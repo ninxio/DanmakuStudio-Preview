@@ -6,6 +6,7 @@ src-tauri/target
 .DS_Store
 *.local
 artifacts/test-results
+artifacts/*.err
+artifacts/*.log
 playwright-report
 test-results
-pnpm-lock.yaml
