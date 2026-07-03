@@ -1,0 +1,353 @@
+# Danmaku Timeline Studio 交接进度
+
+更新时间：2026-07-03
+
+## 本轮新增
+
+- 已优化无 ItemId 的 Emby 订阅库使用路径：
+  - 新增 `Items?SearchTerm=...` 标准搜索能力，可按片名、剧名、`S01E02`、第几季第几集等信息搜索候选，并把季集号匹配项优先排序。
+  - 资源栏“Emby 时长”面板新增搜索框和候选列表，选中候选后自动填入 ItemId。
+  - 电影或单集候选如果带时长，可直接导入为一条人工整理规则。
+  - 浏览器网络层失败不再裸显 `Failed to fetch`，会提示 CORS、证书、地址、路径前缀和桌面端代理方向。
+  - 修正 `S01E01 51:20.123` 这类带毫秒 Emby 时长的人工规则解析。
+- 已重新验证：
+  - `corepack pnpm lint` 成功
+  - `corepack pnpm build` 成功
+  - `corepack pnpm test` 成功，当前 16 个测试文件、39 个测试通过
+
+- 已新增 Emby 订阅库时长接入：
+  - `src/infrastructure/metadata/embyClient.ts`
+  - 通过 `POST /Users/AuthenticateByName` 登录获取 `UserId` 和 token。
+  - 通过 `/Users/{UserId}/Items/{ItemId}` 读取单条条目。
+  - 通过 `/Users/{UserId}/Items?ParentId=...&Recursive=true&IncludeItemTypes=Episode` 读取下级剧集。
+  - 支持路径前缀，默认 UI 使用 `/emby`，适配 `/emby/Users/...` 订阅服务路径。
+  - 将 Emby `RunTimeTicks` 转成毫秒，优先条目字段，回退到 `MediaSources[].RunTimeTicks`。
+- 已在资源栏新增“Emby 时长”面板：
+  - 输入服务器、路径、用户名、密码、ItemId。
+  - 未导入 XML 时也可先使用该面板获取时长表。
+  - 可读取条目时长。
+  - 可读取下级剧集并生成 `S01E01 51:20.123` 形式的时长表。
+  - 可一键导入到“按真实集时长”人工整理规则。
+  - 凭证和 token 只保存在当前组件内存中，不写入项目文件。
+- 已补充测试：
+  - `src/infrastructure/metadata/embyClient.test.ts`
+- 已重新验证：
+  - `corepack pnpm lint` 成功
+  - `corepack pnpm build` 成功
+  - `corepack pnpm test` 成功，当前 16 个测试文件、37 个测试通过
+  - `corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过
+
+- 已将弹幕整理方向调整为“人工规则优先”：
+  - 暂不依赖视频内容识别、弹幕密度智能判断或自然语言指令。
+  - 在资源栏新增“人工整理规则”面板，用少量下拉框和输入框控制整理计划。
+- 已支持分 P 有效内容规则：
+  - 完整保留。
+  - 每个分 P 只取前 N 分钟。
+  - 每个分 P 只取后 N 分钟。
+  - 每个分 P 按统一开始/结束分钟截取。
+- 已支持长合集切分规则：
+  - 自动切分。
+  - 按真实集时长切分。
+  - 按人工切点切分。
+- 已新增人工规则解析：
+  - `S01E01 51:20`
+  - 一行一个 `51:20`
+  - `51:20, 1:42:05` 这类切点列表
+  - `153:10` 会按 153 分 10 秒处理。
+- 已补充测试：
+  - `src/domain/danmaku/manualRules.test.ts`
+  - `src/domain/danmaku/batchMerge.test.ts` 新增人工规则覆盖
+- 已重新验证：
+  - `corepack pnpm lint` 成功
+  - `corepack pnpm build` 成功
+  - `corepack pnpm test` 成功，当前 15 个测试文件、34 个测试通过
+  - `corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过
+
+- 已补齐资源栏管理动作：删除视频引用、删除弹幕 XML 资源、将弹幕资源从时间轴移出。
+- 已实现可拖拽调整的主工作区：资源栏宽度、检查器宽度、时间轴高度均可用鼠标或键盘方向键调整。
+- 已新增批量分集合并草案与导出：
+  - 支持识别 `01 - 1.1.xml`、`02 - 1.2.xml` 这类“集数.分 P”文件并追加式合并。
+  - 支持识别 `第一季1-5.xml`、`S01E01-E05.xml`、`1-5集.xml` 这类多集范围文件并切分为单集输出。
+  - 导出的每集 XML 会重新解析验证，原始导入 XML 不会被直接修改。
+- 已补充测试：
+  - `src/domain/danmaku/batchMerge.test.ts`
+  - `src/features/assets/AssetPanel.test.tsx`
+- 已重新验证：
+  - `corepack pnpm lint` 成功
+  - `corepack pnpm build` 成功
+  - `corepack pnpm test` 成功，当前 14 个测试文件、29 个测试通过
+  - `corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过
+- 已启动 Web Demo，实际地址为 `http://127.0.0.1:53175/`。
+
+## 已完成的事项
+
+- 已在当前目录初始化 Git 仓库。
+- 已创建长期规则和文档：
+  - `AGENTS.md`
+  - `README.md`
+  - `docs/PLAN.md`
+  - `docs/ARCHITECTURE.md`
+  - `docs/PROGRESS.md`
+  - `docs/REFERENCES.md`
+- 已创建 React + TypeScript strict + Vite + Tailwind CSS 工程。
+- 已创建 Tauri 2 桌面壳配置：
+  - `src-tauri/Cargo.toml`
+  - `src-tauri/tauri.conf.json`
+  - `src-tauri/src/lib.rs`
+  - `src-tauri/src/main.rs`
+- 已配置：
+  - pnpm package scripts
+  - Vitest
+  - React Testing Library
+  - Playwright
+  - ESLint
+  - Prettier
+  - Tailwind/PostCSS
+- 已实现基础产品界面：
+  - 顶部工具栏
+  - 左侧资源面板
+  - 中央视频/弹幕预览区
+  - 右侧检查器
+  - 底部 Canvas 时间轴
+  - 状态栏
+  - 导出摘要弹窗
+- 已实现领域模型：
+  - `DanmakuItem`
+  - `DanmakuAsset`
+  - `DanmakuClip`
+  - `CutMarker`
+  - `SyncAnchor`
+  - `EditorProject`
+- 已实现 Bilibili XML 解析和序列化：
+  - 秒转整数毫秒
+  - 保留完整原始 `p` 字段
+  - 解析已知字段
+  - 保留未知字段
+  - XML entity、多语言、Emoji 支持
+  - 非法节点产生导入警告而不阻断导入
+  - 导出按最终时间排序
+  - 负时间导出时限制为 0
+  - 导出后重新解析验证
+- 已实现非破坏性时间映射：
+  - 片段级偏移
+  - 全局偏移
+  - 单条弹幕时间调整
+  - 多个删减标记累计
+  - `getResolvedDanmakuTime`
+- 已实现项目管理：
+  - 多 XML 导入
+  - 资源面板展示弹幕数量、最早/最晚时间、颜色、是否放入时间轴
+  - 资源添加到时间轴
+  - 按顺序自动排列分 P
+  - `.danmaku-project.json` 保存和打开
+  - schema 版本检查
+- 已实现 Zustand 编辑器状态：
+  - 导入 XML
+  - 导入视频
+  - 打开/保存项目
+  - 添加/移动片段
+  - 选择弹幕/片段/删减标记
+  - 移动弹幕
+  - 禁用/恢复弹幕
+  - 添加/编辑/删除删减标记
+  - 全局偏移
+  - 预览设置
+  - 导出摘要
+  - 撤销/重做
+- 已实现 Canvas 2D 时间轴：
+  - 时间标尺
+  - 播放头
+  - 视频轨道
+  - 删减标记轨道
+  - 弹幕片段轨道
+  - 弹幕密度热力图
+  - 弹幕事件轨道
+  - 点击/拖动播放头
+  - 鼠标滚轮横向滚动
+  - Ctrl/Command + 滚轮缩放，并保持鼠标指向时间稳定
+  - 拖动片段
+  - 单击选择弹幕
+  - Shift 多选
+  - 框选时间范围内弹幕
+  - 拖动所选弹幕
+  - 吸附到播放头/删减标记
+  - 双击弹幕跳转播放头
+  - 小时级时间线缩放
+  - 达芬奇式对数缩放滑杆，范围覆盖 `0.01 px/s` 到 `1600 px/s`
+  - `缩放到全部` 按当前时间轴可视宽度计算
+  - 低缩放级别大跨度时间标尺
+  - 播放头边缘自动滚动
+  - 播放头到达真实开端/末端时的边界反馈
+  - 选择工具
+  - 剪刀工具
+  - 在播放头剪切片段
+  - 剪刀工具点击片段剪切
+  - 连续片段合并
+  - 片段/删减点 Shift 多选
+  - 删除选中片段或删减标记
+- 已实现预览区：
+  - `MediaAdapter` 接口
+  - `HtmlVideoMediaAdapter`
+  - `NativeMpvMediaAdapter` 占位接口
+  - MP4/WebM HTML Video 预览
+  - 播放头和预览同步
+  - 基础滚动/顶部/底部弹幕叠加
+  - 字号、颜色、透明度、启用状态
+  - 基础轨道分配
+  - 安全区开关
+- 已实现检查器：
+  - 单条弹幕检查器
+  - 片段检查器
+  - 删减标记检查器
+  - 多选弹幕操作
+- 已实现快捷键：
+  - Space 播放/暂停
+  - Ctrl/Command + Z 撤销
+  - Ctrl/Command + Shift + Z 重做
+  - Delete / Backspace 删除选择项；弹幕删除以禁用表达
+  - Ctrl/Command + A 选择全部片段
+  - Ctrl/Command + K 在播放头剪切片段
+  - Ctrl/Command + J 合并连续片段
+  - V 选择工具
+  - B / C 剪刀工具
+  - Escape 清空选择
+  - Home / End 跳转时间线开端/末端
+  - 左右方向键 10ms 微调
+  - Shift + 左右方向键 100ms 微调
+  - Alt + 左右方向键 1s 微调
+  - M 添加删减标记
+  - F 缩放到全部
+  - `+` / `-` 缩放时间轴
+- 已实现智能对齐扩展接口：
+  - `AlignmentProvider`
+  - `AlignmentInput`
+  - `AlignmentProposal`
+  - `ManualAlignmentProvider`
+  - proposal JSON 导入/导出
+  - proposal 应用到项目
+  - proposal JSON 严格校验
+  - 时间轴同步锚点绘制
+  - 候选锚点虚线绘制
+  - 候选删减点虚线/半透明影响区绘制
+  - proposal 应用前后状态区分
+  - 时间轴“对齐候选 / 已应用”计数
+- 已创建 fixtures：
+  - `fixtures/bilibili/normal.xml`
+  - `fixtures/bilibili/special-chars.xml`
+  - `fixtures/bilibili/missing-fields.xml`
+  - `fixtures/bilibili/multilingual.xml`
+  - `fixtures/bilibili/part-1.xml`
+  - `fixtures/bilibili/part-2.xml`
+  - `fixtures/bilibili/part-3.xml`
+  - `fixtures/bilibili/large-10000.xml`
+  - `fixtures/bilibili/large-50000.xml`
+- 已创建三分 P 示例项目：
+  - `fixtures/projects/three-part-demo.danmaku-project.json`
+- 已创建生成脚本：
+  - `scripts/generate-fixtures.mjs`
+  - `scripts/generate-example-project.mjs`
+- 已完成并通过测试：
+  - XML 解析/序列化
+  - 特殊字符
+  - 非法节点容错
+  - 时间单位转换
+  - 片段时间计算
+  - 全局偏移
+  - 多删减标记累计
+  - 单条弹幕调整
+  - 最终时间排序
+  - 项目文件序列化
+  - 项目版本检查
+  - 撤销/重做
+  - 时间桶聚合
+  - 时间范围二分查找
+  - 导入面板
+  - 检查器
+  - 导出摘要
+  - 删减标记编辑
+  - 快捷键
+  - 时间轴工具切换
+  - 片段剪切、合并、删除快捷键
+  - 时间轴缩放对数映射
+  - 对齐 proposal 解析校验
+  - 对齐 proposal 时间轴预览模型
+- 已验证命令：
+  - `corepack pnpm install` 成功
+  - `corepack pnpm lint` 成功
+  - `corepack pnpm build` 成功
+  - `corepack pnpm test` 成功，当前 12 个测试文件、26 个测试通过
+  - `corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过
+- 已生成截图：
+  - `artifacts/screenshots/empty-project.png`
+  - `artifacts/screenshots/imported-project.png`
+  - `artifacts/screenshots/timeline-editing.png`
+  - `artifacts/screenshots/cut-marker.png`
+  - `artifacts/screenshots/export-dialog.png`
+- 已人工查看 `imported-project.png`、`cut-marker.png`、`export-dialog.png`，未发现明显空白、遮挡或布局崩坏。
+
+## 关键决策
+
+- 首版项目文件选择嵌入解析后的 XML 弹幕数据，不嵌入视频内容。
+- 视频只保存本地媒体引用和文件名，浏览器对象 URL 不写入项目文件。
+- 原始 XML 和 `DanmakuItem.sourceTimeMs` 不直接修改。
+- 禁用弹幕使用 `disabledItemIds` 表达，保留原始 item。
+- 单条弹幕时间调整使用 `itemTimeAdjustments` 表达。
+- 内部时间统一使用整数毫秒。
+- 导出 XML 前必须重新解析验证。
+- 当前视频适配器为 `HtmlVideoMediaAdapter`，只承诺浏览器可播放 MP4/WebM。
+- `NativeMpvMediaAdapter` 只是未来接口占位，不伪造 MKV 支持。
+- 撤销/重做使用项目快照命令历史，历史上限 120。
+- 时间轴主要内容使用 Canvas 2D 绘制，不为每条弹幕创建 DOM。
+- pnpm 在当前环境使用 `corepack pnpm ...` 调用固定版本 `pnpm@9.15.4`，因为全局 pnpm 版本要求 Node 22.13。
+- 当前 PowerShell 执行策略会拦截 `pnpm.ps1`，直接 `pnpm ...` 可能失败；`corepack pnpm ...` 可用。
+
+## 已知的问题
+
+- 当前环境没有 Rust 工具链，暂时无法实际验证 `pnpm tauri dev`。
+- 当前环境全局 pnpm 版本过新，直接 `pnpm.cmd install` 会因 Node 20.11.1 不兼容失败；需要使用 `corepack pnpm ...` 或安装兼容 Node 20 的 pnpm。
+- Playwright 浏览器已安装并可运行；当前只覆盖核心冒烟流程，尚未覆盖保存项目、重新打开项目、导出后重新导入、选择并移动弹幕、撤销后状态恢复。
+- Playwright/Vite 当前使用 `127.0.0.1:53173`，因为本机 `4173/5173` 端口会返回 `EACCES`。
+- 已启动 Web Demo；仍需继续做小窗口、文本溢出、弹窗遮挡和批量分集下载的人工视觉检查。
+- `README.md` 需要最终更新测试结果、截图位置、PowerShell/pnpm 注意事项。
+- 小窗口适配还没有经过 Playwright 截图检查。
+
+## 未完成的待办
+
+1. 扩展 Playwright E2E：
+   - 修改全局偏移
+   - 选择并移动弹幕
+   - 撤销
+   - 导出 XML 后重新导入导出 XML
+   - 保存项目
+   - 重新打开项目
+   - 校验编辑状态恢复
+   - 增加小窗口截图检查
+2. 继续 Web Demo 人工检查：
+   - 当前地址 `http://127.0.0.1:53175/`
+   - 检查 1440x900
+   - 检查小窗口可操作性
+   - 检查文本溢出、按钮状态、时间轴标签、播放头位置、弹窗遮挡
+   - 检查“分集合并草案”和多文件下载行为
+3. 如果环境允许，安装 Rust 后验证：
+   - `corepack pnpm tauri dev`
+4. 最终补全 README：
+   - 安装
+   - 运行
+   - 操作方法
+   - 快捷键
+   - 测试结果
+   - 截图位置
+   - 已知限制
+   - mpv/Emby 后续建议
+   - 智能版本对齐后续建议
+5. 最终汇报时按用户要求列出：
+   - 已实现功能
+   - 尚未实现功能
+   - 架构概览
+   - 关键文件位置
+   - 所有运行命令
+   - 测试结果
+   - 截图位置
+   - 当前视频格式限制
+   - 后续接入 mpv 和 Emby 建议
+   - 后续智能版本对齐建议

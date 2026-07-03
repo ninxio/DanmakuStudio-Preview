@@ -1,0 +1,107 @@
+import type {
+  CutMarker,
+  DanmakuAsset,
+  DanmakuClip,
+  DanmakuItem,
+  ResolvedDanmakuEvent
+} from "../danmaku/types";
+import type { EditorProject } from "../project/types";
+import type { Milliseconds } from "../shared/time";
+import { clampMilliseconds } from "../shared/time";
+
+export interface EditTimingState {
+  globalOffsetMs: Milliseconds;
+  cutMarkers: CutMarker[];
+  itemTimeAdjustments: Record<string, Milliseconds>;
+}
+
+export function applyCutMapping(timeMs: Milliseconds, cutMarkers: CutMarker[]): Milliseconds {
+  const sortedMarkers = [...cutMarkers].sort((a, b) => a.sourceAtMs - b.sourceAtMs);
+  return sortedMarkers.reduce((mapped, marker) => {
+    if (timeMs >= marker.sourceAtMs) {
+      return mapped + marker.targetGapMs;
+    }
+    return mapped;
+  }, timeMs);
+}
+
+export function getResolvedDanmakuTime(
+  item: DanmakuItem,
+  clip: DanmakuClip,
+  editState: EditTimingState
+): Milliseconds {
+  const clipRelativeMs = item.sourceTimeMs - clip.sourceInMs;
+  const itemAdjustmentMs = editState.itemTimeAdjustments[item.id] ?? 0;
+  const beforeCuts =
+    clip.timelineStartMs +
+    clipRelativeMs +
+    clip.localOffsetMs +
+    itemAdjustmentMs +
+    editState.globalOffsetMs;
+  return applyCutMapping(beforeCuts, editState.cutMarkers);
+}
+
+export function isItemInsideClip(item: DanmakuItem, clip: DanmakuClip): boolean {
+  return item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs <= clip.sourceOutMs;
+}
+
+export function getAssetTimeRange(asset: DanmakuAsset): { earliestMs: Milliseconds; latestMs: Milliseconds } {
+  if (asset.items.length === 0) {
+    return { earliestMs: 0, latestMs: 0 };
+  }
+  let earliestMs = Number.POSITIVE_INFINITY;
+  let latestMs = 0;
+  for (const item of asset.items) {
+    earliestMs = Math.min(earliestMs, item.sourceTimeMs);
+    latestMs = Math.max(latestMs, item.sourceTimeMs);
+  }
+  return { earliestMs, latestMs };
+}
+
+export function getClipDurationMs(clip: DanmakuClip): Milliseconds {
+  return Math.max(0, clip.sourceOutMs - clip.sourceInMs);
+}
+
+export function resolveProjectDanmakuEvents(project: EditorProject): ResolvedDanmakuEvent[] {
+  const disabled = new Set(project.disabledItemIds);
+  const events: ResolvedDanmakuEvent[] = [];
+  for (const clip of project.clips) {
+    if (!clip.enabled) {
+      continue;
+    }
+    const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
+    if (!asset) {
+      continue;
+    }
+    for (const item of asset.items) {
+      if (!isItemInsideClip(item, clip)) {
+        continue;
+      }
+      const enabled = item.enabled && !disabled.has(item.id);
+      events.push({
+        id: `${clip.id}:${item.id}`,
+        item,
+        clip,
+        asset,
+        finalTimeMs: getResolvedDanmakuTime(item, clip, project),
+        originalIndex: item.originalIndex,
+        enabled
+      });
+    }
+  }
+  events.sort((a, b) => a.finalTimeMs - b.finalTimeMs || a.originalIndex - b.originalIndex);
+  return events;
+}
+
+export function getProjectDurationMs(project: EditorProject): Milliseconds {
+  const clipEnd = project.clips.reduce(
+    (max, clip) => Math.max(max, clip.timelineStartMs + getClipDurationMs(clip) + clip.localOffsetMs),
+    0
+  );
+  const eventEnd = resolveProjectDanmakuEvents(project).reduce(
+    (max, event) => Math.max(max, clampMilliseconds(event.finalTimeMs)),
+    0
+  );
+  const mediaEnd = project.media?.durationMs ?? 0;
+  return Math.max(60_000, clipEnd, eventEnd, mediaEnd);
+}

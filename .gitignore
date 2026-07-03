@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-ssr
+src-tauri/target
+.vite
+.DS_Store
+*.local
+artifacts/test-results
+playwright-report
+test-results
+pnpm-lock.yaml
