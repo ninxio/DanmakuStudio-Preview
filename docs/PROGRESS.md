@@ -208,3 +208,27 @@
   - `corepack pnpm lint` 成功。
   - `corepack pnpm build` 成功。
   - `corepack pnpm test` 成功，当前 16 个测试文件、39 个测试通过。
+
+### 阶段10：第一个 Windows 桌面安装包
+
+- 状态：完成。
+- 已安装本机 Tauri Windows 打包环境：
+  - 通过 `winget` 安装 Rustup。
+  - 通过 `winget` 安装 Visual Studio 2022 Build Tools C++ 工具集，补齐 MSVC `link.exe`。
+- 已修正 Tauri 构建配置：
+  - `beforeBuildCommand` 改为 `corepack pnpm build`，避免调用全局 pnpm 导致 Node 版本不兼容。
+  - `beforeDevCommand` 改为 `corepack pnpm dev -- --port 1420`，与 Tauri `devUrl` 对齐。
+  - 新增应用图标源 `src-tauri/app-icon.svg` 并生成 `src-tauri/icons`。
+  - 在 `tauri.conf.json` 中配置 Windows/macOS/Linux 图标路径。
+- 已新增打包说明：
+  - `docs/PACKAGING.md`
+- 已生成首个可安装 Windows 桌面包：
+  - `src-tauri/target/release/danmaku_timeline_studio.exe`
+  - `src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`
+  - `src-tauri/target/release/bundle/msi/Danmaku Timeline Studio_0.1.0_x64_en-US.msi`
+- 已验证命令：
+  - `corepack pnpm build` 成功。
+  - `corepack pnpm tauri build` 成功。
+- 已知限制：
+  - 当前安装包未签名，Windows 首次安装或运行时可能显示 SmartScreen 提示。
+  - 桌面壳尚未实现 Tauri 后端 Emby 代理，订阅库 CORS 问题仍待后续阶段解决。

@@ -4,6 +4,16 @@
 
 ## 本轮新增
 
+- 已完成第一个 Windows 桌面安装包：
+  - 已安装 Rustup 和 Visual Studio 2022 Build Tools C++ 工具集。
+  - 已修正 Tauri 构建命令，统一使用 `corepack pnpm ...`。
+  - 已新增应用图标并生成 Tauri 图标资源。
+  - 已新增 `docs/PACKAGING.md`。
+  - 已成功运行 `corepack pnpm tauri build`。
+  - 可运行程序：`src-tauri/target/release/danmaku_timeline_studio.exe`
+  - NSIS 安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`
+  - MSI 安装包：`src-tauri/target/release/bundle/msi/Danmaku Timeline Studio_0.1.0_x64_en-US.msi`
+
 - 已优化无 ItemId 的 Emby 订阅库使用路径：
   - 新增 `Items?SearchTerm=...` 标准搜索能力，可按片名、剧名、`S01E02`、第几季第几集等信息搜索候选，并把季集号匹配项优先排序。
   - 资源栏“Emby 时长”面板新增搜索框和候选列表，选中候选后自动填入 ItemId。

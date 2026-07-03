@@ -2,6 +2,7 @@ node_modules
 dist
 dist-ssr
 src-tauri/target
+src-tauri/gen
 .vite
 .DS_Store
 *.local
