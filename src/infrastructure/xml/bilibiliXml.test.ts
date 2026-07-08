@@ -20,9 +20,13 @@ describe("Bilibili XML", () => {
   });
 
   it("正确处理 XML entity 和特殊符号", () => {
-    const asset = parseBilibiliXml(readFixture("special-chars.xml"), { fileName: "special.xml" });
+    const asset = parseBilibiliXml(readFixture("special-chars.xml"), {
+      fileName: "special.xml"
+    });
     expect(asset.items[0].text).toContain("小于号 < 大于号 > 与 & 符号");
-    const exported = serializeBilibiliXml(asset.items.map((item) => ({ item, finalTimeMs: item.sourceTimeMs })));
+    const exported = serializeBilibiliXml(
+      asset.items.map((item) => ({ item, finalTimeMs: item.sourceTimeMs }))
+    );
     expect(exported.xml).toContain("&lt;");
     expect(validateExportedXml(exported.xml).ok).toBe(true);
   });
@@ -32,6 +36,31 @@ describe("Bilibili XML", () => {
     expect(asset.items).toHaveLength(3);
     expect(asset.warnings.length).toBeGreaterThanOrEqual(3);
     expect(asset.items[0].sourceTimeMs).toBe(0);
+  });
+
+  it("按 XML 三位小数秒规则转换并舍入时间", () => {
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i>
+        <d p="1.2344,1,25,16777215,0,0,u,a">向下舍入</d>
+        <d p="1.2345,1,25,16777215,0,0,u,b">向上舍入</d>
+        <d p="1.9995,1,25,16777215,0,0,u,c">进位</d>
+      </i>`,
+      { fileName: "rounding.xml" }
+    );
+    expect(asset.items.map((item) => item.sourceTimeMs)).toEqual([1234, 1235, 2000]);
+  });
+
+  it("非法、负数和科学计数时间会回退到 0ms 并产生警告", () => {
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i>
+        <d p="-1,1,25,16777215,0,0,u,a">负数</d>
+        <d p="bad,1,25,16777215,0,0,u,b">非法</d>
+        <d p="1e-3,1,25,16777215,0,0,u,c">科学计数</d>
+      </i>`,
+      { fileName: "invalid-time.xml" }
+    );
+    expect(asset.items.map((item) => item.sourceTimeMs)).toEqual([0, 0, 0]);
+    expect(asset.warnings).toHaveLength(3);
   });
 
   it("保留中文、日文和 Emoji", () => {

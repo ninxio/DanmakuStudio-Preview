@@ -16,7 +16,11 @@ import type { CutMarker, DanmakuClip, ResolvedDanmakuEvent } from "../../domain/
 import { formatTimecode } from "../../domain/shared/time";
 import type { Milliseconds } from "../../domain/shared/time";
 import { clamp, clampMilliseconds } from "../../domain/shared/time";
-import { getClipDurationMs, getProjectDurationMs, resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
+import {
+  getClipDurationMs,
+  getProjectDurationMs,
+  resolveProjectDanmakuEvents
+} from "../../domain/timeline/mapping";
 import {
   aggregateDensity,
   chooseBucketSizeMs,
@@ -48,7 +52,13 @@ interface TrackRect {
 type DragState =
   | { type: "none" }
   | { type: "playhead" }
-  | { type: "clip"; clipIds: string[]; startX: number; primaryClipId: string; originalStartMs: Milliseconds }
+  | {
+      type: "clip";
+      clipIds: string[];
+      startX: number;
+      primaryClipId: string;
+      originalStartMs: Milliseconds;
+    }
   | { type: "danmaku"; startX: number }
   | { type: "box"; startX: number; currentX: number; additive: boolean };
 
@@ -57,7 +67,9 @@ export function TimelinePanel() {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState>({ type: "none" });
   const [size, setSize] = useState({ width: 1000, height: 320 });
-  const [boxPreview, setBoxPreview] = useState<{ startX: number; currentX: number } | null>(null);
+  const [boxPreview, setBoxPreview] = useState<{ startX: number; currentX: number } | null>(
+    null
+  );
   const [edgeFeedback, setEdgeFeedback] = useState<TimelineEdgeFeedback>(null);
 
   const project = useEditorStore((state) => state.project);
@@ -76,7 +88,9 @@ export function TimelinePanel() {
   const addCutMarkerAtPlayhead = useEditorStore((state) => state.addCutMarkerAtPlayhead);
   const fitTimelineToContent = useEditorStore((state) => state.fitTimelineToContent);
   const splitClipAtTime = useEditorStore((state) => state.splitClipAtTime);
-  const splitSelectedClipsAtPlayhead = useEditorStore((state) => state.splitSelectedClipsAtPlayhead);
+  const splitSelectedClipsAtPlayhead = useEditorStore(
+    (state) => state.splitSelectedClipsAtPlayhead
+  );
   const mergeSelectedClips = useEditorStore((state) => state.mergeSelectedClips);
   const deleteSelection = useEditorStore((state) => state.deleteSelection);
   const setTimelineTool = useEditorStore((state) => state.setTimelineTool);
@@ -85,10 +99,14 @@ export function TimelinePanel() {
   const tracks = useMemo(() => makeTracks(size.height), [size.height]);
   const allEvents = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
   const timelineDurationMs = useMemo(() => getProjectDurationMs(project), [project]);
-  const alignmentPreview = useMemo(() => buildAlignmentPreview(project, alignmentProposal), [project, alignmentProposal]);
+  const alignmentPreview = useMemo(
+    () => buildAlignmentPreview(project, alignmentProposal),
+    [project, alignmentProposal]
+  );
   const pendingAlignmentCount =
     alignmentPreview.summary.candidateAnchorCount + alignmentPreview.summary.candidateCutCount;
-  const appliedAlignmentCount = alignmentPreview.summary.appliedAnchorCount + alignmentPreview.summary.appliedCutCount;
+  const appliedAlignmentCount =
+    alignmentPreview.summary.appliedAnchorCount + alignmentPreview.summary.appliedCutCount;
   const viewport = useMemo(() => {
     const durationMs = ((size.width - LABEL_WIDTH) * 1000) / project.timeline.pixelsPerSecond;
     return {
@@ -143,7 +161,17 @@ export function TimelinePanel() {
       edgeFeedback,
       alignmentPreview
     });
-  }, [size, project, tracks, visibleEvents, allEvents, selection, boxPreview, edgeFeedback, alignmentPreview]);
+  }, [
+    size,
+    project,
+    tracks,
+    visibleEvents,
+    allEvents,
+    selection,
+    boxPreview,
+    edgeFeedback,
+    alignmentPreview
+  ]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-panel-base" data-testid="timeline-panel">
@@ -178,11 +206,15 @@ export function TimelinePanel() {
           <Trash2 size={14} />
           删除
         </TextButton>
-        <TextButton onClick={() => fitTimelineToContent(Math.max(240, size.width - LABEL_WIDTH - 24))}>
+        <TextButton
+          onClick={() => fitTimelineToContent(Math.max(240, size.width - LABEL_WIDTH - 24))}
+        >
           缩放到全部
         </TextButton>
         <div className="ml-auto flex items-center gap-2 text-xs text-slate-400">
-          {alignmentPreview.summary.proposalAnchorCount + alignmentPreview.summary.proposalCutCount > 0 ? (
+          {alignmentPreview.summary.proposalAnchorCount +
+            alignmentPreview.summary.proposalCutCount >
+          0 ? (
             <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200">
               对齐候选 {pendingAlignmentCount} / 已应用 {appliedAlignmentCount}
             </span>
@@ -204,10 +236,32 @@ export function TimelinePanel() {
           data-testid="timeline-canvas"
           onPointerDown={(event) => {
             const point = getCanvasPoint(event);
-            const timeMs = xToTime(point.x, project.timeline.scrollMs, project.timeline.pixelsPerSecond);
-            const cutHit = hitCut(point, project.cutMarkers, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks);
-            const clipHit = hitClip(point, project.clips, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks);
-            const eventHit = hitEvent(point, visibleEvents, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks);
+            const timeMs = xToTime(
+              point.x,
+              project.timeline.scrollMs,
+              project.timeline.pixelsPerSecond
+            );
+            const cutHit = hitCut(
+              point,
+              project.cutMarkers,
+              project.timeline.scrollMs,
+              project.timeline.pixelsPerSecond,
+              tracks
+            );
+            const clipHit = hitClip(
+              point,
+              project.clips,
+              project.timeline.scrollMs,
+              project.timeline.pixelsPerSecond,
+              tracks
+            );
+            const eventHit = hitEvent(
+              point,
+              visibleEvents,
+              project.timeline.scrollMs,
+              project.timeline.pixelsPerSecond,
+              tracks
+            );
             event.currentTarget.setPointerCapture(event.pointerId);
             setEdgeFeedback(null);
             if (timelineTool === "blade") {
@@ -224,14 +278,16 @@ export function TimelinePanel() {
             }
             if (clipHit) {
               const clipIds =
-                selection.kind === "clip" && selection.ids.includes(clipHit.id) ? selection.ids : [clipHit.id];
+                selection.kind === "clip" && selection.ids.includes(clipHit.id)
+                  ? selection.ids
+                  : [clipHit.id];
               toggleClipSelection(clipHit.id, event.shiftKey);
               dragRef.current = {
                 type: "clip",
                 clipIds,
                 primaryClipId: clipHit.id,
                 startX: point.x,
-                originalStartMs: clipHit.timelineStartMs
+                originalStartMs: clipHit.timelineStartMs + clipHit.localOffsetMs
               };
               return;
             }
@@ -240,7 +296,12 @@ export function TimelinePanel() {
               return;
             }
             if (isInsideTrack(point.y, tracks.events)) {
-              dragRef.current = { type: "box", startX: point.x, currentX: point.x, additive: event.shiftKey };
+              dragRef.current = {
+                type: "box",
+                startX: point.x,
+                currentX: point.x,
+                additive: event.shiftKey
+              };
               setBoxPreview({ startX: point.x, currentX: point.x });
               return;
             }
@@ -272,27 +333,45 @@ export function TimelinePanel() {
             const point = getCanvasPoint(event);
             const drag = dragRef.current;
             if (drag.type === "clip") {
-              const rawDelta = ((point.x - drag.startX) * 1000) / project.timeline.pixelsPerSecond;
+              const rawDelta =
+                ((point.x - drag.startX) * 1000) / project.timeline.pixelsPerSecond;
               const proposedStart = clampMilliseconds(drag.originalStartMs + rawDelta);
-              const snappedStart = snapTime(proposedStart, project.timeline.playheadMs, project.cutMarkers);
+              const snappedStart = snapTime(
+                proposedStart,
+                project.timeline.playheadMs,
+                project.cutMarkers
+              );
               if (drag.clipIds.length > 1) {
                 moveSelectedClips(Math.round(snappedStart - drag.originalStartMs));
               } else {
                 moveClip(drag.primaryClipId, snappedStart - drag.originalStartMs);
               }
             } else if (drag.type === "danmaku") {
-              const rawDelta = ((point.x - drag.startX) * 1000) / project.timeline.pixelsPerSecond;
+              const rawDelta =
+                ((point.x - drag.startX) * 1000) / project.timeline.pixelsPerSecond;
               const firstSelected = visibleEvents.find(
-                (eventItem) => selection.kind === "danmaku" && selection.ids.includes(eventItem.item.id)
+                (eventItem) =>
+                  selection.kind === "danmaku" && selection.ids.includes(eventItem.item.id)
               );
               const snappedDelta = firstSelected
-                ? snapTime(firstSelected.finalTimeMs + rawDelta, project.timeline.playheadMs, project.cutMarkers) -
-                  firstSelected.finalTimeMs
+                ? snapTime(
+                    firstSelected.finalTimeMs + rawDelta,
+                    project.timeline.playheadMs,
+                    project.cutMarkers
+                  ) - firstSelected.finalTimeMs
                 : rawDelta;
               moveSelectedDanmaku(Math.round(snappedDelta));
             } else if (drag.type === "box") {
-              const start = xToTime(drag.startX, project.timeline.scrollMs, project.timeline.pixelsPerSecond);
-              const end = xToTime(point.x, project.timeline.scrollMs, project.timeline.pixelsPerSecond);
+              const start = xToTime(
+                drag.startX,
+                project.timeline.scrollMs,
+                project.timeline.pixelsPerSecond
+              );
+              const end = xToTime(
+                point.x,
+                project.timeline.scrollMs,
+                project.timeline.pixelsPerSecond
+              );
               selectDanmakuRange(start, end, drag.additive);
               setBoxPreview(null);
             }
@@ -301,7 +380,13 @@ export function TimelinePanel() {
           }}
           onDoubleClick={(event) => {
             const point = getCanvasPoint(event);
-            const eventHit = hitEvent(point, visibleEvents, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks);
+            const eventHit = hitEvent(
+              point,
+              visibleEvents,
+              project.timeline.scrollMs,
+              project.timeline.pixelsPerSecond,
+              tracks
+            );
             if (eventHit) {
               toggleDanmakuSelection(eventHit.item.id, false);
               setPlayhead(eventHit.finalTimeMs);
@@ -310,10 +395,18 @@ export function TimelinePanel() {
           onWheel={(event) => {
             event.preventDefault();
             const point = getCanvasPoint(event);
-            const pointerTime = xToTime(point.x, project.timeline.scrollMs, project.timeline.pixelsPerSecond);
+            const pointerTime = xToTime(
+              point.x,
+              project.timeline.scrollMs,
+              project.timeline.pixelsPerSecond
+            );
             if (event.ctrlKey || event.metaKey) {
               const direction = event.deltaY > 0 ? 0.88 : 1.14;
-              setTimelineZoom(project.timeline.pixelsPerSecond * direction, pointerTime, point.x - LABEL_WIDTH);
+              setTimelineZoom(
+                project.timeline.pixelsPerSecond * direction,
+                pointerTime,
+                point.x - LABEL_WIDTH
+              );
             } else {
               const deltaPx = event.deltaX !== 0 ? event.deltaX : event.deltaY;
               const deltaMs = (deltaPx * 1000) / project.timeline.pixelsPerSecond;
@@ -341,7 +434,18 @@ function drawTimeline(
     alignmentPreview: AlignmentPreviewModel;
   }
 ): void {
-  const { width, height, project, tracks, visibleEvents, allEvents, selection, boxPreview, edgeFeedback, alignmentPreview } = props;
+  const {
+    width,
+    height,
+    project,
+    tracks,
+    visibleEvents,
+    allEvents,
+    selection,
+    boxPreview,
+    edgeFeedback,
+    alignmentPreview
+  } = props;
   context.clearRect(0, 0, width, height);
   context.fillStyle = "#101216";
   context.fillRect(0, 0, width, height);
@@ -351,12 +455,39 @@ function drawTimeline(
   drawTrack(context, tracks.clips, width, "弹幕片段");
   drawTrack(context, tracks.density, width, "密度热力图");
   drawTrack(context, tracks.events, width, "弹幕事件");
-  drawRuler(context, width, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks.ruler);
+  drawRuler(
+    context,
+    width,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    tracks.ruler
+  );
   drawVideoTrack(context, project, tracks.video);
-  drawCutMarkers(context, project.cutMarkers, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks.cuts, selection);
+  drawCutMarkers(
+    context,
+    project.cutMarkers,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    tracks.cuts,
+    selection
+  );
   drawClips(context, project.clips, project, tracks.clips, selection);
-  drawDensity(context, allEvents, project.timeline.scrollMs, project.timeline.pixelsPerSecond, width, tracks.density);
-  drawEvents(context, visibleEvents, project.timeline.scrollMs, project.timeline.pixelsPerSecond, tracks.events, selection);
+  drawDensity(
+    context,
+    allEvents,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    width,
+    tracks.density
+  );
+  drawEvents(
+    context,
+    visibleEvents,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    tracks.events,
+    selection
+  );
   drawAlignmentPreview(
     context,
     alignmentPreview,
@@ -366,7 +497,13 @@ function drawTimeline(
     width,
     height
   );
-  drawPlayhead(context, project.timeline.playheadMs, project.timeline.scrollMs, project.timeline.pixelsPerSecond, height);
+  drawPlayhead(
+    context,
+    project.timeline.playheadMs,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    height
+  );
   drawEdgeFeedback(context, edgeFeedback, width, height);
   if (boxPreview) {
     context.fillStyle = "rgba(76, 201, 240, 0.16)";
@@ -388,7 +525,12 @@ function makeTracks(height: number): TimelineTracks {
   return { ruler, video, cuts, clips, density, events };
 }
 
-function drawTrack(context: CanvasRenderingContext2D, track: TrackRect, width: number, label: string): void {
+function drawTrack(
+  context: CanvasRenderingContext2D,
+  track: TrackRect,
+  width: number,
+  label: string
+): void {
   context.fillStyle = track.y % 2 === 0 ? "#15171b" : "#171a20";
   context.fillRect(0, track.y, width, track.height);
   context.strokeStyle = "#303540";
@@ -447,7 +589,11 @@ function drawVideoTrack(
   context.fillRect(Math.max(LABEL_WIDTH, x), track.y + 7, width, track.height - 14);
   context.fillStyle = "#dbeafe";
   context.font = "12px Segoe UI";
-  context.fillText(project.media?.fileName ?? "视频", Math.max(LABEL_WIDTH + 8, x + 8), track.y + 22);
+  context.fillText(
+    project.media?.fileName ?? "视频",
+    Math.max(LABEL_WIDTH + 8, x + 8),
+    track.y + 22
+  );
 }
 
 function drawCutMarkers(
@@ -476,7 +622,11 @@ function drawCutMarkers(
     context.stroke();
     context.fillStyle = "#f8fafc";
     context.font = "11px Segoe UI";
-    context.fillText(`${marker.targetGapMs >= 0 ? "+" : ""}${marker.targetGapMs}ms`, x + 9, track.y + 22);
+    context.fillText(
+      `${marker.targetGapMs >= 0 ? "+" : ""}${marker.targetGapMs}ms`,
+      x + 9,
+      track.y + 22
+    );
   }
 }
 
@@ -489,13 +639,20 @@ function drawClips(
 ): void {
   for (const clip of clips) {
     const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
-    const startX = timeToX(clip.timelineStartMs + clip.localOffsetMs, project.timeline.scrollMs, project.timeline.pixelsPerSecond);
-    const width = Math.max(18, (getClipDurationMs(clip) / 1000) * project.timeline.pixelsPerSecond);
+    const startX = timeToX(
+      clip.timelineStartMs + clip.localOffsetMs,
+      project.timeline.scrollMs,
+      project.timeline.pixelsPerSecond
+    );
+    const width = Math.max(
+      18,
+      (getClipDurationMs(clip) / 1000) * project.timeline.pixelsPerSecond
+    );
     if (startX + width < LABEL_WIDTH || startX > context.canvas.width) {
       continue;
     }
     const selected = selection.kind === "clip" && selection.ids.includes(clip.id);
-    context.fillStyle = clip.enabled ? asset?.color ?? "#4cc9f0" : "#64748b";
+    context.fillStyle = clip.enabled ? (asset?.color ?? "#4cc9f0") : "#64748b";
     context.globalAlpha = selected ? 0.95 : 0.62;
     context.fillRect(Math.max(LABEL_WIDTH, startX), track.y + 10, width, track.height - 20);
     context.globalAlpha = 1;
@@ -525,7 +682,12 @@ function drawDensity(
     const bucketWidth = Math.max(1, ((bucket.endMs - bucket.startMs) / 1000) * pixelsPerSecond);
     const normalized = bucket.count / max;
     context.fillStyle = `rgba(76, 201, 240, ${0.12 + normalized * 0.72})`;
-    context.fillRect(Math.max(LABEL_WIDTH, x), track.y + track.height - normalized * (track.height - 8), bucketWidth, normalized * (track.height - 8));
+    context.fillRect(
+      Math.max(LABEL_WIDTH, x),
+      track.y + track.height - normalized * (track.height - 8),
+      bucketWidth,
+      normalized * (track.height - 8)
+    );
   }
 }
 
@@ -569,9 +731,33 @@ function drawAlignmentPreview(
   width: number,
   height: number
 ): void {
-  drawProjectAnchors(context, preview.projectAnchors, tracks, scrollMs, pixelsPerSecond, width, height);
-  drawProposalAnchors(context, preview.proposalAnchors, tracks, scrollMs, pixelsPerSecond, width, height);
-  drawProposalCutCandidates(context, preview.proposalCuts, tracks, scrollMs, pixelsPerSecond, width, height);
+  drawProjectAnchors(
+    context,
+    preview.projectAnchors,
+    tracks,
+    scrollMs,
+    pixelsPerSecond,
+    width,
+    height
+  );
+  drawProposalAnchors(
+    context,
+    preview.proposalAnchors,
+    tracks,
+    scrollMs,
+    pixelsPerSecond,
+    width,
+    height
+  );
+  drawProposalCutCandidates(
+    context,
+    preview.proposalCuts,
+    tracks,
+    scrollMs,
+    pixelsPerSecond,
+    width,
+    height
+  );
 }
 
 function drawProjectAnchors(
@@ -596,10 +782,17 @@ function drawProjectAnchors(
     context.fillRect(x - 3, tracks.cuts.y + tracks.cuts.height / 2 - 3, 6, 6);
     context.restore();
     if (pixelsPerSecond > 140) {
-      drawTimelineLabel(context, `同步锚点 ${formatTimecode(anchor.sourceMs)}`, x, tracks.cuts.y + 3, width, {
-        borderColor: "#7bd88f",
-        fillColor: "rgba(123, 216, 143, 0.16)"
-      });
+      drawTimelineLabel(
+        context,
+        `同步锚点 ${formatTimecode(anchor.sourceMs)}`,
+        x,
+        tracks.cuts.y + 3,
+        width,
+        {
+          borderColor: "#7bd88f",
+          fillColor: "rgba(123, 216, 143, 0.16)"
+        }
+      );
     }
   }
 }
@@ -622,7 +815,15 @@ function drawProposalAnchors(
     }
     const applied = anchor.state === "applied";
     const strokeColor = applied ? "rgba(123, 216, 143, 0.42)" : "rgba(123, 216, 143, 0.92)";
-    drawVerticalGuide(context, x, guideTop, guideBottom, strokeColor, applied ? [2, 6] : [6, 4], applied ? 1 : 1.6);
+    drawVerticalGuide(
+      context,
+      x,
+      guideTop,
+      guideBottom,
+      strokeColor,
+      applied ? [2, 6] : [6, 4],
+      applied ? 1 : 1.6
+    );
     context.save();
     context.strokeStyle = strokeColor;
     context.fillStyle = applied ? "rgba(123, 216, 143, 0.12)" : "rgba(123, 216, 143, 0.28)";
@@ -669,13 +870,33 @@ function drawProposalCutCandidates(
     if (!applied) {
       context.save();
       context.fillStyle = "rgba(255, 143, 112, 0.045)";
-      context.fillRect(x, tracks.cuts.y, width - x, tracks.events.y + tracks.events.height - tracks.cuts.y);
+      context.fillRect(
+        x,
+        tracks.cuts.y,
+        width - x,
+        tracks.events.y + tracks.events.height - tracks.cuts.y
+      );
       context.restore();
     }
-    drawVerticalGuide(context, x, guideTop, guideBottom, strokeColor, applied ? [2, 6] : [7, 4], applied ? 1 : 1.6);
+    drawVerticalGuide(
+      context,
+      x,
+      guideTop,
+      guideBottom,
+      strokeColor,
+      applied ? [2, 6] : [7, 4],
+      applied ? 1 : 1.6
+    );
     drawCutCandidateDiamond(context, x, tracks.cuts, strokeColor, applied);
     if (!applied) {
-      drawGapArrow(context, x, tracks.cuts.y + tracks.cuts.height - 8, candidate.targetGapMs, pixelsPerSecond, strokeColor);
+      drawGapArrow(
+        context,
+        x,
+        tracks.cuts.y + tracks.cuts.height - 8,
+        candidate.targetGapMs,
+        pixelsPerSecond,
+        strokeColor
+      );
     }
     drawTimelineLabel(
       context,
@@ -847,7 +1068,8 @@ function drawEdgeFeedback(
   context.font = "12px Segoe UI";
   context.fillStyle = "#fecaca";
   const textWidth = context.measureText(label).width + 16;
-  const labelX = edge === "start" ? LABEL_WIDTH + 10 : Math.max(LABEL_WIDTH + 10, width - textWidth - 12);
+  const labelX =
+    edge === "start" ? LABEL_WIDTH + 10 : Math.max(LABEL_WIDTH + 10, width - textWidth - 12);
   context.fillStyle = "rgba(127, 29, 29, 0.78)";
   context.fillRect(labelX, 34, textWidth, 24);
   context.strokeStyle = "rgba(248, 113, 113, 0.9)";
@@ -892,7 +1114,11 @@ function chooseTickStep(pixelsPerSecond: number): Milliseconds {
   return 1_000;
 }
 
-function timeToX(timeMs: Milliseconds, scrollMs: Milliseconds, pixelsPerSecond: number): number {
+function timeToX(
+  timeMs: Milliseconds,
+  scrollMs: Milliseconds,
+  pixelsPerSecond: number
+): number {
   return LABEL_WIDTH + ((timeMs - scrollMs) / 1000) * pixelsPerSecond;
 }
 
@@ -922,11 +1148,15 @@ function getPlayheadDragUpdate({
     nextScrollMs = clampMilliseconds(scrollMs - (edgePressure * 1000) / pixelsPerSecond);
   } else if (pointX > width - EDGE_SCROLL_ZONE_PX && scrollMs < maxScrollMs) {
     const edgePressure = pointX - (width - EDGE_SCROLL_ZONE_PX);
-    nextScrollMs = clampMilliseconds(Math.min(maxScrollMs, scrollMs + (edgePressure * 1000) / pixelsPerSecond));
+    nextScrollMs = clampMilliseconds(
+      Math.min(maxScrollMs, scrollMs + (edgePressure * 1000) / pixelsPerSecond)
+    );
   }
 
   const clampedX = clamp(pointX, LABEL_WIDTH, width);
-  const playheadMs = clampMilliseconds(clamp(xToTime(clampedX, nextScrollMs, pixelsPerSecond), 0, durationMs));
+  const playheadMs = clampMilliseconds(
+    clamp(xToTime(clampedX, nextScrollMs, pixelsPerSecond), 0, durationMs)
+  );
   const edge =
     playheadMs <= 0 && pointX <= LABEL_WIDTH
       ? "start"
@@ -987,7 +1217,9 @@ function hitCut(
     return null;
   }
   return (
-    markers.find((marker) => Math.abs(point.x - timeToX(marker.sourceAtMs, scrollMs, pixelsPerSecond)) <= 9) ?? null
+    markers.find(
+      (marker) => Math.abs(point.x - timeToX(marker.sourceAtMs, scrollMs, pixelsPerSecond)) <= 9
+    ) ?? null
   );
 }
 
@@ -1014,7 +1246,11 @@ function hitEvent(
   return best;
 }
 
-function snapTime(timeMs: Milliseconds, playheadMs: Milliseconds, cutMarkers: CutMarker[]): Milliseconds {
+function snapTime(
+  timeMs: Milliseconds,
+  playheadMs: Milliseconds,
+  cutMarkers: CutMarker[]
+): Milliseconds {
   const candidates = [playheadMs, ...cutMarkers.map((marker) => marker.sourceAtMs)];
   let best = timeMs;
   let bestDistance = SNAP_THRESHOLD_MS + 1;

@@ -15,7 +15,12 @@ import {
   undoHistory,
   type HistoryState
 } from "../domain/history/history";
-import { createEmptyProject, createId, cloneProject, touchProject } from "../domain/project/factory";
+import {
+  createEmptyProject,
+  createId,
+  cloneProject,
+  touchProject
+} from "../domain/project/factory";
 import type { EditorProject, EditorSelection, MediaReference } from "../domain/project/types";
 import {
   getAssetTimeRange,
@@ -30,7 +35,11 @@ import {
   TIMELINE_MAX_PIXELS_PER_SECOND,
   TIMELINE_MIN_PIXELS_PER_SECOND
 } from "../domain/timeline/view";
-import { createObjectUrl, readFilesAsText, revokeObjectUrl } from "../infrastructure/file-system/browserFiles";
+import {
+  createObjectUrl,
+  readFilesAsText,
+  revokeObjectUrl
+} from "../infrastructure/file-system/browserFiles";
 import {
   parseBilibiliXml,
   serializeBilibiliXml,
@@ -38,6 +47,7 @@ import {
 } from "../infrastructure/xml/bilibiliXml";
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
 import { parseAlignmentProposal } from "../domain/alignment/manualProvider";
+import { pickAssetColor } from "../domain/shared/assetColors";
 
 export type TimelineTool = "select" | "blade";
 
@@ -87,7 +97,11 @@ interface EditorStore {
   setPlaying: (playing: boolean) => void;
   togglePlayback: () => void;
   setTimelineScroll: (scrollMs: Milliseconds) => void;
-  setTimelineZoom: (pixelsPerSecond: number, anchorTimeMs?: Milliseconds, anchorRatio?: number) => void;
+  setTimelineZoom: (
+    pixelsPerSecond: number,
+    anchorTimeMs?: Milliseconds,
+    anchorRatio?: number
+  ) => void;
   fitTimelineToContent: (viewportWidthPx?: number) => void;
   moveClip: (clipId: string, deltaMs: Milliseconds) => void;
   moveSelectedClips: (deltaMs: Milliseconds) => void;
@@ -132,6 +146,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   timelineTool: "select",
 
   newProject: () => {
+    revokeObjectUrl(get().project.media?.objectUrl ?? null);
     set({
       project: createEmptyProject(),
       selection: emptySelection,
@@ -145,7 +160,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   importXmlFiles: async (files) => {
-    const fileArray = Array.from(files).filter((file) => file.name.toLowerCase().endsWith(".xml"));
+    const fileArray = Array.from(files).filter((file) =>
+      file.name.toLowerCase().endsWith(".xml")
+    );
     if (fileArray.length === 0) {
       set({ status: { message: "请选择 XML 文件。", tone: "warning" } });
       return;
@@ -226,6 +243,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   openProjectFromText: (text) => {
     try {
       const project = parseProjectJson(text);
+      revokeObjectUrl(get().project.media?.objectUrl ?? null);
       set({
         project,
         selection: emptySelection,
@@ -256,7 +274,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
           return project;
         }
         const latestEnd = project.clips.reduce(
-          (max, clip) => Math.max(max, clip.timelineStartMs + Math.max(0, clip.sourceOutMs - clip.sourceInMs)),
+          (max, clip) => Math.max(max, getClipVisualEndMs(clip)),
           0
         );
         return {
@@ -286,13 +304,17 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       "删除弹幕资源",
       (currentProject) => {
         const itemTimeAdjustments = Object.fromEntries(
-          Object.entries(currentProject.itemTimeAdjustments).filter(([itemId]) => !itemIds.has(itemId))
+          Object.entries(currentProject.itemTimeAdjustments).filter(
+            ([itemId]) => !itemIds.has(itemId)
+          )
         );
         return {
           ...currentProject,
           assets: currentProject.assets.filter((candidate) => candidate.id !== assetId),
           clips: currentProject.clips.filter((clip) => clip.assetId !== assetId),
-          disabledItemIds: currentProject.disabledItemIds.filter((itemId) => !itemIds.has(itemId)),
+          disabledItemIds: currentProject.disabledItemIds.filter(
+            (itemId) => !itemIds.has(itemId)
+          ),
           itemTimeAdjustments
         };
       },
@@ -395,7 +417,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set((state) => ({
       selection: {
         kind: "danmaku",
-        ids: additive && state.selection.kind === "danmaku" ? unique([...state.selection.ids, ...ids]) : unique(ids)
+        ids:
+          additive && state.selection.kind === "danmaku"
+            ? unique([...state.selection.ids, ...ids])
+            : unique(ids)
       }
     }));
   },
@@ -430,7 +455,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   setTimelineZoom: (pixelsPerSecond, anchorTimeMs, anchorRatio) => {
     set((state) => {
-      const nextPps = clamp(pixelsPerSecond, TIMELINE_MIN_PIXELS_PER_SECOND, TIMELINE_MAX_PIXELS_PER_SECOND);
+      const nextPps = clamp(
+        pixelsPerSecond,
+        TIMELINE_MIN_PIXELS_PER_SECOND,
+        TIMELINE_MAX_PIXELS_PER_SECOND
+      );
       const timeline = state.project.timeline;
       const nextScroll =
         anchorTimeMs !== undefined && anchorRatio !== undefined
@@ -523,9 +552,17 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
               ...clip,
               ...patch,
               timelineStartMs:
-                patch.timelineStartMs !== undefined ? clampMilliseconds(patch.timelineStartMs) : clip.timelineStartMs,
-              sourceInMs: patch.sourceInMs !== undefined ? clampMilliseconds(patch.sourceInMs) : clip.sourceInMs,
-              sourceOutMs: patch.sourceOutMs !== undefined ? clampMilliseconds(patch.sourceOutMs) : clip.sourceOutMs
+                patch.timelineStartMs !== undefined
+                  ? clampMilliseconds(patch.timelineStartMs)
+                  : clip.timelineStartMs,
+              sourceInMs:
+                patch.sourceInMs !== undefined
+                  ? clampMilliseconds(patch.sourceInMs)
+                  : clip.sourceInMs,
+              sourceOutMs:
+                patch.sourceOutMs !== undefined
+                  ? clampMilliseconds(patch.sourceOutMs)
+                  : clip.sourceOutMs
             }
           : clip
       )
@@ -615,7 +652,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
               ...marker,
               ...patch,
               sourceAtMs:
-                patch.sourceAtMs !== undefined ? clampMilliseconds(patch.sourceAtMs) : marker.sourceAtMs
+                patch.sourceAtMs !== undefined
+                  ? clampMilliseconds(patch.sourceAtMs)
+                  : marker.sourceAtMs
             }
           : marker
       )
@@ -657,7 +696,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         }),
         emptySelection
       );
-      set({ status: { message: `已删除 ${selection.ids.length} 个时间轴片段。`, tone: "success" } });
+      set({
+        status: { message: `已删除 ${selection.ids.length} 个时间轴片段。`, tone: "success" }
+      });
       return;
     }
     if (selection.kind === "cut") {
@@ -671,7 +712,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         }),
         emptySelection
       );
-      set({ status: { message: `已删除 ${selection.ids.length} 个删减标记。`, tone: "success" } });
+      set({
+        status: { message: `已删除 ${selection.ids.length} 个删减标记。`, tone: "success" }
+      });
       return;
     }
     set({ status: { message: "当前选择类型暂不支持删除。", tone: "warning" } });
@@ -724,7 +767,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({ status: { message: "播放头没有位于可剪切的片段内部。", tone: "warning" } });
       return;
     }
-    const selectedIds = Array.from(splits.values()).flatMap((split) => [split.left.id, split.right.id]);
+    const selectedIds = Array.from(splits.values()).flatMap((split) => [
+      split.left.id,
+      split.right.id
+    ]);
     commitProject(
       set,
       get,
@@ -752,7 +798,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       .sort((left, right) => getClipVisualStartMs(left) - getClipVisualStartMs(right));
     const mergedClip = mergeAdjacentClips(selectedClips);
     if (!mergedClip) {
-      set({ status: { message: "只能合并同一 XML 且源时间、时间轴连续的片段。", tone: "warning" } });
+      set({
+        status: { message: "只能合并同一 XML 且源时间、时间轴连续的片段。", tone: "warning" }
+      });
       return;
     }
     const selected = new Set(selection.ids);
@@ -777,7 +825,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   setTimelineTool: (tool) => {
     set({
       timelineTool: tool,
-      status: { message: tool === "select" ? "已切换到选择工具。" : "已切换到剪刀工具。", tone: "neutral" }
+      status: {
+        message: tool === "select" ? "已切换到选择工具。" : "已切换到剪刀工具。",
+        tone: "neutral"
+      }
     });
   },
 
@@ -947,11 +998,6 @@ function createClipFromAsset(asset: DanmakuAsset, timelineStartMs: Milliseconds)
   };
 }
 
-function pickAssetColor(index: number): string {
-  const colors = ["#4cc9f0", "#7bd88f", "#f2c94c", "#ff8f70", "#b794f4", "#5eead4", "#f472b6"];
-  return colors[index % colors.length];
-}
-
 function unique(values: string[]): string[] {
   return Array.from(new Set(values));
 }
@@ -978,7 +1024,9 @@ function toggleSelectionId(
     return { selection: { kind, ids: [id] } };
   }
   const exists = selection.ids.includes(id);
-  const ids = exists ? selection.ids.filter((candidate) => candidate !== id) : [...selection.ids, id];
+  const ids = exists
+    ? selection.ids.filter((candidate) => candidate !== id)
+    : [...selection.ids, id];
   return { selection: ids.length > 0 ? { kind, ids } : emptySelection };
 }
 
@@ -1029,7 +1077,8 @@ function mergeAdjacentClips(clips: DanmakuClip[]): DanmakuClip | null {
   let enabled = first.enabled;
   let previous = first;
   for (const current of rest) {
-    const timelineContinuous = Math.abs(getClipVisualEndMs(previous) - getClipVisualStartMs(current)) <= 1;
+    const timelineContinuous =
+      Math.abs(getClipVisualEndMs(previous) - getClipVisualStartMs(current)) <= 1;
     const sourceContinuous = Math.abs(previous.sourceOutMs - current.sourceInMs) <= 1;
     if (current.assetId !== first.assetId || !timelineContinuous || !sourceContinuous) {
       return null;
@@ -1056,6 +1105,9 @@ export function findDanmakuItem(project: EditorProject, itemId: string): Danmaku
   return null;
 }
 
-export function findResolvedEvent(project: EditorProject, itemId: string): ResolvedDanmakuEvent | null {
+export function findResolvedEvent(
+  project: EditorProject,
+  itemId: string
+): ResolvedDanmakuEvent | null {
   return resolveProjectDanmakuEvents(project).find((event) => event.item.id === itemId) ?? null;
 }

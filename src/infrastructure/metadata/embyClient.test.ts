@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   authenticateEmby,
+  createTauriEmbyFetch,
   fetchEmbyEpisodeChildren,
   fetchEmbyItem,
   formatEmbyEpisodeDurationLines,
   formatEmbySingleDurationLine,
   searchEmbyItems,
+  type EmbyProxyRequest,
   type EmbyFetch
 } from "./embyClient";
 
@@ -138,7 +140,35 @@ describe("Emby 客户端", () => {
         { username: "tester", password: "secret" },
         fetcher
       )
-    ).rejects.toThrow("通常是订阅服务未开放 CORS");
+    ).rejects.toThrow("桌面模式会自动使用 Tauri 代理");
+  });
+
+  it("在桌面代理中序列化 Emby 请求并返回类 fetch 响应", async () => {
+    const calls: EmbyProxyRequest[] = [];
+    const fetcher = createTauriEmbyFetch((request) => {
+      calls.push(request);
+      return Promise.resolve({
+        status: 200,
+        body: {
+          User: { Id: "user-1", Name: "tester" },
+          AccessToken: "token-1"
+        }
+      });
+    });
+
+    const session = await authenticateEmby(
+      { serverUrl: "https://example.test", pathPrefix: "/emby" },
+      { username: "tester", password: "secret" },
+      fetcher
+    );
+
+    expect(session.accessToken).toBe("token-1");
+    expect(calls[0]).toMatchObject({
+      url: "https://example.test/emby/Users/AuthenticateByName",
+      method: "POST",
+      body: "{\"Username\":\"tester\",\"Pw\":\"secret\"}"
+    });
+    expect(calls[0].headers).toContainEqual({ name: "content-type", value: "application/json" });
   });
 });
 

@@ -2,7 +2,7 @@
 
 ## Windows 桌面版
 
-本项目使用 Tauri 2 打包桌面应用。Windows 本机需要安装：
+本项目使用 Tauri 2 打包桌面应用。以下依赖只面向开发者或 CI 构建机，最终用户不需要安装：
 
 - Node.js 20.x 或更高版本。
 - Corepack。
@@ -13,16 +13,17 @@
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-corepack pnpm tauri build
+corepack pnpm tauri:build
 ```
 
-成功后产物位于：
+默认成功后产物位于：
 
 - `src-tauri/target/release/danmaku_timeline_studio.exe`
 - `src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`
-- `src-tauri/target/release/bundle/msi/Danmaku Timeline Studio_0.1.0_x64_en-US.msi`
 
-优先分发 NSIS `setup.exe`。MSI 可用于企业或系统级安装流程。
+如果构建环境设置了 `CARGO_TARGET_DIR`，产物会输出到该目录下的 `release/bundle/nsis/`。当前配置只生成 NSIS `setup.exe`，优先用于普通 Windows 用户分发；MSI 可在后续企业分发阶段再启用。
+
+最终用户安装和运行 NSIS 包时不需要 Node.js、pnpm、Rust 或 Visual Studio Build Tools。Windows 10/11 通常已预装 WebView2 Runtime；若目标机器缺失 WebView2，应按安装器提示或微软官方运行时安装指引补齐。
 
 ## Web 生产构建
 
@@ -37,5 +38,6 @@ corepack pnpm build
 ## 注意事项
 
 - Tauri 配置中的构建命令使用 `corepack pnpm ...`，避免调用全局 pnpm 导致 Node 版本不兼容。
+- `src-tauri/icons/` 中的图标由 `src-tauri/app-icon.svg` 生成，若更新图标源，可运行 `corepack pnpm tauri icon src-tauri/app-icon.svg` 后重新打包。
 - 当前 Windows 安装包未签名，首次运行或安装时可能出现 Windows SmartScreen 提示。
 - 当前桌面壳仍使用前端直连 Emby，尚未实现 Tauri 后端代理。

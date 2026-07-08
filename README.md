@@ -16,13 +16,16 @@
 
 ## 安装与运行
 
+开发者本地运行和构建：
+
 ```bash
-pnpm install
-pnpm dev
-pnpm build
-pnpm test
-pnpm test:e2e
-pnpm tauri dev
+corepack pnpm install
+corepack pnpm dev
+corepack pnpm build
+corepack pnpm test
+corepack pnpm test:e2e
+corepack pnpm tauri:dev
+corepack pnpm tauri:build
 ```
 
 如果本机尚未安装 pnpm，可先运行：
@@ -32,7 +35,7 @@ corepack enable
 corepack prepare pnpm@9.15.4 --activate
 ```
 
-`pnpm tauri dev` 还需要 Rust 和 Tauri 平台依赖。当前环境如果缺少 Rust，Web Demo 仍可通过 `pnpm dev` 完整运行。
+`corepack pnpm tauri:dev` 和 `corepack pnpm tauri:build` 还需要 Rust、MSVC 和 Tauri 平台依赖。最终用户不需要安装 Node.js、pnpm、Rust 或 Visual Studio Build Tools，只需要运行 Windows NSIS 安装包；详见 `docs/PACKAGING.md`。
 
 ## 视频格式限制
 
@@ -65,7 +68,8 @@ corepack prepare pnpm@9.15.4 --activate
 
 ## 已知限制
 
-- 桌面模式依赖本机 Rust/Tauri 构建环境。
+- 开发者构建桌面安装包依赖本机 Rust/Tauri 构建环境；最终用户运行安装包不需要这些开发工具。
+- 当前 Windows 安装包未签名，首次安装或运行时可能出现 SmartScreen 提示。
 - 当前没有接入 mpv，因此不承诺 MKV、外挂字幕高级渲染或硬解能力。
 - 智能对齐当前只有手动 proposal 导入导出和应用，不包含大型机器学习模型。
 - ASS 导出仅保留扩展接口，不属于本阶段强制能力。

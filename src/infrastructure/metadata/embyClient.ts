@@ -1,3 +1,4 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { Milliseconds } from "../../domain/shared/time";
 
 export interface EmbyAuthSession {
@@ -69,13 +70,37 @@ interface FetchResponse {
 
 export type EmbyFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<FetchResponse>;
 
+type EmbyProxyMethod = "GET" | "POST";
+
+interface EmbyProxyHeader {
+  name: string;
+  value: string;
+}
+
+export interface EmbyProxyRequest {
+  url: string;
+  method: EmbyProxyMethod;
+  headers: EmbyProxyHeader[];
+  body: string | null;
+}
+
+export interface EmbyProxyResponse {
+  status: number;
+  body: unknown;
+}
+
+export type EmbyProxyInvoker = (request: EmbyProxyRequest) => Promise<EmbyProxyResponse>;
+
 const CLIENT_NAME = "Danmaku Timeline Studio";
 const CLIENT_VERSION = "0.1.0";
+const TAURI_EMBY_FETCH = createTauriEmbyFetch((request) =>
+  invoke<EmbyProxyResponse>("emby_http_request", { request })
+);
 
 export async function authenticateEmby(
   config: EmbyClientConfig,
   credentials: EmbyCredentials,
-  fetcher: EmbyFetch = fetch
+  fetcher: EmbyFetch = getDefaultEmbyFetch()
 ): Promise<EmbyAuthSession> {
   const response = await fetchEmbyRequest(fetcher, createEmbyUrl(config, "/Users/AuthenticateByName"), {
     method: "POST",
@@ -100,7 +125,7 @@ export async function fetchEmbyItem(
   config: EmbyClientConfig,
   session: EmbyAuthSession,
   itemId: string,
-  fetcher: EmbyFetch = fetch
+  fetcher: EmbyFetch = getDefaultEmbyFetch()
 ): Promise<EmbyItemMetadata> {
   const url = createEmbyUrl(config, `/Users/${encodeURIComponent(session.userId)}/Items/${encodeURIComponent(itemId)}`);
   url.searchParams.set("Fields", "MediaSources,Path,ProviderIds,RunTimeTicks,ParentIndexNumber,IndexNumber");
@@ -119,7 +144,7 @@ export async function fetchEmbyEpisodeChildren(
   config: EmbyClientConfig,
   session: EmbyAuthSession,
   parentItemId: string,
-  fetcher: EmbyFetch = fetch
+  fetcher: EmbyFetch = getDefaultEmbyFetch()
 ): Promise<EmbyItemMetadata[]> {
   const url = createEmbyUrl(config, `/Users/${encodeURIComponent(session.userId)}/Items`);
   url.searchParams.set("ParentId", parentItemId);
@@ -145,7 +170,7 @@ export async function searchEmbyItems(
   config: EmbyClientConfig,
   session: EmbyAuthSession,
   options: EmbySearchOptions,
-  fetcher: EmbyFetch = fetch
+  fetcher: EmbyFetch = getDefaultEmbyFetch()
 ): Promise<EmbyItemMetadata[]> {
   const query = parseEmbySearchText(options.searchTerm);
   const searchTerm = query.keyword.length > 0 ? query.keyword : options.searchTerm.trim();
@@ -198,6 +223,72 @@ export function formatEmbySingleDurationLine(item: EmbyItemMetadata): string {
   const season = item.seasonNumber ?? 1;
   const episode = item.episodeNumber ?? 1;
   return `S${season.toString().padStart(2, "0")}E${episode.toString().padStart(2, "0")} ${formatDuration(item.durationMs)}`;
+}
+
+export function createTauriEmbyFetch(proxyInvoker: EmbyProxyInvoker): EmbyFetch {
+  return async (input, init) => {
+    const response = await proxyInvoker(createEmbyProxyRequest(input, init));
+    return {
+      ok: response.status >= 200 && response.status < 300,
+      status: response.status,
+      json: () => Promise.resolve(response.body)
+    };
+  };
+}
+
+function getDefaultEmbyFetch(): EmbyFetch {
+  return isTauri() ? TAURI_EMBY_FETCH : fetch;
+}
+
+function createEmbyProxyRequest(input: RequestInfo | URL, init?: RequestInit): EmbyProxyRequest {
+  return {
+    url: requestInputToUrl(input),
+    method: requestMethod(input, init),
+    headers: requestHeaders(input, init),
+    body: requestBody(init)
+  };
+}
+
+function requestInputToUrl(input: RequestInfo | URL): string {
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  if (typeof input === "string") {
+    return input;
+  }
+  return input.url;
+}
+
+function requestMethod(input: RequestInfo | URL, init?: RequestInit): EmbyProxyMethod {
+  const requestDefault = typeof Request !== "undefined" && input instanceof Request ? input.method : "GET";
+  const normalized = (init?.method ?? requestDefault).toUpperCase();
+  if (normalized === "GET" || normalized === "POST") {
+    return normalized;
+  }
+  throw new Error("Emby 桌面代理仅支持 GET 和 POST 请求。");
+}
+
+function requestHeaders(input: RequestInfo | URL, init?: RequestInit): EmbyProxyHeader[] {
+  const headers = new Headers();
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    input.headers.forEach((value, name) => headers.set(name, value));
+  }
+  new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+  return Array.from(headers.entries()).map(([name, value]) => ({ name, value }));
+}
+
+function requestBody(init?: RequestInit): string | null {
+  const body = init?.body;
+  if (body === undefined || body === null) {
+    return null;
+  }
+  if (typeof body === "string") {
+    return body;
+  }
+  if (body instanceof URLSearchParams) {
+    return body.toString();
+  }
+  throw new Error("Emby 桌面代理目前仅支持文本请求体。");
 }
 
 function createEmbyUrl(config: EmbyClientConfig, path: string): URL {
@@ -317,9 +408,9 @@ async function fetchEmbyRequest(fetcher: EmbyFetch, input: RequestInfo | URL, in
   try {
     return await fetcher(input, init);
   } catch (error) {
-    const detail = error instanceof Error && error.message.length > 0 ? `原始错误：${error.message}` : "浏览器没有返回 HTTP 响应。";
+    const detail = error instanceof Error && error.message.length > 0 ? `原始错误：${error.message}` : "没有返回 HTTP 响应。";
     throw new Error(
-      `Emby 请求未能发出。请检查服务器地址、路径前缀、HTTPS 证书和网络连通性；如果第三方 App 可用但网页不可用，通常是订阅服务未开放 CORS，需要后续使用 Tauri 桌面代理。${detail}`
+      `Emby 请求未能发出。请检查服务器地址、路径前缀、HTTPS 证书和网络连通性；网页模式下还可能是订阅服务未开放 CORS，桌面模式会自动使用 Tauri 代理。${detail}`
     );
   }
 }

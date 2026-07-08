@@ -3,14 +3,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
 import type { ResolvedDanmakuEvent } from "../../domain/danmaku/types";
+import {
+  getPreviewEvents,
+  ROLLING_DANMAKU_DURATION_MS,
+  STATIC_DANMAKU_DURATION_MS
+} from "../../domain/preview/visibleEvents";
 import { formatTimecode } from "../../domain/shared/time";
 import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
-import { getEventsInRange } from "../../domain/timeline/search";
 import { HtmlVideoMediaAdapter } from "../../infrastructure/media/mediaAdapter";
 import { useEditorStore } from "../../stores/editorStore";
-
-const ROLLING_DURATION_MS = 8000;
-const STATIC_DURATION_MS = 4500;
 
 export function PreviewPanel() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -120,14 +121,23 @@ export function PreviewPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[#0d0f13]">
-      <div className="relative min-h-0 flex-1 overflow-hidden bg-black" data-testid="preview-panel">
+      <div
+        className="relative min-h-0 flex-1 overflow-hidden bg-black"
+        data-testid="preview-panel"
+      >
         {project.media?.objectUrl ? (
-          <video ref={videoRef} className="h-full w-full object-contain" onPause={() => setPlaying(false)} />
+          <video
+            ref={videoRef}
+            className="h-full w-full object-contain"
+            onPause={() => setPlaying(false)}
+          />
         ) : (
           <div className="flex h-full items-center justify-center text-center text-sm text-slate-500">
             <div>
               <div className="text-slate-300">尚未导入视频</div>
-              <div className="mt-2 text-xs">当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。</div>
+              <div className="mt-2 text-xs">
+                当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。
+              </div>
             </div>
           </div>
         )}
@@ -140,7 +150,11 @@ export function PreviewPanel() {
           <div className="pointer-events-none absolute inset-[8%] border border-dashed border-white/35" />
         ) : null}
         {project.preview.danmakuVisible ? (
-          <DanmakuOverlay events={visibleEvents} currentTimeMs={project.timeline.playheadMs} opacity={project.preview.opacity} />
+          <DanmakuOverlay
+            events={visibleEvents}
+            currentTimeMs={project.timeline.playheadMs}
+            opacity={project.preview.opacity}
+          />
         ) : null}
       </div>
       <div className="flex h-12 shrink-0 items-center gap-3 border-t border-panel-line bg-panel-base px-3">
@@ -150,9 +164,15 @@ export function PreviewPanel() {
           active={isPlaying}
           onClick={togglePlayback}
         />
-        <div className="font-mono text-xs text-slate-300">{formatTimecode(project.timeline.playheadMs)}</div>
-        <div className="text-xs text-slate-500">/ {formatTimecode(project.media?.durationMs ?? 0)}</div>
-        <TextButton onClick={() => updatePreview({ danmakuVisible: !project.preview.danmakuVisible })}>
+        <div className="font-mono text-xs text-slate-300">
+          {formatTimecode(project.timeline.playheadMs)}
+        </div>
+        <div className="text-xs text-slate-500">
+          / {formatTimecode(project.media?.durationMs ?? 0)}
+        </div>
+        <TextButton
+          onClick={() => updatePreview({ danmakuVisible: !project.preview.danmakuVisible })}
+        >
           {project.preview.danmakuVisible ? "隐藏弹幕" : "显示弹幕"}
         </TextButton>
         <label className="ml-auto flex items-center gap-2 text-xs text-slate-400">
@@ -182,13 +202,20 @@ function DanmakuOverlay({
   opacity: number;
 }) {
   return (
-    <div className="pointer-events-none absolute inset-0 overflow-hidden" data-testid="danmaku-overlay">
+    <div
+      className="pointer-events-none absolute inset-0 overflow-hidden"
+      data-testid="danmaku-overlay"
+    >
       {events.map((event) => {
         const mode = event.item.mode ?? 1;
         const isTop = mode === 5;
         const isBottom = mode === 4;
-        const duration = isTop || isBottom ? STATIC_DURATION_MS : ROLLING_DURATION_MS;
-        const progress = Math.min(1, Math.max(0, (currentTimeMs - event.finalTimeMs) / duration));
+        const duration =
+          isTop || isBottom ? STATIC_DANMAKU_DURATION_MS : ROLLING_DANMAKU_DURATION_MS;
+        const progress = Math.min(
+          1,
+          Math.max(0, (currentTimeMs - event.finalTimeMs) / duration)
+        );
         const lane = event.originalIndex % 10;
         const fontSize = Math.min(34, Math.max(14, event.item.fontSize ?? 25));
         const color = `#${(event.item.color ?? 16_777_215).toString(16).padStart(6, "0").slice(-6)}`;
@@ -229,17 +256,4 @@ function DanmakuOverlay({
       })}
     </div>
   );
-}
-
-function getPreviewEvents(events: ResolvedDanmakuEvent[], currentTimeMs: number): ResolvedDanmakuEvent[] {
-  return getEventsInRange(events, currentTimeMs - ROLLING_DURATION_MS, currentTimeMs + 500)
-    .filter((event) => {
-      if (!event.enabled) {
-        return false;
-      }
-      const mode = event.item.mode ?? 1;
-      const duration = mode === 4 || mode === 5 ? STATIC_DURATION_MS : ROLLING_DURATION_MS;
-      return event.finalTimeMs <= currentTimeMs && currentTimeMs <= event.finalTimeMs + duration;
-    })
-    .slice(0, 80);
 }

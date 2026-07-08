@@ -40,9 +40,75 @@ export function revokeObjectUrl(url: string | null): void {
   }
 }
 
+export interface TextDownloadFile {
+  fileName: string;
+  content: string;
+}
+
+export interface DownloadTextFilesResult {
+  fileCount: number;
+  archiveFileName: string | null;
+}
+
 export function downloadTextFile(fileName: string, content: string, type = "text/plain;charset=utf-8"): void {
   const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
+  downloadBlob(fileName, blob);
+}
+
+export function downloadTextFiles(
+  files: TextDownloadFile[],
+  type = "text/plain;charset=utf-8"
+): DownloadTextFilesResult {
+  if (files.length === 0) {
+    return {
+      fileCount: 0,
+      archiveFileName: null
+    };
+  }
+  if (files.length === 1) {
+    downloadTextFile(files[0].fileName, files[0].content, type);
+    return {
+      fileCount: 1,
+      archiveFileName: null
+    };
+  }
+  const archiveFileName = "danmaku-exports.zip";
+  downloadBlob(archiveFileName, createStoredZip(files), "application/zip");
+  return {
+    fileCount: files.length,
+    archiveFileName
+  };
+}
+
+export function createStoredZip(files: TextDownloadFile[]): Blob {
+  const encoder = new TextEncoder();
+  const entries = createUniqueZipEntries(files).map((file) => {
+    const nameBytes = encoder.encode(file.fileName);
+    const data = encoder.encode(file.content);
+    return {
+      nameBytes,
+      data,
+      crc32: calculateCrc32(data)
+    };
+  });
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const localHeader = createZipLocalHeader(entry.nameBytes, entry.data, entry.crc32);
+    localParts.push(localHeader, entry.data);
+    centralParts.push(createZipCentralDirectoryHeader(entry.nameBytes, entry.data, entry.crc32, offset));
+    offset += localHeader.byteLength + entry.data.byteLength;
+  }
+  const centralDirectoryOffset = offset;
+  const centralDirectorySize = centralParts.reduce((sum, part) => sum + part.byteLength, 0);
+  const endRecord = createZipEndOfCentralDirectory(entries.length, centralDirectorySize, centralDirectoryOffset);
+  return new Blob([...localParts, ...centralParts, endRecord].map(copyBytesToArrayBuffer), { type: "application/zip" });
+}
+
+function downloadBlob(fileName: string, blob: Blob, type?: string): void {
+  const resolvedBlob = type && blob.type !== type ? blob.slice(0, blob.size, type) : blob;
+  const url = URL.createObjectURL(resolvedBlob);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = fileName;
@@ -50,11 +116,119 @@ export function downloadTextFile(fileName: string, content: string, type = "text
   URL.revokeObjectURL(url);
 }
 
-export function downloadTextFiles(
-  files: Array<{ fileName: string; content: string }>,
-  type = "text/plain;charset=utf-8"
-): void {
-  for (const file of files) {
-    downloadTextFile(file.fileName, file.content, type);
+function createUniqueZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {
+  const seen = new Map<string, number>();
+  return files.map((file) => {
+    const safeName = sanitizeZipFileName(file.fileName);
+    const count = seen.get(safeName) ?? 0;
+    seen.set(safeName, count + 1);
+    if (count === 0) {
+      return { ...file, fileName: safeName };
+    }
+    const dotIndex = safeName.lastIndexOf(".");
+    const base = dotIndex > 0 ? safeName.slice(0, dotIndex) : safeName;
+    const extension = dotIndex > 0 ? safeName.slice(dotIndex) : "";
+    return {
+      ...file,
+      fileName: `${base} (${count + 1})${extension}`
+    };
+  });
+}
+
+function sanitizeZipFileName(fileName: string): string {
+  const trimmed = fileName.trim().replace(/[\\/:*?"<>|]+/g, "_");
+  return trimmed.length > 0 ? trimmed : "export.xml";
+}
+
+function createZipLocalHeader(nameBytes: Uint8Array, data: Uint8Array, crc32: number): Uint8Array {
+  const header = new Uint8Array(30 + nameBytes.byteLength);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x04034b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 0x0800, true);
+  view.setUint16(8, 0, true);
+  view.setUint16(10, 0, true);
+  view.setUint16(12, 0x0021, true);
+  view.setUint32(14, crc32, true);
+  view.setUint32(18, data.byteLength, true);
+  view.setUint32(22, data.byteLength, true);
+  view.setUint16(26, nameBytes.byteLength, true);
+  view.setUint16(28, 0, true);
+  header.set(nameBytes, 30);
+  return header;
+}
+
+function createZipCentralDirectoryHeader(
+  nameBytes: Uint8Array,
+  data: Uint8Array,
+  crc32: number,
+  localHeaderOffset: number
+): Uint8Array {
+  const header = new Uint8Array(46 + nameBytes.byteLength);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x02014b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 20, true);
+  view.setUint16(8, 0x0800, true);
+  view.setUint16(10, 0, true);
+  view.setUint16(12, 0, true);
+  view.setUint16(14, 0x0021, true);
+  view.setUint32(16, crc32, true);
+  view.setUint32(20, data.byteLength, true);
+  view.setUint32(24, data.byteLength, true);
+  view.setUint16(28, nameBytes.byteLength, true);
+  view.setUint16(30, 0, true);
+  view.setUint16(32, 0, true);
+  view.setUint16(34, 0, true);
+  view.setUint16(36, 0, true);
+  view.setUint32(38, 0, true);
+  view.setUint32(42, localHeaderOffset, true);
+  header.set(nameBytes, 46);
+  return header;
+}
+
+function createZipEndOfCentralDirectory(
+  entryCount: number,
+  centralDirectorySize: number,
+  centralDirectoryOffset: number
+): Uint8Array {
+  const header = new Uint8Array(22);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x06054b50, true);
+  view.setUint16(4, 0, true);
+  view.setUint16(6, 0, true);
+  view.setUint16(8, entryCount, true);
+  view.setUint16(10, entryCount, true);
+  view.setUint32(12, centralDirectorySize, true);
+  view.setUint32(16, centralDirectoryOffset, true);
+  view.setUint16(20, 0, true);
+  return header;
+}
+
+function calculateCrc32(data: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
   }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function copyBytesToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+
+const CRC32_TABLE = createCrc32Table();
+
+function createCrc32Table(): Uint32Array {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
 }

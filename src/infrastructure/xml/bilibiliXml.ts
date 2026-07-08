@@ -1,7 +1,12 @@
 import type { DanmakuAsset, DanmakuItem, ImportWarning } from "../../domain/danmaku/types";
 import { createId } from "../../domain/project/factory";
+import { pickAssetColorByName } from "../../domain/shared/assetColors";
 import type { Milliseconds } from "../../domain/shared/time";
-import { clampMilliseconds, formatXmlSeconds, toMilliseconds } from "../../domain/shared/time";
+import {
+  clampMilliseconds,
+  formatXmlSeconds,
+  parseXmlSecondsToMilliseconds
+} from "../../domain/shared/time";
 
 export interface ParseXmlOptions {
   assetId?: string;
@@ -20,16 +25,6 @@ export interface XmlExportResult {
   xml: string;
   negativeClampCount: number;
 }
-
-const DEFAULT_COLORS = [
-  "#4cc9f0",
-  "#7bd88f",
-  "#f2c94c",
-  "#ff8f70",
-  "#b794f4",
-  "#5eead4",
-  "#f472b6"
-];
 
 export function parseBilibiliXml(xml: string, options: ParseXmlOptions): DanmakuAsset {
   const assetId = options.assetId ?? createId("asset");
@@ -54,7 +49,14 @@ export function parseBilibiliXml(xml: string, options: ParseXmlOptions): Danmaku
     const p = node.getAttribute("p");
     const rawSnippet = node.outerHTML.slice(0, 240);
     if (p === null) {
-      warnings.push(createNodeWarning(assetId, originalIndex, "缺少 p 字段，已使用 0ms 和空元数据。", rawSnippet));
+      warnings.push(
+        createNodeWarning(
+          assetId,
+          originalIndex,
+          "缺少 p 字段，已使用 0ms 和空元数据。",
+          rawSnippet
+        )
+      );
     }
     const rawPFields = p ? p.split(",") : [];
     if (rawPFields.length < 8) {
@@ -69,7 +71,9 @@ export function parseBilibiliXml(xml: string, options: ParseXmlOptions): Danmaku
     }
     const timeMs = parseTimeField(rawPFields[0]);
     if (timeMs === null) {
-      warnings.push(createNodeWarning(assetId, originalIndex, "时间字段非法，已使用 0ms。", rawSnippet));
+      warnings.push(
+        createNodeWarning(assetId, originalIndex, "时间字段非法，已使用 0ms。", rawSnippet)
+      );
     }
     const text = node.textContent ?? "";
     if (text.length === 0) {
@@ -97,7 +101,7 @@ export function parseBilibiliXml(xml: string, options: ParseXmlOptions): Danmaku
     id: assetId,
     name: options.assetName ?? stripExtension(options.fileName),
     fileName: options.fileName,
-    color: options.color ?? DEFAULT_COLORS[Math.abs(hashString(options.fileName)) % DEFAULT_COLORS.length],
+    color: options.color ?? pickAssetColorByName(options.fileName),
     items,
     warnings,
     importedAt: options.importedAt ?? new Date().toISOString()
@@ -109,14 +113,20 @@ export function serializeBilibiliXml(entries: XmlExportEntry[]): XmlExportResult
   const sorted = [...entries].sort(
     (a, b) => a.finalTimeMs - b.finalTimeMs || a.item.originalIndex - b.item.originalIndex
   );
-  const lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<i>", "  <generator>Danmaku Timeline Studio</generator>"];
+  const lines = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    "<i>",
+    "  <generator>Danmaku Timeline Studio</generator>"
+  ];
   for (const entry of sorted) {
     const clampedTime = clampMilliseconds(entry.finalTimeMs);
     if (entry.finalTimeMs < 0) {
       negativeClampCount += 1;
     }
     const fields = buildExportPFields(entry.item, clampedTime);
-    lines.push(`  <d p="${escapeXmlAttribute(fields.join(","))}">${escapeXmlText(entry.item.text)}</d>`);
+    lines.push(
+      `  <d p="${escapeXmlAttribute(fields.join(","))}">${escapeXmlText(entry.item.text)}</d>`
+    );
   }
   lines.push("</i>", "");
   return {
@@ -125,7 +135,11 @@ export function serializeBilibiliXml(entries: XmlExportEntry[]): XmlExportResult
   };
 }
 
-export function validateExportedXml(xml: string): { ok: boolean; message: string; count: number } {
+export function validateExportedXml(xml: string): {
+  ok: boolean;
+  message: string;
+  count: number;
+} {
   try {
     const asset = parseBilibiliXml(xml, { fileName: "export.xml", assetName: "导出验证" });
     const hardErrors = asset.warnings.filter((warning) => warning.severity === "error");
@@ -165,11 +179,7 @@ function parseTimeField(value: string | undefined): Milliseconds | null {
   if (value === undefined || value.trim() === "") {
     return null;
   }
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds) || seconds < 0) {
-    return null;
-  }
-  return toMilliseconds(seconds);
+  return parseXmlSecondsToMilliseconds(value);
 }
 
 function parseNullableInteger(value: string | undefined): number | null {
@@ -200,10 +210,7 @@ function createNodeWarning(
 }
 
 function escapeXmlText(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function escapeXmlAttribute(text: string): string {
@@ -212,13 +219,4 @@ function escapeXmlAttribute(text: string): string {
 
 function stripExtension(fileName: string): string {
   return fileName.replace(/\.[^.]+$/, "");
-}
-
-function hashString(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash << 5) - hash + value.charCodeAt(index);
-    hash |= 0;
-  }
-  return hash;
 }

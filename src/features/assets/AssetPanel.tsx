@@ -737,11 +737,12 @@ function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>) {
     setStatus({ message: `分集 XML 验证失败：${invalid.message}`, tone: "error" });
     return;
   }
-  downloadTextFiles(
+  const downloadResult = downloadTextFiles(
     files.map((file) => ({ fileName: file.fileName, content: file.content })),
     "application/xml;charset=utf-8"
   );
-  setStatus({ message: `已触发下载 ${files.length} 个分集 XML。`, tone: "success" });
+  const archiveText = downloadResult.archiveFileName ? `，已打包为 ${downloadResult.archiveFileName}` : "";
+  setStatus({ message: `已触发下载 ${files.length} 个分集 XML${archiveText}。`, tone: "success" });
 }
 
 function setStatus(status: EditorStatus) {

@@ -8,6 +8,26 @@ export function toMilliseconds(seconds: number): Milliseconds {
   return Math.round(seconds * SECOND_MS);
 }
 
+export function parseXmlSecondsToMilliseconds(value: string): Milliseconds | null {
+  const trimmed = value.trim();
+  if (!/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return null;
+  }
+  const [wholeSecondsText, fractionText = ""] = trimmed.split(".");
+  const wholeSeconds = Number(wholeSecondsText);
+  if (!Number.isSafeInteger(wholeSeconds)) {
+    return null;
+  }
+  const millisecondsText = fractionText.slice(0, 3).padEnd(3, "0");
+  const nextDigit = fractionText.length > 3 ? Number(fractionText[3]) : 0;
+  const roundedFractionMs = Number(millisecondsText) + (nextDigit >= 5 ? 1 : 0);
+  const totalMs = wholeSeconds * SECOND_MS + roundedFractionMs;
+  if (!Number.isSafeInteger(totalMs)) {
+    return null;
+  }
+  return totalMs;
+}
+
 export function secondsFromMilliseconds(milliseconds: Milliseconds): number {
   return milliseconds / SECOND_MS;
 }
