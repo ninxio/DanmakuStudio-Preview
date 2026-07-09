@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C9 已完成：导出摘要补强补偿明细和可下载补偿报告。
+  - `ExportSummary` 现在包含补偿点明细、总补偿时长，并按源时间排序，便于导出前复核。
+  - 新增纯领域 `createCompensationReport`，生成包含项目名、启用/禁用弹幕数量、补偿点数量、总补偿和逐条补偿规则的文本报告。
+  - “导出 XML 摘要”弹窗新增“总补偿时长”和“补偿明细”预览，列出最多前三个补偿点并提示可下载完整报告。
+  - 当存在补偿点时，导出弹窗提供真实“下载补偿报告”按钮，生成 `*-compensation-report.txt`，不影响 XML 导出内容。
+  - 已补充领域报告测试和导出弹窗下载报告测试；Playwright 截图产物已随导出弹窗变化更新。
+  - 已重新验证：`corepack pnpm test -- src/domain/danmaku/exportSummary.test.ts src/features/export/ExportDialog.test.tsx` 成功，2 个测试文件、3 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 28 个测试文件、96 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c9-export-compensation-report-20260710`。
 - 成熟度提升阶段 C8 已完成：资源栏新增补偿点管理面板。
   - “弹幕文件”页新增“补偿点管理”面板，集中显示当前项目的 `cutMarkers` / `insertGap` 规则数量和总补偿时长。
   - 每个补偿点支持从资源栏一键定位到时间轴并选中，同时把播放头移动到补偿点源时间。
@@ -857,7 +870,7 @@
    - 已在批量分集合并前应用补偿后的时间映射。
    - 已在分集合并草案中展示补偿摘要。
    - 已补强：资源栏提供专门的补偿点管理面板，可集中定位、微调和删除补偿规则。
-   - 待补强：导出时输出更完整的补偿报告，方便复核。
+   - 已补强：导出摘要显示补偿明细，并可下载完整补偿报告用于复核。
 2. 疑似删减点辅助发现：
    - 已扫描弹幕文本中的“删、剪、跳、和谐、没了”等词。
    - 已按时间窗口聚类并展示候选删减点。
