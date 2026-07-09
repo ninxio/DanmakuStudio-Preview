@@ -48,6 +48,10 @@ import {
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
 import { parseAlignmentProposal } from "../domain/alignment/manualProvider";
 import { pickAssetColor } from "../domain/shared/assetColors";
+import {
+  DEFAULT_CUT_HINT_SEARCH_SETTINGS,
+  type CutHintSearchSettings
+} from "../domain/danmaku/cutHints";
 
 export type TimelineTool = "select" | "blade";
 
@@ -80,6 +84,7 @@ interface EditorStore {
   importProgress: number | null;
   exportDraft: ExportDraft | null;
   alignmentProposal: AlignmentProposal | null;
+  cutHintSettings: CutHintSearchSettings;
   timelineTool: TimelineTool;
   newProject: () => void;
   importXmlFiles: (files: FileList | File[]) => Promise<void>;
@@ -134,6 +139,7 @@ interface EditorStore {
   exportAlignmentProposal: () => string;
   applyAlignmentProposalData: (proposal: AlignmentProposal) => void;
   applyAlignmentProposal: () => void;
+  setCutHintSettings: (settings: Partial<CutHintSearchSettings>) => void;
   undo: () => void;
   redo: () => void;
 }
@@ -149,6 +155,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   importProgress: null,
   exportDraft: null,
   alignmentProposal: null,
+  cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS },
   timelineTool: "select",
 
   newProject: () => {
@@ -946,6 +953,15 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return;
     }
     get().applyAlignmentProposalData(proposal);
+  },
+
+  setCutHintSettings: (settings) => {
+    set((state) => ({
+      cutHintSettings: {
+        ...state.cutHintSettings,
+        ...settings
+      }
+    }));
   },
 
   undo: () => {

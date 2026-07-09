@@ -1,4 +1,4 @@
-import type { DanmakuAsset, DanmakuItem } from "./types";
+import type { CutMarker, DanmakuAsset, DanmakuItem } from "./types";
 import type { Milliseconds } from "../shared/time";
 import { clampMilliseconds } from "../shared/time";
 
@@ -39,10 +39,28 @@ export interface FindSuspectedCutCandidatesOptions {
   rules?: CutHintRule[];
 }
 
+export interface CutHintSearchSettings {
+  keywordsText: string;
+  windowSeconds: string;
+  minHitCount: string;
+}
+
+export interface CutHintSearchPlan {
+  options: FindSuspectedCutCandidatesOptions;
+  warnings: string[];
+}
+
 const DEFAULT_WINDOW_MS = 60_000;
 const DEFAULT_MIN_HIT_COUNT = 2;
 const DEFAULT_MAX_SAMPLES = 3;
+const DEFAULT_APPLIED_TOLERANCE_MS = 5000;
 const KEYWORD_SPLIT_PATTERN = /[\s,，、;；|]+/u;
+
+export const DEFAULT_CUT_HINT_SEARCH_SETTINGS: CutHintSearchSettings = {
+  keywordsText: "",
+  windowSeconds: "60",
+  minHitCount: "2"
+};
 
 export const DEFAULT_CUT_HINT_RULES: CutHintRule[] = [
   { label: "删了", pattern: /删了|删掉|删减|被删|删过|删了一段|删没了|删掉了/u, weight: 3 },
@@ -65,6 +83,37 @@ export function createCutHintRulesFromKeywords(text: string, weight = 2): CutHin
   }));
 }
 
+export function createCutHintSearchPlan(settings: CutHintSearchSettings): CutHintSearchPlan {
+  const options: FindSuspectedCutCandidatesOptions = {};
+  const warnings: string[] = [];
+  const trimmedWindow = settings.windowSeconds.trim();
+  const parsedWindowSeconds = Number(trimmedWindow);
+  if (trimmedWindow.length === 0 || !Number.isFinite(parsedWindowSeconds) || parsedWindowSeconds <= 0) {
+    warnings.push("疑似删减聚类窗口必须是大于 0 的数字。");
+  } else {
+    options.windowMs = Math.round(parsedWindowSeconds * 1000);
+  }
+
+  const trimmedMinHitCount = settings.minHitCount.trim();
+  const parsedMinHitCount = Number(trimmedMinHitCount);
+  if (trimmedMinHitCount.length === 0 || !Number.isInteger(parsedMinHitCount) || parsedMinHitCount <= 0) {
+    warnings.push("疑似删减最小命中必须是大于 0 的整数。");
+  } else {
+    options.minHitCount = parsedMinHitCount;
+  }
+
+  if (settings.keywordsText.trim().length > 0) {
+    const rules = createCutHintRulesFromKeywords(settings.keywordsText);
+    if (rules.length === 0) {
+      warnings.push("疑似删减关键词为空。");
+    } else {
+      options.rules = rules;
+    }
+  }
+
+  return { options, warnings };
+}
+
 export function findSuspectedCutCandidates(
   assets: DanmakuAsset[],
   options: FindSuspectedCutCandidatesOptions = {}
@@ -78,6 +127,15 @@ export function findSuspectedCutCandidates(
     .flatMap((asset) => createAssetCandidates(asset, { windowMs, minHitCount, maxSamples, rules }))
     .sort((left, right) => right.score - left.score || left.sourceAtMs - right.sourceAtMs)
     .slice(0, 12);
+}
+
+export function isSuspectedCutCandidateApplied(
+  candidate: SuspectedCutCandidate,
+  cutMarkers: CutMarker[],
+  toleranceMs: Milliseconds = DEFAULT_APPLIED_TOLERANCE_MS
+): boolean {
+  const tolerance = clampMilliseconds(toleranceMs);
+  return cutMarkers.some((marker) => Math.abs(marker.sourceAtMs - candidate.sourceAtMs) <= tolerance);
 }
 
 function createAssetCandidates(

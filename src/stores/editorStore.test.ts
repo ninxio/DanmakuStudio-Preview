@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuClip } from "../domain/danmaku/types";
+import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../domain/danmaku/cutHints";
 import { createHistoryState } from "../domain/history/history";
 import { createEmptyProject } from "../domain/project/factory";
 import type { EditorProject } from "../domain/project/types";
@@ -17,6 +18,7 @@ function resetStore(project: EditorProject = createEmptyProject()): void {
     importProgress: null,
     exportDraft: null,
     alignmentProposal: null,
+    cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS },
     timelineTool: "select"
   });
 }
@@ -130,5 +132,18 @@ describe("editor store", () => {
       "#4cc9f0",
       "#7bd88f"
     ]);
+  });
+
+  it("更新共享疑似删减扫描配置", () => {
+    useEditorStore.getState().setCutHintSettings({
+      keywordsText: "广告",
+      windowSeconds: "30"
+    });
+
+    expect(useEditorStore.getState().cutHintSettings).toEqual({
+      ...DEFAULT_CUT_HINT_SEARCH_SETTINGS,
+      keywordsText: "广告",
+      windowSeconds: "30"
+    });
   });
 });

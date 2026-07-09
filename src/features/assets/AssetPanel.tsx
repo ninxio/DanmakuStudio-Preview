@@ -6,9 +6,9 @@ import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
 import { buildBatchMergePlan, type BatchMergeOptions } from "../../domain/danmaku/batchMerge";
 import {
-  createCutHintRulesFromKeywords,
+  createCutHintSearchPlan,
   findSuspectedCutCandidates,
-  type FindSuspectedCutCandidatesOptions,
+  isSuspectedCutCandidateApplied,
   type SuspectedCutCandidate
 } from "../../domain/danmaku/cutHints";
 import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
@@ -68,13 +68,11 @@ export function AssetPanel() {
   const [longSplitMode, setLongSplitMode] = useState<LongSplitMode>("auto");
   const [episodeDurationsText, setEpisodeDurationsText] = useState("");
   const [cutPointsText, setCutPointsText] = useState("");
-  const [cutHintKeywordsText, setCutHintKeywordsText] = useState("");
-  const [cutHintWindowSeconds, setCutHintWindowSeconds] = useState("60");
-  const [cutHintMinHitCount, setCutHintMinHitCount] = useState("2");
   const [anchorCalibrationText, setAnchorCalibrationText] = useState("");
   const [alignmentProposalText, setAlignmentProposalText] = useState("");
   const project = useEditorStore((state) => state.project);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
+  const cutHintSettings = useEditorStore((state) => state.cutHintSettings);
   const importProgress = useEditorStore((state) => state.importProgress);
   const addAssetToTimeline = useEditorStore((state) => state.addAssetToTimeline);
   const removeAsset = useEditorStore((state) => state.removeAsset);
@@ -86,6 +84,7 @@ export function AssetPanel() {
   const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
+  const setCutHintSettings = useEditorStore((state) => state.setCutHintSettings);
   const manualRules = useMemo(
     () =>
       createBatchMergeOptions({
@@ -118,15 +117,7 @@ export function AssetPanel() {
     () => buildBatchMergePlan(project.assets, batchMergeOptions),
     [batchMergeOptions, project.assets]
   );
-  const cutHintSearch = useMemo(
-    () =>
-      createCutHintSearchOptions({
-        keywordsText: cutHintKeywordsText,
-        windowSeconds: cutHintWindowSeconds,
-        minHitCount: cutHintMinHitCount
-      }),
-    [cutHintKeywordsText, cutHintMinHitCount, cutHintWindowSeconds]
-  );
+  const cutHintSearch = useMemo(() => createCutHintSearchPlan(cutHintSettings), [cutHintSettings]);
   const suspectedCutCandidates = useMemo(
     () => findSuspectedCutCandidates(project.assets, cutHintSearch.options),
     [cutHintSearch, project.assets]
@@ -229,13 +220,13 @@ export function AssetPanel() {
                 <SuspectedCutPanel
                   candidates={suspectedCutCandidates}
                   cutMarkers={project.cutMarkers}
-                  keywordsText={cutHintKeywordsText}
-                  windowSeconds={cutHintWindowSeconds}
-                  minHitCount={cutHintMinHitCount}
+                  keywordsText={cutHintSettings.keywordsText}
+                  windowSeconds={cutHintSettings.windowSeconds}
+                  minHitCount={cutHintSettings.minHitCount}
                   warnings={cutHintSearch.warnings}
-                  onKeywordsTextChange={setCutHintKeywordsText}
-                  onWindowSecondsChange={setCutHintWindowSeconds}
-                  onMinHitCountChange={setCutHintMinHitCount}
+                  onKeywordsTextChange={(keywordsText) => setCutHintSettings({ keywordsText })}
+                  onWindowSecondsChange={(windowSeconds) => setCutHintSettings({ windowSeconds })}
+                  onMinHitCountChange={(minHitCount) => setCutHintSettings({ minHitCount })}
                   onApply={(candidate) => {
                     addCutMarker(candidate.sourceAtMs, 45_000, {
                       name: `待确认补偿 ${formatTimecode(candidate.sourceAtMs)}`,
@@ -886,7 +877,7 @@ function SuspectedCutPanel({
           <div className="border-t border-panel-line pt-2 text-slate-500">暂无候选</div>
         ) : null}
         {previewCandidates.map((candidate) => {
-          const applied = hasNearbyCutMarker(candidate, cutMarkers);
+          const applied = isSuspectedCutCandidateApplied(candidate, cutMarkers);
           return (
             <div key={candidate.id} className="grid gap-2 border-t border-panel-line pt-2 first:border-t-0 first:pt-0">
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
@@ -1472,45 +1463,6 @@ function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): st
   return "已取消";
 }
 
-function createCutHintSearchOptions({
-  keywordsText,
-  windowSeconds,
-  minHitCount
-}: {
-  keywordsText: string;
-  windowSeconds: string;
-  minHitCount: string;
-}): { options: FindSuspectedCutCandidatesOptions; warnings: string[] } {
-  const options: FindSuspectedCutCandidatesOptions = {};
-  const warnings: string[] = [];
-  const trimmedWindow = windowSeconds.trim();
-  const parsedWindowSeconds = Number(trimmedWindow);
-  if (trimmedWindow.length === 0 || !Number.isFinite(parsedWindowSeconds) || parsedWindowSeconds <= 0) {
-    warnings.push("疑似删减聚类窗口必须是大于 0 的数字。");
-  } else {
-    options.windowMs = Math.round(parsedWindowSeconds * 1000);
-  }
-
-  const trimmedMinHitCount = minHitCount.trim();
-  const parsedMinHitCount = Number(trimmedMinHitCount);
-  if (trimmedMinHitCount.length === 0 || !Number.isInteger(parsedMinHitCount) || parsedMinHitCount <= 0) {
-    warnings.push("疑似删减最小命中必须是大于 0 的整数。");
-  } else {
-    options.minHitCount = parsedMinHitCount;
-  }
-
-  if (keywordsText.trim().length > 0) {
-    const rules = createCutHintRulesFromKeywords(keywordsText);
-    if (rules.length === 0) {
-      warnings.push("疑似删减关键词为空。");
-    } else {
-      options.rules = rules;
-    }
-  }
-
-  return { options, warnings };
-}
-
 function createBatchMergeOptions({
   partWindowMode,
   partWindowMinutes,
@@ -1615,10 +1567,6 @@ function confidenceText(confidence: "high" | "medium" | "low"): string {
 function formatSignedDuration(milliseconds: number): string {
   const sign = milliseconds < 0 ? "-" : "+";
   return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
-}
-
-function hasNearbyCutMarker(candidate: SuspectedCutCandidate, cutMarkers: CutMarker[]): boolean {
-  return cutMarkers.some((marker) => Math.abs(marker.sourceAtMs - candidate.sourceAtMs) <= 5000);
 }
 
 function TabButton({

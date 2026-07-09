@@ -12,6 +12,12 @@ import {
   type AlignmentPreviewCutCandidate,
   type AlignmentPreviewModel
 } from "../../domain/alignment/preview";
+import {
+  createCutHintSearchPlan,
+  findSuspectedCutCandidates,
+  isSuspectedCutCandidateApplied,
+  type SuspectedCutCandidate
+} from "../../domain/danmaku/cutHints";
 import type { CutMarker, DanmakuClip, ResolvedDanmakuEvent } from "../../domain/danmaku/types";
 import { formatTimecode } from "../../domain/shared/time";
 import type { Milliseconds } from "../../domain/shared/time";
@@ -95,6 +101,7 @@ export function TimelinePanel() {
   const deleteSelection = useEditorStore((state) => state.deleteSelection);
   const setTimelineTool = useEditorStore((state) => state.setTimelineTool);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
+  const cutHintSettings = useEditorStore((state) => state.cutHintSettings);
 
   const tracks = useMemo(() => makeTracks(size.height), [size.height]);
   const allEvents = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
@@ -102,6 +109,18 @@ export function TimelinePanel() {
   const alignmentPreview = useMemo(
     () => buildAlignmentPreview(project, alignmentProposal),
     [project, alignmentProposal]
+  );
+  const cutHintSearch = useMemo(() => createCutHintSearchPlan(cutHintSettings), [cutHintSettings]);
+  const suspectedCutCandidates = useMemo(
+    () => findSuspectedCutCandidates(project.assets, cutHintSearch.options),
+    [cutHintSearch, project.assets]
+  );
+  const pendingSuspectedCutCount = useMemo(
+    () =>
+      suspectedCutCandidates.filter(
+        (candidate) => !isSuspectedCutCandidateApplied(candidate, project.cutMarkers)
+      ).length,
+    [project.cutMarkers, suspectedCutCandidates]
   );
   const pendingAlignmentCount =
     alignmentPreview.summary.candidateAnchorCount + alignmentPreview.summary.candidateCutCount;
@@ -159,7 +178,8 @@ export function TimelinePanel() {
       selection,
       boxPreview,
       edgeFeedback,
-      alignmentPreview
+      alignmentPreview,
+      suspectedCutCandidates
     });
   }, [
     size,
@@ -170,7 +190,8 @@ export function TimelinePanel() {
     selection,
     boxPreview,
     edgeFeedback,
-    alignmentPreview
+    alignmentPreview,
+    suspectedCutCandidates
   ]);
 
   return (
@@ -217,6 +238,12 @@ export function TimelinePanel() {
           0 ? (
             <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200">
               对齐候选 {pendingAlignmentCount} / 已应用 {appliedAlignmentCount}
+            </span>
+          ) : null}
+          {suspectedCutCandidates.length > 0 ? (
+            <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200">
+              文本候选 {pendingSuspectedCutCount} / 已落点{" "}
+              {suspectedCutCandidates.length - pendingSuspectedCutCount}
             </span>
           ) : null}
           <Magnet size={14} className="text-accent-cyan" />
@@ -432,6 +459,7 @@ function drawTimeline(
     boxPreview: { startX: number; currentX: number } | null;
     edgeFeedback: TimelineEdgeFeedback;
     alignmentPreview: AlignmentPreviewModel;
+    suspectedCutCandidates: SuspectedCutCandidate[];
   }
 ): void {
   const {
@@ -444,7 +472,8 @@ function drawTimeline(
     selection,
     boxPreview,
     edgeFeedback,
-    alignmentPreview
+    alignmentPreview,
+    suspectedCutCandidates
   } = props;
   context.clearRect(0, 0, width, height);
   context.fillStyle = "#101216";
@@ -463,14 +492,6 @@ function drawTimeline(
     tracks.ruler
   );
   drawVideoTrack(context, project, tracks.video);
-  drawCutMarkers(
-    context,
-    project.cutMarkers,
-    project.timeline.scrollMs,
-    project.timeline.pixelsPerSecond,
-    tracks.cuts,
-    selection
-  );
   drawClips(context, project.clips, project, tracks.clips, selection);
   drawDensity(
     context,
@@ -486,6 +507,24 @@ function drawTimeline(
     project.timeline.scrollMs,
     project.timeline.pixelsPerSecond,
     tracks.events,
+    selection
+  );
+  drawSuspectedCutHints(
+    context,
+    suspectedCutCandidates,
+    project.cutMarkers,
+    tracks,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    width,
+    height
+  );
+  drawCutMarkers(
+    context,
+    project.cutMarkers,
+    project.timeline.scrollMs,
+    project.timeline.pixelsPerSecond,
+    tracks.cuts,
     selection
   );
   drawAlignmentPreview(
@@ -722,6 +761,75 @@ function drawEvents(
   }
 }
 
+function drawSuspectedCutHints(
+  context: CanvasRenderingContext2D,
+  candidates: SuspectedCutCandidate[],
+  cutMarkers: CutMarker[],
+  tracks: TimelineTracks,
+  scrollMs: Milliseconds,
+  pixelsPerSecond: number,
+  width: number,
+  height: number
+): void {
+  const guideTop = tracks.cuts.y + 2;
+  const guideBottom = Math.min(height - 3, tracks.events.y + tracks.events.height - 3);
+  const bandTop = tracks.cuts.y;
+  const bandBottom = tracks.events.y + tracks.events.height;
+  for (const candidate of candidates) {
+    const x = timeToX(candidate.sourceAtMs, scrollMs, pixelsPerSecond);
+    const startX = timeToX(candidate.startMs, scrollMs, pixelsPerSecond);
+    const endX = timeToX(candidate.endMs, scrollMs, pixelsPerSecond);
+    const rawBandLeft = Math.min(startX, endX, x - 3);
+    const rawBandRight = Math.max(startX, endX, x + 3);
+    const bandVisible = rawBandRight >= LABEL_WIDTH && rawBandLeft <= width;
+    const guideVisible = x >= LABEL_WIDTH && x <= width;
+    if (!bandVisible && !guideVisible) {
+      continue;
+    }
+
+    const applied = isSuspectedCutCandidateApplied(candidate, cutMarkers);
+    const strokeColor = applied ? "rgba(242, 201, 76, 0.36)" : "rgba(242, 201, 76, 0.9)";
+    const fillColor = applied ? "rgba(242, 201, 76, 0.035)" : "rgba(242, 201, 76, 0.085)";
+    context.save();
+    if (bandVisible) {
+      const left = clamp(rawBandLeft, LABEL_WIDTH, width);
+      const right = clamp(rawBandRight, LABEL_WIDTH, width);
+      if (right > left) {
+        context.fillStyle = fillColor;
+        context.fillRect(left, bandTop, Math.max(3, right - left), bandBottom - bandTop);
+      }
+    }
+    context.restore();
+
+    if (!guideVisible) {
+      continue;
+    }
+    drawVerticalGuide(
+      context,
+      x,
+      guideTop,
+      guideBottom,
+      strokeColor,
+      applied ? [2, 5] : [4, 5],
+      applied ? 1 : 1.4
+    );
+    drawSuspectedCutHintMarker(context, x, tracks.cuts, strokeColor, applied);
+    if (!applied || pixelsPerSecond > 95) {
+      drawTimelineLabel(
+        context,
+        `${applied ? "已落点" : "文本候选"} ${candidate.hitCount} 条`,
+        x,
+        tracks.cuts.y + 3,
+        width,
+        {
+          borderColor: strokeColor,
+          fillColor: applied ? "rgba(242, 201, 76, 0.08)" : "rgba(242, 201, 76, 0.18)"
+        }
+      );
+    }
+  }
+}
+
 function drawAlignmentPreview(
   context: CanvasRenderingContext2D,
   preview: AlignmentPreviewModel,
@@ -758,6 +866,27 @@ function drawAlignmentPreview(
     width,
     height
   );
+}
+
+function drawSuspectedCutHintMarker(
+  context: CanvasRenderingContext2D,
+  x: number,
+  track: TrackRect,
+  color: string,
+  applied: boolean
+): void {
+  const centerY = track.y + track.height / 2;
+  const radius = applied ? 5 : 7;
+  context.save();
+  context.fillStyle = applied ? "rgba(242, 201, 76, 0.1)" : "rgba(242, 201, 76, 0.24)";
+  context.strokeStyle = color;
+  context.lineWidth = applied ? 1 : 1.4;
+  context.setLineDash(applied ? [2, 4] : []);
+  context.beginPath();
+  context.arc(x, centerY, radius, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+  context.restore();
 }
 
 function drawProjectAnchors(

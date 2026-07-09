@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
@@ -28,7 +29,8 @@ describe("资源面板", () => {
       },
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
-      exportDraft: null
+      exportDraft: null,
+      cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
     });
   });
 
@@ -68,7 +70,8 @@ describe("资源面板", () => {
       },
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
-      exportDraft: null
+      exportDraft: null,
+      cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
     });
 
     render(<AssetPanel />);
@@ -98,12 +101,14 @@ describe("资源面板", () => {
       },
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
-      exportDraft: null
+      exportDraft: null,
+      cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
     });
 
     render(<AssetPanel />);
     expect(screen.getByText("暂无候选")).toBeInTheDocument();
     await user.type(screen.getByLabelText("疑似删减关键词"), "广告");
+    expect(useEditorStore.getState().cutHintSettings.keywordsText).toBe("广告");
     await waitFor(() => expect(screen.getByRole("button", { name: "转为补偿点" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "转为补偿点" }));
 
