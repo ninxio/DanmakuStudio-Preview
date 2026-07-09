@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C22 已完成：对齐提案新增可下载复核报告。
+  - 新增领域层 `createAlignmentReviewReport`，可从 `AlignmentProposal` 生成文本复核报告，包含生成时间、整体置信度、同步锚点、候选补偿、源时间不确定区间、低置信度风险提示和诊断信息。
+  - 资源栏“视频对齐实验室”新增真实“导出报告”按钮，当前提案导入或生成后可下载 `alignment-review-report.txt`，用于人工复核、留档和后续调参对比。
+  - 旧 `alignment-proposal.json` 导入/导出格式保持不变；报告是旁路审阅产物，不修改原始 XML，也不会自动应用候选。
+  - README 已同步：本地音频对齐实验室支持导出复核报告，当前算法仍需要人工确认。
+  - 已补充领域报告测试和资源栏下载测试。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/alignment/alignmentReport.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、14 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 31 个测试文件、111 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12235264` 字节，时间 `2026/07/10 7:42:31`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2991431` 字节，时间 `2026/07/10 7:42:31`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c22-alignment-review-report-20260710`。
 - 成熟度提升阶段 C21 已完成：Playwright E2E 覆盖同步锚点跨面板编辑撤销/重做。
   - 核心 E2E 流程在重新打开项目后，会通过“锚点校准”生成同步锚点和补偿规则，再在“同步锚点管理”面板修改第二个锚点的目标时间。
   - 测试会断言 `同步锚点 2 目标时间 ms` 从 `30000` 改为 `32000`，随后使用全局撤销恢复到 `30000`，再重做恢复到 `32000`。
@@ -1032,7 +1047,7 @@
    - 已接入 UI 的 proposal 导入、复核和一键应用 MVP。
    - 已接入 Tauri 本地命令，可直接从桌面 UI 运行音频对齐任务。
    - 已支持音频特征窗口、最小缺失时长和匹配阈值调参。
-   - 已支持导出当前对齐提案 JSON，用于复现和回放。
+   - 已支持导出当前对齐提案 JSON 和复核报告，用于复现、回放和人工确认。
    - 已支持后台任务状态、进度轮询和任务级取消请求。
    - 已补强：使用原生文件选择器选择完整片源、删减版视频和 FFmpeg 路径。
    - 已补强：FFmpeg 音频提取阶段支持任务取消时终止子进程，并补充任务日志面板。

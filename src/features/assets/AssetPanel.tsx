@@ -1,6 +1,7 @@
 import { Download, FolderOpen, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
+import { createAlignmentReviewReport } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
@@ -1326,6 +1327,19 @@ function VideoAlignmentLabPanel({
     setStatus({ message: "已导出对齐提案 JSON。", tone: "success" });
   };
 
+  const exportReviewReport = () => {
+    if (!proposal) {
+      setStatus({ message: "暂无可导出的对齐报告。", tone: "warning" });
+      return;
+    }
+    downloadTextFile(
+      "alignment-review-report.txt",
+      createAlignmentReviewReport(proposal),
+      "text/plain;charset=utf-8"
+    );
+    setStatus({ message: "已导出对齐复核报告。", tone: "success" });
+  };
+
   const chooseCompletePath = async () => {
     try {
       const path = await pickAlignmentMediaPath(completePath);
@@ -1550,6 +1564,13 @@ function VideoAlignmentLabPanel({
             disabled={!downloadContent}
           >
             导出提案
+          </TextButton>
+          <TextButton
+            onClick={exportReviewReport}
+            disabled={!proposal}
+          >
+            <Download size={14} />
+            导出报告
           </TextButton>
           <TextButton
             tone="primary"

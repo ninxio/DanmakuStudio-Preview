@@ -290,6 +290,67 @@ describe("资源面板", () => {
     }
   });
 
+  it("可以导出当前音频对齐复核报告", async () => {
+    const user = userEvent.setup();
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:alignment-report");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+    const proposal = {
+      anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
+      cutCandidates: [
+        {
+          id: "audio-gap-1",
+          name: "音频推断补偿 1",
+          sourceAtMs: 20_000,
+          sourceRangeStartMs: 18_000,
+          sourceRangeEndMs: 22_000,
+          targetGapMs: 20_000,
+          confidence: 0.72,
+          note: "音频对齐候选"
+        }
+      ],
+      confidence: 0.82,
+      diagnostics: ["音频特征匹配 4 / 4 帧。"]
+    };
+
+    try {
+      render(<AssetPanel />);
+      fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
+        target: { value: JSON.stringify(proposal) }
+      });
+      await user.click(screen.getByRole("button", { name: "导入提案" }));
+      await user.click(screen.getByRole("button", { name: "导出报告" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const [blob] = createObjectUrl.mock.calls[0];
+      if (!(blob instanceof Blob)) {
+        throw new Error("导出的对象不是 Blob。");
+      }
+      await expect(readBlobText(blob)).resolves.toContain("对齐提案复核报告");
+      await expect(readBlobText(blob)).resolves.toContain("audio-gap-1");
+      await expect(readBlobText(blob)).resolves.toContain("不确定区间：00:00:18.000");
+      await expect(readBlobText(blob)).resolves.toContain("音频特征匹配 4 / 4 帧。");
+      expect(clickSpy).toHaveBeenCalledTimes(1);
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:alignment-report");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
   it("可以通过原生文件选择器填入视频对齐路径", async () => {
     const user = userEvent.setup();
     vi.mocked(pickAlignmentMediaPath)
