@@ -56,6 +56,17 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByLabel("重做").click();
   await expect(page.getByTestId("status-bar")).toContainText("已重做");
 
+  const cutGapInput = page.getByLabel("缺失或新增时长");
+  await expect(cutGapInput).toHaveValue("45000");
+  await cutGapInput.fill("12000");
+  await expect(cutGapInput).toHaveValue("12000");
+  await page.getByLabel("撤销").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已撤销");
+  await expect(cutGapInput).toHaveValue("45000");
+  await page.getByLabel("重做").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已重做");
+  await expect(cutGapInput).toHaveValue("12000");
+
   await page.getByLabel("导出 XML").click();
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
   await expect(page.getByTestId("export-dialog")).toContainText("验证条数");
