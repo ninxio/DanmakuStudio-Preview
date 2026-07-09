@@ -131,6 +131,8 @@ interface EditorStore {
   mergeSelectedClips: () => void;
   setTimelineTool: (tool: TimelineTool) => void;
   addSyncAnchor: (anchor: SyncAnchor) => void;
+  updateSyncAnchor: (id: string, patch: Partial<Omit<SyncAnchor, "id">>) => void;
+  deleteSyncAnchor: (id: string) => void;
   setGlobalOffset: (offsetMs: Milliseconds) => void;
   updatePreview: (patch: Partial<EditorProject["preview"]>) => void;
   prepareExport: () => void;
@@ -851,6 +853,41 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       ...project,
       syncAnchors: [...project.syncAnchors, anchor]
     }));
+  },
+
+  updateSyncAnchor: (id, patch) => {
+    commitProject(set, get, "修改同步锚点", (project) => ({
+      ...project,
+      syncAnchors: project.syncAnchors.map((anchor) =>
+        anchor.id === id
+          ? {
+              ...anchor,
+              ...patch,
+              sourceMs:
+                patch.sourceMs !== undefined
+                  ? clampMilliseconds(patch.sourceMs)
+                  : anchor.sourceMs,
+              targetMs:
+                patch.targetMs !== undefined
+                  ? clampMilliseconds(patch.targetMs)
+                  : anchor.targetMs
+            }
+          : anchor
+      )
+    }));
+  },
+
+  deleteSyncAnchor: (id) => {
+    commitProject(
+      set,
+      get,
+      "删除同步锚点",
+      (project) => ({
+        ...project,
+        syncAnchors: project.syncAnchors.filter((anchor) => anchor.id !== id)
+      }),
+      get().selection.kind === "anchor" && get().selection.ids.includes(id) ? emptySelection : get().selection
+    );
   },
 
   setGlobalOffset: (offsetMs) => {

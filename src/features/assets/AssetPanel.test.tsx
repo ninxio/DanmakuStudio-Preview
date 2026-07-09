@@ -149,6 +149,26 @@ describe("资源面板", () => {
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
   });
 
+  it("可以在同步锚点管理面板定位、微调并删除锚点", async () => {
+    const user = userEvent.setup();
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        syncAnchors: [{ id: "anchor-manual", sourceMs: 4000, targetMs: 9000, confidence: 1, origin: "manual" }]
+      }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "定位同步锚点 1" }));
+    expect(useEditorStore.getState().project.timeline.playheadMs).toBe(4000);
+
+    fireEvent.change(screen.getByLabelText("同步锚点 1 目标时间 ms"), { target: { value: "12000" } });
+    expect(useEditorStore.getState().project.syncAnchors[0].targetMs).toBe(12000);
+
+    await user.click(screen.getByRole("button", { name: "删除同步锚点 1" }));
+    expect(useEditorStore.getState().project.syncAnchors).toHaveLength(0);
+  });
+
   it("可以应用锚点校准推断出的补偿点", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);

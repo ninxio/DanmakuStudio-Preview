@@ -12,7 +12,7 @@ import {
   type SuspectedCutCandidate
 } from "../../domain/danmaku/cutHints";
 import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
-import type { CutMarker } from "../../domain/danmaku/types";
+import type { CutMarker, SyncAnchor } from "../../domain/danmaku/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
@@ -85,6 +85,8 @@ export function AssetPanel() {
   const addCutMarker = useEditorStore((state) => state.addCutMarker);
   const updateCutMarker = useEditorStore((state) => state.updateCutMarker);
   const deleteCutMarker = useEditorStore((state) => state.deleteCutMarker);
+  const updateSyncAnchor = useEditorStore((state) => state.updateSyncAnchor);
+  const deleteSyncAnchor = useEditorStore((state) => state.deleteSyncAnchor);
   const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const previewAlignmentProposalData = useEditorStore((state) => state.previewAlignmentProposalData);
@@ -255,6 +257,12 @@ export function AssetPanel() {
                   onTextChange={setAnchorCalibrationText}
                   onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
                   onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
+                />
+                <SyncAnchorsPanel
+                  anchors={project.syncAnchors}
+                  onFocus={(anchor) => setPlayhead(anchor.sourceMs)}
+                  onUpdate={updateSyncAnchor}
+                  onDelete={deleteSyncAnchor}
                 />
                 <VideoAlignmentLabPanel
                   text={alignmentProposalText}
@@ -1079,6 +1087,83 @@ function AnchorCalibrationPanel({
   );
 }
 
+function SyncAnchorsPanel({
+  anchors,
+  onFocus,
+  onUpdate,
+  onDelete
+}: {
+  anchors: SyncAnchor[];
+  onFocus: (anchor: SyncAnchor) => void;
+  onUpdate: (id: string, patch: Partial<Omit<SyncAnchor, "id">>) => void;
+  onDelete: (id: string) => void;
+}) {
+  const sortedAnchors = [...anchors].sort((left, right) => left.sourceMs - right.sourceMs || left.id.localeCompare(right.id));
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <Layers size={15} className="text-accent-cyan" />
+        <span>同步锚点管理</span>
+        <span className="ml-auto text-[11px] text-slate-500">{sortedAnchors.length} 个</span>
+      </div>
+      <div className="mt-3 grid gap-2">
+        {sortedAnchors.length === 0 ? (
+          <div className="text-slate-500">暂无同步锚点，可从锚点校准或本地对齐提案生成。</div>
+        ) : null}
+        {sortedAnchors.map((anchor, index) => {
+          const label = `同步锚点 ${index + 1}`;
+          return (
+            <article key={anchor.id} className="grid gap-2 rounded border border-panel-line bg-black/20 p-2">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                <button
+                  type="button"
+                  className="min-w-0 text-left"
+                  onClick={() => onFocus(anchor)}
+                  aria-label={`定位${label}`}
+                >
+                  <span className="block truncate text-slate-100">
+                    {label} / {anchorOriginText(anchor.origin)}
+                  </span>
+                  <span className="mt-1 block font-mono text-[11px] text-slate-500">
+                    {formatTimecode(anchor.sourceMs)} -&gt; {formatTimecode(anchor.targetMs)} /{" "}
+                    {formatSignedDuration(anchor.targetMs - anchor.sourceMs)}
+                  </span>
+                </button>
+                <TextButton aria-label={`删除${label}`} tone="danger" onClick={() => onDelete(anchor.id)}>
+                  <Trash2 size={14} />
+                  删除
+                </TextButton>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="grid gap-1">
+                  <span className="text-slate-500">源时间 ms</span>
+                  <input
+                    aria-label={`${label} 源时间 ms`}
+                    className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+                    inputMode="numeric"
+                    value={anchor.sourceMs}
+                    onChange={(event) => onUpdate(anchor.id, { sourceMs: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="grid gap-1">
+                  <span className="text-slate-500">目标时间 ms</span>
+                  <input
+                    aria-label={`${label} 目标时间 ms`}
+                    className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+                    inputMode="numeric"
+                    value={anchor.targetMs}
+                    onChange={(event) => onUpdate(anchor.id, { targetMs: Number(event.target.value) })}
+                  />
+                </label>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function VideoAlignmentLabPanel({
   text,
   proposal,
@@ -1674,6 +1759,10 @@ function confidenceText(confidence: "high" | "medium" | "low"): string {
     return "中置信";
   }
   return "低置信";
+}
+
+function anchorOriginText(origin: SyncAnchor["origin"]): string {
+  return origin === "manual" ? "手动" : "自动";
 }
 
 function formatSignedDuration(milliseconds: number): string {

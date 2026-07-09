@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C10 已完成：资源栏新增同步锚点管理面板。
+  - store 新增 `updateSyncAnchor` 和 `deleteSyncAnchor`，同步锚点编辑/删除进入项目历史，保持可撤销和非破坏性。
+  - “锚点校准”下方新增“同步锚点管理”面板，集中显示已应用锚点数量、来源、源时间、目标时间和累计差值。
+  - 每个锚点支持从资源栏一键定位播放头，支持直接微调源时间 ms 和目标时间 ms，也支持删除。
+  - 面板同时管理手动锚点和自动对齐锚点；空状态提示可从锚点校准或本地对齐提案生成。
+  - 已补充 store 更新/删除同步锚点测试和资源面板锚点定位、微调、删除交互测试。
+  - 已重新验证：`corepack pnpm test -- src/features/assets/AssetPanel.test.tsx src/stores/editorStore.test.ts` 成功，2 个测试文件、18 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 28 个测试文件、98 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c10-sync-anchor-management-20260710`。
 - 成熟度提升阶段 C9 已完成：导出摘要补强补偿明细和可下载补偿报告。
   - `ExportSummary` 现在包含补偿点明细、总补偿时长，并按源时间排序，便于导出前复核。
   - 新增纯领域 `createCompensationReport`，生成包含项目名、启用/禁用弹幕数量、补偿点数量、总补偿和逐条补偿规则的文本报告。
@@ -882,7 +895,7 @@
    - 已根据两个或多个锚点推断中间缺失时长。
    - 已通过对齐提案管线把锚点与推断补偿应用到项目。
    - 已补强：可把锚点校准提案发送到时间轴预览，并明确标注补偿影响区会让后续整体平移。
-   - 待补强：支持编辑、删除和批量管理手动锚点。
+   - 已补强：资源栏提供同步锚点管理面板，可定位、微调和删除已应用锚点。
 4. 本地音频/视频对齐原型：
    - 已做独立 CLI 原型，输入两个用户本地合法视频或两份特征 JSON，输出 `AlignmentProposal` JSON。
    - 已实现音频优先对齐：FFmpeg 抽音频特征，使用动态规划找候选缺失段。

@@ -158,4 +158,22 @@ describe("editor store", () => {
     expect(useEditorStore.getState().alignmentProposal?.anchors).toHaveLength(1);
     expect(useEditorStore.getState().status.message).toContain("时间轴预览");
   });
+
+  it("更新和删除同步锚点", () => {
+    resetStore({
+      ...createEmptyProject(),
+      syncAnchors: [{ id: "anchor", sourceMs: 1000, targetMs: 2000, confidence: 1, origin: "manual" }]
+    });
+    useEditorStore.setState({ selection: { kind: "anchor", ids: ["anchor"] } });
+
+    useEditorStore.getState().updateSyncAnchor("anchor", { sourceMs: 1500, targetMs: 2600 });
+    expect(useEditorStore.getState().project.syncAnchors[0]).toMatchObject({
+      sourceMs: 1500,
+      targetMs: 2600
+    });
+
+    useEditorStore.getState().deleteSyncAnchor("anchor");
+    expect(useEditorStore.getState().project.syncAnchors).toHaveLength(0);
+    expect(useEditorStore.getState().selection).toEqual({ kind: "none", ids: [] });
+  });
 });
