@@ -71,6 +71,7 @@ export function AssetPanel() {
   const [anchorCalibrationText, setAnchorCalibrationText] = useState("");
   const [alignmentProposalText, setAlignmentProposalText] = useState("");
   const project = useEditorStore((state) => state.project);
+  const selection = useEditorStore((state) => state.selection);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
   const cutHintSettings = useEditorStore((state) => state.cutHintSettings);
   const importProgress = useEditorStore((state) => state.importProgress);
@@ -80,7 +81,10 @@ export function AssetPanel() {
   const removeMedia = useEditorStore((state) => state.removeMedia);
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
   const select = useEditorStore((state) => state.select);
+  const setPlayhead = useEditorStore((state) => state.setPlayhead);
   const addCutMarker = useEditorStore((state) => state.addCutMarker);
+  const updateCutMarker = useEditorStore((state) => state.updateCutMarker);
+  const deleteCutMarker = useEditorStore((state) => state.deleteCutMarker);
   const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const previewAlignmentProposalData = useEditorStore((state) => state.previewAlignmentProposalData);
@@ -217,6 +221,16 @@ export function AssetPanel() {
                   onLongSplitModeChange={setLongSplitMode}
                   onEpisodeDurationsTextChange={setEpisodeDurationsText}
                   onCutPointsTextChange={setCutPointsText}
+                />
+                <CompensationMarkersPanel
+                  markers={project.cutMarkers}
+                  selectedIds={selection.kind === "cut" ? selection.ids : []}
+                  onFocus={(marker) => {
+                    select({ kind: "cut", ids: [marker.id] });
+                    setPlayhead(marker.sourceAtMs);
+                  }}
+                  onUpdate={updateCutMarker}
+                  onDelete={deleteCutMarker}
                 />
                 <SuspectedCutPanel
                   candidates={suspectedCutCandidates}
@@ -802,6 +816,94 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
           </div>
         </div>
       ) : null}
+    </section>
+  );
+}
+
+function CompensationMarkersPanel({
+  markers,
+  selectedIds,
+  onFocus,
+  onUpdate,
+  onDelete
+}: {
+  markers: CutMarker[];
+  selectedIds: string[];
+  onFocus: (marker: CutMarker) => void;
+  onUpdate: (id: string, patch: Partial<Omit<CutMarker, "id">>) => void;
+  onDelete: (id: string) => void;
+}) {
+  const totalGapMs = markers.reduce((total, marker) => total + marker.targetGapMs, 0);
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <ListPlus size={15} className="text-accent-cyan" />
+        <span>补偿点管理</span>
+        <span className="ml-auto text-[11px] text-slate-500">{markers.length} 个</span>
+      </div>
+      <div className="mt-3 grid gap-2">
+        {markers.length > 0 ? (
+          <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2 text-slate-400">
+            <span className="text-slate-500">总补偿</span>
+            <span>{formatSignedDuration(totalGapMs)}</span>
+          </div>
+        ) : (
+          <div className="text-slate-500">暂无补偿点，可从时间轴、锚点校准或疑似删减候选生成。</div>
+        )}
+        {markers.map((marker) => {
+          const selected = selectedIds.includes(marker.id);
+          return (
+            <article
+              key={marker.id}
+              className={`grid gap-2 rounded border p-2 ${
+                selected ? "border-accent-cyan bg-accent-cyan/10" : "border-panel-line bg-black/20"
+              }`}
+            >
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                <button
+                  type="button"
+                  className="min-w-0 text-left"
+                  onClick={() => onFocus(marker)}
+                  aria-label={`定位补偿点 ${marker.name}`}
+                >
+                  <span className="block truncate text-slate-100" title={marker.name}>
+                    {marker.name}
+                  </span>
+                  <span className="mt-1 block font-mono text-[11px] text-slate-500">
+                    {formatTimecode(marker.sourceAtMs)} / {formatSignedDuration(marker.targetGapMs)}
+                  </span>
+                </button>
+                <TextButton aria-label={`删除补偿点 ${marker.name}`} tone="danger" onClick={() => onDelete(marker.id)}>
+                  <Trash2 size={14} />
+                  删除
+                </TextButton>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="grid gap-1">
+                  <span className="text-slate-500">源时间 ms</span>
+                  <input
+                    aria-label={`${marker.name} 源时间 ms`}
+                    className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+                    inputMode="numeric"
+                    value={marker.sourceAtMs}
+                    onChange={(event) => onUpdate(marker.id, { sourceAtMs: Number(event.target.value) })}
+                  />
+                </label>
+                <label className="grid gap-1">
+                  <span className="text-slate-500">补偿 ms</span>
+                  <input
+                    aria-label={`${marker.name} 补偿 ms`}
+                    className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+                    inputMode="numeric"
+                    value={marker.targetGapMs}
+                    onChange={(event) => onUpdate(marker.id, { targetGapMs: Number(event.target.value) })}
+                  />
+                </label>
+              </div>
+            </article>
+          );
+        })}
+      </div>
     </section>
   );
 }

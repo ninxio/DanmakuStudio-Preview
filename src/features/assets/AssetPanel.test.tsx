@@ -119,6 +119,36 @@ describe("资源面板", () => {
     expect(useEditorStore.getState().project.cutMarkers[0].note).toContain("广告");
   });
 
+  it("可以在补偿点管理面板定位、微调并删除补偿点", async () => {
+    const user = userEvent.setup();
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        cutMarkers: [
+          {
+            id: "cut-manual",
+            name: "手动补偿",
+            sourceAtMs: 3000,
+            targetGapMs: 45000,
+            note: "人工确认"
+          }
+        ]
+      },
+      selection: { kind: "none", ids: [] }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "定位补偿点 手动补偿" }));
+    expect(useEditorStore.getState().selection).toEqual({ kind: "cut", ids: ["cut-manual"] });
+    expect(useEditorStore.getState().project.timeline.playheadMs).toBe(3000);
+
+    fireEvent.change(screen.getByLabelText("手动补偿 补偿 ms"), { target: { value: "12000" } });
+    expect(useEditorStore.getState().project.cutMarkers[0].targetGapMs).toBe(12000);
+
+    await user.click(screen.getByRole("button", { name: "删除补偿点 手动补偿" }));
+    expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
+  });
+
   it("可以应用锚点校准推断出的补偿点", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
