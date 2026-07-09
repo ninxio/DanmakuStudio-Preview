@@ -913,6 +913,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const project = get().project;
     const events = resolveProjectDanmakuEvents(project);
     const enabledEvents = events.filter((event) => event.enabled);
+    if (enabledEvents.length === 0) {
+      set({
+        exportDraft: null,
+        status: {
+          message: "当前没有可导出的弹幕，请先把 XML 放入时间轴。",
+          tone: "warning"
+        }
+      });
+      return;
+    }
     const exportResult = serializeBilibiliXml(
       enabledEvents.map((event) => ({ item: event.item, finalTimeMs: event.finalTimeMs }))
     );

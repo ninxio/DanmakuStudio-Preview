@@ -134,6 +134,22 @@ describe("editor store", () => {
     ]);
   });
 
+  it("没有可导出弹幕时不会生成空 XML 草稿", () => {
+    const asset = createAsset("asset-empty-export", "empty-export.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset]
+    });
+
+    useEditorStore.getState().prepareExport();
+
+    expect(useEditorStore.getState().exportDraft).toBeNull();
+    expect(useEditorStore.getState().status).toEqual({
+      message: "当前没有可导出的弹幕，请先把 XML 放入时间轴。",
+      tone: "warning"
+    });
+  });
+
   it("更新共享疑似删减扫描配置", () => {
     useEditorStore.getState().setCutHintSettings({
       keywordsText: "广告",

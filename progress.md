@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C15 已完成：导出 XML 入口增加空项目防护并重新打包 release。
+  - `prepareExport` 现在会在没有任何启用弹幕可导出时拒绝生成空 XML 草稿，清空旧导出草稿，并提示“当前没有可导出的弹幕，请先把 XML 放入时间轴。”
+  - 工具栏“导出 XML”按钮根据真实时间轴弹幕状态启用/禁用；空项目或仅导入但未放入时间轴时显示禁用态，避免用户得到无意义空导出。
+  - 新增 `EditorToolbar` 测试，覆盖空项目禁用导出入口，以及时间轴存在启用弹幕后允许导出 XML。
+  - 已补充 store 测试，覆盖没有可导出弹幕时不会生成空 XML 草稿。
+  - 已重新验证：`corepack pnpm test -- src/features/editor/EditorToolbar.test.tsx src/stores/editorStore.test.ts` 成功，2 个测试文件、10 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 29 个测试文件、101 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过，并更新空项目等截图基线。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12210176` 字节，时间 `2026/07/10 6:48:29`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2987022` 字节，时间 `2026/07/10 6:48:28`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c15-export-eligibility-20260710`。
 - 成熟度提升阶段 C14 已完成：扩展 Playwright E2E 覆盖复杂补偿点编辑撤销/重做。
   - 核心 E2E 流程现在会在添加删减点并重做后，读取“缺失或新增时长”检查器字段，确认默认补偿为 `45000ms`。
   - 测试会把该补偿改为 `12000ms`，再执行撤销并断言字段恢复为 `45000ms`，随后重做并断言恢复为 `12000ms`。

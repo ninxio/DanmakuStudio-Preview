@@ -23,6 +23,7 @@ import {
   TIMELINE_ZOOM_SLIDER_MIN,
   zoomToSliderValue
 } from "../../domain/timeline/view";
+import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import { serializeProject } from "../../domain/project/schema";
 import { useEditorStore } from "../../stores/editorStore";
@@ -49,6 +50,9 @@ export function EditorToolbar() {
   const exportAlignmentProposal = useEditorStore((state) => state.exportAlignmentProposal);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
+  const canExportXml = useEditorStore((state) =>
+    resolveProjectDanmakuEvents(state.project).some((event) => event.enabled)
+  );
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b border-panel-line bg-[#111318] px-3">
@@ -68,7 +72,12 @@ export function EditorToolbar() {
       <span className="mx-1 h-6 w-px bg-panel-line" />
       <IconButton label="导入视频" icon={<Video size={16} />} onClick={() => videoInputRef.current?.click()} />
       <IconButton label="导入 XML" icon={<FileUp size={16} />} onClick={() => xmlInputRef.current?.click()} />
-      <IconButton label="导出 XML" icon={<FileDown size={16} />} onClick={prepareExport} />
+      <IconButton
+        label={canExportXml ? "导出 XML" : "请先添加时间轴片段再导出 XML"}
+        icon={<FileDown size={16} />}
+        disabled={!canExportXml}
+        onClick={prepareExport}
+      />
       <span className="mx-1 h-6 w-px bg-panel-line" />
       <IconButton label="撤销" icon={<Undo2 size={16} />} onClick={undo} />
       <IconButton label="重做" icon={<Redo2 size={16} />} onClick={redo} />
