@@ -8,21 +8,13 @@ import type {
 import type { EditorProject } from "../project/types";
 import type { Milliseconds } from "../shared/time";
 import { clampMilliseconds } from "../shared/time";
+export { applyCutMapping } from "../danmaku/timeCompensation";
+import { applyCutMapping } from "../danmaku/timeCompensation";
 
 export interface EditTimingState {
   globalOffsetMs: Milliseconds;
   cutMarkers: CutMarker[];
   itemTimeAdjustments: Record<string, Milliseconds>;
-}
-
-export function applyCutMapping(timeMs: Milliseconds, cutMarkers: CutMarker[]): Milliseconds {
-  const sortedMarkers = [...cutMarkers].sort((a, b) => a.sourceAtMs - b.sourceAtMs);
-  return sortedMarkers.reduce((mapped, marker) => {
-    if (timeMs >= marker.sourceAtMs) {
-      return mapped + marker.targetGapMs;
-    }
-    return mapped;
-  }, timeMs);
 }
 
 export function getResolvedDanmakuTime(

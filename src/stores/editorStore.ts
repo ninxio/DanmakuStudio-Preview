@@ -66,6 +66,11 @@ export interface EditorStatus {
   tone: "neutral" | "success" | "warning" | "error";
 }
 
+export interface CutMarkerDraft {
+  name?: string;
+  note?: string;
+}
+
 interface EditorStore {
   project: EditorProject;
   selection: EditorSelection;
@@ -112,7 +117,7 @@ interface EditorStore {
   disableSelectedDanmaku: () => void;
   restoreSelectedDanmaku: () => void;
   addCutMarkerAtPlayhead: () => void;
-  addCutMarker: (sourceAtMs: Milliseconds, targetGapMs?: Milliseconds) => void;
+  addCutMarker: (sourceAtMs: Milliseconds, targetGapMs?: Milliseconds, draft?: CutMarkerDraft) => void;
   updateCutMarker: (id: string, patch: Partial<Omit<CutMarker, "id">>) => void;
   deleteCutMarker: (id: string) => void;
   deleteSelection: () => void;
@@ -127,6 +132,7 @@ interface EditorStore {
   clearExport: () => void;
   importAlignmentProposalText: (text: string) => void;
   exportAlignmentProposal: () => string;
+  applyAlignmentProposalData: (proposal: AlignmentProposal) => void;
   applyAlignmentProposal: () => void;
   undo: () => void;
   redo: () => void;
@@ -619,7 +625,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     get().addCutMarker(get().project.timeline.playheadMs, 45_000);
   },
 
-  addCutMarker: (sourceAtMs, targetGapMs = 45_000) => {
+  addCutMarker: (sourceAtMs, targetGapMs = 45_000, draft) => {
     const markerId = createId("cut");
     commitProject(
       set,
@@ -631,16 +637,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
           ...project.cutMarkers,
           {
             id: markerId,
-            name: `删减点 ${project.cutMarkers.length + 1}`,
+            name: draft?.name ?? `删减点 ${project.cutMarkers.length + 1}`,
             sourceAtMs: clampMilliseconds(sourceAtMs),
             targetGapMs,
-            note: "目标完整版在此处额外存在内容"
+            note: draft?.note ?? "目标完整版在此处额外存在内容"
           }
         ]
       }),
       { kind: "cut", ids: [markerId] }
     );
-    set({ status: { message: "已添加删减标记。", tone: "success" } });
+    set({ status: { message: draft ? "已添加待确认补偿点。" : "已添加删减标记。", tone: "success" } });
   },
 
   updateCutMarker: (id, patch) => {
@@ -917,12 +923,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     return `${JSON.stringify(proposal, null, 2)}\n`;
   },
 
-  applyAlignmentProposal: () => {
-    const proposal = get().alignmentProposal;
-    if (!proposal) {
-      set({ status: { message: "当前没有可应用的对齐提案。", tone: "warning" } });
-      return;
-    }
+  applyAlignmentProposalData: (proposal) => {
     commitProject(set, get, "应用对齐提案", (project) => ({
       ...project,
       syncAnchors: uniqueById([...project.syncAnchors, ...proposal.anchors]),
@@ -936,6 +937,15 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       ])
     }));
     set({ status: { message: "已应用对齐提案，时间轴会标记已应用项。", tone: "success" } });
+  },
+
+  applyAlignmentProposal: () => {
+    const proposal = get().alignmentProposal;
+    if (!proposal) {
+      set({ status: { message: "当前没有可应用的对齐提案。", tone: "warning" } });
+      return;
+    }
+    get().applyAlignmentProposalData(proposal);
   },
 
   undo: () => {

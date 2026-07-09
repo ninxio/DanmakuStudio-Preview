@@ -1,11 +1,23 @@
 import { Download, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
+import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
+import { buildAlignmentPreview } from "../../domain/alignment/preview";
+import type { AlignmentProposal } from "../../domain/alignment/types";
 import { buildBatchMergePlan, type BatchMergeOptions } from "../../domain/danmaku/batchMerge";
+import { findSuspectedCutCandidates, type SuspectedCutCandidate } from "../../domain/danmaku/cutHints";
 import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
+import type { CutMarker } from "../../domain/danmaku/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
-import { downloadTextFiles } from "../../infrastructure/file-system/browserFiles";
+import {
+  cancelTauriAudioAlignmentJob,
+  getTauriAudioAlignmentJob,
+  isAudioAlignmentJobFinished,
+  startTauriAudioAlignmentJob,
+  type AudioAlignmentJobSnapshot
+} from "../../infrastructure/alignment/tauriAudioAlignment";
+import { downloadTextFile, downloadTextFiles, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import {
   authenticateEmby,
   fetchEmbyEpisodeChildren,
@@ -16,12 +28,30 @@ import {
   type EmbyAuthSession,
   type EmbyItemMetadata
 } from "../../infrastructure/metadata/embyClient";
+import { loadAppSettings } from "../../infrastructure/settings/appSettings";
+import { loadVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
 import { serializeBilibiliXml, validateExportedXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore, type EditorStatus } from "../../stores/editorStore";
 
 type AssetTab = "media" | "danmaku" | "project";
 type PartWindowMode = "full" | "prefix" | "suffix" | "range";
 type LongSplitMode = "auto" | "durations" | "cuts";
+type EmbyLoadingKind = "auth" | "search" | "item" | "episodes";
+
+interface EmbySessionState {
+  key: string;
+  session: EmbyAuthSession;
+}
+
+interface EmbyConnectionState {
+  config: {
+    serverUrl: string;
+    pathPrefix: string;
+  };
+  username: string;
+  password: string;
+  sessionKey: string;
+}
 
 export function AssetPanel() {
   const [tab, setTab] = useState<AssetTab>("danmaku");
@@ -32,7 +62,10 @@ export function AssetPanel() {
   const [longSplitMode, setLongSplitMode] = useState<LongSplitMode>("auto");
   const [episodeDurationsText, setEpisodeDurationsText] = useState("");
   const [cutPointsText, setCutPointsText] = useState("");
+  const [anchorCalibrationText, setAnchorCalibrationText] = useState("");
+  const [alignmentProposalText, setAlignmentProposalText] = useState("");
   const project = useEditorStore((state) => state.project);
+  const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
   const importProgress = useEditorStore((state) => state.importProgress);
   const addAssetToTimeline = useEditorStore((state) => state.addAssetToTimeline);
   const removeAsset = useEditorStore((state) => state.removeAsset);
@@ -40,6 +73,10 @@ export function AssetPanel() {
   const removeMedia = useEditorStore((state) => state.removeMedia);
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
   const select = useEditorStore((state) => state.select);
+  const addCutMarker = useEditorStore((state) => state.addCutMarker);
+  const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
+  const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
+  const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
   const manualRules = useMemo(
     () =>
       createBatchMergeOptions({
@@ -61,9 +98,28 @@ export function AssetPanel() {
       cutPointsText
     ]
   );
+  const batchMergeOptions = useMemo(
+    () => ({
+      ...manualRules.options,
+      cutMarkers: project.cutMarkers
+    }),
+    [manualRules.options, project.cutMarkers]
+  );
   const batchMergePlan = useMemo(
-    () => buildBatchMergePlan(project.assets, manualRules.options),
-    [manualRules.options, project.assets]
+    () => buildBatchMergePlan(project.assets, batchMergeOptions),
+    [batchMergeOptions, project.assets]
+  );
+  const suspectedCutCandidates = useMemo(
+    () => findSuspectedCutCandidates(project.assets),
+    [project.assets]
+  );
+  const anchorCalibrationProposal = useMemo(
+    () => createAnchorCalibrationProposal(anchorCalibrationText),
+    [anchorCalibrationText]
+  );
+  const alignmentPreview = useMemo(
+    () => buildAlignmentPreview(project, alignmentProposal),
+    [project, alignmentProposal]
   );
 
   return (
@@ -152,6 +208,30 @@ export function AssetPanel() {
                   onEpisodeDurationsTextChange={setEpisodeDurationsText}
                   onCutPointsTextChange={setCutPointsText}
                 />
+                <SuspectedCutPanel
+                  candidates={suspectedCutCandidates}
+                  cutMarkers={project.cutMarkers}
+                  onApply={(candidate) => {
+                    addCutMarker(candidate.sourceAtMs, 45_000, {
+                      name: `待确认补偿 ${formatTimecode(candidate.sourceAtMs)}`,
+                      note: `由弹幕文本扫描生成，需人工复核。来源：${candidate.assetFileName}；关键词：${candidate.keywords.join("、")}`
+                    });
+                  }}
+                />
+                <AnchorCalibrationPanel
+                  text={anchorCalibrationText}
+                  proposal={anchorCalibrationProposal}
+                  onTextChange={setAnchorCalibrationText}
+                  onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
+                />
+                <VideoAlignmentLabPanel
+                  text={alignmentProposalText}
+                  proposal={alignmentProposal}
+                  preview={alignmentPreview}
+                  onTextChange={setAlignmentProposalText}
+                  onImportText={importAlignmentProposalText}
+                  onApply={applyAlignmentProposal}
+                />
                 <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
               </>
             ) : null}
@@ -237,23 +317,22 @@ export function AssetPanel() {
   );
 }
 
+const EMBY_INPUT_CLASS =
+  "h-8 min-w-0 w-full rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100";
+
 function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (lines: string) => void }) {
-  const [serverUrl, setServerUrl] = useState("");
-  const [pathPrefix, setPathPrefix] = useState("/emby");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
   const [itemId, setItemId] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
-  const [session, setSession] = useState<EmbyAuthSession | null>(null);
+  const [sessionState, setSessionState] = useState<EmbySessionState | null>(null);
   const [loadedItem, setLoadedItem] = useState<EmbyItemMetadata | null>(null);
   const [episodeItems, setEpisodeItems] = useState<EmbyItemMetadata[]>([]);
   const [searchResults, setSearchResults] = useState<EmbyItemMetadata[]>([]);
   const [durationLines, setDurationLines] = useState("");
-  const [loading, setLoading] = useState<"login" | "search" | "item" | "episodes" | null>(null);
-  const config = { serverUrl, pathPrefix };
-  const disabled = serverUrl.trim().length === 0 || itemId.trim().length === 0;
+  const [loading, setLoading] = useState<EmbyLoadingKind | null>(null);
+  const selectedItemId = itemId.trim();
+  const hasSelectedItem = selectedItemId.length > 0;
 
-  async function runAction<T>(kind: typeof loading, action: () => Promise<T>): Promise<T | null> {
+  async function runAction<T>(kind: EmbyLoadingKind, action: () => Promise<T>): Promise<T | null> {
     setLoading(kind);
     try {
       return await action();
@@ -268,29 +347,38 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
     }
   }
 
-  const login = async () => {
-    if (serverUrl.trim().length === 0 || username.trim().length === 0 || password.length === 0) {
-      setStatus({ message: "请填写 Emby 地址、用户名和密码。", tone: "warning" });
-      return;
+  const ensureSession = async () => {
+    const connection = loadEmbyConnectionState();
+    if (!validateEmbyConnectionState(connection)) {
+      return null;
     }
-    const nextSession = await runAction("login", () => authenticateEmby(config, { username, password }));
+    if (sessionState?.key === connection.sessionKey) {
+      return { connection, session: sessionState.session };
+    }
+    const nextSession = await runAction("auth", () =>
+      authenticateEmby(connection.config, { username: connection.username, password: connection.password })
+    );
     if (nextSession) {
-      setSession(nextSession);
+      setSessionState({ key: connection.sessionKey, session: nextSession });
       setSearchResults([]);
       setStatus({ message: `Emby 已登录：${nextSession.userName || nextSession.userId}`, tone: "success" });
+      return { connection, session: nextSession };
     }
+    return null;
   };
 
   const searchItems = async () => {
-    if (!session) {
-      setStatus({ message: "请先登录后再搜索。", tone: "warning" });
-      return;
-    }
     if (searchTerm.trim().length === 0) {
       setStatus({ message: "请填写要搜索的片名、剧名或季集信息。", tone: "warning" });
       return;
     }
-    const items = await runAction("search", () => searchEmbyItems(config, session, { searchTerm, limit: 12 }));
+    const ready = await ensureSession();
+    if (!ready) {
+      return;
+    }
+    const items = await runAction("search", () =>
+      searchEmbyItems(ready.connection.config, ready.session, { searchTerm, limit: 12 })
+    );
     if (items) {
       setSearchResults(items);
       setStatus({
@@ -320,11 +408,15 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
   };
 
   const readItem = async () => {
-    if (!session || disabled) {
-      setStatus({ message: "请先登录并填写 ItemId。", tone: "warning" });
+    if (!hasSelectedItem) {
+      setStatus({ message: "请先从搜索结果中选择一个 Emby 条目。", tone: "warning" });
       return;
     }
-    const item = await runAction("item", () => fetchEmbyItem(config, session, itemId.trim()));
+    const ready = await ensureSession();
+    if (!ready) {
+      return;
+    }
+    const item = await runAction("item", () => fetchEmbyItem(ready.connection.config, ready.session, selectedItemId));
     if (item) {
       setLoadedItem(item);
       setStatus({ message: `已读取 Emby 条目：${item.name}`, tone: "success" });
@@ -332,11 +424,17 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
   };
 
   const readEpisodes = async () => {
-    if (!session || disabled) {
-      setStatus({ message: "请先登录并填写剧集、季或合集 ItemId。", tone: "warning" });
+    if (!hasSelectedItem) {
+      setStatus({ message: "请先从搜索结果中选择剧集、季或合集。", tone: "warning" });
       return;
     }
-    const items = await runAction("episodes", () => fetchEmbyEpisodeChildren(config, session, itemId.trim()));
+    const ready = await ensureSession();
+    if (!ready) {
+      return;
+    }
+    const items = await runAction("episodes", () =>
+      fetchEmbyEpisodeChildren(ready.connection.config, ready.session, selectedItemId)
+    );
     if (items) {
       const lines = formatEmbyEpisodeDurationLines(items);
       setEpisodeItems(items);
@@ -349,42 +447,21 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
   };
 
   return (
-    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
-      <h3 className="text-sm font-medium text-slate-100">Emby 时长</h3>
-      <div className="mt-3 grid gap-2">
-        <label className="grid gap-1">
-          <span className="text-slate-500">服务器</span>
-          <input
-            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-            value={serverUrl}
-            placeholder="https://example.com:443"
-            onChange={(event) => setServerUrl(event.target.value)}
-          />
-        </label>
-        <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
-          <label className="grid gap-1">
-            <span className="text-slate-500">路径</span>
-            <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              value={pathPrefix}
-              placeholder="/emby"
-              onChange={(event) => setPathPrefix(event.target.value)}
-            />
-          </label>
-          <label className="grid gap-1">
-            <span className="text-slate-500">ItemId</span>
-            <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              value={itemId}
-              placeholder="剧集、季或单集 ID"
-              onChange={(event) => setItemId(event.target.value)}
-            />
-          </label>
-        </div>
-        <label className="grid gap-1">
+    <section className="min-w-0 overflow-hidden rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <h3 className="min-w-0 truncate text-sm font-medium text-slate-100">Emby 时长</h3>
+        <span className="shrink-0 rounded border border-panel-line bg-black/20 px-2 py-0.5 text-[11px] text-slate-500">
+          设置中心
+        </span>
+      </div>
+      <p className="mt-2 text-[11px] leading-5 text-slate-500">
+        连接、路径和账号在设置中心维护；这里仅搜索并导入真实时长。
+      </p>
+      <div className="mt-3 grid min-w-0 gap-2">
+        <label className="grid min-w-0 gap-1">
           <span className="text-slate-500">搜索</span>
           <input
-            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+            className={EMBY_INPUT_CLASS}
             value={searchTerm}
             placeholder="片名 / 剧名 / S01E02 / 第1季第2集"
             onChange={(event) => setSearchTerm(event.target.value)}
@@ -395,50 +472,25 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
             }}
           />
         </label>
-        <div className="grid grid-cols-2 gap-2">
-          <label className="grid gap-1">
-            <span className="text-slate-500">用户名</span>
-            <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              value={username}
-              autoComplete="username"
-              onChange={(event) => setUsername(event.target.value)}
-            />
-          </label>
-          <label className="grid gap-1">
-            <span className="text-slate-500">密码</span>
-            <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              type="password"
-              value={password}
-              autoComplete="current-password"
-              onChange={(event) => setPassword(event.target.value)}
-            />
-          </label>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <TextButton onClick={() => void login()} disabled={loading !== null}>
-            {loading === "login" ? "登录中" : "登录"}
-          </TextButton>
-          <TextButton onClick={() => void searchItems()} disabled={!session || loading !== null}>
+        <div className="grid min-w-0 gap-2">
+          <TextButton
+            tone="primary"
+            className="w-full min-w-0 px-2"
+            onClick={() => void searchItems()}
+            disabled={loading !== null}
+          >
             <Search size={14} />
-            {loading === "search" ? "搜索中" : "搜索"}
-          </TextButton>
-          <TextButton onClick={() => void readItem()} disabled={!session || disabled || loading !== null}>
-            读取条目
-          </TextButton>
-          <TextButton onClick={() => void readEpisodes()} disabled={!session || disabled || loading !== null} tone="primary">
-            读取下级剧集
+            <span className="truncate">{loading === "auth" ? "连接中" : loading === "search" ? "搜索中" : "搜索"}</span>
           </TextButton>
         </div>
         {searchResults.length > 0 ? (
-          <div className="grid gap-1 rounded border border-panel-line bg-black/20 p-2">
+          <div className="grid min-w-0 gap-1 rounded border border-panel-line bg-black/20 p-2">
             <div className="text-slate-500">搜索结果</div>
             {searchResults.map((item) => (
               <button
                 key={item.id}
                 type="button"
-                className={`grid gap-0.5 rounded px-2 py-1 text-left transition hover:bg-slate-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-cyan ${
+                className={`grid min-w-0 gap-0.5 rounded px-2 py-1 text-left transition hover:bg-slate-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-cyan ${
                   item.id === itemId ? "bg-accent-cyan/15 text-accent-cyan" : "text-slate-300"
                 }`}
                 onClick={() => selectSearchResult(item)}
@@ -450,28 +502,48 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
           </div>
         ) : null}
         {loadedItem ? (
-          <div className="rounded border border-panel-line bg-black/20 p-2">
+          <div className="min-w-0 rounded border border-panel-line bg-black/20 p-2">
             <Row label="条目" value={loadedItem.name} />
             <Row label="类型" value={loadedItem.type} />
             <Row label="时长" value={loadedItem.durationMs === null ? "未知" : formatTimecode(loadedItem.durationMs)} />
-            {loadedItem.durationMs !== null ? (
-              <div className="mt-2">
-                <TextButton onClick={importLoadedItemDuration}>导入单条时长</TextButton>
-              </div>
-            ) : null}
+            <div className="mt-2 grid min-w-0 gap-2">
+              <TextButton
+                className="w-full min-w-0 px-2"
+                onClick={() => void readItem()}
+                disabled={loading !== null || !hasSelectedItem}
+              >
+                <span className="truncate">{loading === "item" ? "读取中" : "读取条目"}</span>
+              </TextButton>
+              <TextButton
+                className="w-full min-w-0 px-2"
+                onClick={() => void readEpisodes()}
+                disabled={loading !== null || !hasSelectedItem}
+              >
+                <span className="truncate">{loading === "episodes" ? "读取中" : "读取下级剧集"}</span>
+              </TextButton>
+              {loadedItem.durationMs !== null ? (
+                <TextButton className="w-full min-w-0 px-2" onClick={importLoadedItemDuration}>
+                  <span className="truncate">导入单条时长</span>
+                </TextButton>
+              ) : null}
+            </div>
           </div>
         ) : null}
         {durationLines.length > 0 ? (
-          <div className="grid gap-2">
+          <div className="grid min-w-0 gap-2">
             <textarea
-              className="min-h-24 resize-y rounded border border-panel-line bg-[#111318] p-2 font-mono text-xs leading-5 text-slate-100"
+              className="min-h-24 min-w-0 resize-y rounded border border-panel-line bg-[#111318] p-2 font-mono text-xs leading-5 text-slate-100"
               value={durationLines}
               readOnly
             />
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-slate-500">{episodeItems.length} 个条目</span>
-              <TextButton tone="primary" onClick={() => onImportDurationLines(durationLines)}>
-                导入时长规则
+            <div className="grid min-w-0 gap-2">
+              <span className="min-w-0 truncate text-slate-500">{episodeItems.length} 个条目</span>
+              <TextButton
+                tone="primary"
+                className="w-full min-w-0 px-2"
+                onClick={() => onImportDurationLines(durationLines)}
+              >
+                <span className="truncate">导入时长规则</span>
               </TextButton>
             </div>
           </div>
@@ -479,6 +551,36 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
       </div>
     </section>
   );
+}
+
+function loadEmbyConnectionState(): EmbyConnectionState {
+  const settings = loadAppSettings();
+  const password = loadVolatileEmbyPassword();
+  const serverUrl = settings.emby.serverUrl.trim();
+  const pathPrefix = settings.emby.pathPrefix.trim();
+  const username = settings.emby.username.trim();
+  return {
+    config: { serverUrl, pathPrefix },
+    username,
+    password,
+    sessionKey: [serverUrl, pathPrefix, username, password].join("\n")
+  };
+}
+
+function validateEmbyConnectionState(connection: EmbyConnectionState): boolean {
+  if (connection.config.serverUrl.length === 0) {
+    setStatus({ message: "请先在设置中心填写 Emby 服务器地址。", tone: "warning" });
+    return false;
+  }
+  if (connection.username.length === 0) {
+    setStatus({ message: "请先在设置中心填写 Emby 用户名。", tone: "warning" });
+    return false;
+  }
+  if (connection.password.length === 0) {
+    setStatus({ message: "请先在设置中心填写本次会话密码。密码不会写入本地设置。", tone: "warning" });
+    return false;
+  }
+  return true;
 }
 
 function formatEmbySearchResultMeta(item: EmbyItemMetadata): string {
@@ -664,8 +766,535 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
           {hiddenCount > 0 ? <p className="text-slate-500">另有 {hiddenCount} 个输出。</p> : null}
         </div>
       ) : null}
+      {plan.compensation.markerCount > 0 ? (
+        <div className="mt-3 grid gap-1 border-t border-panel-line pt-3 text-slate-400">
+          <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
+            <span className="text-slate-500">补偿点</span>
+            <span>{plan.compensation.markerCount} 个</span>
+          </div>
+          <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
+            <span className="text-slate-500">总时长</span>
+            <span>{formatSignedDuration(plan.compensation.totalGapMs)}</span>
+          </div>
+          <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
+            <span className="text-slate-500">影响</span>
+            <span>
+              {plan.compensation.affectedEpisodeCount} 个输出，{plan.compensation.affectedEntryCount.toLocaleString("zh-CN")} 条弹幕
+            </span>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
+}
+
+function SuspectedCutPanel({
+  candidates,
+  cutMarkers,
+  onApply
+}: {
+  candidates: SuspectedCutCandidate[];
+  cutMarkers: CutMarker[];
+  onApply: (candidate: SuspectedCutCandidate) => void;
+}) {
+  if (candidates.length === 0) {
+    return null;
+  }
+  const previewCandidates = candidates.slice(0, 5);
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <Search size={15} className="text-accent-yellow" />
+        <span>疑似删减点</span>
+        <span className="ml-auto text-[11px] text-slate-500">{candidates.length} 个候选</span>
+      </div>
+      <div className="mt-3 grid gap-2">
+        {previewCandidates.map((candidate) => {
+          const applied = hasNearbyCutMarker(candidate, cutMarkers);
+          return (
+            <div key={candidate.id} className="grid gap-2 border-t border-panel-line pt-2 first:border-t-0 first:pt-0">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+                <div className="min-w-0">
+                  <div className="truncate text-slate-100" title={candidate.assetFileName}>
+                    {formatTimecode(candidate.sourceAtMs)} / {candidate.assetFileName}
+                  </div>
+                  <div className="mt-1 truncate text-slate-500" title={candidate.sampleTexts.join(" / ")}>
+                    {candidate.hitCount} 条 / {candidate.keywords.join("、")} / {confidenceText(candidate.confidence)}
+                  </div>
+                </div>
+                <TextButton
+                  tone={applied ? "neutral" : "primary"}
+                  disabled={applied}
+                  onClick={() => onApply(candidate)}
+                >
+                  {applied ? "已存在" : "转为补偿点"}
+                </TextButton>
+              </div>
+              <div className="truncate text-[11px] text-slate-500" title={candidate.sampleTexts.join(" / ")}>
+                {candidate.sampleTexts[0]}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function AnchorCalibrationPanel({
+  text,
+  proposal,
+  onTextChange,
+  onApply
+}: {
+  text: string;
+  proposal: ReturnType<typeof createAnchorCalibrationProposal>;
+  onTextChange: (value: string) => void;
+  onApply: () => void;
+}) {
+  const hasInput = text.trim().length > 0;
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <h3 className="text-sm font-medium text-slate-100">锚点校准</h3>
+      <div className="mt-3 grid gap-2">
+        <textarea
+          className="min-h-20 resize-y rounded border border-panel-line bg-[#111318] p-2 text-xs leading-5 text-slate-100"
+          value={text}
+          placeholder={"每行一个对应点，例如：\n00:10 -> 00:10\n23:12.400 -> 24:34.400"}
+          onChange={(event) => onTextChange(event.target.value)}
+        />
+        {hasInput ? (
+          <div className="grid gap-1 text-slate-400">
+            <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+              <span className="text-slate-500">锚点</span>
+              <span>{proposal.anchors.length} 个</span>
+            </div>
+            <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+              <span className="text-slate-500">推断补偿</span>
+              <span>{proposal.cutCandidates.length} 个</span>
+            </div>
+            {proposal.cutCandidates.slice(0, 3).map((candidate) => (
+              <div key={candidate.id} className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+                <span className="text-slate-500">{formatTimecode(candidate.sourceAtMs)}</span>
+                <span>+{formatTimecode(candidate.targetGapMs)}</span>
+              </div>
+            ))}
+            {proposal.diagnostics.length > 0 ? (
+              <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-accent-yellow">
+                {proposal.diagnostics[0]}
+              </div>
+            ) : null}
+            <div className="flex justify-end">
+              <TextButton
+                tone="primary"
+                disabled={proposal.anchors.length === 0}
+                onClick={onApply}
+              >
+                应用锚点与补偿
+              </TextButton>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function VideoAlignmentLabPanel({
+  text,
+  proposal,
+  preview,
+  onTextChange,
+  onImportText,
+  onApply
+}: {
+  text: string;
+  proposal: AlignmentProposal | null;
+  preview: ReturnType<typeof buildAlignmentPreview>;
+  onTextChange: (value: string) => void;
+  onImportText: (value: string) => void;
+  onApply: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const initialSettingsRef = useRef(loadAppSettings());
+  const [completePath, setCompletePath] = useState("");
+  const [sourcePath, setSourcePath] = useState("");
+  const [ffmpegPath, setFfmpegPath] = useState(initialSettingsRef.current.alignment.ffmpegPath);
+  const [windowMs, setWindowMs] = useState(String(initialSettingsRef.current.alignment.windowMs));
+  const [minGapMs, setMinGapMs] = useState(String(initialSettingsRef.current.alignment.minGapMs));
+  const [matchThreshold, setMatchThreshold] = useState(String(initialSettingsRef.current.alignment.matchThreshold));
+  const [running, setRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [jobSnapshot, setJobSnapshot] = useState<AudioAlignmentJobSnapshot | null>(null);
+  const runTokenRef = useRef(0);
+  const pendingCount = preview.summary.candidateAnchorCount + preview.summary.candidateCutCount;
+  const appliedCount = preview.summary.appliedAnchorCount + preview.summary.appliedCutCount;
+  const previewCuts = preview.proposalCuts.slice(0, 3);
+  const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
+  const downloadContent = getAlignmentProposalDownloadText(text, proposal);
+
+  const runDesktopAlignment = async () => {
+    const parsedWindowMs = parsePositiveIntegerInput(windowMs, "窗口");
+    const parsedMinGapMs = parseNonNegativeIntegerInput(minGapMs, "最小缺失");
+    const parsedMatchThreshold = parsePositiveNumberInput(matchThreshold, "匹配阈值");
+    if (parsedWindowMs.error || parsedMinGapMs.error || parsedMatchThreshold.error) {
+      setStatus({
+        message: parsedWindowMs.error ?? parsedMinGapMs.error ?? parsedMatchThreshold.error ?? "对齐参数无效。",
+        tone: "warning"
+      });
+      return;
+    }
+    const request = {
+      completePath: completePath.trim(),
+      sourcePath: sourcePath.trim(),
+      ffmpegPath: ffmpegPath.trim().length > 0 ? ffmpegPath.trim() : null,
+      windowMs: parsedWindowMs.value,
+      minGapMs: parsedMinGapMs.value,
+      matchThreshold: parsedMatchThreshold.value
+    };
+    const runToken = runTokenRef.current + 1;
+    runTokenRef.current = runToken;
+    setRunning(true);
+    setCancelling(false);
+    setJobSnapshot(null);
+    setActiveJobId(null);
+    try {
+      let snapshot = await startTauriAudioAlignmentJob(request);
+      if (runTokenRef.current !== runToken) {
+        return;
+      }
+      setActiveJobId(snapshot.jobId);
+      setJobSnapshot(snapshot);
+      setStatus({ message: snapshot.message, tone: "success" });
+      while (!isAudioAlignmentJobFinished(snapshot.status)) {
+        await waitForAudioAlignmentPoll();
+        if (runTokenRef.current !== runToken) {
+          return;
+        }
+        snapshot = await getTauriAudioAlignmentJob(snapshot.jobId);
+        if (runTokenRef.current !== runToken) {
+          return;
+        }
+        setJobSnapshot(snapshot);
+      }
+      if (snapshot.status === "cancelled") {
+        setStatus({ message: snapshot.message || "本地音频对齐已取消。", tone: "warning" });
+        return;
+      }
+      if (snapshot.status === "failed" || !snapshot.proposal) {
+        throw new Error(snapshot.error ?? snapshot.message ?? "本地音频对齐失败。");
+      }
+      const content = `${JSON.stringify(snapshot.proposal, null, 2)}\n`;
+      onTextChange(content);
+      onImportText(content);
+      setStatus({ message: "本地音频对齐完成，已导入候选提案。", tone: "success" });
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "本地音频对齐失败。",
+        tone: "error"
+      });
+    } finally {
+      if (runTokenRef.current === runToken) {
+        setRunning(false);
+        setCancelling(false);
+        setActiveJobId(null);
+      }
+    }
+  };
+
+  const cancelDesktopAlignment = async () => {
+    if (!activeJobId || cancelling) {
+      return;
+    }
+    setCancelling(true);
+    try {
+      const snapshot = await cancelTauriAudioAlignmentJob(activeJobId);
+      setJobSnapshot(snapshot);
+      setStatus({ message: snapshot.message, tone: "warning" });
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "取消音频对齐任务失败。",
+        tone: "error"
+      });
+    }
+  };
+
+  const exportProposal = () => {
+    if (!downloadContent) {
+      setStatus({ message: "暂无可导出的对齐提案。", tone: "warning" });
+      return;
+    }
+    downloadTextFile("alignment-proposal.json", downloadContent, "application/json;charset=utf-8");
+    setStatus({ message: "已导出对齐提案 JSON。", tone: "success" });
+  };
+
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <Video size={15} className="text-accent-cyan" />
+        <span>视频对齐实验室</span>
+        {proposal ? (
+          <span className="ml-auto text-[11px] text-slate-500">
+            待应用 {pendingCount} / 已应用 {appliedCount}
+          </span>
+        ) : null}
+      </div>
+      <div className="mt-3 grid gap-2">
+        <label className="grid gap-1">
+          <span className="text-slate-500">完整片源路径</span>
+          <input
+            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+            value={completePath}
+            placeholder="D:\\media\\full.mkv"
+            onChange={(event) => setCompletePath(event.target.value)}
+          />
+        </label>
+        <label className="grid gap-1">
+          <span className="text-slate-500">删减版路径</span>
+          <input
+            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+            value={sourcePath}
+            placeholder="D:\\media\\bilibili-cut.mp4"
+            onChange={(event) => setSourcePath(event.target.value)}
+          />
+        </label>
+        <label className="grid gap-1">
+          <span className="text-slate-500">FFmpeg 路径</span>
+          <input
+            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+            value={ffmpegPath}
+            placeholder="留空使用 PATH 中的 ffmpeg"
+            onChange={(event) => setFfmpegPath(event.target.value)}
+          />
+        </label>
+        <div className="grid grid-cols-3 gap-2">
+          <label className="grid gap-1">
+            <span className="text-slate-500">窗口 ms</span>
+            <input
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              inputMode="numeric"
+              value={windowMs}
+              onChange={(event) => setWindowMs(event.target.value)}
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-slate-500">最小缺失 ms</span>
+            <input
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              inputMode="numeric"
+              value={minGapMs}
+              onChange={(event) => setMinGapMs(event.target.value)}
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-slate-500">匹配阈值</span>
+            <input
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              inputMode="decimal"
+              value={matchThreshold}
+              onChange={(event) => setMatchThreshold(event.target.value)}
+            />
+          </label>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <TextButton
+            tone="primary"
+            onClick={() => {
+              void runDesktopAlignment();
+            }}
+            disabled={!canRunAlignment}
+          >
+            {running ? "对齐中" : "运行本地对齐"}
+          </TextButton>
+          <TextButton
+            onClick={() => {
+              void cancelDesktopAlignment();
+            }}
+            disabled={!activeJobId || cancelling || !running}
+          >
+            {cancelling ? "取消中" : "取消任务"}
+          </TextButton>
+        </div>
+        {jobSnapshot ? (
+          <div className="grid gap-1 rounded border border-panel-line bg-black/20 p-2 text-slate-400">
+            <div className="flex items-center justify-between gap-2">
+              <span className="min-w-0 truncate">{jobSnapshot.message}</span>
+              <span className="shrink-0 text-slate-500">
+                {Math.round(jobSnapshot.progress * 100)}%
+              </span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded bg-[#111318]">
+              <div
+                className="h-full rounded bg-accent-cyan"
+                style={{ width: `${Math.round(jobSnapshot.progress * 100)}%` }}
+              />
+            </div>
+            <div className="text-[11px] text-slate-500">
+              任务 {jobSnapshot.jobId} / {alignmentJobStatusText(jobSnapshot.status)}
+            </div>
+          </div>
+        ) : null}
+        <textarea
+          className="min-h-24 resize-y rounded border border-panel-line bg-[#111318] p-2 font-mono text-xs leading-5 text-slate-100"
+          value={text}
+          placeholder="AlignmentProposal JSON"
+          onChange={(event) => onTextChange(event.target.value)}
+        />
+        <div className="flex flex-wrap gap-2">
+          <TextButton onClick={() => inputRef.current?.click()}>导入文件</TextButton>
+          <TextButton
+            onClick={() => onImportText(text)}
+            disabled={text.trim().length === 0}
+          >
+            导入提案
+          </TextButton>
+          <TextButton
+            onClick={exportProposal}
+            disabled={!downloadContent}
+          >
+            导出提案
+          </TextButton>
+          <TextButton
+            tone="primary"
+            onClick={onApply}
+            disabled={!proposal || pendingCount === 0}
+          >
+            应用候选
+          </TextButton>
+        </div>
+        <input
+          ref={inputRef}
+          className="hidden"
+          type="file"
+          accept=".json,application/json"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) {
+              void readTextFile(file)
+                .then((content) => {
+                  onTextChange(content);
+                  onImportText(content);
+                })
+                .catch((error: unknown) => {
+                  setStatus({
+                    message: error instanceof Error ? error.message : "对齐提案文件读取失败。",
+                    tone: "error"
+                  });
+                });
+            }
+            event.target.value = "";
+          }}
+        />
+        {proposal ? (
+          <div className="grid gap-1 text-slate-400">
+            <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+              <span className="text-slate-500">锚点</span>
+              <span>
+                {proposal.anchors.length} 个，候选 {preview.summary.candidateAnchorCount}
+              </span>
+            </div>
+            <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+              <span className="text-slate-500">补偿</span>
+              <span>
+                {proposal.cutCandidates.length} 个，候选 {preview.summary.candidateCutCount}
+              </span>
+            </div>
+            {previewCuts.map((candidate) => (
+              <div key={candidate.id} className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+                <span className="text-slate-500">{formatTimecode(candidate.sourceAtMs)}</span>
+                <span>
+                  {formatSignedDuration(candidate.targetGapMs)} / {candidate.state === "applied" ? "已应用" : "候选"}
+                </span>
+              </div>
+            ))}
+            {proposal.diagnostics.slice(0, 2).map((diagnostic, index) => (
+              <div
+                key={`${diagnostic}-${index}`}
+                className="rounded border border-panel-line bg-black/20 p-2 text-slate-400"
+              >
+                {diagnostic}
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+interface ParsedNumericInput {
+  value: number;
+  error: string | null;
+}
+
+function parsePositiveIntegerInput(value: string, label: string): ParsedNumericInput {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+  if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed <= 0) {
+    return {
+      value: 0,
+      error: `${label}必须是大于 0 的整数。`
+    };
+  }
+  return { value: parsed, error: null };
+}
+
+function parseNonNegativeIntegerInput(value: string, label: string): ParsedNumericInput {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+  if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed < 0) {
+    return {
+      value: 0,
+      error: `${label}必须是 0 或正整数。`
+    };
+  }
+  return { value: parsed, error: null };
+}
+
+function parsePositiveNumberInput(value: string, label: string): ParsedNumericInput {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+  if (trimmed.length === 0 || !Number.isFinite(parsed) || parsed <= 0) {
+    return {
+      value: 0,
+      error: `${label}必须是大于 0 的数字。`
+    };
+  }
+  return { value: parsed, error: null };
+}
+
+function getAlignmentProposalDownloadText(text: string, proposal: AlignmentProposal | null): string {
+  const trimmed = text.trim();
+  if (trimmed.length > 0) {
+    return `${trimmed}\n`;
+  }
+  if (proposal) {
+    return `${JSON.stringify(proposal, null, 2)}\n`;
+  }
+  return "";
+}
+
+function waitForAudioAlignmentPoll(): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, 700);
+  });
+}
+
+function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): string {
+  if (status === "queued") {
+    return "排队中";
+  }
+  if (status === "running") {
+    return "运行中";
+  }
+  if (status === "completed") {
+    return "已完成";
+  }
+  if (status === "failed") {
+    return "失败";
+  }
+  return "已取消";
 }
 
 function createBatchMergeOptions({
@@ -759,6 +1388,25 @@ function confidenceLabel(confidence: "high" | "medium" | "low"): string {
   return "需复核";
 }
 
+function confidenceText(confidence: "high" | "medium" | "low"): string {
+  if (confidence === "high") {
+    return "高置信";
+  }
+  if (confidence === "medium") {
+    return "中置信";
+  }
+  return "低置信";
+}
+
+function formatSignedDuration(milliseconds: number): string {
+  const sign = milliseconds < 0 ? "-" : "+";
+  return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
+}
+
+function hasNearbyCutMarker(candidate: SuspectedCutCandidate, cutMarkers: CutMarker[]): boolean {
+  return cutMarkers.some((marker) => Math.abs(marker.sourceAtMs - candidate.sourceAtMs) <= 5000);
+}
+
 function TabButton({
   active,
   onClick,
@@ -783,8 +1431,8 @@ function TabButton({
 
 function Row({ label, value }: { label: string; value: string }) {
   return (
-    <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
-      <dt className="text-slate-500">{label}</dt>
+    <div className="grid min-w-0 grid-cols-[72px_minmax(0,1fr)] gap-2">
+      <dt className="min-w-0 truncate text-slate-500">{label}</dt>
       <dd className="truncate text-slate-300" title={value}>
         {value}
       </dd>

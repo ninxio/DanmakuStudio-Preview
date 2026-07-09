@@ -1,3 +1,5 @@
+- 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
+
 # Danmaku Timeline Studio 项目进度
 
 更新时间：2026-07-09
@@ -8,8 +10,78 @@
 - 原 `docs/PROGRESS.md` 的阶段记录已合并到本文档，后续不再维护第二份进度文件。
 - 每完成一个阶段都更新本文档，避免阶段信息分散。
 
+## 当前主目标
+
+- 当前 goal：分阶段实现 Danmaku Timeline Studio 的删减补偿与本地音视频对齐能力。
+- 最终期望：用户提供合法拥有或授权读取的完整原片和被删减版视频后，工具能自动或半自动发现删减点，输出精确的非破坏性 `insertGap` 规则，并由 Danmaku Studio 复核后应用到弹幕时间轴。
+- 总体路线：
+  1. 先把现有删减标记升级为可用于长合集切分的手动 `insertGap` 补偿规则。
+  2. 再做疑似删减点辅助发现：扫描弹幕文本中的“删、剪、跳、和谐、没了”等提示并聚类。
+  3. 增加锚点校准：用户输入“被删减版源时间 -> 完整片源时间”，系统推断中间缺失时长。
+  4. 做独立本地音频优先对齐 CLI：FFmpeg 抽音频特征，DTW/动态规划找候选缺失段，输出补偿规则 JSON。
+  5. 将 CLI 接入 Tauri UI，提供候选删减点列表、缩略图/上下文复核和一键应用。
+  6. 视觉对齐作为后续增强：低频抽帧、pHash/dHash、OpenCV ORB、候选区精扫；多模态 API 只作为辅助解释，不作为主算法。
+- 边界：只处理用户主动导入的本地文件和用户授权访问的媒体/元数据；不实现视频下载、DRM 绕过、账号绕过、私有接口爬取或未授权媒体访问。
+
 ## 2026-07-09 最新同步
 
+- 成熟度提升阶段 C2 已完成：Emby 主界面瘦身与窄侧栏溢出修复。
+  - 资源栏“Emby 时长”面板已移除服务器、路径、用户名、密码输入，主界面只保留搜索、候选选择、读取条目/下级剧集和导入时长规则。
+  - Emby 连接信息统一从设置中心读取；搜索时会用设置中心的服务器、路径、用户名和本次会话密码自动登录。
+  - 设置中心新增“本次会话密码”字段，密码仅保存在当前应用进程内，不写入项目文件、localStorage 或明文设置。
+  - 窄侧栏下的 Emby 卡片改为单列布局，输入框、结果列表、按钮和时长文本都增加收缩约束，避免横向撑出面板。
+  - 已补充主界面不显示敏感连接字段、设置保存不落盘密码等测试。
+  - 已重新打包分叉实验版 release exe 和 NSIS 安装包，可直接用于本轮测试。
+- 工程规则已更新：
+  - 每次对话产生可运行代码、UI 或 Tauri 变更后，默认完成相关测试并重新打包 release 产物；若未打包，必须明确说明原因。
+- 成熟度提升阶段 C1 已完成：专业桌面壳层与非敏感设置记忆 MVP。
+  - 当前记录位于分叉 worktree，用于实验性包装，不改变主线目标定义。
+  - Windows 发布版启动入口已加 `windows_subsystem = "windows"`，release 启动时不再弹出用户终端，debug 仍保留调试体验。
+  - 新增应用级设置持久化骨架，只保存 Emby 服务器地址、路径前缀、用户名、FFmpeg 路径和默认对齐参数。
+  - 明确安全边界：Emby 密码、访问 token 不写入项目文件，也不写入本地应用设置；当前实验版仍只在内存中使用敏感凭证。
+  - 设置弹窗升级为 Windows 11 / PowerToys 式设置中心，包含常规、Emby 连接、FFmpeg 与对齐、隐私与本地数据、关于。
+  - Emby 面板和视频对齐实验室已读取本地设置默认值，减少重复输入。
+- 阶段22 已完成：本地音频对齐后台任务状态与取消能力。
+  - Rust 侧新增 `start_audio_alignment_job`、`get_audio_alignment_job`、`cancel_audio_alignment_job` 三个 Tauri 命令。
+  - 桌面端音频对齐现在有任务快照：任务 ID、状态、进度、状态消息、结果 proposal 和错误详情。
+  - 前端调用层新增后台任务封装，保留旧的 `align_audio_files` 一次性接口兼容。
+  - “视频对齐实验室”改为启动后台任务后轮询状态，显示进度条、任务号、状态文本，并提供“取消任务”按钮。
+  - 当前取消是任务级取消请求，可阻止后续阶段和最终结果覆盖；FFmpeg 单次提取仍是阻塞阶段，后续可继续升级为可中断子进程读取。
+- 阶段21 已完成：视频对齐实验室调参与提案导出体验补强。
+  - “视频对齐实验室”新增音频特征窗口、最小缺失时长和匹配阈值输入，可直接传给 Tauri 本地音频对齐命令。
+  - 前端会先校验调参输入，避免无效参数进入本地任务。
+  - 新增“导出提案”按钮，可把当前粘贴、导入或本地运行返回的 `AlignmentProposal` 保存为 JSON，方便复现、回放和排查真实样本。
+  - 已确认当前仓库尚未接入 Tauri dialog 插件或同等文件选择能力；原生文件选择器留到下一阶段集中处理。
+- 阶段20 已完成：Tauri 本地音频对齐任务接入。
+  - Rust 侧新增 `align_audio_files` 命令，接收完整片源路径、删减版路径和可选 FFmpeg 路径。
+  - 命令会调用本机 FFmpeg 抽取单声道低采样率 PCM，计算 RMS/过零率特征，运行动态规划对齐，并返回 `AlignmentProposal`。
+  - 前端新增 Tauri 音频对齐调用层，网页模式下明确提示需要桌面端。
+  - “视频对齐实验室”面板已支持直接填写本地视频路径并运行桌面端对齐任务，返回结果会自动导入复核面板。
+- 阶段19 已完成：视频对齐实验室 UI 闭环 MVP 已接入。
+  - 资源栏新增“视频对齐实验室”面板，可粘贴或导入本地音频对齐 CLI 输出的 `AlignmentProposal` JSON。
+  - 面板会显示锚点数量、候选补偿数量、待应用/已应用状态、候选时间与诊断信息。
+  - 可一键应用候选，把自动锚点写入 `syncAnchors`，把候选缺失段写入 `cutMarkers`。
+  - 本阶段不伪装为已能在 WebView 内直接运行 FFmpeg；外部进程执行仍留给下一阶段 Tauri 命令接入。
+- 阶段18 已完成：本地音频优先对齐 CLI 原型已接入。
+  - 新增纯 TypeScript 音频特征序列对齐领域算法，可从“完整片源特征序列 vs 被删减版特征序列”推断候选缺失段。
+  - 新增 `corepack pnpm align:audio -- ...` 脚本入口，支持 FFmpeg 直接抽取本地视频音频特征，也支持读取预生成特征 JSON。
+  - CLI 输出现有 `AlignmentProposal` JSON，后续可直接复用 Tauri UI 的 proposal 应用与复核管线。
+  - 已提供合成音频特征 fixtures，并完成 CLI 烟测。
+- 阶段17 已完成：锚点校准 MVP 已接入。
+  - 新增“源时间 -> 完整片源时间”锚点文本解析。
+  - 可根据相邻锚点的累计差值变化推断候选 `insertGap` 补偿点。
+  - 资源栏新增“锚点校准”面板，可预览锚点数量、推断补偿数量和候选补偿时长。
+  - 可一键应用锚点与推断补偿，进入现有 `syncAnchors` 和 `cutMarkers`，继续保持非破坏性编辑与可复核。
+- 阶段16 已完成：疑似删减点辅助发现 MVP 已接入。
+  - 新增弹幕文本扫描与时间窗口聚类，识别“删了、剪了、跳了、和谐、没了”等提示。
+  - 资源栏会显示疑似删减点候选、命中数量、关键词、置信度和样例弹幕。
+  - 候选点可一键转为“待确认补偿点”，进入现有 `cutMarkers`，继续保持非破坏性编辑。
+  - 已补充候选聚类、单条提示忽略、不同资源不混并、UI 转换候选为补偿点等测试。
+- 阶段15 已完成：删减补偿基础能力已接入批量分集合并。
+  - 新增共享时间补偿 helper，现有删减标记可作为非破坏性 `insertGap` 规则参与计算。
+  - `buildBatchMergePlan` 已支持传入 `cutMarkers`，长合集切分会先使用补偿后的时间轴，再按 Emby 真实集时长或其他规则切分。
+  - 分集合并草案已显示补偿点数量、总补偿时长、受影响分集数和受影响弹幕数。
+  - 已补充多个补偿点累计、补偿后按真实集时长切分、导出 XML 重新验证等测试。
 - Emby 订阅库接入已在打包程序中验证成功：
   - 已支持用户名/密码登录、搜索、选择候选、读取下级剧集和获取精确剧集时长。
   - 已实现 Tauri 桌面代理 `emby_http_request`，解决订阅库 CORS 导致 WebView `Failed to fetch` 的问题。
@@ -21,12 +93,16 @@
 - 当前桌面构建产物：
   - 裸 exe：`src-tauri/target/release/danmaku_timeline_studio.exe`
   - NSIS 安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`
+- 当前成熟度提升构建产物：
+  - 裸 exe：`C:\Users\lzp\.codex\worktrees\c0f9\xml-ass-bilibili-xml-p-b\src-tauri\target\release\danmaku_timeline_studio.exe`
+  - NSIS 安装包：`C:\Users\lzp\.codex\worktrees\c0f9\xml-ass-bilibili-xml-p-b\src-tauri\target\release\bundle\nsis\Danmaku Timeline Studio_0.1.0_x64-setup.exe`
 - 最近已验证命令：
   - `corepack pnpm lint` 成功。
-  - `corepack pnpm test` 成功，当前 20 个测试文件、55 个测试通过。
+  - `corepack pnpm test` 成功，当前 26 个测试文件、82 个测试通过。
   - `corepack pnpm build` 成功。
-  - `cargo test` 成功。
-  - `corepack pnpm tauri:build` 成功。
+  - `cargo test` 成功，当前 8 个 Rust 单元测试通过。
+  - `corepack pnpm align:audio -- --complete-features fixtures/alignment/audio-complete-features.json --source-features fixtures/alignment/audio-source-features.json` 成功。
+  - `corepack pnpm tauri:build` 成功，分叉实验版已生成包含 C2 改动的 release exe 和 NSIS 安装包。
 - 已确认新的产品难题：
   - B 站源视频可能因删减导致弹幕时间轴缩短。
   - 在多集合集弹幕中，前序删减会让后续集数弹幕整体提前，单纯按 Emby 真实集时长切分仍可能错位。
@@ -88,6 +164,297 @@
   - 独立做一个本地对齐工具，输入用户合法提供的完整原片和删减版视频，输出删减规则 JSON。
   - 优先使用音频对齐，因为多数删减会同时剪掉画面和音频，音频特征通常比视觉逐帧对比更便宜。
   - 对齐流水线建议为：FFmpeg 抽音频/抽帧 → 粗采样特征 → 动态规划/DTW 对齐 → 候选删减区精扫 → 输出规则 → Danmaku Studio 复核应用。
+
+### 阶段15：删减补偿接入批量分集合并
+
+- 状态：完成。
+- 已将当前长期目标设为“删减补偿与本地音视频对齐能力”，并写入本文档的“当前主目标”。
+- 已新增 `src/domain/danmaku/timeCompensation.ts`：
+  - `applyCutMapping`：按删减标记累计插入缺失时长。
+  - `getAppliedCutGap`：统计某一时间点已应用的补偿量。
+  - `src/domain/timeline/mapping.ts` 继续导出 `applyCutMapping`，保持原有调用入口兼容。
+- 已扩展 `buildBatchMergePlan`：
+  - 新增 `cutMarkers` 选项。
+  - 单分集/分 P 输出会按补偿后时间生成 `finalTimeMs`。
+  - 长合集范围切分会先把弹幕 `sourceTimeMs` 映射到补偿后时间轴，再按自动切分、真实集时长或人工切点切分。
+  - 新增 `compensation` 摘要，统计补偿点数量、总补偿时长、受影响弹幕数和受影响分集数。
+- 已更新资源栏“分集合并草案”：
+  - 自动把项目中的删减标记传入分集合并计划。
+  - 展示补偿点、总时长和影响范围，避免用户在不知情时导出。
+- 已补充测试：
+  - 多个删减补偿点累计影响同一分集内最终时间。
+  - 按真实集时长切分前先应用补偿映射，避免后续集被前序删减错误吞入。
+  - 补偿后的分集 XML 仍会重新序列化并验证。
+- 已重新验证：
+  - `corepack pnpm test -- src/domain/danmaku/batchMerge.test.ts src/domain/timeline/mapping.test.ts` 成功，2 个测试文件、9 个测试通过。
+  - `corepack pnpm test` 成功，当前 20 个测试文件、57 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+
+### 阶段16：疑似删减点辅助发现 MVP
+
+- 状态：完成。
+- 已新增 `src/domain/danmaku/cutHints.ts`：
+  - 扫描弹幕文本中的删减相关提示词，包括“删了、剪了、跳了、和谐、没了”等。
+  - 按资源和时间窗口聚类，单条孤立提示默认不生成候选，避免过度打扰。
+  - 输出候选时间、命中数量、关键词、样例弹幕、置信度和来源文件。
+  - 领域逻辑不依赖 React，不修改原始 XML。
+- 已更新资源栏：
+  - 当存在候选时显示“疑似删减点”面板。
+  - 展示候选时间、来源 XML、命中数量、关键词、置信度和样例弹幕。
+  - 支持把候选一键转为“待确认补偿点”，进入项目 `cutMarkers` 并可继续手动复核/编辑。
+  - 已避免靠近已有删减标记的候选重复添加。
+- 已扩展 store：
+  - `addCutMarker` 支持可选名称和备注，用于保留候选来源和关键词。
+  - 旧调用保持兼容。
+- 已补充测试：
+  - `src/domain/danmaku/cutHints.test.ts` 覆盖文本命中、时间聚类、孤立提示过滤和跨资源隔离。
+  - `src/features/assets/AssetPanel.test.tsx` 覆盖候选转为待确认补偿点。
+- 已重新验证：
+  - `corepack pnpm test -- src/domain/danmaku/cutHints.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、5 个测试通过。
+  - `corepack pnpm test` 成功，当前 21 个测试文件、61 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+
+### 阶段17：锚点校准 MVP
+
+- 状态：完成。
+- 已新增 `src/domain/alignment/anchorCalibration.ts`：
+  - 支持解析多行“源时间 -> 完整片源时间”锚点文本。
+  - 支持 `mm:ss`、`mm:ss.xxx`、`hh:mm:ss.xxx` 等常见时间码。
+  - 按源时间排序锚点，并根据相邻锚点的累计差值变化推断缺失时长。
+  - 当新增缺失时长超过阈值时输出 `AlignmentProposal.cutCandidates`，可复用现有对齐提案管线。
+  - 解析错误和锚点不足会产出诊断信息，不会阻断用户继续编辑。
+- 已更新资源栏：
+  - 新增“锚点校准”面板。
+  - 用户可粘贴多行对应点，实时看到锚点数量、推断补偿数量和候选补偿时长。
+  - “应用锚点与补偿”会把锚点写入 `syncAnchors`，把推断补偿写入 `cutMarkers`。
+- 已扩展 store：
+  - 新增 `applyAlignmentProposalData`，让 UI、手动 proposal 和未来本地音频/视频对齐 CLI 输出都能走同一个应用入口。
+  - 旧的 `applyAlignmentProposal` 继续兼容当前导入 proposal 流程。
+- 已补充测试：
+  - `src/domain/alignment/anchorCalibration.test.ts` 覆盖锚点解析、缺失时长推断、小误差过滤和无效行诊断。
+  - `src/features/assets/AssetPanel.test.tsx` 覆盖资源栏应用锚点校准并生成补偿点。
+- 已重新验证：
+  - `corepack pnpm test -- src/domain/alignment/anchorCalibration.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、7 个测试通过。
+  - `corepack pnpm test` 成功，当前 22 个测试文件、66 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+
+### 阶段18：本地音频优先对齐 CLI 原型
+
+- 状态：完成原型。
+- 已新增 `src/domain/alignment/audioAlignment.ts`：
+  - 用完整片源音频特征序列和被删减版音频特征序列做单调动态规划匹配。
+  - 从匹配路径中识别“完整片源前进时长大于删减版前进时长”的区间，生成 `CutCandidate`。
+  - 输出 `AlignmentProposal`，包含自动锚点、候选补偿点、置信度和诊断信息。
+  - 领域算法只处理特征序列，不依赖 React、Tauri、FFmpeg 或真实媒体文件。
+- 已新增 `scripts/audio-align-prototype.mjs` 和 `package.json` 脚本入口：
+  - 命令：`corepack pnpm align:audio -- --complete full.mp4 --source cut.mp4 --out outputs/alignment-proposal.json`
+  - 也支持特征 JSON 烟测：`corepack pnpm align:audio -- --complete-features fixtures/alignment/audio-complete-features.json --source-features fixtures/alignment/audio-source-features.json`
+  - 默认通过 FFmpeg 抽取单声道低采样率 PCM，按窗口计算 RMS 和过零率特征。
+  - 输出现有 `AlignmentProposal` JSON，后续可导入或直接接入 Tauri UI 复核。
+- 已新增合成特征 fixtures：
+  - `fixtures/alignment/audio-complete-features.json`
+  - `fixtures/alignment/audio-source-features.json`
+- 已补充测试：
+  - `src/domain/alignment/audioAlignment.test.ts` 覆盖缺失段推断、无缺失序列、匹配路径转候选和空特征诊断。
+- 已重新验证：
+  - `corepack pnpm test -- src/domain/alignment/audioAlignment.test.ts` 成功，1 个测试文件、4 个测试通过。
+  - `corepack pnpm align:audio -- --complete-features fixtures/alignment/audio-complete-features.json --source-features fixtures/alignment/audio-source-features.json` 成功，输出 `audio-gap-1` 候选补偿。
+  - `corepack pnpm test` 成功，当前 23 个测试文件、70 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+- 当前限制：
+  - 仍是原型算法，精度依赖音频特征窗口大小和两版音轨相似度。
+  - 真实视频模式依赖用户本机可用的 FFmpeg。
+  - 还未接入 Tauri UI 的文件选择、运行进度、候选复核和一键应用流程。
+
+### 阶段19：视频对齐实验室 UI 闭环 MVP
+
+- 状态：完成 MVP。
+- 已更新资源栏：
+  - 新增“视频对齐实验室”面板。
+  - 支持粘贴 `AlignmentProposal` JSON。
+  - 支持从本地 JSON 文件导入对齐提案。
+  - 显示锚点数量、候选补偿数量、待应用/已应用状态、候选补偿时间和诊断信息。
+  - 支持一键“应用候选”，复用现有 `applyAlignmentProposal` 流程写入 `syncAnchors` 和 `cutMarkers`。
+- 已补充测试：
+  - `src/features/assets/AssetPanel.test.tsx` 覆盖导入音频 CLI 输出 proposal 并应用候选。
+- 已重新验证：
+  - `corepack pnpm test -- src/features/assets/AssetPanel.test.tsx` 成功，1 个测试文件、4 个测试通过。
+  - `corepack pnpm test` 成功，当前 23 个测试文件、71 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+- 当前限制：
+  - UI 目前负责导入/预览/应用 CLI 输出，不直接在 Tauri 内启动 FFmpeg。
+  - 下一阶段应实现 Tauri 命令或安全的本地任务封装，处理文件选择、进度、错误和输出 proposal。
+
+### 阶段20：Tauri 本地音频对齐任务接入
+
+- 状态：完成 MVP。
+- 已新增 `src-tauri/src/audio_alignment.rs`：
+  - 新增 Tauri 命令 `align_audio_files`。
+  - 输入完整片源路径、删减版路径、可选 FFmpeg 路径、采样率、窗口、匹配阈值和最小缺失时长等参数。
+  - 校验用户填写的两个媒体路径必须是本地文件。
+  - 使用 `std::process::Command` 直接调用 FFmpeg，不经过 shell 拼接命令。
+  - FFmpeg 抽取单声道 `f32le` PCM 后，按窗口生成 RMS 和过零率特征。
+  - Rust 侧运行单调动态规划对齐，输出自动锚点和候选补偿点。
+  - 返回结构使用 `AlignmentProposal` 兼容字段，可直接进入前端复核和应用流程。
+- 已更新 Tauri invoke handler：
+  - `align_audio_files` 与既有 `emby_http_request` 并列注册。
+- 已新增 `src/infrastructure/alignment/tauriAudioAlignment.ts`：
+  - 封装前端调用 Tauri 命令。
+  - 网页模式下明确提示“本地音频对齐需要在 Tauri 桌面端运行”。
+  - 支持测试注入 invoker，避免前端单元测试依赖真实 Tauri 环境。
+- 已更新资源栏“视频对齐实验室”：
+  - 新增完整片源路径、删减版路径、FFmpeg 路径输入。
+  - 新增“运行本地对齐”按钮。
+  - 桌面端运行成功后会把返回 proposal 写入文本框并导入现有复核面板。
+  - 运行失败会显示明确错误状态。
+- 已补充测试：
+  - Rust：音频缺失段推断、PCM 特征提取、请求参数校验。
+  - 前端：Tauri 音频对齐调用层 invoker 注入测试。
+- 已重新验证：
+  - `cargo test` 成功，6 个 Rust 单元测试通过。
+  - `corepack pnpm test -- src/infrastructure/alignment/tauriAudioAlignment.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、5 个测试通过。
+  - `corepack pnpm test` 成功，当前 24 个测试文件、72 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+- 当前限制：
+  - UI 暂时使用文本路径输入，尚未接入原生文件选择器。
+  - 任务暂时是一次性运行，尚未提供实时进度、取消按钮和后台任务队列。
+  - 真实视频精度仍需要候选区精扫、窗口调参和更多样本验证。
+
+### 阶段21：视频对齐实验室调参与提案导出体验
+
+- 状态：完成。
+- 已更新资源栏“视频对齐实验室”：
+  - 新增 `窗口 ms`、`最小缺失 ms`、`匹配阈值` 三个运行参数。
+  - 运行本地音频对齐前会校验参数，窗口必须为大于 0 的整数，最小缺失必须为 0 或正整数，匹配阈值必须为大于 0 的数字。
+  - 参数会传入 Tauri `align_audio_files` 命令，便于真实样本中在“更粗更快”和“更细更敏感”之间试错。
+  - 新增“导出提案”按钮，可保存当前 `AlignmentProposal` JSON。
+  - 导出来源优先使用文本框内容；如果文本框为空但已有已导入 proposal，则导出已解析的 proposal。
+- 已补充测试：
+  - `src/features/assets/AssetPanel.test.tsx` 覆盖导入音频对齐提案后导出 JSON，校验下载 Blob 中保留候选补偿 ID。
+- 已重新验证：
+  - `corepack pnpm test -- src/features/assets/AssetPanel.test.tsx` 成功，1 个测试文件、5 个测试通过。
+  - `corepack pnpm test` 成功，当前 24 个测试文件、73 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+- 当前限制：
+  - 尚未接入原生文件选择器；当前代码未发现 Tauri dialog 插件或同等前端 API，可在下一阶段集中补依赖、权限和 UI。
+  - 对齐任务仍是一次性运行，尚未提供后台任务进度、取消和详细日志面板。
+  - 真实视频边界精度仍需要候选区精扫和更多样本验证。
+
+### 阶段22：本地音频对齐后台任务状态与取消
+
+- 状态：完成。
+- 已新增 Rust 侧任务命令：
+  - `start_audio_alignment_job`：启动后台音频对齐任务，立即返回任务快照。
+  - `get_audio_alignment_job`：按任务 ID 查询任务状态、进度、消息、结果和错误。
+  - `cancel_audio_alignment_job`：请求取消任务，并把任务状态标记为已取消。
+- 已保留兼容接口：
+  - 旧的 `align_audio_files` 仍可一次性返回 `AlignmentProposal`。
+  - 内部对齐流程抽出阶段进度回调，后台任务和旧接口复用同一套校验、抽取、匹配和推断逻辑。
+- 已更新前端调用层：
+  - 新增后台任务类型 `AudioAlignmentJobSnapshot`。
+  - 新增启动、查询、取消封装。
+  - 新增任务完成状态判断 helper。
+- 已更新资源栏“视频对齐实验室”：
+  - “运行本地对齐”现在会启动后台任务并轮询任务快照。
+  - 面板显示任务消息、百分比进度、任务 ID 和状态文本。
+  - 新增“取消任务”按钮，可在运行中请求取消。
+  - 任务完成后仍自动导入 proposal，继续走现有候选复核和应用流程。
+- 已补充测试：
+  - Rust 覆盖任务快照更新，以及取消后不允许运行状态覆盖取消状态。
+  - 前端覆盖后台任务启动、查询、取消调用封装。
+- 已重新验证：
+  - `cargo test` 成功，8 个 Rust 单元测试通过。
+  - `corepack pnpm test -- src/infrastructure/alignment/tauriAudioAlignment.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、7 个测试通过。
+  - `corepack pnpm test` 成功，当前 24 个测试文件、74 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+- 当前限制：
+  - 取消目前是任务级取消请求，能阻止后续阶段和最终结果覆盖；单次 FFmpeg 音频提取仍是阻塞调用，后续可改成可中断子进程读取。
+  - 尚未提供完整详细日志面板。
+  - 原生文件选择器仍待接入。
+
+### 成熟度提升阶段 C2：Emby 主界面瘦身与窄侧栏溢出修复
+
+- 状态：完成实验迭代。
+- 产品决策：
+  - 资源栏中的“Emby 时长”不再承担连接配置职责，只保留搜索、候选选择、读取条目/下级剧集和导入时长规则。
+  - 服务器地址、路径前缀、用户名和本次会话密码统一放入设置中心的“Emby 连接”页维护。
+  - 当前版本仍不提供跨次启动保存密码；密码只进入当前应用进程内存，后续再接 Windows Credential Manager / 系统凭证库。
+- 已更新设置中心：
+  - “Emby 连接”新增“本次会话密码”输入。
+  - 保存设置时会保存非敏感连接项，同时把密码写入内存级会话凭证。
+  - 恢复默认或清除本地设置时会同步清除内存级会话密码。
+  - 隐私说明补充“密码只保存在当前应用进程内，关闭应用后失效”。
+- 已更新 Emby 主界面：
+  - 删除服务器、路径、用户名、密码和显式登录按钮。
+  - 搜索按钮会读取设置中心配置，必要时自动登录后再搜索。
+  - 搜索结果选中后可读取条目、读取下级剧集或导入单条时长。
+  - 如果缺少服务器、用户名或本次会话密码，会给出真实状态提示，而不是静默失败。
+- 已修复窄侧栏 UI 溢出：
+  - Emby 卡片使用单列搜索流，避免窄宽度下两列输入撑破容器。
+  - 输入框、结果按钮、读取按钮、时长文本框和信息行增加 `min-w-0` / `w-full` / 截断约束。
+  - `Row` 信息行也补充最小宽度约束，避免长文本把侧栏撑出横向滚动。
+- 已补充测试：
+  - `src/features/assets/AssetPanel.test.tsx` 覆盖主界面 Emby 面板只保留搜索入口，不再显示服务器、路径、用户名、密码和登录按钮。
+  - `src/features/editor/SettingsDialog.test.tsx` 覆盖会话密码可供当前进程使用，但不会写入 localStorage。
+- 已重新验证：
+  - `corepack pnpm test -- src/features/assets/AssetPanel.test.tsx src/features/editor/SettingsDialog.test.tsx src/infrastructure/settings/appSettings.test.ts` 成功，3 个测试文件、13 个测试通过。
+  - `corepack pnpm test` 成功，当前 26 个测试文件、82 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+  - `corepack pnpm tauri:build` 成功，已重新生成包含本阶段 UI 修复的 release exe 和 NSIS 安装包。
+- 当前限制：
+  - 尚未接入系统凭证库，因此“本次会话密码”关闭应用后会失效。
+  - 设置中心尚未提供从主 Emby 面板一键跳转的入口；当前仍使用顶栏设置按钮进入。
+
+### 成熟度提升阶段 C1：专业桌面壳层与设置记忆 MVP
+
+- 状态：完成实验 MVP。
+- 分叉定位：
+  - 本阶段在分叉 worktree 中进行，目标是验证产品成熟度提升方向，不改变主线“删减补偿与本地音视频对齐能力”的工程目标。
+  - 视觉方向采用 Windows 11 / PowerToys 式工具外壳 + 深色专业时间线工作区，强调系统工具感、清晰设置导航和克制的信息密度。
+- 已更新 Windows 桌面壳：
+  - `src-tauri/src/main.rs` 增加 release-only Windows GUI subsystem 标记。
+  - 发布版启动时不再同时打开用户终端；debug 构建仍可保留终端调试能力。
+- 已新增应用级设置持久化：
+  - 新增 `src/infrastructure/settings/appSettings.ts`。
+  - 使用现有浏览器本地存储实现可验证骨架，不新增网络依赖。
+  - 仅保存非敏感项：Emby 服务器地址、路径前缀、用户名、FFmpeg 路径、默认窗口、默认最小缺失和默认匹配阈值。
+  - 读取旧数据时会忽略未知字段；保存时只序列化白名单字段。
+- 安全边界：
+  - Emby 密码和访问 token 不保存到项目文件。
+  - Emby 密码和访问 token 不保存到本地应用设置。
+  - 当前实验版敏感凭证仍只在组件内存中使用；真正“记住密码”应后续接 Windows Credential Manager / 系统凭证库。
+- 已更新设置中心：
+  - 旧的轻量设置弹窗升级为左侧导航设置中心。
+  - 新增分类：常规、Emby 连接、FFmpeg 与对齐、隐私与本地数据、关于。
+  - “保存设置”“恢复默认”“清除本地设置”均有真实持久化行为，不是展示按钮。
+  - 隐私页明确说明本地数据边界和不会保存敏感凭证。
+- 已接入现有功能：
+  - Emby 时长面板会读取本地设置中的服务器地址、路径前缀和用户名作为默认值。
+  - 视频对齐实验室会读取本地设置中的 FFmpeg 路径和默认对齐参数。
+- 已补充测试：
+  - `src/infrastructure/settings/appSettings.test.ts` 覆盖默认值、规范化、敏感字段忽略和清除本地设置。
+  - `src/features/editor/SettingsDialog.test.tsx` 覆盖设置中心保存 Emby 非敏感项、保存 FFmpeg/对齐参数和清除本地设置。
+- 已重新验证：
+  - `corepack pnpm install --offline` 成功，分叉 worktree 复用本机 pnpm store，无新增依赖下载。
+  - `corepack pnpm test -- src/infrastructure/settings/appSettings.test.ts src/features/editor/SettingsDialog.test.tsx src/features/assets/AssetPanel.test.tsx` 成功，3 个测试文件、12 个测试通过。
+  - `cargo test` 成功，8 个 Rust 单元测试通过。
+  - `corepack pnpm test` 成功，当前 26 个测试文件、81 个测试通过。
+  - `corepack pnpm lint` 成功。
+  - `corepack pnpm build` 成功。
+  - `corepack pnpm tauri:build` 成功，已生成分叉实验版 release exe 和 NSIS 安装包。
+- 当前限制：
+  - 尚未接入系统凭证库，因此不会提供“记住密码”开关，避免把敏感字段明文落盘。
+  - 设置存储目前使用浏览器本地存储；后续可迁移到 Tauri app config 文件或系统设置目录。
+  - 已完成打包链路验证；发布版无终端行为仍建议再通过实际双击 exe 做一次人工确认。
 
 ## 早期新增记录（2026-07-03）
 
@@ -410,23 +777,35 @@
 ## 未完成的待办
 
 1. 删减补偿基础能力：
-   - 在领域层新增非破坏性 `insertGap` / 缺失时长规则。
-   - 在批量分集合并前应用补偿后的时间映射。
-   - 在 UI 中提供手动添加、编辑、删除补偿点的面板。
-   - 导出时输出补偿报告，方便复核。
+   - 已在领域层用删减标记表达非破坏性 `insertGap` / 缺失时长规则。
+   - 已在批量分集合并前应用补偿后的时间映射。
+   - 已在分集合并草案中展示补偿摘要。
+   - 待补强：提供更专门的手动补偿点面板。
+   - 待补强：导出时输出更完整的补偿报告，方便复核。
 2. 疑似删减点辅助发现：
-   - 扫描弹幕文本中的“删、剪、跳、和谐、没了”等词。
-   - 按时间窗口聚类并展示候选删减点。
-   - 支持一键把候选转换为待确认补偿规则。
+   - 已扫描弹幕文本中的“删、剪、跳、和谐、没了”等词。
+   - 已按时间窗口聚类并展示候选删减点。
+   - 已支持一键把候选转换为待确认补偿规则。
+   - 待补强：允许用户配置关键词、聚类窗口和最小命中数。
+   - 待补强：在时间轴上叠加显示文本扫描候选影响区。
 3. 锚点校准：
-   - 支持用户输入“源弹幕时间 -> 完整片源时间”的对应点。
-   - 根据两个或多个锚点推断中间缺失时长。
-   - 在时间轴上预览补偿影响区。
+   - 已支持用户输入“源弹幕时间 -> 完整片源时间”的对应点。
+   - 已根据两个或多个锚点推断中间缺失时长。
+   - 已通过对齐提案管线把锚点与推断补偿应用到项目。
+   - 待补强：在时间轴上更明确地预览锚点推断补偿影响区。
+   - 待补强：支持编辑、删除和批量管理手动锚点。
 4. 本地音频/视频对齐原型：
-   - 先做独立 CLI 或脚本，输入两个用户本地合法视频，输出删减规则 JSON。
-   - 优先音频对齐：FFmpeg 抽音频特征，使用动态规划/DTW 找到缺失段。
+   - 已做独立 CLI 原型，输入两个用户本地合法视频或两份特征 JSON，输出 `AlignmentProposal` JSON。
+   - 已实现音频优先对齐：FFmpeg 抽音频特征，使用动态规划找候选缺失段。
    - 视觉对齐作为补充：抽帧、感知哈希/ORB、候选区精扫。
-   - 后续再接入 Tauri UI，作为“视频对齐实验室”。
+   - 已接入 UI 的 proposal 导入、复核和一键应用 MVP。
+   - 已接入 Tauri 本地命令，可直接从桌面 UI 运行音频对齐任务。
+   - 已支持音频特征窗口、最小缺失时长和匹配阈值调参。
+   - 已支持导出当前对齐提案 JSON，用于复现和回放。
+   - 已支持后台任务状态、进度轮询和任务级取消请求。
+   - 待补强：使用原生文件选择器选择两个视频路径。
+   - 待补强：让 FFmpeg 音频提取阶段支持真正中断，并补充详细日志面板。
+   - 待补强：增加候选区精扫，提高真实视频删减点边界精度。
 5. 验证与体验：
    - 扩展 Playwright E2E 覆盖保存/打开项目、导出后重新导入、撤销恢复、小窗口截图。
    - 持续检查打包程序中的 Emby、ZIP 导出、长合集切分和未来补偿规则交互。

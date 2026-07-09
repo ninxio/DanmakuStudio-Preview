@@ -13,6 +13,7 @@
     "test:e2e": "playwright test",
     "lint": "eslint .",
     "format": "prettier --write .",
+    "align:audio": "node scripts/audio-align-prototype.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

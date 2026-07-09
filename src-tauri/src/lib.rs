@@ -6,10 +6,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod audio_alignment;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ping, emby_http_request])
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            emby_http_request,
+            audio_alignment::align_audio_files,
+            audio_alignment::start_audio_alignment_job,
+            audio_alignment::get_audio_alignment_job,
+            audio_alignment::cancel_audio_alignment_job
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -113,7 +122,8 @@ fn parse_json_response_body(text: &str) -> Value {
     if text.trim().is_empty() {
         return Value::Null;
     }
-    serde_json::from_str(text).unwrap_or_else(|_| json!({ "Message": truncate_response_text(text) }))
+    serde_json::from_str(text)
+        .unwrap_or_else(|_| json!({ "Message": truncate_response_text(text) }))
 }
 
 fn truncate_response_text(text: &str) -> String {
