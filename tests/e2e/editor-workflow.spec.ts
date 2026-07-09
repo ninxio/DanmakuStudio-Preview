@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
@@ -15,6 +15,43 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
 
   await expect(page.getByTestId("status-bar")).toContainText("准备就绪");
   await page.screenshot({ path: screenshotPath("empty-project.png"), fullPage: true });
+
+  await page.getByLabel("设置").click();
+  await page.getByRole("button", { name: "隐私与本地数据" }).click();
+  await expect(page.getByRole("dialog")).toContainText("隐私与本地数据");
+  await page.screenshot({ path: screenshotPath("settings-privacy.png"), fullPage: true });
+  const settingsDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "导出设置" }).click();
+  const settingsDownload = await settingsDownloadPromise;
+  const settingsBackupPath = resolve(downloadDir, settingsDownload.suggestedFilename());
+  await settingsDownload.saveAs(settingsBackupPath);
+  const settingsBackupText = readFileSync(settingsBackupPath, "utf8");
+  expect(settingsBackupText).toContain("alignment");
+  expect(settingsBackupText).not.toContain("password");
+  expect(settingsBackupText).not.toContain("token");
+  const settingsImportPath = resolve(downloadDir, "imported-settings.json");
+  writeFileSync(
+    settingsImportPath,
+    JSON.stringify({
+      emby: {
+        serverUrl: "https://backup.example.test",
+        pathPrefix: "emby",
+        username: "tester",
+        password: "secret-pass"
+      },
+      alignment: {
+        ffmpegPath: "ffmpeg",
+        windowMs: 600,
+        minGapMs: 1500,
+        matchThreshold: 0.3,
+        token: "secret-token"
+      }
+    }),
+    "utf8"
+  );
+  await page.getByTestId("settings-import-input").setInputFiles(settingsImportPath);
+  await expect(page.getByTestId("status-bar")).toContainText("已导入设置");
+  await page.getByLabel("关闭设置").click();
 
   await page.getByTestId("xml-input").setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
   await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
