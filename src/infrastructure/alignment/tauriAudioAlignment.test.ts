@@ -42,6 +42,7 @@ describe("Tauri 音频对齐调用", () => {
           status: "running",
           progress: 0.25,
           message: "正在提取完整片源音频特征。",
+          logs: ["音频对齐任务已加入队列。", "正在提取完整片源音频特征。"],
           proposal: null,
           error: null,
           updatedAtMs: 1
@@ -52,6 +53,7 @@ describe("Tauri 音频对齐调用", () => {
           status: "completed",
           progress: 1,
           message: "本地音频对齐完成。",
+          logs: ["本地音频对齐完成。"],
           proposal: {
             anchors: [],
             cutCandidates: [],
@@ -67,6 +69,7 @@ describe("Tauri 音频对齐调用", () => {
           status: "cancelled",
           progress: 1,
           message: "已请求取消音频对齐任务。",
+          logs: ["已请求取消音频对齐任务。"],
           proposal: null,
           error: null,
           updatedAtMs: 3
@@ -75,7 +78,8 @@ describe("Tauri 音频对齐调用", () => {
 
     await expect(startTauriAudioAlignmentJob(request, invoker)).resolves.toMatchObject({
       jobId: "job-1",
-      status: "running"
+      status: "running",
+      logs: ["音频对齐任务已加入队列。", "正在提取完整片源音频特征。"]
     });
     await expect(getTauriAudioAlignmentJob("job-1", invoker)).resolves.toMatchObject({
       status: "completed",

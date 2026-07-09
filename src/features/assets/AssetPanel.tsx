@@ -1221,6 +1221,18 @@ function VideoAlignmentLabPanel({
             <div className="text-[11px] text-slate-500">
               任务 {jobSnapshot.jobId} / {alignmentJobStatusText(jobSnapshot.status)}
             </div>
+            {jobSnapshot.logs.length > 0 ? (
+              <details className="rounded border border-panel-line bg-[#111318] p-2 text-[11px] text-slate-400">
+                <summary className="cursor-pointer text-slate-300">任务日志</summary>
+                <ol className="mt-2 grid gap-1">
+                  {jobSnapshot.logs.slice(-8).map((item, index) => (
+                    <li key={`${item}-${index}`} className="break-words">
+                      {item}
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            ) : null}
           </div>
         ) : null}
         <textarea

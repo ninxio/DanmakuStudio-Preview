@@ -23,6 +23,7 @@ export interface AudioAlignmentJobSnapshot {
   status: AudioAlignmentJobStatus;
   progress: number;
   message: string;
+  logs: string[];
   proposal: AlignmentProposal | null;
   error: string | null;
   updatedAtMs: number;

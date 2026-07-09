@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C4 已完成：FFmpeg 提取阶段真实取消与任务日志面板。
+  - Rust 后台任务的 FFmpeg 音频提取已从阻塞 `output()` 改为可轮询的子进程执行，任务取消时会 kill 当前 FFmpeg 子进程并回收 stdout/stderr 读取线程。
+  - `AudioAlignmentJobSnapshot` 新增 `logs`，任务排队、校验、提取完成、匹配、取消和错误都会写入去重后的日志列表。
+  - “视频对齐实验室”进度卡片新增可展开“任务日志”，显示最近日志，便于排查 FFmpeg 路径、媒体文件和长任务取消问题。
+  - 一次性 `align_audio_files` 命令保持兼容；后台任务路径会传入真实取消标记。
+  - 已补充 Rust 任务日志和取消前置检查测试，前端调用层测试同步覆盖 `logs` 字段。
+  - 已重新验证：`cargo test` 成功，当前 9 个 Rust 单元测试通过。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/alignment/tauriAudioAlignment.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、9 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 27 个测试文件、86 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
 - 成熟度提升阶段 C3 已完成：视频对齐实验室原生路径选择器。
   - 已在当前主目录创建回退标签 `checkpoint/pre-uninterrupted-dev-20260710`，指向本轮开发开始前的 `ae040b1345842687a1fbe3607c7178f61ef968eb`，确保可按标签回退。
   - Tauri 桌面壳新增官方 dialog 插件接入，并通过 `src-tauri/capabilities/default.json` 为主窗口开放 `dialog:allow-open` 权限。
@@ -817,7 +830,7 @@
    - 已支持导出当前对齐提案 JSON，用于复现和回放。
    - 已支持后台任务状态、进度轮询和任务级取消请求。
    - 已补强：使用原生文件选择器选择完整片源、删减版视频和 FFmpeg 路径。
-   - 待补强：让 FFmpeg 音频提取阶段支持真正中断，并补充详细日志面板。
+   - 已补强：FFmpeg 音频提取阶段支持任务取消时终止子进程，并补充任务日志面板。
    - 待补强：增加候选区精扫，提高真实视频删减点边界精度。
 5. 验证与体验：
    - 扩展 Playwright E2E 覆盖保存/打开项目、导出后重新导入、撤销恢复、小窗口截图。

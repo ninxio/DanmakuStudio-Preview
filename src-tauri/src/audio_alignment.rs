@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    io::Read,
     path::Path,
-    process::Command,
+    process::{ChildStderr, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 8_000;
@@ -15,6 +17,8 @@ const DEFAULT_WINDOW_MS: u64 = 1_000;
 const DEFAULT_MATCH_THRESHOLD: f64 = 0.18;
 const DEFAULT_MIN_GAP_MS: u64 = 1_000;
 const DEFAULT_MAX_CELLS: usize = 16_000_000;
+const AUDIO_ALIGNMENT_CANCELLED: &str = "音频对齐任务已取消。";
+const MAX_JOB_LOGS: usize = 80;
 
 const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
@@ -94,6 +98,7 @@ pub struct AudioAlignmentJobSnapshot {
     status: AudioAlignmentJobStatus,
     progress: f64,
     message: String,
+    logs: Vec<String>,
     proposal: Option<AudioAlignmentProposal>,
     error: Option<String>,
     updated_at_ms: u64,
@@ -166,6 +171,7 @@ pub fn cancel_audio_alignment_job(job_id: String) -> Result<AudioAlignmentJobSna
         entry.snapshot.status = AudioAlignmentJobStatus::Cancelled;
         entry.snapshot.progress = 1.0;
         entry.snapshot.message = "已请求取消音频对齐任务。".to_string();
+        append_audio_alignment_log(&mut entry.snapshot.logs, "已请求取消音频对齐任务。");
         entry.snapshot.updated_at_ms = current_time_ms();
     }
     Ok(entry.snapshot.clone())
@@ -175,24 +181,38 @@ fn align_audio_files_inner(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentProposal, String> {
     let mut update = |_progress: f64, _message: &str| Ok(());
-    align_audio_files_with_progress(request, &mut update)
+    align_audio_files_with_progress(request, &mut update, None)
 }
 
 fn align_audio_files_with_progress<F>(
     request: AudioAlignmentRequest,
     update_progress: &mut F,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<AudioAlignmentProposal, String>
 where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
+    check_cancelled(cancel_flag)?;
     update_progress(0.05, "正在校验本地媒体路径。")?;
     validate_media_file(&request.complete_path, "完整片源")?;
     validate_media_file(&request.source_path, "被删减版")?;
     let options = create_options(&request)?;
+    update_progress(0.10, "已确认本地媒体路径和对齐参数。")?;
+    check_cancelled(cancel_flag)?;
     update_progress(0.15, "正在提取完整片源音频特征。")?;
-    let complete_frames = extract_audio_features(&request.complete_path, &options)?;
+    let complete_frames = extract_audio_features(&request.complete_path, "完整片源", &options, cancel_flag)?;
+    update_progress(
+        0.42,
+        &format!("完整片源音频特征提取完成：{} 帧。", complete_frames.len()),
+    )?;
+    check_cancelled(cancel_flag)?;
     update_progress(0.45, "正在提取删减版音频特征。")?;
-    let source_frames = extract_audio_features(&request.source_path, &options)?;
+    let source_frames = extract_audio_features(&request.source_path, "删减版", &options, cancel_flag)?;
+    update_progress(
+        0.72,
+        &format!("删减版音频特征提取完成：{} 帧。", source_frames.len()),
+    )?;
+    check_cancelled(cancel_flag)?;
     update_progress(0.75, "正在匹配音频特征并推断缺失段。")?;
     create_audio_alignment_proposal(&complete_frames, &source_frames, &options)
 }
@@ -204,7 +224,7 @@ fn run_audio_alignment_job(
 ) {
     let mut update = |progress: f64, message: &str| {
         if cancel_flag.load(Ordering::Relaxed) {
-            return Err("音频对齐任务已取消。".to_string());
+            return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
         }
         update_audio_alignment_job(
             &job_id,
@@ -215,13 +235,13 @@ fn run_audio_alignment_job(
             None,
         )
     };
-    let result = align_audio_files_with_progress(request, &mut update);
+    let result = align_audio_files_with_progress(request, &mut update, Some(cancel_flag.as_ref()));
     if cancel_flag.load(Ordering::Relaxed) {
         let _ = update_audio_alignment_job(
             &job_id,
             AudioAlignmentJobStatus::Cancelled,
             1.0,
-            "音频对齐任务已取消。",
+            AUDIO_ALIGNMENT_CANCELLED,
             None,
             None,
         );
@@ -239,7 +259,7 @@ fn run_audio_alignment_job(
             );
         }
         Err(error) => {
-            let status = if error == "音频对齐任务已取消。" {
+            let status = if error == AUDIO_ALIGNMENT_CANCELLED {
                 AudioAlignmentJobStatus::Cancelled
             } else {
                 AudioAlignmentJobStatus::Failed
@@ -296,6 +316,7 @@ fn insert_audio_alignment_job(job_id: String, cancel_flag: Arc<AtomicBool>) -> R
         status: AudioAlignmentJobStatus::Queued,
         progress: 0.0,
         message: "音频对齐任务已加入队列。".to_string(),
+        logs: vec!["音频对齐任务已加入队列。".to_string()],
         proposal: None,
         error: None,
         updated_at_ms: current_time_ms(),
@@ -335,10 +356,26 @@ fn update_audio_alignment_job(
     entry.snapshot.status = status;
     entry.snapshot.progress = progress.clamp(0.0, 1.0);
     entry.snapshot.message = message.to_string();
+    append_audio_alignment_log(&mut entry.snapshot.logs, message);
+    if let Some(error_message) = &error {
+        append_audio_alignment_log(&mut entry.snapshot.logs, error_message);
+    }
     entry.snapshot.proposal = proposal;
     entry.snapshot.error = error;
     entry.snapshot.updated_at_ms = current_time_ms();
     Ok(())
+}
+
+fn append_audio_alignment_log(logs: &mut Vec<String>, message: &str) {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || logs.last().is_some_and(|last| last == trimmed) {
+        return;
+    }
+    logs.push(trimmed.to_string());
+    if logs.len() > MAX_JOB_LOGS {
+        let overflow = logs.len() - MAX_JOB_LOGS;
+        logs.drain(0..overflow);
+    }
 }
 
 fn current_time_ms() -> u64 {
@@ -360,9 +397,12 @@ fn validate_media_file(path: &str, label: &str) -> Result<(), String> {
 
 fn extract_audio_features(
     media_path: &str,
+    label: &str,
     options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<AudioFeatureFrame>, String> {
-    let output = Command::new(&options.ffmpeg_path)
+    check_cancelled(cancel_flag)?;
+    let mut child = Command::new(&options.ffmpeg_path)
         .args([
             "-v",
             "error",
@@ -377,13 +417,82 @@ fn extract_audio_features(
             "f32le",
             "pipe:1",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("FFmpeg 启动失败：{error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "FFmpeg 标准输出管道不可用。".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "FFmpeg 错误输出管道不可用。".to_string())?;
+    let stdout_reader = thread::spawn(move || read_child_stdout(stdout));
+    let stderr_reader = thread::spawn(move || read_child_stderr(stderr));
+
+    let status = loop {
+        if let Err(error) = check_cancelled(cancel_flag) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_child_output(stdout_reader, "stdout");
+            let _ = join_child_output(stderr_reader, "stderr");
+            return Err(error);
+        }
+        match child
+            .try_wait()
+            .map_err(|error| format!("FFmpeg 状态读取失败：{error}"))?
+        {
+            Some(status) => break status,
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let stdout = join_child_output(stdout_reader, "stdout")?;
+    let stderr = join_child_output(stderr_reader, "stderr")?;
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
         return Err(format!("FFmpeg 提取音频失败：{detail}"));
     }
-    pcm_to_feature_frames(&output.stdout, options)
+    let frames = pcm_to_feature_frames(&stdout, options)?;
+    if frames.is_empty() {
+        return Err(format!("{label}未能提取到可用音频特征。"));
+    }
+    Ok(frames)
+}
+
+fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
+    if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
+    }
+    Ok(())
+}
+
+fn read_child_stdout(mut stdout: ChildStdout) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    stdout
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("FFmpeg stdout 读取失败：{error}"))?;
+    Ok(bytes)
+}
+
+fn read_child_stderr(mut stderr: ChildStderr) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    stderr
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("FFmpeg stderr 读取失败：{error}"))?;
+    Ok(bytes)
+}
+
+fn join_child_output(
+    handle: thread::JoinHandle<Result<Vec<u8>, String>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, String> {
+    handle
+        .join()
+        .map_err(|_| format!("FFmpeg {stream_name} 读取线程异常。"))?
 }
 
 fn pcm_to_feature_frames(
@@ -710,6 +819,7 @@ mod tests {
         assert_eq!(snapshot.status, AudioAlignmentJobStatus::Running);
         assert_eq!(snapshot.progress, 0.35);
         assert_eq!(snapshot.message, "正在测试任务状态。");
+        assert!(snapshot.logs.contains(&"正在测试任务状态。".to_string()));
     }
 
     #[test]
@@ -734,5 +844,18 @@ mod tests {
         let snapshot = get_audio_alignment_job(job_id).unwrap();
         assert_eq!(snapshot.status, AudioAlignmentJobStatus::Cancelled);
         assert_eq!(snapshot.message, "已请求取消音频对齐任务。");
+        assert!(snapshot
+            .logs
+            .contains(&"已请求取消音频对齐任务。".to_string()));
+    }
+
+    #[test]
+    fn cancellation_is_checked_before_ffmpeg_spawn() {
+        let cancel_flag = AtomicBool::new(true);
+        let error =
+            extract_audio_features("missing.mp4", "完整片源", &test_options(), Some(&cancel_flag))
+                .unwrap_err();
+
+        assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);
     }
 }
