@@ -66,10 +66,18 @@ export function cloneAppSettings(settings: AppSettings): AppSettings {
 
 export function parseAppSettingsText(text: string): AppSettings {
   try {
-    return normalizeAppSettings(JSON.parse(text));
+    return parseAppSettingsTextStrict(text);
   } catch {
     return cloneAppSettings(DEFAULT_APP_SETTINGS);
   }
+}
+
+export function parseAppSettingsTextStrict(text: string): AppSettings {
+  const parsed: unknown = JSON.parse(text);
+  if (!isRecord(parsed)) {
+    throw new Error("设置备份必须是 JSON 对象。");
+  }
+  return normalizeAppSettings(parsed);
 }
 
 export function serializeAppSettings(settings: AppSettings): string {

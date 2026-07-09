@@ -1,5 +1,5 @@
-import { Info, MonitorCog, Save, Server, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { Download, Info, MonitorCog, Save, Server, ShieldCheck, SlidersHorizontal, Trash2, Upload, X } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Field } from "../../components/Field";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
@@ -8,9 +8,12 @@ import {
   clearAppSettings,
   cloneAppSettings,
   loadAppSettings,
+  parseAppSettingsTextStrict,
   saveAppSettings,
+  serializeAppSettings,
   type AppSettings
 } from "../../infrastructure/settings/appSettings";
+import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import {
   clearDesktopAppSettings,
   formatDesktopSettingsError,
@@ -42,6 +45,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const [tab, setTab] = useState<SettingsTab>("general");
   const [settings, setSettings] = useState<AppSettings>(() => loadAppSettings());
   const [embyPassword, setEmbyPassword] = useState(() => loadVolatileEmbyPassword());
+  const settingsInputRef = useRef<HTMLInputElement | null>(null);
   const project = useEditorStore((state) => state.project);
   const setGlobalOffset = useEditorStore((state) => state.setGlobalOffset);
   const updatePreview = useEditorStore((state) => state.updatePreview);
@@ -80,6 +84,28 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
       .catch((error) => {
         setStatus(`桌面应用设置保存失败，已保留浏览器本地副本：${formatDesktopSettingsError(error)}`, "warning");
       });
+  };
+
+  const exportSettingsBackup = () => {
+    downloadTextFile("danmaku-settings.json", `${serializeAppSettings(settings)}\n`, "application/json;charset=utf-8");
+    setStatus("已导出非敏感应用设置备份。", "success");
+  };
+
+  const importSettingsBackup = async (file: File) => {
+    try {
+      const imported = parseAppSettingsTextStrict(await readTextFile(file));
+      const saved = saveAppSettings(imported);
+      setSettings(saved);
+      void persistDesktopAppSettings(saved)
+        .then((storedInDesktop) => {
+          setStatus(storedInDesktop ? "已导入设置并保存到桌面配置目录。" : "已导入设置并保存到浏览器本地存储。", "success");
+        })
+        .catch((error) => {
+          setStatus(`设置已导入到浏览器本地副本，但写入桌面配置失败：${formatDesktopSettingsError(error)}`, "warning");
+        });
+    } catch (error) {
+      setStatus(`导入设置失败：${formatDesktopSettingsError(error)}`, "error");
+    }
   };
 
   const restoreDefaults = () => {
@@ -165,7 +191,12 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
             {tab === "alignment" ? (
               <AlignmentSettingsPanel settings={settings} onChange={setSettings} />
             ) : null}
-            {tab === "privacy" ? <PrivacySettingsPanel /> : null}
+            {tab === "privacy" ? (
+              <PrivacySettingsPanel
+                onExportSettings={exportSettingsBackup}
+                onImportSettings={() => settingsInputRef.current?.click()}
+              />
+            ) : null}
             {tab === "about" ? <AboutSettingsPanel /> : null}
           </main>
         </div>
@@ -183,6 +214,21 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
             <TextButton onClick={onClose}>完成</TextButton>
           </div>
         </footer>
+        <input
+          ref={settingsInputRef}
+          className="hidden"
+          type="file"
+          accept=".json,application/json"
+          aria-label="导入设置文件"
+          data-testid="settings-import-input"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) {
+              void importSettingsBackup(file);
+            }
+            event.target.value = "";
+          }}
+        />
       </div>
     </div>
   );
@@ -363,9 +409,25 @@ function AlignmentSettingsPanel({
   );
 }
 
-function PrivacySettingsPanel() {
+function PrivacySettingsPanel({
+  onExportSettings,
+  onImportSettings
+}: {
+  onExportSettings: () => void;
+  onImportSettings: () => void;
+}) {
   return (
     <SettingsSection title="隐私与本地数据" description="本工具默认以本地文件和本机授权服务为边界。">
+      <div className="flex flex-wrap gap-2">
+        <TextButton onClick={onExportSettings}>
+          <Download size={14} />
+          导出设置
+        </TextButton>
+        <TextButton onClick={onImportSettings}>
+          <Upload size={14} />
+          导入设置
+        </TextButton>
+      </div>
       <InfoBox>
         项目文件只保存弹幕、媒体引用和编辑状态，不嵌入视频内容，也不会保存 Emby 密码或 token。
       </InfoBox>

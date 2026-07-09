@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C17 已完成：设置中心新增非敏感设置备份导出/导入。
+  - 设置中心“隐私与本地数据”页新增真实“导出设置”和“导入设置”入口，导出 `danmaku-settings.json`，内容只包含服务器地址、路径前缀、用户名、FFmpeg 路径和对齐默认参数。
+  - 导入设置备份使用严格 JSON 解析，坏文件会报错，不会静默覆盖为默认值；导入成功后会同步浏览器 fallback 和桌面配置文件。
+  - 导出的设置备份不会包含 Emby 密码、token 或其他未知敏感字段；会话密码仍只保存在当前应用进程内。
+  - README 已同步：设置中心当前支持保存、恢复默认、清除本地设置，以及导出/导入不含密码或 token 的应用设置备份。
+  - 已重新验证：`corepack pnpm test -- src/features/editor/SettingsDialog.test.tsx src/infrastructure/settings/appSettings.test.ts` 成功，2 个测试文件、11 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 30 个测试文件、108 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12231680` 字节，时间 `2026/07/10 7:09:03`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2988848` 字节，时间 `2026/07/10 7:09:03`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c17-settings-backup-restore-20260710`。
 - 成熟度提升阶段 C16 已完成：设置存储从纯浏览器 localStorage 升级为桌面配置文件优先。
   - Tauri 新增 `load_app_settings_file`、`save_app_settings_file`、`clear_app_settings_file` 三个命令，读写应用配置目录下的 `app-settings.json`，写入前验证内容必须是 JSON 对象。
   - 前端新增桌面应用设置桥：桌面端优先调用 Tauri 配置文件，网页模式继续使用 localStorage fallback；桌面读取成功后会同步一份非敏感设置到浏览器 fallback 镜像。
@@ -621,7 +635,7 @@
   - `corepack pnpm tauri:build` 成功，已生成分叉实验版 release exe 和 NSIS 安装包。
 - 当前限制：
   - 尚未接入系统凭证库，因此不会提供“记住密码”开关，避免把敏感字段明文落盘。
-  - 设置存储已升级为桌面端优先使用 Tauri 应用配置目录，网页模式使用浏览器本地存储 fallback；后续可补充迁移、备份和恢复界面。
+  - 设置存储已升级为桌面端优先使用 Tauri 应用配置目录，网页模式使用浏览器本地存储 fallback；已补充非敏感设置备份导出/导入。
   - 已完成打包链路验证；发布版无终端行为仍建议再通过实际双击 exe 做一次人工确认。
 
 ## 早期新增记录（2026-07-03）

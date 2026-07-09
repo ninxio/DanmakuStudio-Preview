@@ -5,6 +5,7 @@ import {
   clearAppSettings,
   loadAppSettings,
   parseAppSettingsText,
+  parseAppSettingsTextStrict,
   saveAppSettings,
   serializeAppSettings,
   type AppSettingsStorage
@@ -116,6 +117,11 @@ describe("应用设置持久化", () => {
     expect(text).toContain("https://emby.example.test");
     expect(text).not.toContain("secret");
     expect(text).not.toContain("token");
+  });
+
+  it("严格解析设置备份时保留 JSON 语法错误", () => {
+    expect(() => parseAppSettingsTextStrict("not json")).toThrow();
+    expect(() => parseAppSettingsTextStrict("[]")).toThrow("设置备份必须是 JSON 对象。");
   });
 });
 
