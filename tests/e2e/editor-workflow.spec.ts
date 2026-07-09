@@ -79,6 +79,37 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
 
+  const audioAlignmentProposal = {
+    anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
+    cutCandidates: [
+      {
+        id: "audio-gap-1",
+        name: "音频推断补偿 1",
+        sourceAtMs: 20_000,
+        sourceRangeStartMs: 18_000,
+        sourceRangeEndMs: 22_000,
+        targetGapMs: 20_000,
+        confidence: 0.72,
+        note: "音频对齐候选"
+      }
+    ],
+    confidence: 0.82,
+    diagnostics: ["音频特征匹配 4 / 4 帧。"]
+  };
+  await page.getByPlaceholder("AlignmentProposal JSON").fill(JSON.stringify(audioAlignmentProposal, null, 2));
+  await page.getByRole("button", { name: "导入提案" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText("已发送到时间轴预览");
+  const alignmentReportDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "导出报告" }).click();
+  const alignmentReportDownload = await alignmentReportDownloadPromise;
+  const alignmentReportPath = resolve(downloadDir, alignmentReportDownload.suggestedFilename());
+  await alignmentReportDownload.saveAs(alignmentReportPath);
+  const alignmentReportText = readFileSync(alignmentReportPath, "utf8");
+  expect(alignmentReportText).toContain("对齐提案复核报告");
+  expect(alignmentReportText).toContain("audio-gap-1");
+  expect(alignmentReportText).toContain("不确定区间：00:00:18.000");
+  expect(alignmentReportText).toContain("音频特征匹配 4 / 4 帧。");
+
   await page.getByPlaceholder(/每行一个对应点/).fill("00:10 -> 00:10\n00:20 -> 00:30");
   await page.getByRole("button", { name: "应用锚点与补偿" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已应用对齐提案");
