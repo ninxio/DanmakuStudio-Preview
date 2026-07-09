@@ -42,17 +42,13 @@ export function loadAppSettings(storage = getDefaultStorage()): AppSettings {
   if (!raw) {
     return cloneAppSettings(DEFAULT_APP_SETTINGS);
   }
-  try {
-    return normalizeAppSettings(JSON.parse(raw));
-  } catch {
-    return cloneAppSettings(DEFAULT_APP_SETTINGS);
-  }
+  return parseAppSettingsText(raw);
 }
 
 export function saveAppSettings(settings: AppSettings, storage = getDefaultStorage()): AppSettings {
   const normalized = normalizeAppSettings(settings);
   if (storage) {
-    storage.setItem(APP_SETTINGS_STORAGE_KEY, JSON.stringify(normalized));
+    storage.setItem(APP_SETTINGS_STORAGE_KEY, serializeAppSettings(normalized));
   }
   return normalized;
 }
@@ -68,7 +64,19 @@ export function cloneAppSettings(settings: AppSettings): AppSettings {
   };
 }
 
-function normalizeAppSettings(value: unknown): AppSettings {
+export function parseAppSettingsText(text: string): AppSettings {
+  try {
+    return normalizeAppSettings(JSON.parse(text));
+  } catch {
+    return cloneAppSettings(DEFAULT_APP_SETTINGS);
+  }
+}
+
+export function serializeAppSettings(settings: AppSettings): string {
+  return JSON.stringify(normalizeAppSettings(settings));
+}
+
+export function normalizeAppSettings(value: unknown): AppSettings {
   if (!isRecord(value)) {
     return cloneAppSettings(DEFAULT_APP_SETTINGS);
   }

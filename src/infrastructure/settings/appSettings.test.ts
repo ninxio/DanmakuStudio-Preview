@@ -4,7 +4,9 @@ import {
   DEFAULT_APP_SETTINGS,
   clearAppSettings,
   loadAppSettings,
+  parseAppSettingsText,
   saveAppSettings,
+  serializeAppSettings,
   type AppSettingsStorage
 } from "./appSettings";
 
@@ -88,6 +90,32 @@ describe("应用设置持久化", () => {
     clearAppSettings(storage);
 
     expect(storage.getItem(APP_SETTINGS_STORAGE_KEY)).toBeNull();
+  });
+
+  it("序列化应用设置时会丢弃未知和敏感字段", () => {
+    const text = serializeAppSettings(
+      parseAppSettingsText(
+        JSON.stringify({
+          emby: {
+            serverUrl: " https://emby.example.test ",
+            pathPrefix: "emby",
+            username: "tester",
+            password: "secret"
+          },
+          alignment: {
+            ffmpegPath: "ffmpeg",
+            windowMs: "500",
+            minGapMs: "1200",
+            matchThreshold: "0.25",
+            token: "secret-token"
+          }
+        })
+      )
+    );
+
+    expect(text).toContain("https://emby.example.test");
+    expect(text).not.toContain("secret");
+    expect(text).not.toContain("token");
   });
 });
 

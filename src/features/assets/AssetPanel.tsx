@@ -1,5 +1,5 @@
 import { Download, FolderOpen, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
@@ -35,6 +35,7 @@ import {
   type EmbyItemMetadata
 } from "../../infrastructure/metadata/embyClient";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
+import { hydrateDesktopAppSettings } from "../../infrastructure/settings/desktopAppSettings";
 import { loadVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
 import { serializeBilibiliXml, validateExportedXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore, type EditorStatus } from "../../stores/editorStore";
@@ -1197,6 +1198,35 @@ function VideoAlignmentLabPanel({
   const previewCuts = preview.proposalCuts.slice(0, 3);
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
+
+  useEffect(() => {
+    let mounted = true;
+    const initialSettings = initialSettingsRef.current;
+    void hydrateDesktopAppSettings()
+      .then((desktopSettings) => {
+        if (!mounted || !desktopSettings) {
+          return;
+        }
+        setFfmpegPath((current) =>
+          current === initialSettings.alignment.ffmpegPath ? desktopSettings.alignment.ffmpegPath : current
+        );
+        setWindowMs((current) =>
+          current === String(initialSettings.alignment.windowMs) ? String(desktopSettings.alignment.windowMs) : current
+        );
+        setMinGapMs((current) =>
+          current === String(initialSettings.alignment.minGapMs) ? String(desktopSettings.alignment.minGapMs) : current
+        );
+        setMatchThreshold((current) =>
+          current === String(initialSettings.alignment.matchThreshold)
+            ? String(desktopSettings.alignment.matchThreshold)
+            : current
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const runDesktopAlignment = async () => {
     const parsedWindowMs = parsePositiveIntegerInput(windowMs, "窗口");

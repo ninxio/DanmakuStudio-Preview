@@ -25,6 +25,22 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C16 已完成：设置存储从纯浏览器 localStorage 升级为桌面配置文件优先。
+  - Tauri 新增 `load_app_settings_file`、`save_app_settings_file`、`clear_app_settings_file` 三个命令，读写应用配置目录下的 `app-settings.json`，写入前验证内容必须是 JSON 对象。
+  - 前端新增桌面应用设置桥：桌面端优先调用 Tauri 配置文件，网页模式继续使用 localStorage fallback；桌面读取成功后会同步一份非敏感设置到浏览器 fallback 镜像。
+  - 设置中心保存、恢复默认、清除本地设置都会同步桌面配置文件；Emby 密码仍只保存在本次应用会话，不写入项目文件、Tauri 配置文件或 localStorage。
+  - 应用启动时会静默尝试加载桌面配置；视频对齐实验室会在用户未修改字段时同步桌面配置里的 FFmpeg 路径和默认对齐参数。
+  - README 已同步：当前设置存储为“桌面配置目录优先、网页 localStorage fallback”，后续路线改为评估系统凭证库和设置迁移/备份/恢复界面。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/settings/appSettings.test.ts src/infrastructure/settings/desktopAppSettings.test.ts src/features/editor/SettingsDialog.test.tsx src/features/assets/AssetPanel.test.tsx` 成功，4 个测试文件、22 个测试通过。
+  - 已重新验证：`cargo test` 成功，Rust 侧 11 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 30 个测试文件、105 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12231680` 字节，时间 `2026/07/10 6:57:10`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2991419` 字节，时间 `2026/07/10 6:57:10`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c16-desktop-settings-storage-20260710`。
 - 成熟度提升阶段 C15 已完成：导出 XML 入口增加空项目防护并重新打包 release。
   - `prepareExport` 现在会在没有任何启用弹幕可导出时拒绝生成空 XML 草稿，清空旧导出草稿，并提示“当前没有可导出的弹幕，请先把 XML 放入时间轴。”
   - 工具栏“导出 XML”按钮根据真实时间轴弹幕状态启用/禁用；空项目或仅导入但未放入时间轴时显示禁用态，避免用户得到无意义空导出。
@@ -605,7 +621,7 @@
   - `corepack pnpm tauri:build` 成功，已生成分叉实验版 release exe 和 NSIS 安装包。
 - 当前限制：
   - 尚未接入系统凭证库，因此不会提供“记住密码”开关，避免把敏感字段明文落盘。
-  - 设置存储目前使用浏览器本地存储；后续可迁移到 Tauri app config 文件或系统设置目录。
+  - 设置存储已升级为桌面端优先使用 Tauri 应用配置目录，网页模式使用浏览器本地存储 fallback；后续可补充迁移、备份和恢复界面。
   - 已完成打包链路验证；发布版无终端行为仍建议再通过实际双击 exe 做一次人工确认。
 
 ## 早期新增记录（2026-07-03）

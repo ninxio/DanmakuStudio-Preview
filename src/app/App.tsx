@@ -6,6 +6,7 @@ import { ExportDialog } from "../features/export/ExportDialog";
 import { InspectorPanel } from "../features/inspector/InspectorPanel";
 import { PreviewPanel } from "../features/preview/PreviewPanel";
 import { TimelinePanel } from "../features/timeline/TimelinePanel";
+import { formatDesktopSettingsError, hydrateDesktopAppSettings } from "../infrastructure/settings/desktopAppSettings";
 import { useEditorStore } from "../stores/editorStore";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
@@ -27,6 +28,24 @@ export function App() {
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelWidth, setRightPanelWidth] = useState(300);
   const [timelineHeight, setTimelineHeight] = useState(320);
+
+  useEffect(() => {
+    let mounted = true;
+    void hydrateDesktopAppSettings().catch((error) => {
+      if (!mounted) {
+        return;
+      }
+      useEditorStore.setState({
+        status: {
+          message: `读取桌面应用设置失败，已使用浏览器本地设置：${formatDesktopSettingsError(error)}`,
+          tone: "warning"
+        }
+      });
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     const handlePointerMove = (event: PointerEvent) => {

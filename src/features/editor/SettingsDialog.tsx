@@ -1,5 +1,5 @@
 import { Info, MonitorCog, Save, Server, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Field } from "../../components/Field";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
@@ -11,6 +11,12 @@ import {
   saveAppSettings,
   type AppSettings
 } from "../../infrastructure/settings/appSettings";
+import {
+  clearDesktopAppSettings,
+  formatDesktopSettingsError,
+  hydrateDesktopAppSettings,
+  persistDesktopAppSettings
+} from "../../infrastructure/settings/desktopAppSettings";
 import {
   clearVolatileEmbyCredentials,
   loadVolatileEmbyPassword,
@@ -40,11 +46,40 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const setGlobalOffset = useEditorStore((state) => state.setGlobalOffset);
   const updatePreview = useEditorStore((state) => state.updatePreview);
 
+  useEffect(() => {
+    let mounted = true;
+    void hydrateDesktopAppSettings()
+      .then((desktopSettings) => {
+        if (mounted && desktopSettings) {
+          setSettings(desktopSettings);
+        }
+      })
+      .catch((error) => {
+        if (mounted) {
+          setStatus(`读取桌面应用设置失败，已使用浏览器本地设置：${formatDesktopSettingsError(error)}`, "warning");
+        }
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const saveSettings = () => {
     const saved = saveAppSettings(settings);
     saveVolatileEmbyPassword(embyPassword);
     setSettings(saved);
-    setStatus("应用设置已保存；Emby 密码仅保存在本次应用会话。", "success");
+    void persistDesktopAppSettings(saved)
+      .then((storedInDesktop) => {
+        setStatus(
+          storedInDesktop
+            ? "应用设置已保存到桌面配置目录；Emby 密码仅保存在本次应用会话。"
+            : "应用设置已保存到浏览器本地存储；Emby 密码仅保存在本次应用会话。",
+          "success"
+        );
+      })
+      .catch((error) => {
+        setStatus(`桌面应用设置保存失败，已保留浏览器本地副本：${formatDesktopSettingsError(error)}`, "warning");
+      });
   };
 
   const restoreDefaults = () => {
@@ -53,7 +88,13 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
     clearVolatileEmbyCredentials();
     setSettings(saved);
     setEmbyPassword("");
-    setStatus("已恢复默认应用设置。", "success");
+    void persistDesktopAppSettings(saved)
+      .then((storedInDesktop) => {
+        setStatus(storedInDesktop ? "已恢复默认桌面应用设置。" : "已恢复默认浏览器本地设置。", "success");
+      })
+      .catch((error) => {
+        setStatus(`恢复默认设置时写入桌面配置失败：${formatDesktopSettingsError(error)}`, "warning");
+      });
   };
 
   const clearLocalSettings = () => {
@@ -61,7 +102,13 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
     clearVolatileEmbyCredentials();
     setSettings(cloneAppSettings(DEFAULT_APP_SETTINGS));
     setEmbyPassword("");
-    setStatus("已清除本机保存的应用设置。", "success");
+    void clearDesktopAppSettings()
+      .then((clearedDesktop) => {
+        setStatus(clearedDesktop ? "已清除桌面应用设置和本次会话密码。" : "已清除浏览器本地设置和本次会话密码。", "success");
+      })
+      .catch((error) => {
+        setStatus(`清除桌面应用设置失败，浏览器本地副本已清除：${formatDesktopSettingsError(error)}`, "warning");
+      });
   };
 
   return (
@@ -203,7 +250,7 @@ function EmbySettingsPanel({
   onPasswordChange: (password: string) => void;
 }) {
   return (
-    <SettingsSection title="Emby 连接" description="服务器、路径和用户名会保存到本机应用设置；密码只保存在本次应用会话。">
+    <SettingsSection title="Emby 连接" description="服务器、路径和用户名会保存到桌面配置文件；网页模式使用浏览器本地存储。密码只保存在本次应用会话。">
       <Field
         label="服务器地址"
         value={settings.emby.serverUrl}
@@ -246,7 +293,7 @@ function EmbySettingsPanel({
         onChange={(event) => onPasswordChange(event.target.value)}
       />
       <InfoBox>
-        主界面的 Emby 时长面板会直接读取这里的连接配置进行搜索。当前实验版不会把 Emby 密码或 token 写入项目文件、localStorage 或明文设置；后续接入 Windows 凭据管理器后再提供跨次启动记忆。
+        主界面的 Emby 时长面板会直接读取这里的连接配置进行搜索。当前实验版不会把 Emby 密码或 token 写入项目文件、桌面配置文件、localStorage 或明文设置；后续接入 Windows 凭据管理器后再提供跨次启动记忆。
       </InfoBox>
     </SettingsSection>
   );
@@ -323,7 +370,7 @@ function PrivacySettingsPanel() {
         项目文件只保存弹幕、媒体引用和编辑状态，不嵌入视频内容，也不会保存 Emby 密码或 token。
       </InfoBox>
       <InfoBox>
-        本地应用设置只保存服务器地址、路径前缀、用户名、FFmpeg 路径和对齐默认参数。Emby 密码只保存在当前应用进程内，关闭应用后失效；清除本地设置也会清除会话密码。
+        本地应用设置只保存服务器地址、路径前缀、用户名、FFmpeg 路径和对齐默认参数。桌面端优先写入 Tauri 应用配置目录，网页模式使用浏览器本地存储。Emby 密码只保存在当前应用进程内，关闭应用后失效；清除本地设置也会清除会话密码。
       </InfoBox>
       <InfoBox>
         当前版本不实现视频下载、DRM 绕过、账号绕过、私有接口爬取或未授权媒体访问。
