@@ -146,4 +146,16 @@ describe("editor store", () => {
       windowSeconds: "30"
     });
   });
+
+  it("可把对齐提案发送到时间轴预览", () => {
+    useEditorStore.getState().previewAlignmentProposalData({
+      anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
+      cutCandidates: [],
+      confidence: 0.5,
+      diagnostics: []
+    });
+
+    expect(useEditorStore.getState().alignmentProposal?.anchors).toHaveLength(1);
+    expect(useEditorStore.getState().status.message).toContain("时间轴预览");
+  });
 });

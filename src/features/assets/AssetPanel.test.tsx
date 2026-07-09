@@ -30,6 +30,7 @@ describe("资源面板", () => {
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
       exportDraft: null,
+      alignmentProposal: null,
       cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
     });
   });
@@ -71,6 +72,7 @@ describe("资源面板", () => {
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
       exportDraft: null,
+      alignmentProposal: null,
       cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
     });
 
@@ -102,6 +104,7 @@ describe("资源面板", () => {
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
       exportDraft: null,
+      alignmentProposal: null,
       cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
     });
 
@@ -129,6 +132,18 @@ describe("资源面板", () => {
       sourceAtMs: 20_000,
       targetGapMs: 10_000
     });
+  });
+
+  it("可以把锚点校准提案发送到时间轴预览", async () => {
+    const user = userEvent.setup();
+    render(<AssetPanel />);
+
+    await user.type(screen.getByPlaceholderText(/每行一个对应点/), "00:10 -> 00:10\n00:20 -> 00:30");
+    await user.click(screen.getByRole("button", { name: "预览到时间轴" }));
+
+    await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.cutCandidates).toHaveLength(1));
+    expect(useEditorStore.getState().alignmentProposal?.anchors).toHaveLength(2);
+    expect(useEditorStore.getState().status.message).toContain("时间轴预览");
   });
 
   it("可以导入并应用音频 CLI 输出的对齐提案", async () => {

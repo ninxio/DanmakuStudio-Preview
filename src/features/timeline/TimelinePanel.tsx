@@ -965,7 +965,7 @@ function drawProposalAnchors(
     if (pixelsPerSecond > 95) {
       drawTimelineLabel(
         context,
-        `${applied ? "已应用锚点" : "候选锚点"} ${formatTimecode(anchor.sourceMs)}`,
+        `${applied ? "已应用锚点" : "候选锚点"} ${formatSignedOffset(anchor.targetMs - anchor.sourceMs)}`,
         x,
         tracks.cuts.y + 3,
         width,
@@ -999,11 +999,19 @@ function drawProposalCutCandidates(
     if (!applied) {
       context.save();
       context.fillStyle = "rgba(255, 143, 112, 0.045)";
+      const impactLeft = Math.max(LABEL_WIDTH, x);
       context.fillRect(
-        x,
+        impactLeft,
         tracks.cuts.y,
-        width - x,
+        width - impactLeft,
         tracks.events.y + tracks.events.height - tracks.cuts.y
+      );
+      drawImpactRegionText(
+        context,
+        `补偿影响区：后续整体 ${formatSignedOffset(candidate.targetGapMs)}`,
+        impactLeft,
+        tracks.events.y + 16,
+        width
       );
       context.restore();
     }
@@ -1029,7 +1037,7 @@ function drawProposalCutCandidates(
     }
     drawTimelineLabel(
       context,
-      `${applied ? "已应用删减" : "候选删减"} ${formatSignedOffset(candidate.targetGapMs)}`,
+      `${applied ? "已应用补偿" : "候选补偿"} ${formatSignedOffset(candidate.targetGapMs)}`,
       x,
       tracks.cuts.y + 3,
       width,
@@ -1039,6 +1047,24 @@ function drawProposalCutCandidates(
       }
     );
   }
+}
+
+function drawImpactRegionText(
+  context: CanvasRenderingContext2D,
+  text: string,
+  left: number,
+  baselineY: number,
+  maxRight: number
+): void {
+  const availableWidth = maxRight - left - 12;
+  if (availableWidth < 96) {
+    return;
+  }
+  context.save();
+  context.font = "11px Segoe UI";
+  context.fillStyle = "rgba(255, 190, 165, 0.92)";
+  context.fillText(text, left + 8, baselineY, availableWidth);
+  context.restore();
 }
 
 function drawVerticalGuide(

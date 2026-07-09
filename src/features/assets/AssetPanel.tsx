@@ -83,6 +83,7 @@ export function AssetPanel() {
   const addCutMarker = useEditorStore((state) => state.addCutMarker);
   const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
+  const previewAlignmentProposalData = useEditorStore((state) => state.previewAlignmentProposalData);
   const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
   const setCutHintSettings = useEditorStore((state) => state.setCutHintSettings);
   const manualRules = useMemo(
@@ -238,6 +239,7 @@ export function AssetPanel() {
                   text={anchorCalibrationText}
                   proposal={anchorCalibrationProposal}
                   onTextChange={setAnchorCalibrationText}
+                  onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
                   onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
                 />
                 <VideoAlignmentLabPanel
@@ -912,11 +914,13 @@ function AnchorCalibrationPanel({
   text,
   proposal,
   onTextChange,
+  onPreview,
   onApply
 }: {
   text: string;
   proposal: ReturnType<typeof createAnchorCalibrationProposal>;
   onTextChange: (value: string) => void;
+  onPreview: () => void;
   onApply: () => void;
 }) {
   const hasInput = text.trim().length > 0;
@@ -951,7 +955,13 @@ function AnchorCalibrationPanel({
                 {proposal.diagnostics[0]}
               </div>
             ) : null}
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              <TextButton
+                disabled={proposal.anchors.length === 0}
+                onClick={onPreview}
+              >
+                预览到时间轴
+              </TextButton>
               <TextButton
                 tone="primary"
                 disabled={proposal.anchors.length === 0}

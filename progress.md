@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C7 已完成：锚点校准提案可发送到时间轴预览，补偿影响区标注更明确。
+  - store 新增通用 `previewAlignmentProposalData`，导入 JSON 和锚点校准都复用同一条时间轴预览路径。
+  - “锚点校准”面板新增“预览到时间轴”按钮，用户可在应用锚点与补偿前先把候选锚点和推断补偿发送到时间轴复核。
+  - 时间轴候选锚点标签现在显示源时间到完整片源时间的累计差值；候选补偿标签从“候选删减”改为“候选补偿”。
+  - 候选补偿的下游半透明影响区新增“补偿影响区：后续整体 +Ns”文字，明确提示 `insertGap` 会影响后续弹幕。
+  - 已补充 store 预览动作测试和资源面板“预览到时间轴”交互测试；Playwright 截图产物已随 UI 变化更新。
+  - 已重新验证：`corepack pnpm test -- src/features/assets/AssetPanel.test.tsx src/stores/editorStore.test.ts src/domain/alignment/preview.test.ts` 成功，3 个测试文件、17 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 27 个测试文件、93 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c7-anchor-impact-preview-20260710`。
 - 成熟度提升阶段 C6 已完成：疑似删减文本候选时间轴叠加预览。
   - 疑似删减扫描配置已从资源面板局部状态提升为共享分析态，资源面板和时间轴现在共用同一套关键词、聚类窗口和最小命中数。
   - 领域层新增扫描配置解析和候选“已落点”判断，避免 UI 之间出现候选状态不一致。
@@ -842,7 +855,7 @@
    - 已支持用户输入“源弹幕时间 -> 完整片源时间”的对应点。
    - 已根据两个或多个锚点推断中间缺失时长。
    - 已通过对齐提案管线把锚点与推断补偿应用到项目。
-   - 待补强：在时间轴上更明确地预览锚点推断补偿影响区。
+   - 已补强：可把锚点校准提案发送到时间轴预览，并明确标注补偿影响区会让后续整体平移。
    - 待补强：支持编辑、删除和批量管理手动锚点。
 4. 本地音频/视频对齐原型：
    - 已做独立 CLI 原型，输入两个用户本地合法视频或两份特征 JSON，输出 `AlignmentProposal` JSON。

@@ -136,6 +136,7 @@ interface EditorStore {
   prepareExport: () => void;
   clearExport: () => void;
   importAlignmentProposalText: (text: string) => void;
+  previewAlignmentProposalData: (proposal: AlignmentProposal) => void;
   exportAlignmentProposal: () => string;
   applyAlignmentProposalData: (proposal: AlignmentProposal) => void;
   applyAlignmentProposal: () => void;
@@ -903,13 +904,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   importAlignmentProposalText: (text) => {
     try {
       const proposal = parseAlignmentProposal(text);
-      set({
-        alignmentProposal: proposal,
-        status: {
-          message: `已导入对齐提案：${proposal.anchors.length} 个锚点，${proposal.cutCandidates.length} 个候选删减点。`,
-          tone: "success"
-        }
-      });
+      get().previewAlignmentProposalData(proposal);
     } catch (error) {
       set({
         status: {
@@ -918,6 +913,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         }
       });
     }
+  },
+
+  previewAlignmentProposalData: (proposal) => {
+    set({
+      alignmentProposal: proposal,
+      status: {
+        message: `已发送到时间轴预览：${proposal.anchors.length} 个锚点，${proposal.cutCandidates.length} 个候选补偿点。`,
+        tone: "success"
+      }
+    });
   },
 
   exportAlignmentProposal: () => {
