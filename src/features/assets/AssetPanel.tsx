@@ -1,4 +1,4 @@
-import { Download, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
+import { Download, FolderOpen, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
@@ -18,6 +18,7 @@ import {
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { downloadTextFile, downloadTextFiles, readTextFile } from "../../infrastructure/file-system/browserFiles";
+import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import {
   authenticateEmby,
   fetchEmbyEpisodeChildren,
@@ -1029,6 +1030,51 @@ function VideoAlignmentLabPanel({
     setStatus({ message: "已导出对齐提案 JSON。", tone: "success" });
   };
 
+  const chooseCompletePath = async () => {
+    try {
+      const path = await pickAlignmentMediaPath(completePath);
+      if (path) {
+        setCompletePath(path);
+        setStatus({ message: "已选择完整片源路径。", tone: "success" });
+      }
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "完整片源路径选择失败。",
+        tone: "error"
+      });
+    }
+  };
+
+  const chooseSourcePath = async () => {
+    try {
+      const path = await pickAlignmentMediaPath(sourcePath);
+      if (path) {
+        setSourcePath(path);
+        setStatus({ message: "已选择删减版路径。", tone: "success" });
+      }
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "删减版路径选择失败。",
+        tone: "error"
+      });
+    }
+  };
+
+  const chooseFfmpegPath = async () => {
+    try {
+      const path = await pickFfmpegExecutablePath(ffmpegPath);
+      if (path) {
+        setFfmpegPath(path);
+        setStatus({ message: "已选择 FFmpeg 路径。", tone: "success" });
+      }
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "FFmpeg 路径选择失败。",
+        tone: "error"
+      });
+    }
+  };
+
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
@@ -1043,30 +1089,72 @@ function VideoAlignmentLabPanel({
       <div className="mt-3 grid gap-2">
         <label className="grid gap-1">
           <span className="text-slate-500">完整片源路径</span>
-          <input
-            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-            value={completePath}
-            placeholder="D:\\media\\full.mkv"
-            onChange={(event) => setCompletePath(event.target.value)}
-          />
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+            <input
+              aria-label="完整片源路径"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              value={completePath}
+              placeholder="D:\\media\\full.mkv"
+              onChange={(event) => setCompletePath(event.target.value)}
+            />
+            <TextButton
+              aria-label="选择完整片源"
+              title="选择完整片源"
+              onClick={() => {
+                void chooseCompletePath();
+              }}
+              className="px-2"
+            >
+              <FolderOpen size={14} />
+              选择
+            </TextButton>
+          </div>
         </label>
         <label className="grid gap-1">
           <span className="text-slate-500">删减版路径</span>
-          <input
-            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-            value={sourcePath}
-            placeholder="D:\\media\\bilibili-cut.mp4"
-            onChange={(event) => setSourcePath(event.target.value)}
-          />
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+            <input
+              aria-label="删减版路径"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              value={sourcePath}
+              placeholder="D:\\media\\bilibili-cut.mp4"
+              onChange={(event) => setSourcePath(event.target.value)}
+            />
+            <TextButton
+              aria-label="选择删减版"
+              title="选择删减版"
+              onClick={() => {
+                void chooseSourcePath();
+              }}
+              className="px-2"
+            >
+              <FolderOpen size={14} />
+              选择
+            </TextButton>
+          </div>
         </label>
         <label className="grid gap-1">
           <span className="text-slate-500">FFmpeg 路径</span>
-          <input
-            className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-            value={ffmpegPath}
-            placeholder="留空使用 PATH 中的 ffmpeg"
-            onChange={(event) => setFfmpegPath(event.target.value)}
-          />
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+            <input
+              aria-label="FFmpeg 路径"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              value={ffmpegPath}
+              placeholder="留空使用 PATH 中的 ffmpeg"
+              onChange={(event) => setFfmpegPath(event.target.value)}
+            />
+            <TextButton
+              aria-label="选择 FFmpeg"
+              title="选择 FFmpeg"
+              onClick={() => {
+                void chooseFfmpegPath();
+              }}
+              className="px-2"
+            >
+              <FolderOpen size={14} />
+              选择
+            </TextButton>
+          </div>
         </label>
         <div className="grid grid-cols-3 gap-2">
           <label className="grid gap-1">

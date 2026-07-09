@@ -3,12 +3,20 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
+import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "../../stores/editorStore";
 import { AssetPanel } from "./AssetPanel";
 
+vi.mock("../../infrastructure/file-system/nativeDialogs", () => ({
+  pickAlignmentMediaPath: vi.fn(),
+  pickFfmpegExecutablePath: vi.fn()
+}));
+
 describe("资源面板", () => {
   beforeEach(() => {
+    vi.mocked(pickAlignmentMediaPath).mockReset();
+    vi.mocked(pickFfmpegExecutablePath).mockReset();
     const asset = parseBilibiliXml(
       `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u,r">测试</d></i>`,
       { fileName: "01 - 1.1.xml" }
@@ -178,6 +186,26 @@ describe("资源面板", () => {
         Reflect.deleteProperty(URL, "revokeObjectURL");
       }
     }
+  });
+
+  it("可以通过原生文件选择器填入视频对齐路径", async () => {
+    const user = userEvent.setup();
+    vi.mocked(pickAlignmentMediaPath)
+      .mockResolvedValueOnce("D:\\media\\full.mkv")
+      .mockResolvedValueOnce("D:\\media\\cut.mp4");
+    vi.mocked(pickFfmpegExecutablePath).mockResolvedValueOnce("C:\\tools\\ffmpeg.exe");
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "选择完整片源" }));
+    await user.click(screen.getByRole("button", { name: "选择删减版" }));
+    await user.click(screen.getByRole("button", { name: "选择 FFmpeg" }));
+
+    expect(screen.getByLabelText("完整片源路径")).toHaveValue("D:\\media\\full.mkv");
+    expect(screen.getByLabelText("删减版路径")).toHaveValue("D:\\media\\cut.mp4");
+    expect(screen.getByLabelText("FFmpeg 路径")).toHaveValue("C:\\tools\\ffmpeg.exe");
+    expect(pickAlignmentMediaPath).toHaveBeenNthCalledWith(1, "");
+    expect(pickAlignmentMediaPath).toHaveBeenNthCalledWith(2, "");
+    expect(pickFfmpegExecutablePath).toHaveBeenCalledWith("");
   });
 });
 
