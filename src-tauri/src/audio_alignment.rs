@@ -67,6 +67,8 @@ pub struct CutCandidateDto {
     id: String,
     name: String,
     source_at_ms: u64,
+    source_range_start_ms: u64,
+    source_range_end_ms: u64,
     target_gap_ms: u64,
     confidence: f64,
     note: String,
@@ -680,6 +682,8 @@ fn infer_cut_candidates(
             id: format!("audio-gap-{}", candidates.len() + 1),
             name: format!("音频推断补偿 {}", candidates.len() + 1),
             source_at_ms,
+            source_range_start_ms: previous.source_time_ms,
+            source_range_end_ms: current.source_time_ms,
             target_gap_ms: missing_duration_ms,
             confidence,
             note: format!(
@@ -778,6 +782,8 @@ mod tests {
         .unwrap();
         assert_eq!(proposal.cut_candidates.len(), 1);
         assert_eq!(proposal.cut_candidates[0].source_at_ms, 15_000);
+        assert_eq!(proposal.cut_candidates[0].source_range_start_ms, 10_000);
+        assert_eq!(proposal.cut_candidates[0].source_range_end_ms, 20_000);
         assert_eq!(proposal.cut_candidates[0].target_gap_ms, 20_000);
         assert!(proposal.cut_candidates[0]
             .note

@@ -11,6 +11,8 @@ export interface CutCandidate {
   id: string;
   name: string;
   sourceAtMs: number;
+  sourceRangeStartMs?: number;
+  sourceRangeEndMs?: number;
   targetGapMs: number;
   confidence: number;
   note: string;

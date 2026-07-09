@@ -25,6 +25,22 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C20 已完成：对齐提案补偿候选支持源时间不确定区间。
+  - `CutCandidate` 新增可选 `sourceRangeStartMs` / `sourceRangeEndMs`，旧对齐提案 JSON 仍兼容；手动导入会校验可选区间字段为有限数字。
+  - TS 领域音频对齐和 Tauri Rust 音频对齐输出都会填充源匹配区间：单点 `sourceAtMs` 仍是区间中点，用于生成实际补偿点；区间用于人工复核和时间轴显示。
+  - 对齐预览模型保留候选区间；资源栏本地对齐候选列表会显示“区间 起点-终点”，时间轴会在候选补偿点附近绘制半透明不确定区间带。
+  - 已补充 TS 音频对齐、手动 proposal 解析、对齐预览和资源栏 UI 测试；Rust 音频对齐测试同步覆盖区间字段。
+  - README 已同步：当前音频候选支持边界细化和不确定区间展示。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/audioAlignment.test.ts src/domain/alignment/manualProvider.test.ts src/domain/alignment/preview.test.ts src/features/assets/AssetPanel.test.tsx` 成功，4 个测试文件、19 个测试通过。
+  - 已重新验证：`cargo test` 成功，Rust 侧 11 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 30 个测试文件、108 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12231168` 字节，时间 `2026/07/10 7:29:19`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2991662` 字节，时间 `2026/07/10 7:29:19`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c20-candidate-source-range-20260710`。
 - 成熟度提升阶段 C19 已完成：Playwright E2E 覆盖设置备份导出/导入和设置中心截图。
   - 核心 E2E 流程现在会打开设置中心“隐私与本地数据”页，生成 `settings-privacy.png` 截图，覆盖设置备份/恢复入口和隐私边界文案的实际布局。
   - E2E 会实际点击“导出设置”，保存下载的 `danmaku-settings.json`，读取文件确认包含 `alignment` 且不包含 `password` 或 `token`。
@@ -1012,6 +1028,7 @@
    - 已补强：使用原生文件选择器选择完整片源、删减版视频和 FFmpeg 路径。
    - 已补强：FFmpeg 音频提取阶段支持任务取消时终止子进程，并补充任务日志面板。
    - 已补强：音频对齐候选补偿点使用前后源匹配帧中点作为初始边界。
+   - 已补强：对齐提案补偿候选保留源时间不确定区间，并在资源栏和时间轴展示。
    - 待补强：增加视觉对齐和更细粒度局部重匹配，提高真实视频删减点边界精度。
 5. 验证与体验：
    - 已补强：Playwright E2E 覆盖保存/打开项目、撤销/重做恢复、小窗口截图和补偿报告下载。

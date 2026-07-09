@@ -46,6 +46,8 @@ describe("alignment preview", () => {
           id: "cut-new",
           name: "候选删减点",
           sourceAtMs: 60_000,
+          sourceRangeStartMs: 58_000,
+          sourceRangeEndMs: 62_000,
           targetGapMs: 15_000,
           confidence: 0.78,
           note: "候选"
@@ -73,6 +75,10 @@ describe("alignment preview", () => {
       ["cut-existing", "applied"],
       ["cut-new", "candidate"]
     ]);
+    expect(preview.proposalCuts.find((candidate) => candidate.id === "cut-new")).toMatchObject({
+      sourceRangeStartMs: 58_000,
+      sourceRangeEndMs: 62_000
+    });
     expect(preview.summary).toMatchObject({
       proposalAnchorCount: 2,
       proposalCutCount: 2,

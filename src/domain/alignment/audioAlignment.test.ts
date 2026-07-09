@@ -20,6 +20,8 @@ describe("音频特征对齐", () => {
     expect(proposal.cutCandidates).toHaveLength(1);
     expect(proposal.cutCandidates[0]).toMatchObject({
       sourceAtMs: 15_000,
+      sourceRangeStartMs: 10_000,
+      sourceRangeEndMs: 20_000,
       targetGapMs: 20_000
     });
     expect(proposal.anchors.map((anchor) => [anchor.sourceMs, anchor.targetMs])).toEqual([

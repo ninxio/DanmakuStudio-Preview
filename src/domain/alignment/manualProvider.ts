@@ -66,6 +66,8 @@ function isCutCandidate(value: unknown): value is CutCandidate {
     typeof record.id === "string" &&
     typeof record.name === "string" &&
     isFiniteNumber(record.sourceAtMs) &&
+    (record.sourceRangeStartMs === undefined || isFiniteNumber(record.sourceRangeStartMs)) &&
+    (record.sourceRangeEndMs === undefined || isFiniteNumber(record.sourceRangeEndMs)) &&
     isFiniteNumber(record.targetGapMs) &&
     isFiniteNumber(record.confidence) &&
     typeof record.note === "string"

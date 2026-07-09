@@ -996,6 +996,7 @@ function drawProposalCutCandidates(
     }
     const applied = candidate.state === "applied";
     const strokeColor = applied ? "rgba(255, 143, 112, 0.42)" : "rgba(255, 143, 112, 0.94)";
+    drawCandidateSourceRange(context, candidate, tracks, scrollMs, pixelsPerSecond, width, applied);
     if (!applied) {
       context.save();
       context.fillStyle = "rgba(255, 143, 112, 0.045)";
@@ -1047,6 +1048,40 @@ function drawProposalCutCandidates(
       }
     );
   }
+}
+
+function drawCandidateSourceRange(
+  context: CanvasRenderingContext2D,
+  candidate: AlignmentPreviewCutCandidate,
+  tracks: TimelineTracks,
+  scrollMs: Milliseconds,
+  pixelsPerSecond: number,
+  width: number,
+  applied: boolean
+): void {
+  if (
+    candidate.sourceRangeStartMs === undefined ||
+    candidate.sourceRangeEndMs === undefined ||
+    candidate.sourceRangeEndMs <= candidate.sourceRangeStartMs
+  ) {
+    return;
+  }
+  const startX = timeToX(candidate.sourceRangeStartMs, scrollMs, pixelsPerSecond);
+  const endX = timeToX(candidate.sourceRangeEndMs, scrollMs, pixelsPerSecond);
+  const left = clamp(Math.min(startX, endX), LABEL_WIDTH, width);
+  const right = clamp(Math.max(startX, endX), LABEL_WIDTH, width);
+  if (right <= LABEL_WIDTH || left >= width || right - left < 2) {
+    return;
+  }
+  context.save();
+  context.fillStyle = applied ? "rgba(255, 143, 112, 0.08)" : "rgba(255, 143, 112, 0.16)";
+  context.strokeStyle = applied ? "rgba(255, 143, 112, 0.22)" : "rgba(255, 143, 112, 0.45)";
+  context.lineWidth = 1;
+  const y = tracks.cuts.y + 4;
+  const height = Math.max(6, tracks.cuts.height - 8);
+  context.fillRect(left, y, right - left, height);
+  context.strokeRect(left, y, right - left, height);
+  context.restore();
 }
 
 function drawImpactRegionText(

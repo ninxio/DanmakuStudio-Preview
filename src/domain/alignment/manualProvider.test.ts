@@ -11,6 +11,8 @@ describe("manual alignment provider", () => {
             id: "cut-1",
             name: "片头差异",
             sourceAtMs: 30_000,
+            sourceRangeStartMs: 28_000,
+            sourceRangeEndMs: 32_000,
             targetGapMs: 45_000,
             confidence: 0.8,
             note: "目标版本多出片头"
@@ -22,6 +24,7 @@ describe("manual alignment provider", () => {
     );
 
     expect(proposal.anchors).toHaveLength(1);
+    expect(proposal.cutCandidates[0]?.sourceRangeStartMs).toBe(28_000);
     expect(proposal.cutCandidates[0]?.targetGapMs).toBe(45_000);
   });
 

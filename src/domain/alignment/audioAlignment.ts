@@ -136,6 +136,8 @@ export function inferAudioCutCandidates(
       id: `audio-gap-${candidates.length + 1}`,
       name: `音频推断补偿 ${candidates.length + 1}`,
       sourceAtMs,
+      sourceRangeStartMs: clampMilliseconds(previous.sourceTimeMs),
+      sourceRangeEndMs: clampMilliseconds(current.sourceTimeMs),
       targetGapMs: missingDurationMs,
       confidence,
       note: `音频对齐显示完整片源在 ${formatDuration(previous.completeTimeMs)} 到 ${formatDuration(current.completeTimeMs)} 之间比删减版多出约 ${formatDuration(missingDurationMs)}，候选边界约在删减版 ${formatDuration(sourceAtMs)}。`
@@ -205,6 +207,14 @@ function mergeNearbyCandidates(candidates: CutCandidate[]): CutCandidate[] {
     if (previous && Math.abs(candidate.sourceAtMs - previous.sourceAtMs) <= 2000) {
       previous.targetGapMs += candidate.targetGapMs;
       previous.confidence = Math.min(previous.confidence, candidate.confidence);
+      previous.sourceRangeStartMs = Math.min(
+        previous.sourceRangeStartMs ?? previous.sourceAtMs,
+        candidate.sourceRangeStartMs ?? candidate.sourceAtMs
+      );
+      previous.sourceRangeEndMs = Math.max(
+        previous.sourceRangeEndMs ?? previous.sourceAtMs,
+        candidate.sourceRangeEndMs ?? candidate.sourceAtMs
+      );
       previous.note = `${previous.note} ${candidate.note}`;
     } else {
       merged.push({ ...candidate });

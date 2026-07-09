@@ -205,6 +205,8 @@ describe("资源面板", () => {
           id: "audio-gap-1",
           name: "音频推断补偿 1",
           sourceAtMs: 20_000,
+          sourceRangeStartMs: 18_000,
+          sourceRangeEndMs: 22_000,
           targetGapMs: 20_000,
           confidence: 0.9,
           note: "音频对齐候选"
@@ -220,6 +222,7 @@ describe("资源面板", () => {
     });
     await user.click(screen.getByRole("button", { name: "导入提案" }));
     await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.cutCandidates).toHaveLength(1));
+    expect(screen.getByText(/区间 00:00:18\.000-00:00:22\.000/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "应用候选" }));
 
     await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));

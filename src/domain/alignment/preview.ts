@@ -18,6 +18,8 @@ export interface AlignmentPreviewCutCandidate {
   id: string;
   name: string;
   sourceAtMs: Milliseconds;
+  sourceRangeStartMs?: Milliseconds;
+  sourceRangeEndMs?: Milliseconds;
   targetGapMs: Milliseconds;
   confidence: number;
   note: string;
@@ -65,6 +67,8 @@ export function buildAlignmentPreview(
         id: candidate.id,
         name: candidate.name,
         sourceAtMs: candidate.sourceAtMs,
+        sourceRangeStartMs: candidate.sourceRangeStartMs,
+        sourceRangeEndMs: candidate.sourceRangeEndMs,
         targetGapMs: candidate.targetGapMs,
         confidence: candidate.confidence,
         note: candidate.note,

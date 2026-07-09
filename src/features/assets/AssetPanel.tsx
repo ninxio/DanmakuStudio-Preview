@@ -1058,7 +1058,10 @@ function AnchorCalibrationPanel({
             {proposal.cutCandidates.slice(0, 3).map((candidate) => (
               <div key={candidate.id} className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
                 <span className="text-slate-500">{formatTimecode(candidate.sourceAtMs)}</span>
-                <span>+{formatTimecode(candidate.targetGapMs)}</span>
+                <span>
+                  +{formatTimecode(candidate.targetGapMs)}
+                  {formatCandidateSourceRange(candidate)}
+                </span>
               </div>
             ))}
             {proposal.diagnostics.length > 0 ? (
@@ -1598,6 +1601,7 @@ function VideoAlignmentLabPanel({
                 <span className="text-slate-500">{formatTimecode(candidate.sourceAtMs)}</span>
                 <span>
                   {formatSignedDuration(candidate.targetGapMs)} / {candidate.state === "applied" ? "已应用" : "候选"}
+                  {formatCandidateSourceRange(candidate)}
                 </span>
               </div>
             ))}
@@ -1798,6 +1802,20 @@ function anchorOriginText(origin: SyncAnchor["origin"]): string {
 function formatSignedDuration(milliseconds: number): string {
   const sign = milliseconds < 0 ? "-" : "+";
   return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
+}
+
+function formatCandidateSourceRange(candidate: {
+  sourceRangeStartMs?: number;
+  sourceRangeEndMs?: number;
+}): string {
+  if (
+    candidate.sourceRangeStartMs === undefined ||
+    candidate.sourceRangeEndMs === undefined ||
+    candidate.sourceRangeEndMs <= candidate.sourceRangeStartMs
+  ) {
+    return "";
+  }
+  return ` / 区间 ${formatTimecode(candidate.sourceRangeStartMs)}-${formatTimecode(candidate.sourceRangeEndMs)}`;
 }
 
 function TabButton({
