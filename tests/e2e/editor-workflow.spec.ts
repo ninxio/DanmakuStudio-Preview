@@ -10,7 +10,7 @@ test.beforeAll(() => {
   mkdirSync(downloadDir, { recursive: true });
 });
 
-test("核心编辑流程可导入、编辑并生成导出摘要", async ({ page }) => {
+test("核心编辑流程可导入、编辑、导出并重新导入 XML", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByTestId("status-bar")).toContainText("准备就绪");
@@ -67,6 +67,22 @@ test("核心编辑流程可导入、编辑并生成导出摘要", async ({ page 
   await compensationReportDownload.saveAs(compensationReportPath);
   expect(readFileSync(compensationReportPath, "utf8")).toContain("补偿明细");
   await page.screenshot({ path: screenshotPath("export-dialog.png"), fullPage: true });
+
+  const exportedXmlDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载 XML" }).click();
+  const exportedXmlDownload = await exportedXmlDownloadPromise;
+  const exportedXmlPath = resolve(downloadDir, exportedXmlDownload.suggestedFilename());
+  await exportedXmlDownload.saveAs(exportedXmlPath);
+  const exportedXmlText = readFileSync(exportedXmlPath, "utf8");
+  expect(exportedXmlText).toContain("<i>");
+  expect(exportedXmlText).toContain("<d p=");
+
+  await page.getByLabel("新建项目").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已创建新项目");
+  await page.getByTestId("xml-input").setInputFiles(exportedXmlPath);
+  await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
+  await expect(page.getByTestId("asset-card")).toContainText(exportedXmlDownload.suggestedFilename());
+  await page.screenshot({ path: screenshotPath("reimported-export.png"), fullPage: true });
 });
 
 function screenshotPath(fileName: string): string {
