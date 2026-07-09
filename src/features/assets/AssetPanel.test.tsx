@@ -82,6 +82,35 @@ describe("资源面板", () => {
     expect(marker.note).toContain("第一季1-2.xml");
   });
 
+  it("可以配置疑似删减扫描关键词", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i>
+        <d p="10,1,25,16777215,0,0,u1,r1">广告时间没了</d>
+        <d p="20,1,25,16777215,0,0,u2,r2">广告被处理了吗</d>
+      </i>`,
+      { fileName: "custom.xml" }
+    );
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        assets: [asset]
+      },
+      history: createHistoryState(),
+      selection: { kind: "none", ids: [] },
+      exportDraft: null
+    });
+
+    render(<AssetPanel />);
+    expect(screen.getByText("暂无候选")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("疑似删减关键词"), "广告");
+    await waitFor(() => expect(screen.getByRole("button", { name: "转为补偿点" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "转为补偿点" }));
+
+    await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));
+    expect(useEditorStore.getState().project.cutMarkers[0].note).toContain("广告");
+  });
+
   it("可以应用锚点校准推断出的补偿点", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);

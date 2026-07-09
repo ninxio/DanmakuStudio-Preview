@@ -5,7 +5,12 @@ import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCa
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
 import { buildBatchMergePlan, type BatchMergeOptions } from "../../domain/danmaku/batchMerge";
-import { findSuspectedCutCandidates, type SuspectedCutCandidate } from "../../domain/danmaku/cutHints";
+import {
+  createCutHintRulesFromKeywords,
+  findSuspectedCutCandidates,
+  type FindSuspectedCutCandidatesOptions,
+  type SuspectedCutCandidate
+} from "../../domain/danmaku/cutHints";
 import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
 import type { CutMarker } from "../../domain/danmaku/types";
 import { formatTimecode } from "../../domain/shared/time";
@@ -63,6 +68,9 @@ export function AssetPanel() {
   const [longSplitMode, setLongSplitMode] = useState<LongSplitMode>("auto");
   const [episodeDurationsText, setEpisodeDurationsText] = useState("");
   const [cutPointsText, setCutPointsText] = useState("");
+  const [cutHintKeywordsText, setCutHintKeywordsText] = useState("");
+  const [cutHintWindowSeconds, setCutHintWindowSeconds] = useState("60");
+  const [cutHintMinHitCount, setCutHintMinHitCount] = useState("2");
   const [anchorCalibrationText, setAnchorCalibrationText] = useState("");
   const [alignmentProposalText, setAlignmentProposalText] = useState("");
   const project = useEditorStore((state) => state.project);
@@ -110,9 +118,18 @@ export function AssetPanel() {
     () => buildBatchMergePlan(project.assets, batchMergeOptions),
     [batchMergeOptions, project.assets]
   );
+  const cutHintSearch = useMemo(
+    () =>
+      createCutHintSearchOptions({
+        keywordsText: cutHintKeywordsText,
+        windowSeconds: cutHintWindowSeconds,
+        minHitCount: cutHintMinHitCount
+      }),
+    [cutHintKeywordsText, cutHintMinHitCount, cutHintWindowSeconds]
+  );
   const suspectedCutCandidates = useMemo(
-    () => findSuspectedCutCandidates(project.assets),
-    [project.assets]
+    () => findSuspectedCutCandidates(project.assets, cutHintSearch.options),
+    [cutHintSearch, project.assets]
   );
   const anchorCalibrationProposal = useMemo(
     () => createAnchorCalibrationProposal(anchorCalibrationText),
@@ -212,6 +229,13 @@ export function AssetPanel() {
                 <SuspectedCutPanel
                   candidates={suspectedCutCandidates}
                   cutMarkers={project.cutMarkers}
+                  keywordsText={cutHintKeywordsText}
+                  windowSeconds={cutHintWindowSeconds}
+                  minHitCount={cutHintMinHitCount}
+                  warnings={cutHintSearch.warnings}
+                  onKeywordsTextChange={setCutHintKeywordsText}
+                  onWindowSecondsChange={setCutHintWindowSeconds}
+                  onMinHitCountChange={setCutHintMinHitCount}
                   onApply={(candidate) => {
                     addCutMarker(candidate.sourceAtMs, 45_000, {
                       name: `待确认补偿 ${formatTimecode(candidate.sourceAtMs)}`,
@@ -792,15 +816,26 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
 function SuspectedCutPanel({
   candidates,
   cutMarkers,
+  keywordsText,
+  windowSeconds,
+  minHitCount,
+  warnings,
+  onKeywordsTextChange,
+  onWindowSecondsChange,
+  onMinHitCountChange,
   onApply
 }: {
   candidates: SuspectedCutCandidate[];
   cutMarkers: CutMarker[];
+  keywordsText: string;
+  windowSeconds: string;
+  minHitCount: string;
+  warnings: string[];
+  onKeywordsTextChange: (value: string) => void;
+  onWindowSecondsChange: (value: string) => void;
+  onMinHitCountChange: (value: string) => void;
   onApply: (candidate: SuspectedCutCandidate) => void;
 }) {
-  if (candidates.length === 0) {
-    return null;
-  }
   const previewCandidates = candidates.slice(0, 5);
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
@@ -810,6 +845,46 @@ function SuspectedCutPanel({
         <span className="ml-auto text-[11px] text-slate-500">{candidates.length} 个候选</span>
       </div>
       <div className="mt-3 grid gap-2">
+        <label className="grid gap-1">
+          <span className="text-slate-500">关键词</span>
+          <textarea
+            aria-label="疑似删减关键词"
+            className="min-h-16 resize-y rounded border border-panel-line bg-[#111318] p-2 text-xs leading-5 text-slate-100"
+            value={keywordsText}
+            placeholder="删了, 剪了, 跳了, 和谐"
+            onChange={(event) => onKeywordsTextChange(event.target.value)}
+          />
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="grid gap-1">
+            <span className="text-slate-500">窗口秒</span>
+            <input
+              aria-label="疑似删减聚类窗口秒"
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              inputMode="decimal"
+              value={windowSeconds}
+              onChange={(event) => onWindowSecondsChange(event.target.value)}
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-slate-500">最小命中</span>
+            <input
+              aria-label="疑似删减最小命中数"
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              inputMode="numeric"
+              value={minHitCount}
+              onChange={(event) => onMinHitCountChange(event.target.value)}
+            />
+          </label>
+        </div>
+        {warnings.map((warning) => (
+          <div key={warning} className="text-[11px] text-accent-yellow">
+            {warning}
+          </div>
+        ))}
+        {previewCandidates.length === 0 ? (
+          <div className="border-t border-panel-line pt-2 text-slate-500">暂无候选</div>
+        ) : null}
         {previewCandidates.map((candidate) => {
           const applied = hasNearbyCutMarker(candidate, cutMarkers);
           return (
@@ -1395,6 +1470,45 @@ function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): st
     return "失败";
   }
   return "已取消";
+}
+
+function createCutHintSearchOptions({
+  keywordsText,
+  windowSeconds,
+  minHitCount
+}: {
+  keywordsText: string;
+  windowSeconds: string;
+  minHitCount: string;
+}): { options: FindSuspectedCutCandidatesOptions; warnings: string[] } {
+  const options: FindSuspectedCutCandidatesOptions = {};
+  const warnings: string[] = [];
+  const trimmedWindow = windowSeconds.trim();
+  const parsedWindowSeconds = Number(trimmedWindow);
+  if (trimmedWindow.length === 0 || !Number.isFinite(parsedWindowSeconds) || parsedWindowSeconds <= 0) {
+    warnings.push("疑似删减聚类窗口必须是大于 0 的数字。");
+  } else {
+    options.windowMs = Math.round(parsedWindowSeconds * 1000);
+  }
+
+  const trimmedMinHitCount = minHitCount.trim();
+  const parsedMinHitCount = Number(trimmedMinHitCount);
+  if (trimmedMinHitCount.length === 0 || !Number.isInteger(parsedMinHitCount) || parsedMinHitCount <= 0) {
+    warnings.push("疑似删减最小命中必须是大于 0 的整数。");
+  } else {
+    options.minHitCount = parsedMinHitCount;
+  }
+
+  if (keywordsText.trim().length > 0) {
+    const rules = createCutHintRulesFromKeywords(keywordsText);
+    if (rules.length === 0) {
+      warnings.push("疑似删减关键词为空。");
+    } else {
+      options.rules = rules;
+    }
+  }
+
+  return { options, warnings };
 }
 
 function createBatchMergeOptions({

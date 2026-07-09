@@ -42,6 +42,7 @@ export interface FindSuspectedCutCandidatesOptions {
 const DEFAULT_WINDOW_MS = 60_000;
 const DEFAULT_MIN_HIT_COUNT = 2;
 const DEFAULT_MAX_SAMPLES = 3;
+const KEYWORD_SPLIT_PATTERN = /[\s,，、;；|]+/u;
 
 export const DEFAULT_CUT_HINT_RULES: CutHintRule[] = [
   { label: "删了", pattern: /删了|删掉|删减|被删|删过|删了一段|删没了|删掉了/u, weight: 3 },
@@ -50,6 +51,19 @@ export const DEFAULT_CUT_HINT_RULES: CutHintRule[] = [
   { label: "和谐", pattern: /和谐|河蟹|阉割|被砍|砍了/u, weight: 3 },
   { label: "没了", pattern: /没了|少了|缺了|不见了|中间没|少一段/u, weight: 2 }
 ];
+
+export function createCutHintRulesFromKeywords(text: string, weight = 2): CutHintRule[] {
+  return unique(
+    text
+      .split(KEYWORD_SPLIT_PATTERN)
+      .map((keyword) => keyword.trim())
+      .filter((keyword) => keyword.length > 0)
+  ).map((keyword) => ({
+    label: keyword,
+    pattern: new RegExp(escapeRegExp(keyword), "iu"),
+    weight
+  }));
+}
 
 export function findSuspectedCutCandidates(
   assets: DanmakuAsset[],
@@ -142,4 +156,8 @@ function resolveConfidence(hitCount: number, score: number): SuspectedCutConfide
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

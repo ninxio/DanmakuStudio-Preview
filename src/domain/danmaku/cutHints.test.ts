@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
-import { findSuspectedCutCandidates } from "./cutHints";
+import { createCutHintRulesFromKeywords, findSuspectedCutCandidates } from "./cutHints";
 
 describe("疑似删减点扫描", () => {
   it("按时间窗口聚类弹幕文本中的删减提示", () => {
@@ -46,6 +46,23 @@ describe("疑似删减点扫描", () => {
 
     expect(candidates).toHaveLength(2);
     expect(candidates.map((candidate) => candidate.assetFileName).sort()).toEqual(["01.xml", "02.xml"]);
+  });
+
+  it("支持从用户关键词生成安全的自定义扫描规则", () => {
+    const asset = createAsset("custom.xml", [
+      [10_000, "这里有广告时间"],
+      [15_000, "广告被处理了吗"],
+      [20_000, "片头[删]"],
+      [25_000, "这里写了[删]"]
+    ]);
+    const candidates = findSuspectedCutCandidates([asset], {
+      windowMs: 20_000,
+      minHitCount: 2,
+      rules: createCutHintRulesFromKeywords("广告, [删]")
+    });
+
+    expect(candidates).toHaveLength(2);
+    expect(candidates.map((candidate) => candidate.keywords).flat()).toEqual(expect.arrayContaining(["广告", "[删]"]));
   });
 });
 
