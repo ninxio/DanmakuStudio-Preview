@@ -126,6 +126,7 @@ export function inferAudioCutCandidates(
     if (missingDurationMs < options.minGapMs) {
       continue;
     }
+    const sourceAtMs = estimateCutBoundaryMs(previous, current);
     const confidence = clampNumber(
       1 - (previous.distance + current.distance) / (2 * options.matchThreshold),
       0.1,
@@ -134,13 +135,18 @@ export function inferAudioCutCandidates(
     candidates.push({
       id: `audio-gap-${candidates.length + 1}`,
       name: `音频推断补偿 ${candidates.length + 1}`,
-      sourceAtMs: clampMilliseconds(current.sourceTimeMs),
+      sourceAtMs,
       targetGapMs: missingDurationMs,
       confidence,
-      note: `音频对齐显示完整片源在 ${formatDuration(previous.completeTimeMs)} 到 ${formatDuration(current.completeTimeMs)} 之间比删减版多出约 ${formatDuration(missingDurationMs)}。`
+      note: `音频对齐显示完整片源在 ${formatDuration(previous.completeTimeMs)} 到 ${formatDuration(current.completeTimeMs)} 之间比删减版多出约 ${formatDuration(missingDurationMs)}，候选边界约在删减版 ${formatDuration(sourceAtMs)}。`
     });
   }
   return mergeNearbyCandidates(candidates);
+}
+
+function estimateCutBoundaryMs(previous: AudioFeatureMatch, current: AudioFeatureMatch): Milliseconds {
+  const sourceDeltaMs = Math.max(0, current.sourceTimeMs - previous.sourceTimeMs);
+  return clampMilliseconds(previous.sourceTimeMs + Math.round(sourceDeltaMs / 2));
 }
 
 function backtrackMatches(

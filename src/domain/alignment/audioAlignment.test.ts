@@ -19,7 +19,7 @@ describe("音频特征对齐", () => {
 
     expect(proposal.cutCandidates).toHaveLength(1);
     expect(proposal.cutCandidates[0]).toMatchObject({
-      sourceAtMs: 20_000,
+      sourceAtMs: 15_000,
       targetGapMs: 20_000
     });
     expect(proposal.anchors.map((anchor) => [anchor.sourceMs, anchor.targetMs])).toEqual([
@@ -50,8 +50,9 @@ describe("音频特征对齐", () => {
     const candidates = inferAudioCutCandidates(matches, { matchThreshold: 0.01, minGapMs: 1000 });
 
     expect(candidates).toHaveLength(1);
-    expect(candidates[0].sourceAtMs).toBe(20_000);
+    expect(candidates[0].sourceAtMs).toBe(15_000);
     expect(candidates[0].targetGapMs).toBe(20_000);
+    expect(candidates[0].note).toContain("候选边界约在删减版 0:15");
   });
 
   it("空特征序列返回诊断而不是抛错", () => {

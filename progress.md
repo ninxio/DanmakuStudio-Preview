@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C18 已完成：音频对齐候选补偿点边界细化。
+  - TS 领域层和 Tauri Rust 对齐实现已同步：音频缺失段候选不再直接落在下游首个匹配帧时间，而是落在前后两个源匹配帧之间的中点，作为更接近删减发生区间的初始边界。
+  - 候选备注会写明“候选边界约在删减版 ...”，便于用户在补偿点管理面板继续人工复核和微调。
+  - 已更新 TS 音频对齐测试和 Rust 音频对齐测试，覆盖新边界估计结果和备注文本。
+  - README 已同步：当前音频候选已有边界细化；视觉对齐和更细粒度局部重匹配仍是后续增强。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/audioAlignment.test.ts` 成功，1 个测试文件、4 个测试通过。
+  - 已重新验证：`cargo test` 成功，Rust 侧 11 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 30 个测试文件、108 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12232192` 字节，时间 `2026/07/10 7:14:46`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2991384` 字节，时间 `2026/07/10 7:14:46`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c18-audio-boundary-refinement-20260710`。
 - 成熟度提升阶段 C17 已完成：设置中心新增非敏感设置备份导出/导入。
   - 设置中心“隐私与本地数据”页新增真实“导出设置”和“导入设置”入口，导出 `danmaku-settings.json`，内容只包含服务器地址、路径前缀、用户名、FFmpeg 路径和对齐默认参数。
   - 导入设置备份使用严格 JSON 解析，坏文件会报错，不会静默覆盖为默认值；导入成功后会同步浏览器 fallback 和桌面配置文件。
@@ -987,7 +1002,8 @@
    - 已支持后台任务状态、进度轮询和任务级取消请求。
    - 已补强：使用原生文件选择器选择完整片源、删减版视频和 FFmpeg 路径。
    - 已补强：FFmpeg 音频提取阶段支持任务取消时终止子进程，并补充任务日志面板。
-   - 待补强：增加候选区精扫，提高真实视频删减点边界精度。
+   - 已补强：音频对齐候选补偿点使用前后源匹配帧中点作为初始边界。
+   - 待补强：增加视觉对齐和更细粒度局部重匹配，提高真实视频删减点边界精度。
 5. 验证与体验：
    - 已补强：Playwright E2E 覆盖保存/打开项目、撤销/重做恢复、小窗口截图和补偿报告下载。
    - 已补强：Playwright E2E 覆盖导出 XML 后重新导入验证。

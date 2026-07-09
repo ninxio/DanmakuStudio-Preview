@@ -672,22 +672,31 @@ fn infer_cut_candidates(
         if missing_duration_ms < options.min_gap_ms {
             continue;
         }
+        let source_at_ms = estimate_cut_boundary_ms(previous, current);
         let confidence = (1.0
             - (previous.distance + current.distance) / (2.0 * options.match_threshold))
             .clamp(0.1, 0.95);
         candidates.push(CutCandidateDto {
             id: format!("audio-gap-{}", candidates.len() + 1),
             name: format!("音频推断补偿 {}", candidates.len() + 1),
-            source_at_ms: current.source_time_ms,
+            source_at_ms,
             target_gap_ms: missing_duration_ms,
             confidence,
             note: format!(
-                "音频对齐显示完整片源比删减版多出约 {}。",
-                format_duration(missing_duration_ms)
+                "音频对齐显示完整片源比删减版多出约 {}，候选边界约在删减版 {}。",
+                format_duration(missing_duration_ms),
+                format_duration(source_at_ms)
             ),
         });
     }
     candidates
+}
+
+fn estimate_cut_boundary_ms(previous: &AudioFeatureMatch, current: &AudioFeatureMatch) -> u64 {
+    let source_delta_ms = current
+        .source_time_ms
+        .saturating_sub(previous.source_time_ms);
+    previous.source_time_ms + source_delta_ms / 2
 }
 
 fn create_anchors(matches: &[AudioFeatureMatch], match_threshold: f64) -> Vec<SyncAnchorDto> {
@@ -768,8 +777,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proposal.cut_candidates.len(), 1);
-        assert_eq!(proposal.cut_candidates[0].source_at_ms, 20_000);
+        assert_eq!(proposal.cut_candidates[0].source_at_ms, 15_000);
         assert_eq!(proposal.cut_candidates[0].target_gap_ms, 20_000);
+        assert!(proposal.cut_candidates[0]
+            .note
+            .contains("候选边界约在删减版 0:15"));
     }
 
     #[test]
