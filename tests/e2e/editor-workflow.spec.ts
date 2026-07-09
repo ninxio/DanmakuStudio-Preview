@@ -1,11 +1,13 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
 const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
+const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
 
 test.beforeAll(() => {
   mkdirSync(screenshotDir, { recursive: true });
+  mkdirSync(downloadDir, { recursive: true });
 });
 
 test("核心编辑流程可导入、编辑并生成导出摘要", async ({ page }) => {
@@ -21,6 +23,23 @@ test("核心编辑流程可导入、编辑并生成导出摘要", async ({ page 
 
   await page.getByRole("button", { name: "放入时间轴" }).click();
   await expect(page.getByTestId("inspector-clip")).toContainText("片段检查器");
+  await page.setViewportSize({ width: 1024, height: 720 });
+  await expect(page.getByTestId("timeline-panel")).toBeVisible();
+  await page.screenshot({ path: screenshotPath("compact-editor.png"), fullPage: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  const projectDownloadPromise = page.waitForEvent("download");
+  await page.getByLabel("保存项目").click();
+  const projectDownload = await projectDownloadPromise;
+  const projectFilePath = resolve(downloadDir, projectDownload.suggestedFilename());
+  await projectDownload.saveAs(projectFilePath);
+  expect(readFileSync(projectFilePath, "utf8")).toContain("normal.xml");
+
+  await page.getByLabel("新建项目").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已创建新项目");
+  await page.getByTestId("project-input").setInputFiles(projectFilePath);
+  await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
+  await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
 
   const timeline = page.getByTestId("timeline-canvas");
   await expect(timeline).toBeVisible();
@@ -32,9 +51,21 @@ test("核心编辑流程可导入、编辑并生成导出摘要", async ({ page 
   await expect(page.getByTestId("status-bar")).toContainText("添加删减标记");
   await page.screenshot({ path: screenshotPath("cut-marker.png"), fullPage: true });
 
+  await page.getByLabel("撤销").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已撤销");
+  await page.getByLabel("重做").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已重做");
+
   await page.getByLabel("导出 XML").click();
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
   await expect(page.getByTestId("export-dialog")).toContainText("验证条数");
+  await expect(page.getByTestId("export-dialog")).toContainText("总补偿时长");
+  const compensationReportDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载补偿报告" }).click();
+  const compensationReportDownload = await compensationReportDownloadPromise;
+  const compensationReportPath = resolve(downloadDir, compensationReportDownload.suggestedFilename());
+  await compensationReportDownload.saveAs(compensationReportPath);
+  expect(readFileSync(compensationReportPath, "utf8")).toContain("补偿明细");
   await page.screenshot({ path: screenshotPath("export-dialog.png"), fullPage: true });
 });
 
