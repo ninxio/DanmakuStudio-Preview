@@ -208,7 +208,7 @@ describe("资源面板", () => {
           sourceRangeStartMs: 18_000,
           sourceRangeEndMs: 22_000,
           targetGapMs: 20_000,
-          confidence: 0.9,
+          confidence: 0.72,
           note: "音频对齐候选"
         }
       ],
@@ -222,6 +222,9 @@ describe("资源面板", () => {
     });
     await user.click(screen.getByRole("button", { name: "导入提案" }));
     await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.cutCandidates).toHaveLength(1));
+    expect(screen.getByText("复核提示")).toBeInTheDocument();
+    expect(screen.getByText(/1 个候选补偿置信度低于 75%/)).toBeInTheDocument();
+    expect(screen.getByText(/1 个候选补偿包含不确定区间/)).toBeInTheDocument();
     expect(screen.getByText(/区间 00:00:18\.000-00:00:22\.000/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "应用候选" }));
 

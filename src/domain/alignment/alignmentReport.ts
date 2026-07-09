@@ -11,7 +11,7 @@ export function createAlignmentReviewReport(proposal: AlignmentProposal, generat
     `候选补偿：${proposal.cutCandidates.length} 个`,
     "",
     "## 复核重点",
-    ...createReviewFocusLines(proposal),
+    ...createAlignmentReviewFocus(proposal).map((item) => `- ${item}`),
     "",
     "## 同步锚点",
     ...createAnchorLines(proposal),
@@ -25,7 +25,7 @@ export function createAlignmentReviewReport(proposal: AlignmentProposal, generat
   return `${lines.join("\n")}\n`;
 }
 
-function createReviewFocusLines(proposal: AlignmentProposal): string[] {
+export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[] {
   const focus: string[] = [];
   const lowConfidenceCuts = proposal.cutCandidates.filter((candidate) => candidate.confidence < 0.75);
   const rangedCuts = proposal.cutCandidates.filter(hasCompleteSourceRange);
@@ -34,22 +34,22 @@ function createReviewFocusLines(proposal: AlignmentProposal): string[] {
   );
 
   if (proposal.cutCandidates.length === 0 && proposal.anchors.length === 0) {
-    focus.push("- 提案没有同步锚点或候选补偿，需要重新生成或检查输入。");
+    focus.push("提案没有同步锚点或候选补偿，需要重新生成或检查输入。");
   }
   if (lowConfidenceCuts.length > 0) {
-    focus.push(`- ${lowConfidenceCuts.length} 个候选补偿置信度低于 75%，建议人工确认边界和缺失时长。`);
+    focus.push(`${lowConfidenceCuts.length} 个候选补偿置信度低于 75%，建议人工确认边界和缺失时长。`);
   }
   if (rangedCuts.length > 0) {
-    focus.push(`- ${rangedCuts.length} 个候选补偿包含不确定区间，优先核对区间内的真实删减边界。`);
+    focus.push(`${rangedCuts.length} 个候选补偿包含不确定区间，优先核对区间内的真实删减边界。`);
   }
   if (invalidRangeCuts.length > 0) {
-    focus.push(`- ${invalidRangeCuts.length} 个候选补偿的不确定区间起止顺序异常，需要修正后再应用。`);
+    focus.push(`${invalidRangeCuts.length} 个候选补偿的不确定区间起止顺序异常，需要修正后再应用。`);
   }
   if (proposal.diagnostics.length === 0) {
-    focus.push("- 没有诊断信息，复核时需要更多上下文判断提案来源。");
+    focus.push("没有诊断信息，复核时需要更多上下文判断提案来源。");
   }
   if (focus.length === 0) {
-    focus.push("- 未发现明显风险项，仍建议抽查首个锚点和每个候选补偿的边界。");
+    focus.push("未发现明显风险项，仍建议抽查首个锚点和每个候选补偿的边界。");
   }
   return focus;
 }

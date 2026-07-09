@@ -1,7 +1,7 @@
 import { Download, FolderOpen, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
-import { createAlignmentReviewReport } from "../../domain/alignment/alignmentReport";
+import { createAlignmentReviewFocus, createAlignmentReviewReport } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
@@ -1202,6 +1202,7 @@ function VideoAlignmentLabPanel({
   const previewCuts = preview.proposalCuts.slice(0, 3);
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
+  const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
 
   useEffect(() => {
     let mounted = true;
@@ -1605,6 +1606,16 @@ function VideoAlignmentLabPanel({
         />
         {proposal ? (
           <div className="grid gap-1 text-slate-400">
+            {reviewFocus.length > 0 ? (
+              <div className="rounded border border-amber-400/30 bg-amber-400/10 p-2 text-[11px] text-amber-100">
+                <div className="mb-1 font-medium">复核提示</div>
+                <ul className="grid list-disc gap-1 pl-4">
+                  {reviewFocus.slice(0, 3).map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
               <span className="text-slate-500">锚点</span>
               <span>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAlignmentReviewReport } from "./alignmentReport";
+import { createAlignmentReviewFocus, createAlignmentReviewReport } from "./alignmentReport";
 import type { AlignmentProposal } from "./types";
 
 describe("alignment review report", () => {
@@ -33,6 +33,10 @@ describe("alignment review report", () => {
     expect(report).toContain("不确定区间：00:00:18.000 (18000 ms) - 00:00:22.000 (22000 ms)");
     expect(report).toContain("1 个候选补偿置信度低于 75%");
     expect(report).toContain("音频特征匹配 4 / 4 帧。");
+    expect(createAlignmentReviewFocus(proposal)).toEqual([
+      "1 个候选补偿置信度低于 75%，建议人工确认边界和缺失时长。",
+      "1 个候选补偿包含不确定区间，优先核对区间内的真实删减边界。"
+    ]);
   });
 
   it("对空提案给出可复核的风险提示", () => {
