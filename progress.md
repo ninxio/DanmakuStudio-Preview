@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C23 已完成：窄窗口时间轴工具条布局修复。
+  - 时间轴工具条从固定单行改为可换行的双组布局：左侧编辑按钮和右侧状态徽章会在窄窗口内换行，不再把按钮文字压成竖排或越界到检查器区域。
+  - 工具按钮和状态徽章增加稳定尺寸约束，保持 `shrink-0` 和 `whitespace-nowrap`；“缩放到全部”补充图标，和其他工具按钮的视觉语言保持一致。
+  - Playwright compact 截图点新增布局断言：会检查时间轴工具条内的按钮和状态徽章都在工具条边界内，且彼此没有矩形重叠。
+  - 已重新生成并人工查看 `artifacts/screenshots/compact-editor.png`，1024px 宽窗口下时间轴工具条不再出现文字挤压或遮挡。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 31 个测试文件、111 个测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12235264` 字节，时间 `2026/07/10 7:49:34`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2988593` 字节，时间 `2026/07/10 7:49:34`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c23-compact-timeline-toolbar-20260710`。
 - 成熟度提升阶段 C22 已完成：对齐提案新增可下载复核报告。
   - 新增领域层 `createAlignmentReviewReport`，可从 `AlignmentProposal` 生成文本复核报告，包含生成时间、整体置信度、同步锚点、候选补偿、源时间不确定区间、低置信度风险提示和诊断信息。
   - 资源栏“视频对齐实验室”新增真实“导出报告”按钮，当前提案导入或生成后可下载 `alignment-review-report.txt`，用于人工复核、留档和后续调参对比。
@@ -1016,7 +1029,7 @@
 - 当前全局 pnpm 版本可能仍要求更高 Node 版本；项目内建议继续使用 `corepack pnpm ...`。
 - 安装包未签名，Windows 首次安装或运行时可能显示 SmartScreen 提示。
 - Playwright E2E 已覆盖核心冒烟、保存/打开项目、撤销/重做、补偿点编辑历史恢复、补偿报告下载和导出 XML 后重新导入；更多跨面板复杂编辑场景仍需扩展。
-- 小窗口、文本溢出、弹窗遮挡等视觉适配仍需要持续截图检查。
+- 时间轴工具条已针对 1024px 窄窗口补强；其他小窗口文本溢出、弹窗遮挡和复杂面板视觉适配仍需要持续截图检查。
 - 当前项目只处理用户主动导入的本地文件和用户授权访问的 Emby 元数据；不实现视频下载、DRM 绕过、账号绕过或未授权媒体访问。
 - 对 B 站删减导致的非线性时间轴错位，目前已有产品路线，尚未实现完整删减补偿和自动音频/视频对齐工具。
 

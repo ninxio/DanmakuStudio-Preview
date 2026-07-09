@@ -1,4 +1,4 @@
-import { Combine, Magnet, MousePointer2, Plus, Scissors, Trash2 } from "lucide-react";
+import { Combine, Magnet, Maximize2, MousePointer2, Plus, Scissors, Trash2 } from "lucide-react";
 import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -38,6 +38,9 @@ import { useEditorStore } from "../../stores/editorStore";
 const LABEL_WIDTH = 104;
 const SNAP_THRESHOLD_MS = 180;
 const EDGE_SCROLL_ZONE_PX = 36;
+const TIMELINE_TOOL_BUTTON_CLASS = "shrink-0 whitespace-nowrap";
+const TIMELINE_TOOL_CHIP_CLASS =
+  "shrink-0 whitespace-nowrap rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200";
 
 type TimelineEdgeFeedback = "start" | "end" | null;
 
@@ -196,62 +199,73 @@ export function TimelinePanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-panel-base" data-testid="timeline-panel">
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-panel-line px-3">
-        <TextButton
-          onClick={() => setTimelineTool("select")}
-          tone={timelineTool === "select" ? "primary" : "neutral"}
-        >
-          <MousePointer2 size={14} />
-          选择
-        </TextButton>
-        <TextButton
-          onClick={() => setTimelineTool("blade")}
-          tone={timelineTool === "blade" ? "primary" : "neutral"}
-        >
-          <Scissors size={14} />
-          剪刀
-        </TextButton>
-        <TextButton onClick={addCutMarkerAtPlayhead}>
-          <Plus size={14} />
-          添加删减点
-        </TextButton>
-        <TextButton onClick={splitSelectedClipsAtPlayhead}>
-          <Scissors size={14} />
-          剪切播放头
-        </TextButton>
-        <TextButton onClick={mergeSelectedClips}>
-          <Combine size={14} />
-          合并片段
-        </TextButton>
-        <TextButton onClick={deleteSelection} tone="danger">
-          <Trash2 size={14} />
-          删除
-        </TextButton>
-        <TextButton
-          onClick={() => fitTimelineToContent(Math.max(240, size.width - LABEL_WIDTH - 24))}
-        >
-          缩放到全部
-        </TextButton>
-        <div className="ml-auto flex items-center gap-2 text-xs text-slate-400">
+      <div
+        className="grid min-h-10 shrink-0 grid-cols-1 gap-2 border-b border-panel-line px-3 py-2 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-center"
+        data-testid="timeline-toolbar"
+      >
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <TextButton
+            className={TIMELINE_TOOL_BUTTON_CLASS}
+            onClick={() => setTimelineTool("select")}
+            tone={timelineTool === "select" ? "primary" : "neutral"}
+          >
+            <MousePointer2 size={14} />
+            选择
+          </TextButton>
+          <TextButton
+            className={TIMELINE_TOOL_BUTTON_CLASS}
+            onClick={() => setTimelineTool("blade")}
+            tone={timelineTool === "blade" ? "primary" : "neutral"}
+          >
+            <Scissors size={14} />
+            剪刀
+          </TextButton>
+          <TextButton className={TIMELINE_TOOL_BUTTON_CLASS} onClick={addCutMarkerAtPlayhead}>
+            <Plus size={14} />
+            添加删减点
+          </TextButton>
+          <TextButton className={TIMELINE_TOOL_BUTTON_CLASS} onClick={splitSelectedClipsAtPlayhead}>
+            <Scissors size={14} />
+            剪切播放头
+          </TextButton>
+          <TextButton className={TIMELINE_TOOL_BUTTON_CLASS} onClick={mergeSelectedClips}>
+            <Combine size={14} />
+            合并片段
+          </TextButton>
+          <TextButton className={TIMELINE_TOOL_BUTTON_CLASS} onClick={deleteSelection} tone="danger">
+            <Trash2 size={14} />
+            删除
+          </TextButton>
+          <TextButton
+            className={TIMELINE_TOOL_BUTTON_CLASS}
+            onClick={() => fitTimelineToContent(Math.max(240, size.width - LABEL_WIDTH - 24))}
+          >
+            <Maximize2 size={14} />
+            缩放到全部
+          </TextButton>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400 xl:justify-end">
           {alignmentPreview.summary.proposalAnchorCount +
             alignmentPreview.summary.proposalCutCount >
           0 ? (
-            <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200">
+            <span className={TIMELINE_TOOL_CHIP_CLASS} data-toolbar-chip="true">
               对齐候选 {pendingAlignmentCount} / 已应用 {appliedAlignmentCount}
             </span>
           ) : null}
           {suspectedCutCandidates.length > 0 ? (
-            <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200">
+            <span className={TIMELINE_TOOL_CHIP_CLASS} data-toolbar-chip="true">
               文本候选 {pendingSuspectedCutCount} / 已落点{" "}
               {suspectedCutCandidates.length - pendingSuspectedCutCount}
             </span>
           ) : null}
-          <Magnet size={14} className="text-accent-cyan" />
-          吸附播放头 / 删减点
-          <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 font-mono text-slate-200">
+          <span className="flex shrink-0 items-center gap-1 whitespace-nowrap" data-toolbar-chip="true">
+            <Magnet size={14} className="text-accent-cyan" />
+            吸附播放头 / 删减点
+          </span>
+          <span className={`${TIMELINE_TOOL_CHIP_CLASS} font-mono`} data-toolbar-chip="true">
             {formatPixelsPerSecond(project.timeline.pixelsPerSecond)}
           </span>
-          <span className="rounded border border-panel-line bg-panel-soft px-2 py-1 text-slate-200">
+          <span className={TIMELINE_TOOL_CHIP_CLASS} data-toolbar-chip="true">
             选择 {selection.ids.length}
           </span>
         </div>

@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
 const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
@@ -62,6 +62,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("inspector-clip")).toContainText("片段检查器");
   await page.setViewportSize({ width: 1024, height: 720 });
   await expect(page.getByTestId("timeline-panel")).toBeVisible();
+  await expectTimelineToolbarLayout(page);
   await page.screenshot({ path: screenshotPath("compact-editor.png"), fullPage: true });
   await page.setViewportSize({ width: 1440, height: 900 });
 
@@ -149,4 +150,55 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
 
 function screenshotPath(fileName: string): string {
   return resolve(screenshotDir, fileName);
+}
+
+interface ToolbarBox {
+  label: string;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  toolbarLeft: number;
+  toolbarRight: number;
+  toolbarTop: number;
+  toolbarBottom: number;
+}
+
+async function expectTimelineToolbarLayout(page: Page): Promise<void> {
+  const boxes: ToolbarBox[] = await page.getByTestId("timeline-toolbar").evaluate((toolbar) => {
+    const toolbarRect = toolbar.getBoundingClientRect();
+    return Array.from(toolbar.querySelectorAll<HTMLElement>("button, [data-toolbar-chip='true']")).map((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        label: element.textContent?.trim() || element.getAttribute("aria-label") || "toolbar item",
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        toolbarLeft: toolbarRect.left,
+        toolbarRight: toolbarRect.right,
+        toolbarTop: toolbarRect.top,
+        toolbarBottom: toolbarRect.bottom
+      };
+    });
+  });
+  expect(boxes.length).toBeGreaterThan(0);
+  for (const box of boxes) {
+    expect(box.left, `${box.label} left edge`).toBeGreaterThanOrEqual(box.toolbarLeft - 1);
+    expect(box.right, `${box.label} right edge`).toBeLessThanOrEqual(box.toolbarRight + 1);
+    expect(box.top, `${box.label} top edge`).toBeGreaterThanOrEqual(box.toolbarTop - 1);
+    expect(box.bottom, `${box.label} bottom edge`).toBeLessThanOrEqual(box.toolbarBottom + 1);
+  }
+  for (let firstIndex = 0; firstIndex < boxes.length; firstIndex += 1) {
+    for (let secondIndex = firstIndex + 1; secondIndex < boxes.length; secondIndex += 1) {
+      const first = boxes[firstIndex];
+      const second = boxes[secondIndex];
+      const horizontalOverlap = Math.min(first.right, second.right) - Math.max(first.left, second.left);
+      const verticalOverlap = Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top);
+      expect(
+        Math.min(horizontalOverlap, verticalOverlap),
+        `${first.label} overlaps ${second.label}`
+      ).toBeLessThanOrEqual(1);
+    }
+  }
 }
