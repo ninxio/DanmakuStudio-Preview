@@ -78,6 +78,20 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
 
+  await page.getByPlaceholder(/每行一个对应点/).fill("00:10 -> 00:10\n00:20 -> 00:30");
+  await page.getByRole("button", { name: "应用锚点与补偿" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText("已应用对齐提案");
+  const secondAnchorTargetInput = page.getByLabel("同步锚点 2 目标时间 ms");
+  await expect(secondAnchorTargetInput).toHaveValue("30000");
+  await secondAnchorTargetInput.fill("32000");
+  await expect(secondAnchorTargetInput).toHaveValue("32000");
+  await page.getByLabel("撤销").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已撤销");
+  await expect(secondAnchorTargetInput).toHaveValue("30000");
+  await page.getByLabel("重做").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已重做");
+  await expect(secondAnchorTargetInput).toHaveValue("32000");
+
   const timeline = page.getByTestId("timeline-canvas");
   await expect(timeline).toBeVisible();
   await timeline.click({ position: { x: 420, y: 18 } });
