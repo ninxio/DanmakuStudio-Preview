@@ -12,6 +12,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "lint": "eslint .",
+    "audit:source": "node scripts/audit-source.mjs",
     "format": "prettier --write .",
     "align:audio": "node scripts/audio-align-prototype.mjs",
     "tauri": "tauri",
