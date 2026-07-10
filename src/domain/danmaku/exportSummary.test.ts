@@ -22,11 +22,13 @@ describe("导出补偿报告", () => {
     ];
 
     const summary = createExportSummary([], markers, false);
-    const report = createCompensationReport("测试项目", summary);
+    const report = createCompensationReport("测试项目", summary, new Date("2026-07-10T01:02:03.000Z"));
 
     expect(summary.totalCutGapMs).toBe(17_000);
     expect(summary.compensationDetails.map((detail) => detail.id)).toEqual(["cut-early", "cut-late"]);
+    expect(report).toContain("导出复核报告");
     expect(report).toContain("项目：测试项目");
+    expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");
     expect(report).toContain("总补偿：+00:00:17.000");
     expect(report).toContain("1. 前段补偿");
     expect(report).toContain("备注：人工复核");

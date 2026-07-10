@@ -75,9 +75,11 @@ export function createExportSummary(
   };
 }
 
-export function createCompensationReport(projectName: string, summary: ExportSummary): string {
+export function createCompensationReport(projectName: string, summary: ExportSummary, generatedAt = new Date()): string {
   const lines = [
+    "导出复核报告",
     `项目：${projectName || "未命名项目"}`,
+    `生成时间：${generatedAt.toISOString()}`,
     `启用弹幕：${summary.enabledCount.toLocaleString("zh-CN")} 条`,
     `禁用弹幕：${summary.disabledCount.toLocaleString("zh-CN")} 条`,
     `补偿点：${summary.cutMarkerCount.toLocaleString("zh-CN")} 个`,
