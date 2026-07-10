@@ -36,16 +36,19 @@ describe("资源面板", () => {
     });
   });
 
-  it("可以从资源栏删除已导入的弹幕文件", async () => {
+  it("可以从资源栏删除已导入的弹幕素材", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
     await user.click(screen.getByRole("button", { name: "删除" }));
     await waitFor(() => expect(useEditorStore.getState().project.assets).toHaveLength(0));
   });
 
-  it("主界面的 Emby 时长面板只保留搜索入口", () => {
+  it("高级工具默认收起，展开后 Emby 时长面板只保留搜索入口", async () => {
+    const user = userEvent.setup();
     render(<AssetPanel />);
 
+    expect(screen.queryByText("Emby 时长")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     expect(screen.getByText("Emby 时长")).toBeInTheDocument();
     expect(screen.getByLabelText("搜索")).toBeInTheDocument();
     expect(screen.queryByLabelText("服务器")).not.toBeInTheDocument();
@@ -55,24 +58,26 @@ describe("资源面板", () => {
     expect(screen.queryByRole("button", { name: "登录" })).not.toBeInTheDocument();
   });
 
-  it("项目信息会展示项目健康摘要", async () => {
+  it("导出检查会展示人话摘要并按需显示诊断详情", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
 
-    await user.click(screen.getByRole("button", { name: "项目信息" }));
+    await user.click(screen.getByRole("button", { name: "导出检查" }));
 
     expect(screen.getByTestId("project-health-panel")).toBeInTheDocument();
-    expect(screen.getByText("项目健康")).toBeInTheDocument();
+    expect(screen.getByText("导出前检查")).toBeInTheDocument();
+    expect(screen.getByText("弹幕还没放到时间轴")).toBeInTheDocument();
+    expect(screen.getByText("建议检查")).toBeInTheDocument();
+    expect(screen.queryByText("项目版本")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "查看诊断详情" }));
     expect(screen.getByText("项目版本")).toBeInTheDocument();
     expect(screen.getByText(`v${CURRENT_SCHEMA_VERSION}`)).toBeInTheDocument();
-    expect(screen.getByText("需复核")).toBeInTheDocument();
-    expect(screen.getByText("没有时间轴片段")).toBeInTheDocument();
     expect(screen.getByText("01 - 1.1.xml（1 条弹幕）")).toBeInTheDocument();
-    expect(screen.getByText("媒体重连")).toBeInTheDocument();
+    expect(screen.getByText("视频重连")).toBeInTheDocument();
     expect(screen.getByText("不需要")).toBeInTheDocument();
   });
 
-  it("项目健康摘要会展示重复 ID 的具体位置", async () => {
+  it("导出检查会展示重复 ID 的具体位置", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(
       `<?xml version="1.0" encoding="UTF-8"?><i>
@@ -94,14 +99,15 @@ describe("资源面板", () => {
     });
     render(<AssetPanel />);
 
-    await user.click(screen.getByRole("button", { name: "项目信息" }));
+    await user.click(screen.getByRole("button", { name: "导出检查" }));
 
-    expect(screen.getByText("弹幕 ID 重复")).toBeInTheDocument();
+    expect(screen.getByText("项目内部 ID 有重复")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "查看诊断详情" }));
     expect(screen.getByText("重复 ID")).toBeInTheDocument();
     expect(screen.getByText(/资源 duplicate\.xml 的第 1 条弹幕；资源 duplicate\.xml 的第 2 条弹幕/)).toBeInTheDocument();
   });
 
-  it("项目健康摘要会展示负最终时间风险", async () => {
+  it("导出检查会展示负最终时间风险", async () => {
     const user = userEvent.setup();
     const project = useEditorStore.getState().project;
     const assetId = project.assets[0].id;
@@ -125,14 +131,13 @@ describe("资源面板", () => {
     });
     render(<AssetPanel />);
 
-    await user.click(screen.getByRole("button", { name: "项目信息" }));
+    await user.click(screen.getByRole("button", { name: "导出检查" }));
 
-    expect(screen.getByText("负最终时间")).toBeInTheDocument();
-    expect(screen.getByText("存在负最终时间")).toBeInTheDocument();
+    expect(screen.getByText("有弹幕会被挤到 0 秒")).toBeInTheDocument();
     expect(screen.getByText(/负时间片段.*-00:00:01\.500/)).toBeInTheDocument();
   });
 
-  it("可以从项目健康摘要导出健康报告", async () => {
+  it("可以从导出检查下载检查报告", async () => {
     const user = userEvent.setup();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
@@ -150,24 +155,24 @@ describe("资源面板", () => {
         }
       });
       render(<AssetPanel />);
-      await user.click(screen.getByRole("button", { name: "项目信息" }));
-      await user.click(screen.getByRole("button", { name: "导出健康报告" }));
+      await user.click(screen.getByRole("button", { name: "导出检查" }));
+      await user.click(screen.getByRole("button", { name: "下载检查报告" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
       const clickedAnchor = clickSpy.mock.contexts[0];
       if (!(clickedAnchor instanceof HTMLAnchorElement)) {
-        throw new Error("健康报告下载未通过锚点触发。");
+        throw new Error("检查报告下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("健康_报告_项目-health-report.txt");
       const [blob] = createObjectUrl.mock.calls[0];
       if (!(blob instanceof Blob)) {
-        throw new Error("导出的健康报告不是 Blob。");
+        throw new Error("导出的检查报告不是 Blob。");
       }
-      await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
+      await expect(readBlobText(blob)).resolves.toContain("导出前检查报告");
       await expect(readBlobText(blob)).resolves.toContain(`项目版本：v${CURRENT_SCHEMA_VERSION}`);
       await expect(readBlobText(blob)).resolves.toContain("没有时间轴片段");
       await expect(readBlobText(blob)).resolves.toContain("01 - 1.1.xml（1 条弹幕）");
-      expect(useEditorStore.getState().status.message).toBe("已导出项目健康报告：健康_报告_项目-health-report.txt。");
+      expect(useEditorStore.getState().status.message).toBe("已导出检查报告：健康_报告_项目-health-report.txt。");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
     } finally {
@@ -185,7 +190,7 @@ describe("资源面板", () => {
     }
   });
 
-  it("可以从项目健康摘要清理失效编辑引用", async () => {
+  it("可以从导出检查清理失效编辑引用", async () => {
     const user = userEvent.setup();
     const project = useEditorStore.getState().project;
     const validItemId = project.assets[0].items[0].id;
@@ -201,18 +206,18 @@ describe("资源面板", () => {
     });
     render(<AssetPanel />);
 
-    await user.click(screen.getByRole("button", { name: "项目信息" }));
-    expect(screen.getByText("存在失效编辑引用")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "导出检查" }));
+    expect(screen.getByText("有失效的弹幕调整记录")).toBeInTheDocument();
     expect(screen.getByText("失效禁用：missing-disabled")).toBeInTheDocument();
     expect(screen.getByText("失效微调：missing-adjustment（+00:00:00.200）")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "清理失效引用" }));
+    await user.click(screen.getByRole("button", { name: "清理失效调整" }));
 
     expect(useEditorStore.getState().project.disabledItemIds).toEqual([validItemId]);
     expect(useEditorStore.getState().project.itemTimeAdjustments).toEqual({ [validItemId]: 100 });
-    expect(screen.queryByText("存在失效编辑引用")).not.toBeInTheDocument();
+    expect(screen.queryByText("有失效的弹幕调整记录")).not.toBeInTheDocument();
   });
 
-  it("可以从项目健康摘要清理缺失资源片段", async () => {
+  it("可以从导出检查清理缺失资源片段", async () => {
     const user = userEvent.setup();
     const project = useEditorStore.getState().project;
     const assetId = project.assets[0].id;
@@ -246,17 +251,17 @@ describe("资源面板", () => {
     });
     render(<AssetPanel />);
 
-    await user.click(screen.getByRole("button", { name: "项目信息" }));
-    expect(screen.getByText("片段引用了缺失资源")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "导出检查" }));
+    expect(screen.getByText("有时间轴片段找不到原来的 XML")).toBeInTheDocument();
     expect(screen.getByText(/坏片段（片段 ID：clip-missing，缺失资源 ID：missing-asset/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "清理缺失片段" }));
+    await user.click(screen.getByRole("button", { name: "移除缺失片段" }));
 
     expect(useEditorStore.getState().project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);
     expect(useEditorStore.getState().selection).toEqual({ kind: "none", ids: [] });
-    expect(screen.queryByText("片段引用了缺失资源")).not.toBeInTheDocument();
+    expect(screen.queryByText("有时间轴片段找不到原来的 XML")).not.toBeInTheDocument();
   });
 
-  it("可以把疑似删减候选转为待确认补偿点", async () => {
+  it("可以把疑似版本差异候选转为待确认版本差异", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(
       `<?xml version="1.0" encoding="UTF-8"?><i>
@@ -279,17 +284,18 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel />);
-    expect(screen.getByText("疑似删减点")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "转为补偿点" }));
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+    expect(screen.getByText("疑似版本差异")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "转为版本差异" }));
 
     await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));
     const marker = useEditorStore.getState().project.cutMarkers[0];
-    expect(marker.name).toContain("待确认补偿");
+    expect(marker.name).toContain("待确认版本差异");
     expect(marker.sourceAtMs).toBe(20_000);
     expect(marker.note).toContain("第一季1-2.xml");
   });
 
-  it("可以配置疑似删减扫描关键词", async () => {
+  it("可以配置疑似版本差异扫描关键词", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(
       `<?xml version="1.0" encoding="UTF-8"?><i>
@@ -311,11 +317,12 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     expect(screen.getByText("暂无候选")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("疑似删减关键词"), "广告");
+    await user.type(screen.getByLabelText("疑似版本差异关键词"), "广告");
     expect(useEditorStore.getState().cutHintSettings.keywordsText).toBe("广告");
-    await waitFor(() => expect(screen.getByRole("button", { name: "转为补偿点" })).toBeEnabled());
-    await user.click(screen.getByRole("button", { name: "转为补偿点" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "转为版本差异" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "转为版本差异" }));
 
     await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));
     expect(useEditorStore.getState().project.cutMarkers[0].note).toContain("广告");
@@ -351,8 +358,8 @@ describe("资源面板", () => {
       });
 
       render(<AssetPanel />);
-      await user.click(screen.getByRole("button", { name: "弹幕文件" }));
-      await user.click(screen.getByRole("button", { name: "导出分集" }));
+      await user.click(screen.getByRole("button", { name: "弹幕素材" }));
+      await user.click(screen.getByRole("button", { name: "导出分集 XML" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
       const clickedAnchor = clickSpy.mock.contexts[0];
@@ -403,8 +410,8 @@ describe("资源面板", () => {
       });
 
       render(<AssetPanel />);
-      await user.click(screen.getByRole("button", { name: "弹幕文件" }));
-      await user.click(screen.getByRole("button", { name: "导出分集" }));
+      await user.click(screen.getByRole("button", { name: "弹幕素材" }));
+      await user.click(screen.getByRole("button", { name: "导出分集 XML" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
       const clickedAnchor = clickSpy.mock.contexts[0];
@@ -429,7 +436,7 @@ describe("资源面板", () => {
     }
   });
 
-  it("可以在补偿点管理面板定位、微调并删除补偿点", async () => {
+  it("可以在版本差异列表定位、微调并删除版本差异", async () => {
     const user = userEvent.setup();
     useEditorStore.setState({
       project: {
@@ -437,7 +444,7 @@ describe("资源面板", () => {
         cutMarkers: [
           {
             id: "cut-manual",
-            name: "手动补偿",
+            name: "手动版本差异",
             sourceAtMs: 3000,
             targetGapMs: 45000,
             note: "人工确认"
@@ -448,14 +455,15 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel />);
-    await user.click(screen.getByRole("button", { name: "定位补偿点 手动补偿" }));
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+    await user.click(screen.getByRole("button", { name: "定位版本差异 手动版本差异" }));
     expect(useEditorStore.getState().selection).toEqual({ kind: "cut", ids: ["cut-manual"] });
     expect(useEditorStore.getState().project.timeline.playheadMs).toBe(3000);
 
-    fireEvent.change(screen.getByLabelText("手动补偿 补偿 ms"), { target: { value: "12000" } });
+    fireEvent.change(screen.getByLabelText("手动版本差异 相差 ms"), { target: { value: "12000" } });
     expect(useEditorStore.getState().project.cutMarkers[0].targetGapMs).toBe(12000);
 
-    await user.click(screen.getByRole("button", { name: "删除补偿点 手动补偿" }));
+    await user.click(screen.getByRole("button", { name: "删除版本差异 手动版本差异" }));
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
   });
 
@@ -469,22 +477,24 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     await user.click(screen.getByRole("button", { name: "定位同步锚点 1" }));
     expect(useEditorStore.getState().project.timeline.playheadMs).toBe(4000);
 
-    fireEvent.change(screen.getByLabelText("同步锚点 1 目标时间 ms"), { target: { value: "12000" } });
+    fireEvent.change(screen.getByLabelText("同步锚点 1 完整版时间 ms"), { target: { value: "12000" } });
     expect(useEditorStore.getState().project.syncAnchors[0].targetMs).toBe(12000);
 
     await user.click(screen.getByRole("button", { name: "删除同步锚点 1" }));
     expect(useEditorStore.getState().project.syncAnchors).toHaveLength(0);
   });
 
-  it("可以应用锚点校准推断出的补偿点", async () => {
+  it("可以应用锚点校准推断出的版本差异", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
 
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     await user.type(screen.getByPlaceholderText(/每行一个对应点/), "00:10 -> 00:10\n00:20 -> 00:30");
-    await user.click(screen.getByRole("button", { name: "应用锚点与补偿" }));
+    await user.click(screen.getByRole("button", { name: "应用线索与差异" }));
 
     await waitFor(() => expect(useEditorStore.getState().project.syncAnchors).toHaveLength(2));
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1);
@@ -498,6 +508,7 @@ describe("资源面板", () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
 
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     await user.type(screen.getByPlaceholderText(/每行一个对应点/), "00:10 -> 00:10\n00:20 -> 00:30");
     await user.click(screen.getByRole("button", { name: "预览到时间轴" }));
 
@@ -507,12 +518,13 @@ describe("资源面板", () => {
   });
 
   it("会把项目内恢复的对齐提案同步到 JSON 文本框", async () => {
+    const user = userEvent.setup();
     const proposal = {
       anchors: [{ id: "saved-anchor", sourceMs: 20_000, targetMs: 40_000, origin: "automatic" as const, confidence: 0.9 }],
       cutCandidates: [
         {
           id: "saved-gap",
-          name: "已保存补偿",
+          name: "已保存版本差异",
           sourceAtMs: 20_000,
           sourceRangeStartMs: 18_000,
           sourceRangeEndMs: 22_000,
@@ -534,6 +546,7 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
 
     await waitFor(() =>
       expect(screen.getByPlaceholderText("AlignmentProposal JSON")).toHaveValue(`${JSON.stringify(proposal, null, 2)}\n`)
@@ -548,7 +561,7 @@ describe("资源面板", () => {
       cutCandidates: [
         {
           id: "saved-gap",
-          name: "已保存补偿",
+          name: "已保存版本差异",
           sourceAtMs: 20_000,
           sourceRangeStartMs: 18_000,
           sourceRangeEndMs: 22_000,
@@ -570,6 +583,7 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
 
     const textArea = screen.getByPlaceholderText("AlignmentProposal JSON");
     await waitFor(() => expect(textArea).toHaveValue(`${JSON.stringify(proposal, null, 2)}\n`));
@@ -592,7 +606,7 @@ describe("资源面板", () => {
       cutCandidates: [
         {
           id: "audio-gap-1",
-          name: "音频推断补偿 1",
+          name: "音频推断差异 1",
           sourceAtMs: 20_000,
           sourceRangeStartMs: 18_000,
           sourceRangeEndMs: 22_000,
@@ -605,6 +619,7 @@ describe("资源面板", () => {
       diagnostics: ["音频特征匹配 4 / 4 帧。"]
     };
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
 
     fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
       target: { value: JSON.stringify(proposal) }
@@ -615,16 +630,16 @@ describe("资源面板", () => {
     expect(screen.getByText("待应用 2 / 已落点 0")).toBeInTheDocument();
     expect(screen.getByText("复核队列")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("优先复核");
-    expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("候选补偿置信度 72.0%");
+    expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("候选版本差异置信度 72.0%");
     await user.click(screen.getByRole("button", { name: "定位复核项 1" }));
     expect(useEditorStore.getState().project.timeline.playheadMs).toBe(20_000);
-    expect(useEditorStore.getState().status.message).toBe("已定位复核项：音频推断补偿 1（00:00:20.000）。");
+    expect(useEditorStore.getState().status.message).toBe("已定位复核项：音频推断差异 1（00:00:20.000）。");
     expect(screen.getByText("落点状态")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("audio-anchor-1");
-    expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("音频推断补偿 1");
+    expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("音频推断差异 1");
     expect(screen.getAllByText("待应用")).toHaveLength(2);
-    expect(screen.getByText(/1 个候选补偿置信度低于 75%/)).toBeInTheDocument();
-    expect(screen.getByText(/1 个候选补偿包含不确定区间/)).toBeInTheDocument();
+    expect(screen.getByText(/1 个候选版本差异置信度低于 75%/)).toBeInTheDocument();
+    expect(screen.getByText(/1 个候选版本差异包含不确定区间/)).toBeInTheDocument();
     expect(screen.getAllByText(/区间 00:00:18\.000-00:00:22\.000/).length).toBeGreaterThan(0);
     await user.click(screen.getByRole("button", { name: "应用候选" }));
 
@@ -638,8 +653,10 @@ describe("资源面板", () => {
   });
 
   it("导入音频对齐提案文件读取失败时显示入口上下文", async () => {
+    const user = userEvent.setup();
     const file = createRejectingTextFile("bad-alignment.json", "读取被拒绝");
     const { container } = render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     const input = container.querySelector('input[type="file"][accept=".json,application/json"]');
     if (!(input instanceof HTMLInputElement)) {
       throw new Error("未找到对齐提案文件输入。");
@@ -656,8 +673,10 @@ describe("资源面板", () => {
   });
 
   it("导入音频对齐提案文件校验失败时显示来源文件名", async () => {
+    const user = userEvent.setup();
     const file = new File([JSON.stringify({})], "bad-alignment.json", { type: "application/json" });
     const { container } = render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
     const input = container.querySelector('input[type="file"][accept=".json,application/json"]');
     if (!(input instanceof HTMLInputElement)) {
       throw new Error("未找到对齐提案文件输入。");
@@ -680,7 +699,7 @@ describe("资源面板", () => {
       cutCandidates: [
         {
           id: "audio-gap-1",
-          name: "音频推断补偿 1",
+          name: "音频推断差异 1",
           sourceAtMs: 20_000,
           sourceRangeStartMs: 22_000,
           sourceRangeEndMs: 18_000,
@@ -693,6 +712,7 @@ describe("资源面板", () => {
       diagnostics: ["音频特征匹配 4 / 4 帧。"]
     };
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
 
     fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
       target: { value: JSON.stringify(proposal) }
@@ -718,7 +738,7 @@ describe("资源面板", () => {
         cutMarkers: [
           {
             id: "audio-gap-1",
-            name: "已有补偿",
+            name: "已有版本差异",
             sourceAtMs: 20_000,
             targetGapMs: 5000,
             note: ""
@@ -731,7 +751,7 @@ describe("资源面板", () => {
       cutCandidates: [
         {
           id: "audio-gap-1",
-          name: "音频推断补偿 1",
+          name: "音频推断差异 1",
           sourceAtMs: 20_000,
           targetGapMs: 20_000,
           confidence: 0.9,
@@ -742,6 +762,7 @@ describe("资源面板", () => {
       diagnostics: ["音频特征匹配 4 / 4 帧。"]
     };
     render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
 
     fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
       target: { value: JSON.stringify(proposal) }
@@ -751,9 +772,9 @@ describe("资源面板", () => {
     expect(screen.getByText("应用已暂停")).toBeInTheDocument();
     expect(screen.getByText("待应用 0 / 已落点 0 / 阻断 2")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（当前项目已有同 ID 锚点）");
-    expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（当前项目已有同 ID 补偿点）");
+    expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（当前项目已有同 ID 版本差异）");
     expect(screen.getByText("1 个同步锚点 ID 已存在于当前项目（ID：audio-anchor-1），应用会丢失新锚点。")).toBeInTheDocument();
-    expect(screen.getByText("1 个候选补偿 ID 已存在于当前项目（ID：audio-gap-1），应用会丢失新补偿。")).toBeInTheDocument();
+    expect(screen.getByText("1 个候选版本差异 ID 已存在于当前项目（ID：audio-gap-1），应用会丢失新的版本差异。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();
     expect(useEditorStore.getState().project.syncAnchors).toHaveLength(1);
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1);
@@ -773,7 +794,7 @@ describe("资源面板", () => {
       cutCandidates: [
         {
           id: "audio-gap-1",
-          name: "音频推断补偿 1",
+          name: "音频推断差异 1",
           sourceAtMs: 20_000,
           targetGapMs: 20_000,
           confidence: 0.9,
@@ -792,6 +813,7 @@ describe("资源面板", () => {
         }
       });
       render(<AssetPanel />);
+      await user.click(screen.getByRole("button", { name: /高级工具/ }));
       fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
         target: { value: JSON.stringify(proposal) }
       });
@@ -843,7 +865,7 @@ describe("资源面板", () => {
       cutCandidates: [
         {
           id: "audio-gap-1",
-          name: "音频推断补偿 1",
+          name: "音频推断差异 1",
           sourceAtMs: 20_000,
           sourceRangeStartMs: 18_000,
           sourceRangeEndMs: 22_000,
@@ -865,15 +887,16 @@ describe("资源面板", () => {
           cutMarkers: [
             {
               id: "audio-gap-1",
-              name: "已有补偿",
+              name: "已有版本差异",
               sourceAtMs: 20_000,
               targetGapMs: 5000,
-              note: "已有项目补偿"
+              note: "已有项目版本差异"
             }
           ]
         }
       });
       render(<AssetPanel />);
+      await user.click(screen.getByRole("button", { name: /高级工具/ }));
       fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
         target: { value: JSON.stringify(proposal) }
       });
@@ -888,7 +911,7 @@ describe("资源面板", () => {
       await expect(readBlobText(blob)).resolves.toContain("对齐提案复核报告");
       await expect(readBlobText(blob)).resolves.toContain("应用阻断");
       await expect(readBlobText(blob)).resolves.toContain("1 个同步锚点 ID 已存在于当前项目（ID：audio-anchor-1）");
-      await expect(readBlobText(blob)).resolves.toContain("1 个候选补偿 ID 已存在于当前项目（ID：audio-gap-1）");
+      await expect(readBlobText(blob)).resolves.toContain("1 个候选版本差异 ID 已存在于当前项目（ID：audio-gap-1）");
       await expect(readBlobText(blob)).resolves.toContain("audio-gap-1");
       await expect(readBlobText(blob)).resolves.toContain("不确定区间：00:00:18.000");
       await expect(readBlobText(blob)).resolves.toContain("音频特征匹配 4 / 4 帧。");
@@ -925,12 +948,13 @@ describe("资源面板", () => {
     vi.mocked(pickFfmpegExecutablePath).mockResolvedValueOnce("C:\\tools\\ffmpeg.exe");
 
     render(<AssetPanel />);
-    await user.click(screen.getByRole("button", { name: "选择完整片源" }));
-    await user.click(screen.getByRole("button", { name: "选择删减版" }));
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+    await user.click(screen.getByRole("button", { name: "选择完整版" }));
+    await user.click(screen.getByRole("button", { name: "选择当前视频" }));
     await user.click(screen.getByRole("button", { name: "选择 FFmpeg" }));
 
-    expect(screen.getByLabelText("完整片源路径")).toHaveValue("D:\\media\\full.mkv");
-    expect(screen.getByLabelText("删减版路径")).toHaveValue("D:\\media\\cut.mp4");
+    expect(screen.getByLabelText("完整版路径")).toHaveValue("D:\\media\\full.mkv");
+    expect(screen.getByLabelText("当前视频路径")).toHaveValue("D:\\media\\cut.mp4");
     expect(screen.getByLabelText("FFmpeg 路径")).toHaveValue("C:\\tools\\ffmpeg.exe");
     expect(pickAlignmentMediaPath).toHaveBeenNthCalledWith(1, "");
     expect(pickAlignmentMediaPath).toHaveBeenNthCalledWith(2, "");

@@ -60,7 +60,7 @@ export function createAlignmentReviewReport(
     `生成时间：${generatedAt.toISOString()}`,
     `整体置信度：${formatConfidence(proposal.confidence)}`,
     `同步锚点：${proposal.anchors.length} 个`,
-    `候选补偿：${proposal.cutCandidates.length} 个`,
+    `候选版本差异：${proposal.cutCandidates.length} 个`,
     "",
     "## 应用阻断",
     ...createApplyBlockerLines(applyBlockers),
@@ -74,7 +74,7 @@ export function createAlignmentReviewReport(
     "## 同步锚点",
     ...createAnchorLines(proposal, statusContext),
     "",
-    "## 候选补偿",
+    "## 候选版本差异",
     ...createCutCandidateLines(proposal.cutCandidates, statusContext),
     "",
     "## 诊断信息",
@@ -152,22 +152,22 @@ export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[
   );
 
   if (proposal.cutCandidates.length === 0 && proposal.anchors.length === 0) {
-    focus.push("提案没有同步锚点或候选补偿，需要重新生成或检查输入。");
+    focus.push("提案没有同步锚点或候选版本差异，需要重新生成或检查输入。");
   }
   if (lowConfidenceCuts.length > 0) {
-    focus.push(`${lowConfidenceCuts.length} 个候选补偿置信度低于 75%，建议人工确认边界和缺失时长。`);
+    focus.push(`${lowConfidenceCuts.length} 个候选版本差异置信度低于 75%，建议人工确认边界和相差时长。`);
   }
   if (rangedCuts.length > 0) {
-    focus.push(`${rangedCuts.length} 个候选补偿包含不确定区间，优先核对区间内的真实删减边界。`);
+    focus.push(`${rangedCuts.length} 个候选版本差异包含不确定区间，优先核对区间内的真实差异边界。`);
   }
   if (invalidRangeCuts.length > 0) {
-    focus.push(`${invalidRangeCuts.length} 个候选补偿的不确定区间起止顺序异常，需要修正后再应用。`);
+    focus.push(`${invalidRangeCuts.length} 个候选版本差异的不确定区间起止顺序异常，需要修正后再应用。`);
   }
   if (proposal.diagnostics.length === 0) {
     focus.push("没有诊断信息，复核时需要更多上下文判断提案来源。");
   }
   if (focus.length === 0) {
-    focus.push("未发现明显风险项，仍建议抽查首个锚点和每个候选补偿的边界。");
+    focus.push("未发现明显风险项，仍建议抽查首个锚点和每个候选版本差异的边界。");
   }
   return focus;
 }
@@ -198,7 +198,7 @@ export function createAlignmentApplyBlockers(
     blockers.push(`${emptyAnchorIdCount} 个同步锚点缺少 ID，无法安全写入项目。`);
   }
   if (emptyCutIdCount > 0) {
-    blockers.push(`${emptyCutIdCount} 个候选补偿缺少 ID，无法安全写入项目。`);
+    blockers.push(`${emptyCutIdCount} 个候选版本差异缺少 ID，无法安全写入项目。`);
   }
   if (duplicateAnchorIds.length > 0) {
     blockers.push(
@@ -207,7 +207,9 @@ export function createAlignmentApplyBlockers(
   }
   if (duplicateCutIds.length > 0) {
     blockers.push(
-      `${duplicateCutIds.length} 个候选补偿 ID 在提案内重复${formatIdEvidence(duplicateCutIds)}，应用会丢失补偿。`
+      `${duplicateCutIds.length} 个候选版本差异 ID 在提案内重复${formatIdEvidence(
+        duplicateCutIds
+      )}，应用会丢失版本差异。`
     );
   }
   if (existingAnchorIdConflicts.length > 0) {
@@ -219,16 +221,16 @@ export function createAlignmentApplyBlockers(
   }
   if (existingCutIdConflicts.length > 0) {
     blockers.push(
-      `${existingCutIdConflicts.length} 个候选补偿 ID 已存在于当前项目${formatIdEvidence(
+      `${existingCutIdConflicts.length} 个候选版本差异 ID 已存在于当前项目${formatIdEvidence(
         existingCutIdConflicts
-      )}，应用会丢失新补偿。`
+      )}，应用会丢失新的版本差异。`
     );
   }
   if (invalidRangeCount > 0) {
-    blockers.push(`${invalidRangeCount} 个候选补偿的不确定区间起止顺序异常，请修正后再应用。`);
+    blockers.push(`${invalidRangeCount} 个候选版本差异的不确定区间起止顺序异常，请修正后再应用。`);
   }
   if (sourceOutsideRangeCount > 0) {
-    blockers.push(`${sourceOutsideRangeCount} 个候选补偿的源时间不在不确定区间内，请修正后再应用。`);
+    blockers.push(`${sourceOutsideRangeCount} 个候选版本差异的发生时间不在不确定区间内，请修正后再应用。`);
   }
   return blockers;
 }
@@ -243,8 +245,8 @@ function createAnchorLines(proposal: AlignmentProposal, statusContext: Alignment
     return [
       `- ${index + 1}. [${anchor.id}] ${anchor.origin === "automatic" ? "自动" : "手动"}`,
       `  落点状态：${createAnchorStatusResult(anchor, statusContext).text}`,
-      `  源时间：${formatTime(anchor.sourceMs)}`,
-      `  目标时间：${formatTime(anchor.targetMs)}`,
+      `  当前视频时间：${formatTime(anchor.sourceMs)}`,
+      `  完整版时间：${formatTime(anchor.targetMs)}`,
       `  偏移：${formatSignedDuration(offsetMs)} (${offsetMs} ms)`,
       `  置信度：${confidence}`
     ].join("\n");
@@ -256,16 +258,16 @@ function createCutCandidateLines(
   statusContext: AlignmentReviewStatusContext
 ): string[] {
   if (candidates.length === 0) {
-    return ["- 暂无候选补偿。"];
+    return ["- 暂无候选版本差异。"];
   }
   return candidates.map((candidate, index) => {
     const sourceRangeLine = createSourceRangeLine(candidate);
     return [
       `- ${index + 1}. [${candidate.id}] ${candidate.name}`,
       `  落点状态：${createCutCandidateStatusResult(candidate, statusContext).text}`,
-      `  源时间：${formatTime(candidate.sourceAtMs)}`,
+      `  发生位置：${formatTime(candidate.sourceAtMs)}`,
       `  ${sourceRangeLine}`,
-      `  补偿：${formatSignedDuration(candidate.targetGapMs)} (${Math.round(candidate.targetGapMs)} ms)`,
+      `  相差时长：${formatSignedDuration(candidate.targetGapMs)} (${Math.round(candidate.targetGapMs)} ms)`,
       `  置信度：${formatConfidence(candidate.confidence)}`,
       `  说明：${candidate.note || "未提供"}`
     ].join("\n");
@@ -365,7 +367,7 @@ function createAnchorReviewQueueItem(
     reasons:
       attentionReasons.length > 0
         ? attentionReasons
-        : ["应用前抽查源时间、目标时间和偏移方向。"]
+        : ["应用前抽查当前视频时间、完整版时间和偏移方向。"]
   };
 }
 
@@ -400,13 +402,13 @@ function createCutCandidateReviewQueueItem(
     reasons:
       attentionReasons.length > 0
         ? attentionReasons
-        : ["应用前抽查补偿边界、缺失时长和下游整体平移影响。"]
+        : ["应用前抽查差异边界、相差时长和下游整体平移影响。"]
   };
 }
 
 function createAnchorAttentionReasons(anchor: SyncAnchor): string[] {
   if (anchor.confidence !== undefined && anchor.confidence < 0.75) {
-    return [`锚点置信度 ${formatConfidence(anchor.confidence)}，建议核对源时间和目标时间。`];
+    return [`锚点置信度 ${formatConfidence(anchor.confidence)}，建议核对当前视频时间和完整版时间。`];
   }
   return [];
 }
@@ -414,10 +416,10 @@ function createAnchorAttentionReasons(anchor: SyncAnchor): string[] {
 function createCutCandidateAttentionReasons(candidate: CutCandidate): string[] {
   const reasons: string[] = [];
   if (candidate.confidence < 0.75) {
-    reasons.push(`候选补偿置信度 ${formatConfidence(candidate.confidence)}，建议核对边界和缺失时长。`);
+    reasons.push(`候选版本差异置信度 ${formatConfidence(candidate.confidence)}，建议核对边界和相差时长。`);
   }
   if (hasCompleteSourceRange(candidate)) {
-    reasons.push(`${formatQueueSourceRange(candidate)} 内存在不确定边界，优先核对真实删减点。`);
+    reasons.push(`${formatQueueSourceRange(candidate)} 内存在不确定边界，优先核对真实差异位置。`);
   }
   return reasons;
 }
@@ -456,7 +458,7 @@ function createCutCandidateStatusResult(
   if (context.existingCutMarkers && isAlignmentCutCandidateApplied(context.existingCutMarkers, candidate)) {
     return {
       state: "applied",
-      text: "已落点（当前项目已有等价补偿点）",
+      text: "已落点（当前项目已有等价版本差异）",
       blockReasons: []
     };
   }
@@ -465,7 +467,7 @@ function createCutCandidateStatusResult(
     reasons.push("缺少 ID");
   } else {
     if (hasExistingId(candidate.id, readExistingCutMarkerIds(context))) {
-      reasons.push("当前项目已有同 ID 补偿点");
+      reasons.push("当前项目已有同 ID 版本差异");
     }
     if (hasDuplicateId(candidate.id, statusContext.duplicateCutIds)) {
       reasons.push("提案内 ID 重复");
@@ -475,7 +477,7 @@ function createCutCandidateStatusResult(
     reasons.push("不确定区间起止异常");
   }
   if (isSourceOutsideRange(candidate)) {
-    reasons.push("源时间不在不确定区间内");
+    reasons.push("发生时间不在不确定区间内");
   }
   return createPendingStatusResult(reasons);
 }
@@ -604,7 +606,7 @@ function reviewQueueSeverityRank(severity: AlignmentReviewQueueSeverity): number
 }
 
 function formatQueueKind(kind: AlignmentReviewItemKind): string {
-  return kind === "anchor" ? "锚点" : "补偿";
+  return kind === "anchor" ? "锚点" : "版本差异";
 }
 
 function formatQueueId(id: string): string {

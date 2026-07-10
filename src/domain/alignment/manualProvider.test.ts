@@ -15,7 +15,7 @@ describe("manual alignment provider", () => {
             sourceRangeEndMs: 32_000,
             targetGapMs: 45_000,
             confidence: 0.8,
-            note: "目标版本多出片头"
+            note: "完整版多出片头"
           }
         ],
         confidence: 0.85,

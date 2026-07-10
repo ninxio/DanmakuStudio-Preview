@@ -58,7 +58,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     return { ok: false, version, message: "项目文件中的时间轴片段结构不完整。" };
   }
   if (!value.cutMarkers.every(isCutMarker)) {
-    return { ok: false, version, message: "项目文件中的删减补偿点结构不完整。" };
+    return { ok: false, version, message: "项目文件中的版本差异结构不完整。" };
   }
   if (!value.syncAnchors.every(isSyncAnchor)) {
     return { ok: false, version, message: "项目文件中的同步锚点结构不完整。" };

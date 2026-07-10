@@ -6,7 +6,7 @@ import { createEmptyProject } from "./factory";
 import { createWorkflowOverview } from "./workflowOverview";
 
 describe("workflow overview", () => {
-  it("空项目从导入 XML 开始，并展示已有能力", () => {
+  it("空项目从导入 XML 开始，并展示下一步", () => {
     const overview = createWorkflowOverview(createEmptyProject(), null);
 
     expect(overview.progressPercent).toBe(0);
@@ -78,7 +78,7 @@ describe("workflow overview", () => {
 
     expect(overview.actions.find((action) => action.id === "apply-alignment")?.enabled).toBe(true);
     expect(overview.actions.find((action) => action.id === "export-xml")?.enabled).toBe(true);
-    expect(overview.stages.find((stage) => stage.id === "alignment")?.stateText).toBe("已有对齐线索");
+    expect(overview.stages.find((stage) => stage.id === "alignment")?.stateText).toBe("已有差异线索");
     expect(overview.stages.find((stage) => stage.id === "export")?.stateText).toBe("可导出");
     expect(overview.capabilities.find((capability) => capability.id === "alignment-review")?.active).toBe(true);
   });

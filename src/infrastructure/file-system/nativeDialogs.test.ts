@@ -13,7 +13,7 @@ describe("原生文件选择器封装", () => {
     expect(path).toBe("D:\\media\\full.mkv");
     expect(dialog).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: "选择完整片源或删减版视频",
+        title: "选择完整版或当前视频",
         defaultPath: "D:\\media",
         multiple: false,
         directory: false,

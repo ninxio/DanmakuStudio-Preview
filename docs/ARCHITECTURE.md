@@ -1,6 +1,6 @@
 # 架构概览
 
-Danmaku Timeline Studio 使用非破坏性编辑模型。原始 XML 解析为资源，资源放入时间轴后成为片段，所有时间调整、禁用、删减映射和单条微调都作为编辑状态保存，不修改 `DanmakuItem.sourceTimeMs`。
+Danmaku Timeline Studio 使用非破坏性编辑模型。原始 XML 解析为资源，资源放入时间轴后成为片段，所有时间调整、禁用、版本差异映射和单条微调都作为编辑状态保存，不修改 `DanmakuItem.sourceTimeMs`。
 
 ## 分层
 
@@ -22,11 +22,11 @@ adjusted = clipTime + itemAdjustments[item.id] + project.globalOffsetMs
 resolved = applyCutMapping(adjusted, cutMarkers)
 ```
 
-删减标记表示“源版本播放到某点时，目标完整版额外存在一段内容”。对于该点之后的弹幕，累计 `targetGapMs`。
+版本差异表示“当前视频播放到某点时，完整版额外存在或少了一段内容”。对于该点之后的弹幕，累计 `targetGapMs`。
 
 ## 历史模型
 
-编辑历史使用命令快照模型。每次核心操作保存编辑前后的轻量项目状态，历史上限为 120 步。支持移动片段、移动弹幕、禁用/恢复、删减标记、同步锚点和全局偏移。
+编辑历史使用命令快照模型。每次核心操作保存编辑前后的轻量项目状态，历史上限为 120 步。支持移动片段、移动弹幕、禁用/恢复、版本差异、同步锚点和全局偏移。
 
 ## XML 策略
 

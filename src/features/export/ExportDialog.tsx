@@ -9,12 +9,15 @@ import {
 } from "../../domain/danmaku/exportSummary";
 import {
   createProjectHealthReport,
-  createProjectHealthSummary,
-  type ProjectHealthFinding,
-  type ProjectHealthStatus,
-  type ProjectHealthSummary
+  createProjectHealthSummary
 } from "../../domain/project/health";
 import { createProjectDownloadFileName } from "../../domain/project/fileNames";
+import {
+  createProjectReadinessSummary,
+  type ProjectReadinessItem,
+  type ProjectReadinessStatus,
+  type ProjectReadinessSummary
+} from "../../domain/project/readiness";
 import { formatTimecode } from "../../domain/shared/time";
 import { downloadTextFile } from "../../infrastructure/file-system/browserFiles";
 import { useEditorStore } from "../../stores/editorStore";
@@ -30,6 +33,7 @@ export function ExportDialog() {
   }
   const { summary, validation } = exportDraft;
   const healthSummary = createProjectHealthSummary(project);
+  const readinessSummary = createProjectReadinessSummary(project);
   const previewCompensations = summary.compensationDetails.slice(0, 3);
   const hiddenCompensationCount = Math.max(0, summary.compensationDetails.length - previewCompensations.length);
   const previewNegativeClamps = summary.negativeClampDetails.slice(0, 3);
@@ -42,7 +46,7 @@ export function ExportDialog() {
       createProjectHealthReport(project.name, healthSummary),
       "text/plain;charset=utf-8"
     );
-    setExportStatus(`已导出健康报告：${fileName}。`, "success");
+    setExportStatus(`已导出检查报告：${fileName}。`, "success");
   };
 
   const downloadExportReviewReport = () => {
@@ -77,20 +81,20 @@ export function ExportDialog() {
           <SummaryRow label="禁用弹幕数量" value={summary.disabledCount.toLocaleString("zh-CN")} />
           <SummaryRow label="最早最终时间" value={formatTimecode(summary.earliestFinalTimeMs)} />
           <SummaryRow label="最晚最终时间" value={formatTimecode(summary.latestFinalTimeMs)} />
-          <SummaryRow label="应用删减标记" value={summary.cutMarkerCount.toString()} />
-          <SummaryRow label="总补偿时长" value={formatSignedCompensationDuration(summary.totalCutGapMs)} />
+          <SummaryRow label="版本差异" value={summary.cutMarkerCount.toString()} />
+          <SummaryRow label="累计调整时长" value={formatSignedCompensationDuration(summary.totalCutGapMs)} />
           <SummaryRow label="存在导入警告" value={summary.hasImportWarnings ? "是" : "否"} />
           <SummaryRow label="负时间限制为 0" value={`${summary.negativeClampCount} 项`} />
-          <ProjectHealthPreflight summary={healthSummary} />
+          <ProjectReadinessPreflight summary={readinessSummary} />
           {previewCompensations.length > 0 ? (
             <section className="rounded border border-panel-line bg-[#111318] p-3 text-xs text-slate-300">
-              <h3 className="font-medium text-slate-100">补偿明细</h3>
+              <h3 className="font-medium text-slate-100">版本差异明细</h3>
               <div className="mt-2 grid gap-2">
                 {previewCompensations.map((detail) => (
                   <CompensationDetailRow key={detail.id} detail={detail} />
                 ))}
                 {hiddenCompensationCount > 0 ? (
-                  <p className="text-slate-500">另有 {hiddenCompensationCount} 个补偿点，可下载报告查看完整明细。</p>
+                  <p className="text-slate-500">另有 {hiddenCompensationCount} 个版本差异，可下载报告查看完整明细。</p>
                 ) : null}
               </div>
             </section>
@@ -121,7 +125,7 @@ export function ExportDialog() {
         <footer className="flex flex-wrap justify-end gap-2 border-t border-panel-line p-4">
           <TextButton onClick={downloadHealthReport}>
             <Download size={14} />
-            下载健康报告
+            下载检查报告
           </TextButton>
           {hasExportReviewReport ? (
             <TextButton onClick={downloadExportReviewReport}>
@@ -158,43 +162,44 @@ function NegativeClampDetailRow({ detail }: { detail: ExportNegativeClampDetail 
   );
 }
 
-function ProjectHealthPreflight({ summary }: { summary: ProjectHealthSummary }) {
-  const reviewFindings = summary.findings.filter((finding) => finding.id !== "ready");
-  const previewFindings = reviewFindings.slice(0, 3);
-  const hiddenFindingCount = Math.max(0, reviewFindings.length - previewFindings.length);
+function ProjectReadinessPreflight({ summary }: { summary: ProjectReadinessSummary }) {
+  const previewItems = summary.items.slice(0, 3);
+  const hiddenItemCount = Math.max(0, summary.items.length - previewItems.length);
   return (
     <section className={`rounded border p-3 text-xs ${projectHealthPanelClass(summary.status)}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="font-medium">导出前健康检查</h3>
-          <p className="mt-1 leading-5 opacity-80">{summary.statusDetail}</p>
+          <h3 className="font-medium">导出前检查</h3>
+          <p className="mt-1 leading-5 opacity-80">{summary.headline}</p>
+          <p className="mt-1 leading-5 opacity-70">{summary.detail}</p>
         </div>
         <span className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectHealthBadgeClass(summary.status)}`}>
           {summary.statusLabel}
         </span>
       </div>
-      {previewFindings.length > 0 ? (
+      {previewItems.length > 0 ? (
         <ul className="mt-2 grid gap-2">
-          {previewFindings.map((finding) => (
-            <ProjectHealthFindingPreview key={finding.id} finding={finding} />
+          {previewItems.map((item) => (
+            <ProjectReadinessItemPreview key={item.id} item={item} />
           ))}
-          {hiddenFindingCount > 0 ? <li className="opacity-70">另有 {hiddenFindingCount} 项，可下载健康报告查看。</li> : null}
+          {hiddenItemCount > 0 ? <li className="opacity-70">另有 {hiddenItemCount} 项，可下载检查报告查看。</li> : null}
         </ul>
       ) : null}
     </section>
   );
 }
 
-function ProjectHealthFindingPreview({ finding }: { finding: ProjectHealthFinding }) {
-  const evidencePreview = finding.evidence?.slice(0, HEALTH_PREFLIGHT_EVIDENCE_LIMIT) ?? [];
-  const hiddenEvidenceCount = Math.max(0, (finding.evidence?.length ?? 0) - evidencePreview.length);
+function ProjectReadinessItemPreview({ item }: { item: ProjectReadinessItem }) {
+  const evidencePreview = item.evidence.slice(0, HEALTH_PREFLIGHT_EVIDENCE_LIMIT);
+  const hiddenEvidenceCount = Math.max(0, item.evidence.length - evidencePreview.length);
   return (
     <li className="border-t border-current/15 pt-2 first:border-t-0 first:pt-0">
       <div>
-        <span className="font-medium">{projectHealthFindingSeverityLabel(finding.severity)}</span>
+        <span className="font-medium">{projectHealthFindingSeverityLabel(item.severity)}</span>
         <span className="mx-1">/</span>
-        <span>{finding.title}</span>
+        <span>{item.title}</span>
       </div>
+      <p className="mt-1 opacity-80">{item.detail}</p>
       {evidencePreview.length > 0 ? (
         <ul className="mt-1 grid gap-1 opacity-80">
           {evidencePreview.map((item) => (
@@ -205,7 +210,7 @@ function ProjectHealthFindingPreview({ finding }: { finding: ProjectHealthFindin
         </ul>
       ) : null}
       {hiddenEvidenceCount > 0 ? (
-        <p className="mt-1 opacity-70">另有 {hiddenEvidenceCount.toLocaleString("zh-CN")} 条证据，可下载健康报告查看。</p>
+        <p className="mt-1 opacity-70">另有 {hiddenEvidenceCount.toLocaleString("zh-CN")} 条证据，可下载检查报告查看。</p>
       ) : null}
     </li>
   );
@@ -227,7 +232,7 @@ function CompensationDetailRow({ detail }: { detail: ExportCompensationDetail })
   );
 }
 
-function projectHealthPanelClass(status: ProjectHealthStatus): string {
+function projectHealthPanelClass(status: ProjectReadinessStatus): string {
   if (status === "blocked") {
     return "border-accent-red/40 bg-accent-red/10 text-red-100";
   }
@@ -237,7 +242,7 @@ function projectHealthPanelClass(status: ProjectHealthStatus): string {
   return "border-accent-green/40 bg-accent-green/10 text-accent-green";
 }
 
-function projectHealthBadgeClass(status: ProjectHealthStatus): string {
+function projectHealthBadgeClass(status: ProjectReadinessStatus): string {
   if (status === "blocked") {
     return "border-red-300/50 bg-red-300/10 text-red-100";
   }
@@ -247,7 +252,7 @@ function projectHealthBadgeClass(status: ProjectHealthStatus): string {
   return "border-accent-green/50 bg-accent-green/10 text-accent-green";
 }
 
-function projectHealthFindingSeverityLabel(severity: ProjectHealthFinding["severity"]): string {
+function projectHealthFindingSeverityLabel(severity: ProjectReadinessItem["severity"]): string {
   if (severity === "error") {
     return "需处理";
   }

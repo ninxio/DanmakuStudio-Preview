@@ -715,7 +715,7 @@ function createDiagnostics(
   }
   if (compensation.markerCount > 0) {
     diagnostics.push(
-      `已应用 ${compensation.markerCount} 个删减补偿点，总补偿 ${formatDurationMs(compensation.totalGapMs)}，影响 ${compensation.affectedEpisodeCount} 个分集输出。`
+      `已应用 ${compensation.markerCount} 个版本差异，累计调整 ${formatDurationMs(compensation.totalGapMs)}，影响 ${compensation.affectedEpisodeCount} 个分集输出。`
     );
   }
   return diagnostics;

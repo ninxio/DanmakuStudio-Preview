@@ -48,7 +48,7 @@ describe("timeline mapping", () => {
     expect(resolved).toBe(13_650);
   });
 
-  it("多个删减标记会累计影响后续时间", () => {
+  it("多个版本差异会累计影响后续时间", () => {
     expect(
       applyCutMapping(21 * 60_000, [
         { id: "c1", name: "cut1", sourceAtMs: 20 * 60_000, targetGapMs: 45_000, note: "" },

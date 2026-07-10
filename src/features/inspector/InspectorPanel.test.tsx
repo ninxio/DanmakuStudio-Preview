@@ -60,12 +60,16 @@ describe("检查器", () => {
     expect(useEditorStore.getState().project.itemTimeAdjustments.item).toBe(120);
   });
 
-  it("编辑删减标记时更新状态", () => {
+  it("编辑版本差异时更新底层时间差", () => {
     useEditorStore.getState().addCutMarker(3000, 45000);
     const marker = useEditorStore.getState().project.cutMarkers[0];
     useEditorStore.getState().select({ kind: "cut", ids: [marker.id] });
     render(<InspectorPanel />);
-    fireEvent.change(screen.getByLabelText("缺失或新增时长"), { target: { value: "12000" } });
+    expect(screen.getByText("版本差异")).toBeInTheDocument();
+    expect(screen.getByText("此点之后的弹幕会整体后移 00:00:45.000。")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("相差多久"), { target: { value: "12000" } });
     expect(useEditorStore.getState().project.cutMarkers[0].targetGapMs).toBe(12000);
+    fireEvent.change(screen.getByLabelText("完整版比当前版"), { target: { value: "less" } });
+    expect(useEditorStore.getState().project.cutMarkers[0].targetGapMs).toBe(-12000);
   });
 });

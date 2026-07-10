@@ -196,23 +196,23 @@ where
 {
     check_cancelled(cancel_flag)?;
     update_progress(0.05, "正在校验本地媒体路径。")?;
-    validate_media_file(&request.complete_path, "完整片源")?;
-    validate_media_file(&request.source_path, "被删减版")?;
+    validate_media_file(&request.complete_path, "完整版")?;
+    validate_media_file(&request.source_path, "当前视频")?;
     let options = create_options(&request)?;
     update_progress(0.10, "已确认本地媒体路径和对齐参数。")?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.15, "正在提取完整片源音频特征。")?;
-    let complete_frames = extract_audio_features(&request.complete_path, "完整片源", &options, cancel_flag)?;
+    update_progress(0.15, "正在提取完整版音频特征。")?;
+    let complete_frames = extract_audio_features(&request.complete_path, "完整版", &options, cancel_flag)?;
     update_progress(
         0.42,
-        &format!("完整片源音频特征提取完成：{} 帧。", complete_frames.len()),
+        &format!("完整版音频特征提取完成：{} 帧。", complete_frames.len()),
     )?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.45, "正在提取删减版音频特征。")?;
-    let source_frames = extract_audio_features(&request.source_path, "删减版", &options, cancel_flag)?;
+    update_progress(0.45, "正在提取当前视频音频特征。")?;
+    let source_frames = extract_audio_features(&request.source_path, "当前视频", &options, cancel_flag)?;
     update_progress(
         0.72,
-        &format!("删减版音频特征提取完成：{} 帧。", source_frames.len()),
+        &format!("当前视频音频特征提取完成：{} 帧。", source_frames.len()),
     )?;
     check_cancelled(cancel_flag)?;
     update_progress(0.75, "正在匹配音频特征并推断缺失段。")?;
@@ -680,14 +680,14 @@ fn infer_cut_candidates(
             .clamp(0.1, 0.95);
         candidates.push(CutCandidateDto {
             id: format!("audio-gap-{}", candidates.len() + 1),
-            name: format!("音频推断补偿 {}", candidates.len() + 1),
+            name: format!("音频推断差异 {}", candidates.len() + 1),
             source_at_ms,
             source_range_start_ms: previous.source_time_ms,
             source_range_end_ms: current.source_time_ms,
             target_gap_ms: missing_duration_ms,
             confidence,
             note: format!(
-                "音频对齐显示完整片源比删减版多出约 {}，候选边界约在删减版 {}。",
+                "音频对齐显示完整版比当前视频多出约 {}，候选边界约在当前视频 {}。",
                 format_duration(missing_duration_ms),
                 format_duration(source_at_ms)
             ),
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(proposal.cut_candidates[0].target_gap_ms, 20_000);
         assert!(proposal.cut_candidates[0]
             .note
-            .contains("候选边界约在删减版 0:15"));
+            .contains("候选边界约在当前视频 0:15"));
     }
 
     #[test]
@@ -871,7 +871,7 @@ mod tests {
     fn cancellation_is_checked_before_ffmpeg_spawn() {
         let cancel_flag = AtomicBool::new(true);
         let error =
-            extract_audio_features("missing.mp4", "完整片源", &test_options(), Some(&cancel_flag))
+            extract_audio_features("missing.mp4", "完整版", &test_options(), Some(&cancel_flag))
                 .unwrap_err();
 
         assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);

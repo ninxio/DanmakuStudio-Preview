@@ -25,7 +25,7 @@ export function parseAnchorCalibrationText(text: string): ParsedAnchorCalibratio
   lines.forEach((line, index) => {
     const parts = line.split(/\s*(?:->|=>|→|,|，|\t)\s*/).filter((part) => part.length > 0);
     if (parts.length !== 2) {
-      warnings.push(`第 ${index + 1} 行需要写成“源时间 -> 完整片源时间”：${line}`);
+      warnings.push(`第 ${index + 1} 行需要写成“当前视频时间 -> 完整版时间”：${line}`);
       return;
     }
     const sourceMs = parseAnchorTimecode(parts[0]);
@@ -59,7 +59,7 @@ export function createAnchorCalibrationProposal(
   } else if (cutCandidates.length === 0) {
     diagnostics.push(`相邻锚点之间没有超过 ${minGapMs} ms 的新增缺失时长。`);
   } else {
-    diagnostics.push(`已根据 ${parsed.anchors.length} 个锚点推断 ${cutCandidates.length} 个候选补偿点。`);
+    diagnostics.push(`已根据 ${parsed.anchors.length} 个锚点推断 ${cutCandidates.length} 个候选版本差异。`);
   }
   return {
     anchors: parsed.anchors,
@@ -83,7 +83,7 @@ export function inferCutCandidatesFromAnchors(anchors: SyncAnchor[], minGapMs = 
     }
     candidates.push({
       id: `anchor-gap-${index}`,
-      name: `锚点推断补偿 ${index}`,
+      name: `锚点推断差异 ${index}`,
       sourceAtMs: clampMilliseconds(current.sourceMs),
       targetGapMs: missingDurationMs,
       confidence: 0.72,

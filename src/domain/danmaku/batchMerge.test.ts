@@ -57,7 +57,7 @@ describe("批量分集合并", () => {
     expect(plan.episodes[1].warnings.join(" ")).toContain("尾部内容");
   });
 
-  it("按真实集时长切分前会先应用删减补偿映射", () => {
+  it("按真实集时长切分前会先应用版本差异映射", () => {
     const asset = createAsset("1 - 第一季1-2.xml", [0, 40_000, 80_000, 90_000, 91_000]);
     const plan = buildBatchMergePlan([asset], {
       rangeSplit: {
@@ -70,7 +70,7 @@ describe("批量分集合并", () => {
       cutMarkers: [
         {
           id: "cut-1",
-          name: "删减点 1",
+          name: "版本差异 1",
           sourceAtMs: 50_000,
           targetGapMs: 10_000,
           note: "第一集前段缺失 10 秒"
@@ -93,12 +93,12 @@ describe("批量分集合并", () => {
     }
   });
 
-  it("多个删减补偿点会累计影响同一分集内的最终时间", () => {
+  it("多个版本差异会累计影响同一分集内的最终时间", () => {
     const asset = createAsset("01 - 1.1.xml", [0, 70_000, 110_000]);
     const plan = buildBatchMergePlan([asset], {
       cutMarkers: [
-        { id: "cut-1", name: "删减点 1", sourceAtMs: 50_000, targetGapMs: 10_000, note: "" },
-        { id: "cut-2", name: "删减点 2", sourceAtMs: 100_000, targetGapMs: 20_000, note: "" }
+        { id: "cut-1", name: "版本差异 1", sourceAtMs: 50_000, targetGapMs: 10_000, note: "" },
+        { id: "cut-2", name: "版本差异 2", sourceAtMs: 100_000, targetGapMs: 20_000, note: "" }
       ]
     });
 

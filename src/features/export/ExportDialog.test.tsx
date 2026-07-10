@@ -58,11 +58,11 @@ describe("导出摘要", () => {
     useEditorStore.getState().prepareExport();
     render(<ExportDialog />);
     expect(screen.getByText("导出 XML 摘要")).toBeInTheDocument();
-    expect(screen.getByText("导出前健康检查")).toBeInTheDocument();
+    expect(screen.getByText("导出前检查")).toBeInTheDocument();
     expect(screen.getByText("导出 XML 可重新导入。 验证条数：1")).toBeInTheDocument();
   });
 
-  it("显示导出前健康复核项并可下载健康报告", async () => {
+  it("显示导出前检查项并可下载检查报告", async () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
     const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:project-health-report");
@@ -97,26 +97,26 @@ describe("导出摘要", () => {
       useEditorStore.getState().prepareExport();
       render(<ExportDialog />);
 
-      expect(screen.getAllByText("需复核").length).toBeGreaterThan(0);
-      expect(screen.getByText("导入时存在警告")).toBeInTheDocument();
+      expect(screen.getAllByText("建议检查").length).toBeGreaterThan(0);
+      expect(screen.getByText("导入 XML 时有少量警告")).toBeInTheDocument();
       expect(screen.getByText("asset.xml / 文件级 / 警告：跳过一条坏弹幕，片段：<d/>")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "下载健康报告" }));
+      fireEvent.click(screen.getByRole("button", { name: "下载检查报告" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
       const [blob] = createObjectUrl.mock.calls[0];
       if (!(blob instanceof Blob)) {
-        throw new Error("健康报告下载对象不是 Blob。");
+        throw new Error("检查报告下载对象不是 Blob。");
       }
-      await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
+      await expect(readBlobText(blob)).resolves.toContain("导出前检查报告");
       await expect(readBlobText(blob)).resolves.toContain(`项目版本：v${CURRENT_SCHEMA_VERSION}`);
       await expect(readBlobText(blob)).resolves.toContain("导入时存在警告");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       const clickedAnchor = clickSpy.mock.contexts[0];
       if (!(clickedAnchor instanceof HTMLAnchorElement)) {
-        throw new Error("健康报告下载未通过锚点触发。");
+        throw new Error("检查报告下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("健康_复核_项目-health-report.txt");
-      expect(useEditorStore.getState().status.message).toBe("已导出健康报告：健康_复核_项目-health-report.txt。");
+      expect(useEditorStore.getState().status.message).toBe("已导出检查报告：健康_复核_项目-health-report.txt。");
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
     } finally {
       clickSpy.mockRestore();
@@ -133,7 +133,7 @@ describe("导出摘要", () => {
     }
   });
 
-  it("显示补偿明细并可下载导出报告", async () => {
+  it("显示版本差异明细并可下载导出报告", async () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
     const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:compensation-report");
@@ -148,7 +148,7 @@ describe("导出摘要", () => {
         cutMarkers: [
           {
             id: "cut-report",
-            name: "手动补偿",
+            name: "手动版本差异",
             sourceAtMs: 1000,
             targetGapMs: 12000,
             note: "复核说明"
@@ -160,8 +160,9 @@ describe("导出摘要", () => {
     try {
       useEditorStore.getState().prepareExport();
       render(<ExportDialog />);
-      expect(screen.getByText("总补偿时长")).toBeInTheDocument();
-      expect(screen.getByText("手动补偿")).toBeInTheDocument();
+      expect(screen.getByText("累计调整时长")).toBeInTheDocument();
+      expect(screen.getByText("版本差异明细")).toBeInTheDocument();
+      expect(screen.getByText("手动版本差异")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "下载导出报告" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
@@ -169,8 +170,8 @@ describe("导出摘要", () => {
       if (!(blob instanceof Blob)) {
         throw new Error("导出报告下载对象不是 Blob。");
       }
-      await expect(readBlobText(blob)).resolves.toContain("补偿明细");
-      await expect(readBlobText(blob)).resolves.toContain("手动补偿");
+      await expect(readBlobText(blob)).resolves.toContain("版本差异明细");
+      await expect(readBlobText(blob)).resolves.toContain("手动版本差异");
       await expect(readBlobText(blob)).resolves.toContain("复核说明");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       const clickedAnchor = clickSpy.mock.contexts[0];
@@ -264,13 +265,13 @@ describe("导出摘要", () => {
 
     expect(screen.getByText("负时间限制为 0")).toBeInTheDocument();
     expect(screen.getByText("3 项")).toBeInTheDocument();
-    expect(screen.getByText("存在负最终时间")).toBeInTheDocument();
+    expect(screen.getByText("有弹幕会被挤到 0 秒")).toBeInTheDocument();
     const firstHealthEvidence = screen.getByText("asset.xml / clip / 第 1 条：-00:00:00.500，导出弹幕");
     expect(firstHealthEvidence).toBeInTheDocument();
     expect(firstHealthEvidence).toHaveClass("break-words");
     expect(firstHealthEvidence).not.toHaveClass("truncate");
     expect(screen.getByText("asset.xml / clip / 第 2 条：-00:00:00.400，第二条导出弹幕")).toBeInTheDocument();
-    expect(screen.getByText("另有 1 条证据，可下载健康报告查看。")).toBeInTheDocument();
+    expect(screen.getByText("另有 1 条证据，可下载检查报告查看。")).toBeInTheDocument();
     expect(screen.getByText("负时间限制明细")).toBeInTheDocument();
     expect(screen.getByText("导出弹幕")).toBeInTheDocument();
     expect(screen.getByText("-00:00:00.500 -> 00:00:00.000")).toBeInTheDocument();

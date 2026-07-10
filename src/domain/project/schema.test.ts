@@ -47,9 +47,9 @@ describe("project schema", () => {
     expect(parsed.cutMarkers).toHaveLength(1);
   });
 
-  it("允许包含合法补偿点和同步锚点的项目", () => {
+  it("允许包含合法版本差异和同步锚点的项目", () => {
     const project = {
-      ...createEmptyProject("带补偿项目"),
+      ...createEmptyProject("带版本差异项目"),
       cutMarkers: [{ id: "cut-1", name: "缺失片段", sourceAtMs: 30_000, targetGapMs: 45_000, note: "复核通过" }],
       syncAnchors: [{ id: "anchor-1", sourceMs: 10_000, targetMs: 12_000, confidence: 0.9, origin: "manual" as const }]
     };
@@ -238,7 +238,7 @@ describe("project schema", () => {
     expect(validation.message).toContain("时间轴片段");
   });
 
-  it("拒绝字段类型错误的删减补偿点", () => {
+  it("拒绝字段类型错误的版本差异", () => {
     const project = {
       ...createEmptyProject(),
       cutMarkers: [
@@ -253,7 +253,7 @@ describe("project schema", () => {
     };
     const validation = validateProjectSchema(project);
     expect(validation.ok).toBe(false);
-    expect(validation.message).toContain("删减补偿点");
+    expect(validation.message).toContain("版本差异");
   });
 
   it("拒绝结构错误的同步锚点", () => {
@@ -340,7 +340,7 @@ function createValidAlignmentProposal() {
     cutCandidates: [
       {
         id: "proposal-cut",
-        name: "候选补偿",
+        name: "候选版本差异",
         sourceAtMs: 20_000,
         sourceRangeStartMs: 18_000,
         sourceRangeEndMs: 22_000,

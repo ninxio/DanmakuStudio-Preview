@@ -234,9 +234,13 @@ export function TimelinePanel() {
             <Scissors size={14} />
             剪刀
           </TextButton>
-          <TextButton className={TIMELINE_TOOL_BUTTON_CLASS} onClick={addCutMarkerAtPlayhead}>
+          <TextButton
+            className={TIMELINE_TOOL_BUTTON_CLASS}
+            title="当前视频和完整版在这里多出或少了一段内容时使用"
+            onClick={addCutMarkerAtPlayhead}
+          >
             <Plus size={14} />
-            添加删减点
+            标记版本差异
           </TextButton>
           <TextButton className={TIMELINE_TOOL_BUTTON_CLASS} onClick={splitSelectedClipsAtPlayhead}>
             <Scissors size={14} />
@@ -273,7 +277,7 @@ export function TimelinePanel() {
           ) : null}
           <span className="flex shrink-0 items-center gap-1 whitespace-nowrap" data-toolbar-chip="true">
             <Magnet size={14} className="text-accent-cyan" />
-            吸附播放头 / 删减点
+            吸附播放头 / 版本差异
           </span>
           <span className={`${TIMELINE_TOOL_CHIP_CLASS} font-mono`} data-toolbar-chip="true">
             {formatPixelsPerSecond(project.timeline.pixelsPerSecond)}
@@ -1036,7 +1040,7 @@ function drawProposalCutCandidates(
       );
       drawImpactRegionText(
         context,
-        `补偿影响区：后续整体 ${formatSignedOffset(candidate.targetGapMs)}`,
+        `版本差异影响：后续弹幕整体 ${formatSignedOffset(candidate.targetGapMs)}`,
         impactLeft,
         tracks.events.y + 16,
         width
@@ -1065,7 +1069,7 @@ function drawProposalCutCandidates(
     }
     drawTimelineLabel(
       context,
-      `${applied ? "已应用补偿" : "候选补偿"} ${formatSignedOffset(candidate.targetGapMs)}`,
+      `${applied ? "已应用版本差异" : "候选版本差异"} ${formatSignedOffset(candidate.targetGapMs)}`,
       x,
       tracks.cuts.y + 3,
       width,

@@ -175,7 +175,7 @@ export function EditorToolbar() {
         应用对齐
       </TextButton>
       <IconButton
-        label="工作流总览"
+        label="新手引导"
         icon={<MapIcon size={16} />}
         active={workflowOpen}
         onClick={() => setWorkflowOpen(true)}

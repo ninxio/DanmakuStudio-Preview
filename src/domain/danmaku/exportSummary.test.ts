@@ -2,19 +2,19 @@ import { describe, expect, it } from "vitest";
 import { createCompensationReport, createExportSummary } from "./exportSummary";
 import type { CutMarker, DanmakuAsset, DanmakuClip, DanmakuItem, ResolvedDanmakuEvent } from "./types";
 
-describe("导出补偿报告", () => {
-  it("按源时间输出补偿明细和总补偿时长", () => {
+describe("导出版本差异报告", () => {
+  it("按发生时间输出版本差异明细和累计调整时长", () => {
     const markers: CutMarker[] = [
       {
         id: "cut-late",
-        name: "后段补偿",
+        name: "后段版本差异",
         sourceAtMs: 30_000,
         targetGapMs: 5_000,
         note: ""
       },
       {
         id: "cut-early",
-        name: "前段补偿",
+        name: "前段版本差异",
         sourceAtMs: 10_000,
         targetGapMs: 12_000,
         note: "人工复核"
@@ -34,10 +34,10 @@ describe("导出补偿报告", () => {
     expect(report).toContain("禁用弹幕：0 条");
     expect(report).toContain("最早最终时间：00:00:00.000");
     expect(report).toContain("最晚最终时间：00:00:00.000");
-    expect(report).toContain("总补偿：+00:00:17.000");
+    expect(report).toContain("累计调整：+00:00:17.000");
     expect(report).toContain("导入警告：无");
     expect(report).toContain("负时间限制：0 项");
-    expect(report).toContain("1. 前段补偿");
+    expect(report).toContain("1. 前段版本差异");
     expect(report).toContain("ID：cut-early");
     expect(report).toContain("备注：人工复核");
   });
@@ -57,7 +57,7 @@ describe("导出补偿报告", () => {
         text: "过早弹幕"
       })
     ]);
-    expect(report).toContain("本次导出未应用补偿点。");
+    expect(report).toContain("本次导出未应用版本差异。");
     expect(report).toContain("原始弹幕：1 条");
     expect(report).toContain("启用弹幕：1 条");
     expect(report).toContain("最早最终时间：00:00:00.000");

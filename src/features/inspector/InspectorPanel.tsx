@@ -137,47 +137,76 @@ export function InspectorPanel() {
   if (selection.kind === "cut" && selection.ids.length === 1) {
     const marker = project.cutMarkers.find((candidate) => candidate.id === selection.ids[0]);
     if (!marker) {
-      return <EmptyInspector text="选中的删减标记不存在。" />;
+      return <EmptyInspector text="选中的版本差异不存在。" />;
     }
+    const gapDirection = marker.targetGapMs < 0 ? -1 : 1;
     return (
       <div className="thin-scrollbar h-full overflow-auto p-3" data-testid="inspector-cut">
-        <Header title="删减标记" subtitle={marker.name} />
+        <Header title="版本差异" subtitle={marker.name} />
+        <p className="mt-3 rounded border border-panel-line bg-panel-soft p-2 text-xs leading-5 text-slate-400">
+          当当前弹幕对应的视频和完整版在这里多出或少了一段内容时，用它让后续弹幕一起前移或后移。
+        </p>
         <div className="mt-3 grid gap-3">
-          <Field label="标记名称" value={marker.name} onChange={(event) => updateCutMarker(marker.id, { name: event.target.value })} />
-          <ReadOnlyRow label="类型" value={marker.targetGapMs >= 0 ? "源版本缺失内容" : "源版本新增内容"} />
+          <Field label="名称" value={marker.name} onChange={(event) => updateCutMarker(marker.id, { name: event.target.value })} />
           <Field
-            label="源版本时间"
+            label="差异发生在当前视频的哪里"
             type="number"
             value={marker.sourceAtMs}
-            suffix="ms"
+            suffix={
+              <span className="whitespace-nowrap">
+                ms / {formatTimecode(marker.sourceAtMs)}
+              </span>
+            }
             onChange={(event) => updateCutMarker(marker.id, { sourceAtMs: Number(event.target.value) })}
           />
-          <ReadOnlyRow label="目标版本时间" value={formatTimecode(marker.sourceAtMs + marker.targetGapMs)} />
+          <label className="grid gap-1 text-xs text-slate-400">
+            <span>完整版比当前版</span>
+            <select
+              aria-label="完整版比当前版"
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-sm text-slate-100"
+              value={marker.targetGapMs < 0 ? "less" : "more"}
+              onChange={(event) => {
+                const nextDirection = event.target.value === "less" ? -1 : 1;
+                updateCutMarker(marker.id, { targetGapMs: nextDirection * Math.abs(marker.targetGapMs) });
+              }}
+            >
+              <option value="more">多了一段内容</option>
+              <option value="less">少了一段内容</option>
+            </select>
+          </label>
           <Field
-            label="缺失或新增时长"
+            label="相差多久"
             type="number"
-            value={marker.targetGapMs}
-            suffix="ms"
-            onChange={(event) => updateCutMarker(marker.id, { targetGapMs: Number(event.target.value) })}
+            value={Math.abs(marker.targetGapMs)}
+            suffix={
+              <span className="whitespace-nowrap">
+                ms / {formatTimecode(Math.abs(marker.targetGapMs))}
+              </span>
+            }
+            onChange={(event) => updateCutMarker(marker.id, { targetGapMs: gapDirection * Math.abs(Number(event.target.value)) })}
           />
+          <ReadOnlyRow label="应用结果" value={createVersionDifferenceEffectText(marker.targetGapMs)} />
           <label className="grid gap-1 text-xs text-slate-400">
             备注
             <textarea
               value={marker.note}
               onChange={(event) => updateCutMarker(marker.id, { note: event.target.value })}
+              placeholder="可写下判断依据，例如：完整版这里有片头，当前版直接进入正片。"
               className="min-h-20 resize-none rounded border border-panel-line bg-[#111318] p-2 text-sm text-slate-100"
             />
           </label>
           <TextButton tone="danger" onClick={() => deleteCutMarker(marker.id)}>
             <Trash2 size={14} />
-            删除删减标记
+            删除版本差异
           </TextButton>
         </div>
       </div>
     );
   }
 
-  return <EmptyInspector text="请选择时间轴上的弹幕、片段或删减标记。" />;
+  return (
+    <EmptyInspector text="选择弹幕可以微调或禁用；选择片段可以移动和裁剪；选择版本差异可以说明这里多了或少了多久。" />
+  );
 }
 
 function Header({ title, subtitle }: { title: string; subtitle: string }) {
@@ -208,4 +237,15 @@ function EmptyInspector({ text }: { text: string }) {
       {text}
     </div>
   );
+}
+
+function createVersionDifferenceEffectText(targetGapMs: number): string {
+  const duration = formatTimecode(Math.abs(targetGapMs));
+  if (targetGapMs > 0) {
+    return `此点之后的弹幕会整体后移 ${duration}。`;
+  }
+  if (targetGapMs < 0) {
+    return `此点之后的弹幕会整体前移 ${duration}。`;
+  }
+  return "目前相差 0 秒，不会改变弹幕时间。";
 }

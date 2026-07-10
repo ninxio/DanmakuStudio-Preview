@@ -83,7 +83,7 @@ describe("疑似删减点扫描", () => {
     expect(plan.options.rules?.map((rule) => rule.label)).toEqual(["广告", "[删]"]);
   });
 
-  it("识别已由附近删减点承接的文本候选", () => {
+  it("识别已由附近版本差异承接的文本候选", () => {
     const asset = createAsset("applied.xml", [
       [10_000, "这里是不是删了"],
       [20_000, "刚才怎么跳了"],
@@ -93,12 +93,12 @@ describe("疑似删减点扫描", () => {
 
     expect(
       isSuspectedCutCandidateApplied(candidate, [
-        { id: "cut-near", name: "补偿", sourceAtMs: 24_000, targetGapMs: 45_000, note: "" }
+        { id: "cut-near", name: "版本差异", sourceAtMs: 24_000, targetGapMs: 45_000, note: "" }
       ])
     ).toBe(true);
     expect(
       isSuspectedCutCandidateApplied(candidate, [
-        { id: "cut-far", name: "补偿", sourceAtMs: 30_500, targetGapMs: 45_000, note: "" }
+        { id: "cut-far", name: "版本差异", sourceAtMs: 30_500, targetGapMs: 45_000, note: "" }
       ])
     ).toBe(false);
   });

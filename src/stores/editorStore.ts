@@ -567,7 +567,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     if (selection.kind !== "cut" || selection.ids.length === 0 || deltaMs === 0) {
       return;
     }
-    commitProject(set, get, "移动删减标记", (project) => ({
+    commitProject(set, get, "移动版本差异", (project) => ({
       ...project,
       cutMarkers: project.cutMarkers.map((marker) =>
         selection.ids.includes(marker.id)
@@ -694,14 +694,14 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     commitProject(
       set,
       get,
-      "添加删减标记",
+      "添加版本差异",
       (project) => ({
         ...project,
         cutMarkers: [
           ...project.cutMarkers,
           {
             id: markerId,
-            name: draft?.name ?? `删减点 ${project.cutMarkers.length + 1}`,
+            name: draft?.name ?? `版本差异 ${project.cutMarkers.length + 1}`,
             sourceAtMs: clampMilliseconds(sourceAtMs),
             targetGapMs,
             note: draft?.note ?? "目标完整版在此处额外存在内容"
@@ -710,11 +710,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       }),
       { kind: "cut", ids: [markerId] }
     );
-    set({ status: { message: draft ? "已添加待确认补偿点。" : "已添加删减标记。", tone: "success" } });
+    set({ status: { message: draft ? "已添加待确认版本差异。" : "已添加版本差异。", tone: "success" } });
   },
 
   updateCutMarker: (id, patch) => {
-    commitProject(set, get, "修改删减标记", (project) => ({
+    commitProject(set, get, "修改版本差异", (project) => ({
       ...project,
       cutMarkers: project.cutMarkers.map((marker) =>
         marker.id === id
@@ -735,7 +735,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     commitProject(
       set,
       get,
-      "删除删减标记",
+      "删除版本差异",
       (project) => ({
         ...project,
         cutMarkers: project.cutMarkers.filter((marker) => marker.id !== id)
@@ -775,7 +775,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       commitProject(
         set,
         get,
-        "删除删减标记",
+        "删除版本差异",
         (project) => ({
           ...project,
           cutMarkers: project.cutMarkers.filter((marker) => !selection.ids.includes(marker.id))
@@ -783,7 +783,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         emptySelection
       );
       set({
-        status: { message: `已删除 ${selection.ids.length} 个删减标记。`, tone: "success" }
+        status: { message: `已删除 ${selection.ids.length} 个版本差异。`, tone: "success" }
       });
       return;
     }
@@ -869,7 +869,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const mergedClip = mergeAdjacentClips(selectedClips);
     if (!mergedClip) {
       set({
-        status: { message: "只能合并同一 XML 且源时间、时间轴连续的片段。", tone: "warning" }
+        status: { message: "只能合并同一 XML 且原弹幕时间、时间轴连续的片段。", tone: "warning" }
       });
       return;
     }
@@ -972,7 +972,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({
         exportDraft: null,
         status: {
-          message: `项目健康检查未通过：${blockingDetail}。请在项目信息中处理后再导出。`,
+          message: `导出前检查未通过：${blockingDetail}。请在导出检查中处理后再导出。`,
           tone: "warning"
         }
       });
@@ -1096,13 +1096,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         ...pendingCutCandidates.map((candidate, index) => ({
           ...cutCandidateToMarker(candidate),
           id: candidate.id.length > 0 ? candidate.id : createId("cut"),
-          name: candidate.name.length > 0 ? candidate.name : `候选删减点 ${index + 1}`
+          name: candidate.name.length > 0 ? candidate.name : `候选版本差异 ${index + 1}`
         }))
       ])
     }));
     set({
       status: {
-        message: `已应用对齐提案：新增 ${pendingAnchors.length} 个锚点，${pendingCutCandidates.length} 个补偿点。`,
+        message: `已应用对齐提案：新增 ${pendingAnchors.length} 个同步线索，${pendingCutCandidates.length} 个版本差异。`,
         tone: "success"
       }
     });
@@ -1177,7 +1177,7 @@ function commitProject(
 
 function createAlignmentProposalPreviewStatus(proposal: AlignmentProposal): EditorStatus {
   return {
-    message: `已发送到时间轴预览：${proposal.anchors.length} 个锚点，${proposal.cutCandidates.length} 个候选补偿点。`,
+    message: `已发送到时间轴预览：${proposal.anchors.length} 个同步线索，${proposal.cutCandidates.length} 个候选版本差异。`,
     tone: "success"
   };
 }

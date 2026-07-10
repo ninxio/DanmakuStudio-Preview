@@ -134,13 +134,13 @@ export function inferAudioCutCandidates(
     );
     candidates.push({
       id: `audio-gap-${candidates.length + 1}`,
-      name: `音频推断补偿 ${candidates.length + 1}`,
+      name: `音频推断差异 ${candidates.length + 1}`,
       sourceAtMs,
       sourceRangeStartMs: clampMilliseconds(previous.sourceTimeMs),
       sourceRangeEndMs: clampMilliseconds(current.sourceTimeMs),
       targetGapMs: missingDurationMs,
       confidence,
-      note: `音频对齐显示完整片源在 ${formatDuration(previous.completeTimeMs)} 到 ${formatDuration(current.completeTimeMs)} 之间比删减版多出约 ${formatDuration(missingDurationMs)}，候选边界约在删减版 ${formatDuration(sourceAtMs)}。`
+      note: `音频对齐显示完整版在 ${formatDuration(previous.completeTimeMs)} 到 ${formatDuration(current.completeTimeMs)} 之间比当前视频多出约 ${formatDuration(missingDurationMs)}，候选边界约在当前视频 ${formatDuration(sourceAtMs)}。`
     });
   }
   return mergeNearbyCandidates(candidates);
@@ -223,7 +223,7 @@ function mergeNearbyCandidates(candidates: CutCandidate[]): CutCandidate[] {
   return merged.map((candidate, index) => ({
     ...candidate,
     id: `audio-gap-${index + 1}`,
-    name: `音频推断补偿 ${index + 1}`
+    name: `音频推断差异 ${index + 1}`
   }));
 }
 

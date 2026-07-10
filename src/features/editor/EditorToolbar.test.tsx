@@ -36,15 +36,15 @@ describe("编辑器工具栏", () => {
     expect(screen.getByLabelText("请先添加时间轴片段再导出 XML")).toBeDisabled();
   });
 
-  it("工作流总览会展示已有能力并随项目状态实时同步", async () => {
+  it("新手引导会展示下一步并随项目状态实时同步", async () => {
     render(<EditorToolbar />);
 
-    fireEvent.click(screen.getByLabelText("工作流总览"));
+    fireEvent.click(screen.getByLabelText("新手引导"));
 
     expect(screen.getByTestId("workflow-overview-dialog")).toBeInTheDocument();
-    expect(screen.getByText("入门引导 / 工作流总览")).toBeInTheDocument();
-    expect(screen.getAllByText("原始 XML 安全").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("XML 导出验证").length).toBeGreaterThan(0);
+    expect(screen.getByText("开始 / 下一步")).toBeInTheDocument();
+    expect(screen.getByText("建议下一步")).toBeInTheDocument();
+    expect(screen.queryByText("能力地图")).not.toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "导入 XML" }).some((button) => !button.hasAttribute("disabled"))).toBe(
       true
     );
@@ -74,7 +74,6 @@ describe("编辑器工具栏", () => {
     });
 
     await waitFor(() => expect(screen.getByText(/1 个 XML \/ 1 个片段/)).toBeInTheDocument());
-    expect(screen.getAllByText("1 个片段").length).toBeGreaterThan(0);
     expect(screen.getAllByRole("button", { name: "导出 XML" }).some((button) => !button.hasAttribute("disabled"))).toBe(
       true
     );
@@ -296,7 +295,7 @@ describe("编辑器工具栏", () => {
         cutMarkers: [
           {
             id: "cut-existing",
-            name: "已有补偿",
+            name: "已有版本差异",
             sourceAtMs: 20_000,
             targetGapMs: 1000,
             note: ""
@@ -308,7 +307,7 @@ describe("编辑器工具栏", () => {
         cutCandidates: [
           {
             id: "cut-existing",
-            name: "冲突补偿",
+            name: "冲突版本差异",
             sourceAtMs: 20_000,
             targetGapMs: 20_000,
             confidence: 0.8,
@@ -357,14 +356,14 @@ describe("编辑器工具栏", () => {
       project: {
         ...createEmptyProject(),
         syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, confidence: 1, origin: "manual" }],
-        cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 20_000, targetGapMs: 5000, note: "" }]
+        cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 20_000, targetGapMs: 5000, note: "" }]
       },
       alignmentProposal: {
         anchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, origin: "automatic" }],
         cutCandidates: [
           {
             id: "cut-existing",
-            name: "已有补偿",
+            name: "已有版本差异",
             sourceAtMs: 20_000,
             targetGapMs: 5000,
             confidence: 0.8,

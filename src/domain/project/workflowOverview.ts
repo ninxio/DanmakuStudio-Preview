@@ -125,31 +125,31 @@ export function createWorkflowOverview(
     },
     {
       id: "apply-alignment",
-      label: "应用对齐候选",
+      label: "应用对齐结果",
       detail: alignmentProposal
         ? `待应用 ${alignmentStatus.pendingCount} 项，已落点 ${alignmentStatus.appliedCount} 项。`
-        : "导入或生成对齐提案后可应用锚点与补偿。",
+        : "导入或生成对齐结果后，可把线索应用到时间轴。",
       enabled: canApplyAlignment,
       reason: createAlignmentActionReason(alignmentProposal, alignmentStatus.pendingCount, alignmentBlockers),
       tone: "primary"
     },
     {
       id: "cleanup-edit-references",
-      label: "清理失效引用",
-      detail: "移除已不存在弹幕的禁用和微调引用。",
+      label: "清理失效调整",
+      detail: "移除已经找不到对应弹幕的禁用和微调记录。",
       enabled: health.metrics.orphanedEditReferenceCount > 0,
       reason:
         health.metrics.orphanedEditReferenceCount > 0
           ? null
-          : "当前没有失效编辑引用。",
+          : "当前没有失效调整记录。",
       tone: "neutral"
     },
     {
       id: "cleanup-missing-clips",
-      label: "清理缺失片段",
-      detail: "移除引用缺失资源的时间轴片段。",
+      label: "移除缺失片段",
+      detail: "移除找不到原始 XML 的时间轴片段。",
       enabled: health.metrics.missingAssetClipCount > 0,
-      reason: health.metrics.missingAssetClipCount > 0 ? null : "当前没有缺失资源片段。",
+      reason: health.metrics.missingAssetClipCount > 0 ? null : "当前没有缺失片段。",
       tone: "danger"
     },
     {
@@ -175,11 +175,11 @@ export function createWorkflowOverview(
     {
       id: "source",
       order: 1,
-      title: "导入源数据",
+      title: "导入素材",
       state: assetCount > 0 ? "complete" : "active",
       stateText: assetCount > 0 ? "已就绪" : "从这里开始",
-      headline: assetCount > 0 ? "弹幕源已经进入项目" : "先把本地文件带进工作台",
-      detail: "视频只作为本地引用，XML 会解析成可编辑弹幕资源；原始 XML 不会被改写。",
+      headline: assetCount > 0 ? "弹幕素材已经进入项目" : "先选择本地视频和 XML",
+      detail: "视频只用于预览，XML 会变成可调整的弹幕素材；原始 XML 不会被改写。",
       metrics: [
         { label: "视频", value: project.media ? project.media.fileName : "未导入" },
         { label: "XML", value: `${formatCount(assetCount)} 个` },
@@ -191,11 +191,11 @@ export function createWorkflowOverview(
     {
       id: "timeline",
       order: 2,
-      title: "整理时间轴",
+      title: "放入时间轴",
       state: hasTimeline ? "complete" : assetCount > 0 ? "active" : "blocked",
       stateText: hasTimeline ? "已有片段" : assetCount > 0 ? "可排布" : "等待 XML",
-      headline: hasTimeline ? "时间轴已有可编辑片段" : "把弹幕资源放入时间轴",
-      detail: "片段、单条微调、禁用、切割和合并都会进入项目历史，便于撤销和重做。",
+      headline: hasTimeline ? "弹幕已经可以预览和调整" : "把弹幕排到视频时间线上",
+      detail: "之后可以移动片段、微调单条弹幕、禁用弹幕，也可以随时撤销。",
       metrics: [
         { label: "片段", value: `${formatCount(clipCount)} 个` },
         { label: "启用弹幕", value: `${formatCount(enabledEvents.length)} 条` },
@@ -207,15 +207,15 @@ export function createWorkflowOverview(
     {
       id: "alignment",
       order: 3,
-      title: "对齐与补偿",
+      title: "处理版本差异",
       state: hasAlignmentWork ? "complete" : assetCount > 0 ? "active" : "idle",
-      stateText: hasAlignmentWork ? "已有对齐线索" : assetCount > 0 ? "可开始复核" : "稍后处理",
-      headline: hasAlignmentWork ? "已有锚点、补偿或候选提案" : "显式处理删减和版本差异",
-      detail: "可用疑似删减扫描、人工锚点、音频对齐提案和复核队列，把差异表达成非破坏性规则。",
+      stateText: hasAlignmentWork ? "已有差异线索" : assetCount > 0 ? "按需处理" : "稍后处理",
+      headline: hasAlignmentWork ? "已有版本差异或对齐线索" : "如果视频被删减，在这里补上差异",
+      detail: "你可以手动标记当前视频和完整版哪里多了或少了多久，高级工具也能辅助寻找线索。",
       metrics: [
-        { label: "锚点", value: `${formatCount(project.syncAnchors.length)} 个` },
-        { label: "补偿点", value: `${formatCount(project.cutMarkers.length)} 个` },
-        { label: "候选提案", value: alignmentProposal ? `${formatCount(alignmentStatus.pendingCount)} 项待应用` : "无" }
+        { label: "同步线索", value: `${formatCount(project.syncAnchors.length)} 个` },
+        { label: "版本差异", value: `${formatCount(project.cutMarkers.length)} 个` },
+        { label: "待应用线索", value: alignmentProposal ? `${formatCount(alignmentStatus.pendingCount)} 项` : "无" }
       ],
       capabilityIds: ["cut-hints", "anchor-calibration", "alignment-proposal", "alignment-review"],
       actionIds: ["apply-alignment"]
@@ -223,11 +223,11 @@ export function createWorkflowOverview(
     {
       id: "review",
       order: 4,
-      title: "项目复核",
+      title: "导出前检查",
       state: health.status === "blocked" ? "blocked" : health.status === "attention" ? "active" : "complete",
       stateText: health.statusLabel,
-      headline: health.status === "ready" ? "健康检查通过" : health.statusDetail,
-      detail: "项目健康会汇总缺失资源、失效编辑引用、重复 ID、负最终时间和媒体重连状态。",
+      headline: health.status === "ready" ? "没有发现会影响导出的问题" : health.statusDetail,
+      detail: "这里只提醒会影响导出或恢复的问题，详细诊断放在导出检查页。",
       metrics: [
         { label: "状态", value: health.statusLabel },
         { label: "问题", value: `${formatCount(health.findings.length)} 项` },
@@ -239,10 +239,10 @@ export function createWorkflowOverview(
     {
       id: "export",
       order: 5,
-      title: "保存与导出",
+      title: "导出 XML",
       state: canExportXml ? "active" : hasTimeline ? "blocked" : "idle",
       stateText: canExportXml ? "可导出" : hasTimeline ? "需先处理" : "等待时间轴",
-      headline: canExportXml ? "可以生成验证后的 XML" : "完成时间轴和健康检查后再导出",
+      headline: canExportXml ? "可以生成新的 XML" : "完成时间轴和导出前检查后再导出",
       detail: "导出前会重新序列化并验证 XML；项目文件只保存媒体引用和编辑状态，不嵌入视频内容。",
       metrics: [
         { label: "可导出弹幕", value: `${formatCount(enabledEvents.length)} 条` },
@@ -317,7 +317,7 @@ function createExportReason(enabledEventCount: number, healthStatus: "ready" | "
     return "需要先把 XML 放入时间轴。";
   }
   if (healthStatus === "blocked") {
-    return "项目健康存在阻断项。";
+    return "导出前检查还有必须处理的问题。";
   }
   return null;
 }
@@ -379,31 +379,31 @@ function createCapabilities({
     {
       id: "history",
       title: "撤销 / 重做历史",
-      detail: "片段、锚点、补偿、清理和对齐提案预览会进入历史。",
+      detail: "片段、同步线索、版本差异、清理和对齐结果预览会进入历史。",
       visibleWhen: "always",
       stateText: "可用",
       active: true
     },
     {
       id: "cut-hints",
-      title: "疑似删减扫描",
-      detail: "按关键词和时间窗口查找可能需要补偿的位置。",
+      title: "疑似版本差异扫描",
+      detail: "按关键词和时间窗口查找可能需要补时的位置。",
       visibleWhen: "with-source",
       stateText: hasAssets ? "可扫描" : "等待 XML",
       active: hasAssets
     },
     {
       id: "anchor-calibration",
-      title: "人工锚点校准",
-      detail: "用对应点文本生成同步锚点和补偿候选。",
+      title: "人工同步线索",
+      detail: "用对应点文本生成同步线索和版本差异候选。",
       visibleWhen: "with-source",
-      stateText: project.syncAnchors.length > 0 ? `${formatCount(project.syncAnchors.length)} 个锚点` : "可录入",
+      stateText: project.syncAnchors.length > 0 ? `${formatCount(project.syncAnchors.length)} 个线索` : "可录入",
       active: project.syncAnchors.length > 0
     },
     {
       id: "alignment-proposal",
       title: "视频 / 音频对齐提案",
-      detail: "可导入 JSON 提案，复核后应用锚点和补偿。",
+      detail: "可导入 JSON 提案，复核后应用同步线索和版本差异。",
       visibleWhen: "with-source",
       stateText: hasAlignmentProposal ? "有候选" : "可导入",
       active: hasAlignmentProposal
@@ -418,7 +418,7 @@ function createCapabilities({
     },
     {
       id: "project-health",
-      title: "项目健康检查",
+      title: "导出前检查",
       detail: "汇总导出阻断、负时间、重复 ID 和媒体重连风险。",
       visibleWhen: "always",
       stateText: "实时计算",
@@ -459,7 +459,7 @@ function createCapabilities({
     {
       id: "export-report",
       title: "导出报告",
-      detail: "导出健康报告和补偿明细，辅助验收。",
+      detail: "导出检查报告和版本差异明细，辅助验收。",
       visibleWhen: "with-timeline",
       stateText: "随导出生成",
       active: hasTimeline

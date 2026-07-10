@@ -19,7 +19,6 @@ import {
   createWorkflowOverview,
   type WorkflowActionDescriptor,
   type WorkflowActionId,
-  type WorkflowCapability,
   type WorkflowStage,
   type WorkflowStageState
 } from "../../domain/project/workflowOverview";
@@ -81,8 +80,6 @@ export function WorkflowOverviewDialog({
   }, [onClose]);
 
   const nextAction = overview.actions.find((action) => action.id === overview.nextActionId) ?? overview.actions[0];
-  const visibleCapabilities = overview.capabilities;
-
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-6" data-testid="workflow-overview-dialog">
       <section
@@ -99,7 +96,7 @@ export function WorkflowOverviewDialog({
               </span>
               <div className="min-w-0">
                 <h2 id="workflow-overview-title" className="truncate text-base font-semibold text-slate-100">
-                  入门引导 / 工作流总览
+                  开始 / 下一步
                 </h2>
                 <p className="mt-1 truncate text-xs text-slate-500" title={overview.projectName}>
                   {overview.projectName} · {overview.liveSummary}
@@ -110,8 +107,8 @@ export function WorkflowOverviewDialog({
           <button
             ref={closeButtonRef}
             type="button"
-            aria-label="关闭工作流总览"
-            title="关闭工作流总览"
+            aria-label="关闭新手引导"
+            title="关闭新手引导"
             className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-panel-line bg-panel-soft text-slate-200 transition hover:border-slate-500 hover:bg-slate-700"
             onClick={onClose}
           >
@@ -132,7 +129,7 @@ export function WorkflowOverviewDialog({
                   </div>
                   <div className="min-w-44">
                     <div className="flex items-center justify-between text-xs text-slate-400">
-                      <span>同步进度</span>
+                      <span>完成进度</span>
                       <span>{overview.progressPercent}%</span>
                     </div>
                     <div className="mt-2 h-2 rounded bg-black/40">
@@ -147,21 +144,9 @@ export function WorkflowOverviewDialog({
 
               <ol className="grid gap-3" aria-label="工作流阶段">
                 {overview.stages.map((stage) => (
-                  <WorkflowStageCard key={stage.id} stage={stage} capabilities={overview.capabilities} />
+                  <WorkflowStageCard key={stage.id} stage={stage} />
                 ))}
               </ol>
-
-              <section className="rounded border border-panel-line bg-panel-soft p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <h3 className="text-sm font-semibold text-slate-100">能力地图</h3>
-                  <span className="text-xs text-slate-500">{visibleCapabilities.length} 项已显性化</span>
-                </div>
-                <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                  {visibleCapabilities.map((capability) => (
-                    <CapabilityRow key={capability.id} capability={capability} />
-                  ))}
-                </div>
-              </section>
             </section>
 
             <aside className="grid content-start gap-4">
@@ -177,7 +162,7 @@ export function WorkflowOverviewDialog({
               </section>
 
               <section className="rounded border border-panel-line bg-panel-soft p-4">
-                <h3 className="text-sm font-semibold text-slate-100">真实操作入口</h3>
+                <h3 className="text-sm font-semibold text-slate-100">常用操作</h3>
                 <div className="mt-3 grid gap-2">
                   {overview.actions.map((action) => (
                     <ActionButton
@@ -191,9 +176,9 @@ export function WorkflowOverviewDialog({
               </section>
 
               <section className="rounded border border-panel-line bg-black/20 p-4">
-                <h3 className="text-sm font-semibold text-slate-100">同步说明</h3>
+                <h3 className="text-sm font-semibold text-slate-100">提示</h3>
                 <p className="mt-2 text-xs leading-5 text-slate-400">
-                  这里的阶段、计数、阻断和按钮状态来自当前项目状态，会随着导入、排布、清理、对齐和导出动作即时刷新。
+                  这里会跟着当前项目变化，只保留你下一步最可能需要的动作。
                 </p>
               </section>
             </aside>
@@ -204,14 +189,7 @@ export function WorkflowOverviewDialog({
   );
 }
 
-function WorkflowStageCard({
-  stage,
-  capabilities
-}: {
-  stage: WorkflowStage;
-  capabilities: WorkflowCapability[];
-}) {
-  const capabilityMap = new Map(capabilities.map((capability) => [capability.id, capability]));
+function WorkflowStageCard({ stage }: { stage: WorkflowStage }) {
   const StageIcon = getStageIcon(stage.state);
   return (
     <li className="rounded border border-panel-line bg-panel-soft p-4">
@@ -243,39 +221,9 @@ function WorkflowStageCard({
               </div>
             ))}
           </dl>
-          <div className="mt-3 flex flex-wrap gap-1.5">
-            {stage.capabilityIds.map((capabilityId) => {
-              const capability = capabilityMap.get(capabilityId);
-              return capability ? (
-                <span
-                  key={capability.id}
-                  className="rounded border border-panel-line bg-[#111318] px-2 py-1 text-[11px] text-slate-300"
-                  title={capability.detail}
-                >
-                  {capability.title}
-                </span>
-              ) : null;
-            })}
-          </div>
         </div>
       </div>
     </li>
-  );
-}
-
-function CapabilityRow({ capability }: { capability: WorkflowCapability }) {
-  return (
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2 rounded border border-panel-line/70 bg-black/15 p-2">
-      <div className="min-w-0">
-        <p className="truncate text-xs font-medium text-slate-200" title={capability.title}>
-          {capability.title}
-        </p>
-        <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-slate-500">{capability.detail}</p>
-      </div>
-      <span className={`h-6 rounded border px-2 py-1 text-[11px] ${capability.active ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200" : "border-panel-line bg-[#111318] text-slate-400"}`}>
-        {capability.stateText}
-      </span>
-    </div>
   );
 }
 

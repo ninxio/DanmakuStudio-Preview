@@ -53,7 +53,7 @@ describe("快捷键", () => {
     });
   });
 
-  it("方向键微调、M 添加删减点、Ctrl+Z 撤销", () => {
+  it("方向键微调、M 标记版本差异、Ctrl+Z 撤销", () => {
     render(<KeyboardShortcuts />);
     fireEvent.keyDown(window, { key: "ArrowRight" });
     expect(useEditorStore.getState().project.itemTimeAdjustments.item).toBe(10);

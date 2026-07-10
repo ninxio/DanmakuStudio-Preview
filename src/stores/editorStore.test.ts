@@ -47,7 +47,7 @@ function createAlignmentProposal() {
     cutCandidates: [
       {
         id: "proposal-cut",
-        name: "候选补偿",
+        name: "候选版本差异",
         sourceAtMs: 20_000,
         sourceRangeStartMs: 18_000,
         sourceRangeEndMs: 22_000,
@@ -335,7 +335,7 @@ describe("editor store", () => {
     });
   });
 
-  it("项目健康存在阻断项时不会生成导出草稿", () => {
+  it("导出前检查存在阻断项时不会生成导出草稿", () => {
     const asset = createAsset("asset-blocked-export", "blocked-export.xml");
     resetStore({
       ...createEmptyProject(),
@@ -358,12 +358,12 @@ describe("editor store", () => {
 
     expect(useEditorStore.getState().exportDraft).toBeNull();
     expect(useEditorStore.getState().status).toEqual({
-      message: "项目健康检查未通过：片段引用了缺失资源。请在项目信息中处理后再导出。",
+      message: "导出前检查未通过：片段引用了缺失资源。请在导出检查中处理后再导出。",
       tone: "warning"
     });
   });
 
-  it("项目健康存在多个阻断项时导出提示会汇总标题", () => {
+  it("导出前检查存在多个阻断项时导出提示会汇总标题", () => {
     const asset = createAsset("asset-multi-blocked-export", "multi-blocked-export.xml");
     resetStore({
       ...createEmptyProject(),
@@ -391,7 +391,7 @@ describe("editor store", () => {
 
     expect(useEditorStore.getState().exportDraft).toBeNull();
     expect(useEditorStore.getState().status).toEqual({
-      message: "项目健康检查未通过：弹幕 ID 重复、片段引用了缺失资源。请在项目信息中处理后再导出。",
+      message: "导出前检查未通过：弹幕 ID 重复、片段引用了缺失资源。请在导出检查中处理后再导出。",
       tone: "warning"
     });
   });
@@ -557,7 +557,7 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.syncAnchors).toHaveLength(0);
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
     expect(useEditorStore.getState().status).toEqual({
-      message: "对齐提案存在应用阻断：1 个候选补偿的不确定区间起止顺序异常，请修正后再应用。",
+      message: "对齐提案存在应用阻断：1 个候选版本差异的不确定区间起止顺序异常，请修正后再应用。",
       tone: "warning"
     });
   });
@@ -566,7 +566,7 @@ describe("editor store", () => {
     resetStore({
       ...createEmptyProject(),
       syncAnchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, confidence: 1, origin: "manual" }],
-      cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
+      cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
@@ -574,7 +574,7 @@ describe("editor store", () => {
       cutCandidates: [
         {
           id: "cut-existing",
-          name: "冲突补偿",
+          name: "冲突版本差异",
           sourceAtMs: 7000,
           targetGapMs: 2000,
           confidence: 0.9,
@@ -598,7 +598,7 @@ describe("editor store", () => {
     resetStore({
       ...createEmptyProject(),
       syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
-      cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
+      cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
@@ -609,7 +609,7 @@ describe("editor store", () => {
       cutCandidates: [
         {
           id: "cut-duplicate-time",
-          name: "重复时间补偿",
+          name: "重复时间版本差异",
           sourceAtMs: 30_000,
           targetGapMs: 12_000,
           confidence: 0.8,
@@ -617,7 +617,7 @@ describe("editor store", () => {
         },
         {
           id: "cut-new",
-          name: "新补偿",
+          name: "新版本差异",
           sourceAtMs: 60_000,
           targetGapMs: 15_000,
           confidence: 0.8,
@@ -638,7 +638,7 @@ describe("editor store", () => {
     ]);
     expect(useEditorStore.getState().history.past).toHaveLength(1);
     expect(useEditorStore.getState().status).toEqual({
-      message: "已应用对齐提案：新增 1 个锚点，1 个补偿点。",
+      message: "已应用对齐提案：新增 1 个同步线索，1 个版本差异。",
       tone: "success"
     });
   });
@@ -647,7 +647,7 @@ describe("editor store", () => {
     resetStore({
       ...createEmptyProject(),
       syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
-      cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
+      cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
@@ -655,7 +655,7 @@ describe("editor store", () => {
       cutCandidates: [
         {
           id: "cut-existing",
-          name: "重复时间补偿",
+          name: "重复时间版本差异",
           sourceAtMs: 30_000,
           targetGapMs: 12_000,
           confidence: 0.8,

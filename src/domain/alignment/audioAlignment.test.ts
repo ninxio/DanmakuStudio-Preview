@@ -7,7 +7,7 @@ import {
 } from "./audioAlignment";
 
 describe("音频特征对齐", () => {
-  it("从完整片源和删减版特征序列中推断缺失段", () => {
+  it("从完整版和当前视频特征序列中推断缺失段", () => {
     const complete = createFrames([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
     const source = createFrames([0.1, 0.2, 0.5, 0.6]);
 
@@ -42,7 +42,7 @@ describe("音频特征对齐", () => {
     expect(proposal.confidence).toBe(1);
   });
 
-  it("匹配路径中的完整片源额外跨度会变成候选补偿", () => {
+  it("匹配路径中的完整版额外跨度会变成候选版本差异", () => {
     const matches = alignAudioFeatureSequences(
       createFrames([0.1, 0.2, 0.3, 0.4, 0.5]),
       createFrames([0.1, 0.2, 0.5]),
@@ -54,7 +54,7 @@ describe("音频特征对齐", () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0].sourceAtMs).toBe(15_000);
     expect(candidates[0].targetGapMs).toBe(20_000);
-    expect(candidates[0].note).toContain("候选边界约在删减版 0:15");
+    expect(candidates[0].note).toContain("候选边界约在当前视频 0:15");
   });
 
   it("空特征序列返回诊断而不是抛错", () => {

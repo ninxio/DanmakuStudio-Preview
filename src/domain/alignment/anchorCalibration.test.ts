@@ -6,7 +6,7 @@ import {
 } from "./anchorCalibration";
 
 describe("锚点校准", () => {
-  it("解析源时间到完整片源时间的锚点文本", () => {
+  it("解析当前视频时间到完整版时间的锚点文本", () => {
     const parsed = parseAnchorCalibrationText("00:10 -> 00:10\n01:20.500 -> 01:30.500");
 
     expect(parsed.warnings).toEqual([]);

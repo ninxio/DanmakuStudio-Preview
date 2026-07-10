@@ -130,7 +130,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   const duplicateCutIdGroups = findDuplicateGroups(
     project.cutMarkers.map((marker, index) => ({
       value: marker.id,
-      label: `补偿点 ${index + 1}（${marker.name} @ ${formatTimecode(marker.sourceAtMs)}）`
+      label: `版本差异 ${index + 1}（${marker.name} @ ${formatTimecode(marker.sourceAtMs)}）`
     }))
   );
   const duplicateAnchorIdGroups = findDuplicateGroups(
@@ -150,7 +150,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   appendDuplicateFinding(findings, "asset-id", "资源 ID 重复", duplicateAssetIdGroups);
   appendDuplicateFinding(findings, "item-id", "弹幕 ID 重复", duplicateItemIdGroups);
   appendDuplicateFinding(findings, "clip-id", "片段 ID 重复", duplicateClipIdGroups);
-  appendDuplicateFinding(findings, "cut-id", "补偿点 ID 重复", duplicateCutIdGroups);
+  appendDuplicateFinding(findings, "cut-id", "版本差异 ID 重复", duplicateCutIdGroups);
   appendDuplicateFinding(findings, "anchor-id", "同步锚点 ID 重复", duplicateAnchorIdGroups);
 
   if (project.assets.length === 0) {
@@ -251,7 +251,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "low-confidence-anchors",
       severity: "warning",
       title: "存在低置信同步锚点",
-      detail: `${lowConfidenceAnchorCount.toLocaleString("zh-CN")} 个自动锚点置信度低于 75%，应用补偿前建议人工复核。`,
+      detail: `${lowConfidenceAnchorCount.toLocaleString("zh-CN")} 个自动锚点置信度低于 75%，应用版本差异前建议人工复核。`,
       evidence: formatLowConfidenceAnchorEvidence(lowConfidenceAnchors)
     });
   }
@@ -259,8 +259,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
     findings.push({
       id: "zero-gap-markers",
       severity: "info",
-      title: "存在 0ms 补偿点",
-      detail: "0ms 补偿点不会改变时间轴，可保留作标记，也可在确认后删除。",
+      title: "存在 0ms 版本差异",
+      detail: "0ms 版本差异不会改变时间轴，可保留作标记，也可在确认后删除。",
       evidence: formatZeroGapMarkerEvidence(zeroGapMarkers)
     });
   }
@@ -351,7 +351,7 @@ export function createProjectHealthReport(
   generatedAt = new Date()
 ): string {
   const lines = [
-    "项目健康报告",
+    "导出前检查报告",
     `项目：${projectName.trim().length > 0 ? projectName : "未命名项目"}`,
     `项目版本：v${summary.metrics.schemaVersion}`,
     `生成时间：${generatedAt.toISOString()}`,
@@ -366,8 +366,8 @@ export function createProjectHealthReport(
     `片段：${summary.metrics.activeClipCount.toLocaleString("zh-CN")} / ${summary.metrics.clipCount.toLocaleString(
       "zh-CN"
     )} 个启用`,
-    `补偿点：${summary.metrics.cutMarkerCount.toLocaleString("zh-CN")} 个`,
-    `总补偿：${formatSignedDuration(summary.metrics.totalCutGapMs)}`,
+    `版本差异：${summary.metrics.cutMarkerCount.toLocaleString("zh-CN")} 个`,
+    `累计调整：${formatSignedDuration(summary.metrics.totalCutGapMs)}`,
     `同步锚点：${summary.metrics.syncAnchorCount.toLocaleString("zh-CN")} 个`,
     `导入警告：${summary.metrics.importWarningCount.toLocaleString("zh-CN")} 条`,
     `单条微调：${summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} 条`,
@@ -554,9 +554,9 @@ function formatEmptyClipEvidence(entries: Array<{ clip: DanmakuClip; asset: Danm
 function formatZeroGapMarkerEvidence(markers: CutMarker[]): string[] {
   const evidence = markers.slice(0, EVIDENCE_PREVIEW_LIMIT).map((marker) => {
     const note = marker.note.trim().length > 0 ? `，备注：${formatLimitedText(marker.note.trim())}` : "";
-    return `${marker.name}（ID：${marker.id}，源时间 ${formatTimecode(marker.sourceAtMs)}${note}）`;
+    return `${marker.name}（ID：${marker.id}，发生位置 ${formatTimecode(marker.sourceAtMs)}${note}）`;
   });
-  return appendOmittedEvidenceNote(evidence, markers.length, "个 0ms 补偿点");
+  return appendOmittedEvidenceNote(evidence, markers.length, "个 0ms 版本差异");
 }
 
 function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {

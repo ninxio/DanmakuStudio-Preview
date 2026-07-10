@@ -85,24 +85,24 @@ export function createCompensationReport(projectName: string, summary: ExportSum
     `禁用弹幕：${summary.disabledCount.toLocaleString("zh-CN")} 条`,
     `最早最终时间：${formatTimecode(summary.earliestFinalTimeMs)}`,
     `最晚最终时间：${formatTimecode(summary.latestFinalTimeMs)}`,
-    `补偿点：${summary.cutMarkerCount.toLocaleString("zh-CN")} 个`,
-    `总补偿：${formatSignedCompensationDuration(summary.totalCutGapMs)}`,
+    `版本差异：${summary.cutMarkerCount.toLocaleString("zh-CN")} 个`,
+    `累计调整：${formatSignedCompensationDuration(summary.totalCutGapMs)}`,
     `导入警告：${summary.hasImportWarnings ? "有" : "无"}`,
     `负时间限制：${summary.negativeClampCount.toLocaleString("zh-CN")} 项`,
     ""
   ];
 
   if (summary.compensationDetails.length === 0) {
-    lines.push("本次导出未应用补偿点。");
+    lines.push("本次导出未应用版本差异。");
   } else {
-    lines.push("补偿明细：");
+    lines.push("版本差异明细：");
     summary.compensationDetails.forEach((detail, index) => {
       lines.push(
         `${index + 1}. ${detail.name}`,
         `   ID：${detail.id}`,
-        `   源时间：${formatTimecode(detail.sourceAtMs)} (${detail.sourceAtMs} ms)`,
-        `   补偿：${formatSignedCompensationDuration(detail.targetGapMs)} (${detail.targetGapMs} ms)`,
-        `   影响：此时间点之后的弹幕最终时间会按该补偿继续平移。`,
+        `   发生位置：${formatTimecode(detail.sourceAtMs)} (${detail.sourceAtMs} ms)`,
+        `   相差时长：${formatSignedCompensationDuration(detail.targetGapMs)} (${detail.targetGapMs} ms)`,
+        `   影响：此时间点之后的弹幕最终时间会整体平移。`,
         `   备注：${detail.note.trim().length > 0 ? detail.note : "无"}`
       );
     });

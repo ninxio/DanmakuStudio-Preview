@@ -24,7 +24,7 @@ describe("project health", () => {
     );
   });
 
-  it("统计可用弹幕、片段和补偿规则", () => {
+  it("统计可用弹幕、片段和版本差异规则", () => {
     const asset = createAsset("asset", [createItem("item-1"), { ...createItem("item-2"), enabled: false }]);
     const project = {
       ...createEmptyProject(),
@@ -41,7 +41,7 @@ describe("project health", () => {
           enabled: true
         }
       ],
-      cutMarkers: [{ id: "cut", name: "补偿", sourceAtMs: 1000, targetGapMs: 2500, note: "确认" }],
+      cutMarkers: [{ id: "cut", name: "版本差异", sourceAtMs: 1000, targetGapMs: 2500, note: "确认" }],
       syncAnchors: [{ id: "anchor", sourceMs: 1000, targetMs: 3500, confidence: 0.95, origin: "manual" as const }]
     };
 
@@ -260,7 +260,7 @@ describe("project health", () => {
     expect(report).toContain("禁用片段 / asset.xml");
   });
 
-  it("提示空片段和 0ms 补偿点时显示证据", () => {
+  it("提示空片段和 0ms 版本差异时显示证据", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const project = {
       ...createEmptyProject(),
@@ -292,7 +292,7 @@ describe("project health", () => {
     expect(summary.findings).toContainEqual(
       expect.objectContaining({
         id: "zero-gap-markers",
-        evidence: ["标记（ID：zero，源时间 00:00:01.500，备注：仅标记）"]
+        evidence: ["标记（ID：zero，发生位置 00:00:01.500，备注：仅标记）"]
       })
     );
     expect(report).toContain("空片段 / asset.xml");
@@ -457,7 +457,7 @@ describe("project health", () => {
     expect(cleanup.project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);
   });
 
-  it("可生成项目健康报告文本", () => {
+  it("可生成导出前检查报告文本", () => {
     const summary = createProjectHealthSummary({
       ...createEmptyProject("报告项目"),
       assets: [createAsset("asset", [createItem("item-1")])],
@@ -466,7 +466,7 @@ describe("project health", () => {
 
     const report = createProjectHealthReport("报告项目", summary, new Date("2026-07-10T01:02:03.000Z"));
 
-    expect(report).toContain("项目健康报告");
+    expect(report).toContain("导出前检查报告");
     expect(report).toContain("项目：报告项目");
     expect(report).toContain(`项目版本：v${CURRENT_SCHEMA_VERSION}`);
     expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");

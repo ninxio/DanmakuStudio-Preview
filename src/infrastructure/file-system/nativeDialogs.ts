@@ -16,7 +16,7 @@ export async function pickAlignmentMediaPath(
 ): Promise<string | null> {
   return pickSingleNativePath(
     {
-      title: "选择完整片源或删减版视频",
+      title: "选择完整版或当前视频",
       filters: alignmentMediaFilters,
       defaultPath: normalizeDefaultPath(defaultPath)
     },

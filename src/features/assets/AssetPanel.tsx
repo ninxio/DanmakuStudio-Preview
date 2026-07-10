@@ -41,12 +41,15 @@ import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from
 import type { CutMarker, SyncAnchor } from "../../domain/danmaku/types";
 import {
   createProjectHealthReport,
-  createProjectHealthSummary,
-  type ProjectHealthFinding,
-  type ProjectHealthStatus,
-  type ProjectHealthSummary
+  createProjectHealthSummary
 } from "../../domain/project/health";
 import { createProjectDownloadFileName } from "../../domain/project/fileNames";
+import {
+  createProjectReadinessSummary,
+  type ProjectReadinessItem,
+  type ProjectReadinessStatus,
+  type ProjectReadinessSummary
+} from "../../domain/project/readiness";
 import type { EditorProject } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
@@ -102,6 +105,7 @@ interface EmbyConnectionState {
 
 export function AssetPanel() {
   const [tab, setTab] = useState<AssetTab>("danmaku");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [partWindowMode, setPartWindowMode] = useState<PartWindowMode>("full");
   const [partWindowMinutes, setPartWindowMinutes] = useState("9");
   const [partRangeStartMinutes, setPartRangeStartMinutes] = useState("0");
@@ -188,6 +192,7 @@ export function AssetPanel() {
     [alignmentProposal]
   );
   const projectHealth = useMemo(() => createProjectHealthSummary(project), [project]);
+  const projectReadiness = useMemo(() => createProjectReadinessSummary(project), [project]);
 
   useEffect(() => {
     const projectChanged = lastAlignmentProjectIdRef.current !== project.id;
@@ -210,10 +215,10 @@ export function AssetPanel() {
           媒体
         </TabButton>
         <TabButton active={tab === "danmaku"} onClick={() => setTab("danmaku")}>
-          弹幕文件
+          弹幕素材
         </TabButton>
         <TabButton active={tab === "project"} onClick={() => setTab("project")}>
-          项目信息
+          导出检查
         </TabButton>
       </div>
       <div className="thin-scrollbar min-h-0 flex-1 overflow-auto p-3">
@@ -244,117 +249,35 @@ export function AssetPanel() {
         ) : null}
         {tab === "danmaku" ? (
           <div className="grid gap-3">
-            <div className="flex gap-2">
-              <TextButton onClick={autoArrangeClips} disabled={project.assets.length === 0}>
-                <Shuffle size={14} />
-                按顺序排列
-              </TextButton>
-              <TextButton
-                tone="primary"
-                onClick={() => exportBatchMergePlan(batchMergePlan, project.name)}
-                disabled={batchMergePlan.episodes.length === 0}
-              >
-                <Download size={14} />
-                导出分集
-              </TextButton>
-            </div>
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <h3 className="text-sm font-medium text-slate-100">下一步</h3>
+              <p className="mt-2 leading-5 text-slate-500">
+                {project.assets.length === 0
+                  ? "先导入 B 站 XML 弹幕文件。导入后，它们会出现在下面的素材列表里。"
+                  : project.clips.length === 0
+                    ? "把弹幕素材放到时间轴。多分 P 文件可以直接按顺序排列。"
+                    : "现在可以在时间轴预览和微调弹幕；遇到视频版本删减时，用“标记版本差异”。"}
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <TextButton onClick={autoArrangeClips} disabled={project.assets.length === 0}>
+                  <Shuffle size={14} />
+                  按顺序放入时间轴
+                </TextButton>
+                <TextButton
+                  tone="primary"
+                  onClick={() => exportBatchMergePlan(batchMergePlan, project.name)}
+                  disabled={batchMergePlan.episodes.length === 0}
+                  title="按当前批量规则导出多个分集 XML"
+                >
+                  <Download size={14} />
+                  导出分集 XML
+                </TextButton>
+              </div>
+            </section>
             {importProgress !== null ? (
               <div className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
                 正在导入 XML... {Math.round(importProgress * 100)}%
               </div>
-            ) : null}
-            <EmbyMetadataPanel
-              onImportDurationLines={(lines) => {
-                setEpisodeDurationsText(lines);
-                setLongSplitMode("durations");
-                setStatus({ message: "已把 Emby 剧集时长导入人工整理规则。", tone: "success" });
-              }}
-            />
-            {project.assets.length > 0 ? (
-              <>
-                <ManualRulePanel
-                  partWindowMode={partWindowMode}
-                  partWindowMinutes={partWindowMinutes}
-                  partRangeStartMinutes={partRangeStartMinutes}
-                  partRangeEndMinutes={partRangeEndMinutes}
-                  longSplitMode={longSplitMode}
-                  episodeDurationsText={episodeDurationsText}
-                  cutPointsText={cutPointsText}
-                  warnings={manualRules.warnings}
-                  onPartWindowModeChange={setPartWindowMode}
-                  onPartWindowMinutesChange={setPartWindowMinutes}
-                  onPartRangeStartMinutesChange={setPartRangeStartMinutes}
-                  onPartRangeEndMinutesChange={setPartRangeEndMinutes}
-                  onLongSplitModeChange={setLongSplitMode}
-                  onEpisodeDurationsTextChange={setEpisodeDurationsText}
-                  onCutPointsTextChange={setCutPointsText}
-                />
-                <CompensationMarkersPanel
-                  markers={project.cutMarkers}
-                  selectedIds={selection.kind === "cut" ? selection.ids : []}
-                  onFocus={(marker) => {
-                    select({ kind: "cut", ids: [marker.id] });
-                    setPlayhead(marker.sourceAtMs);
-                  }}
-                  onUpdate={updateCutMarker}
-                  onDelete={deleteCutMarker}
-                />
-                <SuspectedCutPanel
-                  candidates={suspectedCutCandidates}
-                  cutMarkers={project.cutMarkers}
-                  keywordsText={cutHintSettings.keywordsText}
-                  windowSeconds={cutHintSettings.windowSeconds}
-                  minHitCount={cutHintSettings.minHitCount}
-                  warnings={cutHintSearch.warnings}
-                  onKeywordsTextChange={(keywordsText) => setCutHintSettings({ keywordsText })}
-                  onWindowSecondsChange={(windowSeconds) => setCutHintSettings({ windowSeconds })}
-                  onMinHitCountChange={(minHitCount) => setCutHintSettings({ minHitCount })}
-                  onApply={(candidate) => {
-                    addCutMarker(candidate.sourceAtMs, 45_000, {
-                      name: `待确认补偿 ${formatTimecode(candidate.sourceAtMs)}`,
-                      note: `由弹幕文本扫描生成，需人工复核。来源：${candidate.assetFileName}；关键词：${candidate.keywords.join("、")}`
-                    });
-                  }}
-                />
-                <AnchorCalibrationPanel
-                  text={anchorCalibrationText}
-                  proposal={anchorCalibrationProposal}
-                  onTextChange={setAnchorCalibrationText}
-                  onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
-                  onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
-                />
-                <SyncAnchorsPanel
-                  anchors={project.syncAnchors}
-                  onFocus={(anchor) => setPlayhead(anchor.sourceMs)}
-                  onUpdate={updateSyncAnchor}
-                  onDelete={deleteSyncAnchor}
-                />
-                <VideoAlignmentLabPanel
-                  project={project}
-                  text={alignmentProposalText}
-                  proposal={alignmentProposal}
-                  preview={alignmentPreview}
-                  onTextChange={setAlignmentProposalText}
-                  onImportText={importAlignmentProposalText}
-                  onApply={applyAlignmentProposal}
-                  onClear={() => {
-                    if (alignmentProposal) {
-                      clearAlignmentProposal();
-                    } else {
-                      setStatus({ message: "已清空对齐提案草稿。", tone: "neutral" });
-                    }
-                    setAlignmentProposalText("");
-                  }}
-                  onFocusQueueItem={(sourceAtMs, name) => {
-                    setPlayhead(sourceAtMs);
-                    setStatus({
-                      message: `已定位复核项：${name}（${formatTimecode(sourceAtMs)}）。`,
-                      tone: "success"
-                    });
-                  }}
-                />
-                <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
-              </>
             ) : null}
             {project.assets.length === 0 ? (
               <EmptyState title="尚未导入 XML" text="可一次选择多个 Bilibili XML 分 P 文件。" />
@@ -416,13 +339,131 @@ export function AssetPanel() {
                 );
               })
             )}
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-3 text-left"
+                aria-expanded={advancedOpen}
+                onClick={() => setAdvancedOpen((open) => !open)}
+              >
+                <span>
+                  <span className="block text-sm font-medium text-slate-100">高级工具</span>
+                  <span className="mt-1 block leading-5 text-slate-500">
+                    Emby 时长、批量整理、版本差异列表、差异扫描和视频对齐都在这里。
+                  </span>
+                </span>
+                <span className="shrink-0 rounded border border-panel-line px-2 py-1 text-[11px] text-slate-300">
+                  {advancedOpen ? "收起" : "展开"}
+                </span>
+              </button>
+              {advancedOpen ? (
+                <div className="mt-3 grid gap-3">
+                  <EmbyMetadataPanel
+                    onImportDurationLines={(lines) => {
+                      setEpisodeDurationsText(lines);
+                      setLongSplitMode("durations");
+                      setStatus({ message: "已把 Emby 剧集时长导入批量整理规则。", tone: "success" });
+                    }}
+                  />
+                  {project.assets.length > 0 ? (
+                    <>
+                      <ManualRulePanel
+                        partWindowMode={partWindowMode}
+                        partWindowMinutes={partWindowMinutes}
+                        partRangeStartMinutes={partRangeStartMinutes}
+                        partRangeEndMinutes={partRangeEndMinutes}
+                        longSplitMode={longSplitMode}
+                        episodeDurationsText={episodeDurationsText}
+                        cutPointsText={cutPointsText}
+                        warnings={manualRules.warnings}
+                        onPartWindowModeChange={setPartWindowMode}
+                        onPartWindowMinutesChange={setPartWindowMinutes}
+                        onPartRangeStartMinutesChange={setPartRangeStartMinutes}
+                        onPartRangeEndMinutesChange={setPartRangeEndMinutes}
+                        onLongSplitModeChange={setLongSplitMode}
+                        onEpisodeDurationsTextChange={setEpisodeDurationsText}
+                        onCutPointsTextChange={setCutPointsText}
+                      />
+                      <CompensationMarkersPanel
+                        markers={project.cutMarkers}
+                        selectedIds={selection.kind === "cut" ? selection.ids : []}
+                        onFocus={(marker) => {
+                          select({ kind: "cut", ids: [marker.id] });
+                          setPlayhead(marker.sourceAtMs);
+                        }}
+                        onUpdate={updateCutMarker}
+                        onDelete={deleteCutMarker}
+                      />
+                      <SuspectedCutPanel
+                        candidates={suspectedCutCandidates}
+                        cutMarkers={project.cutMarkers}
+                        keywordsText={cutHintSettings.keywordsText}
+                        windowSeconds={cutHintSettings.windowSeconds}
+                        minHitCount={cutHintSettings.minHitCount}
+                        warnings={cutHintSearch.warnings}
+                        onKeywordsTextChange={(keywordsText) => setCutHintSettings({ keywordsText })}
+                        onWindowSecondsChange={(windowSeconds) => setCutHintSettings({ windowSeconds })}
+                        onMinHitCountChange={(minHitCount) => setCutHintSettings({ minHitCount })}
+                        onApply={(candidate) => {
+                          addCutMarker(candidate.sourceAtMs, 45_000, {
+                            name: `待确认版本差异 ${formatTimecode(candidate.sourceAtMs)}`,
+                            note: `由弹幕文本扫描生成，需人工复核。来源：${candidate.assetFileName}；关键词：${candidate.keywords.join("、")}`
+                          });
+                        }}
+                      />
+                      <AnchorCalibrationPanel
+                        text={anchorCalibrationText}
+                        proposal={anchorCalibrationProposal}
+                        onTextChange={setAnchorCalibrationText}
+                        onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
+                        onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
+                      />
+                      <SyncAnchorsPanel
+                        anchors={project.syncAnchors}
+                        onFocus={(anchor) => setPlayhead(anchor.sourceMs)}
+                        onUpdate={updateSyncAnchor}
+                        onDelete={deleteSyncAnchor}
+                      />
+                      <VideoAlignmentLabPanel
+                        project={project}
+                        text={alignmentProposalText}
+                        proposal={alignmentProposal}
+                        preview={alignmentPreview}
+                        onTextChange={setAlignmentProposalText}
+                        onImportText={importAlignmentProposalText}
+                        onApply={applyAlignmentProposal}
+                        onClear={() => {
+                          if (alignmentProposal) {
+                            clearAlignmentProposal();
+                          } else {
+                            setStatus({ message: "已清空对齐提案草稿。", tone: "neutral" });
+                          }
+                          setAlignmentProposalText("");
+                        }}
+                        onFocusQueueItem={(sourceAtMs, name) => {
+                          setPlayhead(sourceAtMs);
+                          setStatus({
+                            message: `已定位复核项：${name}（${formatTimecode(sourceAtMs)}）。`,
+                            tone: "success"
+                          });
+                        }}
+                      />
+                      <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
+                    </>
+                  ) : (
+                    <EmptyState title="先导入 XML" text="高级工具会基于已导入的弹幕素材生成规则和候选。" />
+                  )}
+                </div>
+              ) : null}
+            </section>
           </div>
         ) : null}
         {tab === "project" ? (
           <div className="grid gap-3 text-xs text-slate-400">
-            <ProjectHealthPanel
+            <ExportReadinessPanel
               projectName={project.name}
-              summary={projectHealth}
+              reportSummary={projectHealth}
+              readiness={projectReadiness}
               onCleanupEditReferences={cleanupProjectEditReferences}
               onCleanupMissingAssetClips={cleanupProjectMissingAssetClips}
             />
@@ -430,8 +471,8 @@ export function AssetPanel() {
               <h3 className="mb-2 text-sm font-medium text-slate-100">{project.name}</h3>
               <Row label="资源数" value={project.assets.length.toString()} />
               <Row label="片段数" value={project.clips.length.toString()} />
-              <Row label="删减标记" value={project.cutMarkers.length.toString()} />
-              <Row label="同步锚点" value={project.syncAnchors.length.toString()} />
+              <Row label="版本差异" value={project.cutMarkers.length.toString()} />
+              <Row label="同步线索" value={project.syncAnchors.length.toString()} />
               <Row label="禁用弹幕" value={project.disabledItemIds.length.toString()} />
               <Row label="全局偏移" value={`${project.globalOffsetMs} ms`} />
               <Row label="创建时间" value={new Date(project.createdAt).toLocaleString("zh-CN")} />
@@ -896,7 +937,7 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
       {plan.compensation.markerCount > 0 ? (
         <div className="mt-3 grid gap-1 border-t border-panel-line pt-3 text-slate-400">
           <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
-            <span className="text-slate-500">补偿点</span>
+            <span className="text-slate-500">版本差异</span>
             <span>{plan.compensation.markerCount} 个</span>
           </div>
           <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
@@ -933,17 +974,17 @@ function CompensationMarkersPanel({
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
         <ListPlus size={15} className="text-accent-cyan" />
-        <span>补偿点管理</span>
+        <span>版本差异列表</span>
         <span className="ml-auto text-[11px] text-slate-500">{markers.length} 个</span>
       </div>
       <div className="mt-3 grid gap-2">
         {markers.length > 0 ? (
           <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2 text-slate-400">
-            <span className="text-slate-500">总补偿</span>
+            <span className="text-slate-500">累计调整</span>
             <span>{formatSignedDuration(totalGapMs)}</span>
           </div>
         ) : (
-          <div className="text-slate-500">暂无补偿点，可从时间轴、锚点校准或疑似删减候选生成。</div>
+          <div className="text-slate-500">暂无版本差异。可在时间轴标记，或从删减扫描、对齐线索生成。</div>
         )}
         {markers.map((marker) => {
           const selected = selectedIds.includes(marker.id);
@@ -959,7 +1000,7 @@ function CompensationMarkersPanel({
                   type="button"
                   className="min-w-0 text-left"
                   onClick={() => onFocus(marker)}
-                  aria-label={`定位补偿点 ${marker.name}`}
+                  aria-label={`定位版本差异 ${marker.name}`}
                 >
                   <span className="block truncate text-slate-100" title={marker.name}>
                     {marker.name}
@@ -968,16 +1009,16 @@ function CompensationMarkersPanel({
                     {formatTimecode(marker.sourceAtMs)} / {formatSignedDuration(marker.targetGapMs)}
                   </span>
                 </button>
-                <TextButton aria-label={`删除补偿点 ${marker.name}`} tone="danger" onClick={() => onDelete(marker.id)}>
+                <TextButton aria-label={`删除版本差异 ${marker.name}`} tone="danger" onClick={() => onDelete(marker.id)}>
                   <Trash2 size={14} />
                   删除
                 </TextButton>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <label className="grid gap-1">
-                  <span className="text-slate-500">源时间 ms</span>
+                  <span className="text-slate-500">发生时间 ms</span>
                   <input
-                    aria-label={`${marker.name} 源时间 ms`}
+                    aria-label={`${marker.name} 发生时间 ms`}
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={marker.sourceAtMs}
@@ -985,9 +1026,9 @@ function CompensationMarkersPanel({
                   />
                 </label>
                 <label className="grid gap-1">
-                  <span className="text-slate-500">补偿 ms</span>
+                  <span className="text-slate-500">相差 ms</span>
                   <input
-                    aria-label={`${marker.name} 补偿 ms`}
+                    aria-label={`${marker.name} 相差 ms`}
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={marker.targetGapMs}
@@ -1031,14 +1072,14 @@ function SuspectedCutPanel({
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
         <Search size={15} className="text-accent-yellow" />
-        <span>疑似删减点</span>
+        <span>疑似版本差异</span>
         <span className="ml-auto text-[11px] text-slate-500">{candidates.length} 个候选</span>
       </div>
       <div className="mt-3 grid gap-2">
         <label className="grid gap-1">
           <span className="text-slate-500">关键词</span>
           <textarea
-            aria-label="疑似删减关键词"
+            aria-label="疑似版本差异关键词"
             className="min-h-16 resize-y rounded border border-panel-line bg-[#111318] p-2 text-xs leading-5 text-slate-100"
             value={keywordsText}
             placeholder="删了, 剪了, 跳了, 和谐"
@@ -1049,7 +1090,7 @@ function SuspectedCutPanel({
           <label className="grid gap-1">
             <span className="text-slate-500">窗口秒</span>
             <input
-              aria-label="疑似删减聚类窗口秒"
+              aria-label="疑似版本差异聚类窗口秒"
               className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               inputMode="decimal"
               value={windowSeconds}
@@ -1059,7 +1100,7 @@ function SuspectedCutPanel({
           <label className="grid gap-1">
             <span className="text-slate-500">最小命中</span>
             <input
-              aria-label="疑似删减最小命中数"
+              aria-label="疑似版本差异最小命中数"
               className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               inputMode="numeric"
               value={minHitCount}
@@ -1093,7 +1134,7 @@ function SuspectedCutPanel({
                   disabled={applied}
                   onClick={() => onApply(candidate)}
                 >
-                  {applied ? "已存在" : "转为补偿点"}
+                  {applied ? "已存在" : "转为版本差异"}
                 </TextButton>
               </div>
               <div className="truncate text-[11px] text-slate-500" title={candidate.sampleTexts.join(" / ")}>
@@ -1138,7 +1179,7 @@ function AnchorCalibrationPanel({
               <span>{proposal.anchors.length} 个</span>
             </div>
             <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
-              <span className="text-slate-500">推断补偿</span>
+              <span className="text-slate-500">推断差异</span>
               <span>{proposal.cutCandidates.length} 个</span>
             </div>
             {proposal.cutCandidates.slice(0, 3).map((candidate) => (
@@ -1167,7 +1208,7 @@ function AnchorCalibrationPanel({
                 disabled={proposal.anchors.length === 0}
                 onClick={onApply}
               >
-                应用锚点与补偿
+                应用线索与差异
               </TextButton>
             </div>
           </div>
@@ -1226,9 +1267,9 @@ function SyncAnchorsPanel({
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <label className="grid gap-1">
-                  <span className="text-slate-500">源时间 ms</span>
+                  <span className="text-slate-500">当前视频时间 ms</span>
                   <input
-                    aria-label={`${label} 源时间 ms`}
+                    aria-label={`${label} 当前视频时间 ms`}
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={anchor.sourceMs}
@@ -1236,9 +1277,9 @@ function SyncAnchorsPanel({
                   />
                 </label>
                 <label className="grid gap-1">
-                  <span className="text-slate-500">目标时间 ms</span>
+                  <span className="text-slate-500">完整版时间 ms</span>
                   <input
-                    aria-label={`${label} 目标时间 ms`}
+                    aria-label={`${label} 完整版时间 ms`}
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={anchor.targetMs}
@@ -1452,11 +1493,11 @@ function VideoAlignmentLabPanel({
       const path = await pickAlignmentMediaPath(completePath);
       if (path) {
         setCompletePath(path);
-        setStatus({ message: "已选择完整片源路径。", tone: "success" });
+        setStatus({ message: "已选择完整版路径。", tone: "success" });
       }
     } catch (error) {
       setStatus({
-        message: error instanceof Error ? error.message : "完整片源路径选择失败。",
+        message: error instanceof Error ? error.message : "完整版路径选择失败。",
         tone: "error"
       });
     }
@@ -1467,11 +1508,11 @@ function VideoAlignmentLabPanel({
       const path = await pickAlignmentMediaPath(sourcePath);
       if (path) {
         setSourcePath(path);
-        setStatus({ message: "已选择删减版路径。", tone: "success" });
+        setStatus({ message: "已选择当前视频路径。", tone: "success" });
       }
     } catch (error) {
       setStatus({
-        message: error instanceof Error ? error.message : "删减版路径选择失败。",
+        message: error instanceof Error ? error.message : "当前视频路径选择失败。",
         tone: "error"
       });
     }
@@ -1506,18 +1547,18 @@ function VideoAlignmentLabPanel({
       </div>
       <div className="mt-3 grid gap-2">
         <label className="grid gap-1">
-          <span className="text-slate-500">完整片源路径</span>
+          <span className="text-slate-500">完整版路径</span>
           <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
-              aria-label="完整片源路径"
+              aria-label="完整版路径"
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={completePath}
               placeholder="D:\\media\\full.mkv"
               onChange={(event) => setCompletePath(event.target.value)}
             />
             <TextButton
-              aria-label="选择完整片源"
-              title="选择完整片源"
+              aria-label="选择完整版"
+              title="选择完整版"
               onClick={() => {
                 void chooseCompletePath();
               }}
@@ -1529,18 +1570,18 @@ function VideoAlignmentLabPanel({
           </div>
         </label>
         <label className="grid gap-1">
-          <span className="text-slate-500">删减版路径</span>
+          <span className="text-slate-500">当前视频路径</span>
           <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
-              aria-label="删减版路径"
+              aria-label="当前视频路径"
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={sourcePath}
               placeholder="D:\\media\\bilibili-cut.mp4"
               onChange={(event) => setSourcePath(event.target.value)}
             />
             <TextButton
-              aria-label="选择删减版"
-              title="选择删减版"
+              aria-label="选择当前视频"
+              title="选择当前视频"
               onClick={() => {
                 void chooseSourcePath();
               }}
@@ -1760,7 +1801,7 @@ function VideoAlignmentLabPanel({
                         <span className="text-slate-100">{item.name}</span>
                         <span className="text-slate-500">
                           {" "}
-                          / {item.kind === "anchor" ? "锚点" : "补偿"} / {formatTimecode(item.sourceAtMs)}
+                          / {item.kind === "anchor" ? "锚点" : "版本差异"} / {formatTimecode(item.sourceAtMs)}
                         </span>
                         <span className="block text-slate-400">{item.reasons.join("；")}</span>
                       </span>
@@ -1790,7 +1831,7 @@ function VideoAlignmentLabPanel({
                       key={`${item.kind}-${item.id}-${index}`}
                       className="grid grid-cols-[44px_minmax(0,1fr)] gap-2"
                     >
-                      <span className="text-slate-500">{item.kind === "anchor" ? "锚点" : "补偿"}</span>
+                      <span className="text-slate-500">{item.kind === "anchor" ? "锚点" : "版本差异"}</span>
                       <span className="min-w-0">
                         <span className="text-slate-100">{item.name}</span>
                         <span className="text-slate-500"> / {formatTimecode(item.sourceAtMs)} / </span>
@@ -1811,7 +1852,7 @@ function VideoAlignmentLabPanel({
               </span>
             </div>
             <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
-              <span className="text-slate-500">补偿</span>
+              <span className="text-slate-500">版本差异</span>
               <span>
                 {proposal.cutCandidates.length} 个，候选 {preview.summary.candidateCutCount}
               </span>
@@ -2036,87 +2077,84 @@ function confidenceLabel(confidence: "high" | "medium" | "low"): string {
   return "需复核";
 }
 
-function ProjectHealthPanel({
+function ExportReadinessPanel({
   projectName,
-  summary,
+  reportSummary,
+  readiness,
   onCleanupEditReferences,
   onCleanupMissingAssetClips
 }: {
   projectName: string;
-  summary: ProjectHealthSummary;
+  reportSummary: ReturnType<typeof createProjectHealthSummary>;
+  readiness: ProjectReadinessSummary;
   onCleanupEditReferences: () => void;
   onCleanupMissingAssetClips: () => void;
 }) {
-  const StatusIcon = summary.status === "blocked" ? CircleAlert : summary.status === "attention" ? TriangleAlert : CircleCheck;
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const StatusIcon = readiness.status === "blocked" ? CircleAlert : readiness.status === "attention" ? TriangleAlert : CircleCheck;
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3" data-testid="project-health-panel">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
-            <StatusIcon size={16} className={projectHealthIconClass(summary.status)} />
-            <span>项目健康</span>
+            <StatusIcon size={16} className={projectReadinessIconClass(readiness.status)} />
+            <span>导出前检查</span>
           </div>
-          <p className="mt-1 text-xs leading-5 text-slate-500">{summary.statusDetail}</p>
+          <p className="mt-1 text-xs font-medium leading-5 text-slate-300">{readiness.headline}</p>
+          <p className="mt-1 text-xs leading-5 text-slate-500">{readiness.detail}</p>
         </div>
-        <span className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectHealthBadgeClass(summary.status)}`}>
-          {summary.statusLabel}
+        <span className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectReadinessBadgeClass(readiness.status)}`}>
+          {readiness.statusLabel}
         </span>
       </div>
-      <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2">
-        <HealthMetric label="项目版本" value={`v${summary.metrics.schemaVersion}`} />
-        <HealthMetric label="资源" value={summary.metrics.assetCount.toLocaleString("zh-CN")} />
-        <HealthMetric
-          label="弹幕"
-          value={`${summary.metrics.enabledItemCount.toLocaleString("zh-CN")} / ${summary.metrics.itemCount.toLocaleString(
-            "zh-CN"
-          )}`}
-        />
-        <HealthMetric
-          label="片段"
-          value={`${summary.metrics.activeClipCount.toLocaleString("zh-CN")} / ${summary.metrics.clipCount.toLocaleString(
-            "zh-CN"
-          )}`}
-        />
-        <HealthMetric label="补偿" value={formatSignedDuration(summary.metrics.totalCutGapMs)} />
-        <HealthMetric label="锚点" value={summary.metrics.syncAnchorCount.toLocaleString("zh-CN")} />
-        <HealthMetric label="导入警告" value={summary.metrics.importWarningCount.toLocaleString("zh-CN")} />
-        <HealthMetric label="单条微调" value={summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} />
-        <HealthMetric label="重复 ID" value={summary.metrics.duplicateIdCount.toLocaleString("zh-CN")} />
-        <HealthMetric label="负最终时间" value={summary.metrics.negativeFinalTimeItemCount.toLocaleString("zh-CN")} />
-        <HealthMetric label="媒体重连" value={summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"} />
-      </dl>
-      <ul className="mt-3 divide-y divide-panel-line border-t border-panel-line">
-        {summary.findings.map((finding) => (
-          <ProjectHealthFindingRow key={finding.id} finding={finding} />
-        ))}
-      </ul>
+      {readiness.items.length > 0 ? (
+        <ul className="mt-3 divide-y divide-panel-line border-t border-panel-line">
+          {readiness.items.map((item) => (
+            <ProjectReadinessItemRow key={item.id} item={item} />
+          ))}
+        </ul>
+      ) : (
+        <div className="mt-3 rounded border border-emerald-400/30 bg-emerald-400/10 p-2 text-xs leading-5 text-emerald-100">
+          没有需要你现在处理的问题。可以继续编辑，或直接导出 XML。
+        </div>
+      )}
       <div className="mt-3 flex flex-wrap justify-end gap-2">
         <TextButton
           onClick={() => {
             const fileName = downloadTextFile(
               createProjectDownloadFileName(projectName, "-health-report.txt"),
-              createProjectHealthReport(projectName, summary),
+              createProjectHealthReport(projectName, reportSummary),
               "text/plain;charset=utf-8"
             );
-            setStatus({ message: `已导出项目健康报告：${fileName}。`, tone: "success" });
+            setStatus({ message: `已导出检查报告：${fileName}。`, tone: "success" });
           }}
         >
           <Download size={14} />
-          导出健康报告
+          下载检查报告
         </TextButton>
-        {summary.metrics.orphanedEditReferenceCount > 0 ? (
+        {readiness.canCleanupEditReferences ? (
           <TextButton onClick={onCleanupEditReferences}>
             <Trash2 size={14} />
-            清理失效引用
+            清理失效调整
           </TextButton>
         ) : null}
-        {summary.metrics.missingAssetClipCount > 0 ? (
+        {readiness.canCleanupMissingAssetClips ? (
           <TextButton tone="danger" onClick={onCleanupMissingAssetClips}>
             <Trash2 size={14} />
-            清理缺失片段
+            移除缺失片段
           </TextButton>
         ) : null}
+        <TextButton onClick={() => setDiagnosticsOpen((open) => !open)}>
+          {diagnosticsOpen ? "收起诊断详情" : "查看诊断详情"}
+        </TextButton>
       </div>
+      {diagnosticsOpen ? (
+        <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-panel-line pt-3">
+          {readiness.diagnostics.map((diagnostic) => (
+            <HealthMetric key={diagnostic.label} label={diagnostic.label} value={diagnostic.value} />
+          ))}
+        </dl>
+      ) : null}
     </section>
   );
 }
@@ -2132,20 +2170,20 @@ function HealthMetric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ProjectHealthFindingRow({ finding }: { finding: ProjectHealthFinding }) {
+function ProjectReadinessItemRow({ item }: { item: ProjectReadinessItem }) {
   const FindingIcon =
-    finding.severity === "error" ? CircleAlert : finding.severity === "warning" ? TriangleAlert : CircleCheck;
+    item.severity === "error" ? CircleAlert : item.severity === "warning" ? TriangleAlert : CircleCheck;
   return (
     <li className="flex gap-2 py-2 first:pt-3 last:pb-0">
-      <FindingIcon size={14} className={`mt-0.5 shrink-0 ${projectHealthFindingIconClass(finding.severity)}`} />
+      <FindingIcon size={14} className={`mt-0.5 shrink-0 ${projectReadinessItemIconClass(item.severity)}`} />
       <div className="min-w-0">
-        <p className="text-xs font-medium text-slate-200">{finding.title}</p>
-        <p className="mt-0.5 text-[11px] leading-5 text-slate-500">{finding.detail}</p>
-        {finding.evidence && finding.evidence.length > 0 ? (
+        <p className="text-xs font-medium text-slate-200">{item.title}</p>
+        <p className="mt-0.5 text-[11px] leading-5 text-slate-500">{item.detail}</p>
+        {item.evidence.length > 0 ? (
           <ul className="mt-1 grid gap-1 text-[11px] leading-5 text-slate-400">
-            {finding.evidence.map((item) => (
-              <li key={item} className="break-words">
-                {item}
+            {item.evidence.map((evidenceItem) => (
+              <li key={evidenceItem} className="break-words">
+                {evidenceItem}
               </li>
             ))}
           </ul>
@@ -2155,7 +2193,7 @@ function ProjectHealthFindingRow({ finding }: { finding: ProjectHealthFinding })
   );
 }
 
-function projectHealthIconClass(status: ProjectHealthStatus): string {
+function projectReadinessIconClass(status: ProjectReadinessStatus): string {
   if (status === "blocked") {
     return "text-red-300";
   }
@@ -2165,7 +2203,7 @@ function projectHealthIconClass(status: ProjectHealthStatus): string {
   return "text-emerald-300";
 }
 
-function projectHealthBadgeClass(status: ProjectHealthStatus): string {
+function projectReadinessBadgeClass(status: ProjectReadinessStatus): string {
   if (status === "blocked") {
     return "border-red-400/40 bg-red-400/10 text-red-200";
   }
@@ -2175,7 +2213,7 @@ function projectHealthBadgeClass(status: ProjectHealthStatus): string {
   return "border-emerald-400/40 bg-emerald-400/10 text-emerald-200";
 }
 
-function projectHealthFindingIconClass(severity: ProjectHealthFinding["severity"]): string {
+function projectReadinessItemIconClass(severity: ProjectReadinessItem["severity"]): string {
   if (severity === "error") {
     return "text-red-300";
   }

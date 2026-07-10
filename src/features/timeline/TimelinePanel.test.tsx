@@ -27,14 +27,14 @@ describe("时间轴面板", () => {
       project: {
         ...createEmptyProject(),
         syncAnchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, origin: "manual" }],
-        cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
+        cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
       },
       alignmentProposal: {
         anchors: [{ id: "anchor-existing", sourceMs: 1200, targetMs: 2400, origin: "automatic" }],
         cutCandidates: [
           {
             id: "cut-existing",
-            name: "同 ID 不同补偿",
+            name: "同 ID 不同版本差异",
             sourceAtMs: 3000,
             targetGapMs: 2400,
             confidence: 0.9,

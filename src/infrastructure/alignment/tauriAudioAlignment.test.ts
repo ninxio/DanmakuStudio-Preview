@@ -41,8 +41,8 @@ describe("Tauri 音频对齐调用", () => {
           jobId: received.completePath === "full.mp4" ? "job-1" : "job-x",
           status: "running",
           progress: 0.25,
-          message: "正在提取完整片源音频特征。",
-          logs: ["音频对齐任务已加入队列。", "正在提取完整片源音频特征。"],
+          message: "正在提取完整版音频特征。",
+          logs: ["音频对齐任务已加入队列。", "正在提取完整版音频特征。"],
           proposal: null,
           error: null,
           updatedAtMs: 1
@@ -79,7 +79,7 @@ describe("Tauri 音频对齐调用", () => {
     await expect(startTauriAudioAlignmentJob(request, invoker)).resolves.toMatchObject({
       jobId: "job-1",
       status: "running",
-      logs: ["音频对齐任务已加入队列。", "正在提取完整片源音频特征。"]
+      logs: ["音频对齐任务已加入队列。", "正在提取完整版音频特征。"]
     });
     await expect(getTauriAudioAlignmentJob("job-1", invoker)).resolves.toMatchObject({
       status: "completed",
