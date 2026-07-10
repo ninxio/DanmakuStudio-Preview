@@ -53,6 +53,10 @@ import {
 } from "../infrastructure/xml/bilibiliXml";
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
 import { createAlignmentApplyBlockers } from "../domain/alignment/alignmentReport";
+import {
+  isAlignmentAnchorApplied,
+  isAlignmentCutCandidateApplied
+} from "../domain/alignment/preview";
 import { parseAlignmentProposal } from "../domain/alignment/manualProvider";
 import { pickAssetColor } from "../domain/shared/assetColors";
 import {
@@ -1055,19 +1059,34 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       });
       return;
     }
+    const pendingAnchors = proposal.anchors.filter(
+      (anchor) => !isAlignmentAnchorApplied(project.syncAnchors, anchor)
+    );
+    const pendingCutCandidates = proposal.cutCandidates.filter(
+      (candidate) => !isAlignmentCutCandidateApplied(project.cutMarkers, candidate)
+    );
+    if (pendingAnchors.length === 0 && pendingCutCandidates.length === 0) {
+      set({ status: { message: "对齐提案没有新的可应用项。", tone: "neutral" } });
+      return;
+    }
     commitProject(set, get, "应用对齐提案", (currentProject) => ({
       ...currentProject,
-      syncAnchors: uniqueById([...currentProject.syncAnchors, ...proposal.anchors]),
+      syncAnchors: uniqueById([...currentProject.syncAnchors, ...pendingAnchors]),
       cutMarkers: uniqueById([
         ...currentProject.cutMarkers,
-        ...proposal.cutCandidates.map((candidate, index) => ({
+        ...pendingCutCandidates.map((candidate, index) => ({
           ...cutCandidateToMarker(candidate),
           id: candidate.id.length > 0 ? candidate.id : createId("cut"),
           name: candidate.name.length > 0 ? candidate.name : `候选删减点 ${index + 1}`
         }))
       ])
     }));
-    set({ status: { message: "已应用对齐提案，时间轴会标记已应用项。", tone: "success" } });
+    set({
+      status: {
+        message: `已应用对齐提案：新增 ${pendingAnchors.length} 个锚点，${pendingCutCandidates.length} 个补偿点。`,
+        tone: "success"
+      }
+    });
   },
 
   applyAlignmentProposal: () => {

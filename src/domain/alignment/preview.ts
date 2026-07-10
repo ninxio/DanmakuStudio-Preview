@@ -51,12 +51,12 @@ export function buildAlignmentPreview(
     proposal?.anchors
       .map(
         (anchor): AlignmentPreviewAnchor => ({
-        id: anchor.id,
-        sourceMs: anchor.sourceMs,
-        targetMs: anchor.targetMs,
-        confidence: anchor.confidence ?? null,
-        origin: anchor.origin,
-        state: isAnchorApplied(project.syncAnchors, anchor) ? "applied" : "candidate"
+          id: anchor.id,
+          sourceMs: anchor.sourceMs,
+          targetMs: anchor.targetMs,
+          confidence: anchor.confidence ?? null,
+          origin: anchor.origin,
+          state: isAlignmentAnchorApplied(project.syncAnchors, anchor) ? "applied" : "candidate"
         })
       )
       .sort(comparePreviewAnchors) ?? [];
@@ -64,15 +64,15 @@ export function buildAlignmentPreview(
     proposal?.cutCandidates
       .map(
         (candidate): AlignmentPreviewCutCandidate => ({
-        id: candidate.id,
-        name: candidate.name,
-        sourceAtMs: candidate.sourceAtMs,
-        sourceRangeStartMs: candidate.sourceRangeStartMs,
-        sourceRangeEndMs: candidate.sourceRangeEndMs,
-        targetGapMs: candidate.targetGapMs,
-        confidence: candidate.confidence,
-        note: candidate.note,
-        state: isCutCandidateApplied(project.cutMarkers, candidate) ? "applied" : "candidate"
+          id: candidate.id,
+          name: candidate.name,
+          sourceAtMs: candidate.sourceAtMs,
+          sourceRangeStartMs: candidate.sourceRangeStartMs,
+          sourceRangeEndMs: candidate.sourceRangeEndMs,
+          targetGapMs: candidate.targetGapMs,
+          confidence: candidate.confidence,
+          note: candidate.note,
+          state: isAlignmentCutCandidateApplied(project.cutMarkers, candidate) ? "applied" : "candidate"
         })
       )
       .sort(comparePreviewCuts) ?? [];
@@ -92,7 +92,7 @@ export function buildAlignmentPreview(
   };
 }
 
-function isAnchorApplied(anchors: SyncAnchor[], proposalAnchor: SyncAnchor): boolean {
+export function isAlignmentAnchorApplied(anchors: SyncAnchor[], proposalAnchor: SyncAnchor): boolean {
   return anchors.some(
     (anchor) =>
       hasSameNonEmptyId(anchor.id, proposalAnchor.id) ||
@@ -100,7 +100,10 @@ function isAnchorApplied(anchors: SyncAnchor[], proposalAnchor: SyncAnchor): boo
   );
 }
 
-function isCutCandidateApplied(markers: EditorProject["cutMarkers"], candidate: CutCandidate): boolean {
+export function isAlignmentCutCandidateApplied(
+  markers: EditorProject["cutMarkers"],
+  candidate: CutCandidate
+): boolean {
   return markers.some(
     (marker) =>
       hasSameNonEmptyId(marker.id, candidate.id) ||

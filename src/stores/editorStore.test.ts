@@ -486,6 +486,87 @@ describe("editor store", () => {
     });
   });
 
+  it("应用对齐提案时跳过已经按时间落点的项目", () => {
+    resetStore({
+      ...createEmptyProject(),
+      syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
+      cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
+    });
+
+    useEditorStore.getState().applyAlignmentProposalData({
+      anchors: [
+        { id: "anchor-duplicate-time", sourceMs: 10_000, targetMs: 20_000, confidence: 0.8, origin: "automatic" },
+        { id: "anchor-new", sourceMs: 40_000, targetMs: 52_000, confidence: 0.8, origin: "automatic" }
+      ],
+      cutCandidates: [
+        {
+          id: "cut-duplicate-time",
+          name: "重复时间补偿",
+          sourceAtMs: 30_000,
+          targetGapMs: 12_000,
+          confidence: 0.8,
+          note: ""
+        },
+        {
+          id: "cut-new",
+          name: "新补偿",
+          sourceAtMs: 60_000,
+          targetGapMs: 15_000,
+          confidence: 0.8,
+          note: ""
+        }
+      ],
+      confidence: 0.8,
+      diagnostics: []
+    });
+
+    expect(useEditorStore.getState().project.syncAnchors.map((anchor) => anchor.id)).toEqual([
+      "anchor-existing",
+      "anchor-new"
+    ]);
+    expect(useEditorStore.getState().project.cutMarkers.map((marker) => marker.id)).toEqual([
+      "cut-existing",
+      "cut-new"
+    ]);
+    expect(useEditorStore.getState().history.past).toHaveLength(1);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "已应用对齐提案：新增 1 个锚点，1 个补偿点。",
+      tone: "success"
+    });
+  });
+
+  it("对齐提案全部已落点时不写入历史", () => {
+    resetStore({
+      ...createEmptyProject(),
+      syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
+      cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
+    });
+
+    useEditorStore.getState().applyAlignmentProposalData({
+      anchors: [{ id: "anchor-duplicate-time", sourceMs: 10_000, targetMs: 20_000, confidence: 0.8, origin: "automatic" }],
+      cutCandidates: [
+        {
+          id: "cut-duplicate-time",
+          name: "重复时间补偿",
+          sourceAtMs: 30_000,
+          targetGapMs: 12_000,
+          confidence: 0.8,
+          note: ""
+        }
+      ],
+      confidence: 0.8,
+      diagnostics: []
+    });
+
+    expect(useEditorStore.getState().project.syncAnchors.map((anchor) => anchor.id)).toEqual(["anchor-existing"]);
+    expect(useEditorStore.getState().project.cutMarkers.map((marker) => marker.id)).toEqual(["cut-existing"]);
+    expect(useEditorStore.getState().history.past).toHaveLength(0);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "对齐提案没有新的可应用项。",
+      tone: "neutral"
+    });
+  });
+
   it("更新和删除同步锚点", () => {
     resetStore({
       ...createEmptyProject(),

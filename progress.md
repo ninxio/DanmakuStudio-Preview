@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C93 已完成：应用对齐提案时只写入待应用项。
+  - 对齐预览层的“已应用”判断已导出为领域 helper，store 应用逻辑复用同一套规则，避免 UI 显示已应用但写入时仍重复创建锚点或补偿点。
+  - `applyAlignmentProposalData` 现在会跳过已按 ID 或按时间/补偿等价落点的同步锚点与候选补偿，只把真正待应用项写入项目。
+  - 当提案全部已落点时，不再创建空历史记录，只提示“对齐提案没有新的可应用项。”；成功应用时状态栏会显示新增锚点和补偿点数量。
+  - 已补充 store 测试，覆盖“部分已落点只新增待应用项”和“全部已落点不写历史”两个边界。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/preview.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx` 成功，3 个测试文件、48 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/190 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 13:53:58`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999881` 字节，时间 `2026/07/10 13:53:58`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c93-apply-only-pending-alignment-items-20260710`。
 - 成熟度提升阶段 C92 已完成：对齐复核报告记录应用阻断。
   - `createAlignmentReviewReport` 新增“应用阻断”章节；没有阻断时写入“暂无应用阻断”，存在结构异常、重复 ID 或当前项目 ID 冲突时逐条记录原因。
   - 资源面板导出“对齐复核报告”时会传入当前项目已有同步锚点和补偿点 ID，让报告能解释为什么“应用候选”按钮被禁用。
