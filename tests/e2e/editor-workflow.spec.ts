@@ -35,6 +35,15 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("准备就绪");
   await page.screenshot({ path: screenshotPath("empty-project.png"), fullPage: true });
 
+  await page.getByLabel("工作流总览").click();
+  const workflowOverview = page.getByTestId("workflow-overview-dialog");
+  await expect(workflowOverview).toContainText("入门引导 / 工作流总览");
+  await expect(workflowOverview).toContainText("建议下一步");
+  await expect(workflowOverview).toContainText("原始 XML 安全");
+  await expect(workflowOverview).toContainText("XML 导出验证");
+  await page.screenshot({ path: screenshotPath("workflow-overview.png"), fullPage: true });
+  await page.getByLabel("关闭工作流总览").click();
+
   await page.getByLabel("设置").click();
   await page.getByRole("button", { name: "隐私与本地数据" }).click();
   await expect(page.getByRole("dialog")).toContainText("隐私与本地数据");
@@ -75,6 +84,10 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByTestId("xml-input").setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
   await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
+  await page.getByLabel("工作流总览").click();
+  await expect(page.getByTestId("workflow-overview-dialog")).toContainText("1 个 XML / 0 个片段");
+  await expect(page.getByTestId("workflow-overview-dialog")).toContainText("按顺序排列");
+  await page.getByLabel("关闭工作流总览").click();
   await page.screenshot({ path: screenshotPath("imported-project.png"), fullPage: true });
 
   await page.getByRole("button", { name: "放入时间轴" }).click();

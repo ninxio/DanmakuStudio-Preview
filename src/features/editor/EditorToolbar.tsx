@@ -3,6 +3,7 @@ import {
   FilePlus,
   FileUp,
   FolderOpen,
+  Map as MapIcon,
   Pause,
   Play,
   Redo2,
@@ -34,6 +35,7 @@ import {
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import { useEditorStore } from "../../stores/editorStore";
 import { SettingsDialog } from "./SettingsDialog";
+import { WorkflowOverviewDialog } from "./WorkflowOverviewDialog";
 
 export function EditorToolbar() {
   const xmlInputRef = useRef<HTMLInputElement | null>(null);
@@ -41,6 +43,7 @@ export function EditorToolbar() {
   const projectInputRef = useRef<HTMLInputElement | null>(null);
   const alignmentInputRef = useRef<HTMLInputElement | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [workflowOpen, setWorkflowOpen] = useState(false);
   const project = useEditorStore((state) => state.project);
   const isPlaying = useEditorStore((state) => state.isPlaying);
   const newProject = useEditorStore((state) => state.newProject);
@@ -171,6 +174,12 @@ export function EditorToolbar() {
       >
         应用对齐
       </TextButton>
+      <IconButton
+        label="工作流总览"
+        icon={<MapIcon size={16} />}
+        active={workflowOpen}
+        onClick={() => setWorkflowOpen(true)}
+      />
       <IconButton label="设置" icon={<Settings size={16} />} onClick={() => setSettingsOpen(true)} />
       <input
         ref={xmlInputRef}
@@ -237,6 +246,15 @@ export function EditorToolbar() {
         }}
       />
       {settingsOpen ? <SettingsDialog onClose={() => setSettingsOpen(false)} /> : null}
+      {workflowOpen ? (
+        <WorkflowOverviewDialog
+          onClose={() => setWorkflowOpen(false)}
+          onImportVideo={() => videoInputRef.current?.click()}
+          onImportXml={() => xmlInputRef.current?.click()}
+          onSaveProject={saveProjectFile}
+          onExportXml={prepareExport}
+        />
+      ) : null}
     </header>
   );
 }

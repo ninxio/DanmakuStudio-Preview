@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuClip } from "../../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
@@ -33,6 +34,50 @@ describe("编辑器工具栏", () => {
     render(<EditorToolbar />);
 
     expect(screen.getByLabelText("请先添加时间轴片段再导出 XML")).toBeDisabled();
+  });
+
+  it("工作流总览会展示已有能力并随项目状态实时同步", async () => {
+    render(<EditorToolbar />);
+
+    fireEvent.click(screen.getByLabelText("工作流总览"));
+
+    expect(screen.getByTestId("workflow-overview-dialog")).toBeInTheDocument();
+    expect(screen.getByText("入门引导 / 工作流总览")).toBeInTheDocument();
+    expect(screen.getAllByText("原始 XML 安全").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("XML 导出验证").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "导入 XML" }).some((button) => !button.hasAttribute("disabled"))).toBe(
+      true
+    );
+
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u,r">测试</d></i>`,
+      { assetId: "asset-workflow-dialog", fileName: "workflow-dialog.xml" }
+    );
+    const clip: DanmakuClip = {
+      id: "clip-workflow-dialog",
+      assetId: asset.id,
+      name: asset.name,
+      timelineStartMs: 0,
+      sourceInMs: 0,
+      sourceOutMs: 1000,
+      localOffsetMs: 0,
+      enabled: true
+    };
+    act(() => {
+      useEditorStore.setState({
+        project: {
+          ...createEmptyProject(),
+          assets: [asset],
+          clips: [clip]
+        }
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText(/1 个 XML \/ 1 个片段/)).toBeInTheDocument());
+    expect(screen.getAllByText("1 个片段").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "导出 XML" }).some((button) => !button.hasAttribute("disabled"))).toBe(
+      true
+    );
   });
 
   it("时间轴存在启用弹幕后允许导出 XML", () => {
