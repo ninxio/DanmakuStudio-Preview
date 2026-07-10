@@ -1,5 +1,6 @@
-import type { DanmakuAsset, DanmakuClip } from "../danmaku/types";
+import type { DanmakuAsset, DanmakuClip, ResolvedDanmakuEvent } from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
+import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import type { EditorProject } from "./types";
 
 export type ProjectHealthStatus = "ready" | "attention" | "blocked";
@@ -28,6 +29,7 @@ export interface ProjectHealthMetrics {
   orphanedEditReferenceCount: number;
   missingAssetClipCount: number;
   duplicateIdCount: number;
+  negativeFinalTimeItemCount: number;
   mediaNeedsReconnect: boolean;
 }
 
@@ -86,6 +88,9 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   const lowConfidenceAnchorCount = project.syncAnchors.filter(
     (anchor) => anchor.confidence !== undefined && anchor.confidence < 0.75
   ).length;
+  const negativeFinalTimeEvents = resolveProjectDanmakuEvents(project).filter(
+    (event) => event.enabled && event.finalTimeMs < 0
+  );
   const duplicateAssetIdGroups = findDuplicateGroups(
     project.assets.map((asset, index) => ({
       value: asset.id,
@@ -182,6 +187,17 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       )} 条禁用或单条微调引用已不存在的弹幕，保存前建议清理。`
     });
   }
+  if (negativeFinalTimeEvents.length > 0) {
+    findings.push({
+      id: "negative-final-times",
+      severity: "warning",
+      title: "存在负最终时间",
+      detail: `${negativeFinalTimeEvents.length.toLocaleString(
+        "zh-CN"
+      )} 条启用弹幕最终时间早于 0ms，导出时会被限制为 0ms；建议复核全局偏移、片段偏移或单条微调。`,
+      evidence: formatNegativeFinalTimeEvidence(negativeFinalTimeEvents)
+    });
+  }
   if (project.media && project.media.objectUrl === null) {
     findings.push({
       id: "media-needs-reconnect",
@@ -251,6 +267,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       orphanedEditReferenceCount: orphanedDisabledIds.length + orphanedAdjustmentIds.length,
       missingAssetClipCount,
       duplicateIdCount,
+      negativeFinalTimeItemCount: negativeFinalTimeEvents.length,
       mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null)
     },
     findings
@@ -324,6 +341,7 @@ export function createProjectHealthReport(projectName: string, summary: ProjectH
     `失效编辑引用：${summary.metrics.orphanedEditReferenceCount.toLocaleString("zh-CN")} 条`,
     `缺失资源片段：${summary.metrics.missingAssetClipCount.toLocaleString("zh-CN")} 个`,
     `重复 ID：${summary.metrics.duplicateIdCount.toLocaleString("zh-CN")} 个`,
+    `负最终时间：${summary.metrics.negativeFinalTimeItemCount.toLocaleString("zh-CN")} 条`,
     `媒体重连：${summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"}`,
     "",
     "复核清单："
@@ -390,6 +408,22 @@ function formatDuplicateEvidence(groups: DuplicateIdGroup[]): string[] {
       group.labels.length > 3 ? `；另有 ${group.labels.length - 3} 处` : "";
     return `${group.value}：${group.labels.slice(0, 3).join("；")}${suffix}`;
   });
+}
+
+function formatNegativeFinalTimeEvidence(events: ResolvedDanmakuEvent[]): string[] {
+  return events.slice(0, 5).map((event) => {
+    const text = event.item.text.trim().length > 0 ? event.item.text.trim() : "空文本";
+    return `${event.asset.fileName} / ${event.clip.name} / 第 ${
+      event.item.originalIndex + 1
+    } 条：${formatSignedDuration(event.finalTimeMs)}，${formatLimitedText(text)}`;
+  });
+}
+
+function formatLimitedText(text: string): string {
+  if (text.length <= 24) {
+    return text;
+  }
+  return `${text.slice(0, 24)}...`;
 }
 
 function formatLimitedList(values: string[]): string {

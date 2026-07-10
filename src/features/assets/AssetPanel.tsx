@@ -1908,6 +1908,7 @@ function ProjectHealthPanel({
         <HealthMetric label="导入警告" value={summary.metrics.importWarningCount.toLocaleString("zh-CN")} />
         <HealthMetric label="单条微调" value={summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} />
         <HealthMetric label="重复 ID" value={summary.metrics.duplicateIdCount.toLocaleString("zh-CN")} />
+        <HealthMetric label="负最终时间" value={summary.metrics.negativeFinalTimeItemCount.toLocaleString("zh-CN")} />
         <HealthMetric label="媒体重连" value={summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"} />
       </dl>
       <ul className="mt-3 divide-y divide-panel-line border-t border-panel-line">

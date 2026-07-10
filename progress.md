@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C46 已完成：项目健康摘要提前提示负最终时间。
+  - `createProjectHealthSummary` 现在会解析当前启用弹幕事件，统计最终时间早于 0ms 的弹幕数量，并生成“存在负最终时间”复核项。
+  - 该复核项会列出资源文件、片段名、XML 原序号、负最终时间和文本预览，帮助用户在导出前复核全局偏移、片段偏移或单条微调。
+  - 项目健康指标、健康报告和资源栏“项目信息”面板新增“负最终时间”计数；导出摘要健康预检也会随项目状态显示该复核项。
+  - README 已同步：项目健康摘要现在覆盖负最终时间风险。
+  - 已补充领域层和资源面板测试，覆盖健康报告、指标和证据行。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx src/features/export/ExportDialog.test.tsx` 成功，3 个测试文件、31 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、147 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:47:08`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2994699` 字节，时间 `2026/07/10 9:47:08`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c46-health-negative-final-times-20260710`。
 - 成熟度提升阶段 C45 已完成：Playwright E2E 覆盖负时间限制明细。
   - 新增独立 E2E：导入 `normal.xml`，放入时间轴后通过设置中心把全局偏移设为 `-2000ms`，再打开导出摘要。
   - 测试断言导出摘要显示“负时间限制为 0”“2 项”“负时间限制明细”，并列出“第一条滚动弹幕”“顶部弹幕”及对应负最终时间。

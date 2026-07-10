@@ -55,7 +55,8 @@ describe("project health", () => {
       activeClipCount: 1,
       cutMarkerCount: 1,
       totalCutGapMs: 2500,
-      syncAnchorCount: 1
+      syncAnchorCount: 1,
+      negativeFinalTimeItemCount: 0
     });
     expect(summary.findings).toContainEqual(expect.objectContaining({ id: "ready" }));
   });
@@ -157,6 +158,42 @@ describe("project health", () => {
     );
   });
 
+  it("提示会在导出时被限制为 0ms 的负最终时间", () => {
+    const asset = createAsset("asset", [createItem("item-1")]);
+    const project = {
+      ...createEmptyProject(),
+      globalOffsetMs: -1500,
+      assets: [asset],
+      clips: [
+        {
+          id: "clip",
+          assetId: "asset",
+          name: "片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 3000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+
+    const summary = createProjectHealthSummary(project);
+    const report = createProjectHealthReport("负时间项目", summary);
+
+    expect(summary.status).toBe("attention");
+    expect(summary.metrics.negativeFinalTimeItemCount).toBe(1);
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "negative-final-times",
+        severity: "warning",
+        evidence: ["asset.xml / 片段 / 第 1 条：-00:00:00.500，测试"]
+      })
+    );
+    expect(report).toContain("负最终时间：1 条");
+    expect(report).toContain("[需复核] 存在负最终时间");
+  });
+
   it("可清理指向不存在弹幕的禁用和微调引用", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const project = {
@@ -230,6 +267,7 @@ describe("project health", () => {
     expect(report).toContain("失效编辑引用：1 条");
     expect(report).toContain("缺失资源片段：0 个");
     expect(report).toContain("重复 ID：0 个");
+    expect(report).toContain("负最终时间：0 条");
     expect(report).toContain("[需复核] 存在失效编辑引用");
   });
 });

@@ -97,6 +97,37 @@ describe("资源面板", () => {
     expect(screen.getByText(/资源 duplicate\.xml 的第 1 条弹幕；资源 duplicate\.xml 的第 2 条弹幕/)).toBeInTheDocument();
   });
 
+  it("项目健康摘要会展示负最终时间风险", async () => {
+    const user = userEvent.setup();
+    const project = useEditorStore.getState().project;
+    const assetId = project.assets[0].id;
+    useEditorStore.setState({
+      project: {
+        ...project,
+        globalOffsetMs: -1500,
+        clips: [
+          {
+            id: "clip-negative",
+            assetId,
+            name: "负时间片段",
+            timelineStartMs: 0,
+            sourceInMs: 0,
+            sourceOutMs: 3000,
+            localOffsetMs: 0,
+            enabled: true
+          }
+        ]
+      }
+    });
+    render(<AssetPanel />);
+
+    await user.click(screen.getByRole("button", { name: "项目信息" }));
+
+    expect(screen.getByText("负最终时间")).toBeInTheDocument();
+    expect(screen.getByText("存在负最终时间")).toBeInTheDocument();
+    expect(screen.getByText(/负时间片段.*-00:00:01\.500/)).toBeInTheDocument();
+  });
+
   it("可以从项目健康摘要导出健康报告", async () => {
     const user = userEvent.setup();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
