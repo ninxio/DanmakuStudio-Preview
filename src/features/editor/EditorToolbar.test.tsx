@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuClip } from "../../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
 import { createHistoryState } from "../../domain/history/history";
@@ -60,6 +60,54 @@ describe("编辑器工具栏", () => {
     render(<EditorToolbar />);
 
     expect(screen.getByLabelText("导出 XML")).toBeEnabled();
+  });
+
+  it("顶部导出对齐提案时使用项目名生成文件名", () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:toolbar-alignment-proposal");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+
+    try {
+      useEditorStore.setState({
+        project: {
+          ...createEmptyProject(),
+          name: "工具栏/对齐:项目"
+        },
+        alignmentProposal: {
+          anchors: [{ id: "toolbar-anchor", sourceMs: 10_000, targetMs: 20_000, origin: "automatic" }],
+          cutCandidates: [],
+          confidence: 0.8,
+          diagnostics: ["测试"]
+        }
+      });
+
+      render(<EditorToolbar />);
+      fireEvent.click(screen.getByRole("button", { name: "导出对齐" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("顶部对齐提案下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("工具栏_对齐_项目-alignment-proposal.json");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:toolbar-alignment-proposal");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
   });
 
   it("对齐提案存在应用阻断时禁用顶部应用入口", () => {

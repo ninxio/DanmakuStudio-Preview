@@ -39,6 +39,7 @@ import {
   type ProjectHealthStatus,
   type ProjectHealthSummary
 } from "../../domain/project/health";
+import { createProjectDownloadFileName } from "../../domain/project/fileNames";
 import type { EditorProject } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
@@ -1368,7 +1369,11 @@ function VideoAlignmentLabPanel({
       setStatus({ message: "暂无可导出的对齐提案。", tone: "warning" });
       return;
     }
-    downloadTextFile("alignment-proposal.json", downloadContent, "application/json;charset=utf-8");
+    downloadTextFile(
+      createProjectDownloadFileName(project.name, "-alignment-proposal.json"),
+      downloadContent,
+      "application/json;charset=utf-8"
+    );
     setStatus({ message: "已导出对齐提案 JSON。", tone: "success" });
   };
 
@@ -1378,7 +1383,7 @@ function VideoAlignmentLabPanel({
       return;
     }
     downloadTextFile(
-      "alignment-review-report.txt",
+      createProjectDownloadFileName(project.name, "-alignment-review-report.txt"),
       createAlignmentReviewReport(proposal),
       "text/plain;charset=utf-8"
     );

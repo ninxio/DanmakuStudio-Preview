@@ -539,6 +539,12 @@ describe("资源面板", () => {
     };
 
     try {
+      useEditorStore.setState({
+        project: {
+          ...useEditorStore.getState().project,
+          name: "对齐/提案:项目"
+        }
+      });
       render(<AssetPanel />);
       fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
         target: { value: JSON.stringify(proposal) }
@@ -552,6 +558,11 @@ describe("资源面板", () => {
         throw new Error("导出的对象不是 Blob。");
       }
       await expect(readBlobText(blob)).resolves.toContain("audio-gap-1");
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("对齐提案下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("对齐_提案_项目-alignment-proposal.json");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:alignment-proposal");
     } finally {
@@ -597,6 +608,12 @@ describe("资源面板", () => {
     };
 
     try {
+      useEditorStore.setState({
+        project: {
+          ...useEditorStore.getState().project,
+          name: "对齐/报告:项目"
+        }
+      });
       render(<AssetPanel />);
       fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
         target: { value: JSON.stringify(proposal) }
@@ -613,6 +630,11 @@ describe("资源面板", () => {
       await expect(readBlobText(blob)).resolves.toContain("audio-gap-1");
       await expect(readBlobText(blob)).resolves.toContain("不确定区间：00:00:18.000");
       await expect(readBlobText(blob)).resolves.toContain("音频特征匹配 4 / 4 帧。");
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("对齐复核报告下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("对齐_报告_项目-alignment-review-report.txt");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:alignment-report");
     } finally {

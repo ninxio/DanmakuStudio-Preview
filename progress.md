@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C68 已完成：对齐提案与复核报告按项目名导出。
+  - 新增项目下载文件名 helper，统一用修剪后的项目名加后缀生成下载文件名，空项目名回退到 `danmaku-project`；非法路径字符仍由下载基础设施统一清理。
+  - 资源面板“导出提案”和顶部工具栏“导出对齐”现在下载为 `项目名-alignment-proposal.json`，资源面板“导出报告”下载为 `项目名-alignment-review-report.txt`，避免多个项目的对齐产物都落成固定文件名。
+  - 保存项目入口也复用同一 helper，保持 `.danmaku-project.json` 命名回退逻辑一致；README 已同步对齐提案和复核报告会按项目名导出。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/fileNames.test.ts src/features/assets/AssetPanel.test.tsx src/features/editor/EditorToolbar.test.tsx src/infrastructure/file-system/browserFiles.test.ts` 成功，4 个测试文件、30 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/159 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:45:14`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997496` 字节，时间 `2026/07/10 11:45:13`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c68-project-named-alignment-downloads-20260710`。
 - 成熟度提升阶段 C67 已完成：对齐提案应用阻断显示具体 ID。
   - `createAlignmentApplyBlockers` 现在会在提案内重复 ID、当前项目已有 ID 冲突的阻断文案中列出具体 ID；数量过多时保留前 5 个并提示剩余数量。
   - 顶部工具栏“应用对齐”现在和“视频对齐实验室”的“应用候选”一样传入当前项目已有同步锚点/补偿点 ID，两个入口会对同一类冲突保持一致禁用。

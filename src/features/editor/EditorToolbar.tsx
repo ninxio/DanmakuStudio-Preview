@@ -17,6 +17,7 @@ import { useRef, useState } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
 import { createAlignmentApplyBlockers } from "../../domain/alignment/alignmentReport";
+import { createProjectDownloadFileName } from "../../domain/project/fileNames";
 import { serializeProject } from "../../domain/project/schema";
 import { formatTimecode } from "../../domain/shared/time";
 import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
@@ -70,7 +71,7 @@ export function EditorToolbar() {
         icon={<Save size={16} />}
         onClick={() =>
           downloadTextFile(
-            `${project.name}.danmaku-project.json`,
+            createProjectDownloadFileName(project.name, ".danmaku-project.json"),
             serializeProject(project),
             "application/json;charset=utf-8"
           )
@@ -129,7 +130,13 @@ export function EditorToolbar() {
       </TextButton>
       <TextButton
         title="导出对齐提案 JSON"
-        onClick={() => downloadTextFile("alignment-proposal.json", exportAlignmentProposal(), "application/json")}
+        onClick={() =>
+          downloadTextFile(
+            createProjectDownloadFileName(project.name, "-alignment-proposal.json"),
+            exportAlignmentProposal(),
+            "application/json"
+          )
+        }
         className="hidden xl:inline-flex"
       >
         导出对齐
