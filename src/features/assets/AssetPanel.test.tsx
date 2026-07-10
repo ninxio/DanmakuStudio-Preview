@@ -796,6 +796,89 @@ describe("资源面板", () => {
     });
   });
 
+  it("视频对齐实验室会使用已绑定本地目标原片路径", async () => {
+    const user = userEvent.setup();
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        mediaBinding: {
+          id: "binding-local-path",
+          kind: "localFile",
+          displayName: "本地完整版",
+          fileName: "full.mkv",
+          mediaId: null,
+          localPath: "D:\\media\\full.mkv",
+          runtimeMs: 3_000_000,
+          linkedAt: "2026-07-10T00:00:00.000Z"
+        }
+      }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+
+    await waitFor(() => expect(screen.getByLabelText("完整版路径")).toHaveValue("D:\\media\\full.mkv"));
+    expect(screen.getByText("已使用目标原片绑定中的本地路径作为完整版输入。")).toBeInTheDocument();
+  });
+
+  it("可以逐个预览、修正、接受或跳过音频候选版本差异", async () => {
+    const user = userEvent.setup();
+    const proposal = {
+      anchors: [],
+      cutCandidates: [
+        {
+          id: "audio-gap-1",
+          name: "音频推断差异 1",
+          sourceAtMs: 20_000,
+          sourceRangeStartMs: 18_000,
+          sourceRangeEndMs: 22_000,
+          targetGapMs: 20_000,
+          confidence: 0.72,
+          note: "音频对齐候选"
+        },
+        {
+          id: "audio-gap-2",
+          name: "音频推断差异 2",
+          sourceAtMs: 40_000,
+          sourceRangeStartMs: 39_000,
+          sourceRangeEndMs: 41_000,
+          targetGapMs: 10_000,
+          confidence: 0.86,
+          note: "第二个候选"
+        }
+      ],
+      confidence: 0.8,
+      diagnostics: ["音频特征匹配 8 / 8 帧。"]
+    };
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+    fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
+      target: { value: JSON.stringify(proposal) }
+    });
+    await user.click(screen.getByRole("button", { name: "导入提案" }));
+
+    expect(screen.getByText("候选版本差异复核")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "预览候选 1" }));
+    expect(useEditorStore.getState().project.timeline.playheadMs).toBe(20_000);
+    fireEvent.change(screen.getByLabelText("候选时间 音频推断差异 1"), {
+      target: { value: "21000" }
+    });
+    fireEvent.change(screen.getByLabelText("差异时长 音频推断差异 1"), {
+      target: { value: "25000" }
+    });
+    await user.click(screen.getAllByRole("button", { name: "接受" })[0]);
+
+    await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));
+    expect(useEditorStore.getState().project.cutMarkers[0]).toMatchObject({
+      sourceAtMs: 21_000,
+      targetGapMs: 25_000
+    });
+    expect(useEditorStore.getState().project.cutMarkers[0].note).toContain("人工复核接受");
+
+    await user.click(screen.getByRole("button", { name: "跳过" }));
+    expect(screen.getByText("候选版本差异已全部处理：已处理 2 条。")).toBeInTheDocument();
+  });
+
   it("导入音频对齐提案文件读取失败时显示入口上下文", async () => {
     const user = userEvent.setup();
     const file = createRejectingTextFile("bad-alignment.json", "读取被拒绝");

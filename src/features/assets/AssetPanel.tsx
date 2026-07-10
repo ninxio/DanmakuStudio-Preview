@@ -29,7 +29,7 @@ import {
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
 import { serializeAlignmentProposal } from "../../domain/alignment/manualProvider";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
-import type { AlignmentProposal } from "../../domain/alignment/types";
+import type { AlignmentProposal, CutCandidate } from "../../domain/alignment/types";
 import { buildBatchMergePlan, type BatchMergeOptions } from "../../domain/danmaku/batchMerge";
 import {
   createCutHintSearchPlan,
@@ -521,6 +521,9 @@ export function AssetPanel() {
                         onTextChange={setAlignmentProposalText}
                         onImportText={importAlignmentProposalText}
                         onApply={applyAlignmentProposal}
+                        onApplyCutCandidate={(candidate) =>
+                          applyAlignmentProposalData(createSingleCutCandidateProposal(candidate))
+                        }
                         onClear={() => {
                           if (alignmentProposal) {
                             clearAlignmentProposal();
@@ -1580,6 +1583,7 @@ function VideoAlignmentLabPanel({
   onTextChange,
   onImportText,
   onApply,
+  onApplyCutCandidate,
   onClear,
   onFocusQueueItem
 }: {
@@ -1590,6 +1594,7 @@ function VideoAlignmentLabPanel({
   onTextChange: (value: string) => void;
   onImportText: (value: string, sourceFileName?: string) => void;
   onApply: () => void;
+  onApplyCutCandidate: (candidate: CutCandidate) => void;
   onClear: () => void;
   onFocusQueueItem: (sourceAtMs: number, name: string) => void;
 }) {
@@ -1605,7 +1610,10 @@ function VideoAlignmentLabPanel({
   const [cancelling, setCancelling] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobSnapshot, setJobSnapshot] = useState<AudioAlignmentJobSnapshot | null>(null);
+  const [skippedCutCandidateIds, setSkippedCutCandidateIds] = useState<string[]>([]);
+  const [cutCandidateDrafts, setCutCandidateDrafts] = useState<Record<string, CutCandidateDraft>>({});
   const runTokenRef = useRef(0);
+  const proposalCandidateKeyRef = useRef("");
   const previewCuts = preview.proposalCuts.slice(0, 3);
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
@@ -1623,6 +1631,13 @@ function VideoAlignmentLabPanel({
   const hiddenReviewQueueCount = reviewQueue.length - visibleReviewQueue.length;
   const visibleReviewItemStatuses = reviewItemStatuses.slice(0, 5);
   const hiddenReviewItemStatusCount = reviewItemStatuses.length - visibleReviewItemStatuses.length;
+  const targetLocalPath =
+    project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath?.trim() ?? "" : "";
+  const embyTargetNeedsLocalAudioInput = project.mediaBinding?.kind === "embyItem";
+  const reviewableCutCandidates = proposal
+    ? proposal.cutCandidates.filter((candidate) => !skippedCutCandidateIds.includes(candidate.id))
+    : [];
+  const handledCutCandidateCount = proposal ? proposal.cutCandidates.length - reviewableCutCandidates.length : 0;
 
   useEffect(() => {
     let mounted = true;
@@ -1652,6 +1667,22 @@ function VideoAlignmentLabPanel({
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (completePath.trim().length === 0 && targetLocalPath.length > 0) {
+      setCompletePath(targetLocalPath);
+    }
+  }, [completePath, targetLocalPath]);
+
+  useEffect(() => {
+    const nextKey = proposal ? proposal.cutCandidates.map((candidate) => candidate.id).join("|") : "";
+    if (proposalCandidateKeyRef.current === nextKey) {
+      return;
+    }
+    proposalCandidateKeyRef.current = nextKey;
+    setSkippedCutCandidateIds([]);
+    setCutCandidateDrafts({});
+  }, [proposal]);
 
   const runDesktopAlignment = async () => {
     const parsedWindowMs = parsePositiveIntegerInput(windowMs, "窗口");
@@ -1810,6 +1841,45 @@ function VideoAlignmentLabPanel({
     }
   };
 
+  const updateCutCandidateDraft = (candidate: CutCandidate, patch: Partial<CutCandidateDraft>) => {
+    setCutCandidateDrafts((current) => {
+      const previous = current[candidate.id] ?? createCutCandidateDraft(candidate);
+      return {
+        ...current,
+        [candidate.id]: { ...previous, ...patch }
+      };
+    });
+  };
+
+  const previewCutCandidate = (candidate: CutCandidate) => {
+    const draft = cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
+    const parsedSource = parseNonNegativeIntegerInput(draft.sourceAtMs, "候选时间");
+    const sourceAtMs = parsedSource.error ? candidate.sourceAtMs : parsedSource.value;
+    onFocusQueueItem(sourceAtMs, candidate.name);
+  };
+
+  const acceptCutCandidate = (candidate: CutCandidate) => {
+    const draft = cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
+    const parsedSource = parseNonNegativeIntegerInput(draft.sourceAtMs, "候选时间");
+    const parsedGap = parseSignedNonZeroIntegerInput(draft.targetGapMs, "差异时长");
+    if (parsedSource.error || parsedGap.error) {
+      setStatus({ message: parsedSource.error ?? parsedGap.error ?? "候选修正无效。", tone: "warning" });
+      return;
+    }
+    onApplyCutCandidate({
+      ...candidate,
+      sourceAtMs: parsedSource.value,
+      targetGapMs: parsedGap.value,
+      note: appendManualReviewNote(candidate.note, parsedSource.value, parsedGap.value)
+    });
+    setSkippedCutCandidateIds((current) => [...new Set([...current, candidate.id])]);
+  };
+
+  const skipCutCandidate = (candidate: CutCandidate) => {
+    setSkippedCutCandidateIds((current) => [...new Set([...current, candidate.id])]);
+    setStatus({ message: `已跳过候选版本差异：${candidate.name}。`, tone: "neutral" });
+  };
+
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
@@ -1846,6 +1916,15 @@ function VideoAlignmentLabPanel({
             </TextButton>
           </div>
         </label>
+        {targetLocalPath ? (
+          <div className="rounded border border-accent-cyan/20 bg-accent-cyan/10 p-2 text-[11px] leading-5 text-slate-300">
+            已使用目标原片绑定中的本地路径作为完整版输入。
+          </div>
+        ) : embyTargetNeedsLocalAudioInput ? (
+          <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
+            已绑定 Emby 目标原片；当前音频对齐仍需要你选择可读取的本地文件路径。后续验证授权流媒体后再直接读取 Emby 播放源。
+          </div>
+        ) : null}
         <label className="grid gap-1">
           <span className="text-slate-500">当前视频路径</span>
           <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
@@ -2062,6 +2141,76 @@ function VideoAlignmentLabPanel({
                 </ul>
               </div>
             ) : null}
+            {reviewableCutCandidates.length > 0 ? (
+              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="font-medium text-slate-200">候选版本差异复核</span>
+                  {handledCutCandidateCount > 0 ? (
+                    <span className="text-slate-500">已处理 {handledCutCandidateCount} 条</span>
+                  ) : null}
+                </div>
+                <div className="grid gap-2">
+                  {reviewableCutCandidates.map((candidate, index) => {
+                    const draft = cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
+                    return (
+                      <div key={candidate.id} className="grid gap-2 rounded border border-panel-line/70 bg-[#111318] p-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="truncate text-slate-100">{candidate.name}</div>
+                            <div className="mt-0.5 text-slate-500">
+                              {formatTimecode(candidate.sourceAtMs)} / {formatSignedDuration(candidate.targetGapMs)} / 置信度{" "}
+                              {formatPercent(candidate.confidence)}
+                              {formatCandidateSourceRange(candidate)}
+                            </div>
+                          </div>
+                          <TextButton
+                            aria-label={`预览候选 ${index + 1}`}
+                            title="定位到候选点，用当前预览后端试听或查看"
+                            onClick={() => previewCutCandidate(candidate)}
+                            className="px-2"
+                          >
+                            <Crosshair size={13} />
+                            预览
+                          </TextButton>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="grid gap-1">
+                            <span className="text-slate-500">候选时间 ms</span>
+                            <input
+                              aria-label={`候选时间 ${candidate.name}`}
+                              className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+                              inputMode="numeric"
+                              value={draft.sourceAtMs}
+                              onChange={(event) => updateCutCandidateDraft(candidate, { sourceAtMs: event.target.value })}
+                            />
+                          </label>
+                          <label className="grid gap-1">
+                            <span className="text-slate-500">差异时长 ms</span>
+                            <input
+                              aria-label={`差异时长 ${candidate.name}`}
+                              className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+                              inputMode="numeric"
+                              value={draft.targetGapMs}
+                              onChange={(event) => updateCutCandidateDraft(candidate, { targetGapMs: event.target.value })}
+                            />
+                          </label>
+                        </div>
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <TextButton onClick={() => skipCutCandidate(candidate)}>跳过</TextButton>
+                          <TextButton tone="primary" onClick={() => acceptCutCandidate(candidate)}>
+                            接受
+                          </TextButton>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : handledCutCandidateCount > 0 ? (
+              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-500">
+                候选版本差异已全部处理：已处理 {handledCutCandidateCount} 条。
+              </div>
+            ) : null}
             {reviewQueue.length > 0 ? (
               <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
                 <div className="mb-1 font-medium text-slate-200">复核队列</div>
@@ -2163,6 +2312,27 @@ interface ParsedNumericInput {
   error: string | null;
 }
 
+interface CutCandidateDraft {
+  sourceAtMs: string;
+  targetGapMs: string;
+}
+
+function createSingleCutCandidateProposal(candidate: CutCandidate): AlignmentProposal {
+  return {
+    anchors: [],
+    cutCandidates: [candidate],
+    confidence: candidate.confidence,
+    diagnostics: [`已从候选复核接受：${candidate.name}。`]
+  };
+}
+
+function createCutCandidateDraft(candidate: CutCandidate): CutCandidateDraft {
+  return {
+    sourceAtMs: String(Math.round(candidate.sourceAtMs)),
+    targetGapMs: String(Math.round(candidate.targetGapMs))
+  };
+}
+
 function parsePositiveIntegerInput(value: string, label: string): ParsedNumericInput {
   const trimmed = value.trim();
   const parsed = Number(trimmed);
@@ -2181,7 +2351,19 @@ function parseNonNegativeIntegerInput(value: string, label: string): ParsedNumer
   if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed < 0) {
     return {
       value: 0,
-      error: `${label}必须是 0 或正整数。`
+      error: `${label}必须是大于或等于 0 的整数毫秒。`
+    };
+  }
+  return { value: parsed, error: null };
+}
+
+function parseSignedNonZeroIntegerInput(value: string, label: string): ParsedNumericInput {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+  if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed === 0) {
+    return {
+      value: 0,
+      error: `${label}必须是非 0 的整数毫秒。`
     };
   }
   return { value: parsed, error: null };
@@ -2208,6 +2390,11 @@ function getAlignmentProposalDownloadText(text: string, proposal: AlignmentPropo
     return `${JSON.stringify(proposal, null, 2)}\n`;
   }
   return "";
+}
+
+function appendManualReviewNote(note: string, sourceAtMs: number, targetGapMs: number): string {
+  const reviewNote = `人工复核接受：候选时间 ${formatTimecode(sourceAtMs)}，差异 ${formatSignedDuration(targetGapMs)}。`;
+  return note.trim().length > 0 ? `${note}\n${reviewNote}` : reviewNote;
 }
 
 function waitForAudioAlignmentPoll(): Promise<void> {
@@ -2595,6 +2782,10 @@ function anchorOriginText(origin: SyncAnchor["origin"]): string {
 function formatSignedDuration(milliseconds: number): string {
   const sign = milliseconds < 0 ? "-" : "+";
   return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 1000) / 10}%`;
 }
 
 function formatCandidateSourceRange(candidate: {
