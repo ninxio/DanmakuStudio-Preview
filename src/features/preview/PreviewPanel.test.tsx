@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHistoryState } from "../../domain/history/history";
@@ -34,6 +34,10 @@ describe("预览面板", () => {
     render(<PreviewPanel />);
     expect(screen.getByText("尚未导入视频")).toBeInTheDocument();
     expect(screen.getByTestId("preview-panel")).toBeInTheDocument();
+    const session = screen.getByLabelText("播放器会话状态");
+    expect(within(session).getByText("播放源")).toBeInTheDocument();
+    expect(within(session).getByText("尚未连接")).toBeInTheDocument();
+    expect(within(session).getByText("导入本地视频或绑定目标原片。")).toBeInTheDocument();
   });
 
   it("本地目标原片缺少当前会话视频时提示重新连接", () => {
@@ -57,6 +61,49 @@ describe("预览面板", () => {
 
     expect(screen.getByText("需要重新连接视频")).toBeInTheDocument();
     expect(screen.getByText("项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份本地视频。")).toBeInTheDocument();
+  });
+
+  it("Emby 目标原片会进入播放器会话状态", () => {
+    useEditorStore.setState((state) => ({
+      project: {
+        ...state.project,
+        mediaBinding: {
+          id: "binding-emby",
+          kind: "embyItem",
+          displayName: "Demo / S01E01",
+          itemId: "episode-1",
+          itemName: "Episode 1",
+          itemType: "Episode",
+          seriesName: "Demo",
+          seasonNumber: 1,
+          episodeNumber: 1,
+          runtimeMs: 3_000_000,
+          linkedAt: "2026-07-10T00:00:00.000Z",
+          server: { serverUrl: "https://emby.example.test", pathPrefix: "/emby", username: "tester" },
+          mediaSources: [
+            {
+              id: "source-1",
+              name: "1080p",
+              container: "mkv",
+              videoCodec: "h264",
+              audioCodec: "aac",
+              width: 1920,
+              height: 1080,
+              bitrate: 8_000_000,
+              sizeBytes: 1_000_000_000,
+              runtimeMs: 3_000_000
+            }
+          ]
+        }
+      }
+    }));
+
+    render(<PreviewPanel />);
+
+    const session = screen.getByLabelText("播放器会话状态");
+    expect(within(session).getByText("Emby 目标原片")).toBeInTheDocument();
+    expect(within(session).getByText("Emby 元数据：aac")).toBeInTheDocument();
+    expect(within(session).getByText(/音频对齐可使用 Emby 授权输入/)).toBeInTheDocument();
   });
 
   it("可以切换弹幕显示状态", async () => {
@@ -125,7 +172,7 @@ describe("预览面板", () => {
     await waitFor(() =>
       expect(useEditorStore.getState().project.media?.durationMs).toBe(12_345)
     );
-    expect(screen.getByText("demo.mp4")).toBeInTheDocument();
+    expect(screen.getAllByText("demo.mp4").length).toBeGreaterThan(0);
     expect(screen.getByText("HTML Video 已就绪 / 00:00:12.345")).toBeInTheDocument();
   });
 
@@ -151,6 +198,8 @@ describe("预览面板", () => {
     fireEvent.error(video);
 
     await screen.findAllByText("格式不支持");
-    expect(screen.getByText("HTML Video 无法播放此视频。请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("HTML Video 无法播放此视频。请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。").length
+    ).toBeGreaterThan(0);
   });
 });

@@ -8,6 +8,12 @@ import {
   ROLLING_DANMAKU_DURATION_MS,
   STATIC_DANMAKU_DURATION_MS
 } from "../../domain/preview/visibleEvents";
+import {
+  createPlayerSessionSummary,
+  type PlayerLoadState,
+  type PlayerPreviewBackend,
+  type PlayerSessionSummary
+} from "../../domain/player/playerSession";
 import { formatTimecode } from "../../domain/shared/time";
 import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import {
@@ -18,8 +24,8 @@ import {
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
 import { useEditorStore } from "../../stores/editorStore";
 
-type VideoLoadState = "empty" | "loading" | "ready" | "unsupported";
-type PreviewBackend = "htmlVideo" | "nativeMpv";
+type VideoLoadState = PlayerLoadState;
+type PreviewBackend = PlayerPreviewBackend;
 
 export function PreviewPanel() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -63,6 +69,19 @@ export function PreviewPanel() {
         ? project.media.id !== project.mediaBinding.mediaId
         : project.media.fileName !== project.mediaBinding.fileName));
   const mediaReferenceNeedsReconnect = Boolean(project.media && !project.media.objectUrl);
+  const playerSession = useMemo(
+    () =>
+      createPlayerSessionSummary({
+        project,
+        isPlaying,
+        backend: previewBackend,
+        loadState: videoLoadState,
+        hasPreviewSource: Boolean(previewSource),
+        videoError,
+        mpvConfigured: mpvPath.trim().length > 0
+      }),
+    [project, isPlaying, previewBackend, videoLoadState, previewSource, videoError, mpvPath]
+  );
 
   const events = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
   const visibleEvents = useMemo(
@@ -258,6 +277,7 @@ export function PreviewPanel() {
           />
         ) : null}
       </div>
+      <PlayerSessionStrip summary={playerSession} />
       <div className="flex h-12 shrink-0 items-center gap-3 border-t border-panel-line bg-panel-base px-3">
         <IconButton
           label={isPlaying ? "暂停预览" : "播放预览"}
@@ -275,11 +295,12 @@ export function PreviewPanel() {
           {formatPreviewBackend(previewBackend)}
         </div>
         <TextButton
+          className="shrink-0 whitespace-nowrap"
           onClick={() => updatePreview({ danmakuVisible: !project.preview.danmakuVisible })}
         >
           {project.preview.danmakuVisible ? "隐藏弹幕" : "显示弹幕"}
         </TextButton>
-        <TextButton onClick={addCutMarkerAtPlayhead}>
+        <TextButton className="shrink-0 whitespace-nowrap" onClick={addCutMarkerAtPlayhead}>
           <Flag size={14} />
           添加播放点差异
         </TextButton>
@@ -297,6 +318,36 @@ export function PreviewPanel() {
         </label>
       </div>
     </div>
+  );
+}
+
+function PlayerSessionStrip({ summary }: { summary: PlayerSessionSummary }) {
+  const items = [
+    { label: "播放源", value: summary.sourceLabel, detail: summary.sourceDetail },
+    { label: "后端", value: summary.backendLabel, detail: summary.backendDetail },
+    { label: "播放", value: summary.playbackLabel, detail: summary.issueLabel ?? summary.nextActionLabel },
+    { label: "音轨", value: summary.audioTrackLabel, detail: summary.subtitleTrackLabel },
+    { label: "弹幕", value: summary.danmakuTrackLabel, detail: summary.cacheLabel }
+  ];
+  return (
+    <section
+      aria-label="播放器会话状态"
+      className="shrink-0 border-t border-panel-line bg-[#101318] px-3 py-2 text-[11px] text-slate-400"
+    >
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+        {items.map((item) => (
+          <div key={item.label} className="min-w-0">
+            <div className="flex items-center gap-1">
+              <span className="shrink-0 text-slate-500">{item.label}</span>
+              <span className="min-w-0 truncate text-slate-200">{item.value}</span>
+            </div>
+            <div className="mt-0.5 truncate text-slate-500" title={item.detail}>
+              {item.detail}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

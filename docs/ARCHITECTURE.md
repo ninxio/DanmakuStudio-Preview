@@ -72,6 +72,8 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 - `HtmlVideoMediaAdapter`：支持浏览器可播放的 MP4/WebM，作为轻量预览 fallback。预览区根据项目媒体引用和加载结果展示未导入、正在载入、可播放、格式不支持、需要重新连接等状态；加载失败会明确提示 HTML Video 限制和后续 mpv 方向。
 - `TauriMpvMediaAdapter`：桌面端 mpv 后端，需要用户在设置中心配置 mpv 路径，并在目标原片中选择真实本地媒体路径。前端通过 `src/infrastructure/media/tauriMpvPlayer.ts` 调用 Tauri 命令；后端 `src-tauri/src/media_tools.rs` 负责检测 FFmpeg/mpv 版本、启动/停止 mpv sidecar、查询状态和通过 mpv IPC 发送播放、暂停、seek、倍率和属性读取命令。没有 mpv 路径或只有浏览器 blob URL 时不会启用该后端。
 
+`src/domain/player/playerSession.ts` 是播放器化阶段的第一层领域模型，不依赖 React。它把当前项目、预览后端、加载状态、播放状态、错误、mpv 配置和目标原片绑定整理成统一的播放器会话摘要：播放源、后端、播放状态、音轨、字幕轨、弹幕轨、缓存和下一步。预览面板只展示这份摘要，不在组件里重新解释播放器能力；后续接入双源对比、真实轨道探测和播放器缓存时应优先扩展该领域模型。
+
 预留：
 
 - mpv 画面嵌入、Emby 授权流媒体播放、截图/缩略图采样和更完整的硬解/字幕状态诊断仍属于后续播放器化阶段。

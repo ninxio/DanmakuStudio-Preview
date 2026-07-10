@@ -1,5 +1,19 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C118 已完成：推进 G7 逐步播放器化第一段，新增播放器会话模型和预览状态栏。
+  - 新增 `src/domain/player/playerSession.ts`，作为不依赖 React 的播放器会话领域模型，把当前项目、播放源、预览后端、加载状态、播放状态、错误、mpv 配置和目标原片绑定整理成统一摘要。
+  - 预览面板新增“播放器会话状态”栏，统一展示播放源、后端、播放状态、音轨、字幕轨、弹幕轨、缓存和下一步操作，让用户知道当前为什么能播、为什么不能播，以及下一步该接入本地路径、Emby 授权输入还是等待播放器能力。
+  - Emby 目标原片状态会如实说明“音频对齐可使用 Emby 授权输入”，同时明确预览播放器仍需本地路径或后续流接入；字幕轨、真实轨道探测和播放器缓存不会被伪装成已可用。
+  - 预览底栏的弹幕显示和播放点差异按钮已固定为单行展示，避免新增状态栏后在常用桌面宽度下出现按钮文案断字。
+  - README 和架构文档已同步播放器会话状态栏、领域模型边界，以及后续真实音轨/字幕轨探测、双源对比、播放器缓存和剧集批量工作台路线。
+  - 已补充 `playerSession` 领域测试和预览面板测试，覆盖空项目、Emby 目标原片、本地视频就绪，以及状态栏用户可见文案。
+  - 已重新验证：`corepack pnpm lint` 通过；`corepack pnpm test` 通过（42 个测试文件 / 247 个测试）；`corepack pnpm build` 通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、42 个测试文件 / 247 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12368896` 字节，时间 `2026/07/10 23:09:19`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3052924` 字节，时间 `2026/07/10 23:09:19`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c118-player-session-status-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C117 已完成：完成 G6 音频对齐实用化的 Emby 本次会话授权输入。
   - Emby 客户端新增 `createEmbyAuthorizedStreamUrl`，可基于已登录会话、条目 ID 和媒体源 ID 生成本次运行使用的 `/Videos/{itemId}/stream` 授权播放地址。
   - 视频对齐实验室在绑定 Emby 目标原片后新增真实“使用 Emby 授权输入”动作：用户点击后会用当前会话密码重新登录、读取条目确认可访问，再把临时输入交给 FFmpeg；可见“完整版路径”输入框不会显示 token。
