@@ -25,6 +25,15 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C70 已完成：导出摘要下载入口复用项目文件名 helper。
+  - 导出摘要弹窗的健康报告、导出报告和 XML 下载现在统一通过 `createProjectDownloadFileName` 生成文件名，保留 `danmaku-export` 作为空项目名回退。
+  - 已补充导出摘要测试，覆盖导出报告和 XML 下载文件名会按项目名生成并经下载基础设施清理。
+  - 已重新验证：`corepack pnpm test -- src/features/export/ExportDialog.test.tsx` 成功，1 个测试文件、5 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/162 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:55:19`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998555` 字节，时间 `2026/07/10 11:55:19`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c70-export-dialog-file-name-helper-20260710`。
 - 成熟度提升阶段 C69 已完成：多分集导出 ZIP 按项目名命名。
   - `downloadTextFiles` 新增可选压缩包名参数，多文件下载会返回并使用清理后的实际 ZIP 文件名，状态提示和浏览器下载名保持一致。
   - 资源面板“导出分集”现在把多分集 XML 打包为 `项目名-danmaku-exports.zip`，不再固定使用 `danmaku-exports.zip`；项目名中的非法路径字符仍由统一下载基础设施清理。

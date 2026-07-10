@@ -14,6 +14,7 @@ import {
   type ProjectHealthStatus,
   type ProjectHealthSummary
 } from "../../domain/project/health";
+import { createProjectDownloadFileName } from "../../domain/project/fileNames";
 import { formatTimecode } from "../../domain/shared/time";
 import { downloadTextFile } from "../../infrastructure/file-system/browserFiles";
 import { useEditorStore } from "../../stores/editorStore";
@@ -34,7 +35,6 @@ export function ExportDialog() {
   const previewNegativeClamps = summary.negativeClampDetails.slice(0, 3);
   const hiddenNegativeClampCount = Math.max(0, summary.negativeClampDetails.length - previewNegativeClamps.length);
   const hasExportReviewReport = summary.compensationDetails.length > 0 || summary.negativeClampDetails.length > 0;
-  const exportFileBaseName = project.name.trim() || "danmaku-export";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65" role="dialog" aria-modal="true">
       <div className="flex max-h-[86vh] w-[560px] flex-col rounded border border-panel-line bg-panel-raised shadow-2xl" data-testid="export-dialog">
@@ -93,7 +93,7 @@ export function ExportDialog() {
           <TextButton
             onClick={() =>
               downloadTextFile(
-                `${exportFileBaseName}-health-report.txt`,
+                createProjectDownloadFileName(project.name, "-health-report.txt", "danmaku-export"),
                 createProjectHealthReport(project.name, healthSummary),
                 "text/plain;charset=utf-8"
               )
@@ -106,7 +106,7 @@ export function ExportDialog() {
             <TextButton
               onClick={() =>
                 downloadTextFile(
-                  `${exportFileBaseName}-export-report.txt`,
+                  createProjectDownloadFileName(project.name, "-export-report.txt", "danmaku-export"),
                   createCompensationReport(project.name, summary),
                   "text/plain;charset=utf-8"
                 )
@@ -121,7 +121,11 @@ export function ExportDialog() {
             tone="primary"
             disabled={!validation.ok}
             onClick={() => {
-              downloadTextFile(`${exportFileBaseName}.xml`, exportDraft.xml, "application/xml;charset=utf-8");
+              downloadTextFile(
+                createProjectDownloadFileName(project.name, ".xml", "danmaku-export"),
+                exportDraft.xml,
+                "application/xml;charset=utf-8"
+              );
               clearExport();
             }}
           >

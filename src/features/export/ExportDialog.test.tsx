@@ -140,7 +140,7 @@ describe("导出摘要", () => {
     useEditorStore.setState({
       project: {
         ...useEditorStore.getState().project,
-        name: "导出项目",
+        name: "导出/报告:项目",
         cutMarkers: [
           {
             id: "cut-report",
@@ -169,7 +169,55 @@ describe("导出摘要", () => {
       await expect(readBlobText(blob)).resolves.toContain("手动补偿");
       await expect(readBlobText(blob)).resolves.toContain("复核说明");
       expect(clickSpy).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("导出报告下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("导出_报告_项目-export-report.txt");
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:compensation-report");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
+  it("下载 XML 时使用项目名生成文件名", () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:export-xml");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        name: "导出/XML:项目"
+      }
+    });
+
+    try {
+      useEditorStore.getState().prepareExport();
+      render(<ExportDialog />);
+      fireEvent.click(screen.getByRole("button", { name: "下载 XML" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("XML 下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("导出_XML_项目.xml");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:export-xml");
+      expect(useEditorStore.getState().exportDraft).toBeNull();
     } finally {
       clickSpy.mockRestore();
       if (createDescriptor) {
