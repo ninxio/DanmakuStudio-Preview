@@ -25,6 +25,22 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C44 已完成：导出摘要支持负时间限制明细。
+  - `ExportSummary` 现在会从已解析导出事件中收集被限制到 0ms 的负最终时间弹幕，记录资源文件、片段名、XML 原序号、原最终时间和文本。
+  - 导出摘要在存在负时间时显示“负时间限制明细”，最多预览 3 条，并继续显示总数。
+  - 原“下载补偿报告”升级为“下载导出报告”，当存在补偿点或负时间限制明细时可下载；报告会同时写入补偿明细和负时间限制明细。
+  - README 已同步：导出摘要现在可查看负时间限制明细，并下载导出报告。
+  - 已补充领域层、导出对话框和 store 相关测试；Playwright 同步改为点击“下载导出报告”。
+  - 本地 E2E 下载产物：`artifacts/downloads/未命名项目-export-report.txt`，大小 `599` 字节，时间 `2026/07/10 9:35:06`。
+  - 已重新验证：`corepack pnpm test -- src/domain/danmaku/exportSummary.test.ts src/features/export/ExportDialog.test.tsx src/stores/editorStore.test.ts` 成功，3 个测试文件、20 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、145 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:36:00`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2994788` 字节，时间 `2026/07/10 9:36:00`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c44-export-negative-clamp-details-20260710`。
 - 成熟度提升阶段 C43 已完成：Playwright E2E 覆盖导出摘要健康报告下载。
   - 核心 E2E 在打开导出摘要后会确认“导出前健康检查”和“健康”状态可见，再点击“下载健康报告”。
   - 测试会保存浏览器下载的 `未命名项目-health-report.txt`，读取文本并断言包含“项目健康报告”“状态：健康”和“重复 ID：0 个”。

@@ -11,6 +11,15 @@ export interface ExportCompensationDetail {
   note: string;
 }
 
+export interface ExportNegativeClampDetail {
+  id: string;
+  assetFileName: string;
+  clipName: string;
+  originalIndex: number;
+  finalTimeMs: Milliseconds;
+  text: string;
+}
+
 export interface ExportSummary {
   originalCount: number;
   enabledCount: number;
@@ -22,16 +31,27 @@ export interface ExportSummary {
   compensationDetails: ExportCompensationDetail[];
   hasImportWarnings: boolean;
   negativeClampCount: number;
+  negativeClampDetails: ExportNegativeClampDetail[];
 }
 
 export function createExportSummary(
   allEvents: ResolvedDanmakuEvent[],
   cutMarkers: CutMarker[],
-  hasImportWarnings: boolean,
-  negativeClampCount: number
+  hasImportWarnings: boolean
 ): ExportSummary {
   const enabled = allEvents.filter((event) => event.enabled);
   const times = enabled.map((event) => Math.max(0, event.finalTimeMs));
+  const negativeClampDetails = enabled
+    .filter((event) => event.finalTimeMs < 0)
+    .sort((left, right) => left.finalTimeMs - right.finalTimeMs || left.originalIndex - right.originalIndex)
+    .map((event) => ({
+      id: event.id,
+      assetFileName: event.asset.fileName,
+      clipName: event.clip.name,
+      originalIndex: event.item.originalIndex,
+      finalTimeMs: event.finalTimeMs,
+      text: event.item.text
+    }));
   return {
     originalCount: allEvents.length,
     enabledCount: enabled.length,
@@ -50,7 +70,8 @@ export function createExportSummary(
         note: marker.note
       })),
     hasImportWarnings,
-    negativeClampCount
+    negativeClampCount: negativeClampDetails.length,
+    negativeClampDetails
   };
 }
 
@@ -66,19 +87,31 @@ export function createCompensationReport(projectName: string, summary: ExportSum
 
   if (summary.compensationDetails.length === 0) {
     lines.push("本次导出未应用补偿点。");
-    return `${lines.join("\n")}\n`;
+  } else {
+    lines.push("补偿明细：");
+    summary.compensationDetails.forEach((detail, index) => {
+      lines.push(
+        `${index + 1}. ${detail.name}`,
+        `   源时间：${formatTimecode(detail.sourceAtMs)} (${detail.sourceAtMs} ms)`,
+        `   补偿：${formatSignedCompensationDuration(detail.targetGapMs)} (${detail.targetGapMs} ms)`,
+        `   影响：此时间点之后的弹幕最终时间会按该补偿继续平移。`,
+        `   备注：${detail.note.trim().length > 0 ? detail.note : "无"}`
+      );
+    });
   }
 
-  lines.push("补偿明细：");
-  summary.compensationDetails.forEach((detail, index) => {
-    lines.push(
-      `${index + 1}. ${detail.name}`,
-      `   源时间：${formatTimecode(detail.sourceAtMs)} (${detail.sourceAtMs} ms)`,
-      `   补偿：${formatSignedCompensationDuration(detail.targetGapMs)} (${detail.targetGapMs} ms)`,
-      `   影响：此时间点之后的弹幕最终时间会按该补偿继续平移。`,
-      `   备注：${detail.note.trim().length > 0 ? detail.note : "无"}`
-    );
-  });
+  if (summary.negativeClampDetails.length > 0) {
+    lines.push("", "负时间限制明细：");
+    summary.negativeClampDetails.forEach((detail, index) => {
+      lines.push(
+        `${index + 1}. ${detail.assetFileName} / ${detail.clipName}`,
+        `   XML 序号：${detail.originalIndex + 1}`,
+        `   原最终时间：${formatSignedCompensationDuration(detail.finalTimeMs)} (${detail.finalTimeMs} ms)`,
+        `   导出时间：00:00:00.000`,
+        `   文本：${detail.text.trim().length > 0 ? detail.text : "空文本"}`
+      );
+    });
+  }
 
   return `${lines.join("\n")}\n`;
 }

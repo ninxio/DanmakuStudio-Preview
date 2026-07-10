@@ -123,7 +123,7 @@ describe("导出摘要", () => {
     }
   });
 
-  it("显示补偿明细并可下载补偿报告", async () => {
+  it("显示补偿明细并可下载导出报告", async () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
     const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:compensation-report");
@@ -152,13 +152,14 @@ describe("导出摘要", () => {
       render(<ExportDialog />);
       expect(screen.getByText("总补偿时长")).toBeInTheDocument();
       expect(screen.getByText("手动补偿")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "下载补偿报告" }));
+      fireEvent.click(screen.getByRole("button", { name: "下载导出报告" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
       const [blob] = createObjectUrl.mock.calls[0];
       if (!(blob instanceof Blob)) {
-        throw new Error("补偿报告下载对象不是 Blob。");
+        throw new Error("导出报告下载对象不是 Blob。");
       }
+      await expect(readBlobText(blob)).resolves.toContain("补偿明细");
       await expect(readBlobText(blob)).resolves.toContain("手动补偿");
       await expect(readBlobText(blob)).resolves.toContain("复核说明");
       expect(clickSpy).toHaveBeenCalledTimes(1);
@@ -176,6 +177,25 @@ describe("导出摘要", () => {
         Reflect.deleteProperty(URL, "revokeObjectURL");
       }
     }
+  });
+
+  it("显示负时间限制明细", () => {
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        globalOffsetMs: -1500
+      }
+    });
+
+    useEditorStore.getState().prepareExport();
+    render(<ExportDialog />);
+
+    expect(screen.getByText("负时间限制为 0")).toBeInTheDocument();
+    expect(screen.getByText("1 项")).toBeInTheDocument();
+    expect(screen.getByText("负时间限制明细")).toBeInTheDocument();
+    expect(screen.getByText("导出弹幕")).toBeInTheDocument();
+    expect(screen.getByText("-00:00:00.500 -> 00:00:00.000")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "下载导出报告" })).toBeInTheDocument();
   });
 });
 

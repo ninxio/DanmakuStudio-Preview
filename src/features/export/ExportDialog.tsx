@@ -4,7 +4,8 @@ import { TextButton } from "../../components/TextButton";
 import {
   createCompensationReport,
   formatSignedCompensationDuration,
-  type ExportCompensationDetail
+  type ExportCompensationDetail,
+  type ExportNegativeClampDetail
 } from "../../domain/danmaku/exportSummary";
 import {
   createProjectHealthReport,
@@ -28,6 +29,9 @@ export function ExportDialog() {
   const healthSummary = createProjectHealthSummary(project);
   const previewCompensations = summary.compensationDetails.slice(0, 3);
   const hiddenCompensationCount = Math.max(0, summary.compensationDetails.length - previewCompensations.length);
+  const previewNegativeClamps = summary.negativeClampDetails.slice(0, 3);
+  const hiddenNegativeClampCount = Math.max(0, summary.negativeClampDetails.length - previewNegativeClamps.length);
+  const hasExportReviewReport = summary.compensationDetails.length > 0 || summary.negativeClampDetails.length > 0;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65" role="dialog" aria-modal="true">
       <div className="flex max-h-[86vh] w-[560px] flex-col rounded border border-panel-line bg-panel-raised shadow-2xl" data-testid="export-dialog">
@@ -59,6 +63,19 @@ export function ExportDialog() {
               </div>
             </section>
           ) : null}
+          {previewNegativeClamps.length > 0 ? (
+            <section className="rounded border border-amber-400/40 bg-amber-400/10 p-3 text-xs text-amber-100">
+              <h3 className="font-medium">负时间限制明细</h3>
+              <div className="mt-2 grid gap-2">
+                {previewNegativeClamps.map((detail) => (
+                  <NegativeClampDetailRow key={detail.id} detail={detail} />
+                ))}
+                {hiddenNegativeClampCount > 0 ? (
+                  <p className="text-amber-100/70">另有 {hiddenNegativeClampCount} 条，可下载导出报告查看完整明细。</p>
+                ) : null}
+              </div>
+            </section>
+          ) : null}
           <div
             className={`rounded border px-3 py-2 text-xs ${
               validation.ok
@@ -82,18 +99,18 @@ export function ExportDialog() {
             <Download size={14} />
             下载健康报告
           </TextButton>
-          {summary.compensationDetails.length > 0 ? (
+          {hasExportReviewReport ? (
             <TextButton
               onClick={() =>
                 downloadTextFile(
-                  `${project.name || "danmaku-export"}-compensation-report.txt`,
+                  `${project.name || "danmaku-export"}-export-report.txt`,
                   createCompensationReport(project.name, summary),
                   "text/plain;charset=utf-8"
                 )
               }
             >
               <Download size={14} />
-              下载补偿报告
+              下载导出报告
             </TextButton>
           ) : null}
           <TextButton onClick={clearExport}>取消</TextButton>
@@ -110,6 +127,24 @@ export function ExportDialog() {
           </TextButton>
         </footer>
       </div>
+    </div>
+  );
+}
+
+function NegativeClampDetailRow({ detail }: { detail: ExportNegativeClampDetail }) {
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 border-t border-amber-100/20 pt-2 first:border-t-0 first:pt-0">
+      <div className="min-w-0">
+        <div className="truncate font-medium" title={detail.text}>
+          {detail.text.trim().length > 0 ? detail.text : "空文本"}
+        </div>
+        <div className="mt-1 truncate text-[11px] text-amber-100/70" title={`${detail.assetFileName} / ${detail.clipName}`}>
+          {detail.assetFileName} / {detail.clipName}
+        </div>
+      </div>
+      <span className="font-mono text-[11px] text-amber-100/80">
+        {`${formatSignedCompensationDuration(detail.finalTimeMs)} -> 00:00:00.000`}
+      </span>
     </div>
   );
 }

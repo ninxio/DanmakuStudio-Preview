@@ -986,8 +986,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const summary = createExportSummary(
       events,
       project.cutMarkers,
-      project.assets.some((asset) => asset.warnings.length > 0),
-      exportResult.negativeClampCount
+      project.assets.some((asset) => asset.warnings.length > 0)
     );
     set({
       exportDraft: {

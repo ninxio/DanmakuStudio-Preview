@@ -234,7 +234,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   expect(exportHealthReportText).toContain("状态：健康");
   expect(exportHealthReportText).toContain("重复 ID：0 个");
   const compensationReportDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "下载补偿报告" }).click();
+  await page.getByRole("button", { name: "下载导出报告" }).click();
   const compensationReportDownload = await compensationReportDownloadPromise;
   const compensationReportPath = resolve(downloadDir, compensationReportDownload.suggestedFilename());
   await compensationReportDownload.saveAs(compensationReportPath);
