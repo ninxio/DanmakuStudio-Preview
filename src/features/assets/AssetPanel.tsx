@@ -1,6 +1,7 @@
 import {
   CircleAlert,
   CircleCheck,
+  Crosshair,
   Download,
   FolderOpen,
   Layers,
@@ -314,6 +315,13 @@ export function AssetPanel() {
                   onTextChange={setAlignmentProposalText}
                   onImportText={importAlignmentProposalText}
                   onApply={applyAlignmentProposal}
+                  onFocusQueueItem={(sourceAtMs, name) => {
+                    setPlayhead(sourceAtMs);
+                    setStatus({
+                      message: `已定位复核项：${name}（${formatTimecode(sourceAtMs)}）。`,
+                      tone: "success"
+                    });
+                  }}
                 />
                 <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
               </>
@@ -1223,7 +1231,8 @@ function VideoAlignmentLabPanel({
   preview,
   onTextChange,
   onImportText,
-  onApply
+  onApply,
+  onFocusQueueItem
 }: {
   project: EditorProject;
   text: string;
@@ -1232,6 +1241,7 @@ function VideoAlignmentLabPanel({
   onTextChange: (value: string) => void;
   onImportText: (value: string, sourceFileName?: string) => void;
   onApply: () => void;
+  onFocusQueueItem: (sourceAtMs: number, name: string) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const initialSettingsRef = useRef(loadAppSettings());
@@ -1701,7 +1711,7 @@ function VideoAlignmentLabPanel({
                   {visibleReviewQueue.map((item, index) => (
                     <li
                       key={`${item.kind}-${item.id}-${index}`}
-                      className="grid grid-cols-[64px_minmax(0,1fr)] gap-2"
+                      className="grid grid-cols-[64px_minmax(0,1fr)_auto] items-start gap-2"
                     >
                       <span className={getAlignmentReviewQueueSeverityClassName(item.severity)}>
                         {item.severityText}
@@ -1714,6 +1724,15 @@ function VideoAlignmentLabPanel({
                         </span>
                         <span className="block text-slate-400">{item.reasons.join("；")}</span>
                       </span>
+                      <TextButton
+                        aria-label={`定位复核项 ${index + 1}`}
+                        title={`定位到 ${formatTimecode(item.sourceAtMs)}`}
+                        onClick={() => onFocusQueueItem(item.sourceAtMs, item.name)}
+                        className="px-2"
+                      >
+                        <Crosshair size={13} />
+                        定位
+                      </TextButton>
                     </li>
                   ))}
                 </ol>

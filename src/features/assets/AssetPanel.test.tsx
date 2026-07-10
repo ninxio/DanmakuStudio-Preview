@@ -537,6 +537,9 @@ describe("资源面板", () => {
     expect(screen.getByText("复核队列")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("优先复核");
     expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("候选补偿置信度 72.0%");
+    await user.click(screen.getByRole("button", { name: "定位复核项 1" }));
+    expect(useEditorStore.getState().project.timeline.playheadMs).toBe(20_000);
+    expect(useEditorStore.getState().status.message).toBe("已定位复核项：音频推断补偿 1（00:00:20.000）。");
     expect(screen.getByText("落点状态")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("audio-anchor-1");
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("音频推断补偿 1");

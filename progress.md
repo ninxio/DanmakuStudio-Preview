@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C100 已完成：对齐复核队列可直接定位到时间轴。
+  - “视频对齐实验室”的复核队列每条记录新增真实“定位”按钮，可把时间轴播放头跳到该锚点或候选补偿的源时间，便于按队列顺序逐条核对真实删减边界。
+  - 定位动作会走现有 `setPlayhead`，由 store 统一钳制合法时间范围，并在状态栏显示已定位的复核项名称和时间码。
+  - 复核队列仍复用 C99 的结构化优先级与状态语义；本阶段不改变对齐提案写入、阻断或导出规则，只把复核队列从静态列表补成可操作入口。
+  - 已补充资源面板测试，覆盖点击“定位复核项”后播放头跳转到候选源时间，并显示定位状态反馈。
+  - 已重新验证：`corepack pnpm test -- src/features/assets/AssetPanel.test.tsx` 成功，1 个测试文件、24 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/194 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 14:47:27`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3001684` 字节，时间 `2026/07/10 14:47:27`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c100-alignment-review-queue-locate-20260710`。
 - 成熟度提升阶段 C99 已完成：对齐实验室新增结构化复核队列。
   - 领域层新增 `createAlignmentReviewQueue`，从同一套落点状态中生成可排序复核队列，按“先修阻断 / 优先复核 / 待确认”排序，已落点项不再进入待复核队列。
   - 复核队列会把当前项目 ID 冲突、提案内重复、区间异常等阻断项排在最前；低置信度候选补偿和带不确定区间的候选补偿会进入优先复核，普通待应用锚点/补偿进入待确认。
