@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C28 已完成：项目文件 schema 校验补强。
+  - `validateProjectSchema` 现在会校验删减补偿点、同步锚点、整数毫秒时间字段、时间轴视图和预览设置，不再只检查数组是否存在。
+  - 打开 `.danmaku-project.json` 时，字段类型错误的补偿点、置信度越界的同步锚点、非整数毫秒调整、非正时间轴缩放等坏数据会被拒绝，避免非法非破坏性规则进入运行时状态。
+  - 合法补偿点和同步锚点仍可正常打开；仓库内 `fixtures/projects/three-part-demo.danmaku-project.json` 已纳入 schema 测试，防止严格校验误伤示例项目。
+  - README 已同步：项目文件打开会校验补偿点、同步锚点和关键时间字段。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/project/schema.test.ts` 成功，1 个测试文件、9 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 31 个测试文件、120 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12235264` 字节，时间 `2026/07/10 8:15:37`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2991495` 字节，时间 `2026/07/10 8:15:37`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c28-project-schema-hardening-20260710`。
 - 成熟度提升阶段 C27 已完成：Playwright E2E 覆盖异常对齐提案阻断和修正恢复。
   - 核心 E2E 流程在重新打开项目后，会先向“视频对齐实验室”导入一个不确定区间起止反向的 `AlignmentProposal`。
   - 测试会断言页面显示“应用已暂停”、显示“不确定区间起止顺序异常”，且“应用候选”按钮被禁用。

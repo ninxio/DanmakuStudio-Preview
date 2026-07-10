@@ -25,10 +25,10 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     !isMediaReference(value.media) ||
     !Array.isArray(value.assets) ||
     !Array.isArray(value.clips) ||
-    typeof value.globalOffsetMs !== "number" ||
+    !isIntegerMilliseconds(value.globalOffsetMs) ||
     !Array.isArray(value.cutMarkers) ||
     !Array.isArray(value.syncAnchors) ||
-    !isNumberRecord(value.itemTimeAdjustments) ||
+    !isMillisecondsRecord(value.itemTimeAdjustments) ||
     !isStringArray(value.disabledItemIds) ||
     !isTimelineState(value.timeline) ||
     !isPreviewSettings(value.preview) ||
@@ -42,6 +42,12 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
   }
   if (!value.clips.every(isDanmakuClip)) {
     return { ok: false, version, message: "项目文件中的时间轴片段结构不完整。" };
+  }
+  if (!value.cutMarkers.every(isCutMarker)) {
+    return { ok: false, version, message: "项目文件中的删减补偿点结构不完整。" };
+  }
+  if (!value.syncAnchors.every(isSyncAnchor)) {
+    return { ok: false, version, message: "项目文件中的同步锚点结构不完整。" };
   }
   return { ok: true, version, message: "项目文件可打开。" };
 }
@@ -82,7 +88,7 @@ function isMediaReference(value: unknown): boolean {
     typeof value.name === "string" &&
     typeof value.fileName === "string" &&
     (typeof value.objectUrl === "string" || value.objectUrl === null) &&
-    (typeof value.durationMs === "number" || value.durationMs === null)
+    (isNonNegativeIntegerMilliseconds(value.durationMs) || value.durationMs === null)
   );
 }
 
@@ -106,7 +112,7 @@ function isDanmakuItem(value: unknown): boolean {
     typeof value.id === "string" &&
     typeof value.assetId === "string" &&
     typeof value.originalIndex === "number" &&
-    typeof value.sourceTimeMs === "number" &&
+    isNonNegativeIntegerMilliseconds(value.sourceTimeMs) &&
     typeof value.text === "string" &&
     Array.isArray(value.rawPFields) &&
     value.rawPFields.every((field) => typeof field === "string") &&
@@ -120,20 +126,43 @@ function isDanmakuClip(value: unknown): boolean {
     typeof value.id === "string" &&
     typeof value.assetId === "string" &&
     typeof value.name === "string" &&
-    typeof value.timelineStartMs === "number" &&
-    typeof value.sourceInMs === "number" &&
-    typeof value.sourceOutMs === "number" &&
-    typeof value.localOffsetMs === "number" &&
+    isIntegerMilliseconds(value.timelineStartMs) &&
+    isNonNegativeIntegerMilliseconds(value.sourceInMs) &&
+    isNonNegativeIntegerMilliseconds(value.sourceOutMs) &&
+    value.sourceOutMs > value.sourceInMs &&
+    isIntegerMilliseconds(value.localOffsetMs) &&
     typeof value.enabled === "boolean"
+  );
+}
+
+function isCutMarker(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    isNonNegativeIntegerMilliseconds(value.sourceAtMs) &&
+    isIntegerMilliseconds(value.targetGapMs) &&
+    typeof value.note === "string"
+  );
+}
+
+function isSyncAnchor(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    isNonNegativeIntegerMilliseconds(value.sourceMs) &&
+    isNonNegativeIntegerMilliseconds(value.targetMs) &&
+    (value.origin === "manual" || value.origin === "automatic") &&
+    (value.confidence === undefined || isUnitNumber(value.confidence))
   );
 }
 
 function isTimelineState(value: unknown): boolean {
   return (
     isRecord(value) &&
-    typeof value.pixelsPerSecond === "number" &&
-    typeof value.scrollMs === "number" &&
-    typeof value.playheadMs === "number"
+    isPositiveFiniteNumber(value.pixelsPerSecond) &&
+    isNonNegativeIntegerMilliseconds(value.scrollMs) &&
+    isNonNegativeIntegerMilliseconds(value.playheadMs)
   );
 }
 
@@ -142,7 +171,7 @@ function isPreviewSettings(value: unknown): boolean {
     isRecord(value) &&
     typeof value.danmakuVisible === "boolean" &&
     typeof value.safeAreaVisible === "boolean" &&
-    typeof value.opacity === "number"
+    isUnitNumber(value.opacity)
   );
 }
 
@@ -150,6 +179,22 @@ function isStringArray(value: unknown): boolean {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-function isNumberRecord(value: unknown): boolean {
-  return isRecord(value) && Object.values(value).every((item) => typeof item === "number");
+function isMillisecondsRecord(value: unknown): boolean {
+  return isRecord(value) && Object.values(value).every(isIntegerMilliseconds);
+}
+
+function isIntegerMilliseconds(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+function isNonNegativeIntegerMilliseconds(value: unknown): value is number {
+  return isIntegerMilliseconds(value) && value >= 0;
+}
+
+function isPositiveFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function isUnitNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 }

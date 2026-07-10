@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEmptyProject } from "./factory";
 import { parseProjectJson, serializeProject, validateProjectSchema } from "./schema";
@@ -18,6 +20,28 @@ describe("project schema", () => {
     const parsed = parseProjectJson(json);
     expect(parsed.name).toBe("测试项目");
     expect(parsed.media?.objectUrl).toBeNull();
+  });
+
+  it("可打开仓库内三分 P 示例项目", () => {
+    const fixture = readFileSync(resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"), "utf8");
+    const parsed = parseProjectJson(fixture);
+
+    expect(parsed.assets).toHaveLength(3);
+    expect(parsed.cutMarkers).toHaveLength(1);
+  });
+
+  it("允许包含合法补偿点和同步锚点的项目", () => {
+    const project = {
+      ...createEmptyProject("带补偿项目"),
+      cutMarkers: [{ id: "cut-1", name: "缺失片段", sourceAtMs: 30_000, targetGapMs: 45_000, note: "复核通过" }],
+      syncAnchors: [{ id: "anchor-1", sourceMs: 10_000, targetMs: 12_000, confidence: 0.9, origin: "manual" as const }]
+    };
+
+    expect(validateProjectSchema(project)).toEqual({
+      ok: true,
+      version: 1,
+      message: "项目文件可打开。"
+    });
   });
 
   it("拒绝不支持的 schema 版本", () => {
@@ -63,5 +87,43 @@ describe("project schema", () => {
     const validation = validateProjectSchema(project);
     expect(validation.ok).toBe(false);
     expect(validation.message).toContain("时间轴片段");
+  });
+
+  it("拒绝字段类型错误的删减补偿点", () => {
+    const project = {
+      ...createEmptyProject(),
+      cutMarkers: [
+        {
+          id: "cut",
+          name: "bad",
+          sourceAtMs: 30_000,
+          targetGapMs: "45000",
+          note: ""
+        }
+      ]
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("删减补偿点");
+  });
+
+  it("拒绝结构错误的同步锚点", () => {
+    const project = {
+      ...createEmptyProject(),
+      syncAnchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 12_000, confidence: 1.5, origin: "automatic" }]
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("同步锚点");
+  });
+
+  it("拒绝非整数毫秒的单条弹幕调整", () => {
+    const project = {
+      ...createEmptyProject(),
+      itemTimeAdjustments: { item: 10.5 }
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("必要字段");
   });
 });
