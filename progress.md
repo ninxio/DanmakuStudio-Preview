@@ -1,5 +1,20 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C127 已完成：按多阶段音频指纹思路重构本地视频对齐流程。
+  - Tauri 原生音频对齐从默认密集 DP 改为“稀疏音频指纹 → 锚点候选匹配 → offset 簇筛选 → 单调路径拟合 → 候选差异精修”的多阶段流程；密集 DP 只在稀疏锚点不足且单元规模安全时作为明确回退。
+  - 当稀疏锚点已经足够时，`maxCells` 不再成为 50 分钟音频对齐的主要阻塞点；如果稀疏锚点不足且 DP 规模过大，会返回低置信诊断而不是继续平方级爆算。
+  - 前端领域层同步实现稀疏锚点原型路径，方便用小样本测试算法行为；`AlignmentProposal` 新增可选 `evidence`，记录算法类型、指纹数、稀疏匹配数、单调锚点数、强弱锚点、offset 簇、低置信区和精修候选数。
+  - 对齐提案导入、项目 schema、复核报告和 Tauri bridge 均支持证据字段；导出的复核报告新增“对齐证据”段。
+  - `AudioAlignmentJobSnapshot` 新增阶段字段，资源栏视频对齐实验室显示阶段序号、阶段内进度和阶段条，覆盖校验、提取、指纹、匹配、拟合、精修和报告生成。
+  - 视频对齐实验室新增证据摘要和轻量证据图，基于真实锚点、候选差异和 offset 范围展示结果可信度，不再只给黑盒 JSON。
+  - 已补充 TS/Rust 算法测试、资源面板阶段与证据 UI 测试，并扩展 schema/report 覆盖。
+  - 已重新验证：Rust 聚焦测试 `cargo test --manifest-path src-tauri\Cargo.toml audio_alignment --lib` 通过（13 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、47 个测试文件 / 272 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12453888` 字节，时间 `2026/07/11 03:55:24`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3077774` 字节，时间 `2026/07/11 03:55:24`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c127-multistage-alignment-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C126 已完成：收束双视频导入语义、拖放导入和音频对齐噪声保护。
   - 顶部“导入视频”统一改为“导入参考视频”，媒体页新增“视频来源”说明，明确参考视频代表 B 站删减版预览时间轴，目标原片（完整版）是最终对齐目标；对齐实验室路径标签改为“完整版输入（目标原片）”和“B 站删减版输入（参考视频）”。
   - App 根界面新增真实拖放导入：拖入 Bilibili XML 会导入弹幕素材，拖入 MP4/WebM 会导入参考视频；拖放时显示覆盖提示，并明确目标原片仍在媒体页绑定。

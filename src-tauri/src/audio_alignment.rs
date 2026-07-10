@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -22,6 +22,12 @@ const AUDIO_ALIGNMENT_CANCELLED: &str = "音频对齐任务已取消。";
 const MAX_JOB_LOGS: usize = 80;
 const MAX_AUDIO_FEATURE_CACHE_ENTRIES: usize = 12;
 const MERGE_NEARBY_CANDIDATE_MS: u64 = 2_000;
+const FINGERPRINT_BUCKET_MS: i64 = 1_000;
+const MAX_COMPLETE_FINGERPRINTS_PER_KEY: usize = 32;
+const MAX_SPARSE_MATCH_CANDIDATES: usize = 80_000;
+const MIN_SPARSE_MATCHES: usize = 3;
+const MIN_SPARSE_COVERAGE: f64 = 0.25;
+const AUDIO_ALIGNMENT_STAGE_COUNT: u8 = 8;
 
 const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
@@ -79,11 +85,28 @@ pub struct CutCandidateDto {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AlignmentEvidenceSummary {
+    algorithm: String,
+    complete_fingerprint_count: usize,
+    source_fingerprint_count: usize,
+    fingerprint_match_count: usize,
+    monotonic_match_count: usize,
+    strong_anchor_count: usize,
+    weak_anchor_count: usize,
+    offset_cluster_count: usize,
+    refined_candidate_count: usize,
+    low_confidence_region_count: usize,
+    quality: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioAlignmentProposal {
     anchors: Vec<SyncAnchorDto>,
     cut_candidates: Vec<CutCandidateDto>,
     confidence: f64,
     diagnostics: Vec<String>,
+    evidence: Option<AlignmentEvidenceSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -103,6 +126,11 @@ pub struct AudioAlignmentJobSnapshot {
     status: AudioAlignmentJobStatus,
     progress: f64,
     message: String,
+    stage_key: String,
+    stage_label: String,
+    stage_index: u8,
+    stage_count: u8,
+    stage_progress: f64,
     logs: Vec<String>,
     proposal: Option<AudioAlignmentProposal>,
     error: Option<String>,
@@ -122,6 +150,53 @@ struct AudioAlignmentOptions {
 struct CachedAudioFeatures {
     frames: Vec<AudioFeatureFrame>,
     cache_hit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AudioFingerprint {
+    key: u64,
+    frame_index: usize,
+    time_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SparseAudioCandidate {
+    complete_index: usize,
+    source_index: usize,
+    complete_time_ms: u64,
+    source_time_ms: u64,
+    distance: f64,
+    offset_ms: i64,
+    offset_bucket: i64,
+}
+
+struct SparseAudioAlignmentResult {
+    matches: Vec<AudioFeatureMatch>,
+    complete_fingerprint_count: usize,
+    source_fingerprint_count: usize,
+    fingerprint_match_count: usize,
+    offset_cluster_count: usize,
+    low_confidence_region_count: usize,
+    diagnostics: Vec<String>,
+}
+
+struct MultistageAudioAlignmentResult {
+    algorithm: String,
+    matches: Vec<AudioFeatureMatch>,
+    complete_fingerprint_count: usize,
+    source_fingerprint_count: usize,
+    fingerprint_match_count: usize,
+    offset_cluster_count: usize,
+    low_confidence_region_count: usize,
+    diagnostics: Vec<String>,
+}
+
+struct AudioAlignmentStageSnapshot {
+    key: &'static str,
+    label: &'static str,
+    index: u8,
+    count: u8,
+    progress: f64,
 }
 
 struct AudioAlignmentJobEntry {
@@ -184,6 +259,11 @@ pub fn cancel_audio_alignment_job(job_id: String) -> Result<AudioAlignmentJobSna
         entry.snapshot.status = AudioAlignmentJobStatus::Cancelled;
         entry.snapshot.progress = 1.0;
         entry.snapshot.message = "已请求取消音频对齐任务。".to_string();
+        let stage = create_audio_alignment_stage_snapshot(
+            &AudioAlignmentJobStatus::Cancelled,
+            entry.snapshot.progress,
+        );
+        apply_audio_alignment_stage_snapshot(&mut entry.snapshot, stage);
         append_audio_alignment_log(&mut entry.snapshot.logs, "已请求取消音频对齐任务。");
         entry.snapshot.updated_at_ms = current_time_ms();
     }
@@ -228,12 +308,19 @@ where
         &format_audio_feature_cache_message("当前视频", &source_features),
     )?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.75, "正在匹配音频特征并推断缺失段。")?;
+    update_progress(0.76, "正在生成稀疏音频指纹。")?;
+    check_cancelled(cancel_flag)?;
+    update_progress(0.82, "正在匹配音频锚点。")?;
+    check_cancelled(cancel_flag)?;
+    update_progress(0.88, "正在拟合单调对齐路径。")?;
+    check_cancelled(cancel_flag)?;
     let mut proposal = create_audio_alignment_proposal(
         &complete_features.frames,
         &source_features.frames,
         &options,
     )?;
+    update_progress(0.94, "正在精修候选版本差异。")?;
+    check_cancelled(cancel_flag)?;
     proposal.diagnostics.push(format!(
         "音频特征缓存：完整版{}，当前视频{}。",
         if complete_features.cache_hit {
@@ -247,6 +334,7 @@ where
             "新提取"
         }
     ));
+    update_progress(0.97, "正在生成对齐复核数据。")?;
     Ok(proposal)
 }
 
@@ -349,6 +437,11 @@ fn insert_audio_alignment_job(job_id: String, cancel_flag: Arc<AtomicBool>) -> R
         status: AudioAlignmentJobStatus::Queued,
         progress: 0.0,
         message: "音频对齐任务已加入队列。".to_string(),
+        stage_key: "queued".to_string(),
+        stage_label: "排队".to_string(),
+        stage_index: 0,
+        stage_count: AUDIO_ALIGNMENT_STAGE_COUNT,
+        stage_progress: 0.0,
         logs: vec!["音频对齐任务已加入队列。".to_string()],
         proposal: None,
         error: None,
@@ -389,6 +482,9 @@ fn update_audio_alignment_job(
     entry.snapshot.status = status;
     entry.snapshot.progress = progress.clamp(0.0, 1.0);
     entry.snapshot.message = message.to_string();
+    let stage =
+        create_audio_alignment_stage_snapshot(&entry.snapshot.status, entry.snapshot.progress);
+    apply_audio_alignment_stage_snapshot(&mut entry.snapshot, stage);
     append_audio_alignment_log(&mut entry.snapshot.logs, message);
     if let Some(error_message) = &error {
         append_audio_alignment_log(&mut entry.snapshot.logs, error_message);
@@ -397,6 +493,104 @@ fn update_audio_alignment_job(
     entry.snapshot.error = error;
     entry.snapshot.updated_at_ms = current_time_ms();
     Ok(())
+}
+
+fn create_audio_alignment_stage_snapshot(
+    status: &AudioAlignmentJobStatus,
+    progress: f64,
+) -> AudioAlignmentStageSnapshot {
+    if *status == AudioAlignmentJobStatus::Cancelled {
+        return AudioAlignmentStageSnapshot {
+            key: "cancelled",
+            label: "已取消",
+            index: AUDIO_ALIGNMENT_STAGE_COUNT,
+            count: AUDIO_ALIGNMENT_STAGE_COUNT,
+            progress: 1.0,
+        };
+    }
+    if *status == AudioAlignmentJobStatus::Failed {
+        return AudioAlignmentStageSnapshot {
+            key: "failed",
+            label: "失败",
+            index: AUDIO_ALIGNMENT_STAGE_COUNT,
+            count: AUDIO_ALIGNMENT_STAGE_COUNT,
+            progress: 1.0,
+        };
+    }
+    if *status == AudioAlignmentJobStatus::Completed {
+        return AudioAlignmentStageSnapshot {
+            key: "completed",
+            label: "已完成",
+            index: AUDIO_ALIGNMENT_STAGE_COUNT,
+            count: AUDIO_ALIGNMENT_STAGE_COUNT,
+            progress: 1.0,
+        };
+    }
+    let clamped = progress.clamp(0.0, 1.0);
+    if clamped < 0.12 {
+        create_stage_range("validating", "校验输入", 1, clamped, 0.0, 0.12)
+    } else if clamped < 0.44 {
+        create_stage_range(
+            "extracting-complete",
+            "提取完整版特征",
+            2,
+            clamped,
+            0.12,
+            0.44,
+        )
+    } else if clamped < 0.74 {
+        create_stage_range(
+            "extracting-source",
+            "提取删减版特征",
+            3,
+            clamped,
+            0.44,
+            0.74,
+        )
+    } else if clamped < 0.80 {
+        create_stage_range("fingerprinting", "生成稀疏指纹", 4, clamped, 0.74, 0.80)
+    } else if clamped < 0.86 {
+        create_stage_range("matching", "匹配音频锚点", 5, clamped, 0.80, 0.86)
+    } else if clamped < 0.92 {
+        create_stage_range("fitting", "拟合单调路径", 6, clamped, 0.86, 0.92)
+    } else if clamped < 0.97 {
+        create_stage_range("refining", "精修候选差异", 7, clamped, 0.92, 0.97)
+    } else {
+        create_stage_range("reporting", "生成复核数据", 8, clamped, 0.97, 1.0)
+    }
+}
+
+fn create_stage_range(
+    key: &'static str,
+    label: &'static str,
+    index: u8,
+    progress: f64,
+    start: f64,
+    end: f64,
+) -> AudioAlignmentStageSnapshot {
+    let stage_progress = if end <= start {
+        1.0
+    } else {
+        ((progress - start) / (end - start)).clamp(0.0, 1.0)
+    };
+    AudioAlignmentStageSnapshot {
+        key,
+        label,
+        index,
+        count: AUDIO_ALIGNMENT_STAGE_COUNT,
+        progress: stage_progress,
+    }
+}
+
+fn apply_audio_alignment_stage_snapshot(
+    snapshot: &mut AudioAlignmentJobSnapshot,
+    stage: AudioAlignmentStageSnapshot,
+) {
+    snapshot.stage_key = stage.key.to_string();
+    snapshot.stage_label = stage.label.to_string();
+    snapshot.stage_index = stage.index;
+    snapshot.stage_count = stage.count;
+    snapshot.stage_progress = stage.progress;
 }
 
 fn append_audio_alignment_log(logs: &mut Vec<String>, message: &str) {
@@ -709,31 +903,362 @@ fn create_audio_alignment_proposal(
             cut_candidates: Vec::new(),
             confidence: 0.0,
             diagnostics: vec!["音频特征为空，无法对齐。".to_string()],
+            evidence: Some(AlignmentEvidenceSummary {
+                algorithm: "sparse-fingerprint".to_string(),
+                complete_fingerprint_count: 0,
+                source_fingerprint_count: 0,
+                fingerprint_match_count: 0,
+                monotonic_match_count: 0,
+                strong_anchor_count: 0,
+                weak_anchor_count: 0,
+                offset_cluster_count: 0,
+                refined_candidate_count: 0,
+                low_confidence_region_count: 1,
+                quality: "blocked".to_string(),
+            }),
         });
     }
-    let matches = align_audio_feature_sequences(complete_frames, source_frames, options)?;
-    let cut_candidates = infer_cut_candidates(&matches, options);
+    let alignment = create_multistage_audio_alignment(complete_frames, source_frames, options)?;
+    let matches = alignment.matches;
+    let cut_candidates = refine_cut_candidates(infer_cut_candidates(&matches, options));
     let cut_candidate_count = cut_candidates.len();
     let anchors = create_anchors(&matches, options.match_threshold);
     let coverage = matches.len() as f64 / source_frames.len().max(1) as f64;
+    let strong_anchor_count = matches
+        .iter()
+        .filter(|item| item.distance <= options.match_threshold * 0.5)
+        .count();
+    let weak_anchor_count = matches.len().saturating_sub(strong_anchor_count);
+    let mut diagnostics = alignment.diagnostics;
+    diagnostics.push(format!(
+        "音频特征匹配 {} / {} 帧，覆盖率 {}%。",
+        matches.len(),
+        source_frames.len(),
+        (coverage * 100.0).round()
+    ));
+    diagnostics.push(if cut_candidate_count == 0 {
+        "未发现超过阈值的候选缺失段。".to_string()
+    } else {
+        format!("已推断 {cut_candidate_count} 个候选缺失段。")
+    });
     Ok(AudioAlignmentProposal {
         anchors,
         cut_candidates,
         confidence: coverage.clamp(0.0, 1.0),
+        diagnostics,
+        evidence: Some(AlignmentEvidenceSummary {
+            algorithm: alignment.algorithm,
+            complete_fingerprint_count: alignment.complete_fingerprint_count,
+            source_fingerprint_count: alignment.source_fingerprint_count,
+            fingerprint_match_count: alignment.fingerprint_match_count,
+            monotonic_match_count: matches.len(),
+            strong_anchor_count,
+            weak_anchor_count,
+            offset_cluster_count: alignment.offset_cluster_count,
+            refined_candidate_count: cut_candidate_count,
+            low_confidence_region_count: alignment.low_confidence_region_count,
+            quality: create_evidence_quality(
+                coverage,
+                strong_anchor_count,
+                weak_anchor_count,
+                alignment.low_confidence_region_count,
+            ),
+        }),
+    })
+}
+
+fn create_multistage_audio_alignment(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    options: &AudioAlignmentOptions,
+) -> Result<MultistageAudioAlignmentResult, String> {
+    let sparse = create_sparse_audio_alignment(complete_frames, source_frames, options);
+    let sparse_coverage = sparse.matches.len() as f64 / source_frames.len().max(1) as f64;
+    let required_matches = MIN_SPARSE_MATCHES.min(source_frames.len());
+    if sparse.matches.len() >= required_matches && sparse_coverage >= MIN_SPARSE_COVERAGE {
+        return Ok(MultistageAudioAlignmentResult {
+            algorithm: "sparse-fingerprint".to_string(),
+            matches: sparse.matches,
+            complete_fingerprint_count: sparse.complete_fingerprint_count,
+            source_fingerprint_count: sparse.source_fingerprint_count,
+            fingerprint_match_count: sparse.fingerprint_match_count,
+            offset_cluster_count: sparse.offset_cluster_count,
+            low_confidence_region_count: sparse.low_confidence_region_count,
+            diagnostics: sparse.diagnostics,
+        });
+    }
+
+    let cell_count = (complete_frames.len() + 1) * (source_frames.len() + 1);
+    if cell_count > options.max_cells {
+        let mut diagnostics = sparse.diagnostics;
+        diagnostics.push(format!(
+            "稀疏锚点不足，已跳过 {cell_count} 个 DP 单元的密集回退以避免平方级爆炸。"
+        ));
+        return Ok(MultistageAudioAlignmentResult {
+            algorithm: "sparse-fingerprint".to_string(),
+            matches: sparse.matches,
+            complete_fingerprint_count: sparse.complete_fingerprint_count,
+            source_fingerprint_count: sparse.source_fingerprint_count,
+            fingerprint_match_count: sparse.fingerprint_match_count,
+            offset_cluster_count: sparse.offset_cluster_count,
+            low_confidence_region_count: sparse.low_confidence_region_count,
+            diagnostics,
+        });
+    }
+
+    let dense_matches = align_audio_feature_sequences(complete_frames, source_frames, options)?;
+    let low_confidence_region_count =
+        sparse
+            .low_confidence_region_count
+            .max(estimate_low_confidence_region_count(
+                dense_matches.len(),
+                source_frames.len(),
+            ));
+    let mut diagnostics = sparse.diagnostics;
+    diagnostics.push(format!(
+        "稀疏锚点不足，已回退到密集 DP：{} 个匹配点。",
+        dense_matches.len()
+    ));
+    Ok(MultistageAudioAlignmentResult {
+        algorithm: "sparse-fingerprint-fallback".to_string(),
+        matches: dense_matches,
+        complete_fingerprint_count: sparse.complete_fingerprint_count,
+        source_fingerprint_count: sparse.source_fingerprint_count,
+        fingerprint_match_count: sparse.fingerprint_match_count,
+        offset_cluster_count: sparse.offset_cluster_count,
+        low_confidence_region_count,
+        diagnostics,
+    })
+}
+
+fn create_sparse_audio_alignment(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    options: &AudioAlignmentOptions,
+) -> SparseAudioAlignmentResult {
+    let complete_fingerprints = create_audio_fingerprints(complete_frames);
+    let source_fingerprints = create_audio_fingerprints(source_frames);
+    let candidates = create_sparse_audio_candidates(
+        complete_frames,
+        source_frames,
+        &complete_fingerprints,
+        &source_fingerprints,
+        options.match_threshold,
+    );
+    let offset_clusters = create_offset_clusters(&candidates);
+    let matches =
+        select_monotonic_sparse_matches(&candidates, &offset_clusters, options.match_threshold);
+    let match_count = matches.len();
+    let low_confidence_region_count =
+        estimate_low_confidence_region_count(match_count, source_frames.len());
+    SparseAudioAlignmentResult {
+        matches,
+        complete_fingerprint_count: complete_fingerprints.len(),
+        source_fingerprint_count: source_fingerprints.len(),
+        fingerprint_match_count: candidates.len(),
+        offset_cluster_count: offset_clusters.len(),
+        low_confidence_region_count,
         diagnostics: vec![
             format!(
-                "音频特征匹配 {} / {} 帧，覆盖率 {}%。",
-                matches.len(),
-                source_frames.len(),
-                (coverage * 100.0).round()
+                "多阶段对齐：生成完整版 {} 个、B 站删减版 {} 个稀疏音频指纹。",
+                complete_fingerprints.len(),
+                source_fingerprints.len()
             ),
-            if cut_candidate_count == 0 {
-                "未发现超过阈值的候选缺失段。".to_string()
-            } else {
-                format!("已推断 {cut_candidate_count} 个候选缺失段。")
-            },
+            format!(
+                "稀疏锚点匹配 {} 对，单调路径保留 {} 个锚点，offset 簇 {} 个。",
+                candidates.len(),
+                match_count,
+                offset_clusters.len()
+            ),
         ],
-    })
+    }
+}
+
+fn create_audio_fingerprints(frames: &[AudioFeatureFrame]) -> Vec<AudioFingerprint> {
+    frames
+        .iter()
+        .enumerate()
+        .map(|(frame_index, frame)| AudioFingerprint {
+            key: create_audio_fingerprint_key(frame),
+            frame_index,
+            time_ms: frame.time_ms,
+        })
+        .collect()
+}
+
+fn create_audio_fingerprint_key(frame: &AudioFeatureFrame) -> u64 {
+    let width = frame.values.len().clamp(1, 4);
+    let mut key = width as u64;
+    for index in 0..width {
+        key = key * 37 + quantize_feature(frame.values.get(index).copied().unwrap_or(0.0));
+    }
+    key
+}
+
+fn quantize_feature(value: f64) -> u64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    (value.clamp(0.0, 1.0) * 32.0).round() as u64
+}
+
+fn create_sparse_audio_candidates(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    complete_fingerprints: &[AudioFingerprint],
+    source_fingerprints: &[AudioFingerprint],
+    match_threshold: f64,
+) -> Vec<SparseAudioCandidate> {
+    let mut complete_by_key: HashMap<u64, Vec<AudioFingerprint>> = HashMap::new();
+    for fingerprint in complete_fingerprints {
+        complete_by_key
+            .entry(fingerprint.key)
+            .or_default()
+            .push(fingerprint.clone());
+    }
+
+    let mut candidates = Vec::new();
+    for source_fingerprint in source_fingerprints {
+        let Some(complete_matches) = complete_by_key.get(&source_fingerprint.key) else {
+            continue;
+        };
+        for complete_fingerprint in select_complete_fingerprints_for_key(complete_matches) {
+            let complete_frame = &complete_frames[complete_fingerprint.frame_index];
+            let source_frame = &source_frames[source_fingerprint.frame_index];
+            let distance = get_feature_distance(complete_frame, source_frame);
+            if distance > match_threshold.max(0.05) {
+                continue;
+            }
+            let offset_ms = complete_fingerprint.time_ms as i64 - source_fingerprint.time_ms as i64;
+            candidates.push(SparseAudioCandidate {
+                complete_index: complete_fingerprint.frame_index,
+                source_index: source_fingerprint.frame_index,
+                complete_time_ms: complete_fingerprint.time_ms,
+                source_time_ms: source_fingerprint.time_ms,
+                distance,
+                offset_ms,
+                offset_bucket: (offset_ms as f64 / FINGERPRINT_BUCKET_MS as f64).round() as i64,
+            });
+            if candidates.len() >= MAX_SPARSE_MATCH_CANDIDATES {
+                return candidates;
+            }
+        }
+    }
+    candidates
+}
+
+fn select_complete_fingerprints_for_key(items: &[AudioFingerprint]) -> Vec<&AudioFingerprint> {
+    if items.len() <= MAX_COMPLETE_FINGERPRINTS_PER_KEY {
+        return items.iter().collect();
+    }
+    let mut selected = Vec::new();
+    let step = (items.len() - 1) as f64 / (MAX_COMPLETE_FINGERPRINTS_PER_KEY - 1) as f64;
+    for index in 0..MAX_COMPLETE_FINGERPRINTS_PER_KEY {
+        selected.push(&items[(index as f64 * step).round() as usize]);
+    }
+    selected
+}
+
+fn create_offset_clusters(candidates: &[SparseAudioCandidate]) -> HashSet<i64> {
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for candidate in candidates {
+        *counts.entry(candidate.offset_bucket).or_default() += 1;
+    }
+    let mut sorted: Vec<(i64, usize)> = counts.into_iter().collect();
+    sorted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut accepted = HashSet::new();
+    for (bucket, count) in sorted.into_iter().take(24) {
+        if count >= 2 || accepted.len() < 8 {
+            accepted.insert(bucket);
+        }
+    }
+    accepted
+}
+
+fn select_monotonic_sparse_matches(
+    candidates: &[SparseAudioCandidate],
+    offset_clusters: &HashSet<i64>,
+    match_threshold: f64,
+) -> Vec<AudioFeatureMatch> {
+    let mut by_source_index: HashMap<usize, Vec<&SparseAudioCandidate>> = HashMap::new();
+    for candidate in candidates {
+        if !offset_clusters.contains(&candidate.offset_bucket) {
+            continue;
+        }
+        by_source_index
+            .entry(candidate.source_index)
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut source_indexes: Vec<usize> = by_source_index.keys().copied().collect();
+    source_indexes.sort_unstable();
+    let mut matches = Vec::new();
+    let mut previous_complete_index: Option<usize> = None;
+    let mut previous_offset_ms: Option<i64> = None;
+    for source_index in source_indexes {
+        let Some(group) = by_source_index.get(&source_index) else {
+            continue;
+        };
+        let candidate = group
+            .iter()
+            .copied()
+            .filter(|item| {
+                previous_complete_index
+                    .map(|previous| item.complete_index > previous)
+                    .unwrap_or(true)
+            })
+            .filter(|item| {
+                previous_offset_ms
+                    .map(|previous| item.offset_ms + FINGERPRINT_BUCKET_MS >= previous)
+                    .unwrap_or(true)
+            })
+            .max_by(|left, right| {
+                score_sparse_candidate(left, previous_offset_ms, offset_clusters, match_threshold)
+                    .total_cmp(&score_sparse_candidate(
+                        right,
+                        previous_offset_ms,
+                        offset_clusters,
+                        match_threshold,
+                    ))
+                    .then_with(|| right.complete_index.cmp(&left.complete_index))
+            });
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        matches.push(AudioFeatureMatch {
+            complete_time_ms: candidate.complete_time_ms,
+            source_time_ms: candidate.source_time_ms,
+            distance: candidate.distance,
+        });
+        previous_complete_index = Some(candidate.complete_index);
+        previous_offset_ms = Some(
+            previous_offset_ms
+                .map(|previous| previous.max(candidate.offset_ms))
+                .unwrap_or(candidate.offset_ms),
+        );
+    }
+    matches
+}
+
+fn score_sparse_candidate(
+    candidate: &SparseAudioCandidate,
+    previous_offset_ms: Option<i64>,
+    offset_clusters: &HashSet<i64>,
+    match_threshold: f64,
+) -> f64 {
+    let cluster_score = if offset_clusters.contains(&candidate.offset_bucket) {
+        3.0
+    } else {
+        0.0
+    };
+    let match_score = 1.0 - candidate.distance / match_threshold.max(0.000_001);
+    let offset_penalty = previous_offset_ms
+        .map(|previous| {
+            candidate.offset_ms.abs_diff(previous) as f64 / FINGERPRINT_BUCKET_MS as f64
+        })
+        .unwrap_or(0.0);
+    cluster_score + match_score - offset_penalty
 }
 
 fn align_audio_feature_sequences(
@@ -855,6 +1380,56 @@ fn infer_cut_candidates(
         });
     }
     merge_nearby_candidates(candidates)
+}
+
+fn refine_cut_candidates(candidates: Vec<CutCandidateDto>) -> Vec<CutCandidateDto> {
+    candidates
+        .into_iter()
+        .map(|mut candidate| {
+            if candidate.source_range_end_ms <= candidate.source_range_start_ms {
+                return candidate;
+            }
+            candidate.source_at_ms = candidate.source_range_start_ms
+                + (candidate.source_range_end_ms - candidate.source_range_start_ms) / 2;
+            candidate.confidence = (candidate.confidence + 0.03).clamp(0.1, 0.98);
+            candidate.note = format!(
+                "{} 已用相邻单调锚点给出复核区间 {}-{}。",
+                candidate.note,
+                format_duration(candidate.source_range_start_ms),
+                format_duration(candidate.source_range_end_ms)
+            );
+            candidate
+        })
+        .collect()
+}
+
+fn estimate_low_confidence_region_count(match_count: usize, source_frame_count: usize) -> usize {
+    let unmatched_count = source_frame_count.saturating_sub(match_count);
+    if unmatched_count == 0 {
+        return 0;
+    }
+    (unmatched_count as f64 / 5.0).ceil().max(1.0) as usize
+}
+
+fn create_evidence_quality(
+    coverage: f64,
+    strong_anchor_count: usize,
+    weak_anchor_count: usize,
+    low_confidence_region_count: usize,
+) -> String {
+    if coverage == 0.0 || low_confidence_region_count >= 6 {
+        return "blocked".to_string();
+    }
+    if coverage >= 0.75
+        && strong_anchor_count >= weak_anchor_count
+        && low_confidence_region_count <= 1
+    {
+        return "high".to_string();
+    }
+    if coverage >= 0.45 && low_confidence_region_count <= 3 {
+        return "medium".to_string();
+    }
+    "low".to_string()
 }
 
 fn estimate_cut_boundary_ms(previous: &AudioFeatureMatch, current: &AudioFeatureMatch) -> u64 {
@@ -1005,6 +1580,30 @@ mod tests {
         assert!(proposal.cut_candidates[0]
             .note
             .contains("候选边界约在当前视频 0:15"));
+        let evidence = proposal.evidence.as_ref().unwrap();
+        assert_eq!(evidence.algorithm, "sparse-fingerprint");
+        assert_eq!(evidence.fingerprint_match_count, 4);
+        assert_eq!(evidence.monotonic_match_count, 4);
+        assert_eq!(evidence.refined_candidate_count, 1);
+        assert!(proposal.diagnostics.join("\n").contains("稀疏音频指纹"));
+    }
+
+    #[test]
+    fn sparse_alignment_avoids_dense_dp_cell_limit() {
+        let mut options = test_options();
+        options.max_cells = 1;
+        let proposal = create_audio_alignment_proposal(
+            &frames(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+            &frames(&[0.1, 0.2, 0.5, 0.6]),
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(proposal.cut_candidates.len(), 1);
+        assert_eq!(
+            proposal.evidence.as_ref().unwrap().algorithm,
+            "sparse-fingerprint"
+        );
     }
 
     #[test]
@@ -1145,6 +1744,11 @@ mod tests {
         assert_eq!(snapshot.status, AudioAlignmentJobStatus::Running);
         assert_eq!(snapshot.progress, 0.35);
         assert_eq!(snapshot.message, "正在测试任务状态。");
+        assert_eq!(snapshot.stage_key, "extracting-complete");
+        assert_eq!(snapshot.stage_label, "提取完整版特征");
+        assert_eq!(snapshot.stage_index, 2);
+        assert_eq!(snapshot.stage_count, AUDIO_ALIGNMENT_STAGE_COUNT);
+        assert!(snapshot.stage_progress > 0.0);
         assert!(snapshot.logs.contains(&"正在测试任务状态。".to_string()));
     }
 

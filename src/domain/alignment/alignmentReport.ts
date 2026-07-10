@@ -80,6 +80,9 @@ export function createAlignmentReviewReport(
     "## 候选版本差异",
     ...createCutCandidateLines(proposal.cutCandidates, statusContext),
     "",
+    "## 对齐证据",
+    ...createEvidenceLines(proposal),
+    "",
     "## 诊断信息",
     ...createDiagnosticLines(proposal.diagnostics)
   ];
@@ -312,6 +315,46 @@ function createDiagnosticLines(diagnostics: string[]): string[] {
     return ["- 暂无诊断信息。"];
   }
   return diagnostics.map((diagnostic, index) => `- ${index + 1}. ${diagnostic}`);
+}
+
+function createEvidenceLines(proposal: AlignmentProposal): string[] {
+  if (!proposal.evidence) {
+    return ["- 暂无对齐证据。"];
+  }
+  const evidence = proposal.evidence;
+  return [
+    `- 算法：${formatEvidenceAlgorithm(evidence.algorithm)}`,
+    `- 质量：${formatEvidenceQuality(evidence.quality)}`,
+    `- 指纹数量：完整版 ${evidence.completeFingerprintCount}，B 站删减版 ${evidence.sourceFingerprintCount}`,
+    `- 稀疏匹配：${evidence.monotonicMatchCount} / ${evidence.fingerprintMatchCount}`,
+    `- 强/弱锚点：${evidence.strongAnchorCount} / ${evidence.weakAnchorCount}`,
+    `- offset 簇：${evidence.offsetClusterCount}`,
+    `- 低置信区：${evidence.lowConfidenceRegionCount}`,
+    `- 精修候选：${evidence.refinedCandidateCount}`
+  ];
+}
+
+function formatEvidenceAlgorithm(algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]): string {
+  if (algorithm === "sparse-fingerprint") {
+    return "稀疏指纹";
+  }
+  if (algorithm === "sparse-fingerprint-fallback") {
+    return "稀疏指纹 + 密集 DP 回退";
+  }
+  return "密集 DP";
+}
+
+function formatEvidenceQuality(quality: NonNullable<AlignmentProposal["evidence"]>["quality"]): string {
+  if (quality === "high") {
+    return "高可信";
+  }
+  if (quality === "medium") {
+    return "中等可信";
+  }
+  if (quality === "low") {
+    return "低可信";
+  }
+  return "需重跑";
 }
 
 function createApplyBlockerLines(blockers: string[]): string[] {

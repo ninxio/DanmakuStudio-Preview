@@ -18,11 +18,30 @@ export interface CutCandidate {
   note: string;
 }
 
+export type AlignmentEvidenceQuality = "high" | "medium" | "low" | "blocked";
+
+export type AlignmentEvidenceAlgorithm = "sparse-fingerprint" | "sparse-fingerprint-fallback" | "dense-dp";
+
+export interface AlignmentEvidenceSummary {
+  algorithm: AlignmentEvidenceAlgorithm;
+  completeFingerprintCount: number;
+  sourceFingerprintCount: number;
+  fingerprintMatchCount: number;
+  monotonicMatchCount: number;
+  strongAnchorCount: number;
+  weakAnchorCount: number;
+  offsetClusterCount: number;
+  refinedCandidateCount: number;
+  lowConfidenceRegionCount: number;
+  quality: AlignmentEvidenceQuality;
+}
+
 export interface AlignmentProposal {
   anchors: SyncAnchor[];
   cutCandidates: CutCandidate[];
   confidence: number;
   diagnostics: string[];
+  evidence?: AlignmentEvidenceSummary;
 }
 
 export interface AlignmentProvider {

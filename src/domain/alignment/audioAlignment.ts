@@ -1,7 +1,7 @@
 import type { SyncAnchor } from "../danmaku/types";
 import type { Milliseconds } from "../shared/time";
 import { clampMilliseconds } from "../shared/time";
-import type { AlignmentProposal, CutCandidate } from "./types";
+import type { AlignmentEvidenceAlgorithm, AlignmentEvidenceQuality, AlignmentProposal, CutCandidate } from "./types";
 
 export interface AudioFeatureFrame {
   timeMs: Milliseconds;
@@ -27,10 +27,45 @@ const DEFAULT_MATCH_THRESHOLD = 0.18;
 const DEFAULT_MIN_GAP_MS = 1000;
 const DEFAULT_MAX_CELLS = 16_000_000;
 const DEFAULT_ANCHOR_STRIDE = 8;
+const FINGERPRINT_BUCKET_MS = 1000;
+const MAX_COMPLETE_FINGERPRINTS_PER_KEY = 32;
+const MAX_SPARSE_MATCH_CANDIDATES = 80_000;
+const MIN_SPARSE_MATCHES = 3;
+const MIN_SPARSE_COVERAGE = 0.25;
 
 const DIRECTION_SKIP_COMPLETE = 1;
 const DIRECTION_SKIP_SOURCE = 2;
 const DIRECTION_MATCH = 3;
+
+interface SparseAudioFingerprint {
+  key: string;
+  frameIndex: number;
+  timeMs: Milliseconds;
+}
+
+interface SparseAudioCandidate {
+  completeIndex: number;
+  sourceIndex: number;
+  completeTimeMs: Milliseconds;
+  sourceTimeMs: Milliseconds;
+  distance: number;
+  offsetMs: number;
+  offsetBucket: number;
+}
+
+interface SparseAudioAlignmentResult {
+  matches: AudioFeatureMatch[];
+  completeFingerprintCount: number;
+  sourceFingerprintCount: number;
+  fingerprintMatchCount: number;
+  offsetClusterCount: number;
+  lowConfidenceRegionCount: number;
+  diagnostics: string[];
+}
+
+interface MultistageAudioAlignmentResult extends SparseAudioAlignmentResult {
+  algorithm: AlignmentEvidenceAlgorithm;
+}
 
 export function createAudioAlignmentProposal(
   completeFrames: AudioFeatureFrame[],
@@ -42,31 +77,292 @@ export function createAudioAlignmentProposal(
       anchors: [],
       cutCandidates: [],
       confidence: 0,
-      diagnostics: ["音频特征为空，无法对齐。"]
+      diagnostics: ["音频特征为空，无法对齐。"],
+      evidence: {
+        algorithm: "sparse-fingerprint",
+        completeFingerprintCount: 0,
+        sourceFingerprintCount: 0,
+        fingerprintMatchCount: 0,
+        monotonicMatchCount: 0,
+        strongAnchorCount: 0,
+        weakAnchorCount: 0,
+        offsetClusterCount: 0,
+        refinedCandidateCount: 0,
+        lowConfidenceRegionCount: 1,
+        quality: "blocked"
+      }
     };
   }
 
   const matchThreshold = options.matchThreshold ?? DEFAULT_MATCH_THRESHOLD;
-  const matches = alignAudioFeatureSequences(completeFrames, sourceFrames, options);
-  const cutCandidates = inferAudioCutCandidates(matches, {
+  const alignment = createMultistageAudioAlignment(completeFrames, sourceFrames, options);
+  const cutCandidates = refineAudioCutCandidates(inferAudioCutCandidates(alignment.matches, {
     matchThreshold,
     minGapMs: options.minGapMs ?? DEFAULT_MIN_GAP_MS
-  });
-  const anchors = createAnchorsFromMatches(matches, options.anchorStride ?? DEFAULT_ANCHOR_STRIDE, matchThreshold);
-  const coverage = matches.length / Math.max(1, sourceFrames.length);
+  }));
+  const anchors = createAnchorsFromMatches(alignment.matches, options.anchorStride ?? DEFAULT_ANCHOR_STRIDE, matchThreshold);
+  const coverage = alignment.matches.length / Math.max(1, sourceFrames.length);
   const diagnostics = [
-    `音频特征匹配 ${matches.length} / ${sourceFrames.length} 帧，覆盖率 ${Math.round(coverage * 100)}%。`,
+    ...alignment.diagnostics,
+    `音频特征匹配 ${alignment.matches.length} / ${sourceFrames.length} 帧，覆盖率 ${Math.round(coverage * 100)}%。`,
     cutCandidates.length > 0
       ? `已推断 ${cutCandidates.length} 个候选缺失段。`
       : "未发现超过阈值的候选缺失段。"
   ];
+  const strongAnchorCount = alignment.matches.filter((match) => match.distance <= matchThreshold * 0.5).length;
+  const weakAnchorCount = alignment.matches.length - strongAnchorCount;
 
   return {
     anchors,
     cutCandidates,
     confidence: clampNumber(coverage, 0, 1),
-    diagnostics
+    diagnostics,
+    evidence: {
+      algorithm: alignment.algorithm,
+      completeFingerprintCount: alignment.completeFingerprintCount,
+      sourceFingerprintCount: alignment.sourceFingerprintCount,
+      fingerprintMatchCount: alignment.fingerprintMatchCount,
+      monotonicMatchCount: alignment.matches.length,
+      strongAnchorCount,
+      weakAnchorCount,
+      offsetClusterCount: alignment.offsetClusterCount,
+      refinedCandidateCount: cutCandidates.length,
+      lowConfidenceRegionCount: alignment.lowConfidenceRegionCount,
+      quality: createEvidenceQuality(coverage, strongAnchorCount, weakAnchorCount, alignment.lowConfidenceRegionCount)
+    }
   };
+}
+
+export function alignSparseAudioFeatureSequences(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  options: AudioAlignmentOptions = {}
+): AudioFeatureMatch[] {
+  return createSparseAudioAlignment(completeFrames, sourceFrames, options).matches;
+}
+
+function createMultistageAudioAlignment(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  options: AudioAlignmentOptions = {}
+): MultistageAudioAlignmentResult {
+  const sparse = createSparseAudioAlignment(completeFrames, sourceFrames, options);
+  const sparseCoverage = sparse.matches.length / Math.max(1, sourceFrames.length);
+  const requiredMatches = Math.min(MIN_SPARSE_MATCHES, sourceFrames.length);
+  if (sparse.matches.length >= requiredMatches && sparseCoverage >= MIN_SPARSE_COVERAGE) {
+    return {
+      ...sparse,
+      algorithm: "sparse-fingerprint"
+    };
+  }
+
+  const maxCells = options.maxCells ?? DEFAULT_MAX_CELLS;
+  const cellCount = (completeFrames.length + 1) * (sourceFrames.length + 1);
+  if (cellCount > maxCells) {
+    return {
+      ...sparse,
+      algorithm: "sparse-fingerprint",
+      diagnostics: [
+        ...sparse.diagnostics,
+        `稀疏锚点不足，已跳过 ${cellCount} 个 DP 单元的密集回退以避免平方级爆炸。`
+      ]
+    };
+  }
+
+  const denseMatches = alignAudioFeatureSequences(completeFrames, sourceFrames, options);
+  return {
+    ...sparse,
+    algorithm: "sparse-fingerprint-fallback",
+    matches: denseMatches,
+    lowConfidenceRegionCount: Math.max(
+      sparse.lowConfidenceRegionCount,
+      estimateLowConfidenceRegionCount(denseMatches.length, sourceFrames.length)
+    ),
+    diagnostics: [
+      ...sparse.diagnostics,
+      `稀疏锚点不足，已回退到密集 DP：${denseMatches.length} 个匹配点。`
+    ]
+  };
+}
+
+function createSparseAudioAlignment(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  options: AudioAlignmentOptions = {}
+): SparseAudioAlignmentResult {
+  const matchThreshold = options.matchThreshold ?? DEFAULT_MATCH_THRESHOLD;
+  const completeFingerprints = createAudioFingerprints(completeFrames);
+  const sourceFingerprints = createAudioFingerprints(sourceFrames);
+  const candidates = createSparseAudioCandidates(completeFrames, sourceFrames, completeFingerprints, sourceFingerprints, matchThreshold);
+  const offsetClusters = createOffsetClusters(candidates);
+  const matches = selectMonotonicSparseMatches(candidates, offsetClusters, matchThreshold);
+  const lowConfidenceRegionCount = estimateLowConfidenceRegionCount(matches.length, sourceFrames.length);
+  return {
+    matches,
+    completeFingerprintCount: completeFingerprints.length,
+    sourceFingerprintCount: sourceFingerprints.length,
+    fingerprintMatchCount: candidates.length,
+    offsetClusterCount: offsetClusters.size,
+    lowConfidenceRegionCount,
+    diagnostics: [
+      `多阶段对齐：生成完整版 ${completeFingerprints.length} 个、B 站删减版 ${sourceFingerprints.length} 个稀疏音频指纹。`,
+      `稀疏锚点匹配 ${candidates.length} 对，单调路径保留 ${matches.length} 个锚点，offset 簇 ${offsetClusters.size} 个。`
+    ]
+  };
+}
+
+function createAudioFingerprints(frames: AudioFeatureFrame[]): SparseAudioFingerprint[] {
+  return frames.map((frame, frameIndex) => ({
+    key: createAudioFingerprintKey(frame),
+    frameIndex,
+    timeMs: frame.timeMs
+  }));
+}
+
+function createAudioFingerprintKey(frame: AudioFeatureFrame): string {
+  const width = Math.min(4, Math.max(1, frame.values.length));
+  const bins: number[] = [];
+  for (let index = 0; index < width; index += 1) {
+    bins.push(quantizeFeature(frame.values[index] ?? 0));
+  }
+  return bins.join(":");
+}
+
+function quantizeFeature(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(clampNumber(value, 0, 1) * 32);
+}
+
+function createSparseAudioCandidates(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  completeFingerprints: SparseAudioFingerprint[],
+  sourceFingerprints: SparseAudioFingerprint[],
+  matchThreshold: number
+): SparseAudioCandidate[] {
+  const completeByKey = new Map<string, SparseAudioFingerprint[]>();
+  for (const fingerprint of completeFingerprints) {
+    const items = completeByKey.get(fingerprint.key) ?? [];
+    items.push(fingerprint);
+    completeByKey.set(fingerprint.key, items);
+  }
+
+  const candidates: SparseAudioCandidate[] = [];
+  for (const sourceFingerprint of sourceFingerprints) {
+    const completeMatches = completeByKey.get(sourceFingerprint.key);
+    if (!completeMatches) {
+      continue;
+    }
+    for (const completeFingerprint of selectCompleteFingerprintsForKey(completeMatches)) {
+      const completeFrame = completeFrames[completeFingerprint.frameIndex];
+      const sourceFrame = sourceFrames[sourceFingerprint.frameIndex];
+      const distance = getFeatureDistance(completeFrame, sourceFrame);
+      if (distance > Math.max(matchThreshold, 0.05)) {
+        continue;
+      }
+      const offsetMs = completeFingerprint.timeMs - sourceFingerprint.timeMs;
+      candidates.push({
+        completeIndex: completeFingerprint.frameIndex,
+        sourceIndex: sourceFingerprint.frameIndex,
+        completeTimeMs: completeFingerprint.timeMs,
+        sourceTimeMs: sourceFingerprint.timeMs,
+        distance,
+        offsetMs,
+        offsetBucket: Math.round(offsetMs / FINGERPRINT_BUCKET_MS)
+      });
+      if (candidates.length >= MAX_SPARSE_MATCH_CANDIDATES) {
+        return candidates;
+      }
+    }
+  }
+  return candidates;
+}
+
+function selectCompleteFingerprintsForKey(items: SparseAudioFingerprint[]): SparseAudioFingerprint[] {
+  if (items.length <= MAX_COMPLETE_FINGERPRINTS_PER_KEY) {
+    return items;
+  }
+  const selected: SparseAudioFingerprint[] = [];
+  const step = (items.length - 1) / (MAX_COMPLETE_FINGERPRINTS_PER_KEY - 1);
+  for (let index = 0; index < MAX_COMPLETE_FINGERPRINTS_PER_KEY; index += 1) {
+    selected.push(items[Math.round(index * step)]);
+  }
+  return selected;
+}
+
+function createOffsetClusters(candidates: SparseAudioCandidate[]): Map<number, number> {
+  const counts = new Map<number, number>();
+  for (const candidate of candidates) {
+    counts.set(candidate.offsetBucket, (counts.get(candidate.offsetBucket) ?? 0) + 1);
+  }
+  const sorted = [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0] - right[0]);
+  const accepted = new Map<number, number>();
+  for (const [bucket, count] of sorted.slice(0, 24)) {
+    if (count >= 2 || accepted.size < 8) {
+      accepted.set(bucket, count);
+    }
+  }
+  return accepted;
+}
+
+function selectMonotonicSparseMatches(
+  candidates: SparseAudioCandidate[],
+  offsetClusters: Map<number, number>,
+  matchThreshold: number
+): AudioFeatureMatch[] {
+  const bySourceIndex = new Map<number, SparseAudioCandidate[]>();
+  for (const candidate of candidates) {
+    if (!offsetClusters.has(candidate.offsetBucket)) {
+      continue;
+    }
+    const items = bySourceIndex.get(candidate.sourceIndex) ?? [];
+    items.push(candidate);
+    bySourceIndex.set(candidate.sourceIndex, items);
+  }
+
+  const matches: AudioFeatureMatch[] = [];
+  let previousCompleteIndex = -1;
+  let previousOffsetMs = Number.NEGATIVE_INFINITY;
+  for (const sourceIndex of [...bySourceIndex.keys()].sort((left, right) => left - right)) {
+    const group = bySourceIndex.get(sourceIndex) ?? [];
+    const candidate = group
+      .filter((item) => item.completeIndex > previousCompleteIndex)
+      .filter((item) => item.offsetMs + FINGERPRINT_BUCKET_MS >= previousOffsetMs)
+      .sort((left, right) => {
+        const leftScore = scoreSparseCandidate(left, previousOffsetMs, offsetClusters, matchThreshold);
+        const rightScore = scoreSparseCandidate(right, previousOffsetMs, offsetClusters, matchThreshold);
+        return rightScore - leftScore || left.completeIndex - right.completeIndex;
+      })[0];
+    if (!candidate) {
+      continue;
+    }
+    matches.push({
+      completeIndex: candidate.completeIndex,
+      sourceIndex: candidate.sourceIndex,
+      completeTimeMs: candidate.completeTimeMs,
+      sourceTimeMs: candidate.sourceTimeMs,
+      distance: candidate.distance
+    });
+    previousCompleteIndex = candidate.completeIndex;
+    previousOffsetMs = Math.max(previousOffsetMs, candidate.offsetMs);
+  }
+  return matches;
+}
+
+function scoreSparseCandidate(
+  candidate: SparseAudioCandidate,
+  previousOffsetMs: number,
+  offsetClusters: Map<number, number>,
+  matchThreshold: number
+): number {
+  const clusterScore = offsetClusters.get(candidate.offsetBucket) ?? 0;
+  const matchScore = 1 - candidate.distance / Math.max(matchThreshold, 0.000_001);
+  const offsetPenalty = Number.isFinite(previousOffsetMs)
+    ? Math.abs(candidate.offsetMs - previousOffsetMs) / FINGERPRINT_BUCKET_MS
+    : 0;
+  return clusterScore * 3 + matchScore - offsetPenalty;
 }
 
 export function alignAudioFeatureSequences(
@@ -144,6 +440,49 @@ export function inferAudioCutCandidates(
     });
   }
   return mergeNearbyCandidates(candidates);
+}
+
+function refineAudioCutCandidates(candidates: CutCandidate[]): CutCandidate[] {
+  return candidates.map((candidate) => {
+    const rangeStartMs = candidate.sourceRangeStartMs ?? candidate.sourceAtMs;
+    const rangeEndMs = candidate.sourceRangeEndMs ?? candidate.sourceAtMs;
+    if (rangeEndMs <= rangeStartMs) {
+      return candidate;
+    }
+    const sourceAtMs = clampMilliseconds(rangeStartMs + Math.round((rangeEndMs - rangeStartMs) / 2));
+    return {
+      ...candidate,
+      sourceAtMs,
+      confidence: clampNumber(candidate.confidence + 0.03, 0.1, 0.98),
+      note: `${candidate.note} 已用相邻单调锚点给出复核区间 ${formatDuration(rangeStartMs)}-${formatDuration(rangeEndMs)}。`
+    };
+  });
+}
+
+function estimateLowConfidenceRegionCount(matchCount: number, sourceFrameCount: number): number {
+  const unmatchedCount = Math.max(0, sourceFrameCount - matchCount);
+  if (unmatchedCount === 0) {
+    return 0;
+  }
+  return Math.max(1, Math.ceil(unmatchedCount / 5));
+}
+
+function createEvidenceQuality(
+  coverage: number,
+  strongAnchorCount: number,
+  weakAnchorCount: number,
+  lowConfidenceRegionCount: number
+): AlignmentEvidenceQuality {
+  if (coverage === 0 || lowConfidenceRegionCount >= 6) {
+    return "blocked";
+  }
+  if (coverage >= 0.75 && strongAnchorCount >= weakAnchorCount && lowConfidenceRegionCount <= 1) {
+    return "high";
+  }
+  if (coverage >= 0.45 && lowConfidenceRegionCount <= 3) {
+    return "medium";
+  }
+  return "low";
 }
 
 function estimateCutBoundaryMs(previous: AudioFeatureMatch, current: AudioFeatureMatch): Milliseconds {

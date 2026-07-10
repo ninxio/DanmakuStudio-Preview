@@ -868,7 +868,20 @@ describe("资源面板", () => {
         }
       ],
       confidence: 0.9,
-      diagnostics: ["音频特征匹配 4 / 4 帧。"]
+      diagnostics: ["音频特征匹配 4 / 4 帧。"],
+      evidence: {
+        algorithm: "sparse-fingerprint" as const,
+        completeFingerprintCount: 6,
+        sourceFingerprintCount: 4,
+        fingerprintMatchCount: 4,
+        monotonicMatchCount: 4,
+        strongAnchorCount: 4,
+        weakAnchorCount: 0,
+        offsetClusterCount: 2,
+        refinedCandidateCount: 1,
+        lowConfidenceRegionCount: 0,
+        quality: "high" as const
+      }
     };
     render(<AssetPanel />);
     await user.click(screen.getByRole("button", { name: /高级工具/ }));
@@ -893,6 +906,10 @@ describe("资源面板", () => {
     expect(screen.getByText(/1 个候选版本差异置信度低于 75%/)).toBeInTheDocument();
     expect(screen.getByText(/1 个候选版本差异包含不确定区间/)).toBeInTheDocument();
     expect(screen.getAllByText(/区间 00:00:18\.000-00:00:22\.000/).length).toBeGreaterThan(0);
+    expect(screen.getByText("对齐证据")).toBeInTheDocument();
+    expect(screen.getByText("稀疏指纹")).toBeInTheDocument();
+    expect(screen.getByText("高可信")).toBeInTheDocument();
+    expect(screen.getByLabelText("对齐证据图")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "应用候选" }));
 
     await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));
@@ -973,6 +990,11 @@ describe("资源面板", () => {
         diagnostics: ["Emby 授权输入测试。"]
       },
       error: null,
+      stageKey: "completed",
+      stageLabel: "已完成",
+      stageIndex: 8,
+      stageCount: 8,
+      stageProgress: 1,
       updatedAtMs: 1
     });
     useEditorStore.setState({
@@ -1009,6 +1031,8 @@ describe("资源面板", () => {
     await user.click(screen.getByRole("button", { name: "运行本地对齐" }));
 
     await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalled());
+    expect(screen.getByLabelText("音频对齐阶段")).toHaveTextContent("阶段 8/8");
+    expect(screen.getByLabelText("音频对齐阶段")).toHaveTextContent("已完成");
     const request = vi.mocked(startTauriAudioAlignmentJob).mock.calls[0][0];
     expect(request.completePath).toContain("https://emby.example.test/emby/Videos/episode-1/stream");
     expect(request.completePath).toContain("api_key=token-secret");

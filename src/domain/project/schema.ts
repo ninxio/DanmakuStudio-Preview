@@ -337,7 +337,27 @@ function isAlignmentProposalOrNull(value: unknown): boolean {
     value.cutCandidates.every(isCutCandidate) &&
     isUnitNumber(value.confidence) &&
     Array.isArray(value.diagnostics) &&
-    value.diagnostics.every((diagnostic) => typeof diagnostic === "string")
+    value.diagnostics.every((diagnostic) => typeof diagnostic === "string") &&
+    (value.evidence === undefined || isAlignmentEvidence(value.evidence))
+  );
+}
+
+function isAlignmentEvidence(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    (value.algorithm === "sparse-fingerprint" ||
+      value.algorithm === "sparse-fingerprint-fallback" ||
+      value.algorithm === "dense-dp") &&
+    isNonNegativeInteger(value.completeFingerprintCount) &&
+    isNonNegativeInteger(value.sourceFingerprintCount) &&
+    isNonNegativeInteger(value.fingerprintMatchCount) &&
+    isNonNegativeInteger(value.monotonicMatchCount) &&
+    isNonNegativeInteger(value.strongAnchorCount) &&
+    isNonNegativeInteger(value.weakAnchorCount) &&
+    isNonNegativeInteger(value.offsetClusterCount) &&
+    isNonNegativeInteger(value.refinedCandidateCount) &&
+    isNonNegativeInteger(value.lowConfidenceRegionCount) &&
+    (value.quality === "high" || value.quality === "medium" || value.quality === "low" || value.quality === "blocked")
   );
 }
 

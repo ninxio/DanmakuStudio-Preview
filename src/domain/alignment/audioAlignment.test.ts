@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   alignAudioFeatureSequences,
+  alignSparseAudioFeatureSequences,
   createAudioAlignmentProposal,
   inferAudioCutCandidates,
   type AudioFeatureFrame
@@ -29,6 +30,42 @@ describe("音频特征对齐", () => {
       [10_000, 10_000],
       [20_000, 40_000],
       [30_000, 50_000]
+    ]);
+    expect(proposal.evidence).toMatchObject({
+      algorithm: "sparse-fingerprint",
+      fingerprintMatchCount: 4,
+      monotonicMatchCount: 4,
+      refinedCandidateCount: 1
+    });
+    expect(proposal.diagnostics.join("\n")).toContain("稀疏音频指纹");
+  });
+
+  it("稀疏路径可在低 maxCells 下避开密集 DP 爆炸", () => {
+    const complete = createFrames([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+    const source = createFrames([0.1, 0.2, 0.5, 0.6]);
+
+    const proposal = createAudioAlignmentProposal(complete, source, {
+      matchThreshold: 0.01,
+      minGapMs: 1000,
+      maxCells: 1,
+      anchorStride: 1
+    });
+
+    expect(proposal.cutCandidates).toHaveLength(1);
+    expect(proposal.evidence?.algorithm).toBe("sparse-fingerprint");
+  });
+
+  it("公开的稀疏锚点匹配会输出单调路径", () => {
+    const matches = alignSparseAudioFeatureSequences(
+      createFrames([0.1, 0.2, 0.3, 0.4, 0.5]),
+      createFrames([0.1, 0.2, 0.5]),
+      { matchThreshold: 0.01 }
+    );
+
+    expect(matches.map((match) => [match.sourceTimeMs, match.completeTimeMs])).toEqual([
+      [0, 0],
+      [10_000, 10_000],
+      [20_000, 40_000]
     ]);
   });
 

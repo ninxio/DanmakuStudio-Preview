@@ -1832,6 +1832,7 @@ function VideoAlignmentLabPanel({
     ? proposal.cutCandidates.filter((candidate) => !skippedCutCandidateIds.includes(candidate.id))
     : [];
   const handledCutCandidateCount = proposal ? proposal.cutCandidates.length - reviewableCutCandidates.length : 0;
+  const alignmentStageItems = jobSnapshot ? createAudioAlignmentStageItems(jobSnapshot) : [];
 
   useEffect(() => {
     let mounted = true;
@@ -2300,6 +2301,28 @@ function VideoAlignmentLabPanel({
                 style={{ width: `${Math.round(jobSnapshot.progress * 100)}%` }}
               />
             </div>
+            {jobSnapshot.stageLabel ? (
+              <div className="grid gap-1" aria-label="音频对齐阶段">
+                <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                  <span className="min-w-0 truncate">
+                    阶段 {jobSnapshot.stageIndex ?? 0}/{jobSnapshot.stageCount ?? alignmentStageItems.length} ·{" "}
+                    {jobSnapshot.stageLabel}
+                  </span>
+                  <span className="shrink-0">{Math.round((jobSnapshot.stageProgress ?? 0) * 100)}%</span>
+                </div>
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(54px,1fr))] gap-1">
+                  {alignmentStageItems.map((item) => (
+                    <span
+                      key={item.key}
+                      className={getAudioAlignmentStageClassName(item.state)}
+                      title={item.label}
+                    >
+                      {item.shortLabel}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <div className="text-[11px] text-slate-500">
               任务 {jobSnapshot.jobId} / {alignmentJobStatusText(jobSnapshot.status)}
             </div>
@@ -2393,6 +2416,7 @@ function VideoAlignmentLabPanel({
         />
         {proposal ? (
           <div className="grid gap-1 text-slate-400">
+            <AlignmentEvidencePanel proposal={proposal} />
             {reviewFocus.length > 0 ? (
               <div className="rounded border border-amber-400/30 bg-amber-400/10 p-2 text-[11px] text-amber-100">
                 <div className="mb-1 font-medium">复核提示</div>
@@ -2579,6 +2603,117 @@ function VideoAlignmentLabPanel({
   );
 }
 
+type AudioAlignmentStageState = "done" | "active" | "pending";
+
+interface AudioAlignmentStageItem {
+  key: string;
+  label: string;
+  shortLabel: string;
+  state: AudioAlignmentStageState;
+}
+
+interface AlignmentOffsetSummary {
+  minOffsetMs: number;
+  maxOffsetMs: number;
+}
+
+const AUDIO_ALIGNMENT_STAGE_ITEMS: Array<Omit<AudioAlignmentStageItem, "state">> = [
+  { key: "validating", label: "校验输入", shortLabel: "校验" },
+  { key: "extracting-complete", label: "提取完整版特征", shortLabel: "原片" },
+  { key: "extracting-source", label: "提取删减版特征", shortLabel: "参考" },
+  { key: "fingerprinting", label: "生成稀疏指纹", shortLabel: "指纹" },
+  { key: "matching", label: "匹配音频锚点", shortLabel: "匹配" },
+  { key: "fitting", label: "拟合单调路径", shortLabel: "拟合" },
+  { key: "refining", label: "精修候选差异", shortLabel: "精修" },
+  { key: "reporting", label: "生成复核数据", shortLabel: "报告" }
+];
+
+function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
+  if (!proposal.evidence) {
+    return null;
+  }
+  const evidence = proposal.evidence;
+  const offsetSummary = createAlignmentOffsetSummary(proposal);
+  const timelineMaxMs = createAlignmentEvidenceTimelineMaxMs(proposal);
+  const anchorTicks = proposal.anchors.slice(0, 18).map((anchor) => ({
+    id: anchor.id,
+    x: timelineMaxMs > 0 ? Math.min(96, Math.max(4, (anchor.sourceMs / timelineMaxMs) * 100)) : 4
+  }));
+  const cutBands = proposal.cutCandidates.slice(0, 12).map((candidate) => ({
+    id: candidate.id,
+    x: timelineMaxMs > 0 ? Math.min(96, Math.max(4, (candidate.sourceAtMs / timelineMaxMs) * 100)) : 4,
+    width: timelineMaxMs > 0 ? Math.min(18, Math.max(3, (Math.abs(candidate.targetGapMs) / timelineMaxMs) * 100)) : 3
+  }));
+  return (
+    <div className="grid gap-2 rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium text-slate-200">对齐证据</span>
+        <span className={getAlignmentEvidenceQualityClassName(evidence.quality)}>
+          {formatAlignmentEvidenceQuality(evidence.quality)}
+        </span>
+      </div>
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(92px,1fr))] gap-2">
+        <EvidenceMetric label="算法" value={formatAlignmentEvidenceAlgorithm(evidence.algorithm)} />
+        <EvidenceMetric label="稀疏锚点" value={`${evidence.monotonicMatchCount} / ${evidence.fingerprintMatchCount}`} />
+        <EvidenceMetric label="强/弱锚点" value={`${evidence.strongAnchorCount} / ${evidence.weakAnchorCount}`} />
+        <EvidenceMetric label="offset 簇" value={`${evidence.offsetClusterCount}`} />
+        <EvidenceMetric label="低置信区" value={`${evidence.lowConfidenceRegionCount}`} />
+        <EvidenceMetric label="精修候选" value={`${evidence.refinedCandidateCount}`} />
+      </div>
+      <svg
+        className="h-12 w-full overflow-visible"
+        viewBox="0 0 100 32"
+        role="img"
+        aria-label="对齐证据图"
+        preserveAspectRatio="none"
+      >
+        <line x1="4" y1="10" x2="96" y2="10" stroke="rgb(71 85 105)" strokeWidth="1" />
+        <line x1="4" y1="22" x2="96" y2="22" stroke="rgb(71 85 105)" strokeWidth="1" />
+        {cutBands.map((band) => (
+          <rect
+            key={band.id}
+            x={Math.max(4, band.x - band.width / 2)}
+            y="5"
+            width={band.width}
+            height="22"
+            rx="1.5"
+            fill="rgba(245,158,11,0.26)"
+          />
+        ))}
+        {anchorTicks.map((tick) => (
+          <circle key={tick.id} cx={tick.x} cy="10" r="1.6" fill="rgb(34 211 238)" />
+        ))}
+        {anchorTicks.map((tick) => (
+          <circle key={`${tick.id}-target`} cx={tick.x} cy="22" r="1.6" fill="rgb(16 185 129)" />
+        ))}
+      </svg>
+      <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 text-slate-400">
+        <span className="text-slate-500">指纹数量</span>
+        <span>
+          完整版 {evidence.completeFingerprintCount} / B 站删减版 {evidence.sourceFingerprintCount}
+        </span>
+        <span className="text-slate-500">offset 范围</span>
+        <span>
+          {offsetSummary
+            ? `${formatSignedDuration(offsetSummary.minOffsetMs)} 到 ${formatSignedDuration(offsetSummary.maxOffsetMs)}`
+            : "锚点不足"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function EvidenceMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid min-w-0 gap-0.5 rounded border border-panel-line/70 bg-[#111318] px-2 py-1">
+      <span className="truncate text-slate-500">{label}</span>
+      <span className="truncate text-slate-100" title={value}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 interface ParsedNumericInput {
   value: number;
   error: string | null;
@@ -2709,6 +2844,95 @@ function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): st
     return "失败";
   }
   return "已取消";
+}
+
+function createAudioAlignmentStageItems(snapshot: AudioAlignmentJobSnapshot): AudioAlignmentStageItem[] {
+  const activeIndex = Math.max(0, snapshot.stageIndex ?? 0);
+  if (snapshot.status === "completed") {
+    return AUDIO_ALIGNMENT_STAGE_ITEMS.map((item) => ({
+      ...item,
+      state: "done"
+    }));
+  }
+  return AUDIO_ALIGNMENT_STAGE_ITEMS.map((item, index) => ({
+    ...item,
+    state: index + 1 < activeIndex ? "done" : index + 1 === activeIndex ? "active" : "pending"
+  }));
+}
+
+function getAudioAlignmentStageClassName(state: AudioAlignmentStageState): string {
+  if (state === "done") {
+    return "truncate rounded border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-1 text-center text-emerald-200";
+  }
+  if (state === "active") {
+    return "truncate rounded border border-accent-cyan/50 bg-accent-cyan/15 px-1.5 py-1 text-center text-accent-cyan";
+  }
+  return "truncate rounded border border-panel-line bg-[#111318] px-1.5 py-1 text-center text-slate-500";
+}
+
+function formatAlignmentEvidenceAlgorithm(algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]): string {
+  if (algorithm === "sparse-fingerprint") {
+    return "稀疏指纹";
+  }
+  if (algorithm === "sparse-fingerprint-fallback") {
+    return "稀疏+DP";
+  }
+  return "密集 DP";
+}
+
+function formatAlignmentEvidenceQuality(quality: NonNullable<AlignmentProposal["evidence"]>["quality"]): string {
+  if (quality === "high") {
+    return "高可信";
+  }
+  if (quality === "medium") {
+    return "中等可信";
+  }
+  if (quality === "low") {
+    return "低可信";
+  }
+  return "需重跑";
+}
+
+function getAlignmentEvidenceQualityClassName(quality: NonNullable<AlignmentProposal["evidence"]>["quality"]): string {
+  if (quality === "high") {
+    return "text-emerald-300";
+  }
+  if (quality === "medium") {
+    return "text-accent-cyan";
+  }
+  if (quality === "low") {
+    return "text-amber-200";
+  }
+  return "text-red-200";
+}
+
+function createAlignmentOffsetSummary(proposal: AlignmentProposal): AlignmentOffsetSummary | null {
+  if (proposal.anchors.length === 0) {
+    return null;
+  }
+  const offsets = proposal.anchors.map((anchor) => anchor.targetMs - anchor.sourceMs);
+  return {
+    minOffsetMs: Math.min(...offsets),
+    maxOffsetMs: Math.max(...offsets)
+  };
+}
+
+function createAlignmentEvidenceTimelineMaxMs(proposal: AlignmentProposal): number {
+  const anchorMax = proposal.anchors.reduce(
+    (current, anchor) => Math.max(current, anchor.sourceMs, anchor.targetMs),
+    0
+  );
+  const cutMax = proposal.cutCandidates.reduce(
+    (current, candidate) =>
+      Math.max(
+        current,
+        candidate.sourceAtMs,
+        candidate.sourceRangeEndMs ?? candidate.sourceAtMs,
+        candidate.sourceAtMs + Math.abs(candidate.targetGapMs)
+      ),
+    0
+  );
+  return Math.max(anchorMax, cutMax, 1);
 }
 
 function getAlignmentReviewStatusClassName(state: AlignmentReviewItemState): string {

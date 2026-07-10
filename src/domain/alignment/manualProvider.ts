@@ -39,7 +39,30 @@ function isProposal(value: unknown): value is AlignmentProposal {
     typeof record.confidence === "number" &&
     Number.isFinite(record.confidence) &&
     Array.isArray(record.diagnostics) &&
-    record.diagnostics.every((diagnostic) => typeof diagnostic === "string")
+    record.diagnostics.every((diagnostic) => typeof diagnostic === "string") &&
+    (record.evidence === undefined || isAlignmentEvidence(record.evidence))
+  );
+}
+
+function isAlignmentEvidence(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    (record.algorithm === "sparse-fingerprint" ||
+      record.algorithm === "sparse-fingerprint-fallback" ||
+      record.algorithm === "dense-dp") &&
+    isNonNegativeInteger(record.completeFingerprintCount) &&
+    isNonNegativeInteger(record.sourceFingerprintCount) &&
+    isNonNegativeInteger(record.fingerprintMatchCount) &&
+    isNonNegativeInteger(record.monotonicMatchCount) &&
+    isNonNegativeInteger(record.strongAnchorCount) &&
+    isNonNegativeInteger(record.weakAnchorCount) &&
+    isNonNegativeInteger(record.offsetClusterCount) &&
+    isNonNegativeInteger(record.refinedCandidateCount) &&
+    isNonNegativeInteger(record.lowConfidenceRegionCount) &&
+    (record.quality === "high" || record.quality === "medium" || record.quality === "low" || record.quality === "blocked")
   );
 }
 
@@ -76,4 +99,8 @@ function isCutCandidate(value: unknown): value is CutCandidate {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }

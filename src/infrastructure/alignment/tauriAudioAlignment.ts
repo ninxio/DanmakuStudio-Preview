@@ -18,11 +18,30 @@ export type AudioAlignmentInvoker = (
 
 export type AudioAlignmentJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
+export type AudioAlignmentStageKey =
+  | "queued"
+  | "validating"
+  | "extracting-complete"
+  | "extracting-source"
+  | "fingerprinting"
+  | "matching"
+  | "fitting"
+  | "refining"
+  | "reporting"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
 export interface AudioAlignmentJobSnapshot {
   jobId: string;
   status: AudioAlignmentJobStatus;
   progress: number;
   message: string;
+  stageKey?: AudioAlignmentStageKey;
+  stageLabel?: string;
+  stageIndex?: number;
+  stageCount?: number;
+  stageProgress?: number;
   logs: string[];
   proposal: AlignmentProposal | null;
   error: string | null;
