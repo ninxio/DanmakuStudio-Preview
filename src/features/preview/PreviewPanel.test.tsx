@@ -88,6 +88,9 @@ describe("预览面板", () => {
     expect(within(session).getByText("播放源")).toBeInTheDocument();
     expect(within(session).getByText("尚未连接")).toBeInTheDocument();
     expect(within(session).getByText("导入本地视频或绑定目标原片。")).toBeInTheDocument();
+    const reliability = screen.getByLabelText("播放可靠性状态");
+    expect(within(reliability).getByText("同步目标 240ms 内")).toBeInTheDocument();
+    expect(within(reliability).getByText("等待媒体后可缓存")).toBeInTheDocument();
   });
 
   it("本地目标原片缺少当前会话视频时提示重新连接", () => {
@@ -248,6 +251,9 @@ describe("预览面板", () => {
       })
     );
     expect(screen.getByText(/已使用 Emby 授权流：Episode 1 \/ 媒体源 source-1/)).toBeInTheDocument();
+    const reliability = screen.getByLabelText("播放可靠性状态");
+    await waitFor(() => expect(within(reliability).getByText("可靠性正常")).toBeInTheDocument());
+    expect(within(reliability).getByText("临时流不落盘")).toBeInTheDocument();
     expect(screen.queryByText(/secret-token/)).not.toBeInTheDocument();
   });
 
@@ -346,6 +352,9 @@ describe("预览面板", () => {
     expect(
       screen.getAllByText("HTML Video 无法播放此视频。请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。").length
     ).toBeGreaterThan(0);
+    const reliability = screen.getByLabelText("播放可靠性状态");
+    expect(within(reliability).getByText("需要恢复")).toBeInTheDocument();
+    expect(within(reliability).getByText("已阻断静默失败")).toBeInTheDocument();
   });
 });
 

@@ -1,5 +1,18 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C123 已完成：补齐 G7 播放器化验收中的性能目标、缓存策略和错误恢复覆盖。
+  - 新增 `src/domain/player/playerReliability.ts`，作为不依赖 React 的播放器可靠性摘要模型，把播放头同步目标、缓存边界和错误恢复路径整理成统一输出。
+  - 播放头同步阈值抽为 `PLAYER_SEEK_SYNC_TOLERANCE_MS = 240`，预览面板纠偏 seek 逻辑与用户可见状态共用同一个可测试常量。
+  - 预览面板新增“播放可靠性状态”条，展示同步目标、当前缓存策略和恢复动作；Emby 授权流明确为本次会话临时流不落盘，格式失败时给出改用 MP4/WebM、本地路径或 mpv 后端的动作。
+  - README 和架构文档已同步性能目标、浏览器对象 URL / 本地路径 / Emby 授权流缓存边界，以及仍待后续实现的自动重试和 mpv 画面嵌入。
+  - 已补充播放器可靠性领域测试和预览面板测试，覆盖无媒体、Emby 授权流和格式失败恢复文案。
+  - 已重新验证：播放器可靠性聚焦测试通过（2 个测试文件 / 13 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、45 个测试文件 / 260 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12376064` 字节，时间 `2026/07/10 23:48:04`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3057404` 字节，时间 `2026/07/10 23:48:04`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c123-player-reliability-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C122 已完成：推进 G7 剧集批量工作台，新增批量整理状态摘要。
   - 新增 `src/domain/project/seasonWorkbench.ts`，作为不依赖 React 的剧集工作台摘要模型，把 XML 导入、目标原片绑定、分集草案、版本差异复核和导出就绪状态整理成可读步骤。
   - 资源栏高级工具新增“剧集工作台”面板，展示当前状态、XML 数、目标原片、输出数、版本差异数，以及下一步建议，让用户能从普通使用视角知道一季弹幕现在卡在哪一步。

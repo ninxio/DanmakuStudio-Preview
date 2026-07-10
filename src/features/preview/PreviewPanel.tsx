@@ -16,6 +16,12 @@ import {
   type PlayerSessionSummary
 } from "../../domain/player/playerSession";
 import {
+  createPlayerReliabilitySummary,
+  PLAYER_SEEK_SYNC_TOLERANCE_MS,
+  type PlayerReliabilitySourceKind,
+  type PlayerReliabilitySummary
+} from "../../domain/player/playerReliability";
+import {
   createPlayerSourceComparisonSummary,
   type PlayerSourceComparisonSummary
 } from "../../domain/player/playerComparison";
@@ -118,6 +124,14 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
         ? project.media.id !== project.mediaBinding.mediaId
         : project.media.fileName !== project.mediaBinding.fileName));
   const mediaReferenceNeedsReconnect = Boolean(project.media && !project.media.objectUrl);
+  const reliabilitySourceKind: PlayerReliabilitySourceKind =
+    previewBackend === "nativeMpv" && previewSourceKind === "url" && embyPreviewInput
+      ? "embyStream"
+      : previewBackend === "nativeMpv" && previewSourceKind === "file" && previewSource
+        ? "localPath"
+        : mediaObjectUrl
+          ? "localObject"
+          : "none";
   const playerSession = useMemo(
     () =>
       createPlayerSessionSummary({
@@ -131,6 +145,18 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
         tracks: playerTracks
       }),
     [project, isPlaying, previewBackend, videoLoadState, previewSource, videoError, mpvPath, playerTracks]
+  );
+  const playerReliability = useMemo(
+    () =>
+      createPlayerReliabilitySummary({
+        backend: previewBackend,
+        loadState: videoLoadState,
+        hasPreviewSource: Boolean(previewSource),
+        sourceKind: reliabilitySourceKind,
+        videoError,
+        mpvConfigured: mpvPath.trim().length > 0
+      }),
+    [previewBackend, videoLoadState, previewSource, reliabilitySourceKind, videoError, mpvPath]
   );
   const sourceComparison = useMemo(
     () =>
@@ -266,7 +292,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
     if (!adapter) {
       return;
     }
-    if (Math.abs(adapter.getCurrentTimeMs() - project.timeline.playheadMs) > 240) {
+    if (Math.abs(adapter.getCurrentTimeMs() - project.timeline.playheadMs) > PLAYER_SEEK_SYNC_TOLERANCE_MS) {
       adapter.seek(project.timeline.playheadMs);
     }
   }, [project.timeline.playheadMs]);
@@ -419,6 +445,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
       </div>
       <PlayerSessionStrip summary={playerSession} />
       {sourceComparison.visible ? <PlayerSourceComparisonStrip summary={sourceComparison} /> : null}
+      <PlayerReliabilityStrip summary={playerReliability} />
       <div className="flex h-12 shrink-0 items-center gap-3 border-t border-panel-line bg-panel-base px-3">
         <IconButton
           label={isPlaying ? "暂停预览" : "播放预览"}
@@ -507,6 +534,35 @@ function PlayerSourceComparisonStrip({ summary }: { summary: PlayerSourceCompari
       className="shrink-0 border-t border-panel-line bg-[#0d1117] px-3 py-2 text-[11px] text-slate-400"
     >
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
+        {items.map((item) => (
+          <div key={item.label} className="min-w-0">
+            <div className="flex items-center gap-1">
+              <span className="shrink-0 text-slate-500">{item.label}</span>
+              <span className="min-w-0 truncate text-slate-200">{item.value}</span>
+            </div>
+            <div className="mt-0.5 truncate text-slate-500" title={item.detail}>
+              {item.detail}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function PlayerReliabilityStrip({ summary }: { summary: PlayerReliabilitySummary }) {
+  const items = [
+    { label: "可靠性", value: summary.statusLabel, detail: summary.recoveryDetail },
+    { label: "同步", value: summary.performanceTargetLabel, detail: summary.performanceStateLabel },
+    { label: "缓存", value: summary.cachePolicyLabel, detail: summary.cacheDetail },
+    { label: "恢复", value: summary.recoveryLabel, detail: summary.recoveryDetail }
+  ];
+  return (
+    <section
+      aria-label="播放可靠性状态"
+      className="shrink-0 border-t border-panel-line bg-[#101217] px-3 py-2 text-[11px] text-slate-400"
+    >
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         {items.map((item) => (
           <div key={item.label} className="min-w-0">
             <div className="flex items-center gap-1">
