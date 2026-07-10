@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C31 已完成：Playwright E2E 覆盖项目健康摘要。
+  - 核心 E2E 流程在保存并重新打开项目后，会切换到“项目信息”，断言“项目健康”面板可见、状态为“健康”，并确认“媒体重连”指标存在。
+  - 已新增真实浏览器截图基线：`artifacts/screenshots/project-health.png`，大小 `79007` 字节，时间 `2026/07/10 8:33:34`。
+  - 重新运行 E2E 后已同步更新主流程截图基线：`compact-editor.png`、`cut-marker.png`、`export-dialog.png`、`reimported-export.png`、`timeline-editing.png`。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 本阶段只修改 E2E 测试、截图基线和进度文档，没有修改运行时代码、UI 源码或 Tauri 代码，因此未重新打包；最新可安装 release 产物仍是 C30 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:31:10`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996578` 字节，时间 `2026/07/10 8:31:10`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c31-e2e-project-health-summary-20260710`。
 - 成熟度提升阶段 C30 已完成：项目信息页新增项目健康摘要。
   - 新增纯领域层 `createProjectHealthSummary`，用于汇总项目资源、弹幕、片段、补偿点、同步锚点、导入警告、单条微调和媒体重连状态。
   - 健康摘要会提示重复 ID、片段引用缺失资源、空片段、所有片段禁用、失效禁用/微调引用、媒体引用需重连、视频时长未知、导入警告、低置信锚点和 0ms 补偿点。

@@ -78,6 +78,12 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByTestId("project-input").setInputFiles(projectFilePath);
   await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
+  await page.getByRole("button", { name: "项目信息" }).click();
+  await expect(page.getByTestId("project-health-panel")).toContainText("项目健康");
+  await expect(page.getByTestId("project-health-panel")).toContainText("健康");
+  await expect(page.getByTestId("project-health-panel")).toContainText("媒体重连");
+  await page.screenshot({ path: screenshotPath("project-health.png"), fullPage: true });
+  await page.getByRole("button", { name: "弹幕文件" }).click();
 
   const blockedAudioAlignmentProposal = {
     anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
