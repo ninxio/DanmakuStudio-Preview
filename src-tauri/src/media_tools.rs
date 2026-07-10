@@ -204,12 +204,7 @@ fn start_mpv_sidecar_inner(request: MpvStartRequest) -> Result<MpvSidecarStatus,
         return Err("尚未配置 mpv 路径。请在设置中心选择 mpv 可执行文件。".to_string());
     }
     let media_path = request.media_path.trim();
-    if media_path.is_empty() {
-        return Err("mpv 播放需要真实本地视频路径。".to_string());
-    }
-    if !Path::new(media_path).is_file() {
-        return Err(format!("mpv 无法读取本地视频文件：{media_path}"));
-    }
+    validate_mpv_media_path(media_path)?;
 
     let ipc_path = create_mpv_ipc_path();
     let start_position_ms = request.start_position_ms.unwrap_or(0);
@@ -242,7 +237,7 @@ fn start_mpv_sidecar_inner(request: MpvStartRequest) -> Result<MpvSidecarStatus,
     stop_mpv_child(&mut state);
     state.child = Some(child);
     state.ipc_path = Some(ipc_path);
-    state.media_path = Some(media_path.to_string());
+    state.media_path = Some(redact_sensitive_media_text(media_path));
     state.playback_status = if start_paused {
         MpvPlaybackStatus::Paused
     } else {
@@ -420,7 +415,61 @@ fn read_child_stderr(child: &mut Child) -> Option<String> {
     let mut stderr = child.stderr.take()?;
     let mut text = String::new();
     stderr.read_to_string(&mut text).ok()?;
-    Some(truncate_text(text.trim(), 600))
+    Some(truncate_text(&redact_sensitive_media_text(text.trim()), 600))
+}
+
+fn validate_mpv_media_path(media_path: &str) -> Result<(), String> {
+    if media_path.is_empty() {
+        return Err("mpv 播放需要真实本地视频路径，或本次会话生成的 Emby 授权播放地址。".to_string());
+    }
+    if is_remote_media_url(media_path) {
+        return Ok(());
+    }
+    if !Path::new(media_path).is_file() {
+        return Err(format!(
+            "mpv 无法读取本地视频文件：{}",
+            redact_sensitive_media_text(media_path)
+        ));
+    }
+    Ok(())
+}
+
+fn is_remote_media_url(media_path: &str) -> bool {
+    let normalized = media_path.trim().to_ascii_lowercase();
+    normalized.starts_with("http://") || normalized.starts_with("https://")
+}
+
+fn redact_sensitive_media_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for key in [
+        "api_key=",
+        "apiKey=",
+        "AccessToken=",
+        "X-Emby-Token=",
+        "token=",
+    ] {
+        redacted = redact_query_value(&redacted, key);
+    }
+    redacted
+}
+
+fn redact_query_value(text: &str, key: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(key) {
+        let (prefix, tail) = rest.split_at(index);
+        result.push_str(prefix);
+        result.push_str(key);
+        result.push_str("<已隐藏>");
+        let value_start = key.len();
+        let value_tail = &tail[value_start..];
+        let value_end = value_tail
+            .find(|character| matches!(character, '&' | ' ' | '\n' | '\r' | '\t'))
+            .unwrap_or(value_tail.len());
+        rest = &value_tail[value_end..];
+    }
+    result.push_str(rest);
+    result
 }
 
 fn create_mpv_status(state: &MpvSidecarState) -> MpvSidecarStatus {
@@ -548,6 +597,26 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("无法读取本地视频文件"));
+    }
+
+    #[test]
+    fn mpv_accepts_remote_authorized_media_url() {
+        assert!(validate_mpv_media_path(
+            "https://emby.example.test/Videos/item/stream?api_key=secret-token&MediaSourceId=source-1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn mpv_status_and_errors_redact_emby_tokens() {
+        let redacted = redact_sensitive_media_text(
+            "https://emby.example.test/Videos/item/stream?api_key=secret-token&token=other failed",
+        );
+
+        assert_eq!(
+            redacted,
+            "https://emby.example.test/Videos/item/stream?api_key=<已隐藏>&token=<已隐藏> failed"
+        );
     }
 
     #[test]

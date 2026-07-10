@@ -1,5 +1,19 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C120 已完成：推进 G7 逐步播放器化第三段，接入 Emby 本次会话授权流 mpv 预览。
+  - `TauriMpvMediaAdapter` 现在支持真实本地文件路径和本次会话生成的 http/https 授权播放地址，继续拒绝浏览器 blob URL；mpv 说明文案同步为本地媒体与 Emby 授权流两类输入。
+  - 预览面板在绑定 Emby 目标原片且没有本地路径时新增真实“使用 Emby 授权流预览”动作：用户点击后会读取本次会话密码、重新登录 Emby、确认条目可访问、生成 `/Videos/{itemId}/stream` 临时地址并交给 mpv。
+  - Emby 播放 URL、token 和密码只停留在当前 React/Tauri 进程内存；界面只显示条目名和媒体源 ID，不展示 token，不写入项目文件、设置备份或 `mediaBinding`。
+  - Tauri mpv sidecar 后端现在允许 http/https 媒体路径；返回状态和 mpv stderr 会遮蔽 `api_key`、`token`、`AccessToken`、`X-Emby-Token` 等敏感参数。
+  - 播放器会话、双源对比、README 和架构文档已同步：Emby 目标可显式生成授权流给 mpv 预览，但双播放器同步、嵌入式窗口、转码失败恢复和更多真实服务器兼容性仍是后续阶段。
+  - 已补充媒体适配器、预览面板、播放器领域和 Rust 测试，覆盖 URL 输入、Emby 授权流按钮、token 不出现在界面、参考源语义修正、Rust URL 校验和 token 遮蔽。
+  - 已重新验证：播放器聚焦测试通过（4 个测试文件 / 19 个测试）；`cargo test` 通过（27 个 Rust 测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、43 个测试文件 / 253 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12366336` 字节，时间 `2026/07/10 23:26:02`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3051079` 字节，时间 `2026/07/10 23:26:02`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c120-emby-mpv-preview-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C119 已完成：推进 G7 逐步播放器化第二段，新增双源对比时间映射状态。
   - 新增 `src/domain/player/playerComparison.ts`，作为不依赖 React 的双源对比摘要模型：把当前编辑时间轴位置视为 B 站参考侧时间，通过已确认 `CutMarker` 计算目标原片时间和已应用补偿。
   - 预览面板在已有参考源、目标源或版本差异时显示“双源对比状态”栏，展示对比状态、参考源、目标源、参考时间、目标时间和已补偿时间；空项目不显示该高级状态，避免打扰第一步导入。

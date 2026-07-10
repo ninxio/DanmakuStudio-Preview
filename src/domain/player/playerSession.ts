@@ -94,7 +94,7 @@ function formatEmbySourceDetail(binding: EmbyItemMediaBinding, hasPreviewSource:
   const suffix = codecParts.length > 0 ? ` / ${codecParts.join(" / ")}` : "";
   return hasPreviewSource
     ? `${prefix}${binding.itemName}${suffix}`
-    : `${prefix}${binding.itemName}${suffix}；预览仍需本地路径或后续播放器流接入。`;
+    : `${prefix}${binding.itemName}${suffix}；可用本次会话授权流或本地路径接入预览。`;
 }
 
 function describeBackendLabel(backend: PlayerPreviewBackend): string {
@@ -150,7 +150,7 @@ function describeNextAction(input: PlayerSessionInput): string {
     return "导入本地视频或绑定目标原片。";
   }
   if (input.project.mediaBinding?.kind === "embyItem" && !input.hasPreviewSource) {
-    return "音频对齐可使用 Emby 授权输入；预览播放器仍需本地路径或后续流接入。";
+    return "音频对齐可使用 Emby 授权输入；预览可使用 Emby 授权流或本地路径。";
   }
   if (input.project.mediaBinding?.kind === "localFile" && !input.hasPreviewSource) {
     return "重新导入视频，或在目标原片中选择本地路径。";

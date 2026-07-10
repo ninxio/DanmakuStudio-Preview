@@ -23,15 +23,45 @@ import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import {
   HtmlVideoMediaAdapter,
   TauriMpvMediaAdapter,
-  type MediaAdapter
+  type MediaAdapter,
+  type MediaSource
 } from "../../infrastructure/media/mediaAdapter";
+import {
+  authenticateEmby,
+  createEmbyAuthorizedStreamUrl,
+  fetchEmbyItem
+} from "../../infrastructure/metadata/embyClient";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
+import { loadVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
 import { useEditorStore } from "../../stores/editorStore";
 
 type VideoLoadState = PlayerLoadState;
 type PreviewBackend = PlayerPreviewBackend;
 
-export function PreviewPanel() {
+interface EmbyPreviewInput {
+  url: string;
+  label: string;
+}
+
+interface EmbyPreviewStatus {
+  tone: "neutral" | "success" | "warning" | "error";
+  message: string;
+}
+
+type PreviewAdapterFactory = (options: {
+  backend: PreviewBackend;
+  video: HTMLVideoElement | null;
+  mpvPath: string;
+}) => MediaAdapter | null;
+
+interface PreviewPanelProps {
+  adapterFactory?: PreviewAdapterFactory;
+}
+
+const defaultPreviewAdapterFactory: PreviewAdapterFactory = ({ backend, video, mpvPath }) =>
+  backend === "nativeMpv" ? new TauriMpvMediaAdapter(mpvPath) : video ? new HtmlVideoMediaAdapter(video) : null;
+
+export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: PreviewPanelProps = {}) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const adapterRef = useRef<MediaAdapter | null>(null);
   const playheadRef = useRef(0);
@@ -46,24 +76,37 @@ export function PreviewPanel() {
   const addCutMarkerAtPlayhead = useEditorStore((state) => state.addCutMarkerAtPlayhead);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadState, setVideoLoadState] = useState<VideoLoadState>("empty");
+  const [embyPreviewInput, setEmbyPreviewInput] = useState<EmbyPreviewInput | null>(null);
+  const [preparingEmbyPreview, setPreparingEmbyPreview] = useState(false);
+  const [embyPreviewStatus, setEmbyPreviewStatus] = useState<EmbyPreviewStatus | null>(null);
   const appSettings = loadAppSettings();
   const preferredBackend = appSettings.player.preferredBackend;
   const mpvPath = appSettings.player.mpvPath;
   const mediaObjectUrl = project.media?.objectUrl ?? null;
   const mediaName = project.media?.name ?? "视频";
+  const embyBinding = project.mediaBinding?.kind === "embyItem" ? project.mediaBinding : null;
   const localMediaPath =
     project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath?.trim() ?? "" : "";
   const localMediaFileName = project.mediaBinding?.kind === "localFile" ? project.mediaBinding.fileName : mediaName;
   const hasLocalMediaPath = localMediaPath.length > 0;
-  const canUseNativeMpv = mpvPath.trim().length > 0 && hasLocalMediaPath;
+  const nativeMpvSource: { kind: MediaSource["kind"]; url: string; name: string } | null = hasLocalMediaPath
+    ? { kind: "file", url: localMediaPath, name: localMediaFileName }
+    : embyPreviewInput
+      ? { kind: "url", url: embyPreviewInput.url, name: embyPreviewInput.label }
+      : null;
+  const canUseNativeMpv = mpvPath.trim().length > 0 && nativeMpvSource !== null;
   const previewBackend: PreviewBackend =
-    canUseNativeMpv && (preferredBackend === "nativeMpv" || (preferredBackend === "auto" && !mediaObjectUrl))
+    canUseNativeMpv &&
+    (Boolean(embyPreviewInput) || preferredBackend === "nativeMpv" || (preferredBackend === "auto" && !mediaObjectUrl))
       ? "nativeMpv"
       : "htmlVideo";
-  const previewSource = previewBackend === "nativeMpv" ? localMediaPath : mediaObjectUrl;
-  const previewSourceName = previewBackend === "nativeMpv" ? localMediaFileName : mediaName;
-  const mediaFileName = previewBackend === "nativeMpv" ? localMediaFileName : project.media?.fileName ?? mediaName;
+  const previewSource = previewBackend === "nativeMpv" ? nativeMpvSource?.url ?? null : mediaObjectUrl;
+  const previewSourceKind: MediaSource["kind"] =
+    previewBackend === "nativeMpv" ? nativeMpvSource?.kind ?? "file" : "url";
+  const previewSourceName = previewBackend === "nativeMpv" ? nativeMpvSource?.name ?? mediaName : mediaName;
+  const mediaFileName = previewBackend === "nativeMpv" ? nativeMpvSource?.name ?? mediaName : project.media?.fileName ?? mediaName;
   const previewDurationMs = project.media?.durationMs ?? project.mediaBinding?.runtimeMs ?? 0;
+  const canPrepareEmbyPreview = Boolean(embyBinding && !hasLocalMediaPath && !embyPreviewInput);
   const localBindingNeedsReconnect =
     project.mediaBinding?.kind === "localFile" &&
     !hasLocalMediaPath &&
@@ -91,9 +134,9 @@ export function PreviewPanel() {
       createPlayerSourceComparisonSummary({
         project,
         referenceTimeMs: project.timeline.playheadMs,
-        hasReferencePlaybackSource: Boolean(previewSource)
+        hasReferencePlaybackSource: Boolean(mediaObjectUrl)
       }),
-    [project, previewSource]
+    [project, mediaObjectUrl]
   );
 
   const events = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
@@ -102,18 +145,62 @@ export function PreviewPanel() {
     [events, project.timeline.playheadMs]
   );
 
+  const prepareEmbyPreview = async (): Promise<void> => {
+    if (!embyBinding) {
+      setEmbyPreviewStatus({ tone: "warning", message: "当前项目没有绑定 Emby 目标原片。" });
+      return;
+    }
+    if (mpvPath.trim().length === 0) {
+      setEmbyPreviewStatus({ tone: "warning", message: "请先在设置中心配置 mpv 路径，再使用 Emby 授权流预览。" });
+      return;
+    }
+    const password = loadVolatileEmbyPassword().trim();
+    if (password.length === 0) {
+      setEmbyPreviewStatus({ tone: "warning", message: "请先在设置中心填写 Emby 密码并保存本次会话。" });
+      return;
+    }
+    setPreparingEmbyPreview(true);
+    setEmbyPreviewStatus({ tone: "neutral", message: "正在准备 Emby 授权流..." });
+    try {
+      const config = {
+        serverUrl: embyBinding.server.serverUrl,
+        pathPrefix: embyBinding.server.pathPrefix
+      };
+      const session = await authenticateEmby(config, {
+        username: embyBinding.server.username,
+        password
+      });
+      const item = await fetchEmbyItem(config, session, embyBinding.itemId);
+      const mediaSourceId = item.mediaSources[0]?.id ?? embyBinding.mediaSources[0]?.id ?? null;
+      const url = createEmbyAuthorizedStreamUrl(config, session, embyBinding.itemId, mediaSourceId);
+      const label = formatEmbyPreviewInputLabel(item.name, mediaSourceId);
+      setEmbyPreviewInput({ url, label });
+      setEmbyPreviewStatus({
+        tone: "success",
+        message: `已准备 Emby 授权流：${label}。临时播放地址不会写入项目文件。`
+      });
+    } catch (error) {
+      setEmbyPreviewStatus({
+        tone: "error",
+        message: `Emby 授权流准备失败：${error instanceof Error ? error.message : "Emby 请求失败。"}`
+      });
+    } finally {
+      setPreparingEmbyPreview(false);
+    }
+  };
+
   useEffect(() => {
     playheadRef.current = project.timeline.playheadMs;
   }, [project.timeline.playheadMs]);
 
   useEffect(() => {
+    setEmbyPreviewInput(null);
+    setEmbyPreviewStatus(null);
+  }, [project.mediaBinding?.id]);
+
+  useEffect(() => {
     const video = videoRef.current;
-    const adapter =
-      previewBackend === "nativeMpv"
-        ? new TauriMpvMediaAdapter(mpvPath)
-        : video
-          ? new HtmlVideoMediaAdapter(video)
-          : null;
+    const adapter = adapterFactory({ backend: previewBackend, video, mpvPath });
     if (!adapter) {
       return;
     }
@@ -125,7 +212,7 @@ export function PreviewPanel() {
         adapterRef.current = null;
       }
     };
-  }, [mpvPath, previewBackend]);
+  }, [adapterFactory, mpvPath, previewBackend]);
 
   useEffect(() => {
     const adapter = adapterRef.current;
@@ -147,7 +234,7 @@ export function PreviewPanel() {
     setVideoLoadState("loading");
     setVideoError(null);
     void adapter
-      .load({ kind: "file", name: previewSourceName, url: previewSource })
+      .load({ kind: previewSourceKind, name: previewSourceName, url: previewSource })
       .then(() => {
         if (!cancelled) {
           loadedSourceRef.current = sourceKey;
@@ -166,7 +253,7 @@ export function PreviewPanel() {
     return () => {
       cancelled = true;
     };
-  }, [previewBackend, previewSource, previewSourceName, setPlaying, updateMediaDuration]);
+  }, [previewBackend, previewSource, previewSourceKind, previewSourceName, setPlaying, updateMediaDuration]);
 
   useEffect(() => {
     const adapter = adapterRef.current;
@@ -233,6 +320,8 @@ export function PreviewPanel() {
               <div className="text-slate-300">
                 {localBindingNeedsReconnect || mediaReferenceNeedsReconnect
                   ? "需要重新连接视频"
+                  : canPrepareEmbyPreview
+                    ? "可使用 Emby 授权流预览"
                   : preferredBackend === "nativeMpv" && !hasLocalMediaPath
                     ? "需要选择本地原片路径"
                     : "尚未导入视频"}
@@ -242,10 +331,34 @@ export function PreviewPanel() {
                   ? "项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份本地视频。"
                   : mediaReferenceNeedsReconnect
                     ? "项目里只有媒体引用，没有当前会话可播放的视频对象。请重新导入本地视频。"
+                    : canPrepareEmbyPreview
+                      ? "mpv 可以读取本次会话生成的 Emby 临时播放地址；项目文件不会保存密码、token 或播放 URL。"
                     : preferredBackend === "nativeMpv" && !hasLocalMediaPath
                       ? "mpv 需要真实本地文件路径。请在“媒体 / 目标原片”里选择本地路径。"
                       : "当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。"}
               </div>
+              {canPrepareEmbyPreview ? (
+                <div className="mt-3 grid justify-items-center gap-2">
+                  <TextButton onClick={() => void prepareEmbyPreview()} disabled={preparingEmbyPreview}>
+                    {preparingEmbyPreview ? "准备中" : "使用 Emby 授权流预览"}
+                  </TextButton>
+                  {embyPreviewStatus ? (
+                    <div
+                      className={`max-w-[360px] text-xs leading-5 ${
+                        embyPreviewStatus.tone === "error"
+                          ? "text-accent-red"
+                          : embyPreviewStatus.tone === "warning"
+                            ? "text-accent-yellow"
+                            : embyPreviewStatus.tone === "success"
+                              ? "text-accent-green"
+                              : "text-slate-400"
+                      }`}
+                    >
+                      {embyPreviewStatus.message}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -254,8 +367,15 @@ export function PreviewPanel() {
             <div className="max-w-[min(420px,calc(100%-32px))]">
               <div className="text-slate-300">mpv 桌面播放器</div>
               <div className="mt-2 text-xs leading-5">
-                本地视频正在 mpv 窗口中播放；这里继续显示播放头、时间和弹幕预览状态。
+                {previewSourceKind === "url"
+                  ? "Emby 授权流正在 mpv 窗口中播放；临时地址只保存在本次会话内。"
+                  : "本地视频正在 mpv 窗口中播放；这里继续显示播放头、时间和弹幕预览状态。"}
               </div>
+              {embyPreviewInput ? (
+                <div className="mt-2 text-xs leading-5 text-accent-cyan">
+                  已使用 Emby 授权流：{embyPreviewInput.label}。
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -464,4 +584,8 @@ function DanmakuOverlay({
 
 function formatPreviewBackend(backend: PreviewBackend): string {
   return backend === "nativeMpv" ? "mpv" : "HTML Video";
+}
+
+function formatEmbyPreviewInputLabel(itemName: string, mediaSourceId: string | null): string {
+  return mediaSourceId ? `${itemName} / 媒体源 ${mediaSourceId}` : itemName;
 }

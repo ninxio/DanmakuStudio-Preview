@@ -3,12 +3,62 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
+import type { MediaAdapter } from "../../infrastructure/media/mediaAdapter";
+import {
+  authenticateEmby,
+  createEmbyAuthorizedStreamUrl,
+  fetchEmbyItem
+} from "../../infrastructure/metadata/embyClient";
+import { DEFAULT_APP_SETTINGS, saveAppSettings } from "../../infrastructure/settings/appSettings";
+import { loadVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
 import { useEditorStore } from "../../stores/editorStore";
 import { PreviewPanel } from "./PreviewPanel";
+
+vi.mock("../../infrastructure/metadata/embyClient", () => ({
+  authenticateEmby: vi.fn(),
+  createEmbyAuthorizedStreamUrl: vi.fn(),
+  fetchEmbyItem: vi.fn()
+}));
+
+vi.mock("../../infrastructure/settings/volatileEmbyCredentials", () => ({
+  loadVolatileEmbyPassword: vi.fn()
+}));
 
 describe("预览面板", () => {
   beforeEach(() => {
     window.localStorage.clear();
+    vi.mocked(loadVolatileEmbyPassword).mockReturnValue("secret-pass");
+    vi.mocked(authenticateEmby).mockResolvedValue({
+      userId: "user-1",
+      accessToken: "secret-token",
+      userName: "tester"
+    });
+    vi.mocked(fetchEmbyItem).mockResolvedValue({
+      id: "episode-1",
+      name: "Episode 1",
+      type: "Episode",
+      seriesName: "Demo",
+      seasonNumber: 1,
+      episodeNumber: 1,
+      durationMs: 3_000_000,
+      mediaSources: [
+        {
+          id: "source-1",
+          name: "1080p",
+          container: "mkv",
+          videoCodec: "h264",
+          audioCodec: "aac",
+          width: 1920,
+          height: 1080,
+          bitrate: 8_000_000,
+          sizeBytes: 1_000_000_000,
+          runtimeMs: 3_000_000
+        }
+      ]
+    });
+    vi.mocked(createEmbyAuthorizedStreamUrl).mockReturnValue(
+      "https://emby.example.test/Videos/episode-1/stream?api_key=secret-token&MediaSourceId=source-1"
+    );
     useEditorStore.setState({
       project: createEmptyProject(),
       selection: { kind: "none", ids: [] },
@@ -154,6 +204,53 @@ describe("预览面板", () => {
     expect(within(comparison).getByText("+00:00:45.000")).toBeInTheDocument();
   });
 
+  it("可以用 Emby 授权流启动 mpv 预览且界面不显示 token", async () => {
+    const user = userEvent.setup();
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      player: {
+        mpvPath: "C:\\tools\\mpv.exe",
+        preferredBackend: "auto"
+      }
+    });
+    useEditorStore.setState((state) => ({
+      project: {
+        ...state.project,
+        mediaBinding: {
+          id: "binding-emby",
+          kind: "embyItem",
+          displayName: "Demo / S01E01",
+          itemId: "episode-1",
+          itemName: "Episode 1",
+          itemType: "Episode",
+          seriesName: "Demo",
+          seasonNumber: 1,
+          episodeNumber: 1,
+          runtimeMs: 3_000_000,
+          linkedAt: "2026-07-10T00:00:00.000Z",
+          server: { serverUrl: "https://emby.example.test", pathPrefix: "/emby", username: "tester" },
+          mediaSources: []
+        }
+      }
+    }));
+    const load = vi.fn<MediaAdapter["load"]>(() => Promise.resolve());
+    const adapterFactory = vi.fn(() => createFakeMediaAdapter(load));
+
+    render(<PreviewPanel adapterFactory={adapterFactory} />);
+
+    await user.click(screen.getByRole("button", { name: "使用 Emby 授权流预览" }));
+
+    await waitFor(() =>
+      expect(load).toHaveBeenCalledWith({
+        kind: "url",
+        name: "Episode 1 / 媒体源 source-1",
+        url: "https://emby.example.test/Videos/episode-1/stream?api_key=secret-token&MediaSourceId=source-1"
+      })
+    );
+    expect(screen.getByText(/已使用 Emby 授权流：Episode 1 \/ 媒体源 source-1/)).toBeInTheDocument();
+    expect(screen.queryByText(/secret-token/)).not.toBeInTheDocument();
+  });
+
   it("可以切换弹幕显示状态", async () => {
     const user = userEvent.setup();
     render(<PreviewPanel />);
@@ -251,3 +348,16 @@ describe("预览面板", () => {
     ).toBeGreaterThan(0);
   });
 });
+
+function createFakeMediaAdapter(load: MediaAdapter["load"]): MediaAdapter {
+  return {
+    load,
+    play: vi.fn<MediaAdapter["play"]>(() => Promise.resolve()),
+    pause: vi.fn<MediaAdapter["pause"]>(),
+    seek: vi.fn<MediaAdapter["seek"]>(),
+    getCurrentTimeMs: vi.fn<MediaAdapter["getCurrentTimeMs"]>(() => 0),
+    getDurationMs: vi.fn<MediaAdapter["getDurationMs"]>(() => 3_000_000),
+    setPlaybackRate: vi.fn<MediaAdapter["setPlaybackRate"]>(),
+    dispose: vi.fn<MediaAdapter["dispose"]>()
+  };
+}

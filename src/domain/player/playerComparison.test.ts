@@ -17,7 +17,7 @@ describe("播放器双源对比摘要", () => {
     expect(summary.nextActionLabel).toBe("先导入 B 站 XML 或参考视频。");
   });
 
-  it("说明 Emby 目标可以授权采样但视频双源播放仍待接入", () => {
+  it("说明 Emby 目标可以授权采样并显式生成 mpv 预览流", () => {
     const project: EditorProject = {
       ...createEmptyProject(),
       assets: [createAsset("asset-1")],
@@ -50,7 +50,7 @@ describe("播放器双源对比摘要", () => {
     expect(summary.referenceLabel).toBe("B 站 XML 时间轴");
     expect(summary.targetLabel).toBe("Emby 目标原片");
     expect(summary.referenceTimeLabel).toBe("00:00:12.000");
-    expect(summary.nextActionLabel).toBe("可用 Emby 授权输入做音频对齐；双源视频播放仍待接入。");
+    expect(summary.nextActionLabel).toBe("可显式生成 Emby 授权流进行 mpv 预览；音频对齐也可使用授权输入。");
   });
 
   it("把当前参考时间映射到已应用版本差异后的目标时间", () => {

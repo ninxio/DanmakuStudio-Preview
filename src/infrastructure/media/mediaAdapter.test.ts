@@ -42,6 +42,21 @@ describe("媒体适配器", () => {
       new TauriMpvMediaAdapter("mpv", bridge).load({ kind: "file", name: "demo", url: "blob:demo" })
     ).rejects.toThrow("真实本地文件路径");
   });
+
+  it("mpv 适配器可以加载本次会话的 Emby 授权播放地址", async () => {
+    const bridge = createBridge();
+    const adapter = new TauriMpvMediaAdapter("C:\\tools\\mpv.exe", bridge);
+    const url = "https://emby.example.test/Videos/item/stream?api_key=secret-token&MediaSourceId=source-1";
+
+    await adapter.load({ kind: "url", name: "Episode 1", url });
+
+    expect(bridge.start).toHaveBeenCalledWith({
+      mpvPath: "C:\\tools\\mpv.exe",
+      mediaPath: url,
+      startPositionMs: 0,
+      startPaused: true
+    });
+  });
 });
 
 function createBridge(): TauriMpvBridge {

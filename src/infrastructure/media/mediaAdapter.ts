@@ -110,8 +110,8 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
     if (this.mpvPath.length === 0) {
       throw new Error("尚未配置 mpv 路径。请在“设置中心 / 播放器与工具”里选择 mpv 可执行文件。");
     }
-    if (source.kind !== "file" || source.url.startsWith("blob:")) {
-      throw new Error("mpv 播放需要真实本地文件路径。请在“目标原片”里选择本地原片路径。");
+    if (!isSupportedMpvSource(source)) {
+      throw new Error("mpv 播放需要真实本地文件路径，或本次会话生成的 Emby 授权播放地址。");
     }
     const status = await startTauriMpvSidecar(
       {
@@ -177,7 +177,7 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
   }
 
   getSupportedContainerNote(): string {
-    return "mpv 后端用于本地 MKV、高码率或复杂编码视频；需要桌面端和真实本地文件路径。";
+    return "mpv 后端用于本地 MKV、高码率、复杂编码视频和本次会话生成的 Emby 授权流；需要桌面端。";
   }
 
   private startPolling(): void {
@@ -206,4 +206,19 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
       this.stopPolling();
     }
   }
+}
+
+function isSupportedMpvSource(source: MediaSource): boolean {
+  if (source.url.startsWith("blob:")) {
+    return false;
+  }
+  if (source.kind === "file") {
+    return source.url.trim().length > 0;
+  }
+  return source.kind === "url" && isHttpMediaUrl(source.url);
+}
+
+function isHttpMediaUrl(url: string): boolean {
+  const normalized = url.trim().toLocaleLowerCase();
+  return normalized.startsWith("http://") || normalized.startsWith("https://");
 }

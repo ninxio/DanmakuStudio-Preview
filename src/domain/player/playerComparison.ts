@@ -138,7 +138,7 @@ function describeNextAction(project: EditorProject, hasReference: boolean, hasTa
     return "绑定本地或 Emby 目标原片。";
   }
   if (project.mediaBinding?.kind === "embyItem") {
-    return "可用 Emby 授权输入做音频对齐；双源视频播放仍待接入。";
+    return "可显式生成 Emby 授权流进行 mpv 预览；音频对齐也可使用授权输入。";
   }
   if (project.cutMarkers.length === 0) {
     return "试听疑似删减点，标记版本差异后会显示目标时间补偿。";
