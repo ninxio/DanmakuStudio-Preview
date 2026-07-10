@@ -14,6 +14,10 @@ import {
   type PlayerPreviewBackend,
   type PlayerSessionSummary
 } from "../../domain/player/playerSession";
+import {
+  createPlayerSourceComparisonSummary,
+  type PlayerSourceComparisonSummary
+} from "../../domain/player/playerComparison";
 import { formatTimecode } from "../../domain/shared/time";
 import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import {
@@ -81,6 +85,15 @@ export function PreviewPanel() {
         mpvConfigured: mpvPath.trim().length > 0
       }),
     [project, isPlaying, previewBackend, videoLoadState, previewSource, videoError, mpvPath]
+  );
+  const sourceComparison = useMemo(
+    () =>
+      createPlayerSourceComparisonSummary({
+        project,
+        referenceTimeMs: project.timeline.playheadMs,
+        hasReferencePlaybackSource: Boolean(previewSource)
+      }),
+    [project, previewSource]
   );
 
   const events = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
@@ -278,6 +291,7 @@ export function PreviewPanel() {
         ) : null}
       </div>
       <PlayerSessionStrip summary={playerSession} />
+      {sourceComparison.visible ? <PlayerSourceComparisonStrip summary={sourceComparison} /> : null}
       <div className="flex h-12 shrink-0 items-center gap-3 border-t border-panel-line bg-panel-base px-3">
         <IconButton
           label={isPlaying ? "暂停预览" : "播放预览"}
@@ -335,6 +349,37 @@ function PlayerSessionStrip({ summary }: { summary: PlayerSessionSummary }) {
       className="shrink-0 border-t border-panel-line bg-[#101318] px-3 py-2 text-[11px] text-slate-400"
     >
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+        {items.map((item) => (
+          <div key={item.label} className="min-w-0">
+            <div className="flex items-center gap-1">
+              <span className="shrink-0 text-slate-500">{item.label}</span>
+              <span className="min-w-0 truncate text-slate-200">{item.value}</span>
+            </div>
+            <div className="mt-0.5 truncate text-slate-500" title={item.detail}>
+              {item.detail}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function PlayerSourceComparisonStrip({ summary }: { summary: PlayerSourceComparisonSummary }) {
+  const items = [
+    { label: "对比", value: summary.stateLabel, detail: summary.nextActionLabel },
+    { label: "参考源", value: summary.referenceLabel, detail: summary.referenceDetail },
+    { label: "目标源", value: summary.targetLabel, detail: summary.targetDetail },
+    { label: "参考时间", value: summary.referenceTimeLabel, detail: "编辑时间轴当前位置" },
+    { label: "目标时间", value: summary.targetTimeLabel, detail: summary.compensationDetail },
+    { label: "已补偿", value: summary.compensationLabel, detail: summary.compensationDetail }
+  ];
+  return (
+    <section
+      aria-label="双源对比状态"
+      className="shrink-0 border-t border-panel-line bg-[#0d1117] px-3 py-2 text-[11px] text-slate-400"
+    >
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
         {items.map((item) => (
           <div key={item.label} className="min-w-0">
             <div className="flex items-center gap-1">

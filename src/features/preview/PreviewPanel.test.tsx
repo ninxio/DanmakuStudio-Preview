@@ -106,6 +106,54 @@ describe("预览面板", () => {
     expect(within(session).getByText(/音频对齐可使用 Emby 授权输入/)).toBeInTheDocument();
   });
 
+  it("显示双源对比的参考时间和目标时间补偿", () => {
+    useEditorStore.setState((state) => ({
+      project: {
+        ...state.project,
+        media: {
+          id: "media-local",
+          name: "cut",
+          fileName: "cut.mp4",
+          objectUrl: "blob:cut",
+          durationMs: 120_000
+        },
+        mediaBinding: {
+          id: "binding-local",
+          kind: "localFile",
+          displayName: "完整版",
+          fileName: "full.mkv",
+          mediaId: null,
+          localPath: "D:\\media\\full.mkv",
+          runtimeMs: 180_000,
+          linkedAt: "2026-07-10T00:00:00.000Z"
+        },
+        cutMarkers: [
+          {
+            id: "cut-1",
+            name: "片头缺失",
+            sourceAtMs: 2_000,
+            targetGapMs: 45_000,
+            note: "目标完整版在此处额外存在内容"
+          }
+        ],
+        timeline: {
+          ...state.project.timeline,
+          playheadMs: 2_500
+        }
+      }
+    }));
+
+    render(<PreviewPanel />);
+
+    const comparison = screen.getByLabelText("双源对比状态");
+    expect(within(comparison).getByText("双源对比可复核")).toBeInTheDocument();
+    expect(within(comparison).getByText("B 站参考视频")).toBeInTheDocument();
+    expect(within(comparison).getByText("本地目标原片")).toBeInTheDocument();
+    expect(within(comparison).getByText("00:00:02.500")).toBeInTheDocument();
+    expect(within(comparison).getByText("00:00:47.500")).toBeInTheDocument();
+    expect(within(comparison).getByText("+00:00:45.000")).toBeInTheDocument();
+  });
+
   it("可以切换弹幕显示状态", async () => {
     const user = userEvent.setup();
     render(<PreviewPanel />);
