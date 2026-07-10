@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C82 已完成：ZIP 内重名条目去重后仍限制长度。
+  - `createStoredZip` 生成内部条目名时，重复文件名追加 ` (2)`、` (3)` 等后缀后也会保持 180 字符上限。
+  - 超长重名 XML 条目会保留去重后缀和 `.xml` 扩展名，避免 ZIP 内部文件名因追加后缀再次超长或互相覆盖。
+  - 已补充下载基础设施测试，覆盖超长重名条目的 ZIP 中央目录名称、去重后缀、扩展名和长度限制。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts` 成功，1 个测试文件、9 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/175 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:47:40`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997692` 字节，时间 `2026/07/10 12:47:40`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c82-zip-duplicate-file-name-length-20260710`。
 - 成熟度提升阶段 C81 已完成：下载文件名限制长度并保留扩展名。
   - 下载文件名清理现在会把最终文件名限制在 180 个字符内，降低超长项目名在 Windows 下载或保存时失败的风险。
   - 截断超长文件名时会优先保留短扩展名，例如 `.xml`、`.json`、`.zip`，让下载文件仍容易识别类型。

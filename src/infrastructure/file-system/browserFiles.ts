@@ -174,7 +174,7 @@ function createUniqueZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {
     const extension = dotIndex > 0 ? safeName.slice(dotIndex) : "";
     return {
       ...file,
-      fileName: `${base} (${count + 1})${extension}`
+      fileName: appendDuplicateSuffixToDownloadFileName(base, extension, count + 1)
     };
   });
 }
@@ -227,6 +227,18 @@ function truncateDownloadFileName(fileName: string): string {
     .join("")
     .replace(TRAILING_WINDOWS_DOTS_AND_SPACES_PATTERN, "");
   return `${truncatedBase}${extension}`;
+}
+
+function appendDuplicateSuffixToDownloadFileName(base: string, extension: string, duplicateNumber: number): string {
+  const suffix = ` (${duplicateNumber})`;
+  const extensionLength = Array.from(extension).length;
+  const suffixLength = Array.from(suffix).length;
+  const baseLength = Math.max(1, MAX_DOWNLOAD_FILE_NAME_LENGTH - extensionLength - suffixLength);
+  const truncatedBase = Array.from(base)
+    .slice(0, baseLength)
+    .join("")
+    .replace(TRAILING_WINDOWS_DOTS_AND_SPACES_PATTERN, "");
+  return `${truncatedBase || "export"}${suffix}${extension}`;
 }
 
 function createZipLocalHeader(nameBytes: Uint8Array, data: Uint8Array, crc32: number): Uint8Array {

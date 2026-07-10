@@ -21,6 +21,21 @@ describe("浏览器文件导出", () => {
     await expect(readCentralDirectoryNames(zip)).resolves.toEqual(["S01_E01.xml", "S01_E01 (2).xml"]);
   });
 
+  it("打包超长重名条目时保留去重后缀并限制长度", async () => {
+    const longName = `${"超长分集名".repeat(50)}.xml`;
+    const zip = createStoredZip([
+      { fileName: longName, content: "<i />" },
+      { fileName: longName, content: "<i />" }
+    ]);
+
+    const names = await readCentralDirectoryNames(zip);
+    expect(names).toHaveLength(2);
+    expect(names[0]).not.toBe(names[1]);
+    expect(names.every((name) => Array.from(name).length <= 180)).toBe(true);
+    expect(names[0].endsWith(".xml")).toBe(true);
+    expect(names[1].endsWith(" (2).xml")).toBe(true);
+  });
+
   it("下载文件名会清理路径字符和 Windows 保留名", () => {
     expect(sanitizeDownloadFileName(" 健康/报告:项目?.txt ")).toBe("健康_报告_项目_.txt");
     expect(sanitizeDownloadFileName("CON.xml")).toBe("_CON.xml");
