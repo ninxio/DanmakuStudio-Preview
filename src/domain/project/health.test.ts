@@ -205,6 +205,45 @@ describe("project health", () => {
     );
   });
 
+  it("提示空片段和 0ms 补偿点时显示证据", () => {
+    const asset = createAsset("asset", [createItem("item-1")]);
+    const project = {
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-empty",
+          assetId: "asset",
+          name: "空片段",
+          timelineStartMs: 5000,
+          sourceInMs: 2000,
+          sourceOutMs: 3000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ],
+      cutMarkers: [{ id: "zero", name: "标记", sourceAtMs: 1500, targetGapMs: 0, note: "仅标记" }]
+    };
+
+    const summary = createProjectHealthSummary(project);
+    const report = createProjectHealthReport("复核项目", summary);
+
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "empty-clips",
+        evidence: ["空片段 / asset.xml（时间轴 00:00:05.000，源区间 00:00:02.000 - 00:00:03.000）"]
+      })
+    );
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "zero-gap-markers",
+        evidence: ["标记（ID：zero，源时间 00:00:01.500，备注：仅标记）"]
+      })
+    );
+    expect(report).toContain("空片段 / asset.xml");
+    expect(report).toContain("标记（ID：zero");
+  });
+
   it("提示会在导出时被限制为 0ms 的负最终时间", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const project = {

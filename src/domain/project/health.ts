@@ -1,4 +1,11 @@
-import type { DanmakuAsset, DanmakuClip, ImportWarning, ResolvedDanmakuEvent, SyncAnchor } from "../danmaku/types";
+import type {
+  CutMarker,
+  DanmakuAsset,
+  DanmakuClip,
+  ImportWarning,
+  ResolvedDanmakuEvent,
+  SyncAnchor
+} from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import type { EditorProject } from "./types";
@@ -83,10 +90,14 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   const assetIds = new Set(project.assets.map((asset) => asset.id));
   const missingAssetClips = project.clips.filter((clip) => !assetIds.has(clip.assetId));
   const missingAssetClipCount = missingAssetClips.length;
-  const emptyClipCount = project.clips.filter((clip) => {
-    const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
-    return asset ? !clipHasVisibleItem(asset, clip) : false;
-  }).length;
+  const emptyClips = project.clips
+    .map((clip) => {
+      const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
+      return asset && !clipHasVisibleItem(asset, clip) ? { clip, asset } : null;
+    })
+    .filter((entry): entry is { clip: DanmakuClip; asset: DanmakuAsset } => entry !== null);
+  const emptyClipCount = emptyClips.length;
+  const zeroGapMarkers = project.cutMarkers.filter((marker) => marker.targetGapMs === 0);
   const activeClipCount = project.clips.filter((clip) => clip.enabled).length;
   const lowConfidenceAnchors = project.syncAnchors.filter(
     (anchor) => anchor.confidence !== undefined && anchor.confidence < 0.75
@@ -171,7 +182,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "empty-clips",
       severity: "warning",
       title: "存在空片段",
-      detail: `${emptyClipCount.toLocaleString("zh-CN")} 个时间轴片段当前源区间内没有弹幕，导出前建议确认片段裁剪范围。`
+      detail: `${emptyClipCount.toLocaleString("zh-CN")} 个时间轴片段当前源区间内没有弹幕，导出前建议确认片段裁剪范围。`,
+      evidence: formatEmptyClipEvidence(emptyClips)
     });
   }
   if (project.clips.length > 0 && activeClipCount === 0) {
@@ -238,12 +250,13 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       evidence: formatLowConfidenceAnchorEvidence(lowConfidenceAnchors)
     });
   }
-  if (project.cutMarkers.some((marker) => marker.targetGapMs === 0)) {
+  if (zeroGapMarkers.length > 0) {
     findings.push({
       id: "zero-gap-markers",
       severity: "info",
       title: "存在 0ms 补偿点",
-      detail: "0ms 补偿点不会改变时间轴，可保留作标记，也可在确认后删除。"
+      detail: "0ms 补偿点不会改变时间轴，可保留作标记，也可在确认后删除。",
+      evidence: formatZeroGapMarkerEvidence(zeroGapMarkers)
     });
   }
   if (findings.length === 0) {
@@ -485,6 +498,23 @@ function formatLowConfidenceAnchorEvidence(anchors: SyncAnchor[]): string[] {
     )}，置信度 ${confidence}）`;
   });
   return appendOmittedEvidenceNote(evidence, anchors.length, "个低置信锚点");
+}
+
+function formatEmptyClipEvidence(entries: Array<{ clip: DanmakuClip; asset: DanmakuAsset }>): string[] {
+  const evidence = entries.slice(0, EVIDENCE_PREVIEW_LIMIT).map(({ clip, asset }) => {
+    return `${clip.name} / ${asset.fileName}（时间轴 ${formatTimecode(clip.timelineStartMs)}，源区间 ${formatTimecode(
+      clip.sourceInMs
+    )} - ${formatTimecode(clip.sourceOutMs)}）`;
+  });
+  return appendOmittedEvidenceNote(evidence, entries.length, "个空片段");
+}
+
+function formatZeroGapMarkerEvidence(markers: CutMarker[]): string[] {
+  const evidence = markers.slice(0, EVIDENCE_PREVIEW_LIMIT).map((marker) => {
+    const note = marker.note.trim().length > 0 ? `，备注：${formatLimitedText(marker.note.trim())}` : "";
+    return `${marker.name}（ID：${marker.id}，源时间 ${formatTimecode(marker.sourceAtMs)}${note}）`;
+  });
+  return appendOmittedEvidenceNote(evidence, markers.length, "个 0ms 补偿点");
 }
 
 function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {

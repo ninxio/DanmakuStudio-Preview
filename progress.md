@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C54 已完成：空片段与 0ms 补偿点健康项显示证据。
+  - 项目健康摘要中的“存在空片段”现在会列出片段名、资源文件、时间轴起点和源区间。
+  - “存在 0ms 补偿点”现在会列出补偿点名、ID、源时间和备注，方便确认它只是标记还是误配置。
+  - README 已同步：空片段和 0ms 补偿点也会列出具体出现位置，并写入健康报告。
+  - 已补充领域层测试，覆盖空片段证据、0ms 补偿点证据和健康报告内容。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts` 成功，1 个测试文件、11 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、150 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:30:35`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997655` 字节，时间 `2026/07/10 10:30:35`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c54-health-empty-and-zero-evidence-20260710`。
 - 成熟度提升阶段 C53 已完成：低置信同步锚点健康项显示证据。
   - 项目健康摘要中的“存在低置信同步锚点”现在会列出锚点 ID、来源、源时间、目标时间和置信度百分比。
   - 证据会进入资源栏“项目信息”、健康报告和导出摘要健康预检，便于应用补偿前定位需要人工复核的锚点。
