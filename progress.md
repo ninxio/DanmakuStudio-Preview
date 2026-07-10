@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C81 已完成：下载文件名限制长度并保留扩展名。
+  - 下载文件名清理现在会把最终文件名限制在 180 个字符内，降低超长项目名在 Windows 下载或保存时失败的风险。
+  - 截断超长文件名时会优先保留短扩展名，例如 `.xml`、`.json`、`.zip`，让下载文件仍容易识别类型。
+  - Windows 保留名加前缀后也会经过同一长度限制，非法路径字符清理和保留名处理继续保持原行为。
+  - 已补充下载基础设施测试，覆盖超长文件名截断、扩展名保留和保留名前缀后的长度限制。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts` 成功，1 个测试文件、8 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/174 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:43:10`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997137` 字节，时间 `2026/07/10 12:43:10`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c81-truncate-download-file-names-20260710`。
 - 成熟度提升阶段 C80 已完成：导出前健康阻断提示汇总多个问题。
   - 新增 `summarizeProjectHealthBlockers` 领域 helper，用于从项目健康摘要中生成导出阻断项标题概览。
   - `prepareExport` 在项目存在多个结构阻断时，现在会在状态栏同时提示多个阻断标题，不再只显示第一个问题。

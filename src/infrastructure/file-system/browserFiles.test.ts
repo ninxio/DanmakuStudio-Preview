@@ -27,6 +27,21 @@ describe("浏览器文件导出", () => {
     expect(sanitizeDownloadFileName("   ", "export.xml")).toBe("export.xml");
   });
 
+  it("下载文件名会限制长度并保留短扩展名", () => {
+    const result = sanitizeDownloadFileName(`${"超长项目名".repeat(50)}.xml`);
+
+    expect(Array.from(result).length).toBeLessThanOrEqual(180);
+    expect(result).toMatch(/^超长项目名/);
+    expect(result.endsWith(".xml")).toBe(true);
+  });
+
+  it("Windows 保留名加前缀后仍会限制长度", () => {
+    const result = sanitizeDownloadFileName(`CON.${"x".repeat(260)}`);
+
+    expect(Array.from(result).length).toBeLessThanOrEqual(180);
+    expect(result.startsWith("_CON.")).toBe(true);
+  });
+
   it("单文件下载返回实际使用的文件名", () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");

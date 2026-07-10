@@ -52,6 +52,8 @@ export interface DownloadTextFilesResult {
 }
 
 const ILLEGAL_DOWNLOAD_FILE_NAME_CHARACTERS = "\\/:*?\"<>|";
+const MAX_DOWNLOAD_FILE_NAME_LENGTH = 180;
+const MAX_PRESERVED_EXTENSION_LENGTH = 24;
 const TRAILING_WINDOWS_DOTS_AND_SPACES_PATTERN = /[. ]+$/g;
 const RESERVED_WINDOWS_FILE_NAMES = new Set([
   "CON",
@@ -190,9 +192,9 @@ function sanitizeFileNameCandidate(fileName: string): string | null {
   }
   const baseName = sanitized.split(".")[0].toUpperCase();
   if (RESERVED_WINDOWS_FILE_NAMES.has(baseName)) {
-    return `_${sanitized}`;
+    return truncateDownloadFileName(`_${sanitized}`);
   }
-  return sanitized;
+  return truncateDownloadFileName(sanitized);
 }
 
 function replaceIllegalDownloadFileNameCharacter(result: string, character: string): string {
@@ -205,6 +207,26 @@ function replaceIllegalDownloadFileNameCharacter(result: string, character: stri
 function isIllegalDownloadFileNameCharacter(character: string): boolean {
   const codePoint = character.codePointAt(0) ?? 0;
   return codePoint < 32 || codePoint === 127 || ILLEGAL_DOWNLOAD_FILE_NAME_CHARACTERS.includes(character);
+}
+
+function truncateDownloadFileName(fileName: string): string {
+  const characters = Array.from(fileName);
+  if (characters.length <= MAX_DOWNLOAD_FILE_NAME_LENGTH) {
+    return fileName;
+  }
+  const extensionStart = fileName.lastIndexOf(".");
+  const extension =
+    extensionStart > 0 && Array.from(fileName.slice(extensionStart)).length <= MAX_PRESERVED_EXTENSION_LENGTH
+      ? fileName.slice(extensionStart)
+      : "";
+  const extensionLength = Array.from(extension).length;
+  const base = extension ? fileName.slice(0, extensionStart) : fileName;
+  const baseLength = Math.max(1, MAX_DOWNLOAD_FILE_NAME_LENGTH - extensionLength);
+  const truncatedBase = Array.from(base)
+    .slice(0, baseLength)
+    .join("")
+    .replace(TRAILING_WINDOWS_DOTS_AND_SPACES_PATTERN, "");
+  return `${truncatedBase}${extension}`;
 }
 
 function createZipLocalHeader(nameBytes: Uint8Array, data: Uint8Array, crc32: number): Uint8Array {
