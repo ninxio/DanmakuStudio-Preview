@@ -13,6 +13,7 @@
     "test:e2e": "playwright test",
     "lint": "eslint .",
     "audit:source": "node scripts/audit-source.mjs",
+    "verify": "corepack pnpm audit:source && corepack pnpm lint && corepack pnpm test && corepack pnpm build",
     "format": "prettier --write .",
     "align:audio": "node scripts/audio-align-prototype.mjs",
     "tauri": "tauri",

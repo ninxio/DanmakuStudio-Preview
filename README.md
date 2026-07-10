@@ -32,6 +32,7 @@ corepack pnpm test
 corepack pnpm test:e2e
 corepack pnpm lint
 corepack pnpm audit:source
+corepack pnpm verify
 corepack pnpm tauri:dev
 corepack pnpm tauri:build
 ```
