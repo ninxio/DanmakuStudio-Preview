@@ -1,5 +1,14 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C108 已完成：修复导入本地视频后预览区不显示、时长不更新的问题。
+  - 根因：`PreviewPanel` 只在组件首次挂载时创建 `HtmlVideoMediaAdapter`；空项目首次渲染时还没有 `<video>` 节点，导入视频后节点才出现，但 adapter 不会重新创建，导致 object URL 已进入 store 却没有任何加载动作。
+  - 预览区现在始终保留真实 `<video>` 节点，未导入视频时用占位层覆盖；导入视频后会显示文件名、“正在加载预览...”和“预览已就绪 / 时长”，让用户不用去资源栏找隐藏状态。
+  - 加载成功后会读取 metadata、写入 `project.media.durationMs`，时间轴视频轨和媒体信息可以拿到真实时长；加载失败仍显示浏览器原生格式限制提示。
+  - 已补充回归测试，覆盖“先打开空预览，再导入视频”的真实用户路径，防止 adapter 再次错过 video 节点。
+  - 已重新验证：`corepack pnpm lint` 通过；`corepack pnpm test` 通过（36 个测试文件，208 个测试）；`corepack pnpm build` 通过；`corepack pnpm test:e2e` 通过（3 个 Chromium E2E）；`corepack pnpm tauri:build` 通过。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12247552` 字节，时间 `2026/07/10 20:18:21`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3007829` 字节，时间 `2026/07/10 20:18:20`。
+
 - 2026-07-10：成熟度提升阶段 C107 已完成：完成 Danmaku Studio 新手友好改造，把主界面从“工程师工具箱”收敛为“下一步该做什么”的五步动线。
   - `AGENTS.md` 已新增总原则：任何用户可见功能都必须先从普通用户视角审视为什么需要、何时需要、是否需要亲自管理、能否看懂入口和结果。
   - 首页/资源栏/工作流总览改为围绕“导入素材、放入时间轴、处理版本差异、导出前检查、导出 XML”组织；常用动作默认可见，Emby、对齐实验室、疑似差异扫描、批量规则等高级工具默认收起。

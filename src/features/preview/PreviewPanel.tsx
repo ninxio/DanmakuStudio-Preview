@@ -13,10 +13,13 @@ import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import { HtmlVideoMediaAdapter } from "../../infrastructure/media/mediaAdapter";
 import { useEditorStore } from "../../stores/editorStore";
 
+type VideoLoadState = "empty" | "loading" | "ready";
+
 export function PreviewPanel() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const adapterRef = useRef<HtmlVideoMediaAdapter | null>(null);
   const playheadRef = useRef(0);
+  const loadedSourceRef = useRef<string | null>(null);
   const project = useEditorStore((state) => state.project);
   const isPlaying = useEditorStore((state) => state.isPlaying);
   const setPlaying = useEditorStore((state) => state.setPlaying);
@@ -25,8 +28,10 @@ export function PreviewPanel() {
   const updateMediaDuration = useEditorStore((state) => state.updateMediaDuration);
   const updatePreview = useEditorStore((state) => state.updatePreview);
   const [videoError, setVideoError] = useState<string | null>(null);
+  const [videoLoadState, setVideoLoadState] = useState<VideoLoadState>("empty");
   const mediaObjectUrl = project.media?.objectUrl ?? null;
   const mediaName = project.media?.name ?? "视频";
+  const mediaFileName = project.media?.fileName ?? mediaName;
 
   const events = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
   const visibleEvents = useMemo(
@@ -53,22 +58,36 @@ export function PreviewPanel() {
 
   useEffect(() => {
     const adapter = adapterRef.current;
-    if (!adapter || !mediaObjectUrl) {
+    if (!adapter) {
+      return;
+    }
+    if (!mediaObjectUrl) {
+      if (loadedSourceRef.current) {
+        adapter.dispose();
+        loadedSourceRef.current = null;
+      }
+      setVideoError(null);
+      setVideoLoadState("empty");
+      setPlaying(false);
       return;
     }
     let cancelled = false;
+    setVideoLoadState("loading");
     setVideoError(null);
     void adapter
       .load({ kind: "file", name: mediaName, url: mediaObjectUrl })
       .then(() => {
         if (!cancelled) {
+          loadedSourceRef.current = mediaObjectUrl;
           updateMediaDuration(adapter.getDurationMs());
           adapter.seek(playheadRef.current);
+          setVideoLoadState("ready");
         }
       })
       .catch((error: unknown) => {
         if (!cancelled) {
           setVideoError(error instanceof Error ? error.message : "视频加载失败。");
+          setVideoLoadState("empty");
           setPlaying(false);
         }
       });
@@ -125,14 +144,17 @@ export function PreviewPanel() {
         className="relative min-h-0 flex-1 overflow-hidden bg-black"
         data-testid="preview-panel"
       >
-        {project.media?.objectUrl ? (
-          <video
-            ref={videoRef}
-            className="h-full w-full object-contain"
-            onPause={() => setPlaying(false)}
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center text-center text-sm text-slate-500">
+        <video
+          ref={videoRef}
+          aria-label="视频预览画面"
+          className={`h-full w-full object-contain transition-opacity ${mediaObjectUrl ? "opacity-100" : "opacity-0"}`}
+          data-testid="preview-video"
+          playsInline
+          preload="metadata"
+          onPause={() => setPlaying(false)}
+        />
+        {!mediaObjectUrl ? (
+          <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-slate-500">
             <div>
               <div className="text-slate-300">尚未导入视频</div>
               <div className="mt-2 text-xs">
@@ -140,7 +162,19 @@ export function PreviewPanel() {
               </div>
             </div>
           </div>
-        )}
+        ) : null}
+        {mediaObjectUrl ? (
+          <div className="absolute left-3 top-3 max-w-[min(420px,calc(100%-24px))] rounded border border-white/10 bg-black/55 px-3 py-2 text-xs text-slate-300 shadow-lg backdrop-blur">
+            <div className="truncate font-medium text-slate-100">{mediaFileName}</div>
+            <div className="mt-1 text-slate-400">
+              {videoLoadState === "loading"
+                ? "正在加载预览..."
+                : videoLoadState === "ready"
+                  ? `预览已就绪 / ${formatTimecode(project.media?.durationMs ?? 0)}`
+                  : "等待视频载入"}
+            </div>
+          </div>
+        ) : null}
         {videoError ? (
           <div className="absolute left-4 top-4 rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 text-xs text-accent-red">
             {videoError}
