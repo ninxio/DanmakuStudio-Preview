@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "demo_three_part_project",
   "name": "三分P合并示例",
   "media": null,
@@ -267,7 +267,7 @@
       "name": "part-1 时间轴片段",
       "timelineStartMs": 0,
       "sourceInMs": 0,
-      "sourceOutMs": 24000,
+      "sourceOutMs": 24001,
       "localOffsetMs": 0,
       "enabled": true
     },
@@ -275,9 +275,9 @@
       "id": "demo_clip_2",
       "assetId": "demo_asset_2",
       "name": "part-2 时间轴片段",
-      "timelineStartMs": 24000,
+      "timelineStartMs": 24001,
       "sourceInMs": 0,
-      "sourceOutMs": 28000,
+      "sourceOutMs": 28001,
       "localOffsetMs": 0,
       "enabled": true
     },
@@ -285,9 +285,9 @@
       "id": "demo_clip_3",
       "assetId": "demo_asset_3",
       "name": "part-3 时间轴片段",
-      "timelineStartMs": 52000,
+      "timelineStartMs": 52002,
       "sourceInMs": 0,
-      "sourceOutMs": 32000,
+      "sourceOutMs": 32001,
       "localOffsetMs": 0,
       "enabled": true
     }

@@ -31,8 +31,10 @@ describe("project schema", () => {
 
   it("可打开仓库内三分 P 示例项目", () => {
     const fixture = readFileSync(resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"), "utf8");
-    const parsed = parseProjectJson(fixture);
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(fixture);
 
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(migration).toBeNull();
     expect(parsed.assets).toHaveLength(3);
     expect(parsed.cutMarkers).toHaveLength(1);
   });

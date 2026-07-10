@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C86 已完成：仓库主示例项目升级为 schema v2。
+  - `fixtures/projects/three-part-demo.danmaku-project.json` 已从 v1 升到 v2，三个分 P 片段的 `sourceOutMs` 改为半开区间尾界，保证示例本身不再作为旧项目打开。
+  - 示例片段的 `timelineStartMs` 已同步微调，保持三个分 P 片段在 v2 半开区间语义下连续排列。
+  - 项目 schema 测试现在断言三分 P 示例为当前版本且不触发迁移，避免主示例再次落回旧 schema。
+  - E2E 健康阻断用例会从当前 v2 示例临时构造 v1 输入，继续端到端覆盖“打开旧版项目”迁移提示和旧闭区间兼容逻辑。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/schema.test.ts` 成功，1 个测试文件、13 个测试通过。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/178 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:11:41`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998785` 字节，时间 `2026/07/10 13:11:41`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c86-fixture-project-schema-v2-20260710`。
 - 成熟度提升阶段 C85 已完成：项目健康信息展示当前项目版本。
   - `ProjectHealthMetrics` 新增 `schemaVersion`，健康摘要可以直接携带当前项目文件语义版本。
   - “项目信息”里的项目健康指标新增“项目版本”，当前显示为 `v2`，方便确认旧项目打开后已迁移到当前版本。

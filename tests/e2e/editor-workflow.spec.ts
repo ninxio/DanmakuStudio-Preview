@@ -6,7 +6,8 @@ const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
 const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
 
 interface SavedProjectFile {
-  clips?: Array<{ assetId?: string; [key: string]: unknown }>;
+  schemaVersion?: number;
+  clips?: Array<{ assetId?: string; sourceOutMs?: number; [key: string]: unknown }>;
   disabledItemIds?: string[];
   itemTimeAdjustments?: Record<string, number>;
   [key: string]: unknown;
@@ -278,6 +279,11 @@ test("导出前会阻断项目健康错误", async ({ page }) => {
   if (!blockedProject.clips || blockedProject.clips.length === 0) {
     throw new Error("测试项目缺少时间轴片段。");
   }
+  blockedProject.schemaVersion = 1;
+  blockedProject.clips = blockedProject.clips.map((clip) => ({
+    ...clip,
+    sourceOutMs: typeof clip.sourceOutMs === "number" ? clip.sourceOutMs - 1 : clip.sourceOutMs
+  }));
   blockedProject.clips[0] = {
     ...blockedProject.clips[0],
     assetId: "missing-asset"
