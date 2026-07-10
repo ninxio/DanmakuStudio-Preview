@@ -79,6 +79,29 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
 
+  const blockedAudioAlignmentProposal = {
+    anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
+    cutCandidates: [
+      {
+        id: "audio-gap-1",
+        name: "音频推断补偿 1",
+        sourceAtMs: 20_000,
+        sourceRangeStartMs: 22_000,
+        sourceRangeEndMs: 18_000,
+        targetGapMs: 20_000,
+        confidence: 0.72,
+        note: "音频对齐候选"
+      }
+    ],
+    confidence: 0.82,
+    diagnostics: ["音频特征匹配 4 / 4 帧。"]
+  };
+  await page.getByPlaceholder("AlignmentProposal JSON").fill(JSON.stringify(blockedAudioAlignmentProposal, null, 2));
+  await page.getByRole("button", { name: "导入提案" }).click();
+  await expect(page.getByText("应用已暂停")).toBeVisible();
+  await expect(page.getByText(/不确定区间起止顺序异常/).last()).toBeVisible();
+  await expect(page.getByRole("button", { name: "应用候选" })).toBeDisabled();
+
   const audioAlignmentProposal = {
     anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
     cutCandidates: [
@@ -99,6 +122,8 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByPlaceholder("AlignmentProposal JSON").fill(JSON.stringify(audioAlignmentProposal, null, 2));
   await page.getByRole("button", { name: "导入提案" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已发送到时间轴预览");
+  await expect(page.getByText("应用已暂停")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "应用候选" })).toBeEnabled();
   const alignmentReportDownloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "导出报告" }).click();
   const alignmentReportDownload = await alignmentReportDownloadPromise;
