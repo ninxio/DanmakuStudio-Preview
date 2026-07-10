@@ -132,6 +132,7 @@ export function AssetPanel() {
   const deleteSyncAnchor = useEditorStore((state) => state.deleteSyncAnchor);
   const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
+  const clearAlignmentProposal = useEditorStore((state) => state.clearAlignmentProposal);
   const previewAlignmentProposalData = useEditorStore((state) => state.previewAlignmentProposalData);
   const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
   const setCutHintSettings = useEditorStore((state) => state.setCutHintSettings);
@@ -336,6 +337,14 @@ export function AssetPanel() {
                   onTextChange={setAlignmentProposalText}
                   onImportText={importAlignmentProposalText}
                   onApply={applyAlignmentProposal}
+                  onClear={() => {
+                    if (alignmentProposal) {
+                      clearAlignmentProposal();
+                    } else {
+                      setStatus({ message: "已清空对齐提案草稿。", tone: "neutral" });
+                    }
+                    setAlignmentProposalText("");
+                  }}
                   onFocusQueueItem={(sourceAtMs, name) => {
                     setPlayhead(sourceAtMs);
                     setStatus({
@@ -1253,6 +1262,7 @@ function VideoAlignmentLabPanel({
   onTextChange,
   onImportText,
   onApply,
+  onClear,
   onFocusQueueItem
 }: {
   project: EditorProject;
@@ -1262,6 +1272,7 @@ function VideoAlignmentLabPanel({
   onTextChange: (value: string) => void;
   onImportText: (value: string, sourceFileName?: string) => void;
   onApply: () => void;
+  onClear: () => void;
   onFocusQueueItem: (sourceAtMs: number, name: string) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1280,6 +1291,7 @@ function VideoAlignmentLabPanel({
   const previewCuts = preview.proposalCuts.slice(0, 3);
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
+  const canClearProposal = Boolean(proposal) || text.trim().length > 0;
   const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
   const applyBlockerContext = {
     existingAnchors: project.syncAnchors,
@@ -1667,6 +1679,13 @@ function VideoAlignmentLabPanel({
           >
             <Download size={14} />
             导出报告
+          </TextButton>
+          <TextButton
+            onClick={onClear}
+            disabled={!canClearProposal}
+          >
+            <Trash2 size={14} />
+            清空提案
           </TextButton>
           <TextButton
             tone="primary"

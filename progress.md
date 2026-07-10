@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C104 已完成：对齐提案支持从资源面板显式清空，并进入撤销/重做链路。
+  - `editorStore` 新增 `clearAlignmentProposal`，通过现有项目快照提交机制把 `project.alignmentProposal` 置空，并同步顶层 `alignmentProposal`，避免对齐提案持久化后旧候选长期残留在项目状态里。
+  - “视频对齐实验室”新增真实“清空提案”按钮；当前已有项目提案时会清空项目内提案、复核队列和 `AlignmentProposal JSON` 文本框，没有项目提案但有本地草稿时会仅清空草稿。
+  - 清空项目提案是非破坏性项目操作，可通过撤销恢复原提案、重做再次清空；不会修改原始 XML 数据或已落点的同步锚点/补偿标记。
+  - 已补充 store 测试，覆盖清空对齐提案后项目状态与顶层状态同步置空，并验证撤销/重做恢复与再次清空。
+  - 已补充资源面板测试，覆盖点击“清空提案”后 JSON 文本框清空、项目内提案清空、复核队列消失并显示成功状态。
+  - 已重新验证：`corepack pnpm test -- src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、52 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/202 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 15:15:36`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3000461` 字节，时间 `2026/07/10 15:15:36`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c104-clear-alignment-proposal-20260710`。
 - 成熟度提升阶段 C103 已完成：资源栏对齐提案 JSON 文本框同步项目内恢复状态。
   - C101/C102 让对齐提案进入项目文件与历史快照后，“视频对齐实验室”的 `AlignmentProposal JSON` 文本框现在会从当前项目提案温和同步，打开带持久化提案的项目后可直接看到、复制、重新导入或导出提案 JSON。
   - 同步逻辑会保留用户正在手写的非空草稿；只有切换/打开项目、文本框为空，或文本框仍是上一次自动同步内容时才用项目内提案回填，避免普通状态刷新覆盖用户输入。

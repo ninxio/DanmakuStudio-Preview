@@ -541,6 +541,50 @@ describe("资源面板", () => {
     expect(screen.getByText("复核队列")).toBeInTheDocument();
   });
 
+  it("可以从资源面板清空当前对齐提案和 JSON 文本框", async () => {
+    const user = userEvent.setup();
+    const proposal = {
+      anchors: [{ id: "saved-anchor", sourceMs: 20_000, targetMs: 40_000, origin: "automatic" as const, confidence: 0.9 }],
+      cutCandidates: [
+        {
+          id: "saved-gap",
+          name: "已保存补偿",
+          sourceAtMs: 20_000,
+          sourceRangeStartMs: 18_000,
+          sourceRangeEndMs: 22_000,
+          targetGapMs: 20_000,
+          confidence: 0.82,
+          note: "项目内恢复"
+        }
+      ],
+      confidence: 0.9,
+      diagnostics: ["项目内恢复的提案"]
+    };
+    const project = useEditorStore.getState().project;
+    useEditorStore.setState({
+      project: {
+        ...project,
+        alignmentProposal: proposal
+      },
+      alignmentProposal: proposal
+    });
+
+    render(<AssetPanel />);
+
+    const textArea = screen.getByPlaceholderText("AlignmentProposal JSON");
+    await waitFor(() => expect(textArea).toHaveValue(`${JSON.stringify(proposal, null, 2)}\n`));
+    await user.click(screen.getByRole("button", { name: "清空提案" }));
+
+    expect(textArea).toHaveValue("");
+    expect(useEditorStore.getState().alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().status).toEqual({
+      message: "已清空当前对齐提案。",
+      tone: "success"
+    });
+    expect(screen.queryByText("复核队列")).not.toBeInTheDocument();
+  });
+
   it("可以导入并应用音频 CLI 输出的对齐提案", async () => {
     const user = userEvent.setup();
     const proposal = {

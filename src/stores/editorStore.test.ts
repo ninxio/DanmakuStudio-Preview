@@ -166,6 +166,30 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.alignmentProposal).toBe(proposal);
   });
 
+  it("清空对齐提案时同步项目状态并支持撤销重做", () => {
+    const proposal = createAlignmentProposal();
+    useEditorStore.getState().previewAlignmentProposalData(proposal);
+
+    useEditorStore.getState().clearAlignmentProposal();
+
+    expect(useEditorStore.getState().alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().status).toEqual({
+      message: "已清空当前对齐提案。",
+      tone: "success"
+    });
+
+    useEditorStore.getState().undo();
+
+    expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(useEditorStore.getState().project.alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
+
+    useEditorStore.getState().redo();
+
+    expect(useEditorStore.getState().alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
+  });
+
   it("撤销和重做项目快照时同步顶层对齐提案", () => {
     const asset = createAsset("asset-with-preview", "preview.xml");
     resetStore({

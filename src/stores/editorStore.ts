@@ -153,6 +153,7 @@ interface EditorStore {
   importAlignmentProposalText: (text: string, sourceFileName?: string) => void;
   previewAlignmentProposalData: (proposal: AlignmentProposal) => void;
   exportAlignmentProposal: () => string;
+  clearAlignmentProposal: () => void;
   applyAlignmentProposalData: (proposal: AlignmentProposal) => void;
   applyAlignmentProposal: () => void;
   setCutHintSettings: (settings: Partial<CutHintSearchSettings>) => void;
@@ -1046,6 +1047,18 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       diagnostics: ["手动导出的当前锚点。"]
     };
     return `${JSON.stringify(proposal, null, 2)}\n`;
+  },
+
+  clearAlignmentProposal: () => {
+    if (!get().alignmentProposal && !get().project.alignmentProposal) {
+      set({ status: { message: "当前没有可清空的对齐提案。", tone: "warning" } });
+      return;
+    }
+    commitProject(set, get, "清空对齐提案", (currentProject) => ({
+      ...currentProject,
+      alignmentProposal: null
+    }));
+    set({ status: { message: "已清空当前对齐提案。", tone: "success" } });
   },
 
   applyAlignmentProposalData: (proposal) => {
