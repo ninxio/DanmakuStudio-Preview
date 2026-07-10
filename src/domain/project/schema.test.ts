@@ -2,7 +2,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEmptyProject } from "./factory";
-import { parseProjectJson, serializeProject, validateProjectSchema } from "./schema";
+import {
+  parseProjectJson,
+  parseProjectJsonWithMetadata,
+  serializeProject,
+  validateProjectSchema
+} from "./schema";
 import { CURRENT_SCHEMA_VERSION } from "./types";
 
 describe("project schema", () => {
@@ -65,10 +70,15 @@ describe("project schema", () => {
       ]
     };
 
-    const parsed = parseProjectJson(JSON.stringify(project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(project));
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.clips[0].sourceOutMs).toBe(1001);
+    expect(migration).toEqual({
+      fromVersion: 1,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 1
+    });
   });
 
   it("打开当前版本项目时保留半开 sourceOutMs", () => {
@@ -89,10 +99,11 @@ describe("project schema", () => {
       ]
     };
 
-    const parsed = parseProjectJson(JSON.stringify(project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(project));
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.clips[0].sourceOutMs).toBe(1000);
+    expect(migration).toBeNull();
   });
 
   it("拒绝不支持的 schema 版本", () => {

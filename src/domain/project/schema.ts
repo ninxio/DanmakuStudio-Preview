@@ -6,6 +6,17 @@ import {
 
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
+export interface ProjectSchemaMigration {
+  fromVersion: number;
+  toVersion: number;
+  adjustedClipRangeCount: number;
+}
+
+export interface ProjectParseResult {
+  project: EditorProject;
+  migration: ProjectSchemaMigration | null;
+}
+
 export function validateProjectSchema(value: unknown): ProjectValidationResult {
   if (!isRecord(value)) {
     return { ok: false, version: null, message: "项目文件不是有效对象。" };
@@ -55,10 +66,17 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
 }
 
 export function parseProjectJson(json: string): EditorProject {
+  return parseProjectJsonWithMetadata(json).project;
+}
+
+export function parseProjectJsonWithMetadata(json: string): ProjectParseResult {
   const parsed = JSON.parse(json) as unknown;
   const validation = validateProjectSchema(parsed);
   if (!validation.ok) {
     throw new Error(validation.message);
+  }
+  if (validation.version === null) {
+    throw new Error("项目文件缺少 schemaVersion。");
   }
   return migrateProjectToCurrentSchema(parsed as EditorProject, validation.version);
 }
@@ -81,26 +99,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: number | null): EditorProject {
+function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: number): ProjectParseResult {
   if (parsedVersion === CURRENT_SCHEMA_VERSION) {
-    return project;
+    return { project, migration: null };
   }
+  const legacyClipRanges = migrateLegacyClosedClipRanges(project);
   return {
-    ...project,
-    schemaVersion: CURRENT_SCHEMA_VERSION,
-    clips: migrateLegacyClosedClipRanges(project)
+    project: {
+      ...project,
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      clips: legacyClipRanges.clips
+    },
+    migration: {
+      fromVersion: parsedVersion,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: legacyClipRanges.adjustedClipRangeCount
+    }
   };
 }
 
-function migrateLegacyClosedClipRanges(project: EditorProject): EditorProject["clips"] {
+function migrateLegacyClosedClipRanges(project: EditorProject): {
+  clips: EditorProject["clips"];
+  adjustedClipRangeCount: number;
+} {
   const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
-  return project.clips.map((clip) => {
+  let adjustedClipRangeCount = 0;
+  const clips = project.clips.map((clip) => {
     const asset = assetsById.get(clip.assetId);
     const hasBoundaryItem = asset?.items.some(
       (item) => item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs === clip.sourceOutMs
     );
-    return hasBoundaryItem ? { ...clip, sourceOutMs: clip.sourceOutMs + 1 } : clip;
+    if (!hasBoundaryItem) {
+      return clip;
+    }
+    adjustedClipRangeCount += 1;
+    return { ...clip, sourceOutMs: clip.sourceOutMs + 1 };
   });
+  return { clips, adjustedClipRangeCount };
 }
 
 function isMediaReference(value: unknown): boolean {

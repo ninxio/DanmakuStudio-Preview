@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C84 已完成：打开旧版项目时显示 schema 迁移反馈。
+  - 项目解析层新增 `parseProjectJsonWithMetadata`，在保留原 `parseProjectJson` 兼容入口的同时，返回旧版项目迁移来源版本、目标版本和片段边界兼容调整数量。
+  - 顶部“打开项目”流程现在会在打开 v1 项目时显示“已打开旧版项目”状态，并提示已从 v1 升级到 v2；如果自动兼容了旧闭区间片段边界，会同时提示调整的片段数量。
+  - 当前版本项目仍显示原有成功打开反馈，不把正常 v2 项目误报为迁移。
+  - 已补充项目 schema 与 editor store 测试，覆盖迁移元数据、无迁移项目、旧版项目打开状态和边界调整后的项目内容。
+  - 已同步 E2E 断言，让三分 P 示例旧项目的打开流程端到端覆盖新迁移提示。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/schema.test.ts src/stores/editorStore.test.ts` 成功，2 个测试文件、32 个测试通过。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/178 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:01:26`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997978` 字节，时间 `2026/07/10 13:01:26`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c84-project-migration-open-status-20260710`。
 - 成熟度提升阶段 C83 已完成：项目 schema v2 兼容旧片段边界。
   - `CURRENT_SCHEMA_VERSION` 已升级到 2，序列化项目时会强制写入当前 schemaVersion，避免新旧语义混杂。
   - 读取 v1 项目时，如果片段 `sourceOutMs` 处正好存在弹幕，会迁移为 `sourceOutMs + 1`，兼容 C79 后的半开区间 `[sourceInMs, sourceOutMs)`，避免重开旧项目时丢失最后一条边界弹幕。

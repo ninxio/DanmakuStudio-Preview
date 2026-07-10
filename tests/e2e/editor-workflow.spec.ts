@@ -286,7 +286,7 @@ test("导出前会阻断项目健康错误", async ({ page }) => {
   writeFileSync(blockedProjectPath, JSON.stringify(blockedProject, null, 2), "utf8");
 
   await page.getByTestId("project-input").setInputFiles(blockedProjectPath);
-  await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
+  await expect(page.getByTestId("status-bar")).toContainText("已打开旧版项目");
   await page.getByLabel("导出 XML").click();
   await expect(page.getByTestId("status-bar")).toContainText("项目健康检查未通过：片段引用了缺失资源");
   await expect(page.getByTestId("export-dialog")).toHaveCount(0);

@@ -34,7 +34,7 @@ import {
   getProjectDurationMs,
   resolveProjectDanmakuEvents
 } from "../domain/timeline/mapping";
-import { parseProjectJson } from "../domain/project/schema";
+import { parseProjectJsonWithMetadata, type ProjectSchemaMigration } from "../domain/project/schema";
 import type { Milliseconds } from "../domain/shared/time";
 import { clamp, clampMilliseconds } from "../domain/shared/time";
 import {
@@ -267,7 +267,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   openProjectFromText: (text) => {
     try {
-      const project = parseProjectJson(text);
+      const { project, migration } = parseProjectJsonWithMetadata(text);
       revokeObjectUrl(get().project.media?.objectUrl ?? null);
       set({
         project,
@@ -276,7 +276,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         exportDraft: null,
         alignmentProposal: null,
         timelineTool: "select",
-        status: { message: `已打开项目：${project.name}`, tone: "success" }
+        status: createOpenProjectStatus(project.name, migration)
       });
     } catch (error) {
       set({
@@ -1131,6 +1131,23 @@ function commitProject(
     selection: selection ?? state.selection,
     exportDraft: null
   }));
+}
+
+function createOpenProjectStatus(
+  projectName: string,
+  migration: ProjectSchemaMigration | null
+): EditorStatus {
+  if (!migration) {
+    return { message: `已打开项目：${projectName}`, tone: "success" };
+  }
+  const adjustedClipRangeSuffix =
+    migration.adjustedClipRangeCount > 0
+      ? `，并兼容调整 ${migration.adjustedClipRangeCount} 个片段边界`
+      : "";
+  return {
+    message: `已打开旧版项目：${projectName}。已从 v${migration.fromVersion} 升级到 v${migration.toVersion}${adjustedClipRangeSuffix}。`,
+    tone: migration.adjustedClipRangeCount > 0 ? "warning" : "success"
+  };
 }
 
 function createClipFromAsset(asset: DanmakuAsset, timelineStartMs: Milliseconds): DanmakuClip {

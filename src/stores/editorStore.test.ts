@@ -3,7 +3,7 @@ import type { DanmakuClip } from "../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../domain/danmaku/cutHints";
 import { createHistoryState } from "../domain/history/history";
 import { createEmptyProject } from "../domain/project/factory";
-import type { EditorProject } from "../domain/project/types";
+import { CURRENT_SCHEMA_VERSION, type EditorProject } from "../domain/project/types";
 import { serializeProject } from "../domain/project/schema";
 import { parseBilibiliXml } from "../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "./editorStore";
@@ -85,6 +85,36 @@ describe("editor store", () => {
     useEditorStore.getState().openProjectFromText(serializeProject(nextProject));
     expect(revokeSpy).toHaveBeenCalledWith("blob:old-project");
     expect(useEditorStore.getState().project.name).toBe("打开的项目");
+  });
+
+  it("打开旧版项目时提示 schema 迁移和片段边界兼容", () => {
+    const asset = createAsset("asset-legacy-open", "legacy.xml");
+    const legacyProject: EditorProject = {
+      ...createEmptyProject("旧版项目"),
+      schemaVersion: 1,
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-legacy-open",
+          assetId: asset.id,
+          name: "旧片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+
+    useEditorStore.getState().openProjectFromText(JSON.stringify(legacyProject));
+
+    expect(useEditorStore.getState().project.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(useEditorStore.getState().project.clips[0].sourceOutMs).toBe(1001);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "已打开旧版项目：旧版项目。已从 v1 升级到 v2，并兼容调整 1 个片段边界。",
+      tone: "warning"
+    });
   });
 
   it("追加片段时使用已有片段包含 localOffsetMs 的视觉结束点", () => {
