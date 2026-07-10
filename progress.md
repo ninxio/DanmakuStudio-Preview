@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C50 已完成：缺失资源片段健康阻断显示定位证据。
+  - 项目健康摘要中的“片段引用了缺失资源”阻断项现在会列出片段名、片段 ID、缺失资源 ID、时间轴起点和源区间。
+  - 证据会出现在资源栏“项目信息”、健康报告中；由于 C49 已接入导出健康证据预览，后续可导出的非阻断证据也沿用同一展示模式。
+  - README 已同步：缺失资源片段也会列出具体出现位置，并写入健康报告。
+  - 已补充领域层测试，确认健康报告写入缺失资源 ID；资源面板测试确认缺失片段证据可见；Playwright E2E 确认坏项目项目信息显示片段名和 `missing-asset`。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、29 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、149 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:10:14`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999519` 字节，时间 `2026/07/10 10:10:13`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c50-health-missing-clip-evidence-20260710`。
 - 成熟度提升阶段 C49 已完成：导出摘要健康预检展示证据预览。
   - `ExportDialog` 的“导出前健康检查”现在会为每个预览健康项展示最多 2 条证据，超过时提示“另有 N 条证据，可下载健康报告查看”。
   - 负最终时间、重复 ID 等带证据的健康项在导出前就能看到具体来源，不必先下载健康报告才能定位风险。

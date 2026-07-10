@@ -228,6 +228,7 @@ describe("资源面板", () => {
 
     await user.click(screen.getByRole("button", { name: "项目信息" }));
     expect(screen.getByText("片段引用了缺失资源")).toBeInTheDocument();
+    expect(screen.getByText(/坏片段（片段 ID：clip-missing，缺失资源 ID：missing-asset/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "清理缺失片段" }));
 
     expect(useEditorStore.getState().project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);

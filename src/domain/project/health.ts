@@ -80,8 +80,9 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   );
   const importWarningCount = project.assets.reduce((total, asset) => total + asset.warnings.length, 0);
   const totalCutGapMs = project.cutMarkers.reduce((total, marker) => total + marker.targetGapMs, 0);
-  const missingAssetClipCount = project.clips.filter((clip) => !project.assets.some((asset) => asset.id === clip.assetId))
-    .length;
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const missingAssetClips = project.clips.filter((clip) => !assetIds.has(clip.assetId));
+  const missingAssetClipCount = missingAssetClips.length;
   const emptyClipCount = project.clips.filter((clip) => {
     const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
     return asset ? !clipHasVisibleItem(asset, clip) : false;
@@ -160,7 +161,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "clip-missing-asset",
       severity: "error",
       title: "片段引用了缺失资源",
-      detail: `${missingAssetClipCount.toLocaleString("zh-CN")} 个时间轴片段找不到对应弹幕资源，建议重新打开上一个 checkpoint 或删除这些片段。`
+      detail: `${missingAssetClipCount.toLocaleString("zh-CN")} 个时间轴片段找不到对应弹幕资源，建议重新打开上一个 checkpoint 或删除这些片段。`,
+      evidence: formatMissingAssetClipEvidence(missingAssetClips)
     });
   }
   if (emptyClipCount > 0) {
@@ -421,6 +423,15 @@ function formatNegativeFinalTimeEvidence(events: ResolvedDanmakuEvent[]): string
     } 条：${formatSignedDuration(event.finalTimeMs)}，${formatLimitedText(text)}`;
   });
   return appendOmittedEvidenceNote(evidence, events.length, "条负最终时间");
+}
+
+function formatMissingAssetClipEvidence(clips: DanmakuClip[]): string[] {
+  const evidence = clips.slice(0, EVIDENCE_PREVIEW_LIMIT).map((clip) => {
+    return `${clip.name}（片段 ID：${clip.id}，缺失资源 ID：${clip.assetId}，时间轴 ${formatTimecode(
+      clip.timelineStartMs
+    )}，源区间 ${formatTimecode(clip.sourceInMs)} - ${formatTimecode(clip.sourceOutMs)}）`;
+  });
+  return appendOmittedEvidenceNote(evidence, clips.length, "个缺失资源片段");
 }
 
 function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {

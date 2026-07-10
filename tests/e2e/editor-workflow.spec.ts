@@ -280,6 +280,8 @@ test("导出前会阻断项目健康错误", async ({ page }) => {
   await page.getByRole("button", { name: "项目信息" }).click();
   await expect(page.getByTestId("project-health-panel")).toContainText("需处理");
   await expect(page.getByTestId("project-health-panel")).toContainText("片段引用了缺失资源");
+  await expect(page.getByTestId("project-health-panel")).toContainText("part-1 时间轴片段");
+  await expect(page.getByTestId("project-health-panel")).toContainText("缺失资源 ID：missing-asset");
   await page.getByRole("button", { name: "清理缺失片段" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已清理 1 个缺失资源片段");
   await expect(page.getByTestId("project-health-panel")).not.toContainText("片段引用了缺失资源");

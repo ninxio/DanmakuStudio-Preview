@@ -92,11 +92,20 @@ describe("project health", () => {
         evidence: ["same-id：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕"]
       })
     );
-    expect(summary.findings).toContainEqual(expect.objectContaining({ id: "clip-missing-asset", severity: "error" }));
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "clip-missing-asset",
+        severity: "error",
+        evidence: [
+          "坏片段（片段 ID：clip，缺失资源 ID：missing-asset，时间轴 00:00:00.000，源区间 00:00:00.000 - 00:00:03.000）"
+        ]
+      })
+    );
 
     const report = createProjectHealthReport("重复项目", summary);
     expect(report).toContain("重复 ID：1 个");
     expect(report).toContain("same-id：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕");
+    expect(report).toContain("缺失资源 ID：missing-asset");
   });
 
   it("重复 ID 证据超过预览限制时提示剩余数量", () => {
