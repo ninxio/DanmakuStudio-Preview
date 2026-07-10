@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "./factory";
+import { CURRENT_SCHEMA_VERSION } from "./types";
 import {
   cleanupProjectEditReferences,
   cleanupProjectMissingAssetClips,
@@ -48,6 +49,7 @@ describe("project health", () => {
 
     expect(summary.status).toBe("ready");
     expect(summary.metrics).toMatchObject({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
       assetCount: 1,
       itemCount: 2,
       enabledItemCount: 1,
@@ -466,6 +468,7 @@ describe("project health", () => {
 
     expect(report).toContain("项目健康报告");
     expect(report).toContain("项目：报告项目");
+    expect(report).toContain(`项目版本：v${CURRENT_SCHEMA_VERSION}`);
     expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");
     expect(report).toContain("状态：需复核");
     expect(report).toContain("失效编辑引用：1 条");

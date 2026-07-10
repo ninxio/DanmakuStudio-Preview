@@ -1920,6 +1920,7 @@ function ProjectHealthPanel({
         </span>
       </div>
       <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2">
+        <HealthMetric label="项目版本" value={`v${summary.metrics.schemaVersion}`} />
         <HealthMetric label="资源" value={summary.metrics.assetCount.toLocaleString("zh-CN")} />
         <HealthMetric
           label="弹幕"

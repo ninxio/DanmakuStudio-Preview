@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuAsset, DanmakuClip } from "../../domain/danmaku/types";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
+import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
 import { useEditorStore } from "../../stores/editorStore";
 import { ExportDialog } from "./ExportDialog";
 
@@ -107,6 +108,7 @@ describe("导出摘要", () => {
         throw new Error("健康报告下载对象不是 Blob。");
       }
       await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
+      await expect(readBlobText(blob)).resolves.toContain(`项目版本：v${CURRENT_SCHEMA_VERSION}`);
       await expect(readBlobText(blob)).resolves.toContain("导入时存在警告");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       const clickedAnchor = clickSpy.mock.contexts[0];

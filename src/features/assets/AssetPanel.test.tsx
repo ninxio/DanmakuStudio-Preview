@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
+import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "../../stores/editorStore";
@@ -62,6 +63,8 @@ describe("资源面板", () => {
 
     expect(screen.getByTestId("project-health-panel")).toBeInTheDocument();
     expect(screen.getByText("项目健康")).toBeInTheDocument();
+    expect(screen.getByText("项目版本")).toBeInTheDocument();
+    expect(screen.getByText(`v${CURRENT_SCHEMA_VERSION}`)).toBeInTheDocument();
     expect(screen.getByText("需复核")).toBeInTheDocument();
     expect(screen.getByText("没有时间轴片段")).toBeInTheDocument();
     expect(screen.getByText("01 - 1.1.xml（1 条弹幕）")).toBeInTheDocument();
@@ -161,6 +164,7 @@ describe("资源面板", () => {
         throw new Error("导出的健康报告不是 Blob。");
       }
       await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
+      await expect(readBlobText(blob)).resolves.toContain(`项目版本：v${CURRENT_SCHEMA_VERSION}`);
       await expect(readBlobText(blob)).resolves.toContain("没有时间轴片段");
       await expect(readBlobText(blob)).resolves.toContain("01 - 1.1.xml（1 条弹幕）");
       expect(useEditorStore.getState().status.message).toBe("已导出项目健康报告：健康_报告_项目-health-report.txt。");

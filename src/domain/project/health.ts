@@ -24,6 +24,7 @@ export interface ProjectHealthFinding {
 }
 
 export interface ProjectHealthMetrics {
+  schemaVersion: number;
   assetCount: number;
   itemCount: number;
   enabledItemCount: number;
@@ -278,6 +279,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
     statusLabel: statusToLabel(status),
     statusDetail: statusToDetail(status),
     metrics: {
+      schemaVersion: project.schemaVersion,
       assetCount: project.assets.length,
       itemCount,
       enabledItemCount,
@@ -351,6 +353,7 @@ export function createProjectHealthReport(
   const lines = [
     "项目健康报告",
     `项目：${projectName.trim().length > 0 ? projectName : "未命名项目"}`,
+    `项目版本：v${summary.metrics.schemaVersion}`,
     `生成时间：${generatedAt.toISOString()}`,
     `状态：${summary.statusLabel}`,
     `说明：${summary.statusDetail}`,

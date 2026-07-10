@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C85 已完成：项目健康信息展示当前项目版本。
+  - `ProjectHealthMetrics` 新增 `schemaVersion`，健康摘要可以直接携带当前项目文件语义版本。
+  - “项目信息”里的项目健康指标新增“项目版本”，当前显示为 `v2`，方便确认旧项目打开后已迁移到当前版本。
+  - 项目健康报告头部新增“项目版本：v2”，从资源面板和导出摘要弹窗下载健康报告时都会带上该诊断信息。
+  - 已补充项目健康、资源面板和导出摘要测试，覆盖 metrics、面板显示和两条健康报告下载入口的版本行。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx src/features/export/ExportDialog.test.tsx` 成功，3 个测试文件、40 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/178 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:05:55`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998316` 字节，时间 `2026/07/10 13:05:55`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c85-project-health-schema-version-20260710`。
 - 成熟度提升阶段 C84 已完成：打开旧版项目时显示 schema 迁移反馈。
   - 项目解析层新增 `parseProjectJsonWithMetadata`，在保留原 `parseProjectJson` 兼容入口的同时，返回旧版项目迁移来源版本、目标版本和片段边界兼容调整数量。
   - 顶部“打开项目”流程现在会在打开 v1 项目时显示“已打开旧版项目”状态，并提示已从 v1 升级到 v2；如果自动兼容了旧闭区间片段边界，会同时提示调整的片段数量。
