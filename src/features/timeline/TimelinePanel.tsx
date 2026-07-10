@@ -7,6 +7,10 @@ import type {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import {
+  createAlignmentReviewItemStatuses,
+  createAlignmentReviewStatusSummary
+} from "../../domain/alignment/alignmentReport";
+import {
   buildAlignmentPreview,
   type AlignmentPreviewAnchor,
   type AlignmentPreviewCutCandidate,
@@ -113,6 +117,20 @@ export function TimelinePanel() {
     () => buildAlignmentPreview(project, alignmentProposal),
     [project, alignmentProposal]
   );
+  const alignmentReviewStatuses = useMemo(
+    () =>
+      alignmentProposal
+        ? createAlignmentReviewItemStatuses(alignmentProposal, {
+            existingAnchors: project.syncAnchors,
+            existingCutMarkers: project.cutMarkers
+          })
+        : [],
+    [alignmentProposal, project.cutMarkers, project.syncAnchors]
+  );
+  const alignmentReviewSummary = useMemo(
+    () => createAlignmentReviewStatusSummary(alignmentReviewStatuses),
+    [alignmentReviewStatuses]
+  );
   const cutHintSearch = useMemo(() => createCutHintSearchPlan(cutHintSettings), [cutHintSettings]);
   const suspectedCutCandidates = useMemo(
     () => findSuspectedCutCandidates(project.assets, cutHintSearch.options),
@@ -125,10 +143,6 @@ export function TimelinePanel() {
       ).length,
     [project.cutMarkers, suspectedCutCandidates]
   );
-  const pendingAlignmentCount =
-    alignmentPreview.summary.candidateAnchorCount + alignmentPreview.summary.candidateCutCount;
-  const appliedAlignmentCount =
-    alignmentPreview.summary.appliedAnchorCount + alignmentPreview.summary.appliedCutCount;
   const viewport = useMemo(() => {
     const durationMs = ((size.width - LABEL_WIDTH) * 1000) / project.timeline.pixelsPerSecond;
     return {
@@ -245,11 +259,10 @@ export function TimelinePanel() {
           </TextButton>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400 xl:justify-end">
-          {alignmentPreview.summary.proposalAnchorCount +
-            alignmentPreview.summary.proposalCutCount >
-          0 ? (
+          {alignmentReviewSummary.totalCount > 0 ? (
             <span className={TIMELINE_TOOL_CHIP_CLASS} data-toolbar-chip="true">
-              对齐候选 {pendingAlignmentCount} / 已应用 {appliedAlignmentCount}
+              对齐待应用 {alignmentReviewSummary.pendingCount} / 已落点 {alignmentReviewSummary.appliedCount}
+              {alignmentReviewSummary.blockedCount > 0 ? ` / 阻断 ${alignmentReviewSummary.blockedCount}` : ""}
             </span>
           ) : null}
           {suspectedCutCandidates.length > 0 ? (

@@ -27,6 +27,13 @@ export interface AlignmentReviewItemStatus {
   blockReasons: string[];
 }
 
+export interface AlignmentReviewStatusSummary {
+  totalCount: number;
+  pendingCount: number;
+  appliedCount: number;
+  blockedCount: number;
+}
+
 export function createAlignmentReviewReport(
   proposal: AlignmentProposal,
   generatedAt: Date = new Date(),
@@ -91,6 +98,17 @@ export function createAlignmentReviewItemStatuses(
       };
     })
   ];
+}
+
+export function createAlignmentReviewStatusSummary(
+  statuses: AlignmentReviewItemStatus[]
+): AlignmentReviewStatusSummary {
+  return {
+    totalCount: statuses.length,
+    pendingCount: statuses.filter((item) => item.state === "pending").length,
+    appliedCount: statuses.filter((item) => item.state === "applied").length,
+    blockedCount: statuses.filter((item) => item.state === "blocked").length
+  };
 }
 
 export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[] {

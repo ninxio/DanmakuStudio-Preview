@@ -20,6 +20,7 @@ import {
   createAlignmentReviewFocus,
   createAlignmentReviewItemStatuses,
   createAlignmentReviewReport,
+  createAlignmentReviewStatusSummary,
   type AlignmentReviewItemState
 } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
@@ -1243,8 +1244,6 @@ function VideoAlignmentLabPanel({
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobSnapshot, setJobSnapshot] = useState<AudioAlignmentJobSnapshot | null>(null);
   const runTokenRef = useRef(0);
-  const pendingCount = preview.summary.candidateAnchorCount + preview.summary.candidateCutCount;
-  const appliedCount = preview.summary.appliedAnchorCount + preview.summary.appliedCutCount;
   const previewCuts = preview.proposalCuts.slice(0, 3);
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
@@ -1255,6 +1254,7 @@ function VideoAlignmentLabPanel({
   };
   const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal, applyBlockerContext) : [];
   const reviewItemStatuses = proposal ? createAlignmentReviewItemStatuses(proposal, applyBlockerContext) : [];
+  const reviewStatusSummary = createAlignmentReviewStatusSummary(reviewItemStatuses);
   const visibleReviewItemStatuses = reviewItemStatuses.slice(0, 5);
   const hiddenReviewItemStatusCount = reviewItemStatuses.length - visibleReviewItemStatuses.length;
 
@@ -1451,7 +1451,8 @@ function VideoAlignmentLabPanel({
         <span>视频对齐实验室</span>
         {proposal ? (
           <span className="ml-auto text-[11px] text-slate-500">
-            待应用 {pendingCount} / 已应用 {appliedCount}
+            待应用 {reviewStatusSummary.pendingCount} / 已落点 {reviewStatusSummary.appliedCount}
+            {reviewStatusSummary.blockedCount > 0 ? ` / 阻断 ${reviewStatusSummary.blockedCount}` : ""}
           </span>
         ) : null}
       </div>
@@ -1634,7 +1635,7 @@ function VideoAlignmentLabPanel({
           <TextButton
             tone="primary"
             onClick={onApply}
-            disabled={!proposal || pendingCount === 0 || applyBlockers.length > 0}
+            disabled={!proposal || reviewStatusSummary.pendingCount === 0 || applyBlockers.length > 0}
             title={applyBlockers[0] ?? "应用候选"}
           >
             应用候选

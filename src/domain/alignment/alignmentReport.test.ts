@@ -3,6 +3,7 @@ import {
   createAlignmentApplyBlockers,
   createAlignmentReviewFocus,
   createAlignmentReviewItemStatuses,
+  createAlignmentReviewStatusSummary,
   createAlignmentReviewReport
 } from "./alignmentReport";
 import type { AlignmentProposal } from "./types";
@@ -237,5 +238,11 @@ describe("alignment review report", () => {
         blockReasons: ["当前项目已有同 ID 补偿点"]
       }
     ]);
+    expect(createAlignmentReviewStatusSummary(createAlignmentReviewItemStatuses(conflictProposal, context))).toEqual({
+      totalCount: 2,
+      pendingCount: 0,
+      appliedCount: 0,
+      blockedCount: 2
+    });
   });
 });

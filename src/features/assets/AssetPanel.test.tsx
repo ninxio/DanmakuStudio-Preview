@@ -533,6 +533,7 @@ describe("资源面板", () => {
     await user.click(screen.getByRole("button", { name: "导入提案" }));
     await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.cutCandidates).toHaveLength(1));
     expect(screen.getByText("复核提示")).toBeInTheDocument();
+    expect(screen.getByText("待应用 2 / 已落点 0")).toBeInTheDocument();
     expect(screen.getByText("落点状态")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("audio-anchor-1");
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("音频推断补偿 1");
@@ -614,6 +615,7 @@ describe("资源面板", () => {
     await user.click(screen.getByRole("button", { name: "导入提案" }));
 
     expect(screen.getByText("应用已暂停")).toBeInTheDocument();
+    expect(screen.getByText("待应用 1 / 已落点 0 / 阻断 1")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（不确定区间起止异常）");
     expect(screen.getAllByText(/不确定区间起止顺序异常/).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();
@@ -660,6 +662,7 @@ describe("资源面板", () => {
     await user.click(screen.getByRole("button", { name: "导入提案" }));
 
     expect(screen.getByText("应用已暂停")).toBeInTheDocument();
+    expect(screen.getByText("待应用 0 / 已落点 0 / 阻断 2")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（当前项目已有同 ID 锚点）");
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（当前项目已有同 ID 补偿点）");
     expect(screen.getByText("1 个同步锚点 ID 已存在于当前项目（ID：audio-anchor-1），应用会丢失新锚点。")).toBeInTheDocument();
