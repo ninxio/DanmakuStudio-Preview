@@ -31,7 +31,10 @@ export function createPlayerSourceComparisonSummary(
   const appliedGapMs = getAppliedCutGap(referenceTimeMs, input.project.cutMarkers);
   const reference = describeReferenceSource(input.project, input.hasReferencePlaybackSource);
   const target = describeTargetSource(input.project.mediaBinding, input.project);
-  const hasReference = input.project.assets.length > 0 || Boolean(input.project.media);
+  const hasReference =
+    input.project.assets.length > 0 ||
+    Boolean(input.project.media) ||
+    input.project.mediaLibrary.some((media) => media.role === "bilibiliReference");
   const hasTarget = Boolean(input.project.mediaBinding);
   return {
     visible: hasReference || hasTarget || input.project.cutMarkers.length > 0,
@@ -64,6 +67,20 @@ function describeReferenceSource(
       detail: `${project.media.fileName} / 项目不保存视频内容`
     };
   }
+  const connectedReference = project.mediaLibrary.find((media) => media.role === "bilibiliReference" && media.objectUrl);
+  if (connectedReference) {
+    return {
+      label: "B 站参考视频",
+      detail: `${connectedReference.fileName} / 当前会话可播放`
+    };
+  }
+  const reference = project.mediaLibrary.find((media) => media.role === "bilibiliReference");
+  if (reference) {
+    return {
+      label: "参考视频待重连",
+      detail: `${reference.fileName} / 项目不保存视频内容`
+    };
+  }
   if (project.assets.length > 0) {
     return {
       label: "B 站 XML 时间轴",
@@ -94,6 +111,13 @@ function describeTargetSource(
       };
     }
     if (binding.mediaId && project.media?.id === binding.mediaId && project.media.objectUrl) {
+      return {
+        label: "本地目标原片",
+        detail: `${binding.fileName} / 当前会话可播放，重开后需重连`
+      };
+    }
+    const media = binding.mediaId ? project.mediaLibrary.find((candidate) => candidate.id === binding.mediaId) : null;
+    if (media?.objectUrl) {
       return {
         label: "本地目标原片",
         detail: `${binding.fileName} / 当前会话可播放，重开后需重连`

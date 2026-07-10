@@ -68,11 +68,17 @@ function describePlayerSource(
     };
   }
   if (project.mediaBinding?.kind === "localFile") {
+    const binding = project.mediaBinding;
+    const bindingMedia = binding.mediaId
+      ? project.mediaLibrary.find((media) => media.id === binding.mediaId)
+      : null;
     return {
       label: "本地目标原片",
-      detail: project.mediaBinding.localPath
-        ? `本地路径已连接：${project.mediaBinding.fileName}`
-        : `需要重新连接：${project.mediaBinding.fileName}`
+      detail: binding.localPath
+        ? `本地路径已连接：${binding.fileName}`
+        : bindingMedia?.objectUrl
+          ? `当前会话已连接：${binding.fileName}`
+          : `需要重新连接：${binding.fileName}`
     };
   }
   if (project.media?.objectUrl) {
@@ -85,6 +91,22 @@ function describePlayerSource(
     return {
       label: "媒体引用待重连",
       detail: project.media.fileName
+    };
+  }
+  const connectedReference = project.mediaLibrary.find((media) => media.role === "bilibiliReference" && media.objectUrl);
+  if (connectedReference) {
+    return {
+      label: "B 站参考视频",
+      detail: connectedReference.fileName
+    };
+  }
+  const reconnectReference = project.mediaLibrary.find(
+    (media) => media.role === "bilibiliReference" && media.connectionState === "needsReconnect"
+  );
+  if (reconnectReference) {
+    return {
+      label: "媒体引用待重连",
+      detail: reconnectReference.fileName
     };
   }
   return {

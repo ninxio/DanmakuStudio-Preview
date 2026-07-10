@@ -646,7 +646,12 @@ function drawVideoTrack(
   project: ReturnType<typeof useEditorStore.getState>["project"],
   track: TrackRect
 ): void {
-  const duration = project.media?.durationMs ?? 0;
+  const media =
+    project.media ??
+    project.mediaLibrary.find((candidate) => candidate.role === "bilibiliReference") ??
+    project.mediaLibrary.find((candidate) => candidate.role === "targetOriginal") ??
+    null;
+  const duration = media?.durationMs ?? 0;
   if (duration <= 0) {
     context.fillStyle = "#64748b";
     context.font = "12px Segoe UI";
@@ -660,7 +665,7 @@ function drawVideoTrack(
   context.fillStyle = "#dbeafe";
   context.font = "12px Segoe UI";
   context.fillText(
-    project.media?.fileName ?? "视频",
+    media?.fileName ?? "视频",
     Math.max(LABEL_WIDTH + 8, x + 8),
     track.y + 22
   );

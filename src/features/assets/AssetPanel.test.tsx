@@ -5,7 +5,7 @@ import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints"
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
 import { createEmbyItemMediaBinding, createLocalPathMediaBinding } from "../../domain/project/mediaBinding";
-import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
+import { CURRENT_SCHEMA_VERSION, type ProjectMediaReference, type ProjectMediaRole } from "../../domain/project/types";
 import { startTauriAudioAlignmentJob } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import { authenticateEmby, fetchEmbyItem } from "../../infrastructure/metadata/embyClient";
@@ -70,35 +70,123 @@ describe("资源面板", () => {
     await waitFor(() => expect(useEditorStore.getState().project.assets).toHaveLength(0));
   });
 
-  it("媒体页可以把当前本地视频绑定为目标原片", async () => {
+  it("弹幕素材页可以绑定、更换和解除 XML 的 B 站参考素材", async () => {
     const user = userEvent.setup();
+    const project = useEditorStore.getState().project;
+    const asset = project.assets[0];
     useEditorStore.setState({
       project: {
-        ...createEmptyProject(),
-        media: {
-          id: "media-local",
-          name: "本地完整版",
-          fileName: "full.mp4",
-          objectUrl: "blob:full",
-          durationMs: 3_000_000
-        }
+        ...project,
+        mediaLibrary: [
+          createProjectMediaReference("source-a", "bilibiliReference", {
+            name: "B 站参考 A",
+            fileName: "source-a.mp4"
+          }),
+          createProjectMediaReference("source-b", "bilibiliReference", {
+            name: "B 站参考 B",
+            fileName: "source-b.mp4"
+          }),
+          createProjectMediaReference("target-media", "targetOriginal", {
+            name: "目标原片",
+            fileName: "target.mp4"
+          })
+        ]
       }
     });
 
     render(<AssetPanel />);
-    await user.click(screen.getByRole("button", { name: "媒体" }));
-    expect(screen.getByText("视频来源")).toBeInTheDocument();
-    expect(screen.getByText(/参考视频用于预览 B 站删减版时间轴/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "用参考视频作为目标" }));
+    expect(screen.getByText("该 XML 尚未关联弹幕来源视频，仍可编辑但无法进行可靠的来源段匹配。")).toBeInTheDocument();
+    const sourceSelect = screen.getByLabelText(`${asset.fileName} 弹幕来源视频`);
+    expect(within(sourceSelect).getByRole("option", { name: "B 站参考 A" })).toBeInTheDocument();
+    expect(within(sourceSelect).getByRole("option", { name: "B 站参考 B" })).toBeInTheDocument();
+    expect(within(sourceSelect).queryByRole("option", { name: "目标原片" })).not.toBeInTheDocument();
 
-    expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
-      kind: "localFile",
-      displayName: "本地完整版",
-      fileName: "full.mp4"
-    });
-    const targetPanel = getTargetMediaBindingPanel();
-    expect(within(targetPanel).getByText("本地文件已连接")).toBeInTheDocument();
-    expect(within(targetPanel).getByText("本地完整版")).toBeInTheDocument();
+    await user.selectOptions(sourceSelect, "source-a");
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.danmakuSourceBindings).toMatchObject([
+        {
+          assetId: asset.id,
+          sourceMediaId: "source-a"
+        }
+      ])
+    );
+    const bindingId = useEditorStore.getState().project.danmakuSourceBindings[0].id;
+    expect(screen.getByText("已关联：source-a.mp4")).toBeInTheDocument();
+
+    await user.selectOptions(sourceSelect, "source-b");
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.danmakuSourceBindings[0]).toMatchObject({
+        id: bindingId,
+        assetId: asset.id,
+        sourceMediaId: "source-b"
+      })
+    );
+    expect(screen.getByText("已关联：source-b.mp4")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "解除绑定" }));
+    await waitFor(() => expect(useEditorStore.getState().project.danmakuSourceBindings).toEqual([]));
+    expect(screen.getByText("该 XML 尚未关联弹幕来源视频，仍可编辑但无法进行可靠的来源段匹配。")).toBeInTheDocument();
+  });
+
+  it("媒体页可以批量导入原片和 B 站参考素材", async () => {
+    const user = userEvent.setup();
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>((object) =>
+      object instanceof File ? `blob:${object.name}` : "blob:media"
+    );
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+
+    try {
+      render(<AssetPanel />);
+      await user.click(screen.getByRole("button", { name: "媒体" }));
+      expect(screen.getByText("视频来源")).toBeInTheDocument();
+      expect(screen.getByText(/视频只作为时间轴证据或目标标准时间轴/)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText("导入原片素材文件"), {
+        target: {
+          files: [
+            new File(["target-a"], "full-a.mp4", { type: "video/mp4" }),
+            new File(["target-b"], "full-b.webm", { type: "video/webm" })
+          ]
+        }
+      });
+      fireEvent.change(screen.getByLabelText("导入 B 站参考素材文件"), {
+        target: {
+          files: [new File(["source-a"], "bilibili-a.mp4", { type: "video/mp4" })]
+        }
+      });
+
+      await waitFor(() => expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(3));
+      const project = useEditorStore.getState().project;
+      const targetMedia = project.mediaLibrary.filter((media) => media.role === "targetOriginal");
+      const sourceMedia = project.mediaLibrary.filter((media) => media.role === "bilibiliReference");
+      expect(targetMedia.map((media) => media.fileName)).toEqual(["full-a.mp4", "full-b.webm"]);
+      expect(sourceMedia.map((media) => media.fileName)).toEqual(["bilibili-a.mp4"]);
+      expect(project.mediaBinding).toMatchObject({
+        kind: "localFile",
+        fileName: "full-a.mp4",
+        mediaId: targetMedia[0].id
+      });
+      expect(project.media).toMatchObject({
+        id: sourceMedia[0].id,
+        fileName: "bilibili-a.mp4",
+        objectUrl: "blob:bilibili-a.mp4"
+      });
+      expect(screen.getAllByText("full-a").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("full-b").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("bilibili-a").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("已连接").length).toBeGreaterThanOrEqual(3);
+      const targetPanel = getTargetMediaBindingPanel();
+      expect(within(targetPanel).getByText("本地文件已连接")).toBeInTheDocument();
+      expect(within(targetPanel).getByText("full-a")).toBeInTheDocument();
+      expect(createObjectUrl).toHaveBeenCalledTimes(3);
+    } finally {
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    }
   });
 
   it("媒体页可以选择本地路径作为 mpv 目标原片", async () => {
@@ -318,7 +406,17 @@ describe("资源面板", () => {
     useEditorStore.setState({
       project: {
         ...createEmptyProject(),
-        assets: [asset]
+        assets: [asset],
+        mediaLibrary: [
+          createProjectMediaReference("source-media", "bilibiliReference", {
+            name: "B 站参考 A",
+            fileName: "bilibili-a.mp4"
+          }),
+          createProjectMediaReference("target-media", "targetOriginal", {
+            name: "原片 A",
+            fileName: "full-a.mp4"
+          })
+        ]
       },
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
@@ -333,6 +431,8 @@ describe("资源面板", () => {
     const panel = screen.getByRole("region", { name: "弹幕来源内容段" });
     expect(within(panel).getByText("待标注")).toBeInTheDocument();
     expect(within(panel).getByText(/不剪切、不修改视频文件/)).toBeInTheDocument();
+    await waitFor(() => expect(within(panel).getByLabelText("来源段 B 站参考素材")).toHaveValue("source-media"));
+    expect(within(panel).getByLabelText("来源段目标原片")).toHaveValue("target-media");
 
     await user.clear(within(panel).getByLabelText("来源段开始"));
     await user.type(within(panel).getByLabelText("来源段开始"), "02:00:00.000");
@@ -343,12 +443,17 @@ describe("资源面板", () => {
     await waitFor(() => expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1));
     expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
       kind: "content",
+      assetId: asset.id,
+      sourceMediaId: "source-media",
+      targetMediaId: "target-media",
       episodeKey: "S01E01",
       sourceStartMs: 7_200_000,
       sourceEndMs: 8_640_000
     });
     expect(within(panel).getByText("已记录")).toBeInTheDocument();
     expect(within(panel).getByText("第 1 集 来源段")).toBeInTheDocument();
+    expect(within(panel).getByText(/B 站参考：B 站参考 A/)).toBeInTheDocument();
+    expect(within(panel).getByText(/目标原片：原片 A/)).toBeInTheDocument();
 
     await user.selectOptions(within(panel).getByLabelText("第 1 集 来源段 用途"), "ignored");
     await user.clear(within(panel).getByLabelText("第 1 集 来源段 名称"));
@@ -359,6 +464,7 @@ describe("资源面板", () => {
       expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
         kind: "ignored",
         label: "前置无意义片段",
+        targetMediaId: null,
         episodeKey: null
       })
     );
@@ -1606,6 +1712,31 @@ function createTimedXml(count: number, intervalSeconds: number): string {
     (_, index) => `<d p="${index * intervalSeconds},1,25,16777215,0,0,u${index},r${index}">测试 ${index + 1}</d>`
   );
   return `<?xml version="1.0" encoding="UTF-8"?><i>${lines.join("")}</i>`;
+}
+
+function createProjectMediaReference(
+  id: string,
+  role: ProjectMediaRole,
+  overrides: Partial<ProjectMediaReference> = {}
+): ProjectMediaReference {
+  const fileName = overrides.fileName ?? (role === "bilibiliReference" ? "reference.mp4" : "target.mp4");
+  return {
+    id,
+    role,
+    name: overrides.name ?? (role === "bilibiliReference" ? "B 站参考素材" : "目标原片"),
+    fileName,
+    objectUrl: "objectUrl" in overrides ? overrides.objectUrl ?? null : `blob:${fileName}`,
+    durationMs: "durationMs" in overrides ? overrides.durationMs ?? null : 10_000_000,
+    referenceKind: overrides.referenceKind ?? "browserFile",
+    connectionState: overrides.connectionState ?? "connected",
+    sourceSummary: overrides.sourceSummary ?? "测试媒体",
+    localPath: overrides.localPath ?? null,
+    emby: overrides.emby ?? null,
+    episodeKey: overrides.episodeKey ?? null,
+    episodeLabel: overrides.episodeLabel ?? null,
+    createdAt: overrides.createdAt ?? "2026-07-11T00:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-07-11T00:00:00.000Z"
+  };
 }
 
 function getTargetMediaBindingPanel(): HTMLElement {

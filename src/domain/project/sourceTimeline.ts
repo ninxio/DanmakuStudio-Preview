@@ -6,8 +6,11 @@ import type { DanmakuSourceSegment, DanmakuSourceSegmentKind, EditorProject } fr
 export interface DanmakuSourceSegmentDraft {
   label?: string;
   kind: DanmakuSourceSegmentKind;
+  assetId: string | null;
+  sourceMediaId: string | null;
   sourceStartMs: Milliseconds;
   sourceEndMs: Milliseconds;
+  targetMediaId: string | null;
   episodeKey: string | null;
   episodeLabel: string | null;
   note?: string;
@@ -60,8 +63,11 @@ export function updateDanmakuSourceSegment(
   const normalized = normalizeSegmentDraft({
     label: patch.label ?? segment.label,
     kind: patch.kind ?? segment.kind,
+    assetId: patch.assetId !== undefined ? patch.assetId : segment.assetId,
+    sourceMediaId: patch.sourceMediaId !== undefined ? patch.sourceMediaId : segment.sourceMediaId,
     sourceStartMs: patch.sourceStartMs ?? segment.sourceStartMs,
     sourceEndMs: patch.sourceEndMs ?? segment.sourceEndMs,
+    targetMediaId: patch.targetMediaId !== undefined ? patch.targetMediaId : segment.targetMediaId,
     episodeKey: patch.episodeKey !== undefined ? patch.episodeKey : segment.episodeKey,
     episodeLabel: patch.episodeLabel !== undefined ? patch.episodeLabel : segment.episodeLabel,
     note: patch.note ?? segment.note
@@ -80,6 +86,8 @@ export function createSourceTimelineSummary(
   const segments = sortSegments(project.danmakuSourceSegments);
   const contentSegments = segments.filter((segment) => segment.kind === "content");
   const ignoredSegments = segments.filter((segment) => segment.kind === "ignored");
+  const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
+  const mediaById = new Map(project.mediaLibrary.map((media) => [media.id, media]));
   const episodeLabelsByKey = new Map(plan.episodes.map((episode) => [createSeasonEpisodeKey(episode), episode.label]));
   const mappedEpisodeKeys = new Set(
     contentSegments
@@ -103,6 +111,69 @@ export function createSourceTimelineSummary(
       detail: "请把 B 站/XML 时间轴上的正片范围、前后无意义片段或空白范围标出来。"
     });
   }
+
+  segments
+    .filter((segment) => !segment.assetId || !assetsById.has(segment.assetId))
+    .forEach((segment) => {
+      findings.push({
+        id: `segment-without-asset-${segment.id}`,
+        severity: "error",
+        title: "来源段未选择 XML",
+        detail: `${segment.label} 还没有明确属于哪一个 XML。`
+      });
+    });
+
+  segments
+    .filter((segment) => !segment.sourceMediaId || mediaById.get(segment.sourceMediaId)?.role !== "bilibiliReference")
+    .forEach((segment) => {
+      findings.push({
+        id: `segment-without-source-media-${segment.id}`,
+        severity: "error",
+        title: "来源段未选择 B 站参考素材",
+        detail: `${segment.label} 需要选择具体的 B 站参考视频，不能使用原片素材作为来源。`
+      });
+    });
+
+  contentSegments
+    .filter((segment) => !segment.targetMediaId)
+    .forEach((segment) => {
+      findings.push({
+        id: `content-without-target-media-${segment.id}`,
+        severity: "warning",
+        title: "正片段未选择目标原片",
+        detail: `${segment.label} 还没有指向具体原片素材，后续无法可靠投影到原片时间轴。`
+      });
+    });
+
+  contentSegments
+    .filter((segment) => segment.targetMediaId && mediaById.get(segment.targetMediaId)?.role !== "targetOriginal")
+    .forEach((segment) => {
+      findings.push({
+        id: `content-invalid-target-media-${segment.id}`,
+        severity: "error",
+        title: "来源段目标素材角色错误",
+        detail: `${segment.label} 的目标只能选择原片素材。`
+      });
+    });
+
+  segments
+    .filter((segment) => {
+      const sourceMedia = segment.sourceMediaId ? mediaById.get(segment.sourceMediaId) : null;
+      return Boolean(
+        sourceMedia &&
+          sourceMedia.role === "bilibiliReference" &&
+          sourceMedia.durationMs !== null &&
+          segment.sourceEndMs > sourceMedia.durationMs
+      );
+    })
+    .forEach((segment) => {
+      findings.push({
+        id: `segment-out-of-source-media-range-${segment.id}`,
+        severity: "warning",
+        title: "来源段超出参考素材时长",
+        detail: `${segment.label} 的结束时间超过所选 B 站参考素材已知时长，请确认元数据或重新连接。`
+      });
+    });
 
   contentSegments
     .filter((segment) => !segment.episodeKey)
@@ -197,23 +268,40 @@ export function parseSourceTimecode(value: string): Milliseconds | null {
 }
 
 function normalizeSegmentDraft(draft: DanmakuSourceSegmentDraft): Omit<DanmakuSourceSegment, "id" | "createdAt" | "updatedAt"> {
+  assertFiniteMilliseconds(draft.sourceStartMs, "内容段开始时间无效。");
+  assertFiniteMilliseconds(draft.sourceEndMs, "内容段结束时间无效。");
   const sourceStartMs = Math.max(0, Math.round(draft.sourceStartMs));
   const sourceEndMs = Math.max(0, Math.round(draft.sourceEndMs));
   if (sourceEndMs <= sourceStartMs) {
     throw new Error("内容段结束时间必须晚于开始时间。");
   }
   const kind = draft.kind;
+  if (kind !== "content" && kind !== "ignored") {
+    throw new Error("内容段类型无效。");
+  }
+  const assetId = normalizeOptionalText(draft.assetId);
+  const sourceMediaId = normalizeOptionalText(draft.sourceMediaId);
+  const targetMediaId = kind === "content" ? normalizeOptionalText(draft.targetMediaId) : null;
   const episodeKey = kind === "content" ? normalizeOptionalText(draft.episodeKey) : null;
   const episodeLabel = kind === "content" ? normalizeOptionalText(draft.episodeLabel) : null;
   return {
     label: normalizeLabel(draft.label, kind, episodeLabel, sourceStartMs, sourceEndMs),
     kind,
+    assetId,
+    sourceMediaId,
     sourceStartMs,
     sourceEndMs,
+    targetMediaId,
     episodeKey,
     episodeLabel,
     note: draft.note?.trim() ?? ""
   };
+}
+
+function assertFiniteMilliseconds(value: Milliseconds, message: string): void {
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(Math.round(value)) || value < 0) {
+    throw new Error(message);
+  }
 }
 
 function normalizeLabel(
@@ -248,15 +336,27 @@ function sortSegments(segments: readonly DanmakuSourceSegment[]): DanmakuSourceS
 }
 
 function collectOverlaps(segments: readonly DanmakuSourceSegment[]): Array<[DanmakuSourceSegment, DanmakuSourceSegment]> {
-  const sorted = sortSegments(segments);
   const overlaps: Array<[DanmakuSourceSegment, DanmakuSourceSegment]> = [];
-  for (let index = 1; index < sorted.length; index += 1) {
-    const previous = sorted[index - 1];
-    const current = sorted[index];
-    if (current.sourceStartMs < previous.sourceEndMs) {
-      overlaps.push([previous, current]);
+  const groups = new Map<string, DanmakuSourceSegment[]>();
+  segments.forEach((segment) => {
+    const key = `${segment.assetId ?? "unassigned"}:${segment.sourceMediaId ?? "unassigned"}`;
+    const group = groups.get(key);
+    if (group) {
+      group.push(segment);
+    } else {
+      groups.set(key, [segment]);
     }
-  }
+  });
+  groups.forEach((group) => {
+    const sorted = sortSegments(group);
+    for (let index = 1; index < sorted.length; index += 1) {
+      const previous = sorted[index - 1];
+      const current = sorted[index];
+      if (current.sourceStartMs < previous.sourceEndMs) {
+        overlaps.push([previous, current]);
+      }
+    }
+  });
   return overlaps;
 }
 

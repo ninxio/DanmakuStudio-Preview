@@ -90,12 +90,21 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
   const appSettings = loadAppSettings();
   const preferredBackend = appSettings.player.preferredBackend;
   const mpvPath = appSettings.player.mpvPath;
-  const mediaObjectUrl = project.media?.objectUrl ?? null;
-  const mediaName = project.media?.name ?? "视频";
   const embyBinding = project.mediaBinding?.kind === "embyItem" ? project.mediaBinding : null;
-  const localMediaPath =
-    project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath?.trim() ?? "" : "";
-  const localMediaFileName = project.mediaBinding?.kind === "localFile" ? project.mediaBinding.fileName : mediaName;
+  const localBinding = project.mediaBinding?.kind === "localFile" ? project.mediaBinding : null;
+  const boundLocalMedia =
+    localBinding?.mediaId
+      ? project.mediaLibrary.find((media) => media.id === localBinding.mediaId) ?? null
+      : null;
+  const activeReferenceMedia =
+    project.media ??
+    project.mediaLibrary.find((media) => media.role === "bilibiliReference" && media.objectUrl) ??
+    null;
+  const mediaObjectUrl = activeReferenceMedia?.objectUrl ?? boundLocalMedia?.objectUrl ?? null;
+  const mediaName = activeReferenceMedia?.name ?? boundLocalMedia?.name ?? "视频";
+  const previewMediaId = activeReferenceMedia?.id ?? boundLocalMedia?.id ?? null;
+  const localMediaPath = localBinding ? localBinding.localPath?.trim() ?? "" : "";
+  const localMediaFileName = localBinding ? localBinding.fileName : mediaName;
   const hasLocalMediaPath = localMediaPath.length > 0;
   const nativeMpvSource: { kind: MediaSource["kind"]; url: string; name: string } | null = hasLocalMediaPath
     ? { kind: "file", url: localMediaPath, name: localMediaFileName }
@@ -112,18 +121,20 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
   const previewSourceKind: MediaSource["kind"] =
     previewBackend === "nativeMpv" ? nativeMpvSource?.kind ?? "file" : "url";
   const previewSourceName = previewBackend === "nativeMpv" ? nativeMpvSource?.name ?? mediaName : mediaName;
-  const mediaFileName = previewBackend === "nativeMpv" ? nativeMpvSource?.name ?? mediaName : project.media?.fileName ?? mediaName;
-  const previewDurationMs = project.media?.durationMs ?? project.mediaBinding?.runtimeMs ?? 0;
+  const mediaFileName =
+    previewBackend === "nativeMpv" ? nativeMpvSource?.name ?? mediaName : activeReferenceMedia?.fileName ?? boundLocalMedia?.fileName ?? mediaName;
+  const previewDurationMs = activeReferenceMedia?.durationMs ?? boundLocalMedia?.durationMs ?? project.mediaBinding?.runtimeMs ?? 0;
   const canPrepareEmbyPreview = Boolean(embyBinding && !hasLocalMediaPath && !embyPreviewInput);
   const localBindingNeedsReconnect =
     project.mediaBinding?.kind === "localFile" &&
     !hasLocalMediaPath &&
-    (!project.media ||
-      !project.media.objectUrl ||
+    (!boundLocalMedia?.objectUrl &&
+      (!project.media ||
+        !project.media.objectUrl ||
       (project.mediaBinding.mediaId
         ? project.media.id !== project.mediaBinding.mediaId
-        : project.media.fileName !== project.mediaBinding.fileName));
-  const mediaReferenceNeedsReconnect = Boolean(project.media && !project.media.objectUrl);
+        : project.media.fileName !== project.mediaBinding.fileName)));
+  const mediaReferenceNeedsReconnect = Boolean(activeReferenceMedia && !activeReferenceMedia.objectUrl);
   const reliabilitySourceKind: PlayerReliabilitySourceKind =
     previewBackend === "nativeMpv" && previewSourceKind === "url" && embyPreviewInput
       ? "embyStream"
@@ -269,7 +280,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
       .then(() => {
         if (!cancelled) {
           loadedSourceRef.current = sourceKey;
-          updateMediaDuration(adapter.getDurationMs());
+          updateMediaDuration(adapter.getDurationMs(), previewMediaId);
           updatePlayerTracks(setPlayerTracks, adapter.getTracks());
           adapter.seek(playheadRef.current);
           setVideoLoadState("ready");
@@ -285,7 +296,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
     return () => {
       cancelled = true;
     };
-  }, [previewBackend, previewSource, previewSourceKind, previewSourceName, setPlaying, updateMediaDuration]);
+  }, [previewBackend, previewMediaId, previewSource, previewSourceKind, previewSourceName, setPlaying, updateMediaDuration]);
 
   useEffect(() => {
     const adapter = adapterRef.current;

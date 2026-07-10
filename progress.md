@@ -1,5 +1,24 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C134 已完成：实现“多视频素材导入与弹幕匹配到原片时间轴”基础工作流。
+  - 项目 schema 升级到 v7，新增 `mediaLibrary` 和 `danmakuSourceBindings`；`danmakuSourceSegments` 增加所属 XML、B 站参考素材、目标原片等稳定 ID 关系，旧 `project.media`、`mediaBinding` 和 v6 来源段会确定性迁移。
+  - 新增 `src/domain/project/mediaLibrary.ts`，作为不依赖 React 的媒体素材库、XML 绑定、删除引用检查、重连、保存清理和角色验证领域模型。
+  - 媒体页改为“原片素材”和“B 站参考素材”两个真实导入区域，支持多次/批量导入、显示名称/角色/时长/来源/连接状态，并提供删除和必要的重新连接。
+  - 弹幕素材页支持每个 XML 不绑定、绑定、更换或解除一个 B 站参考素材；未绑定时显示风险提示，绑定只修改项目关系，不修改原始 XML 和弹幕时间。
+  - 弹幕来源内容段升级为可直接说明“哪个 XML、哪个 B 站参考视频的哪一段、对应哪个原片”；来源选择器只列 B 站参考素材，目标选择器只列原片素材，忽略范围不要求目标原片。
+  - 保存项目时会清除浏览器 `blob:` 对象 URL，并把浏览器文件素材标记为 `needsReconnect`；重新连接更新原媒体 ID，不创建重复素材，已有 XML 绑定和来源段关系保持不变。
+  - 删除媒体素材前会检查 XML 绑定、来源段、项目目标绑定和逐集目标绑定；被引用素材会阻止删除并提示引用位置，避免悬空 ID。
+  - 三分 P 示例项目已升级到 schema v7；架构文档同步记录媒体库、稳定 ID、临时对象 URL 和来源段关系。
+  - 已补充领域、schema、store 和资源面板测试，覆盖媒体角色、非法绑定、时间范围、删除引用、blob 保存重连、v6 迁移、ID 碰撞避让、XML 绑定 UI 和来源段 UI。
+  - 已重新验证：`corepack pnpm test` 通过（52 个测试文件 / 304 个测试）。
+  - 已重新验证：`corepack pnpm lint` 通过；`corepack pnpm build` 通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、52 个测试文件 / 304 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包；首次普通权限运行在 Vitest 启动 esbuild 时因 Windows `spawn EPERM` 中断，已用提升权限重跑同一命令通过。
+  - 已人工 UI 走查：本地 preview 中导入 2 个原片素材、2 个 B 站参考素材和 2 个 XML，完成 XML 绑定、正片来源段和忽略范围创建；截图 `artifacts/screenshots/c134-media-library.png`、`artifacts/screenshots/c134-danmaku-binding.png` 已人工查看，未发现空白、重叠或无效按钮。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12516864` 字节，时间 `2026/07/11 07:03:02`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3107908` 字节，时间 `2026/07/11 07:03:02`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c134-multi-video-binding-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C133 已完成：新增“弹幕来源内容段”，把 B 站/XML 时间轴上的虚拟正片段和忽略范围保存为项目状态。
   - 项目 schema 升级到 v6，新增 `danmakuSourceSegments`；打开 v1-v5 项目会自动迁移并补空数组，三分 P 示例项目已更新到 v6。
   - 新增 `src/domain/project/sourceTimeline.ts`，作为不依赖 React 的弹幕来源时间轴模型；支持创建/更新内容段、解析 `00:00:00.000` 时间码、生成来源时间轴摘要，并检测重叠、未关联输出集和已失效分集。

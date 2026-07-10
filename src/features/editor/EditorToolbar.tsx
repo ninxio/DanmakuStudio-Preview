@@ -48,7 +48,7 @@ export function EditorToolbar() {
   const isPlaying = useEditorStore((state) => state.isPlaying);
   const newProject = useEditorStore((state) => state.newProject);
   const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
-  const importVideoFile = useEditorStore((state) => state.importVideoFile);
+  const importMediaFiles = useEditorStore((state) => state.importMediaFiles);
   const openProjectFromText = useEditorStore((state) => state.openProjectFromText);
   const prepareExport = useEditorStore((state) => state.prepareExport);
   const undo = useEditorStore((state) => state.undo);
@@ -200,11 +200,11 @@ export function EditorToolbar() {
         className="hidden"
         type="file"
         accept="video/mp4,video/webm"
+        multiple
         data-testid="video-input"
         onChange={(event) => {
-          const file = event.target.files?.[0];
-          if (file) {
-            importVideoFile(file);
+          if (event.target.files) {
+            importMediaFiles(event.target.files, "bilibiliReference");
           }
           event.target.value = "";
         }}

@@ -3,7 +3,12 @@ import type { DanmakuClip } from "../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../domain/danmaku/cutHints";
 import { createHistoryState } from "../domain/history/history";
 import { createEmptyProject } from "../domain/project/factory";
-import { CURRENT_SCHEMA_VERSION, type EditorProject } from "../domain/project/types";
+import {
+  CURRENT_SCHEMA_VERSION,
+  type EditorProject,
+  type ProjectMediaReference,
+  type ProjectMediaRole
+} from "../domain/project/types";
 import { serializeProject } from "../domain/project/schema";
 import { parseBilibiliXml } from "../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "./editorStore";
@@ -252,10 +257,23 @@ describe("editor store", () => {
   });
 
   it("可以增删改弹幕来源内容段并支持撤销", () => {
+    const asset = createAsset("asset-source-segment", "source-segment.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      mediaLibrary: [
+        createProjectMediaReference("source-media", "bilibiliReference"),
+        createProjectMediaReference("target-media", "targetOriginal")
+      ]
+    });
+
     useEditorStore.getState().addDanmakuSourceSegment({
       kind: "content",
+      assetId: asset.id,
+      sourceMediaId: "source-media",
       sourceStartMs: 7_200_000,
       sourceEndMs: 7_260_000,
+      targetMediaId: "target-media",
       episodeKey: "S01E01",
       episodeLabel: "第 1 集",
       note: "正片开始"
@@ -274,6 +292,7 @@ describe("editor store", () => {
       kind: "ignored",
       sourceStartMs: 0,
       sourceEndMs: 7_200_000,
+      targetMediaId: null,
       label: "前置无意义片段"
     });
 
@@ -288,6 +307,198 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(0);
     useEditorStore.getState().undo();
     expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
+  });
+
+  it("阻止删除仍被引用的媒体素材，并允许删除空闲素材", () => {
+    const revokeSpy = mockRevokeObjectUrl();
+    const asset = createAsset("asset-media-delete", "delete.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      mediaLibrary: [
+        createProjectMediaReference("source-media", "bilibiliReference", { objectUrl: "blob:source" }),
+        createProjectMediaReference("target-media", "targetOriginal", { objectUrl: "blob:target" }),
+        createProjectMediaReference("loose-media", "bilibiliReference", { objectUrl: "blob:loose" })
+      ],
+      mediaBinding: {
+        id: "target-binding",
+        kind: "localFile",
+        displayName: "目标原片",
+        fileName: "target.mp4",
+        mediaId: "target-media",
+        localPath: null,
+        runtimeMs: 120_000,
+        linkedAt: "2026-07-11T00:00:00.000Z"
+      },
+      danmakuSourceBindings: [
+        {
+          id: "xml-binding",
+          assetId: asset.id,
+          sourceMediaId: "source-media",
+          linkedAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      danmakuSourceSegments: [
+        {
+          id: "segment",
+          label: "第 1 集来源段",
+          kind: "content",
+          assetId: asset.id,
+          sourceMediaId: "source-media",
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetMediaId: "target-media",
+          episodeKey: "S01E01",
+          episodeLabel: "第 1 集",
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    });
+
+    useEditorStore.getState().removeMediaReference("source-media");
+    expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(3);
+    expect(useEditorStore.getState().status.message).toContain("不能删除该素材：XML 绑定：delete.xml");
+
+    useEditorStore.getState().removeMediaReference("loose-media");
+    expect(useEditorStore.getState().project.mediaLibrary.map((media) => media.id)).toEqual([
+      "source-media",
+      "target-media"
+    ]);
+    expect(revokeSpy).toHaveBeenCalledWith("blob:loose");
+  });
+
+  it("重新连接媒体素材时不创建重复素材并保留已有绑定 ID", () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>((object) =>
+      object instanceof File ? `blob:${object.name}` : "blob:media"
+    );
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    const asset = createAsset("asset-media-reconnect", "reconnect.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      mediaLibrary: [
+        createProjectMediaReference("source-media", "bilibiliReference", {
+          objectUrl: null,
+          connectionState: "needsReconnect"
+        }),
+        createProjectMediaReference("target-media", "targetOriginal", {
+          objectUrl: null,
+          connectionState: "needsReconnect"
+        })
+      ],
+      mediaBinding: {
+        id: "target-binding",
+        kind: "localFile",
+        displayName: "目标原片",
+        fileName: "target.mp4",
+        mediaId: "target-media",
+        localPath: null,
+        runtimeMs: 120_000,
+        linkedAt: "2026-07-11T00:00:00.000Z"
+      },
+      danmakuSourceBindings: [
+        {
+          id: "xml-binding",
+          assetId: asset.id,
+          sourceMediaId: "source-media",
+          linkedAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      danmakuSourceSegments: [
+        {
+          id: "segment",
+          label: "第 1 集来源段",
+          kind: "content",
+          assetId: asset.id,
+          sourceMediaId: "source-media",
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetMediaId: "target-media",
+          episodeKey: "S01E01",
+          episodeLabel: "第 1 集",
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    });
+
+    try {
+      useEditorStore
+        .getState()
+        .reconnectMediaReference("source-media", new File(["source"], "source-new.mp4", { type: "video/mp4" }));
+      expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(2);
+      expect(useEditorStore.getState().project.mediaLibrary[0]).toMatchObject({
+        id: "source-media",
+        fileName: "source-new.mp4",
+        objectUrl: "blob:source-new.mp4",
+        connectionState: "connected"
+      });
+      expect(useEditorStore.getState().project.media).toMatchObject({
+        id: "source-media",
+        fileName: "source-new.mp4"
+      });
+      expect(useEditorStore.getState().project.danmakuSourceBindings[0].sourceMediaId).toBe("source-media");
+      expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
+        sourceMediaId: "source-media",
+        targetMediaId: "target-media"
+      });
+
+      useEditorStore
+        .getState()
+        .reconnectMediaReference("target-media", new File(["target"], "target-new.webm", { type: "video/webm" }));
+      expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(2);
+      expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
+        kind: "localFile",
+        mediaId: "target-media",
+        fileName: "target-new.webm"
+      });
+      expect(useEditorStore.getState().project.danmakuSourceSegments[0].targetMediaId).toBe("target-media");
+      expect(createObjectUrl).toHaveBeenCalledTimes(2);
+    } finally {
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    }
+  });
+
+  it("更新媒体时长时可以按稳定 ID 写回目标原片素材", () => {
+    resetStore({
+      ...createEmptyProject(),
+      media: null,
+      mediaLibrary: [
+        createProjectMediaReference("target-media", "targetOriginal", {
+          durationMs: null
+        })
+      ],
+      mediaBinding: {
+        id: "target-binding",
+        kind: "localFile",
+        displayName: "目标原片",
+        fileName: "target.mp4",
+        mediaId: "target-media",
+        localPath: null,
+        runtimeMs: null,
+        linkedAt: "2026-07-11T00:00:00.000Z"
+      }
+    });
+
+    useEditorStore.getState().updateMediaDuration(123_456, "target-media");
+
+    expect(useEditorStore.getState().project.media).toBeNull();
+    expect(useEditorStore.getState().project.mediaLibrary[0].durationMs).toBe(123_456);
+    expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
+      kind: "localFile",
+      mediaId: "target-media",
+      runtimeMs: 123_456
+    });
   });
 
   it("预览对齐提案时同步写入项目文件状态", () => {
@@ -826,3 +1037,27 @@ describe("editor store", () => {
     expect(useEditorStore.getState().selection).toEqual({ kind: "none", ids: [] });
   });
 });
+
+function createProjectMediaReference(
+  id: string,
+  role: ProjectMediaRole,
+  overrides: Partial<ProjectMediaReference> = {}
+): ProjectMediaReference {
+  return {
+    id,
+    role,
+    name: overrides.name ?? (role === "bilibiliReference" ? "B 站参考素材" : "目标原片"),
+    fileName: overrides.fileName ?? (role === "bilibiliReference" ? "reference.mp4" : "target.mp4"),
+    objectUrl: "objectUrl" in overrides ? overrides.objectUrl ?? null : "blob:test",
+    durationMs: "durationMs" in overrides ? overrides.durationMs ?? null : 120_000,
+    referenceKind: overrides.referenceKind ?? "browserFile",
+    connectionState: overrides.connectionState ?? "connected",
+    sourceSummary: overrides.sourceSummary ?? "测试媒体",
+    localPath: overrides.localPath ?? null,
+    emby: overrides.emby ?? null,
+    episodeKey: overrides.episodeKey ?? null,
+    episodeLabel: overrides.episodeLabel ?? null,
+    createdAt: overrides.createdAt ?? "2026-07-11T00:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-07-11T00:00:00.000Z"
+  };
+}

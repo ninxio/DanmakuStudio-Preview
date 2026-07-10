@@ -8,7 +8,7 @@ import {
   serializeProject,
   validateProjectSchema
 } from "./schema";
-import { CURRENT_SCHEMA_VERSION } from "./types";
+import { CURRENT_SCHEMA_VERSION, type ProjectMediaReference, type ProjectMediaRole } from "./types";
 
 describe("project schema", () => {
   it("序列化后可重新打开，并清除临时 objectUrl", () => {
@@ -21,6 +21,14 @@ describe("project schema", () => {
         objectUrl: "blob:test",
         durationMs: 1000
       },
+      mediaLibrary: [
+        createValidProjectMediaReference({
+          id: "media",
+          role: "bilibiliReference",
+          objectUrl: "blob:test",
+          connectionState: "connected"
+        })
+      ],
       mediaBinding: createValidLocalFileBinding(),
       alignmentProposal: createValidAlignmentProposal()
     };
@@ -31,6 +39,14 @@ describe("project schema", () => {
         kind: "localFile",
         fileName: "demo.mp4"
       },
+      mediaLibrary: [
+        {
+          id: "media",
+          role: "bilibiliReference",
+          objectUrl: null,
+          connectionState: "needsReconnect"
+        }
+      ],
       alignmentProposal: {
         anchors: [{ id: "proposal-anchor" }],
         cutCandidates: [{ id: "proposal-cut" }]
@@ -39,6 +55,8 @@ describe("project schema", () => {
     const parsed = parseProjectJson(json);
     expect(parsed.name).toBe("测试项目");
     expect(parsed.media?.objectUrl).toBeNull();
+    expect(parsed.mediaLibrary[0].objectUrl).toBeNull();
+    expect(parsed.mediaLibrary[0].connectionState).toBe("needsReconnect");
     expect(parsed.mediaBinding?.kind).toBe("localFile");
     expect(parsed.alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
   });
@@ -121,13 +139,21 @@ describe("project schema", () => {
   it("允许保存弹幕来源内容段", () => {
     const project = {
       ...createEmptyProject("来源内容段项目"),
+      assets: [createValidAsset()],
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
       danmakuSourceSegments: [
         {
           id: "source-segment-1",
           label: "第 1 集来源段",
           kind: "content" as const,
+          assetId: "asset",
+          sourceMediaId: "source-media",
           sourceStartMs: 7_200_000,
           sourceEndMs: 7_260_000,
+          targetMediaId: "target-media",
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "B 站长视频两小时后进入正片",
@@ -138,8 +164,11 @@ describe("project schema", () => {
           id: "source-segment-ignored",
           label: "前置无意义片段",
           kind: "ignored" as const,
+          assetId: "asset",
+          sourceMediaId: "source-media",
           sourceStartMs: 0,
           sourceEndMs: 7_200_000,
+          targetMediaId: null,
           episodeKey: null,
           episodeLabel: null,
           note: "",
@@ -290,6 +319,127 @@ describe("project schema", () => {
       fromVersion: 5,
       toVersion: CURRENT_SCHEMA_VERSION,
       adjustedClipRangeCount: 0
+    });
+  });
+
+  it("打开 v6 项目时迁移旧媒体、目标绑定和来源段关系", () => {
+    const legacySourceSegment = {
+      id: "legacy-segment",
+      label: "第 1 集来源段",
+      kind: "content" as const,
+      sourceStartMs: 7_200_000,
+      sourceEndMs: 7_260_000,
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集",
+      note: "旧来源段",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      updatedAt: "2026-07-11T00:00:00.000Z"
+    };
+    const legacyProject = {
+      ...createEmptyProject("v6 旧媒体项目"),
+      schemaVersion: 6,
+      assets: [createValidAsset()],
+      media: {
+        id: "legacy-source-media",
+        name: "B 站参考",
+        fileName: "reference.mp4",
+        objectUrl: "blob:reference",
+        durationMs: 8_000_000
+      },
+      mediaBinding: createValidLocalFileBinding(),
+      danmakuSourceSegments: [legacySourceSegment]
+    };
+    const v6Project = JSON.parse(JSON.stringify(legacyProject)) as Record<string, unknown>;
+    delete v6Project.mediaLibrary;
+    delete v6Project.danmakuSourceBindings;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v6Project));
+
+    expect(migration).toEqual({
+      fromVersion: 6,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+    expect(parsed.mediaLibrary.map((media) => [media.id, media.role])).toEqual([
+      ["legacy-source-media", "bilibiliReference"],
+      ["migrated_target_binding-local", "targetOriginal"]
+    ]);
+    expect(parsed.mediaBinding).toMatchObject({
+      kind: "localFile",
+      mediaId: "migrated_target_binding-local"
+    });
+    expect(parsed.danmakuSourceBindings).toMatchObject([
+      {
+        assetId: "asset",
+        sourceMediaId: "legacy-source-media"
+      }
+    ]);
+    expect(parsed.danmakuSourceSegments[0]).toMatchObject({
+      assetId: "asset",
+      sourceMediaId: "legacy-source-media",
+      targetMediaId: "migrated_target_binding-local"
+    });
+
+    const reopened = parseProjectJson(serializeProject(parsed));
+    expect(reopened.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(reopened.mediaLibrary[0]).toMatchObject({
+      id: "legacy-source-media",
+      objectUrl: null,
+      connectionState: "needsReconnect"
+    });
+    expect(reopened.danmakuSourceSegments[0]).toMatchObject({
+      assetId: "asset",
+      sourceMediaId: "legacy-source-media",
+      targetMediaId: "migrated_target_binding-local"
+    });
+  });
+
+  it("迁移 v6 项目时稳定避让旧媒体 ID 碰撞，避免重复或覆盖素材", () => {
+    const legacyProject = {
+      ...createEmptyProject("v6 ID 碰撞项目"),
+      schemaVersion: 6,
+      assets: [createValidAsset()],
+      media: {
+        id: "migrated_target_binding-local",
+        name: "B 站参考",
+        fileName: "reference.mp4",
+        objectUrl: null,
+        durationMs: 8_000_000
+      },
+      mediaBinding: createValidLocalFileBinding(),
+      danmakuSourceSegments: [
+        {
+          id: "legacy-segment",
+          label: "第 1 集来源段",
+          kind: "content" as const,
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          episodeKey: "S01E01",
+          episodeLabel: "第 1 集",
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    };
+    const v6Project = JSON.parse(JSON.stringify(legacyProject)) as Record<string, unknown>;
+    delete v6Project.mediaLibrary;
+    delete v6Project.danmakuSourceBindings;
+
+    const parsed = parseProjectJson(JSON.stringify(v6Project));
+
+    expect(parsed.mediaLibrary.map((media) => [media.id, media.role])).toEqual([
+      ["migrated_target_binding-local", "bilibiliReference"],
+      ["migrated_target_binding-local_2", "targetOriginal"]
+    ]);
+    expect(new Set(parsed.mediaLibrary.map((media) => media.id)).size).toBe(parsed.mediaLibrary.length);
+    expect(parsed.mediaBinding).toMatchObject({
+      kind: "localFile",
+      mediaId: "migrated_target_binding-local_2"
+    });
+    expect(parsed.danmakuSourceSegments[0]).toMatchObject({
+      sourceMediaId: "migrated_target_binding-local",
+      targetMediaId: "migrated_target_binding-local_2"
     });
   });
 
@@ -480,8 +630,11 @@ describe("project schema", () => {
           id: "source-segment",
           label: "bad",
           kind: "ignored",
+          assetId: "asset",
+          sourceMediaId: "source-media",
           sourceStartMs: 1000,
           sourceEndMs: 1000,
+          targetMediaId: null,
           episodeKey: null,
           episodeLabel: null,
           note: "",
@@ -610,5 +763,31 @@ function createValidEmbyBinding() {
         runtimeMs: 3_000_000
       }
     ]
+  };
+}
+
+function createValidProjectMediaReference(
+  overrides: Partial<ProjectMediaReference> & { id: string; role: ProjectMediaRole }
+): ProjectMediaReference {
+  const roleDefaults =
+    overrides.role === "bilibiliReference"
+      ? { name: "B 站参考素材", fileName: "reference.mp4" }
+      : { name: "目标原片", fileName: "target.mp4" };
+  return {
+    id: overrides.id,
+    role: overrides.role,
+    name: overrides.name ?? roleDefaults.name,
+    fileName: overrides.fileName ?? roleDefaults.fileName,
+    objectUrl: overrides.objectUrl ?? null,
+    durationMs: overrides.durationMs ?? 120_000,
+    referenceKind: overrides.referenceKind ?? "browserFile",
+    connectionState: overrides.connectionState ?? "needsReconnect",
+    sourceSummary: overrides.sourceSummary ?? "测试媒体",
+    localPath: overrides.localPath ?? null,
+    emby: overrides.emby ?? null,
+    episodeKey: overrides.episodeKey ?? null,
+    episodeLabel: overrides.episodeLabel ?? null,
+    createdAt: overrides.createdAt ?? "2026-07-11T00:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-07-11T00:00:00.000Z"
   };
 }

@@ -1,8 +1,16 @@
 import {
   CURRENT_SCHEMA_VERSION,
   type EditorProject,
+  type MediaBinding,
+  type ProjectMediaReference,
   type ProjectValidationResult
 } from "./types";
+import {
+  createDanmakuSourceBinding,
+  createMediaReferenceFromBinding,
+  createMediaReferenceFromLegacyMedia,
+  sanitizeMediaReferencesForSave
+} from "./mediaLibrary";
 
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
@@ -15,6 +23,18 @@ export interface ProjectSchemaMigration {
 export interface ProjectParseResult {
   project: EditorProject;
   migration: ProjectSchemaMigration | null;
+}
+
+type LegacyEditorProject = Omit<EditorProject, "mediaLibrary" | "danmakuSourceBindings"> &
+  Partial<Pick<EditorProject, "mediaLibrary" | "danmakuSourceBindings">>;
+
+interface MediaSchemaMigrationResult {
+  mediaLibrary: ProjectMediaReference[];
+  mediaBinding: MediaBinding | null;
+  danmakuSourceBindings: EditorProject["danmakuSourceBindings"];
+  defaultSourceMediaId: string | null;
+  defaultTargetMediaId: string | null;
+  defaultAssetId: string | null;
 }
 
 export function validateProjectSchema(value: unknown): ProjectValidationResult {
@@ -36,9 +56,11 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     typeof value.id !== "string" ||
     typeof value.name !== "string" ||
     !isMediaReference(value.media) ||
+    (version >= 7 && !isProjectMediaReferences(value.mediaLibrary)) ||
     (version >= 4 && !isMediaBindingOrNull(value.mediaBinding)) ||
     (version >= 5 && !isSeasonEpisodeBindings(value.seasonEpisodeBindings)) ||
-    (version >= 6 && !isDanmakuSourceSegments(value.danmakuSourceSegments)) ||
+    (version >= 7 && !isDanmakuSourceBindings(value.danmakuSourceBindings)) ||
+    (version >= 6 && !isDanmakuSourceSegments(value.danmakuSourceSegments, version)) ||
     !Array.isArray(value.assets) ||
     !Array.isArray(value.clips) ||
     !isIntegerMilliseconds(value.globalOffsetMs) ||
@@ -86,9 +108,11 @@ export function parseProjectJsonWithMetadata(json: string): ProjectParseResult {
 }
 
 export function serializeProject(project: EditorProject): string {
+  const savedMediaLibrary = sanitizeMediaReferencesForSave(project.mediaLibrary);
   const savedProject: EditorProject = {
     ...project,
     schemaVersion: CURRENT_SCHEMA_VERSION,
+    mediaLibrary: savedMediaLibrary,
     media: project.media
       ? {
           ...project.media,
@@ -107,19 +131,26 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
   if (parsedVersion === CURRENT_SCHEMA_VERSION) {
     return { project, migration: null };
   }
+  const legacyProject = project as LegacyEditorProject;
   const legacyClipRanges =
     parsedVersion < 2
       ? migrateLegacyClosedClipRanges(project)
       : { clips: project.clips, adjustedClipRangeCount: 0 };
+  const mediaMigration = migrateProjectMediaState(legacyProject, parsedVersion);
   return {
     project: {
       ...project,
       schemaVersion: CURRENT_SCHEMA_VERSION,
       clips: legacyClipRanges.clips,
       alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null,
-      mediaBinding: parsedVersion >= 4 ? project.mediaBinding : null,
+      mediaLibrary: mediaMigration.mediaLibrary,
+      mediaBinding: mediaMigration.mediaBinding,
       seasonEpisodeBindings: parsedVersion >= 5 ? project.seasonEpisodeBindings : [],
-      danmakuSourceSegments: parsedVersion >= 6 ? project.danmakuSourceSegments : []
+      danmakuSourceBindings: mediaMigration.danmakuSourceBindings,
+      danmakuSourceSegments:
+        parsedVersion >= 6
+          ? migrateLegacyDanmakuSourceSegments(project.danmakuSourceSegments, mediaMigration)
+          : []
     },
     migration: {
       fromVersion: parsedVersion,
@@ -127,6 +158,122 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
       adjustedClipRangeCount: legacyClipRanges.adjustedClipRangeCount
     }
   };
+}
+
+function migrateProjectMediaState(
+  project: LegacyEditorProject,
+  parsedVersion: number
+): MediaSchemaMigrationResult {
+  const timestamp = normalizeMigrationTimestamp(project.updatedAt, project.createdAt);
+  const existingMedia = parsedVersion >= 7 && project.mediaLibrary ? project.mediaLibrary : [];
+  const mediaLibrary: ProjectMediaReference[] = uniqueMediaReferences(existingMedia);
+  const legacySourceMediaId = project.media?.id ?? null;
+  if (parsedVersion < 7 && project.media) {
+    upsertMediaReference(mediaLibrary, createMediaReferenceFromLegacyMedia(project.media, timestamp));
+  }
+  let mediaBinding = parsedVersion >= 4 ? project.mediaBinding : null;
+  let defaultTargetMediaId: string | null = null;
+  if (parsedVersion < 7 && mediaBinding) {
+    const targetMediaId = createUniqueMigratedMediaId(
+      mediaLibrary,
+      createMigratedMediaId("migrated_target", mediaBinding.id)
+    );
+    upsertMediaReference(mediaLibrary, createMediaReferenceFromBinding(targetMediaId, mediaBinding));
+    defaultTargetMediaId = targetMediaId;
+    if (mediaBinding.kind === "localFile") {
+      mediaBinding = {
+        ...mediaBinding,
+        mediaId: targetMediaId
+      };
+    }
+  }
+  const defaultSourceMediaId =
+    legacySourceMediaId &&
+    mediaLibrary.some((media) => media.id === legacySourceMediaId && media.role === "bilibiliReference")
+      ? legacySourceMediaId
+      : mediaLibrary.find((media) => media.role === "bilibiliReference")?.id ?? null;
+  const defaultAssetId = project.assets.length === 1 ? project.assets[0].id : null;
+  const danmakuSourceBindings =
+    parsedVersion >= 7 && project.danmakuSourceBindings
+      ? project.danmakuSourceBindings
+      : createMigratedDanmakuSourceBindings(project, defaultSourceMediaId, timestamp);
+  return {
+    mediaLibrary,
+    mediaBinding,
+    danmakuSourceBindings,
+    defaultSourceMediaId,
+    defaultTargetMediaId,
+    defaultAssetId
+  };
+}
+
+function migrateLegacyDanmakuSourceSegments(
+  segments: EditorProject["danmakuSourceSegments"],
+  mediaMigration: MediaSchemaMigrationResult
+): EditorProject["danmakuSourceSegments"] {
+  return segments.map((segment) => ({
+    ...segment,
+    assetId: segment.assetId ?? mediaMigration.defaultAssetId,
+    sourceMediaId: segment.sourceMediaId ?? mediaMigration.defaultSourceMediaId,
+    targetMediaId:
+      segment.kind === "content"
+        ? segment.targetMediaId ?? mediaMigration.defaultTargetMediaId
+        : null
+  }));
+}
+
+function createMigratedDanmakuSourceBindings(
+  project: LegacyEditorProject,
+  sourceMediaId: string | null,
+  timestamp: string
+): EditorProject["danmakuSourceBindings"] {
+  if (!sourceMediaId) {
+    return [];
+  }
+  return project.assets.map((asset) =>
+    createDanmakuSourceBinding(
+      createMigratedMediaId("migrated_xml_binding", `${asset.id}_${sourceMediaId}`),
+      asset.id,
+      sourceMediaId,
+      timestamp
+    )
+  );
+}
+
+function uniqueMediaReferences(mediaLibrary: readonly ProjectMediaReference[]): ProjectMediaReference[] {
+  const result: ProjectMediaReference[] = [];
+  mediaLibrary.forEach((media) => upsertMediaReference(result, media));
+  return result;
+}
+
+function upsertMediaReference(mediaLibrary: ProjectMediaReference[], media: ProjectMediaReference): void {
+  const index = mediaLibrary.findIndex((candidate) => candidate.id === media.id);
+  if (index >= 0) {
+    mediaLibrary[index] = media;
+    return;
+  }
+  mediaLibrary.push(media);
+}
+
+function createMigratedMediaId(prefix: string, id: string): string {
+  return `${prefix}_${id.replace(/[^A-Za-z0-9_-]+/g, "_")}`;
+}
+
+function createUniqueMigratedMediaId(mediaLibrary: readonly ProjectMediaReference[], preferredId: string): string {
+  if (!mediaLibrary.some((media) => media.id === preferredId)) {
+    return preferredId;
+  }
+  for (let index = 2; index < Number.MAX_SAFE_INTEGER; index += 1) {
+    const candidate = `${preferredId}_${index}`;
+    if (!mediaLibrary.some((media) => media.id === candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error("无法为迁移媒体生成唯一 ID。");
+}
+
+function normalizeMigrationTimestamp(updatedAt: string, createdAt: string): string {
+  return updatedAt.trim().length > 0 ? updatedAt : createdAt;
 }
 
 function migrateLegacyClosedClipRanges(project: EditorProject): {
@@ -160,6 +307,51 @@ function isMediaReference(value: unknown): boolean {
     typeof value.fileName === "string" &&
     (typeof value.objectUrl === "string" || value.objectUrl === null) &&
     (isNonNegativeIntegerMilliseconds(value.durationMs) || value.durationMs === null)
+  );
+}
+
+function isProjectMediaReferences(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isProjectMediaReference);
+}
+
+function isProjectMediaReference(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    (value.role === "targetOriginal" || value.role === "bilibiliReference") &&
+    typeof value.name === "string" &&
+    typeof value.fileName === "string" &&
+    (typeof value.objectUrl === "string" || value.objectUrl === null) &&
+    (isNonNegativeIntegerMilliseconds(value.durationMs) || value.durationMs === null) &&
+    (value.referenceKind === "browserFile" || value.referenceKind === "localPath" || value.referenceKind === "embyItem") &&
+    (value.connectionState === "connected" ||
+      value.connectionState === "needsReconnect" ||
+      value.connectionState === "metadataOnly") &&
+    typeof value.sourceSummary === "string" &&
+    (typeof value.localPath === "string" || value.localPath === null) &&
+    isProjectMediaEmbyReferenceOrNull(value.emby) &&
+    (typeof value.episodeKey === "string" || value.episodeKey === null) &&
+    (typeof value.episodeLabel === "string" || value.episodeLabel === null) &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function isProjectMediaEmbyReferenceOrNull(value: unknown): boolean {
+  if (value === null) {
+    return true;
+  }
+  return (
+    isRecord(value) &&
+    typeof value.itemId === "string" &&
+    typeof value.itemName === "string" &&
+    typeof value.itemType === "string" &&
+    (typeof value.seriesName === "string" || value.seriesName === null) &&
+    (isNonNegativeInteger(value.seasonNumber) || value.seasonNumber === null) &&
+    (isNonNegativeInteger(value.episodeNumber) || value.episodeNumber === null) &&
+    isEmbyServerReference(value.server) &&
+    Array.isArray(value.mediaSources) &&
+    value.mediaSources.every(isEmbyMediaSourceSummary)
   );
 }
 
@@ -242,18 +434,36 @@ function isSeasonEpisodeBinding(value: unknown): boolean {
   );
 }
 
-function isDanmakuSourceSegments(value: unknown): boolean {
-  return Array.isArray(value) && value.every(isDanmakuSourceSegment);
+function isDanmakuSourceBindings(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isDanmakuSourceBinding);
 }
 
-function isDanmakuSourceSegment(value: unknown): boolean {
+function isDanmakuSourceBinding(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.assetId === "string" &&
+    typeof value.sourceMediaId === "string" &&
+    typeof value.linkedAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function isDanmakuSourceSegments(value: unknown, version: number): boolean {
+  return Array.isArray(value) && value.every((segment) => isDanmakuSourceSegment(segment, version));
+}
+
+function isDanmakuSourceSegment(value: unknown, version: number): boolean {
   if (
     !isRecord(value) ||
     typeof value.id !== "string" ||
     typeof value.label !== "string" ||
+    (version >= 7 && (typeof value.assetId !== "string" && value.assetId !== null)) ||
+    (version >= 7 && (typeof value.sourceMediaId !== "string" && value.sourceMediaId !== null)) ||
     !isNonNegativeIntegerMilliseconds(value.sourceStartMs) ||
     !isNonNegativeIntegerMilliseconds(value.sourceEndMs) ||
     value.sourceEndMs <= value.sourceStartMs ||
+    (version >= 7 && (typeof value.targetMediaId !== "string" && value.targetMediaId !== null)) ||
     typeof value.note !== "string" ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string"
@@ -267,7 +477,7 @@ function isDanmakuSourceSegment(value: unknown): boolean {
     );
   }
   if (value.kind === "ignored") {
-    return value.episodeKey === null && value.episodeLabel === null;
+    return value.episodeKey === null && value.episodeLabel === null && (version < 7 || value.targetMediaId === null);
   }
   return false;
 }

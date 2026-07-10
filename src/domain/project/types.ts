@@ -7,7 +7,7 @@ import type {
 import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 export interface MediaReference {
   id: string;
@@ -15,6 +15,39 @@ export interface MediaReference {
   fileName: string;
   objectUrl: string | null;
   durationMs: Milliseconds | null;
+}
+
+export type ProjectMediaRole = "targetOriginal" | "bilibiliReference";
+export type ProjectMediaReferenceKind = "browserFile" | "localPath" | "embyItem";
+export type ProjectMediaConnectionState = "connected" | "needsReconnect" | "metadataOnly";
+
+export interface ProjectMediaEmbyReference {
+  itemId: string;
+  itemName: string;
+  itemType: string;
+  seriesName: string | null;
+  seasonNumber: number | null;
+  episodeNumber: number | null;
+  server: EmbyServerReference;
+  mediaSources: EmbyMediaSourceSummary[];
+}
+
+export interface ProjectMediaReference {
+  id: string;
+  role: ProjectMediaRole;
+  name: string;
+  fileName: string;
+  objectUrl: string | null;
+  durationMs: Milliseconds | null;
+  referenceKind: ProjectMediaReferenceKind;
+  connectionState: ProjectMediaConnectionState;
+  sourceSummary: string;
+  localPath: string | null;
+  emby: ProjectMediaEmbyReference | null;
+  episodeKey: string | null;
+  episodeLabel: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface EmbyServerReference {
@@ -74,12 +107,23 @@ export interface SeasonEpisodeBinding {
 
 export type DanmakuSourceSegmentKind = "content" | "ignored";
 
+export interface DanmakuSourceBinding {
+  id: string;
+  assetId: string;
+  sourceMediaId: string;
+  linkedAt: string;
+  updatedAt: string;
+}
+
 export interface DanmakuSourceSegment {
   id: string;
   label: string;
   kind: DanmakuSourceSegmentKind;
+  assetId: string | null;
+  sourceMediaId: string | null;
   sourceStartMs: Milliseconds;
   sourceEndMs: Milliseconds;
+  targetMediaId: string | null;
   episodeKey: string | null;
   episodeLabel: string | null;
   note: string;
@@ -104,8 +148,10 @@ export interface EditorProject {
   id: string;
   name: string;
   media: MediaReference | null;
+  mediaLibrary: ProjectMediaReference[];
   mediaBinding: MediaBinding | null;
   seasonEpisodeBindings: SeasonEpisodeBinding[];
+  danmakuSourceBindings: DanmakuSourceBinding[];
   danmakuSourceSegments: DanmakuSourceSegment[];
   assets: DanmakuAsset[];
   clips: DanmakuClip[];

@@ -27,6 +27,20 @@ import {
   createProjectHealthSummary,
   summarizeProjectHealthBlockers
 } from "../domain/project/health";
+import {
+  createBrowserFileMediaReference,
+  createDanmakuSourceBinding,
+  createMediaReferenceFromBinding,
+  findDanmakuSourceBinding,
+  findProjectMedia,
+  removeDanmakuSourceBinding,
+  removeMediaReference,
+  reconnectMediaReference as reconnectProjectMediaReference,
+  updateMediaDuration as updateProjectMediaDuration,
+  upsertDanmakuSourceBinding,
+  validateDanmakuSourceBinding,
+  validateSourceSegmentReferences
+} from "../domain/project/mediaLibrary";
 import { createLocalFileMediaBinding } from "../domain/project/mediaBinding";
 import {
   createDanmakuSourceSegment,
@@ -34,7 +48,14 @@ import {
   type DanmakuSourceSegmentDraft,
   type DanmakuSourceSegmentPatch
 } from "../domain/project/sourceTimeline";
-import type { EditorProject, EditorSelection, MediaBinding, MediaReference } from "../domain/project/types";
+import type {
+  EditorProject,
+  EditorSelection,
+  MediaBinding,
+  MediaReference,
+  ProjectMediaReference,
+  ProjectMediaRole
+} from "../domain/project/types";
 import {
   getAssetTimeRange,
   getClipDurationMs,
@@ -111,17 +132,22 @@ interface EditorStore {
   timelineTool: TimelineTool;
   newProject: () => void;
   importXmlFiles: (files: FileList | File[]) => Promise<void>;
+  importMediaFiles: (files: FileList | File[], role: ProjectMediaRole) => void;
   importVideoFile: (file: File) => void;
   removeMedia: () => void;
+  removeMediaReference: (mediaId: string) => void;
+  reconnectMediaReference: (mediaId: string, file: File) => void;
   bindCurrentMediaAsTarget: () => void;
   setMediaBinding: (binding: MediaBinding) => void;
   clearMediaBinding: () => void;
+  bindXmlToSourceMedia: (assetId: string, sourceMediaId: string) => void;
+  clearXmlSourceBinding: (assetId: string) => void;
   bindCurrentTargetToSeasonEpisode: (episodeKey: string, episodeLabel: string) => void;
   clearSeasonEpisodeBinding: (episodeKey: string) => void;
   addDanmakuSourceSegment: (draft: DanmakuSourceSegmentDraft) => void;
   updateDanmakuSourceSegment: (id: string, patch: DanmakuSourceSegmentPatch) => void;
   deleteDanmakuSourceSegment: (id: string) => void;
-  updateMediaDuration: (durationMs: Milliseconds) => void;
+  updateMediaDuration: (durationMs: Milliseconds, mediaId?: string | null) => void;
   openProjectFromText: (text: string, sourceFileName?: string) => void;
   addAssetToTimeline: (assetId: string) => void;
   removeAsset: (assetId: string) => void;
@@ -196,7 +222,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   timelineTool: "select",
 
   newProject: () => {
-    revokeObjectUrl(get().project.media?.objectUrl ?? null);
+    revokeProjectObjectUrls(get().project);
     set({
       project: createEmptyProject(),
       selection: emptySelection,
@@ -252,24 +278,51 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
   },
 
-  importVideoFile: (file) => {
-    const previousUrl = get().project.media?.objectUrl;
-    if (previousUrl) {
-      URL.revokeObjectURL(previousUrl);
+  importMediaFiles: (files, role) => {
+    const fileArray = Array.from(files).filter(isSupportedVideoFile);
+    if (fileArray.length === 0) {
+      set({ status: { message: "请选择 MP4 或 WebM 视频文件。", tone: "warning" } });
+      return;
     }
-    const objectUrl = createObjectUrl(file);
-    const media: MediaReference = {
-      id: createId("media"),
-      name: file.name.replace(/\.[^.]+$/, ""),
-      fileName: file.name,
-      objectUrl,
-      durationMs: null
-    };
-    commitProject(set, get, "导入参考视频", (project) => ({
-      ...project,
-      media
-    }));
-    set({ status: { message: `已导入参考视频：${file.name}`, tone: "success" } });
+    const importedMedia = fileArray.map((file) =>
+      createBrowserFileMediaReference(createId("media"), role, {
+        name: file.name.replace(/\.[^.]+$/, ""),
+        fileName: file.name,
+        objectUrl: createObjectUrl(file),
+        durationMs: null
+      })
+    );
+    commitProject(set, get, role === "targetOriginal" ? "导入原片素材" : "导入 B 站参考素材", (project) => {
+      const nextMediaLibrary = [...project.mediaLibrary, ...importedMedia];
+      const firstImported = importedMedia[0];
+      const mediaBinding =
+        role === "targetOriginal" && !project.mediaBinding
+          ? createLocalFileMediaBinding(createId("media_binding"), toLegacyMediaReference(firstImported))
+          : project.mediaBinding;
+      const normalizedMediaBinding =
+        mediaBinding && role === "targetOriginal" && !project.mediaBinding && mediaBinding.kind === "localFile"
+          ? { ...mediaBinding, mediaId: firstImported.id }
+          : mediaBinding;
+      return {
+        ...project,
+        mediaLibrary: nextMediaLibrary,
+        media: role === "bilibiliReference" ? toLegacyMediaReference(firstImported) : project.media,
+        mediaBinding: normalizedMediaBinding
+      };
+    });
+    set({
+      status: {
+        message:
+          role === "targetOriginal"
+            ? `已导入 ${importedMedia.length} 个原片素材。`
+            : `已导入 ${importedMedia.length} 个 B 站参考素材。`,
+        tone: "success"
+      }
+    });
+  },
+
+  importVideoFile: (file) => {
+    get().importMediaFiles([file], "bilibiliReference");
   },
 
   removeMedia: () => {
@@ -278,12 +331,65 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({ status: { message: "当前没有可删除的视频。", tone: "warning" } });
       return;
     }
-    revokeObjectUrl(media.objectUrl);
-    commitProject(set, get, "删除视频引用", (project) => ({
+    get().removeMediaReference(media.id);
+  },
+
+  removeMediaReference: (mediaId) => {
+    const media = findProjectMedia(get().project, mediaId);
+    if (!media) {
+      set({ status: { message: "媒体素材不存在。", tone: "warning" } });
+      return;
+    }
+    const result = removeMediaReference(get().project, mediaId);
+    if (!result.ok) {
+      const detail =
+        result.usages.length > 0
+          ? result.usages.slice(0, 3).map((usage) => usage.label).join("；")
+          : "未找到可删除的媒体素材。";
+      set({ status: { message: `不能删除该素材：${detail}`, tone: "warning" } });
+      return;
+    }
+    revokeObjectUrlIfUnused(get().project, media.objectUrl, media.id);
+    commitProject(set, get, "删除媒体素材", () => result.project);
+    set({ status: { message: `已删除媒体素材：${media.fileName}`, tone: "success" } });
+  },
+
+  reconnectMediaReference: (mediaId, file) => {
+    const media = findProjectMedia(get().project, mediaId);
+    if (!media) {
+      set({ status: { message: "媒体素材不存在。", tone: "warning" } });
+      return;
+    }
+    if (!isSupportedVideoFile(file)) {
+      set({ status: { message: "请选择 MP4 或 WebM 视频文件重新连接。", tone: "warning" } });
+      return;
+    }
+    const objectUrl = createObjectUrl(file);
+    const reconnected = reconnectProjectMediaReference(media, {
+      name: file.name.replace(/\.[^.]+$/, ""),
+      fileName: file.name,
+      objectUrl,
+      durationMs: media.durationMs
+    });
+    revokeObjectUrlIfUnused(get().project, media.objectUrl, media.id);
+    commitProject(set, get, "重新连接媒体素材", (project) => ({
       ...project,
-      media: null
+      mediaLibrary: project.mediaLibrary.map((candidate) => (candidate.id === mediaId ? reconnected : candidate)),
+      media:
+        project.media?.id === mediaId || (media.role === "bilibiliReference" && !project.media)
+          ? toLegacyMediaReference(reconnected)
+          : project.media,
+      mediaBinding:
+        project.mediaBinding?.kind === "localFile" && project.mediaBinding.mediaId === mediaId
+          ? {
+              ...project.mediaBinding,
+              displayName: reconnected.name,
+              fileName: reconnected.fileName,
+              runtimeMs: reconnected.durationMs
+            }
+          : project.mediaBinding
     }));
-    set({ status: { message: `已删除视频引用：${media.fileName}`, tone: "success" } });
+    set({ status: { message: `已重新连接媒体素材：${file.name}`, tone: "success" } });
   },
 
   bindCurrentMediaAsTarget: () => {
@@ -292,20 +398,38 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({ status: { message: "请先导入参考视频，再绑定为目标原片。", tone: "warning" } });
       return;
     }
-    const binding = createLocalFileMediaBinding(createId("media_binding"), media);
+    if (!media.objectUrl) {
+      set({ status: { message: "该视频需要重新连接后才能作为本次会话的目标原片。", tone: "warning" } });
+      return;
+    }
+    const targetMedia = createBrowserFileMediaReference(createId("media"), "targetOriginal", {
+      name: media.name,
+      fileName: media.fileName,
+      objectUrl: media.objectUrl,
+      durationMs: media.durationMs
+    });
+    const binding = createLocalFileMediaBinding(createId("media_binding"), toLegacyMediaReference(targetMedia));
     commitProject(set, get, "绑定本地目标原片", (project) => ({
       ...project,
-      mediaBinding: binding
+      mediaLibrary: [...project.mediaLibrary, targetMedia],
+      mediaBinding: { ...binding, mediaId: targetMedia.id }
     }));
     set({ status: { message: `已绑定目标原片：${binding.displayName}`, tone: "success" } });
   },
 
   setMediaBinding: (binding) => {
+    const mediaId = createBindingMediaId(binding);
+    const normalizedBinding =
+      binding.kind === "localFile" && binding.mediaId !== mediaId
+        ? { ...binding, mediaId }
+        : binding;
+    const targetMedia = createMediaReferenceFromBinding(mediaId, normalizedBinding);
     commitProject(set, get, "绑定目标原片", (project) => ({
       ...project,
-      mediaBinding: binding
+      mediaLibrary: upsertMediaById(project.mediaLibrary, targetMedia),
+      mediaBinding: normalizedBinding
     }));
-    set({ status: { message: `已绑定目标原片：${binding.displayName}`, tone: "success" } });
+    set({ status: { message: `已绑定目标原片：${normalizedBinding.displayName}`, tone: "success" } });
   },
 
   clearMediaBinding: () => {
@@ -319,6 +443,42 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       mediaBinding: null
     }));
     set({ status: { message: `已解除目标原片绑定：${binding.displayName}`, tone: "success" } });
+  },
+
+  bindXmlToSourceMedia: (assetId, sourceMediaId) => {
+    const validationMessage = validateDanmakuSourceBinding(get().project, assetId, sourceMediaId);
+    if (validationMessage) {
+      set({ status: { message: validationMessage, tone: "warning" } });
+      return;
+    }
+    const existing = findDanmakuSourceBinding(get().project.danmakuSourceBindings, assetId);
+    const binding = createDanmakuSourceBinding(existing?.id ?? createId("danmaku_source_binding"), assetId, sourceMediaId);
+    const asset = get().project.assets.find((candidate) => candidate.id === assetId);
+    const sourceMedia = findProjectMedia(get().project, sourceMediaId);
+    commitProject(set, get, "绑定 XML 来源视频", (project) => ({
+      ...project,
+      danmakuSourceBindings: upsertDanmakuSourceBinding(project.danmakuSourceBindings, binding)
+    }));
+    set({
+      status: {
+        message: `已绑定 XML 来源：${asset?.fileName ?? assetId} -> ${sourceMedia?.fileName ?? sourceMediaId}`,
+        tone: "success"
+      }
+    });
+  },
+
+  clearXmlSourceBinding: (assetId) => {
+    const binding = findDanmakuSourceBinding(get().project.danmakuSourceBindings, assetId);
+    if (!binding) {
+      set({ status: { message: "该 XML 尚未绑定 B 站参考素材。", tone: "warning" } });
+      return;
+    }
+    const asset = get().project.assets.find((candidate) => candidate.id === assetId);
+    commitProject(set, get, "解除 XML 来源视频绑定", (project) => ({
+      ...project,
+      danmakuSourceBindings: removeDanmakuSourceBinding(project.danmakuSourceBindings, assetId)
+    }));
+    set({ status: { message: `已解除 XML 来源绑定：${asset?.fileName ?? assetId}`, tone: "success" } });
   },
 
   bindCurrentTargetToSeasonEpisode: (episodeKey, episodeLabel) => {
@@ -360,11 +520,24 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   addDanmakuSourceSegment: (draft) => {
     try {
       const segment = createDanmakuSourceSegment(createId("danmaku_source_segment"), draft);
+      const issues = validateSourceSegmentReferences(get().project, segment);
+      const error = issues.find((issue) => issue.severity === "error");
+      if (error) {
+        throw new Error(error.message);
+      }
       commitProject(set, get, "新增弹幕来源内容段", (project) => ({
         ...project,
         danmakuSourceSegments: [...project.danmakuSourceSegments, segment]
       }));
-      set({ status: { message: `已新增弹幕来源内容段：${segment.label}`, tone: "success" } });
+      const warning = issues.find((issue) => issue.severity === "warning");
+      set({
+        status: {
+          message: warning
+            ? `已新增弹幕来源内容段：${segment.label}。${warning.message}`
+            : `已新增弹幕来源内容段：${segment.label}`,
+          tone: warning ? "warning" : "success"
+        }
+      });
     } catch (error) {
       set({ status: createErrorStatus("弹幕来源内容段无效", error) });
     }
@@ -378,13 +551,26 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
     try {
       const updatedSegment = updateDanmakuSourceSegment(segment, patch);
+      const issues = validateSourceSegmentReferences(get().project, updatedSegment);
+      const error = issues.find((issue) => issue.severity === "error");
+      if (error) {
+        throw new Error(error.message);
+      }
       commitProject(set, get, "更新弹幕来源内容段", (project) => ({
         ...project,
         danmakuSourceSegments: project.danmakuSourceSegments.map((candidate) =>
           candidate.id === id ? updatedSegment : candidate
         )
       }));
-      set({ status: { message: `已更新弹幕来源内容段：${updatedSegment.label}`, tone: "success" } });
+      const warning = issues.find((issue) => issue.severity === "warning");
+      set({
+        status: {
+          message: warning
+            ? `已更新弹幕来源内容段：${updatedSegment.label}。${warning.message}`
+            : `已更新弹幕来源内容段：${updatedSegment.label}`,
+          tone: warning ? "warning" : "success"
+        }
+      });
     } catch (error) {
       set({ status: createErrorStatus("弹幕来源内容段更新失败", error) });
     }
@@ -403,26 +589,42 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set({ status: { message: `已删除弹幕来源内容段：${segment.label}`, tone: "success" } });
   },
 
-  updateMediaDuration: (durationMs) => {
-    set((state) => ({
-      project: state.project.media
-        ? touchProject({
-            ...state.project,
-            media: { ...state.project.media, durationMs: clampMilliseconds(durationMs) },
-            mediaBinding:
-              state.project.mediaBinding?.kind === "localFile" &&
-              state.project.mediaBinding.mediaId === state.project.media.id
-                ? { ...state.project.mediaBinding, runtimeMs: clampMilliseconds(durationMs) }
-                : state.project.mediaBinding
-          })
-        : state.project
-    }));
+  updateMediaDuration: (durationMs, mediaId = null) => {
+    const normalizedDuration = clampMilliseconds(durationMs);
+    set((state) => {
+      const localBinding = state.project.mediaBinding?.kind === "localFile" ? state.project.mediaBinding : null;
+      const fallbackMediaId =
+        state.project.media?.id ?? localBinding?.mediaId ?? null;
+      const activeMediaId = mediaId ?? fallbackMediaId;
+      if (!activeMediaId) {
+        return { project: state.project };
+      }
+      const legacyMedia = state.project.media;
+      const updatesLegacyMedia = legacyMedia?.id === activeMediaId;
+      const updatesMediaLibrary = state.project.mediaLibrary.some((media) => media.id === activeMediaId);
+      const updatesLocalBinding = localBinding?.mediaId === activeMediaId;
+      if (!updatesLegacyMedia && !updatesMediaLibrary && !updatesLocalBinding) {
+        return { project: state.project };
+      }
+      return {
+        project: touchProject({
+          ...state.project,
+          media: updatesLegacyMedia && legacyMedia ? { ...legacyMedia, durationMs: normalizedDuration } : legacyMedia,
+          mediaLibrary: state.project.mediaLibrary.map((media) =>
+            media.id === activeMediaId ? updateProjectMediaDuration(media, normalizedDuration) : media
+          ),
+          mediaBinding: updatesLocalBinding && localBinding
+            ? { ...localBinding, runtimeMs: normalizedDuration }
+            : state.project.mediaBinding
+        })
+      };
+    });
   },
 
   openProjectFromText: (text, sourceFileName) => {
     try {
       const { project, migration } = parseProjectJsonWithMetadata(text);
-      revokeObjectUrl(get().project.media?.objectUrl ?? null);
+      revokeProjectObjectUrls(get().project);
       set({
         project,
         selection: emptySelection,
@@ -488,6 +690,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
           ...currentProject,
           assets: currentProject.assets.filter((candidate) => candidate.id !== assetId),
           clips: currentProject.clips.filter((clip) => clip.assetId !== assetId),
+          danmakuSourceBindings: currentProject.danmakuSourceBindings.filter((binding) => binding.assetId !== assetId),
+          danmakuSourceSegments: currentProject.danmakuSourceSegments.map((segment) =>
+            segment.assetId === assetId ? { ...segment, assetId: null } : segment
+          ),
           disabledItemIds: currentProject.disabledItemIds.filter(
             (itemId) => !itemIds.has(itemId)
           ),
@@ -1315,6 +1521,62 @@ function commitProject(
     selection: selection ?? state.selection,
     exportDraft: null
   }));
+}
+
+function revokeProjectObjectUrls(project: EditorProject): void {
+  const urls = new Set<string>();
+  if (project.media?.objectUrl) {
+    urls.add(project.media.objectUrl);
+  }
+  project.mediaLibrary.forEach((media) => {
+    if (media.objectUrl) {
+      urls.add(media.objectUrl);
+    }
+  });
+  urls.forEach((url) => revokeObjectUrl(url));
+}
+
+function revokeObjectUrlIfUnused(project: EditorProject, objectUrl: string | null, removedMediaId: string): void {
+  if (!objectUrl) {
+    return;
+  }
+  const stillUsed = project.mediaLibrary.some((media) => media.id !== removedMediaId && media.objectUrl === objectUrl);
+  if (!stillUsed) {
+    revokeObjectUrl(objectUrl);
+  }
+}
+
+function isSupportedVideoFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return name.endsWith(".mp4") || name.endsWith(".webm") || file.type === "video/mp4" || file.type === "video/webm";
+}
+
+function toLegacyMediaReference(media: ProjectMediaReference): MediaReference {
+  return {
+    id: media.id,
+    name: media.name,
+    fileName: media.fileName,
+    objectUrl: media.objectUrl,
+    durationMs: media.durationMs
+  };
+}
+
+function upsertMediaById(
+  mediaLibrary: readonly ProjectMediaReference[],
+  media: ProjectMediaReference
+): ProjectMediaReference[] {
+  const exists = mediaLibrary.some((candidate) => candidate.id === media.id);
+  if (!exists) {
+    return [...mediaLibrary, media];
+  }
+  return mediaLibrary.map((candidate) => (candidate.id === media.id ? media : candidate));
+}
+
+function createBindingMediaId(binding: MediaBinding): string {
+  if (binding.kind === "localFile" && binding.mediaId) {
+    return binding.mediaId;
+  }
+  return `media_${binding.id}`;
 }
 
 function createAlignmentProposalPreviewStatus(proposal: AlignmentProposal): EditorStatus {

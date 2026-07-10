@@ -8,6 +8,11 @@ import type {
 } from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { isItemInsideClip, resolveProjectDanmakuEvents } from "../timeline/mapping";
+import {
+  formatMediaConnectionState,
+  formatMediaRole,
+  validateSourceSegmentReferences
+} from "./mediaLibrary";
 import { formatMediaBindingSource, formatMediaBindingTitle } from "./mediaBinding";
 import type { EditorProject } from "./types";
 
@@ -143,6 +148,18 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       label: `同步锚点 ${index + 1}（${formatTimecode(anchor.sourceMs)} -> ${formatTimecode(anchor.targetMs)}）`
     }))
   );
+  const duplicateMediaIdGroups = findDuplicateGroups(
+    project.mediaLibrary.map((media, index) => ({
+      value: media.id,
+      label: `媒体素材 ${index + 1}（${formatMediaRole(media.role)} / ${media.fileName}）`
+    }))
+  );
+  const duplicateSourceBindingIdGroups = findDuplicateGroups(
+    project.danmakuSourceBindings.map((binding, index) => ({
+      value: binding.id,
+      label: `XML 来源绑定 ${index + 1}（${binding.assetId} -> ${binding.sourceMediaId}）`
+    }))
+  );
   const duplicateSourceSegmentIdGroups = findDuplicateGroups(
     project.danmakuSourceSegments.map((segment, index) => ({
       value: segment.id,
@@ -157,6 +174,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
     duplicateClipIdGroups.length +
     duplicateCutIdGroups.length +
     duplicateAnchorIdGroups.length +
+    duplicateMediaIdGroups.length +
+    duplicateSourceBindingIdGroups.length +
     duplicateSourceSegmentIdGroups.length;
 
   const findings: ProjectHealthFinding[] = [];
@@ -165,6 +184,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   appendDuplicateFinding(findings, "clip-id", "片段 ID 重复", duplicateClipIdGroups);
   appendDuplicateFinding(findings, "cut-id", "版本差异 ID 重复", duplicateCutIdGroups);
   appendDuplicateFinding(findings, "anchor-id", "同步锚点 ID 重复", duplicateAnchorIdGroups);
+  appendDuplicateFinding(findings, "media-id", "媒体素材 ID 重复", duplicateMediaIdGroups);
+  appendDuplicateFinding(findings, "source-binding-id", "XML 来源绑定 ID 重复", duplicateSourceBindingIdGroups);
   appendDuplicateFinding(findings, "source-segment-id", "弹幕来源内容段 ID 重复", duplicateSourceSegmentIdGroups);
 
   if (project.assets.length === 0) {
@@ -251,6 +272,46 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       evidence: formatMediaEvidence(project.media)
     });
   }
+  const reconnectMedia = project.mediaLibrary.filter((media) => media.connectionState === "needsReconnect");
+  if (reconnectMedia.length > 0) {
+    findings.push({
+      id: "media-library-needs-reconnect",
+      severity: "warning",
+      title: "媒体素材需要重新连接",
+      detail: `${reconnectMedia.length.toLocaleString("zh-CN")} 个素材只有项目引用，没有当前会话可用的视频对象。`,
+      evidence: formatMediaLibraryEvidence(reconnectMedia)
+    });
+  }
+  const unknownDurationMedia = project.mediaLibrary.filter((media) => media.durationMs === null);
+  if (unknownDurationMedia.length > 0) {
+    findings.push({
+      id: "media-library-duration-missing",
+      severity: "warning",
+      title: "媒体素材时长未知",
+      detail: `${unknownDurationMedia.length.toLocaleString("zh-CN")} 个素材还没有读取到时长，来源段越界检查会较弱。`,
+      evidence: formatMediaLibraryEvidence(unknownDurationMedia)
+    });
+  }
+  collectDanglingDanmakuSourceBindingEvidence(project).forEach((evidence) => {
+    findings.push({
+      id: `dangling-source-binding-${evidence.id}`,
+      severity: "error",
+      title: "XML 来源绑定引用失效",
+      detail: evidence.detail,
+      evidence: evidence.rows
+    });
+  });
+  project.danmakuSourceSegments.forEach((segment) => {
+    validateSourceSegmentReferences(project, segment).forEach((issue, index) => {
+      findings.push({
+        id: `source-segment-reference-${segment.id}-${index}`,
+        severity: issue.severity,
+        title: issue.severity === "error" ? "来源段引用无效" : "来源段需要复核",
+        detail: `${segment.label}：${issue.message}`,
+        evidence: [`${formatTimecode(segment.sourceStartMs)} - ${formatTimecode(segment.sourceEndMs)}`]
+      });
+    });
+  });
   if (mediaBindingNeedsReconnect && project.mediaBinding) {
     findings.push({
       id: "target-local-needs-reconnect",
@@ -318,7 +379,9 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       missingAssetClipCount,
       duplicateIdCount,
       negativeFinalTimeItemCount: negativeFinalTimeEvents.length,
-      mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null),
+      mediaNeedsReconnect:
+        Boolean(project.media && project.media.objectUrl === null) ||
+        project.mediaLibrary.some((media) => media.connectionState === "needsReconnect"),
       mediaBindingKind: project.mediaBinding?.kind ?? "none",
       mediaBindingNeedsReconnect
     },
@@ -509,6 +572,44 @@ function formatClipEvidence(clips: DanmakuClip[], assets: DanmakuAsset[]): strin
 
 function formatMediaEvidence(media: NonNullable<EditorProject["media"]>): string[] {
   return [`${media.fileName}（名称：${media.name}）`];
+}
+
+function formatMediaLibraryEvidence(mediaLibrary: EditorProject["mediaLibrary"]): string[] {
+  const evidence = mediaLibrary.slice(0, EVIDENCE_PREVIEW_LIMIT).map((media) => {
+    const duration = media.durationMs === null ? "时长未知" : formatTimecode(media.durationMs);
+    return `${formatMediaRole(media.role)} / ${media.fileName}（${formatMediaConnectionState(media)}，${duration}）`;
+  });
+  return appendOmittedEvidenceNote(evidence, mediaLibrary.length, "个媒体素材");
+}
+
+function collectDanglingDanmakuSourceBindingEvidence(project: EditorProject): Array<{
+  id: string;
+  detail: string;
+  rows: string[];
+}> {
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const sourceMediaIds = new Set(
+    project.mediaLibrary.filter((media) => media.role === "bilibiliReference").map((media) => media.id)
+  );
+  return project.danmakuSourceBindings.flatMap((binding) => {
+    const rows: string[] = [];
+    if (!assetIds.has(binding.assetId)) {
+      rows.push(`缺失 XML：${binding.assetId}`);
+    }
+    if (!sourceMediaIds.has(binding.sourceMediaId)) {
+      rows.push(`缺失或角色错误的 B 站参考素材：${binding.sourceMediaId}`);
+    }
+    if (rows.length === 0) {
+      return [];
+    }
+    return [
+      {
+        id: binding.id,
+        detail: `绑定 ${binding.id} 指向不存在或角色不正确的对象。`,
+        rows
+      }
+    ];
+  });
 }
 
 function formatMediaBindingEvidence(project: EditorProject): string[] {

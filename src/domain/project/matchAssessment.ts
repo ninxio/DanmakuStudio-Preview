@@ -140,7 +140,13 @@ function summarizeDanmakuSource(assets: DanmakuAsset[]): ProjectMatchSourceSumma
 
 function createSourceText(project: EditorProject): string {
   return normalizeText(
-    [project.name, ...project.assets.map((asset) => `${asset.name} ${asset.fileName}`), project.media?.name, project.media?.fileName]
+    [
+      project.name,
+      ...project.assets.map((asset) => `${asset.name} ${asset.fileName}`),
+      ...project.mediaLibrary.map((media) => `${media.name} ${media.fileName}`),
+      project.media?.name,
+      project.media?.fileName
+    ]
       .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       .join(" ")
   );

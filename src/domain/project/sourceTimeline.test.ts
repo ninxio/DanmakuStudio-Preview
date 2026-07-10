@@ -8,6 +8,7 @@ import {
   parseSourceTimecode,
   updateDanmakuSourceSegment
 } from "./sourceTimeline";
+import type { ProjectMediaReference, ProjectMediaRole } from "./types";
 
 describe("danmaku source timeline", () => {
   it("创建正片内容段并保留对应输出集", () => {
@@ -15,8 +16,11 @@ describe("danmaku source timeline", () => {
       "segment-1",
       {
         kind: "content",
+        assetId: "asset",
+        sourceMediaId: "source-media",
         sourceStartMs: 7_200_000,
         sourceEndMs: 7_260_000,
+        targetMediaId: "target-media",
         episodeKey: "S01E01",
         episodeLabel: "第 1 集",
         note: "正片开始"
@@ -28,8 +32,11 @@ describe("danmaku source timeline", () => {
       id: "segment-1",
       label: "第 1 集 来源段",
       kind: "content",
+      assetId: "asset",
+      sourceMediaId: "source-media",
       sourceStartMs: 7_200_000,
       sourceEndMs: 7_260_000,
+      targetMediaId: "target-media",
       episodeKey: "S01E01",
       episodeLabel: "第 1 集",
       note: "正片开始"
@@ -39,8 +46,11 @@ describe("danmaku source timeline", () => {
   it("忽略范围不会保留分集关联", () => {
     const segment = createDanmakuSourceSegment("ignored", {
       kind: "ignored",
+      assetId: "asset",
+      sourceMediaId: "source-media",
       sourceStartMs: 0,
       sourceEndMs: 7_200_000,
+      targetMediaId: "target-media",
       episodeKey: "S01E01",
       episodeLabel: "第 1 集"
     });
@@ -67,22 +77,29 @@ describe("danmaku source timeline", () => {
     const plan = createPlan();
     const emptyProject = {
       ...createEmptyProject(),
-      assets: [createAsset()]
+      assets: [createAsset()],
+      mediaLibrary: [createMedia("source-media", "bilibiliReference"), createMedia("target-media", "targetOriginal")]
     };
 
     expect(createSourceTimelineSummary(emptyProject, plan).status).toBe("needsSegments");
 
     const segmentA = createDanmakuSourceSegment("segment-a", {
       kind: "content",
+      assetId: "asset",
+      sourceMediaId: "source-media",
       sourceStartMs: 0,
       sourceEndMs: 60_000,
+      targetMediaId: "target-media",
       episodeKey: "S01E01",
       episodeLabel: "第 1 集"
     });
     const segmentB = createDanmakuSourceSegment("segment-b", {
       kind: "ignored",
+      assetId: "asset",
+      sourceMediaId: "source-media",
       sourceStartMs: 30_000,
       sourceEndMs: 90_000,
+      targetMediaId: null,
       episodeKey: null,
       episodeLabel: null
     });
@@ -138,6 +155,26 @@ function createPlan(): BatchMergePlan {
       affectedEntryCount: 0,
       affectedEpisodeCount: 0
     }
+  };
+}
+
+function createMedia(id: string, role: ProjectMediaRole): ProjectMediaReference {
+  return {
+    id,
+    role,
+    name: role === "bilibiliReference" ? "B 站参考" : "目标原片",
+    fileName: role === "bilibiliReference" ? "reference.mp4" : "target.mp4",
+    objectUrl: "blob:test",
+    durationMs: 120_000,
+    referenceKind: "browserFile",
+    connectionState: "connected",
+    sourceSummary: "浏览器文件",
+    localPath: null,
+    emby: null,
+    episodeKey: null,
+    episodeLabel: null,
+    createdAt: "2026-07-11T00:00:00.000Z",
+    updatedAt: "2026-07-11T00:00:00.000Z"
   };
 }
 

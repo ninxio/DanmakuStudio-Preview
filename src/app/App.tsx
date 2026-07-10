@@ -25,7 +25,7 @@ const RESIZE_STEP = 24;
 export function App() {
   const status = useEditorStore((state) => state.status);
   const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
-  const importVideoFile = useEditorStore((state) => state.importVideoFile);
+  const importMediaFiles = useEditorStore((state) => state.importMediaFiles);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const activeResizeRef = useRef<ResizeTarget | null>(null);
   const dragDepthRef = useRef(0);
@@ -144,14 +144,14 @@ export function App() {
     setDragActive(false);
     const files = Array.from(event.dataTransfer.files);
     const xmlFiles = files.filter(isXmlFile);
-    const videoFile = files.find(isSupportedReferenceVideoFile);
-    if (videoFile) {
-      importVideoFile(videoFile);
+    const videoFiles = files.filter(isSupportedReferenceVideoFile);
+    if (videoFiles.length > 0) {
+      importMediaFiles(videoFiles, "bilibiliReference");
     }
     if (xmlFiles.length > 0) {
       void importXmlFiles(xmlFiles);
     }
-    if (!videoFile && xmlFiles.length === 0) {
+    if (videoFiles.length === 0 && xmlFiles.length === 0) {
       useEditorStore.setState({
         status: {
           message: "拖放文件未导入：请拖入 Bilibili XML，或 MP4/WebM 参考视频。",

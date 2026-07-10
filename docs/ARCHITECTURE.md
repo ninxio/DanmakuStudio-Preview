@@ -30,7 +30,14 @@ resolved = applyCutMapping(adjusted, cutMarkers)
 
 ## 目标原片绑定
 
-项目 schema v4 新增 `mediaBinding`，用于表达当前项目最终要对齐到哪一份目标原片。schema v5 新增 `seasonEpisodeBindings`，用于表达剧集批量工作台中每个输出集对应哪份目标原片。schema v6 新增 `danmakuSourceSegments`，用于表达 B 站/XML 弹幕来源时间轴上的虚拟内容段和忽略范围。绑定与来源时间轴模型位于 `src/domain/project`，不依赖 React，后续匹配评分、预览、对齐和导出检查都应读取同一份项目状态。
+项目 schema v4 新增 `mediaBinding`，用于表达当前项目最终要对齐到哪一份目标原片。schema v5 新增 `seasonEpisodeBindings`，用于表达剧集批量工作台中每个输出集对应哪份目标原片。schema v6 新增 `danmakuSourceSegments`，用于表达 B 站/XML 弹幕来源时间轴上的虚拟内容段和忽略范围。schema v7 新增 `mediaLibrary` 和 `danmakuSourceBindings`，把多条媒体素材、XML 到 B 站参考素材的绑定、来源段到参考素材/目标原片的关系统一改为稳定 ID 引用。绑定与来源时间轴模型位于 `src/domain/project`，不依赖 React，后续匹配评分、预览、对齐和导出检查都应读取同一份项目状态。
+
+`mediaLibrary` 是项目级媒体素材库，每条素材都有稳定 ID、角色、名称、文件名或媒体名、时长、引用类型、连接状态和来源摘要。当前角色包括：
+
+- `targetOriginal`：原片素材，是弹幕最终要匹配到的标准时间轴。
+- `bilibiliReference`：B 站参考素材，是 XML 原始弹幕时间轴的证据，不是最终输出目标。
+
+持久关系不得依赖数组索引、文件名或 UI 顺序：`mediaBinding.mediaId`、`danmakuSourceBindings.sourceMediaId`、`danmakuSourceSegments.sourceMediaId` 和 `danmakuSourceSegments.targetMediaId` 都引用 `mediaLibrary` 中的稳定 ID。浏览器 `blob:` 对象 URL 只允许当前会话使用；保存项目时会清空对象 URL，并把浏览器文件素材标记为 `needsReconnect`，重新连接时更新原媒体 ID，不创建重复素材。
 
 当前支持两类绑定：
 
@@ -41,7 +48,9 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 
 `seasonEpisodeBindings` 的 key 由 `src/domain/project/seasonEpisodeBinding.ts` 根据批量输出的季集号或文件名生成。资源栏高级工具的“逐集目标绑定”只把当前项目级目标原片复制为某个输出集的目标引用；清除和更新都进入编辑历史。它不改变原始 XML，不影响批量导出的弹幕内容，也不保存 Emby 密码、token 或临时播放 URL。
 
-`danmakuSourceSegments` 由 `src/domain/project/sourceTimeline.ts` 维护。它只记录弹幕来源时间轴上的正片内容段、前后无意义片段和空白范围，以及内容段对应的输出集 key；新增、更新和删除都进入编辑历史。它不剪切视频、不改变原始 XML，后续弹幕投影和分集复核应读取这些虚拟范围作为证据边界。
+`danmakuSourceBindings` 表达每个 XML 当前绑定的 B 站参考素材。XML 可以不绑定、绑定、更换或解除绑定；这些操作只修改项目关系，不修改原始 XML 或弹幕时间。未绑定 XML 仍可编辑，但来源段匹配会显示风险提示。
+
+`danmakuSourceSegments` 由 `src/domain/project/sourceTimeline.ts` 维护。schema v7 后，每段明确记录所属 XML、B 站参考素材、来源起止时间、正片/忽略类型、目标原片和可选输出集 key。正片内容段可以指向目标原片；忽略范围不要求目标原片。新增、更新和删除都进入编辑历史。它不剪切视频、不改变原始 XML，后续弹幕投影和分集复核应读取这些虚拟范围作为证据边界。
 
 ## 匹配评分
 
