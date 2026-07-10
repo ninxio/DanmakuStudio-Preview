@@ -1,5 +1,19 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C117 已完成：完成 G6 音频对齐实用化的 Emby 本次会话授权输入。
+  - Emby 客户端新增 `createEmbyAuthorizedStreamUrl`，可基于已登录会话、条目 ID 和媒体源 ID 生成本次运行使用的 `/Videos/{itemId}/stream` 授权播放地址。
+  - 视频对齐实验室在绑定 Emby 目标原片后新增真实“使用 Emby 授权输入”动作：用户点击后会用当前会话密码重新登录、读取条目确认可访问，再把临时输入交给 FFmpeg；可见“完整版路径”输入框不会显示 token。
+  - 项目文件、设置备份和 `mediaBinding` 仍不保存 Emby 密码、token 或临时播放 URL；会话密码缺失、服务器不可达或 FFmpeg 无法读取流时，用户可以继续改用本地路径。
+  - Tauri 音频对齐后端现在接受 http/https 远程媒体输入；远程缓存 key 和 FFmpeg 错误输出会遮蔽 `api_key`、`token`、`AccessToken`、`X-Emby-Token` 等敏感参数。
+  - README 和架构文档已同步 Emby 本次会话授权输入、token 不持久化、安全遮蔽和后续真实服务器兼容性验证路线。
+  - 已补充 Emby 客户端、资源面板和 Rust 测试，覆盖授权流 URL 构造、UI 不显示 token、运行时传入临时 URL、远程输入校验、缓存 key token 遮蔽和 FFmpeg 错误 token 遮蔽。
+  - 已重新验证：Emby/资源面板聚焦测试通过（2 个测试文件 / 40 个测试）；`cargo test` 通过（25 个 Rust 测试）；`corepack pnpm lint` 通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、41 个测试文件 / 243 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12368896` 字节，时间 `2026/07/10 22:54:47`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3050794` 字节，时间 `2026/07/10 22:54:47`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c117-emby-audio-input-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C116 已完成：推进 G6 音频对齐实用化第二段，新增 Tauri 后端进程内音频特征缓存。
   - `src-tauri/src/audio_alignment.rs` 新增音频特征缓存，按规范化本地路径、文件大小、修改时间、FFmpeg 路径、采样率和特征窗口生成缓存 key。
   - 用户反复调整匹配阈值或最小缺失时长时，完整版和当前视频可复用同一组已提取特征，避免同一集在同一桌面进程里反复全量扫描。
@@ -142,7 +156,7 @@
 ## 当前主目标
 
 - 当前 goal：按 `docs/player-goal.md` 分阶段实现播放器化与全量对齐能力，让用户能把 B 站删减版弹幕对齐到自己的完整版视频上。
-- 下一阶段：G6 音频对齐实用化（继续：Emby 授权输入验证）。
+- 下一阶段：G7 逐步播放器化。
 - 总体路线：
   1. 默认导出文件夹 / 自定义导出目录。
   2. Emby 原片绑定项目，不只是查时长。

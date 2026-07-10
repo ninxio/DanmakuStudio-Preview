@@ -87,6 +87,7 @@ import {
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import {
   authenticateEmby,
+  createEmbyAuthorizedStreamUrl,
   fetchEmbyEpisodeChildren,
   fetchEmbyItem,
   formatEmbyEpisodeDurationLines,
@@ -1608,14 +1609,17 @@ function VideoAlignmentLabPanel({
   const [matchThreshold, setMatchThreshold] = useState(String(initialSettingsRef.current.alignment.matchThreshold));
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [preparingEmbyInput, setPreparingEmbyInput] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobSnapshot, setJobSnapshot] = useState<AudioAlignmentJobSnapshot | null>(null);
+  const [embyCompleteInput, setEmbyCompleteInput] = useState<EmbyAlignmentInput | null>(null);
   const [skippedCutCandidateIds, setSkippedCutCandidateIds] = useState<string[]>([]);
   const [cutCandidateDrafts, setCutCandidateDrafts] = useState<Record<string, CutCandidateDraft>>({});
   const runTokenRef = useRef(0);
   const proposalCandidateKeyRef = useRef("");
   const previewCuts = preview.proposalCuts.slice(0, 3);
-  const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
+  const hasCompleteAlignmentInput = completePath.trim().length > 0 || embyCompleteInput !== null;
+  const canRunAlignment = hasCompleteAlignmentInput && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const canClearProposal = Boolean(proposal) || text.trim().length > 0;
   const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
@@ -1675,6 +1679,10 @@ function VideoAlignmentLabPanel({
   }, [completePath, targetLocalPath]);
 
   useEffect(() => {
+    setEmbyCompleteInput(null);
+  }, [project.mediaBinding?.id]);
+
+  useEffect(() => {
     const nextKey = proposal ? proposal.cutCandidates.map((candidate) => candidate.id).join("|") : "";
     if (proposalCandidateKeyRef.current === nextKey) {
       return;
@@ -1695,8 +1703,13 @@ function VideoAlignmentLabPanel({
       });
       return;
     }
+    const completeInputPath = embyCompleteInput?.url ?? completePath.trim();
+    if (completeInputPath.length === 0) {
+      setStatus({ message: "请先选择完整版路径，或使用已绑定 Emby 原片生成授权输入。", tone: "warning" });
+      return;
+    }
     const request = {
-      completePath: completePath.trim(),
+      completePath: completeInputPath,
       sourcePath: sourcePath.trim(),
       ffmpegPath: ffmpegPath.trim().length > 0 ? ffmpegPath.trim() : null,
       windowMs: parsedWindowMs.value,
@@ -1796,10 +1809,51 @@ function VideoAlignmentLabPanel({
     setStatus({ message: `已导出对齐复核报告：${fileName}。`, tone: "success" });
   };
 
+  const prepareEmbyCompleteInput = async () => {
+    const binding = project.mediaBinding;
+    if (!binding || binding.kind !== "embyItem") {
+      setStatus({ message: "当前项目没有绑定 Emby 目标原片。", tone: "warning" });
+      return;
+    }
+    const password = loadVolatileEmbyPassword().trim();
+    if (password.length === 0) {
+      setStatus({ message: "请先在设置中心填写 Emby 密码并保存本次会话。", tone: "warning" });
+      return;
+    }
+    setPreparingEmbyInput(true);
+    try {
+      const config = {
+        serverUrl: binding.server.serverUrl,
+        pathPrefix: binding.server.pathPrefix
+      };
+      const session = await authenticateEmby(config, {
+        username: binding.server.username,
+        password
+      });
+      const item = await fetchEmbyItem(config, session, binding.itemId);
+      const mediaSourceId = item.mediaSources[0]?.id ?? binding.mediaSources[0]?.id ?? null;
+      const url = createEmbyAuthorizedStreamUrl(config, session, binding.itemId, mediaSourceId);
+      setCompletePath("");
+      setEmbyCompleteInput({
+        url,
+        label: formatEmbyAlignmentInputLabel(item.name, mediaSourceId)
+      });
+      setStatus({ message: `已准备 Emby 授权输入：${item.name}。`, tone: "success" });
+    } catch (error) {
+      setStatus({
+        message: `Emby 授权输入准备失败：${error instanceof Error ? error.message : "Emby 请求失败。"}`,
+        tone: "error"
+      });
+    } finally {
+      setPreparingEmbyInput(false);
+    }
+  };
+
   const chooseCompletePath = async () => {
     try {
       const path = await pickAlignmentMediaPath(completePath);
       if (path) {
+        setEmbyCompleteInput(null);
         setCompletePath(path);
         setStatus({ message: "已选择完整版路径。", tone: "success" });
       }
@@ -1901,7 +1955,10 @@ function VideoAlignmentLabPanel({
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={completePath}
               placeholder="D:\\media\\full.mkv"
-              onChange={(event) => setCompletePath(event.target.value)}
+              onChange={(event) => {
+                setEmbyCompleteInput(null);
+                setCompletePath(event.target.value);
+              }}
             />
             <TextButton
               aria-label="选择完整版"
@@ -1921,8 +1978,28 @@ function VideoAlignmentLabPanel({
             已使用目标原片绑定中的本地路径作为完整版输入。
           </div>
         ) : embyTargetNeedsLocalAudioInput ? (
-          <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
-            已绑定 Emby 目标原片；当前音频对齐仍需要你选择可读取的本地文件路径。后续验证授权流媒体后再直接读取 Emby 播放源。
+          <div className="grid gap-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
+            <div>
+              已绑定 Emby 目标原片。可以用本次会话密码生成临时授权输入交给 FFmpeg，也可以继续选择可读取的本地文件路径。
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <TextButton
+                onClick={() => {
+                  void prepareEmbyCompleteInput();
+                }}
+                disabled={preparingEmbyInput || running}
+              >
+                {preparingEmbyInput ? "准备中" : "使用 Emby 授权输入"}
+              </TextButton>
+              {embyCompleteInput ? (
+                <TextButton onClick={() => setEmbyCompleteInput(null)}>改用本地路径</TextButton>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        {embyCompleteInput ? (
+          <div className="rounded border border-accent-cyan/20 bg-accent-cyan/10 p-2 text-[11px] leading-5 text-slate-300">
+            已准备 Emby 授权输入：{embyCompleteInput.label}。本次运行会使用临时播放地址；项目文件不会保存密码、token 或播放 URL。
           </div>
         ) : null}
         <label className="grid gap-1">
@@ -2315,6 +2392,15 @@ interface ParsedNumericInput {
 interface CutCandidateDraft {
   sourceAtMs: string;
   targetGapMs: string;
+}
+
+interface EmbyAlignmentInput {
+  url: string;
+  label: string;
+}
+
+function formatEmbyAlignmentInputLabel(itemName: string, mediaSourceId: string | null): string {
+  return mediaSourceId && mediaSourceId.trim().length > 0 ? `${itemName} / 媒体源 ${mediaSourceId}` : itemName;
 }
 
 function createSingleCutCandidateProposal(candidate: CutCandidate): AlignmentProposal {

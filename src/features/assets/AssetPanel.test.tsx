@@ -6,7 +6,10 @@ import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
 import { createEmbyItemMediaBinding } from "../../domain/project/mediaBinding";
 import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
+import { startTauriAudioAlignmentJob } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
+import { authenticateEmby, fetchEmbyItem } from "../../infrastructure/metadata/embyClient";
+import { clearVolatileEmbyCredentials, saveVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "../../stores/editorStore";
 import { AssetPanel } from "./AssetPanel";
@@ -16,10 +19,33 @@ vi.mock("../../infrastructure/file-system/nativeDialogs", () => ({
   pickFfmpegExecutablePath: vi.fn()
 }));
 
+vi.mock("../../infrastructure/alignment/tauriAudioAlignment", async () => {
+  const actual = await vi.importActual("../../infrastructure/alignment/tauriAudioAlignment");
+  return {
+    ...actual,
+    startTauriAudioAlignmentJob: vi.fn(),
+    getTauriAudioAlignmentJob: vi.fn(),
+    cancelTauriAudioAlignmentJob: vi.fn()
+  };
+});
+
+vi.mock("../../infrastructure/metadata/embyClient", async () => {
+  const actual = await vi.importActual("../../infrastructure/metadata/embyClient");
+  return {
+    ...actual,
+    authenticateEmby: vi.fn(),
+    fetchEmbyItem: vi.fn()
+  };
+});
+
 describe("资源面板", () => {
   beforeEach(() => {
     vi.mocked(pickAlignmentMediaPath).mockReset();
     vi.mocked(pickFfmpegExecutablePath).mockReset();
+    vi.mocked(startTauriAudioAlignmentJob).mockReset();
+    vi.mocked(authenticateEmby).mockReset();
+    vi.mocked(fetchEmbyItem).mockReset();
+    clearVolatileEmbyCredentials();
     const asset = parseBilibiliXml(
       `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u,r">测试</d></i>`,
       { fileName: "01 - 1.1.xml" }
@@ -819,6 +845,93 @@ describe("资源面板", () => {
 
     await waitFor(() => expect(screen.getByLabelText("完整版路径")).toHaveValue("D:\\media\\full.mkv"));
     expect(screen.getByText("已使用目标原片绑定中的本地路径作为完整版输入。")).toBeInTheDocument();
+  });
+
+  it("视频对齐实验室可用已绑定 Emby 原片生成临时授权输入", async () => {
+    const user = userEvent.setup();
+    saveVolatileEmbyPassword("secret");
+    vi.mocked(authenticateEmby).mockResolvedValue({
+      userId: "user-1",
+      userName: "tester",
+      accessToken: "token-secret"
+    });
+    vi.mocked(fetchEmbyItem).mockResolvedValue({
+      id: "episode-1",
+      name: "Episode 1",
+      type: "Episode",
+      seriesName: "Demo Series",
+      seasonNumber: 1,
+      episodeNumber: 1,
+      durationMs: 3_000_000,
+      mediaSources: [
+        {
+          id: "source-1",
+          name: "1080p",
+          container: "mkv",
+          videoCodec: "h264",
+          audioCodec: "aac",
+          width: 1920,
+          height: 1080,
+          bitrate: 8_000_000,
+          sizeBytes: 1_000_000_000,
+          runtimeMs: 3_000_000
+        }
+      ]
+    });
+    vi.mocked(startTauriAudioAlignmentJob).mockResolvedValue({
+      jobId: "job-emby",
+      status: "completed",
+      progress: 1,
+      message: "本地音频对齐完成。",
+      logs: ["本地音频对齐完成。"],
+      proposal: {
+        anchors: [],
+        cutCandidates: [],
+        confidence: 1,
+        diagnostics: ["Emby 授权输入测试。"]
+      },
+      error: null,
+      updatedAtMs: 1
+    });
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        mediaBinding: createEmbyItemMediaBinding(
+          "binding-emby",
+          {
+            id: "episode-1",
+            name: "Episode 1",
+            type: "Episode",
+            seriesName: "Demo Series",
+            seasonNumber: 1,
+            episodeNumber: 1,
+            durationMs: 3_000_000,
+            mediaSources: []
+          },
+          { serverUrl: "https://emby.example.test", pathPrefix: "/emby", username: "tester" }
+        )
+      }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+    await user.click(screen.getByRole("button", { name: "使用 Emby 授权输入" }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/已准备 Emby 授权输入：Episode 1 \/ 媒体源 source-1/)).toBeInTheDocument()
+    );
+    expect(screen.getByLabelText("完整版路径")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("当前视频路径"), {
+      target: { value: "D:\\media\\cut.mp4" }
+    });
+    await user.click(screen.getByRole("button", { name: "运行本地对齐" }));
+
+    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalled());
+    const request = vi.mocked(startTauriAudioAlignmentJob).mock.calls[0][0];
+    expect(request.completePath).toContain("https://emby.example.test/emby/Videos/episode-1/stream");
+    expect(request.completePath).toContain("api_key=token-secret");
+    expect(request.completePath).toContain("MediaSourceId=source-1");
+    expect(screen.getByLabelText("完整版路径")).toHaveValue("");
   });
 
   it("可以逐个预览、修正、接受或跳过音频候选版本差异", async () => {

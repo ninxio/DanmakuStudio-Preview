@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   authenticateEmby,
+  createEmbyAuthorizedStreamUrl,
   createTauriEmbyFetch,
   fetchEmbyEpisodeChildren,
   fetchEmbyItem,
@@ -86,6 +87,23 @@ describe("Emby 客户端", () => {
       runtimeMs: 3_080_123
     });
     expect(JSON.stringify(item)).not.toContain("token");
+  });
+
+  it("为本次会话生成授权播放地址但不改变条目元数据", () => {
+    const url = new URL(
+      createEmbyAuthorizedStreamUrl(
+        { serverUrl: "https://example.test", pathPrefix: "/emby" },
+        { userId: "user-1", userName: "tester", accessToken: "token-1" },
+        "item 1",
+        "source 1"
+      )
+    );
+
+    expect(url.origin).toBe("https://example.test");
+    expect(url.pathname).toBe("/emby/Videos/item%201/stream");
+    expect(url.searchParams.get("Static")).toBe("true");
+    expect(url.searchParams.get("api_key")).toBe("token-1");
+    expect(url.searchParams.get("MediaSourceId")).toBe("source 1");
   });
 
   it("读取下级剧集并生成真实集时长表", async () => {

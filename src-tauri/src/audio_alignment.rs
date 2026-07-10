@@ -206,8 +206,8 @@ where
 {
     check_cancelled(cancel_flag)?;
     update_progress(0.05, "正在校验本地媒体路径。")?;
-    validate_media_file(&request.complete_path, "完整版")?;
-    validate_media_file(&request.source_path, "当前视频")?;
+    validate_media_input(&request.complete_path, "完整版")?;
+    validate_media_input(&request.source_path, "当前视频")?;
     let options = create_options(&request)?;
     update_progress(0.10, "已确认本地媒体路径和对齐参数。")?;
     check_cancelled(cancel_flag)?;
@@ -417,14 +417,23 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn validate_media_file(path: &str, label: &str) -> Result<(), String> {
-    if path.trim().is_empty() {
+fn validate_media_input(path: &str, label: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
         return Err(format!("{label}路径不能为空。"));
     }
-    if !Path::new(path).is_file() {
+    if is_remote_media_input(trimmed) {
+        return Ok(());
+    }
+    if !Path::new(trimmed).is_file() {
         return Err(format!("{label}不是可读取的本地文件：{path}"));
     }
     Ok(())
+}
+
+fn is_remote_media_input(path: &str) -> bool {
+    let lower = path.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 fn get_audio_features(
@@ -479,6 +488,15 @@ fn create_audio_feature_cache_key(
     media_path: &str,
     options: &AudioAlignmentOptions,
 ) -> Result<String, String> {
+    if is_remote_media_input(media_path) {
+        return Ok(format!(
+            "remote:{}|sampleRate={}|windowMs={}|ffmpeg={}",
+            redact_sensitive_media_text(media_path),
+            options.sample_rate,
+            options.window_ms,
+            options.ffmpeg_path
+        ));
+    }
     let metadata = fs::metadata(media_path)
         .map_err(|error| format!("无法读取音频特征缓存文件信息：{error}"))?;
     let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
@@ -565,7 +583,7 @@ fn extract_audio_features(
     let stdout = join_child_output(stdout_reader, "stdout")?;
     let stderr = join_child_output(stderr_reader, "stderr")?;
     if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr);
+        let detail = redact_sensitive_media_text(&String::from_utf8_lossy(&stderr));
         return Err(format!("FFmpeg 提取音频失败：{detail}"));
     }
     let frames = pcm_to_feature_frames(&stdout, options)?;
@@ -573,6 +591,38 @@ fn extract_audio_features(
         return Err(format!("{label}未能提取到可用音频特征。"));
     }
     Ok(frames)
+}
+
+fn redact_sensitive_media_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for key in [
+        "api_key=",
+        "apiKey=",
+        "AccessToken=",
+        "X-Emby-Token=",
+        "token=",
+    ] {
+        redacted = redact_query_value(&redacted, key);
+    }
+    redacted
+}
+
+fn redact_query_value(text: &str, key: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(relative_start) = text[cursor..].find(key) {
+        let key_start = cursor + relative_start;
+        let value_start = key_start + key.len();
+        output.push_str(&text[cursor..value_start]);
+        output.push_str("<已隐藏>");
+        let value_end = text[value_start..]
+            .find(|character: char| matches!(character, '&' | ' ' | '\n' | '\r' | '"' | '\''))
+            .map(|relative_end| value_start + relative_end)
+            .unwrap_or(text.len());
+        cursor = value_end;
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
 fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
@@ -959,6 +1009,41 @@ mod tests {
 
         assert_ne!(original_key, changed_key);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn remote_media_input_is_accepted_for_emby_streams() {
+        assert!(validate_media_input(
+            "https://emby.example.test/Videos/item/stream?api_key=secret",
+            "完整版"
+        )
+        .is_ok());
+        assert!(validate_media_input("ftp://example.test/item.mkv", "完整版").is_err());
+    }
+
+    #[test]
+    fn remote_audio_feature_cache_key_redacts_tokens() {
+        let key = create_audio_feature_cache_key(
+            "https://emby.example.test/Videos/item/stream?api_key=secret-token&MediaSourceId=source-1",
+            &test_options(),
+        )
+        .unwrap();
+
+        assert!(key.contains("api_key=<已隐藏>"));
+        assert!(key.contains("MediaSourceId=source-1"));
+        assert!(!key.contains("secret-token"));
+    }
+
+    #[test]
+    fn ffmpeg_error_text_redacts_emby_tokens() {
+        let redacted = redact_sensitive_media_text(
+            "https://emby.example.test/Videos/item/stream?api_key=secret-token&token=other failed",
+        );
+
+        assert_eq!(
+            redacted,
+            "https://emby.example.test/Videos/item/stream?api_key=<已隐藏>&token=<已隐藏> failed"
+        );
     }
 
     #[test]

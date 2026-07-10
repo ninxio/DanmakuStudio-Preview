@@ -150,6 +150,21 @@ export async function fetchEmbyItem(
   return item;
 }
 
+export function createEmbyAuthorizedStreamUrl(
+  config: EmbyClientConfig,
+  session: EmbyAuthSession,
+  itemId: string,
+  mediaSourceId: string | null = null
+): string {
+  const url = createEmbyUrl(config, `/Videos/${encodeURIComponent(itemId)}/stream`);
+  url.searchParams.set("Static", "true");
+  url.searchParams.set("api_key", session.accessToken);
+  if (mediaSourceId && mediaSourceId.trim().length > 0) {
+    url.searchParams.set("MediaSourceId", mediaSourceId.trim());
+  }
+  return url.toString();
+}
+
 export async function fetchEmbyEpisodeChildren(
   config: EmbyClientConfig,
   session: EmbyAuthSession,
