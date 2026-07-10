@@ -383,7 +383,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
           ...base,
           timelineStartMs: cursor,
           sourceInMs: range.earliestMs,
-          sourceOutMs: Math.max(range.latestMs, range.earliestMs + 1),
+          sourceOutMs: Math.max(range.latestMs + 1, range.earliestMs + 1),
           localOffsetMs: 0,
           enabled: true
         };
@@ -1139,7 +1139,7 @@ function createClipFromAsset(asset: DanmakuAsset, timelineStartMs: Milliseconds)
     name: asset.name,
     timelineStartMs: clampMilliseconds(timelineStartMs),
     sourceInMs: range.earliestMs,
-    sourceOutMs: Math.max(range.latestMs, range.earliestMs + 1),
+    sourceOutMs: Math.max(range.latestMs + 1, range.earliestMs + 1),
     localOffsetMs: 0,
     enabled: true
   };

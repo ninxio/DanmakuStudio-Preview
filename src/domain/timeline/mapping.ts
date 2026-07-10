@@ -34,7 +34,7 @@ export function getResolvedDanmakuTime(
 }
 
 export function isItemInsideClip(item: DanmakuItem, clip: DanmakuClip): boolean {
-  return item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs <= clip.sourceOutMs;
+  return item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs < clip.sourceOutMs;
 }
 
 export function getAssetTimeRange(asset: DanmakuAsset): { earliestMs: Milliseconds; latestMs: Milliseconds } {

@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C79 已完成：片段源区间统一为半开区间。
+  - `isItemInsideClip` 现在按 `[sourceInMs, sourceOutMs)` 判断片段源区间，避免刚好落在剪切边界的弹幕同时进入左右两个片段而重复导出。
+  - 新增片段和自动排列片段现在会把 `sourceOutMs` 设置为最后一条弹幕后 1ms，保持半开区间语义下不丢尾条弹幕。
+  - 项目健康检查的空片段判断改为复用同一个边界判断，确保健康提示和实际导出事件集合一致。
+  - 已补充时间轴映射、项目健康和 store 测试，覆盖半开边界、边界空片段、新增/自动排列片段覆盖最后一条弹幕。
+  - 已重新验证：`corepack pnpm test -- src/domain/timeline/mapping.test.ts src/domain/project/health.test.ts src/stores/editorStore.test.ts` 成功，3 个测试文件、34 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/171 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:34:23`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996868` 字节，时间 `2026/07/10 12:34:23`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c79-half-open-clip-source-ranges-20260710`。
 - 成熟度提升阶段 C78 已完成：导出复核报告补充稳定 ID。
   - 导出复核报告的补偿明细现在会写入补偿点 ID，便于从离线报告回到项目中的具体补偿点。
   - 负时间限制明细现在会写入事件 ID，便于定位被限制到 0ms 的具体导出事件。

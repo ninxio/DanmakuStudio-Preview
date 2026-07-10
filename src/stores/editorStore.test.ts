@@ -112,6 +112,36 @@ describe("editor store", () => {
     expect(addedClip?.timelineStartMs).toBe(2500);
   });
 
+  it("新增片段使用半开源区间并覆盖最后一条弹幕", () => {
+    const asset = createAsset("asset-source-range", "source-range.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset]
+    });
+
+    useEditorStore.getState().addAssetToTimeline(asset.id);
+
+    const clip = useEditorStore.getState().project.clips[0];
+    expect(clip.sourceInMs).toBe(0);
+    expect(clip.sourceOutMs).toBe(1001);
+    useEditorStore.getState().prepareExport();
+    expect(useEditorStore.getState().exportDraft?.summary.enabledCount).toBe(2);
+  });
+
+  it("自动排列片段使用半开源区间并覆盖最后一条弹幕", () => {
+    const asset = createAsset("asset-auto-range", "auto-range.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset]
+    });
+
+    useEditorStore.getState().autoArrangeClips();
+
+    const clip = useEditorStore.getState().project.clips[0];
+    expect(clip.sourceInMs).toBe(0);
+    expect(clip.sourceOutMs).toBe(1001);
+  });
+
   it("导入多个 XML 时按共享调色板顺序分配颜色", async () => {
     const firstFile = new File(
       ['<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u,a">A</d></i>'],

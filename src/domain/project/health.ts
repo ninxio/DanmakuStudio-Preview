@@ -7,7 +7,7 @@ import type {
   SyncAnchor
 } from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
-import { resolveProjectDanmakuEvents } from "../timeline/mapping";
+import { isItemInsideClip, resolveProjectDanmakuEvents } from "../timeline/mapping";
 import type { EditorProject } from "./types";
 
 const EVIDENCE_PREVIEW_LIMIT = 5;
@@ -393,7 +393,7 @@ function collectProjectItemIds(project: EditorProject): Set<string> {
 }
 
 function clipHasVisibleItem(asset: DanmakuAsset, clip: DanmakuClip): boolean {
-  return asset.items.some((item) => item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs <= clip.sourceOutMs);
+  return asset.items.some((item) => isItemInsideClip(item, clip));
 }
 
 function appendDuplicateFinding(

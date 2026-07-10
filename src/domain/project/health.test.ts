@@ -295,6 +295,33 @@ describe("project health", () => {
     expect(report).toContain("标记（ID：zero");
   });
 
+  it("空片段判断使用半开源区间边界", () => {
+    const asset = createAsset("asset", [createItem("edge-item")]);
+    const summary = createProjectHealthSummary({
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-edge-empty",
+          assetId: "asset",
+          name: "边界空片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    });
+
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "empty-clips",
+        evidence: ["边界空片段 / asset.xml（时间轴 00:00:00.000，源区间 00:00:00.000 - 00:00:01.000）"]
+      })
+    );
+  });
+
   it("提示会在导出时被限制为 0ms 的负最终时间", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const project = {

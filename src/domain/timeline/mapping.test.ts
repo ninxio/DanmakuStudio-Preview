@@ -4,6 +4,7 @@ import { createEmptyProject } from "../project/factory";
 import {
   applyCutMapping,
   getResolvedDanmakuTime,
+  isItemInsideClip,
   resolveProjectDanmakuEvents
 } from "./mapping";
 
@@ -72,5 +73,36 @@ describe("timeline mapping", () => {
       clips: [{ ...clip, timelineStartMs: 0, sourceInMs: 0, sourceOutMs: 5000, localOffsetMs: 0 }]
     };
     expect(resolveProjectDanmakuEvents(project).map((event) => event.item.id)).toEqual(["early", "same", "late"]);
+  });
+
+  it("片段源区间按左闭右开匹配，避免剪切边界重复", () => {
+    const boundaryItem = item("boundary", 1000, 0);
+    const leftClip = { ...clip, sourceInMs: 0, sourceOutMs: 1000 };
+    const rightClip = { ...clip, sourceInMs: 1000, sourceOutMs: 2000 };
+    const asset: DanmakuAsset = {
+      id: "asset",
+      name: "asset",
+      fileName: "a.xml",
+      color: "#4cc9f0",
+      importedAt: new Date().toISOString(),
+      warnings: [],
+      items: [item("before", 999, 0), boundaryItem, item("after", 1999, 2)]
+    };
+    const project = {
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        { ...leftClip, id: "left", timelineStartMs: 0, localOffsetMs: 0 },
+        { ...rightClip, id: "right", timelineStartMs: 1000, localOffsetMs: 0 }
+      ]
+    };
+
+    expect(isItemInsideClip(boundaryItem, leftClip)).toBe(false);
+    expect(isItemInsideClip(boundaryItem, rightClip)).toBe(true);
+    expect(resolveProjectDanmakuEvents(project).map((event) => event.id)).toEqual([
+      "left:before",
+      "right:boundary",
+      "right:after"
+    ]);
   });
 });
