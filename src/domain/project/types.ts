@@ -7,7 +7,7 @@ import type {
 import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export interface MediaReference {
   id: string;
@@ -16,6 +16,53 @@ export interface MediaReference {
   objectUrl: string | null;
   durationMs: Milliseconds | null;
 }
+
+export interface EmbyServerReference {
+  serverUrl: string;
+  pathPrefix: string;
+  username: string;
+}
+
+export interface EmbyMediaSourceSummary {
+  id: string | null;
+  name: string | null;
+  container: string | null;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  width: number | null;
+  height: number | null;
+  bitrate: number | null;
+  sizeBytes: number | null;
+  runtimeMs: Milliseconds | null;
+}
+
+interface MediaBindingBase {
+  id: string;
+  displayName: string;
+  runtimeMs: Milliseconds | null;
+  linkedAt: string;
+}
+
+export interface LocalFileMediaBinding extends MediaBindingBase {
+  kind: "localFile";
+  fileName: string;
+  mediaId: string | null;
+  localPath: string | null;
+}
+
+export interface EmbyItemMediaBinding extends MediaBindingBase {
+  kind: "embyItem";
+  itemId: string;
+  itemName: string;
+  itemType: string;
+  seriesName: string | null;
+  seasonNumber: number | null;
+  episodeNumber: number | null;
+  server: EmbyServerReference;
+  mediaSources: EmbyMediaSourceSummary[];
+}
+
+export type MediaBinding = LocalFileMediaBinding | EmbyItemMediaBinding;
 
 export interface TimelineViewState {
   pixelsPerSecond: number;
@@ -34,6 +81,7 @@ export interface EditorProject {
   id: string;
   name: string;
   media: MediaReference | null;
+  mediaBinding: MediaBinding | null;
   assets: DanmakuAsset[];
   clips: DanmakuClip[];
   globalOffsetMs: Milliseconds;

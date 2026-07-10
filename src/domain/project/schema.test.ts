@@ -21,11 +21,16 @@ describe("project schema", () => {
         objectUrl: "blob:test",
         durationMs: 1000
       },
+      mediaBinding: createValidLocalFileBinding(),
       alignmentProposal: createValidAlignmentProposal()
     };
     const json = serializeProject(project);
     expect(JSON.parse(json)).toMatchObject({
       schemaVersion: CURRENT_SCHEMA_VERSION,
+      mediaBinding: {
+        kind: "localFile",
+        fileName: "demo.mp4"
+      },
       alignmentProposal: {
         anchors: [{ id: "proposal-anchor" }],
         cutCandidates: [{ id: "proposal-cut" }]
@@ -34,6 +39,7 @@ describe("project schema", () => {
     const parsed = parseProjectJson(json);
     expect(parsed.name).toBe("测试项目");
     expect(parsed.media?.objectUrl).toBeNull();
+    expect(parsed.mediaBinding?.kind).toBe("localFile");
     expect(parsed.alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
   });
 
@@ -59,6 +65,26 @@ describe("project schema", () => {
       version: CURRENT_SCHEMA_VERSION,
       message: "项目文件可打开。"
     });
+  });
+
+  it("允许保存 Emby 目标原片绑定摘要", () => {
+    const project = {
+      ...createEmptyProject("Emby 绑定项目"),
+      mediaBinding: createValidEmbyBinding()
+    };
+
+    expect(validateProjectSchema(project)).toEqual({
+      ok: true,
+      version: CURRENT_SCHEMA_VERSION,
+      message: "项目文件可打开。"
+    });
+    const parsed = parseProjectJson(serializeProject(project));
+    expect(parsed.mediaBinding).toMatchObject({
+      kind: "embyItem",
+      itemId: "emby-item-1",
+      seriesName: "测试剧集"
+    });
+    expect(JSON.stringify(parsed.mediaBinding)).not.toContain("token");
   });
 
   it("打开 v1 项目时迁移闭区间片段 sourceOutMs", () => {
@@ -91,7 +117,7 @@ describe("project schema", () => {
     });
   });
 
-  it("打开 v2 项目时补齐对齐提案字段但不重复迁移片段边界", () => {
+  it("打开 v2 项目时补齐对齐提案和媒体绑定字段但不重复迁移片段边界", () => {
     const currentProject = {
       ...createEmptyProject("v2 项目"),
       schemaVersion: 2,
@@ -116,9 +142,32 @@ describe("project schema", () => {
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.alignmentProposal).toBeNull();
+    expect(parsed.mediaBinding).toBeNull();
     expect(parsed.clips[0].sourceOutMs).toBe(1000);
     expect(migration).toEqual({
       fromVersion: 2,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+  });
+
+  it("打开 v3 项目时补齐媒体绑定字段并保留对齐提案", () => {
+    const currentProject = {
+      ...createEmptyProject("v3 项目"),
+      schemaVersion: 3,
+      assets: [createValidAsset()],
+      alignmentProposal: createValidAlignmentProposal()
+    };
+    const v3Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
+    delete v3Project.mediaBinding;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v3Project));
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(parsed.mediaBinding).toBeNull();
+    expect(migration).toEqual({
+      fromVersion: 3,
       toVersion: CURRENT_SCHEMA_VERSION,
       adjustedClipRangeCount: 0
     });
@@ -284,6 +333,25 @@ describe("project schema", () => {
     expect(validation.message).toContain("必要字段");
   });
 
+  it("拒绝结构错误的目标原片绑定", () => {
+    const validBinding = createValidEmbyBinding();
+    const project = {
+      ...createEmptyProject(),
+      mediaBinding: {
+        ...validBinding,
+        mediaSources: [
+          {
+            ...validBinding.mediaSources[0],
+            runtimeMs: 10.5
+          }
+        ]
+      }
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("必要字段");
+  });
+
   it("拒绝非整数毫秒的单条弹幕调整", () => {
     const project = {
       ...createEmptyProject(),
@@ -351,5 +419,53 @@ function createValidAlignmentProposal() {
     ],
     confidence: 0.85,
     diagnostics: ["测试诊断"]
+  };
+}
+
+function createValidLocalFileBinding() {
+  return {
+    id: "binding-local",
+    kind: "localFile" as const,
+    displayName: "demo",
+    fileName: "demo.mp4",
+    mediaId: "media",
+    localPath: null,
+    runtimeMs: 1000,
+    linkedAt: "2026-07-10T00:00:00.000Z"
+  };
+}
+
+function createValidEmbyBinding() {
+  return {
+    id: "binding-emby",
+    kind: "embyItem" as const,
+    displayName: "测试剧集 / S01E02 / 第二集",
+    itemId: "emby-item-1",
+    itemName: "第二集",
+    itemType: "Episode",
+    seriesName: "测试剧集",
+    seasonNumber: 1,
+    episodeNumber: 2,
+    runtimeMs: 3_000_000,
+    linkedAt: "2026-07-10T00:00:00.000Z",
+    server: {
+      serverUrl: "https://emby.example.test",
+      pathPrefix: "/emby",
+      username: "tester"
+    },
+    mediaSources: [
+      {
+        id: "source-1",
+        name: "1080p",
+        container: "mkv",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        width: 1920,
+        height: 1080,
+        bitrate: 8_000_000,
+        sizeBytes: 1_000_000_000,
+        runtimeMs: 3_000_000
+      }
+    ]
   };
 }

@@ -42,9 +42,24 @@ describe("Emby 客户端", () => {
         Id: "item-1",
         Name: "Episode 1",
         Type: "Episode",
+        SeriesName: "Demo Series",
         ParentIndexNumber: 1,
         IndexNumber: 1,
-        RunTimeTicks: 3_080_123_0000
+        RunTimeTicks: 3_080_123_0000,
+        MediaSources: [
+          {
+            Id: "source-1",
+            Name: "1080p",
+            Container: "mkv",
+            Bitrate: 8_000_000,
+            Size: 1_234_567_890,
+            RunTimeTicks: 3_080_123_0000,
+            MediaStreams: [
+              { Type: "Video", Codec: "h264", Width: 1920, Height: 1080, BitRate: 7_000_000 },
+              { Type: "Audio", Codec: "aac", BitRate: 192_000 }
+            ]
+          }
+        ]
       }));
 
     const item = await fetchEmbyItem(
@@ -55,8 +70,22 @@ describe("Emby 客户端", () => {
     );
 
     expect(item.durationMs).toBe(3_080_123);
+    expect(item.seriesName).toBe("Demo Series");
     expect(item.seasonNumber).toBe(1);
     expect(item.episodeNumber).toBe(1);
+    expect(item.mediaSources[0]).toMatchObject({
+      id: "source-1",
+      name: "1080p",
+      container: "mkv",
+      videoCodec: "h264",
+      audioCodec: "aac",
+      width: 1920,
+      height: 1080,
+      bitrate: 8_000_000,
+      sizeBytes: 1_234_567_890,
+      runtimeMs: 3_080_123
+    });
+    expect(JSON.stringify(item)).not.toContain("token");
   });
 
   it("读取下级剧集并生成真实集时长表", async () => {

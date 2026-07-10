@@ -44,13 +44,21 @@ import {
   createProjectHealthSummary
 } from "../../domain/project/health";
 import { createProjectDownloadFileName } from "../../domain/project/fileNames";
+import { createId } from "../../domain/project/factory";
+import {
+  createEmbyItemMediaBinding,
+  formatMediaBindingEpisode,
+  formatMediaBindingSource,
+  formatMediaBindingTitle,
+  formatMediaSourceSummary
+} from "../../domain/project/mediaBinding";
 import {
   createProjectReadinessSummary,
   type ProjectReadinessItem,
   type ProjectReadinessStatus,
   type ProjectReadinessSummary
 } from "../../domain/project/readiness";
-import type { EditorProject } from "../../domain/project/types";
+import type { EditorProject, MediaBinding, MediaReference } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
@@ -118,6 +126,7 @@ export function AssetPanel() {
   const [cutPointsText, setCutPointsText] = useState("");
   const [anchorCalibrationText, setAnchorCalibrationText] = useState("");
   const [alignmentProposalText, setAlignmentProposalText] = useState("");
+  const [targetValidationLoading, setTargetValidationLoading] = useState(false);
   const lastSyncedAlignmentProposalTextRef = useRef("");
   const lastAlignmentProjectIdRef = useRef<string | null>(null);
   const project = useEditorStore((state) => state.project);
@@ -129,6 +138,9 @@ export function AssetPanel() {
   const removeAsset = useEditorStore((state) => state.removeAsset);
   const removeAssetFromTimeline = useEditorStore((state) => state.removeAssetFromTimeline);
   const removeMedia = useEditorStore((state) => state.removeMedia);
+  const bindCurrentMediaAsTarget = useEditorStore((state) => state.bindCurrentMediaAsTarget);
+  const setMediaBinding = useEditorStore((state) => state.setMediaBinding);
+  const clearMediaBinding = useEditorStore((state) => state.clearMediaBinding);
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
   const select = useEditorStore((state) => state.select);
   const setPlayhead = useEditorStore((state) => state.setPlayhead);
@@ -197,6 +209,36 @@ export function AssetPanel() {
   const projectHealth = useMemo(() => createProjectHealthSummary(project), [project]);
   const projectReadiness = useMemo(() => createProjectReadinessSummary(project), [project]);
 
+  const validateEmbyTargetBinding = async () => {
+    const binding = project.mediaBinding;
+    if (!binding || binding.kind !== "embyItem") {
+      setStatus({ message: "当前目标原片不是 Emby 条目。", tone: "warning" });
+      return;
+    }
+    const connection = loadEmbyConnectionState();
+    if (!validateEmbyConnectionState(connection)) {
+      return;
+    }
+    setTargetValidationLoading(true);
+    try {
+      const session = await authenticateEmby(connection.config, {
+        username: connection.username,
+        password: connection.password
+      });
+      const item = await fetchEmbyItem(connection.config, session, binding.itemId);
+      const updatedBinding = createEmbyBindingFromItem(item, connection);
+      setMediaBinding(updatedBinding);
+      setStatus({ message: `已重新确认目标原片：${updatedBinding.displayName}`, tone: "success" });
+    } catch (error) {
+      setStatus({
+        message: `目标原片需要重新连接：${error instanceof Error ? error.message : "Emby 请求失败。"}`,
+        tone: "error"
+      });
+    } finally {
+      setTargetValidationLoading(false);
+    }
+  };
+
   useEffect(() => {
     const projectChanged = lastAlignmentProjectIdRef.current !== project.id;
     lastAlignmentProjectIdRef.current = project.id;
@@ -227,6 +269,14 @@ export function AssetPanel() {
       <div className="thin-scrollbar min-h-0 flex-1 overflow-auto p-3">
         {tab === "media" ? (
           <div className="grid gap-3">
+            <TargetMediaBindingPanel
+              binding={project.mediaBinding}
+              media={project.media}
+              validating={targetValidationLoading}
+              onBindLocal={bindCurrentMediaAsTarget}
+              onValidateEmby={() => void validateEmbyTargetBinding()}
+              onClear={clearMediaBinding}
+            />
             {project.media ? (
               <div className="rounded border border-panel-line bg-panel-soft p-3">
                 <div className="flex items-center gap-2 text-sm text-slate-100">
@@ -477,6 +527,7 @@ export function AssetPanel() {
               <Row label="版本差异" value={project.cutMarkers.length.toString()} />
               <Row label="同步线索" value={project.syncAnchors.length.toString()} />
               <Row label="禁用弹幕" value={project.disabledItemIds.length.toString()} />
+              <Row label="目标原片" value={formatMediaBindingTitle(project.mediaBinding)} />
               <Row label="全局偏移" value={`${project.globalOffsetMs} ms`} />
               <Row label="创建时间" value={new Date(project.createdAt).toLocaleString("zh-CN")} />
               <Row label="更新时间" value={new Date(project.updatedAt).toLocaleString("zh-CN")} />
@@ -485,6 +536,85 @@ export function AssetPanel() {
         ) : null}
       </div>
     </div>
+  );
+}
+
+function TargetMediaBindingPanel({
+  binding,
+  media,
+  validating,
+  onBindLocal,
+  onValidateEmby,
+  onClear
+}: {
+  binding: MediaBinding | null;
+  media: MediaReference | null;
+  validating: boolean;
+  onBindLocal: () => void;
+  onValidateEmby: () => void;
+  onClear: () => void;
+}) {
+  const localBindingConnected =
+    binding?.kind === "localFile" &&
+    Boolean(media?.objectUrl) &&
+    (binding.mediaId ? media?.id === binding.mediaId : media?.fileName === binding.fileName);
+  const statusText = !binding
+    ? "未绑定"
+    : binding.kind === "localFile"
+      ? localBindingConnected
+        ? "本地文件已连接"
+        : "需要重新选择本地视频"
+      : "Emby 条目已保存";
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2">
+        <Crosshair size={16} className="text-accent-cyan" />
+        <h3 className="text-sm font-medium text-slate-100">目标原片</h3>
+        <span className="ml-auto rounded border border-panel-line bg-black/20 px-2 py-0.5 text-[11px] text-slate-500">
+          {statusText}
+        </span>
+      </div>
+      <p className="mt-2 leading-5 text-slate-500">
+        {binding
+          ? "后续匹配评分、对齐和导出检查会读取这里保存的目标来源。"
+          : "绑定本地完整版或 Emby 条目后，项目会记住自己对应哪一部、哪一集。"}
+      </p>
+      {binding ? (
+        <dl className="mt-3 grid gap-2">
+          <Row label="名称" value={formatMediaBindingTitle(binding)} />
+          <Row label="来源" value={formatMediaBindingSource(binding)} />
+          <Row label="位置" value={formatMediaBindingEpisode(binding)} />
+          <Row label="时长" value={binding.runtimeMs === null ? "未知" : formatTimecode(binding.runtimeMs)} />
+          {binding.kind === "embyItem" ? (
+            <>
+              <Row label="条目 ID" value={binding.itemId} />
+              <Row
+                label="媒体源"
+                value={binding.mediaSources[0] ? formatMediaSourceSummary(binding.mediaSources[0]) : "暂未读取"}
+              />
+            </>
+          ) : null}
+        </dl>
+      ) : null}
+      <div className="mt-3 flex flex-wrap gap-2">
+        <TextButton onClick={onBindLocal} disabled={!media}>
+          <Video size={14} />
+          绑定当前视频
+        </TextButton>
+        {binding?.kind === "embyItem" ? (
+          <TextButton onClick={onValidateEmby} disabled={validating}>
+            <Search size={14} />
+            {validating ? "验证中" : "验证 Emby"}
+          </TextButton>
+        ) : null}
+        {binding ? (
+          <TextButton tone="danger" onClick={onClear}>
+            <Trash2 size={14} />
+            解除绑定
+          </TextButton>
+        ) : null}
+      </div>
+    </section>
   );
 }
 
@@ -500,6 +630,7 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
   const [searchResults, setSearchResults] = useState<EmbyItemMetadata[]>([]);
   const [durationLines, setDurationLines] = useState("");
   const [loading, setLoading] = useState<EmbyLoadingKind | null>(null);
+  const setMediaBinding = useEditorStore((state) => state.setMediaBinding);
   const selectedItemId = itemId.trim();
   const hasSelectedItem = selectedItemId.length > 0;
 
@@ -576,6 +707,18 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
     setDurationLines(line);
     onImportDurationLines(line);
     setStatus({ message: "已把单条 Emby 时长导入人工整理规则。", tone: "success" });
+  };
+
+  const bindLoadedItemAsTarget = () => {
+    if (!loadedItem) {
+      setStatus({ message: "请先选择或读取一个 Emby 条目。", tone: "warning" });
+      return;
+    }
+    const connection = loadEmbyConnectionState();
+    if (!validateEmbyConnectionState(connection)) {
+      return;
+    }
+    setMediaBinding(createEmbyBindingFromItem(loadedItem, connection));
   };
 
   const readItem = async () => {
@@ -676,7 +819,12 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
           <div className="min-w-0 rounded border border-panel-line bg-black/20 p-2">
             <Row label="条目" value={loadedItem.name} />
             <Row label="类型" value={loadedItem.type} />
+            {loadedItem.seriesName ? <Row label="剧名" value={loadedItem.seriesName} /> : null}
             <Row label="时长" value={loadedItem.durationMs === null ? "未知" : formatTimecode(loadedItem.durationMs)} />
+            <Row
+              label="媒体源"
+              value={loadedItem.mediaSources[0] ? formatMediaSourceSummary(loadedItem.mediaSources[0]) : "暂未读取"}
+            />
             <div className="mt-2 grid min-w-0 gap-2">
               <TextButton
                 className="w-full min-w-0 px-2"
@@ -697,6 +845,9 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
                   <span className="truncate">导入单条时长</span>
                 </TextButton>
               ) : null}
+              <TextButton tone="primary" className="w-full min-w-0 px-2" onClick={bindLoadedItemAsTarget}>
+                <span className="truncate">绑定为目标原片</span>
+              </TextButton>
             </div>
           </div>
         ) : null}
@@ -736,6 +887,18 @@ function loadEmbyConnectionState(): EmbyConnectionState {
     password,
     sessionKey: [serverUrl, pathPrefix, username, password].join("\n")
   };
+}
+
+function createEmbyBindingFromItem(item: EmbyItemMetadata, connection: EmbyConnectionState): MediaBinding {
+  return createEmbyItemMediaBinding(
+    createId("media_binding"),
+    item,
+    {
+      serverUrl: connection.config.serverUrl,
+      pathPrefix: connection.config.pathPrefix,
+      username: connection.username
+    }
+  );
 }
 
 function validateEmbyConnectionState(connection: EmbyConnectionState): boolean {

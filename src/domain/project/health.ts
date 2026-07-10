@@ -8,6 +8,7 @@ import type {
 } from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { isItemInsideClip, resolveProjectDanmakuEvents } from "../timeline/mapping";
+import { formatMediaBindingSource, formatMediaBindingTitle } from "./mediaBinding";
 import type { EditorProject } from "./types";
 
 const EVIDENCE_PREVIEW_LIMIT = 5;
@@ -41,6 +42,8 @@ export interface ProjectHealthMetrics {
   duplicateIdCount: number;
   negativeFinalTimeItemCount: number;
   mediaNeedsReconnect: boolean;
+  mediaBindingKind: "none" | "localFile" | "embyItem";
+  mediaBindingNeedsReconnect: boolean;
 }
 
 export interface ProjectHealthSummary {
@@ -104,6 +107,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
     (anchor) => anchor.confidence !== undefined && anchor.confidence < 0.75
   );
   const lowConfidenceAnchorCount = lowConfidenceAnchors.length;
+  const mediaBindingNeedsReconnect = isLocalMediaBindingDisconnected(project);
   const negativeFinalTimeEvents = resolveProjectDanmakuEvents(project).filter(
     (event) => event.enabled && event.finalTimeMs < 0
   );
@@ -237,6 +241,15 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       evidence: formatMediaEvidence(project.media)
     });
   }
+  if (mediaBindingNeedsReconnect && project.mediaBinding) {
+    findings.push({
+      id: "target-local-needs-reconnect",
+      severity: "warning",
+      title: "目标原片需要重新连接",
+      detail: "项目文件保存了本地目标原片引用，但不会嵌入视频内容。重新打开项目后，请再次导入同一个本地视频再复核。",
+      evidence: formatMediaBindingEvidence(project)
+    });
+  }
   if (importWarningCount > 0) {
     findings.push({
       id: "import-warnings",
@@ -295,7 +308,9 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       missingAssetClipCount,
       duplicateIdCount,
       negativeFinalTimeItemCount: negativeFinalTimeEvents.length,
-      mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null)
+      mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null),
+      mediaBindingKind: project.mediaBinding?.kind ?? "none",
+      mediaBindingNeedsReconnect
     },
     findings
   };
@@ -376,6 +391,8 @@ export function createProjectHealthReport(
     `重复 ID：${summary.metrics.duplicateIdCount.toLocaleString("zh-CN")} 个`,
     `负最终时间：${summary.metrics.negativeFinalTimeItemCount.toLocaleString("zh-CN")} 条`,
     `媒体重连：${summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"}`,
+    `目标原片：${formatMediaBindingMetricLabel(summary.metrics.mediaBindingKind)}`,
+    `目标原片重连：${summary.metrics.mediaBindingNeedsReconnect ? "需要" : "不需要"}`,
     "",
     "复核清单："
   ];
@@ -482,6 +499,34 @@ function formatClipEvidence(clips: DanmakuClip[], assets: DanmakuAsset[]): strin
 
 function formatMediaEvidence(media: NonNullable<EditorProject["media"]>): string[] {
   return [`${media.fileName}（名称：${media.name}）`];
+}
+
+function formatMediaBindingEvidence(project: EditorProject): string[] {
+  return [`${formatMediaBindingTitle(project.mediaBinding)}（${formatMediaBindingSource(project.mediaBinding)}）`];
+}
+
+function isLocalMediaBindingDisconnected(project: EditorProject): boolean {
+  const binding = project.mediaBinding;
+  if (!binding || binding.kind !== "localFile") {
+    return false;
+  }
+  if (!project.media || project.media.objectUrl === null) {
+    return true;
+  }
+  if (binding.mediaId && project.media.id === binding.mediaId) {
+    return false;
+  }
+  return project.media.fileName !== binding.fileName;
+}
+
+function formatMediaBindingMetricLabel(kind: ProjectHealthMetrics["mediaBindingKind"]): string {
+  if (kind === "localFile") {
+    return "本地文件";
+  }
+  if (kind === "embyItem") {
+    return "Emby 条目";
+  }
+  return "未绑定";
 }
 
 function formatMissingAssetClipEvidence(clips: DanmakuClip[]): string[] {

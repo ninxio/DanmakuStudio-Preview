@@ -61,6 +61,28 @@ function createAlignmentProposal() {
   };
 }
 
+function createEmbyBinding() {
+  return {
+    id: "binding-emby",
+    kind: "embyItem" as const,
+    displayName: "测试剧集 / S01E02 / 第二集",
+    itemId: "emby-item-1",
+    itemName: "第二集",
+    itemType: "Episode",
+    seriesName: "测试剧集",
+    seasonNumber: 1,
+    episodeNumber: 2,
+    runtimeMs: 3_000_000,
+    linkedAt: "2026-07-10T00:00:00.000Z",
+    server: {
+      serverUrl: "https://emby.example.test",
+      pathPrefix: "/emby",
+      username: "tester"
+    },
+    mediaSources: []
+  };
+}
+
 function mockRevokeObjectUrl(): ReturnType<typeof vi.fn> {
   const revokeObjectUrl = vi.fn();
   Object.defineProperty(URL, "revokeObjectURL", {
@@ -155,6 +177,52 @@ describe("editor store", () => {
 
     expect(useEditorStore.getState().alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
     expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+  });
+
+  it("可把当前本地视频绑定为目标原片并随时解除", () => {
+    resetStore({
+      ...createEmptyProject(),
+      media: {
+        id: "media-local",
+        name: "本地完整版",
+        fileName: "full.mp4",
+        objectUrl: "blob:full",
+        durationMs: 3_000_000
+      }
+    });
+
+    useEditorStore.getState().bindCurrentMediaAsTarget();
+
+    expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
+      kind: "localFile",
+      displayName: "本地完整版",
+      fileName: "full.mp4",
+      runtimeMs: 3_000_000
+    });
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("绑定本地目标原片");
+
+    useEditorStore.getState().clearMediaBinding();
+
+    expect(useEditorStore.getState().project.mediaBinding).toBeNull();
+    useEditorStore.getState().undo();
+    expect(useEditorStore.getState().project.mediaBinding?.kind).toBe("localFile");
+  });
+
+  it("打开项目时恢复持久化的 Emby 目标原片绑定", () => {
+    const project = {
+      ...createEmptyProject("Emby 绑定项目"),
+      mediaBinding: createEmbyBinding()
+    };
+
+    useEditorStore.getState().openProjectFromText(serializeProject(project));
+
+    expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
+      kind: "embyItem",
+      itemId: "emby-item-1",
+      seriesName: "测试剧集",
+      episodeNumber: 2
+    });
+    expect(JSON.stringify(useEditorStore.getState().project.mediaBinding)).not.toContain("token");
   });
 
   it("预览对齐提案时同步写入项目文件状态", () => {

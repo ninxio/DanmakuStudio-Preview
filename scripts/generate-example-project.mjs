@@ -74,10 +74,11 @@ const clips = assets.map((asset, index) => {
 });
 
 const project = {
-  schemaVersion: 1,
+  schemaVersion: 4,
   id: "demo_three_part_project",
   name: "三分P合并示例",
   media: null,
+  mediaBinding: null,
   assets,
   clips,
   globalOffsetMs: 0,
@@ -91,6 +92,7 @@ const project = {
     }
   ],
   syncAnchors: [],
+  alignmentProposal: null,
   itemTimeAdjustments: {},
   disabledItemIds: [],
   timeline: {

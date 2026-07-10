@@ -6,6 +6,7 @@ import {
 import type { AlignmentProposal } from "../alignment/types";
 import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import { createProjectHealthSummary } from "./health";
+import { formatMediaBindingSource, formatMediaBindingTitle } from "./mediaBinding";
 import type { EditorProject } from "./types";
 
 export type WorkflowStageId = "source" | "timeline" | "alignment" | "review" | "export";
@@ -182,10 +183,11 @@ export function createWorkflowOverview(
       detail: "视频只用于预览，XML 会变成可调整的弹幕素材；原始 XML 不会被改写。",
       metrics: [
         { label: "视频", value: project.media ? project.media.fileName : "未导入" },
+        { label: "目标原片", value: project.mediaBinding ? formatMediaBindingTitle(project.mediaBinding) : "未绑定" },
         { label: "XML", value: `${formatCount(assetCount)} 个` },
         { label: "弹幕", value: `${formatCount(itemCount)} 条` }
       ],
-      capabilityIds: ["local-media", "multi-xml", "raw-xml-safe"],
+      capabilityIds: ["local-media", "target-media", "multi-xml", "raw-xml-safe"],
       actionIds: ["import-xml", "import-video"]
     },
     {
@@ -231,7 +233,8 @@ export function createWorkflowOverview(
       metrics: [
         { label: "状态", value: health.statusLabel },
         { label: "问题", value: `${formatCount(health.findings.length)} 项` },
-        { label: "媒体重连", value: health.metrics.mediaNeedsReconnect ? "需要" : "不需要" }
+        { label: "媒体重连", value: health.metrics.mediaNeedsReconnect ? "需要" : "不需要" },
+        { label: "目标重连", value: health.metrics.mediaBindingNeedsReconnect ? "需要" : "不需要" }
       ],
       capabilityIds: ["project-health", "cleanup", "settings-privacy"],
       actionIds: ["cleanup-edit-references", "cleanup-missing-clips"]
@@ -343,6 +346,16 @@ function createCapabilities({
       visibleWhen: "always",
       stateText: mediaLoaded ? "已连接" : "可导入",
       active: mediaLoaded
+    },
+    {
+      id: "target-media",
+      title: "目标原片绑定",
+      detail: project.mediaBinding
+        ? formatMediaBindingSource(project.mediaBinding)
+        : "绑定本地文件或 Emby 条目，作为后续匹配、对齐和导出复核的目标来源。",
+      visibleWhen: "always",
+      stateText: project.mediaBinding ? "已绑定" : "可绑定",
+      active: Boolean(project.mediaBinding)
     },
     {
       id: "multi-xml",

@@ -221,6 +221,32 @@ describe("project health", () => {
     );
   });
 
+  it("提示本地目标原片重新打开后需要重新连接", () => {
+    const summary = createProjectHealthSummary({
+      ...createEmptyProject(),
+      mediaBinding: {
+        id: "binding-local",
+        kind: "localFile",
+        displayName: "本地完整版",
+        fileName: "full.mp4",
+        mediaId: "media-local",
+        localPath: null,
+        runtimeMs: 3_000_000,
+        linkedAt: "2026-07-10T00:00:00.000Z"
+      }
+    });
+
+    expect(summary.metrics.mediaBindingKind).toBe("localFile");
+    expect(summary.metrics.mediaBindingNeedsReconnect).toBe(true);
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "target-local-needs-reconnect",
+        evidence: ["本地完整版（本地文件 / full.mp4）"]
+      })
+    );
+    expect(createProjectHealthReport("目标绑定项目", summary)).toContain("目标原片重连：需要");
+  });
+
   it("提示没有时间轴片段和所有片段禁用时显示证据", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const noClipSummary = createProjectHealthSummary({

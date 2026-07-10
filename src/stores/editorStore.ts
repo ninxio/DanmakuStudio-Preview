@@ -27,7 +27,8 @@ import {
   createProjectHealthSummary,
   summarizeProjectHealthBlockers
 } from "../domain/project/health";
-import type { EditorProject, EditorSelection, MediaReference } from "../domain/project/types";
+import { createLocalFileMediaBinding } from "../domain/project/mediaBinding";
+import type { EditorProject, EditorSelection, MediaBinding, MediaReference } from "../domain/project/types";
 import {
   getAssetTimeRange,
   getClipDurationMs,
@@ -106,6 +107,9 @@ interface EditorStore {
   importXmlFiles: (files: FileList | File[]) => Promise<void>;
   importVideoFile: (file: File) => void;
   removeMedia: () => void;
+  bindCurrentMediaAsTarget: () => void;
+  setMediaBinding: (binding: MediaBinding) => void;
+  clearMediaBinding: () => void;
   updateMediaDuration: (durationMs: Milliseconds) => void;
   openProjectFromText: (text: string, sourceFileName?: string) => void;
   addAssetToTimeline: (assetId: string) => void;
@@ -271,12 +275,52 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     set({ status: { message: `已删除视频引用：${media.fileName}`, tone: "success" } });
   },
 
+  bindCurrentMediaAsTarget: () => {
+    const media = get().project.media;
+    if (!media) {
+      set({ status: { message: "请先导入本地视频，再绑定为目标原片。", tone: "warning" } });
+      return;
+    }
+    const binding = createLocalFileMediaBinding(createId("media_binding"), media);
+    commitProject(set, get, "绑定本地目标原片", (project) => ({
+      ...project,
+      mediaBinding: binding
+    }));
+    set({ status: { message: `已绑定目标原片：${binding.displayName}`, tone: "success" } });
+  },
+
+  setMediaBinding: (binding) => {
+    commitProject(set, get, "绑定目标原片", (project) => ({
+      ...project,
+      mediaBinding: binding
+    }));
+    set({ status: { message: `已绑定目标原片：${binding.displayName}`, tone: "success" } });
+  },
+
+  clearMediaBinding: () => {
+    const binding = get().project.mediaBinding;
+    if (!binding) {
+      set({ status: { message: "当前没有绑定目标原片。", tone: "warning" } });
+      return;
+    }
+    commitProject(set, get, "解除目标原片绑定", (project) => ({
+      ...project,
+      mediaBinding: null
+    }));
+    set({ status: { message: `已解除目标原片绑定：${binding.displayName}`, tone: "success" } });
+  },
+
   updateMediaDuration: (durationMs) => {
     set((state) => ({
       project: state.project.media
         ? touchProject({
             ...state.project,
-            media: { ...state.project.media, durationMs: clampMilliseconds(durationMs) }
+            media: { ...state.project.media, durationMs: clampMilliseconds(durationMs) },
+            mediaBinding:
+              state.project.mediaBinding?.kind === "localFile" &&
+              state.project.mediaBinding.mediaId === state.project.media.id
+                ? { ...state.project.mediaBinding, runtimeMs: clampMilliseconds(durationMs) }
+                : state.project.mediaBinding
           })
         : state.project
     }));

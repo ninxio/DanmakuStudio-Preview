@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
@@ -43,6 +43,83 @@ describe("资源面板", () => {
     await waitFor(() => expect(useEditorStore.getState().project.assets).toHaveLength(0));
   });
 
+  it("媒体页可以把当前本地视频绑定为目标原片", async () => {
+    const user = userEvent.setup();
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        media: {
+          id: "media-local",
+          name: "本地完整版",
+          fileName: "full.mp4",
+          objectUrl: "blob:full",
+          durationMs: 3_000_000
+        }
+      }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "媒体" }));
+    await user.click(screen.getByRole("button", { name: "绑定当前视频" }));
+
+    expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
+      kind: "localFile",
+      displayName: "本地完整版",
+      fileName: "full.mp4"
+    });
+    const targetPanel = getTargetMediaBindingPanel();
+    expect(within(targetPanel).getByText("本地文件已连接")).toBeInTheDocument();
+    expect(within(targetPanel).getByText("本地完整版")).toBeInTheDocument();
+  });
+
+  it("媒体页显示保存恢复的 Emby 目标原片绑定", async () => {
+    const user = userEvent.setup();
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        mediaBinding: {
+          id: "binding-emby",
+          kind: "embyItem",
+          displayName: "测试剧集 / S01E02 / 第二集",
+          itemId: "emby-item-1",
+          itemName: "第二集",
+          itemType: "Episode",
+          seriesName: "测试剧集",
+          seasonNumber: 1,
+          episodeNumber: 2,
+          runtimeMs: 3_000_000,
+          linkedAt: "2026-07-10T00:00:00.000Z",
+          server: {
+            serverUrl: "https://emby.example.test",
+            pathPrefix: "/emby",
+            username: "tester"
+          },
+          mediaSources: [
+            {
+              id: "source-1",
+              name: "主媒体源",
+              container: "mkv",
+              videoCodec: "h264",
+              audioCodec: "aac",
+              width: 1920,
+              height: 1080,
+              bitrate: 8_000_000,
+              sizeBytes: 1_000_000_000,
+              runtimeMs: 3_000_000
+            }
+          ]
+        }
+      }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "媒体" }));
+
+    expect(screen.getByText("Emby 条目已保存")).toBeInTheDocument();
+    expect(screen.getByText("测试剧集 / S01E02 / 第二集")).toBeInTheDocument();
+    expect(screen.getByText("主媒体源 / mkv / h264 / aac / 1920x1080")).toBeInTheDocument();
+  });
+
   it("高级工具默认收起，展开后 Emby 时长面板只保留搜索入口", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
@@ -74,7 +151,8 @@ describe("资源面板", () => {
     expect(screen.getByText(`v${CURRENT_SCHEMA_VERSION}`)).toBeInTheDocument();
     expect(screen.getByText("01 - 1.1.xml（1 条弹幕）")).toBeInTheDocument();
     expect(screen.getByText("视频重连")).toBeInTheDocument();
-    expect(screen.getByText("不需要")).toBeInTheDocument();
+    expect(getDiagnosticMetricText("视频重连")).toContain("不需要");
+    expect(getDiagnosticMetricText("目标重连")).toContain("不需要");
   });
 
   it("导出检查会展示重复 ID 的具体位置", async () => {
@@ -969,6 +1047,24 @@ function createRejectingTextFile(fileName: string, message: string): File {
     value: vi.fn<() => Promise<string>>(() => Promise.reject(new Error(message)))
   });
   return file;
+}
+
+function getTargetMediaBindingPanel(): HTMLElement {
+  const heading = screen.getByRole("heading", { name: "目标原片" });
+  const panel = heading.closest("section");
+  if (!(panel instanceof HTMLElement)) {
+    throw new Error("未找到目标原片面板。");
+  }
+  return panel;
+}
+
+function getDiagnosticMetricText(label: string): string {
+  const labelElement = screen.getByText(label);
+  const metric = labelElement.closest("div");
+  if (!(metric instanceof HTMLElement)) {
+    throw new Error(`未找到诊断项：${label}`);
+  }
+  return metric.textContent ?? "";
 }
 
 function readBlobText(blob: Blob): Promise<string> {

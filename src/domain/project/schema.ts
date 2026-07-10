@@ -36,6 +36,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     typeof value.id !== "string" ||
     typeof value.name !== "string" ||
     !isMediaReference(value.media) ||
+    (version >= 4 && !isMediaBindingOrNull(value.mediaBinding)) ||
     !Array.isArray(value.assets) ||
     !Array.isArray(value.clips) ||
     !isIntegerMilliseconds(value.globalOffsetMs) ||
@@ -113,7 +114,8 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
       ...project,
       schemaVersion: CURRENT_SCHEMA_VERSION,
       clips: legacyClipRanges.clips,
-      alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null
+      alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null,
+      mediaBinding: parsedVersion >= 4 ? project.mediaBinding : null
     },
     migration: {
       fromVersion: parsedVersion,
@@ -154,6 +156,69 @@ function isMediaReference(value: unknown): boolean {
     typeof value.fileName === "string" &&
     (typeof value.objectUrl === "string" || value.objectUrl === null) &&
     (isNonNegativeIntegerMilliseconds(value.durationMs) || value.durationMs === null)
+  );
+}
+
+function isMediaBindingOrNull(value: unknown): boolean {
+  if (value === null) {
+    return true;
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (
+    typeof value.id !== "string" ||
+    typeof value.displayName !== "string" ||
+    (value.runtimeMs !== null && !isNonNegativeIntegerMilliseconds(value.runtimeMs)) ||
+    typeof value.linkedAt !== "string"
+  ) {
+    return false;
+  }
+  if (value.kind === "localFile") {
+    return (
+      typeof value.fileName === "string" &&
+      (typeof value.mediaId === "string" || value.mediaId === null) &&
+      (typeof value.localPath === "string" || value.localPath === null)
+    );
+  }
+  if (value.kind === "embyItem") {
+    return (
+      typeof value.itemId === "string" &&
+      typeof value.itemName === "string" &&
+      typeof value.itemType === "string" &&
+      (typeof value.seriesName === "string" || value.seriesName === null) &&
+      (isNonNegativeInteger(value.seasonNumber) || value.seasonNumber === null) &&
+      (isNonNegativeInteger(value.episodeNumber) || value.episodeNumber === null) &&
+      isEmbyServerReference(value.server) &&
+      Array.isArray(value.mediaSources) &&
+      value.mediaSources.every(isEmbyMediaSourceSummary)
+    );
+  }
+  return false;
+}
+
+function isEmbyServerReference(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.serverUrl === "string" &&
+    typeof value.pathPrefix === "string" &&
+    typeof value.username === "string"
+  );
+}
+
+function isEmbyMediaSourceSummary(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    (typeof value.id === "string" || value.id === null) &&
+    (typeof value.name === "string" || value.name === null) &&
+    (typeof value.container === "string" || value.container === null) &&
+    (typeof value.videoCodec === "string" || value.videoCodec === null) &&
+    (typeof value.audioCodec === "string" || value.audioCodec === null) &&
+    (isNonNegativeInteger(value.width) || value.width === null) &&
+    (isNonNegativeInteger(value.height) || value.height === null) &&
+    (isNonNegativeInteger(value.bitrate) || value.bitrate === null) &&
+    (isNonNegativeInteger(value.sizeBytes) || value.sizeBytes === null) &&
+    (isNonNegativeIntegerMilliseconds(value.runtimeMs) || value.runtimeMs === null)
   );
 }
 

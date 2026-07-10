@@ -58,7 +58,9 @@ export function createProjectReadinessSummary(project: EditorProject): ProjectRe
       { label: "单条微调", value: health.metrics.itemAdjustmentCount.toLocaleString("zh-CN") },
       { label: "重复 ID", value: health.metrics.duplicateIdCount.toLocaleString("zh-CN") },
       { label: "导出到 0 秒", value: health.metrics.negativeFinalTimeItemCount.toLocaleString("zh-CN") },
-      { label: "视频重连", value: health.metrics.mediaNeedsReconnect ? "需要" : "不需要" }
+      { label: "视频重连", value: health.metrics.mediaNeedsReconnect ? "需要" : "不需要" },
+      { label: "目标原片", value: formatMediaBindingKind(health.metrics.mediaBindingKind) },
+      { label: "目标重连", value: health.metrics.mediaBindingNeedsReconnect ? "需要" : "不需要" }
     ],
     canCleanupEditReferences: health.metrics.orphanedEditReferenceCount > 0,
     canCleanupMissingAssetClips: health.metrics.missingAssetClipCount > 0
@@ -140,6 +142,13 @@ function toReadinessItem(finding: ProjectHealthFinding): ProjectReadinessItem {
       detail: "时间轴仍可编辑；如果需要按视频长度复核，请先让预览视频加载完成。"
     };
   }
+  if (finding.id === "target-local-needs-reconnect") {
+    return {
+      ...common,
+      title: "目标原片需要重新选择",
+      detail: "项目不会嵌入本地视频。重新打开后，请导入同一个目标原片，后续对齐和导出检查才能继续读取它。"
+    };
+  }
   if (finding.id === "import-warnings") {
     return {
       ...common,
@@ -173,6 +182,16 @@ function toReadinessItem(finding: ProjectHealthFinding): ProjectReadinessItem {
     title: finding.title,
     detail: finding.detail
   };
+}
+
+function formatMediaBindingKind(kind: "none" | "localFile" | "embyItem"): string {
+  if (kind === "localFile") {
+    return "本地文件";
+  }
+  if (kind === "embyItem") {
+    return "Emby 条目";
+  }
+  return "未绑定";
 }
 
 function formatSignedDuration(milliseconds: number): string {

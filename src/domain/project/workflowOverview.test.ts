@@ -20,7 +20,41 @@ describe("workflow overview", () => {
       ["export", "idle"]
     ]);
     expect(overview.capabilities.map((capability) => capability.id)).toContain("raw-xml-safe");
+    expect(overview.capabilities.map((capability) => capability.id)).toContain("target-media");
     expect(overview.actions.find((action) => action.id === "export-xml")?.reason).toBe("需要先把 XML 放入时间轴。");
+  });
+
+  it("目标原片绑定会进入来源阶段和能力地图", () => {
+    const overview = createWorkflowOverview(
+      {
+        ...createEmptyProject(),
+        mediaBinding: {
+          id: "binding-emby",
+          kind: "embyItem",
+          displayName: "测试剧集 / S01E02 / 第二集",
+          itemId: "item-1",
+          itemName: "第二集",
+          itemType: "Episode",
+          seriesName: "测试剧集",
+          seasonNumber: 1,
+          episodeNumber: 2,
+          runtimeMs: 3_000_000,
+          linkedAt: "2026-07-10T00:00:00.000Z",
+          server: { serverUrl: "https://emby.example.test", pathPrefix: "/emby", username: "tester" },
+          mediaSources: []
+        }
+      },
+      null
+    );
+
+    expect(overview.stages.find((stage) => stage.id === "source")?.metrics).toContainEqual({
+      label: "目标原片",
+      value: "测试剧集 / S01E02 / 第二集"
+    });
+    expect(overview.capabilities.find((capability) => capability.id === "target-media")).toMatchObject({
+      stateText: "已绑定",
+      active: true
+    });
   });
 
   it("导入 XML 后总览同步资源和自动排布入口", () => {

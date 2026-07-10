@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { EmbyMediaSourceSummary } from "../../domain/project/types";
 import type { Milliseconds } from "../../domain/shared/time";
 
 export interface EmbyAuthSession {
@@ -11,9 +12,11 @@ export interface EmbyItemMetadata {
   id: string;
   name: string;
   type: string;
+  seriesName: string | null;
   seasonNumber: number | null;
   episodeNumber: number | null;
   durationMs: Milliseconds | null;
+  mediaSources: EmbyMediaSourceSummary[];
 }
 
 export interface EmbySearchOptions {
@@ -49,13 +52,20 @@ interface EmbyAuthDto {
 }
 
 interface EmbyMediaSourceDto {
+  Id?: unknown;
+  Name?: unknown;
+  Container?: unknown;
+  Bitrate?: unknown;
+  Size?: unknown;
   RunTimeTicks?: unknown;
+  MediaStreams?: unknown;
 }
 
 interface EmbyItemDto {
   Id?: unknown;
   Name?: unknown;
   Type?: unknown;
+  SeriesName?: unknown;
   RunTimeTicks?: unknown;
   ParentIndexNumber?: unknown;
   IndexNumber?: unknown;
@@ -451,10 +461,41 @@ function parseItemPayload(payload: unknown): EmbyItemMetadata | null {
     id: dto.Id,
     name: dto.Name,
     type: typeof dto.Type === "string" ? dto.Type : "Unknown",
+    seriesName: typeof dto.SeriesName === "string" ? dto.SeriesName : null,
     seasonNumber: toIntegerOrNull(dto.ParentIndexNumber),
     episodeNumber: toIntegerOrNull(dto.IndexNumber),
-    durationMs: readDurationMs(dto)
+    durationMs: readDurationMs(dto),
+    mediaSources: readMediaSourceSummaries(dto.MediaSources)
   };
+}
+
+function readMediaSourceSummaries(value: unknown): EmbyMediaSourceSummary[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+    const mediaSource = entry as EmbyMediaSourceDto;
+    const streams = Array.isArray(mediaSource.MediaStreams) ? mediaSource.MediaStreams.filter(isRecord) : [];
+    const videoStream = streams.find((stream) => stream.Type === "Video");
+    const audioStream = streams.find((stream) => stream.Type === "Audio");
+    return [
+      {
+        id: readOptionalString(mediaSource.Id),
+        name: readOptionalString(mediaSource.Name),
+        container: readOptionalString(mediaSource.Container),
+        videoCodec: readOptionalString(videoStream?.Codec),
+        audioCodec: readOptionalString(audioStream?.Codec),
+        width: toIntegerOrNull(videoStream?.Width),
+        height: toIntegerOrNull(videoStream?.Height),
+        bitrate: toIntegerOrNull(mediaSource.Bitrate) ?? toIntegerOrNull(videoStream?.BitRate),
+        sizeBytes: toIntegerOrNull(mediaSource.Size),
+        runtimeMs: ticksToMilliseconds(mediaSource.RunTimeTicks)
+      }
+    ];
+  });
 }
 
 function readDurationMs(item: EmbyItemDto): Milliseconds | null {
@@ -491,6 +532,10 @@ function toIntegerOrNull(value: unknown): number | null {
     return null;
   }
   return Math.trunc(parsed);
+}
+
+function readOptionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
 function formatDuration(milliseconds: Milliseconds): string {
