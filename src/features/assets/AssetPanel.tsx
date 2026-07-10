@@ -27,6 +27,7 @@ import {
   type AlignmentReviewQueueSeverity
 } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
+import { serializeAlignmentProposal } from "../../domain/alignment/manualProvider";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
 import { buildBatchMergePlan, type BatchMergeOptions } from "../../domain/danmaku/batchMerge";
@@ -110,6 +111,8 @@ export function AssetPanel() {
   const [cutPointsText, setCutPointsText] = useState("");
   const [anchorCalibrationText, setAnchorCalibrationText] = useState("");
   const [alignmentProposalText, setAlignmentProposalText] = useState("");
+  const lastSyncedAlignmentProposalTextRef = useRef("");
+  const lastAlignmentProjectIdRef = useRef<string | null>(null);
   const project = useEditorStore((state) => state.project);
   const selection = useEditorStore((state) => state.selection);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
@@ -179,7 +182,25 @@ export function AssetPanel() {
     () => buildAlignmentPreview(project, alignmentProposal),
     [project, alignmentProposal]
   );
+  const serializedAlignmentProposalText = useMemo(
+    () => (alignmentProposal ? serializeAlignmentProposal(alignmentProposal) : ""),
+    [alignmentProposal]
+  );
   const projectHealth = useMemo(() => createProjectHealthSummary(project), [project]);
+
+  useEffect(() => {
+    const projectChanged = lastAlignmentProjectIdRef.current !== project.id;
+    lastAlignmentProjectIdRef.current = project.id;
+    setAlignmentProposalText((currentText) => {
+      const lastSyncedText = lastSyncedAlignmentProposalTextRef.current;
+      const hasUserDraft = currentText.trim().length > 0 && currentText !== lastSyncedText;
+      if (!projectChanged && hasUserDraft) {
+        return currentText;
+      }
+      lastSyncedAlignmentProposalTextRef.current = serializedAlignmentProposalText;
+      return serializedAlignmentProposalText;
+    });
+  }, [project.id, serializedAlignmentProposalText]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">

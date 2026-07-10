@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C103 已完成：资源栏对齐提案 JSON 文本框同步项目内恢复状态。
+  - C101/C102 让对齐提案进入项目文件与历史快照后，“视频对齐实验室”的 `AlignmentProposal JSON` 文本框现在会从当前项目提案温和同步，打开带持久化提案的项目后可直接看到、复制、重新导入或导出提案 JSON。
+  - 同步逻辑会保留用户正在手写的非空草稿；只有切换/打开项目、文本框为空，或文本框仍是上一次自动同步内容时才用项目内提案回填，避免普通状态刷新覆盖用户输入。
+  - 已复用领域层 `serializeAlignmentProposal` 输出格式，保证文本框、导出提案和项目内提案语义一致。
+  - 已补充资源面板测试，覆盖项目内恢复的对齐提案会回填到 JSON 文本框，并继续显示复核队列。
+  - 已重新验证：`corepack pnpm test -- src/features/assets/AssetPanel.test.tsx` 成功，1 个测试文件、25 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/200 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 15:06:32`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3001635` 字节，时间 `2026/07/10 15:06:32`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c103-sync-alignment-proposal-text-20260710`。
 - 成熟度提升阶段 C102 已完成：撤销/重做时同步项目内对齐提案状态。
   - C101 将对齐提案纳入项目文件后，顶层 store 的 `alignmentProposal` 现在会在所有项目快照提交、撤销和重做时从 `project.alignmentProposal` 同步，避免顶部工具栏、资源栏和时间轴读取到旧提案。
   - 通用 `commitProject` 会把提交后的项目提案同步到顶层状态；`undo` / `redo` 恢复历史快照时也会同步恢复或清空提案。
