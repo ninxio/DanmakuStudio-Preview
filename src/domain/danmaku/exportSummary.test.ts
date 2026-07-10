@@ -29,7 +29,14 @@ describe("导出补偿报告", () => {
     expect(report).toContain("导出复核报告");
     expect(report).toContain("项目：测试项目");
     expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");
+    expect(report).toContain("原始弹幕：0 条");
+    expect(report).toContain("启用弹幕：0 条");
+    expect(report).toContain("禁用弹幕：0 条");
+    expect(report).toContain("最早最终时间：00:00:00.000");
+    expect(report).toContain("最晚最终时间：00:00:00.000");
     expect(report).toContain("总补偿：+00:00:17.000");
+    expect(report).toContain("导入警告：无");
+    expect(report).toContain("负时间限制：0 项");
     expect(report).toContain("1. 前段补偿");
     expect(report).toContain("备注：人工复核");
   });
@@ -50,9 +57,28 @@ describe("导出补偿报告", () => {
       })
     ]);
     expect(report).toContain("本次导出未应用补偿点。");
+    expect(report).toContain("原始弹幕：1 条");
+    expect(report).toContain("启用弹幕：1 条");
+    expect(report).toContain("最早最终时间：00:00:00.000");
+    expect(report).toContain("负时间限制：1 项");
     expect(report).toContain("负时间限制明细");
     expect(report).toContain("原最终时间：-00:00:00.500 (-500 ms)");
     expect(report).toContain("文本：过早弹幕");
+  });
+
+  it("导出复核报告包含时间范围和导入警告摘要", () => {
+    const summary = createExportSummary(
+      [createResolvedEvent(1500), { ...createResolvedEvent(3200), id: "clip:item-2" }],
+      [],
+      true
+    );
+    const report = createCompensationReport("摘要项目", summary, new Date("2026-07-10T01:02:03.000Z"));
+
+    expect(report).toContain("原始弹幕：2 条");
+    expect(report).toContain("启用弹幕：2 条");
+    expect(report).toContain("最早最终时间：00:00:01.500");
+    expect(report).toContain("最晚最终时间：00:00:03.200");
+    expect(report).toContain("导入警告：有");
   });
 });
 

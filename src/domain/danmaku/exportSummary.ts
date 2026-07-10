@@ -80,10 +80,15 @@ export function createCompensationReport(projectName: string, summary: ExportSum
     "导出复核报告",
     `项目：${projectName || "未命名项目"}`,
     `生成时间：${generatedAt.toISOString()}`,
+    `原始弹幕：${summary.originalCount.toLocaleString("zh-CN")} 条`,
     `启用弹幕：${summary.enabledCount.toLocaleString("zh-CN")} 条`,
     `禁用弹幕：${summary.disabledCount.toLocaleString("zh-CN")} 条`,
+    `最早最终时间：${formatTimecode(summary.earliestFinalTimeMs)}`,
+    `最晚最终时间：${formatTimecode(summary.latestFinalTimeMs)}`,
     `补偿点：${summary.cutMarkerCount.toLocaleString("zh-CN")} 个`,
     `总补偿：${formatSignedCompensationDuration(summary.totalCutGapMs)}`,
+    `导入警告：${summary.hasImportWarnings ? "有" : "无"}`,
+    `负时间限制：${summary.negativeClampCount.toLocaleString("zh-CN")} 项`,
     ""
   ];
 

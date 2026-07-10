@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C77 已完成：导出复核报告补充关键摘要上下文。
+  - `createCompensationReport` 现在在报告头部写入原始弹幕数、启用/禁用弹幕数、最早/最晚最终时间、导入警告状态和负时间限制总数。
+  - 导出的复核报告不再只依赖补偿点和负时间明细，离线查看时也能还原本次导出的整体规模和时间范围。
+  - 已补充导出复核报告领域测试，覆盖基础摘要字段、负时间限制数量、时间范围和导入警告摘要。
+  - 已重新验证：`corepack pnpm test -- src/domain/danmaku/exportSummary.test.ts` 成功，1 个测试文件、3 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/167 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:26:16`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998104` 字节，时间 `2026/07/10 12:26:16`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c77-export-review-report-summary-context-20260710`。
 - 成熟度提升阶段 C76 已完成：单分集导出反馈实际 XML 文件名。
   - `downloadTextFiles` 现在会统一返回 `downloadedFileName`，单文件下载时为实际 XML 文件名，多文件下载时为实际 ZIP 文件名，空下载时为 `null`。
   - 资源面板“导出分集”在只有 1 个分集 XML 时会显示实际 XML 文件名；多个分集时继续显示实际 ZIP 文件名。
