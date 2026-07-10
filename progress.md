@@ -1,5 +1,16 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C131 已完成：新增合成对齐基准，防止音频时间映射继续围绕单个案例调参。
+  - 新增 `fixtures/alignment/benchmark-cases.json`，用纯合成音频特征描述无删减、单个持续删减、两个持续删减、短暂误配不应生成删减四类基准；不包含真实视频、真实音频或受版权内容。
+  - 新增 `src/domain/alignment/alignmentBenchmark.test.ts`，读取基准 JSON 并生成可重复的合成特征，跑同一套 `createAudioAlignmentProposal` 时间映射流程。
+  - 基准断言要求真实持续 offset 阶跃输出准确缺口时长，同时要求短暂后跳误配不产生候选版本差异，避免未来把局部噪声重新误判为删减点。
+  - 已重新验证：聚焦测试 `corepack pnpm test -- src/domain/alignment/alignmentBenchmark.test.ts src/domain/alignment/audioAlignment.test.ts` 通过（2 个测试文件 / 12 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、50 个测试文件 / 284 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包；首次普通权限运行仍因 Windows `spawn EPERM` 中断，已用提升权限重跑同一命令通过。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12508672` 字节，时间 `2026/07/11 04:58:39`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3098966` 字节，时间 `2026/07/11 04:58:39`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c131-alignment-benchmark-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C130 已完成：将已导入 XML 的弹幕文本线索接入本地对齐 proposal，形成音频、视觉、弹幕三类证据信号闭环。
   - 新增 `src/domain/alignment/danmakuEvidence.ts`，作为不依赖 React 的弹幕证据融合模型；它只基于用户已导入的 XML 弹幕和现有疑似删减文本聚类工作，不访问外部数据，也不修改原始 XML。
   - 本地对齐任务完成后，资源栏会用当前项目弹幕素材和疑似删减扫描结果增强 Tauri 返回的 proposal；手动导入外部 proposal 不会被自动改写。
