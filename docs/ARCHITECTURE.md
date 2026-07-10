@@ -69,7 +69,7 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 
 当前实现：
 
-- `HtmlVideoMediaAdapter`：支持浏览器可播放的 MP4/WebM。
+- `HtmlVideoMediaAdapter`：支持浏览器可播放的 MP4/WebM，作为轻量预览 fallback。预览区根据项目媒体引用和加载结果展示未导入、正在载入、可播放、格式不支持、需要重新连接等状态；加载失败会明确提示 HTML Video 限制和后续 mpv 方向。
 
 预留：
 

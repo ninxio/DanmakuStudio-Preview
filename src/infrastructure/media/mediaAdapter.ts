@@ -32,7 +32,7 @@ export class HtmlVideoMediaAdapter implements MediaAdapter {
       };
       const onError = (): void => {
         cleanup();
-        reject(new Error("视频加载失败，请确认格式为浏览器可播放的 MP4 或 WebM。"));
+        reject(new Error("HTML Video 无法播放此视频。请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。"));
       };
       const cleanup = (): void => {
         this.video.removeEventListener("loadedmetadata", onLoaded);

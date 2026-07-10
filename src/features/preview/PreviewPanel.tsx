@@ -1,4 +1,4 @@
-import { Pause, Play } from "lucide-react";
+import { Flag, Pause, Play } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
@@ -13,7 +13,7 @@ import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import { HtmlVideoMediaAdapter } from "../../infrastructure/media/mediaAdapter";
 import { useEditorStore } from "../../stores/editorStore";
 
-type VideoLoadState = "empty" | "loading" | "ready";
+type VideoLoadState = "empty" | "loading" | "ready" | "unsupported";
 
 export function PreviewPanel() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -27,11 +27,20 @@ export function PreviewPanel() {
   const setPlayhead = useEditorStore((state) => state.setPlayhead);
   const updateMediaDuration = useEditorStore((state) => state.updateMediaDuration);
   const updatePreview = useEditorStore((state) => state.updatePreview);
+  const addCutMarkerAtPlayhead = useEditorStore((state) => state.addCutMarkerAtPlayhead);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadState, setVideoLoadState] = useState<VideoLoadState>("empty");
   const mediaObjectUrl = project.media?.objectUrl ?? null;
   const mediaName = project.media?.name ?? "视频";
   const mediaFileName = project.media?.fileName ?? mediaName;
+  const localBindingNeedsReconnect =
+    project.mediaBinding?.kind === "localFile" &&
+    (!project.media ||
+      !project.media.objectUrl ||
+      (project.mediaBinding.mediaId
+        ? project.media.id !== project.mediaBinding.mediaId
+        : project.media.fileName !== project.mediaBinding.fileName));
+  const mediaReferenceNeedsReconnect = Boolean(project.media && !project.media.objectUrl);
 
   const events = useMemo(() => resolveProjectDanmakuEvents(project), [project]);
   const visibleEvents = useMemo(
@@ -87,7 +96,7 @@ export function PreviewPanel() {
       .catch((error: unknown) => {
         if (!cancelled) {
           setVideoError(error instanceof Error ? error.message : "视频加载失败。");
-          setVideoLoadState("empty");
+          setVideoLoadState("unsupported");
           setPlaying(false);
         }
       });
@@ -155,10 +164,16 @@ export function PreviewPanel() {
         />
         {!mediaObjectUrl ? (
           <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-slate-500">
-            <div>
-              <div className="text-slate-300">尚未导入视频</div>
-              <div className="mt-2 text-xs">
-                当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。
+            <div className="max-w-[min(420px,calc(100%-32px))]">
+              <div className="text-slate-300">
+                {localBindingNeedsReconnect || mediaReferenceNeedsReconnect ? "需要重新连接视频" : "尚未导入视频"}
+              </div>
+              <div className="mt-2 text-xs leading-5">
+                {localBindingNeedsReconnect
+                  ? "项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份本地视频。"
+                  : mediaReferenceNeedsReconnect
+                    ? "项目里只有媒体引用，没有当前会话可播放的视频对象。请重新导入本地视频。"
+                    : "当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。"}
               </div>
             </div>
           </div>
@@ -171,13 +186,16 @@ export function PreviewPanel() {
                 ? "正在加载预览..."
                 : videoLoadState === "ready"
                   ? `预览已就绪 / ${formatTimecode(project.media?.durationMs ?? 0)}`
-                  : "等待视频载入"}
+                  : videoLoadState === "unsupported"
+                    ? "格式不支持"
+                    : "等待视频载入"}
             </div>
           </div>
         ) : null}
         {videoError ? (
-          <div className="absolute left-4 top-4 rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 text-xs text-accent-red">
-            {videoError}
+          <div className="absolute left-4 top-4 max-w-[min(520px,calc(100%-32px))] rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 text-xs leading-5 text-accent-red">
+            <div className="font-medium">格式不支持</div>
+            <div>{videoError}</div>
           </div>
         ) : null}
         {project.preview.safeAreaVisible ? (
@@ -208,6 +226,10 @@ export function PreviewPanel() {
           onClick={() => updatePreview({ danmakuVisible: !project.preview.danmakuVisible })}
         >
           {project.preview.danmakuVisible ? "隐藏弹幕" : "显示弹幕"}
+        </TextButton>
+        <TextButton onClick={addCutMarkerAtPlayhead}>
+          <Flag size={14} />
+          添加播放点差异
         </TextButton>
         <label className="ml-auto flex items-center gap-2 text-xs text-slate-400">
           透明度

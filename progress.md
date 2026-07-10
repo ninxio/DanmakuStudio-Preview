@@ -1,5 +1,19 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C113 已完成：完成 G4 轻量播放预览，用于实时看效果和打版本差异。
+  - 预览区继续使用 HTML Video 作为轻量 fallback，不伪装完整播放器能力；界面会明确显示未导入、正在载入、可播放、格式不支持和需要重新连接等状态。
+  - 本地目标原片绑定或项目媒体引用恢复后，如果当前会话缺少真实视频对象，预览区会提示重新导入同一份本地视频，不会把项目文件中的媒体引用误当成可播放内容。
+  - HTML Video 加载失败时会显示“格式不支持”，并说明请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。
+  - 播放头、视频 seek、弹幕叠加和时间轴补偿点继续保持同步；预览底部新增真实“添加播放点差异”动作，可直接在当前播放点创建版本差异并选中进入检查器。
+  - 新增回归测试覆盖目标原片需要重新连接、预览底部添加版本差异、HTML Video 格式失败提示和播放状态文案。
+  - README 和架构文档已同步 HTML Video fallback 边界、预览状态、重新连接提示和后续 mpv 方向。
+  - 已重新验证：`cargo test` 通过（14 个 Rust 测试）；`corepack pnpm lint` 通过；`corepack pnpm test` 通过（39 个测试文件 / 231 个测试）；`corepack pnpm build` 通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、39 个测试文件 / 231 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12251648` 字节，时间 `2026/07/10 21:59:04`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3018308` 字节，时间 `2026/07/10 21:59:04`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c113-light-preview-states-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C112 已完成：完成 G3 B 站 XML 与目标原片的可解释匹配评分和非破坏性预览提案。
   - 新增 `src/domain/project/matchAssessment.ts`，从目标原片绑定、片名/季集、目标时长、XML 弹幕时间范围、弹幕密度、同步线索、当前对齐提案和音频/视觉诊断生成领域层评分，不依赖 React。
   - 匹配结论明确分为“很可能匹配 / 需要确认 / 看起来不是同一集”；没有运行音频或视觉分析时会显示未运行，不伪造媒体识别结果。
@@ -83,7 +97,7 @@
 ## 当前主目标
 
 - 当前 goal：按 `docs/player-goal.md` 分阶段实现播放器化与全量对齐能力，让用户能把 B 站删减版弹幕对齐到自己的完整版视频上。
-- 下一阶段：G4 轻量播放预览，用于实时看效果和打版本差异。
+- 下一阶段：G5 FFmpeg / mpv sidecar 管理能力。
 - 总体路线：
   1. 默认导出文件夹 / 自定义导出目录。
   2. Emby 原片绑定项目，不只是查时长。
