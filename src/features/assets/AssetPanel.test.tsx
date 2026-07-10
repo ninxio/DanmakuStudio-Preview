@@ -506,8 +506,8 @@ describe("资源面板", () => {
     await user.click(screen.getByRole("button", { name: "导入提案" }));
 
     expect(screen.getByText("应用已暂停")).toBeInTheDocument();
-    expect(screen.getByText("1 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。")).toBeInTheDocument();
-    expect(screen.getByText("1 个候选补偿 ID 已存在于当前项目，应用会丢失新补偿。")).toBeInTheDocument();
+    expect(screen.getByText("1 个同步锚点 ID 已存在于当前项目（ID：audio-anchor-1），应用会丢失新锚点。")).toBeInTheDocument();
+    expect(screen.getByText("1 个候选补偿 ID 已存在于当前项目（ID：audio-gap-1），应用会丢失新补偿。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();
     expect(useEditorStore.getState().project.syncAnchors).toHaveLength(1);
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1);

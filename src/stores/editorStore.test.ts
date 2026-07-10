@@ -371,7 +371,7 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1);
     expect(useEditorStore.getState().history.past).toHaveLength(0);
     expect(useEditorStore.getState().status).toEqual({
-      message: "对齐提案存在应用阻断：1 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。",
+      message: "对齐提案存在应用阻断：1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
       tone: "warning"
     });
   });

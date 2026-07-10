@@ -87,4 +87,46 @@ describe("编辑器工具栏", () => {
 
     expect(screen.getByRole("button", { name: "应用对齐" })).toBeDisabled();
   });
+
+  it("对齐提案复用当前项目 ID 时禁用顶部应用入口", () => {
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, confidence: 1, origin: "manual" }],
+        cutMarkers: [
+          {
+            id: "cut-existing",
+            name: "已有补偿",
+            sourceAtMs: 20_000,
+            targetGapMs: 1000,
+            note: ""
+          }
+        ]
+      },
+      alignmentProposal: {
+        anchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, origin: "automatic" }],
+        cutCandidates: [
+          {
+            id: "cut-existing",
+            name: "冲突补偿",
+            sourceAtMs: 20_000,
+            targetGapMs: 20_000,
+            confidence: 0.8,
+            note: ""
+          }
+        ],
+        confidence: 0.8,
+        diagnostics: ["测试"]
+      }
+    });
+
+    render(<EditorToolbar />);
+
+    const applyButton = screen.getByRole("button", { name: "应用对齐" });
+    expect(applyButton).toBeDisabled();
+    expect(applyButton).toHaveAttribute(
+      "title",
+      "1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。"
+    );
+  });
 });

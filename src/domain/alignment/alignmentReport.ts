@@ -66,13 +66,13 @@ export function createAlignmentApplyBlockers(
   const blockers: string[] = [];
   const emptyAnchorIdCount = proposal.anchors.filter((anchor) => anchor.id.trim().length === 0).length;
   const emptyCutIdCount = proposal.cutCandidates.filter((candidate) => candidate.id.trim().length === 0).length;
-  const duplicateAnchorIdCount = countDuplicateIds(proposal.anchors.map((anchor) => anchor.id));
-  const duplicateCutIdCount = countDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id));
-  const existingAnchorIdConflictCount = countExistingIdConflicts(
+  const duplicateAnchorIds = findDuplicateIds(proposal.anchors.map((anchor) => anchor.id));
+  const duplicateCutIds = findDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id));
+  const existingAnchorIdConflicts = findExistingIdConflicts(
     proposal.anchors.map((anchor) => anchor.id),
     context.existingAnchorIds ?? []
   );
-  const existingCutIdConflictCount = countExistingIdConflicts(
+  const existingCutIdConflicts = findExistingIdConflicts(
     proposal.cutCandidates.map((candidate) => candidate.id),
     context.existingCutMarkerIds ?? []
   );
@@ -92,17 +92,29 @@ export function createAlignmentApplyBlockers(
   if (emptyCutIdCount > 0) {
     blockers.push(`${emptyCutIdCount} 个候选补偿缺少 ID，无法安全写入项目。`);
   }
-  if (duplicateAnchorIdCount > 0) {
-    blockers.push(`${duplicateAnchorIdCount} 个同步锚点 ID 在提案内重复，应用会丢失锚点。`);
+  if (duplicateAnchorIds.length > 0) {
+    blockers.push(
+      `${duplicateAnchorIds.length} 个同步锚点 ID 在提案内重复${formatIdEvidence(duplicateAnchorIds)}，应用会丢失锚点。`
+    );
   }
-  if (duplicateCutIdCount > 0) {
-    blockers.push(`${duplicateCutIdCount} 个候选补偿 ID 在提案内重复，应用会丢失补偿。`);
+  if (duplicateCutIds.length > 0) {
+    blockers.push(
+      `${duplicateCutIds.length} 个候选补偿 ID 在提案内重复${formatIdEvidence(duplicateCutIds)}，应用会丢失补偿。`
+    );
   }
-  if (existingAnchorIdConflictCount > 0) {
-    blockers.push(`${existingAnchorIdConflictCount} 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。`);
+  if (existingAnchorIdConflicts.length > 0) {
+    blockers.push(
+      `${existingAnchorIdConflicts.length} 个同步锚点 ID 已存在于当前项目${formatIdEvidence(
+        existingAnchorIdConflicts
+      )}，应用会丢失新锚点。`
+    );
   }
-  if (existingCutIdConflictCount > 0) {
-    blockers.push(`${existingCutIdConflictCount} 个候选补偿 ID 已存在于当前项目，应用会丢失新补偿。`);
+  if (existingCutIdConflicts.length > 0) {
+    blockers.push(
+      `${existingCutIdConflicts.length} 个候选补偿 ID 已存在于当前项目${formatIdEvidence(
+        existingCutIdConflicts
+      )}，应用会丢失新补偿。`
+    );
   }
   if (invalidRangeCount > 0) {
     blockers.push(`${invalidRangeCount} 个候选补偿的不确定区间起止顺序异常，请修正后再应用。`);
@@ -171,7 +183,7 @@ function hasCompleteSourceRange(
   return candidate.sourceRangeStartMs !== undefined && candidate.sourceRangeEndMs !== undefined;
 }
 
-function countDuplicateIds(ids: string[]): number {
+function findDuplicateIds(ids: string[]): string[] {
   const seen = new Set<string>();
   const duplicates = new Set<string>();
   for (const rawId of ids) {
@@ -185,10 +197,10 @@ function countDuplicateIds(ids: string[]): number {
     }
     seen.add(id);
   }
-  return duplicates.size;
+  return [...duplicates];
 }
 
-function countExistingIdConflicts(ids: string[], existingIds: string[]): number {
+function findExistingIdConflicts(ids: string[], existingIds: string[]): string[] {
   const existing = new Set(existingIds.map((id) => id.trim()).filter((id) => id.length > 0));
   const conflicts = new Set<string>();
   for (const rawId of ids) {
@@ -197,7 +209,15 @@ function countExistingIdConflicts(ids: string[], existingIds: string[]): number 
       conflicts.add(id);
     }
   }
-  return conflicts.size;
+  return [...conflicts];
+}
+
+function formatIdEvidence(ids: string[]): string {
+  const previewLimit = 5;
+  const preview = ids.slice(0, previewLimit).join("、");
+  const omittedCount = ids.length - previewLimit;
+  const omitted = omittedCount > 0 ? `，另有 ${omittedCount} 个` : "";
+  return `（ID：${preview}${omitted}）`;
 }
 
 function formatConfidence(confidence: number): string {

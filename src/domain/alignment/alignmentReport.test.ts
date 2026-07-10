@@ -103,8 +103,8 @@ describe("alignment review report", () => {
 
     expect(createAlignmentApplyBlockers(proposal)).toEqual([
       "1 个同步锚点缺少 ID，无法安全写入项目。",
-      "1 个同步锚点 ID 在提案内重复，应用会丢失锚点。",
-      "1 个候选补偿 ID 在提案内重复，应用会丢失补偿。",
+      "1 个同步锚点 ID 在提案内重复（ID：anchor-dup），应用会丢失锚点。",
+      "1 个候选补偿 ID 在提案内重复（ID：source-outside），应用会丢失补偿。",
       "1 个候选补偿的不确定区间起止顺序异常，请修正后再应用。",
       "1 个候选补偿的源时间不在不确定区间内，请修正后再应用。"
     ]);
@@ -133,8 +133,8 @@ describe("alignment review report", () => {
         existingCutMarkerIds: ["cut-existing"]
       })
     ).toEqual([
-      "1 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。",
-      "1 个候选补偿 ID 已存在于当前项目，应用会丢失新补偿。"
+      "1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
+      "1 个候选补偿 ID 已存在于当前项目（ID：cut-existing），应用会丢失新补偿。"
     ]);
   });
 });

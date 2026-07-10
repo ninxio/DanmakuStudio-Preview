@@ -51,7 +51,12 @@ export function EditorToolbar() {
   const exportAlignmentProposal = useEditorStore((state) => state.exportAlignmentProposal);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
-  const alignmentApplyBlockers = alignmentProposal ? createAlignmentApplyBlockers(alignmentProposal) : [];
+  const alignmentApplyBlockers = alignmentProposal
+    ? createAlignmentApplyBlockers(alignmentProposal, {
+        existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
+        existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+      })
+    : [];
   const canExportXml = useEditorStore((state) =>
     resolveProjectDanmakuEvents(state.project).some((event) => event.enabled)
   );

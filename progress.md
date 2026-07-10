@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C67 已完成：对齐提案应用阻断显示具体 ID。
+  - `createAlignmentApplyBlockers` 现在会在提案内重复 ID、当前项目已有 ID 冲突的阻断文案中列出具体 ID；数量过多时保留前 5 个并提示剩余数量。
+  - 顶部工具栏“应用对齐”现在和“视频对齐实验室”的“应用候选”一样传入当前项目已有同步锚点/补偿点 ID，两个入口会对同一类冲突保持一致禁用。
+  - README 已同步：本地音频对齐实验室的异常提案阻断会带具体 ID，便于定位需要重命名或重新生成的锚点/补偿点。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/alignmentReport.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx src/features/editor/EditorToolbar.test.tsx` 成功，4 个测试文件、43 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、32 个测试文件/156 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:37:47`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996538` 字节，时间 `2026/07/10 11:37:47`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c67-alignment-blocker-id-evidence-20260710`。
 - 成熟度提升阶段 C66 已完成：阻断对齐提案复用当前项目 ID。
   - 对齐提案应用前现在同时检查提案内部重复 ID，以及提案锚点/候选补偿点和当前项目已有同步锚点/补偿点之间的 ID 冲突。
   - “视频对齐实验室”里的“应用候选”会提前显示“应用已暂停”，store 直接调用同样会阻断，避免合并时因为 `uniqueById([...existing, ...proposal])` 静默丢失新锚点或新补偿点。
