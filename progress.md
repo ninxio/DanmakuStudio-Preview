@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C40 已完成：Playwright E2E 覆盖清理缺失资源片段后恢复导出。
+  - C38 的导出健康阻断 E2E 已扩展：坏项目触发“片段引用了缺失资源”后，会在“项目信息”点击“清理缺失片段”。
+  - 测试断言状态栏显示“已清理 1 个缺失资源片段”，项目健康面板不再显示该阻断原因，随后再次点击“导出 XML”并确认导出摘要对话框恢复出现。
+  - 本地 E2E 构造产物：`artifacts/downloads/blocked-health-project.danmaku-project.json`，大小 `7495` 字节，时间 `2026/07/10 9:11:51`。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 本阶段只修改 E2E 测试、截图基线和进度文档，没有修改运行时代码、UI 源码或 Tauri 代码，因此未重新打包；最新可安装 release 产物仍是 C39 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:09:18`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997097` 字节，时间 `2026/07/10 9:09:18`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c40-e2e-clean-missing-clips-export-20260710`。
 - 成熟度提升阶段 C39 已完成：项目健康摘要支持清理缺失资源片段。
   - 项目健康领域层新增 `cleanupProjectMissingAssetClips`，只清理 `clips` 中引用不存在资源的片段，不修改弹幕资源或原始 XML。
   - 健康摘要指标和健康报告新增“缺失资源片段”计数；缺失资源片段仍作为阻断项提示，但现在可通过真实清理动作修复。
