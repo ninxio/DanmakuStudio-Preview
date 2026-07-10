@@ -118,6 +118,51 @@ describe("project schema", () => {
     expect(JSON.stringify(parsed.seasonEpisodeBindings)).not.toContain("token");
   });
 
+  it("允许保存弹幕来源内容段", () => {
+    const project = {
+      ...createEmptyProject("来源内容段项目"),
+      danmakuSourceSegments: [
+        {
+          id: "source-segment-1",
+          label: "第 1 集来源段",
+          kind: "content" as const,
+          sourceStartMs: 7_200_000,
+          sourceEndMs: 7_260_000,
+          episodeKey: "S01E01",
+          episodeLabel: "第 1 集",
+          note: "B 站长视频两小时后进入正片",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        },
+        {
+          id: "source-segment-ignored",
+          label: "前置无意义片段",
+          kind: "ignored" as const,
+          sourceStartMs: 0,
+          sourceEndMs: 7_200_000,
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    };
+
+    expect(validateProjectSchema(project)).toEqual({
+      ok: true,
+      version: CURRENT_SCHEMA_VERSION,
+      message: "项目文件可打开。"
+    });
+    const parsed = parseProjectJson(serializeProject(project));
+    expect(parsed.danmakuSourceSegments).toHaveLength(2);
+    expect(parsed.danmakuSourceSegments[0]).toMatchObject({
+      kind: "content",
+      episodeKey: "S01E01",
+      sourceStartMs: 7_200_000
+    });
+  });
+
   it("打开 v1 项目时迁移闭区间片段 sourceOutMs", () => {
     const project = {
       ...createEmptyProject("旧项目"),
@@ -219,8 +264,30 @@ describe("project schema", () => {
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.mediaBinding?.kind).toBe("localFile");
     expect(parsed.seasonEpisodeBindings).toEqual([]);
+    expect(parsed.danmakuSourceSegments).toEqual([]);
     expect(migration).toEqual({
       fromVersion: 4,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+  });
+
+  it("打开 v5 项目时补齐弹幕来源内容段字段", () => {
+    const currentProject = {
+      ...createEmptyProject("v5 项目"),
+      schemaVersion: 5,
+      seasonEpisodeBindings: []
+    };
+    const v5Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
+    delete v5Project.danmakuSourceSegments;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v5Project));
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.seasonEpisodeBindings).toEqual([]);
+    expect(parsed.danmakuSourceSegments).toEqual([]);
+    expect(migration).toEqual({
+      fromVersion: 5,
       toVersion: CURRENT_SCHEMA_VERSION,
       adjustedClipRangeCount: 0
     });
@@ -399,6 +466,29 @@ describe("project schema", () => {
           }
         ]
       }
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("必要字段");
+  });
+
+  it("拒绝结构错误的弹幕来源内容段", () => {
+    const project = {
+      ...createEmptyProject(),
+      danmakuSourceSegments: [
+        {
+          id: "source-segment",
+          label: "bad",
+          kind: "ignored",
+          sourceStartMs: 1000,
+          sourceEndMs: 1000,
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
     };
     const validation = validateProjectSchema(project);
     expect(validation.ok).toBe(false);

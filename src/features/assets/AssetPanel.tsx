@@ -1,6 +1,7 @@
 import {
   CircleAlert,
   CircleCheck,
+  Clock3,
   Crosshair,
   Download,
   FolderOpen,
@@ -72,8 +73,23 @@ import {
   type SeasonWorkbenchSummary
 } from "../../domain/project/seasonWorkbench";
 import { createSeasonEpisodeKey, findSeasonEpisodeBinding } from "../../domain/project/seasonEpisodeBinding";
-import type { EditorProject, MediaBinding, MediaReference, SeasonEpisodeBinding } from "../../domain/project/types";
-import { formatTimecode } from "../../domain/shared/time";
+import {
+  createSourceTimelineSummary,
+  parseSourceTimecode,
+  type DanmakuSourceSegmentDraft,
+  type DanmakuSourceSegmentPatch,
+  type SourceTimelineFinding,
+  type SourceTimelineSummary
+} from "../../domain/project/sourceTimeline";
+import type {
+  DanmakuSourceSegment,
+  DanmakuSourceSegmentKind,
+  EditorProject,
+  MediaBinding,
+  MediaReference,
+  SeasonEpisodeBinding
+} from "../../domain/project/types";
+import { formatTimecode, type Milliseconds } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
   cancelTauriAudioAlignmentJob,
@@ -158,6 +174,9 @@ export function AssetPanel() {
   const clearMediaBinding = useEditorStore((state) => state.clearMediaBinding);
   const bindCurrentTargetToSeasonEpisode = useEditorStore((state) => state.bindCurrentTargetToSeasonEpisode);
   const clearSeasonEpisodeBinding = useEditorStore((state) => state.clearSeasonEpisodeBinding);
+  const addDanmakuSourceSegment = useEditorStore((state) => state.addDanmakuSourceSegment);
+  const updateDanmakuSourceSegment = useEditorStore((state) => state.updateDanmakuSourceSegment);
+  const deleteDanmakuSourceSegment = useEditorStore((state) => state.deleteDanmakuSourceSegment);
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
   const select = useEditorStore((state) => state.select);
   const setPlayhead = useEditorStore((state) => state.setPlayhead);
@@ -209,6 +228,10 @@ export function AssetPanel() {
   const seasonWorkbench = useMemo(
     () => createSeasonWorkbenchSummary(project, batchMergePlan, manualRules.warnings),
     [batchMergePlan, manualRules.warnings, project]
+  );
+  const sourceTimelineSummary = useMemo(
+    () => createSourceTimelineSummary(project, batchMergePlan),
+    [batchMergePlan, project]
   );
   const cutHintSearch = useMemo(() => createCutHintSearchPlan(cutHintSettings), [cutHintSettings]);
   const suspectedCutCandidates = useMemo(
@@ -454,7 +477,7 @@ export function AssetPanel() {
                 <span>
                   <span className="block text-sm font-medium text-slate-100">高级工具</span>
                   <span className="mt-1 block leading-5 text-slate-500">
-                    Emby 时长、批量整理、版本差异列表、差异扫描和视频对齐都在这里。
+                    Emby 时长、批量整理、弹幕来源内容段、版本差异列表、差异扫描和视频对齐都在这里。
                   </span>
                 </span>
                 <span className="shrink-0 rounded border border-panel-line px-2 py-1 text-[11px] text-slate-300">
@@ -522,6 +545,18 @@ export function AssetPanel() {
                         onTextChange={setAnchorCalibrationText}
                         onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
                         onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
+                      />
+                      <SourceTimelineSegmentsPanel
+                        segments={project.danmakuSourceSegments}
+                        plan={batchMergePlan}
+                        summary={sourceTimelineSummary}
+                        onAdd={addDanmakuSourceSegment}
+                        onUpdate={updateDanmakuSourceSegment}
+                        onDelete={deleteDanmakuSourceSegment}
+                        onFocus={(timeMs) => {
+                          setPlayhead(timeMs);
+                          setStatus({ message: `已定位弹幕来源时间：${formatTimecode(timeMs)}。`, tone: "success" });
+                        }}
                       />
                       <SyncAnchorsPanel
                         anchors={project.syncAnchors}
@@ -1281,6 +1316,406 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
       ) : null}
     </section>
   );
+}
+
+interface SourceSegmentEpisodeOption {
+  key: string;
+  label: string;
+}
+
+interface SourceSegmentFormState {
+  kind: DanmakuSourceSegmentKind;
+  startText: string;
+  endText: string;
+  episodeKey: string;
+  label: string;
+  note: string;
+}
+
+function SourceTimelineSegmentsPanel({
+  segments,
+  plan,
+  summary,
+  onAdd,
+  onUpdate,
+  onDelete,
+  onFocus
+}: {
+  segments: DanmakuSourceSegment[];
+  plan: ReturnType<typeof buildBatchMergePlan>;
+  summary: SourceTimelineSummary;
+  onAdd: (draft: DanmakuSourceSegmentDraft) => void;
+  onUpdate: (id: string, patch: DanmakuSourceSegmentPatch) => void;
+  onDelete: (id: string) => void;
+  onFocus: (timeMs: Milliseconds) => void;
+}) {
+  const episodeOptions = useMemo(() => createSourceSegmentEpisodeOptions(plan), [plan]);
+  const [form, setForm] = useState<SourceSegmentFormState>({
+    kind: "content",
+    startText: "00:00:00.000",
+    endText: "00:24:00.000",
+    episodeKey: "",
+    label: "",
+    note: ""
+  });
+
+  useEffect(() => {
+    if (form.episodeKey.length === 0 && episodeOptions.length > 0) {
+      setForm((current) => ({ ...current, episodeKey: episodeOptions[0].key }));
+    }
+  }, [episodeOptions, form.episodeKey]);
+
+  const submit = () => {
+    const draft = createSourceSegmentDraftFromForm(form, episodeOptions);
+    if (!draft.ok) {
+      setStatus({ message: draft.message, tone: "warning" });
+      return;
+    }
+    onAdd(draft.value);
+    setForm((current) => ({
+      ...current,
+      startText: current.endText,
+      endText: formatTimecode((parseSourceTimecode(current.endText) ?? 0) + 24 * 60 * 1000),
+      label: "",
+      note: ""
+    }));
+  };
+
+  return (
+    <section
+      className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+      aria-label="弹幕来源内容段"
+    >
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <Clock3 size={15} className="text-accent-cyan" />
+        <span>弹幕来源内容段</span>
+        <span className="ml-auto rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
+          {summary.statusLabel}
+        </span>
+      </div>
+      <p className="mt-2 text-[11px] leading-5 text-slate-500">
+        {summary.headline}。这里只标注 B 站/XML 时间轴上的虚拟范围，不剪切、不修改视频文件。
+      </p>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {summary.metrics.map((metric) => (
+          <div key={metric.label} className="rounded border border-panel-line bg-[#111318] p-2">
+            <div className="text-[11px] text-slate-500">{metric.label}</div>
+            <div className="mt-1 text-sm font-medium text-slate-100">{metric.value}</div>
+          </div>
+        ))}
+      </div>
+      <SourceTimelineStrip segments={segments} />
+      <div className="mt-3 grid gap-1">
+        {summary.findings.map((finding) => (
+          <div key={finding.id} className={`rounded border p-2 ${sourceTimelineFindingClass(finding.severity)}`}>
+            <div className="font-medium">{finding.title}</div>
+            <div className="mt-1 leading-5">{finding.detail}</div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 grid gap-2 rounded border border-panel-line bg-black/15 p-2">
+        <div className="grid grid-cols-2 gap-2">
+          <label className="grid gap-1">
+            <span className="text-slate-500">开始</span>
+            <input
+              aria-label="来源段开始"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              value={form.startText}
+              onChange={(event) => setForm((current) => ({ ...current, startText: event.target.value }))}
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-slate-500">结束</span>
+            <input
+              aria-label="来源段结束"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              value={form.endText}
+              onChange={(event) => setForm((current) => ({ ...current, endText: event.target.value }))}
+            />
+          </label>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <label className="grid gap-1">
+            <span className="text-slate-500">用途</span>
+            <select
+              aria-label="来源段用途"
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              value={form.kind}
+              onChange={(event) =>
+                setForm((current) => ({
+                  ...current,
+                  kind: event.target.value as DanmakuSourceSegmentKind
+                }))
+              }
+            >
+              <option value="content">正片内容</option>
+              <option value="ignored">忽略范围</option>
+            </select>
+          </label>
+          <label className="grid gap-1">
+            <span className="text-slate-500">对应输出</span>
+            <select
+              aria-label="来源段对应输出"
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100 disabled:opacity-50"
+              value={form.episodeKey}
+              disabled={form.kind === "ignored"}
+              onChange={(event) => setForm((current) => ({ ...current, episodeKey: event.target.value }))}
+            >
+              <option value="">暂不关联</option>
+              {episodeOptions.map((option) => (
+                <option key={option.key} value={option.key}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label className="grid gap-1">
+          <span className="text-slate-500">名称</span>
+          <input
+            aria-label="来源段名称"
+            className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+            value={form.label}
+            placeholder="留空时自动命名"
+            onChange={(event) => setForm((current) => ({ ...current, label: event.target.value }))}
+          />
+        </label>
+        <label className="grid gap-1">
+          <span className="text-slate-500">备注</span>
+          <input
+            aria-label="来源段备注"
+            className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+            value={form.note}
+            placeholder="例如：前两小时为无意义片段"
+            onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))}
+          />
+        </label>
+        <div className="flex justify-end">
+          <TextButton tone="primary" onClick={submit}>
+            <ListPlus size={14} />
+            新增来源段
+          </TextButton>
+        </div>
+      </div>
+      {segments.length > 0 ? (
+        <div className="mt-3 grid gap-2">
+          {[...segments]
+            .sort((left, right) => left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs)
+            .map((segment) => (
+              <SourceTimelineSegmentRow
+                key={segment.id}
+                segment={segment}
+                episodeOptions={episodeOptions}
+                onUpdate={onUpdate}
+                onDelete={onDelete}
+                onFocus={onFocus}
+              />
+            ))}
+        </div>
+      ) : null}
+      <p className="mt-3 text-[11px] leading-5 text-slate-500">下一步：{summary.nextActionLabel}</p>
+    </section>
+  );
+}
+
+function SourceTimelineSegmentRow({
+  segment,
+  episodeOptions,
+  onUpdate,
+  onDelete,
+  onFocus
+}: {
+  segment: DanmakuSourceSegment;
+  episodeOptions: SourceSegmentEpisodeOption[];
+  onUpdate: (id: string, patch: DanmakuSourceSegmentPatch) => void;
+  onDelete: (id: string) => void;
+  onFocus: (timeMs: Milliseconds) => void;
+}) {
+  const [form, setForm] = useState<SourceSegmentFormState>(() => createFormFromSegment(segment));
+
+  useEffect(() => {
+    setForm(createFormFromSegment(segment));
+  }, [segment]);
+
+  const save = () => {
+    const draft = createSourceSegmentDraftFromForm(form, episodeOptions);
+    if (!draft.ok) {
+      setStatus({ message: draft.message, tone: "warning" });
+      return;
+    }
+    onUpdate(segment.id, draft.value);
+  };
+
+  return (
+    <article className="grid gap-2 rounded border border-panel-line bg-[#111318] p-2">
+      <div className="flex items-center gap-2">
+        <span className={`h-2.5 w-2.5 rounded-sm ${segment.kind === "content" ? "bg-accent-cyan" : "bg-slate-600"}`} />
+        <span className="min-w-0 flex-1 truncate text-slate-100" title={segment.label}>
+          {segment.label}
+        </span>
+        <span className="text-[11px] text-slate-500">
+          {formatTimecode(segment.sourceStartMs)} - {formatTimecode(segment.sourceEndMs)}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <input
+          aria-label={`${segment.label} 开始`}
+          className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+          value={form.startText}
+          onChange={(event) => setForm((current) => ({ ...current, startText: event.target.value }))}
+        />
+        <input
+          aria-label={`${segment.label} 结束`}
+          className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+          value={form.endText}
+          onChange={(event) => setForm((current) => ({ ...current, endText: event.target.value }))}
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <select
+          aria-label={`${segment.label} 用途`}
+          className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+          value={form.kind}
+          onChange={(event) =>
+            setForm((current) => ({ ...current, kind: event.target.value as DanmakuSourceSegmentKind }))
+          }
+        >
+          <option value="content">正片内容</option>
+          <option value="ignored">忽略范围</option>
+        </select>
+        <select
+          aria-label={`${segment.label} 对应输出`}
+          className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-50"
+          value={form.episodeKey}
+          disabled={form.kind === "ignored"}
+          onChange={(event) => setForm((current) => ({ ...current, episodeKey: event.target.value }))}
+        >
+          <option value="">暂不关联</option>
+          {episodeOptions.map((option) => (
+            <option key={option.key} value={option.key}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <input
+        aria-label={`${segment.label} 名称`}
+        className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+        value={form.label}
+        onChange={(event) => setForm((current) => ({ ...current, label: event.target.value }))}
+      />
+      <input
+        aria-label={`${segment.label} 备注`}
+        className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+        value={form.note}
+        placeholder="备注"
+        onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))}
+      />
+      <div className="flex flex-wrap justify-end gap-2">
+        <TextButton onClick={() => onFocus(segment.sourceStartMs)}>
+          <Crosshair size={14} />
+          定位
+        </TextButton>
+        <TextButton onClick={save}>
+          <CircleCheck size={14} />
+          更新
+        </TextButton>
+        <TextButton tone="danger" onClick={() => onDelete(segment.id)}>
+          <Trash2 size={14} />
+          删除
+        </TextButton>
+      </div>
+    </article>
+  );
+}
+
+function SourceTimelineStrip({ segments }: { segments: DanmakuSourceSegment[] }) {
+  if (segments.length === 0) {
+    return null;
+  }
+  const sorted = [...segments].sort((left, right) => left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs);
+  const startMs = sorted[0].sourceStartMs;
+  const endMs = Math.max(...sorted.map((segment) => segment.sourceEndMs));
+  const durationMs = Math.max(1, endMs - startMs);
+  return (
+    <div className="mt-3 rounded border border-panel-line bg-black/20 p-2" aria-label="弹幕来源时间带">
+      <div className="relative h-7 overflow-hidden rounded bg-[#0b0d12]">
+        {sorted.map((segment) => {
+          const left = ((segment.sourceStartMs - startMs) / durationMs) * 100;
+          const width = Math.max(1, ((segment.sourceEndMs - segment.sourceStartMs) / durationMs) * 100);
+          return (
+            <div
+              key={segment.id}
+              className={`absolute top-0 h-full border-r border-black/40 ${
+                segment.kind === "content" ? "bg-accent-cyan/60" : "bg-slate-600/60"
+              }`}
+              style={{ left: `${left}%`, width: `${width}%` }}
+              title={`${segment.label}：${formatTimecode(segment.sourceStartMs)} - ${formatTimecode(segment.sourceEndMs)}`}
+            />
+          );
+        })}
+      </div>
+      <div className="mt-1 flex justify-between text-[11px] text-slate-500">
+        <span>{formatTimecode(startMs)}</span>
+        <span>{formatTimecode(endMs)}</span>
+      </div>
+    </div>
+  );
+}
+
+function createSourceSegmentEpisodeOptions(plan: ReturnType<typeof buildBatchMergePlan>): SourceSegmentEpisodeOption[] {
+  return plan.episodes.map((episode) => ({
+    key: createSeasonEpisodeKey(episode),
+    label: episode.label
+  }));
+}
+
+function createSourceSegmentDraftFromForm(
+  form: SourceSegmentFormState,
+  episodeOptions: readonly SourceSegmentEpisodeOption[]
+): { ok: true; value: DanmakuSourceSegmentDraft } | { ok: false; message: string } {
+  const sourceStartMs = parseSourceTimecode(form.startText);
+  const sourceEndMs = parseSourceTimecode(form.endText);
+  if (sourceStartMs === null || sourceEndMs === null) {
+    return { ok: false, message: "来源段时间格式无效，请使用 00:00:00.000。" };
+  }
+  if (sourceEndMs <= sourceStartMs) {
+    return { ok: false, message: "来源段结束时间必须晚于开始时间。" };
+  }
+  const episode = episodeOptions.find((option) => option.key === form.episodeKey);
+  return {
+    ok: true,
+    value: {
+      kind: form.kind,
+      sourceStartMs,
+      sourceEndMs,
+      episodeKey: form.kind === "content" ? form.episodeKey || null : null,
+      episodeLabel: form.kind === "content" ? episode?.label ?? null : null,
+      label: form.label,
+      note: form.note
+    }
+  };
+}
+
+function createFormFromSegment(segment: DanmakuSourceSegment): SourceSegmentFormState {
+  return {
+    kind: segment.kind,
+    startText: formatTimecode(segment.sourceStartMs),
+    endText: formatTimecode(segment.sourceEndMs),
+    episodeKey: segment.episodeKey ?? "",
+    label: segment.label,
+    note: segment.note
+  };
+}
+
+function sourceTimelineFindingClass(severity: SourceTimelineFinding["severity"]): string {
+  if (severity === "error") {
+    return "border-accent-red/30 bg-accent-red/10 text-accent-red";
+  }
+  if (severity === "warning") {
+    return "border-accent-yellow/30 bg-accent-yellow/10 text-accent-yellow";
+  }
+  return "border-panel-line bg-black/15 text-slate-500";
 }
 
 function SeasonWorkbenchPanel({ summary }: { summary: SeasonWorkbenchSummary }) {

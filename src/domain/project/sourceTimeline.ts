@@ -1,0 +1,321 @@
+import type { BatchMergePlan } from "../danmaku/batchMerge";
+import { formatTimecode, type Milliseconds } from "../shared/time";
+import { createSeasonEpisodeKey } from "./seasonEpisodeBinding";
+import type { DanmakuSourceSegment, DanmakuSourceSegmentKind, EditorProject } from "./types";
+
+export interface DanmakuSourceSegmentDraft {
+  label?: string;
+  kind: DanmakuSourceSegmentKind;
+  sourceStartMs: Milliseconds;
+  sourceEndMs: Milliseconds;
+  episodeKey: string | null;
+  episodeLabel: string | null;
+  note?: string;
+}
+
+export type DanmakuSourceSegmentPatch = Partial<DanmakuSourceSegmentDraft>;
+
+export type SourceTimelineStatus = "waiting" | "needsSegments" | "needsReview" | "ready";
+
+export interface SourceTimelineMetric {
+  label: string;
+  value: string;
+}
+
+export interface SourceTimelineFinding {
+  id: string;
+  severity: "info" | "warning" | "error";
+  title: string;
+  detail: string;
+}
+
+export interface SourceTimelineSummary {
+  status: SourceTimelineStatus;
+  statusLabel: string;
+  headline: string;
+  nextActionLabel: string;
+  metrics: SourceTimelineMetric[];
+  findings: SourceTimelineFinding[];
+}
+
+export function createDanmakuSourceSegment(
+  id: string,
+  draft: DanmakuSourceSegmentDraft,
+  timestamp = new Date().toISOString()
+): DanmakuSourceSegment {
+  const normalized = normalizeSegmentDraft(draft);
+  return {
+    id,
+    ...normalized,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+}
+
+export function updateDanmakuSourceSegment(
+  segment: DanmakuSourceSegment,
+  patch: DanmakuSourceSegmentPatch,
+  timestamp = new Date().toISOString()
+): DanmakuSourceSegment {
+  const normalized = normalizeSegmentDraft({
+    label: patch.label ?? segment.label,
+    kind: patch.kind ?? segment.kind,
+    sourceStartMs: patch.sourceStartMs ?? segment.sourceStartMs,
+    sourceEndMs: patch.sourceEndMs ?? segment.sourceEndMs,
+    episodeKey: patch.episodeKey !== undefined ? patch.episodeKey : segment.episodeKey,
+    episodeLabel: patch.episodeLabel !== undefined ? patch.episodeLabel : segment.episodeLabel,
+    note: patch.note ?? segment.note
+  });
+  return {
+    ...segment,
+    ...normalized,
+    updatedAt: timestamp
+  };
+}
+
+export function createSourceTimelineSummary(
+  project: EditorProject,
+  plan: BatchMergePlan
+): SourceTimelineSummary {
+  const segments = sortSegments(project.danmakuSourceSegments);
+  const contentSegments = segments.filter((segment) => segment.kind === "content");
+  const ignoredSegments = segments.filter((segment) => segment.kind === "ignored");
+  const episodeLabelsByKey = new Map(plan.episodes.map((episode) => [createSeasonEpisodeKey(episode), episode.label]));
+  const mappedEpisodeKeys = new Set(
+    contentSegments
+      .map((segment) => segment.episodeKey)
+      .filter((episodeKey): episodeKey is string => Boolean(episodeKey))
+  );
+  const findings: SourceTimelineFinding[] = [];
+
+  if (project.assets.length === 0) {
+    findings.push({
+      id: "no-assets",
+      severity: "info",
+      title: "等待 XML",
+      detail: "导入 B 站 XML 后，再标注哪些弹幕时间范围对应原片正片。"
+    });
+  } else if (segments.length === 0) {
+    findings.push({
+      id: "no-source-segments",
+      severity: "warning",
+      title: "尚未标注来源时间轴",
+      detail: "请把 B 站/XML 时间轴上的正片范围、前后无意义片段或空白范围标出来。"
+    });
+  }
+
+  contentSegments
+    .filter((segment) => !segment.episodeKey)
+    .forEach((segment) => {
+      findings.push({
+        id: `content-without-episode-${segment.id}`,
+        severity: "warning",
+        title: "内容段未关联输出集",
+        detail: `${segment.label} 还没有指向某一集原片输出。`
+      });
+    });
+
+  contentSegments
+    .filter((segment) => segment.episodeKey && !episodeLabelsByKey.has(segment.episodeKey))
+    .forEach((segment) => {
+      findings.push({
+        id: `unknown-episode-${segment.id}`,
+        severity: "warning",
+        title: "内容段关联的分集已不存在",
+        detail: `${segment.label} 指向 ${segment.episodeLabel ?? segment.episodeKey}，但当前分集草案里没有这个输出。`
+      });
+    });
+
+  collectOverlaps(segments).forEach(([left, right]) => {
+    findings.push({
+      id: `overlap-${left.id}-${right.id}`,
+      severity: "error",
+      title: "来源内容段时间重叠",
+      detail: `${left.label} 与 ${right.label} 在 B 站/XML 时间轴上有重叠，请调整起止时间。`
+    });
+  });
+
+  if (segments.length > 0 && findings.length === 0) {
+    findings.push({
+      id: "ready",
+      severity: "info",
+      title: "来源时间轴已记录",
+      detail: "这些内容段只描述弹幕来源时间轴，不会剪切、改写或导出视频。"
+    });
+  }
+
+  const status = createStatus(project.assets.length, segments.length, findings);
+  return {
+    status,
+    statusLabel: statusToLabel(status),
+    headline: statusToHeadline(status),
+    nextActionLabel: createNextActionLabel(status),
+    metrics: [
+      { label: "内容段", value: `${contentSegments.length} 个` },
+      { label: "忽略段", value: `${ignoredSegments.length} 个` },
+      { label: "已关联输出", value: `${mappedEpisodeKeys.size} 集` },
+      { label: "覆盖时长", value: formatTimecode(sumSegmentDuration(segments)) }
+    ],
+    findings
+  };
+}
+
+export function parseSourceTimecode(value: string): Milliseconds | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const parts = trimmed.split(":");
+  if (parts.length > 3 || parts.some((part) => part.trim().length === 0)) {
+    return null;
+  }
+  const secondsText = parts.at(-1);
+  if (!secondsText || !/^\d+(?:\.\d{1,3})?$/.test(secondsText)) {
+    return null;
+  }
+  const wholeParts = parts.slice(0, -1);
+  if (!wholeParts.every((part) => /^\d+$/.test(part))) {
+    return null;
+  }
+  const [secondsWholeText, millisecondsText = ""] = secondsText.split(".");
+  const secondsWhole = Number(secondsWholeText);
+  const milliseconds = Number(millisecondsText.padEnd(3, "0"));
+  const minutes = wholeParts.length >= 1 ? Number(wholeParts.at(-1)) : 0;
+  const hours = wholeParts.length === 2 ? Number(wholeParts[0]) : 0;
+  if (
+    !Number.isSafeInteger(hours) ||
+    !Number.isSafeInteger(minutes) ||
+    !Number.isSafeInteger(secondsWhole) ||
+    !Number.isSafeInteger(milliseconds) ||
+    minutes >= 60 ||
+    secondsWhole >= 60
+  ) {
+    return null;
+  }
+  const totalMs = ((hours * 60 + minutes) * 60 + secondsWhole) * 1000 + milliseconds;
+  return Number.isSafeInteger(totalMs) ? totalMs : null;
+}
+
+function normalizeSegmentDraft(draft: DanmakuSourceSegmentDraft): Omit<DanmakuSourceSegment, "id" | "createdAt" | "updatedAt"> {
+  const sourceStartMs = Math.max(0, Math.round(draft.sourceStartMs));
+  const sourceEndMs = Math.max(0, Math.round(draft.sourceEndMs));
+  if (sourceEndMs <= sourceStartMs) {
+    throw new Error("内容段结束时间必须晚于开始时间。");
+  }
+  const kind = draft.kind;
+  const episodeKey = kind === "content" ? normalizeOptionalText(draft.episodeKey) : null;
+  const episodeLabel = kind === "content" ? normalizeOptionalText(draft.episodeLabel) : null;
+  return {
+    label: normalizeLabel(draft.label, kind, episodeLabel, sourceStartMs, sourceEndMs),
+    kind,
+    sourceStartMs,
+    sourceEndMs,
+    episodeKey,
+    episodeLabel,
+    note: draft.note?.trim() ?? ""
+  };
+}
+
+function normalizeLabel(
+  label: string | undefined,
+  kind: DanmakuSourceSegmentKind,
+  episodeLabel: string | null,
+  sourceStartMs: Milliseconds,
+  sourceEndMs: Milliseconds
+): string {
+  const trimmed = label?.trim() ?? "";
+  if (trimmed.length > 0) {
+    return trimmed;
+  }
+  if (kind === "content") {
+    return episodeLabel ? `${episodeLabel} 来源段` : "未关联内容段";
+  }
+  return `忽略范围 ${formatTimecode(sourceStartMs)} - ${formatTimecode(sourceEndMs)}`;
+}
+
+function normalizeOptionalText(value: string | null | undefined): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function sortSegments(segments: readonly DanmakuSourceSegment[]): DanmakuSourceSegment[] {
+  return [...segments].sort(
+    (left, right) => left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs
+  );
+}
+
+function collectOverlaps(segments: readonly DanmakuSourceSegment[]): Array<[DanmakuSourceSegment, DanmakuSourceSegment]> {
+  const sorted = sortSegments(segments);
+  const overlaps: Array<[DanmakuSourceSegment, DanmakuSourceSegment]> = [];
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    if (current.sourceStartMs < previous.sourceEndMs) {
+      overlaps.push([previous, current]);
+    }
+  }
+  return overlaps;
+}
+
+function sumSegmentDuration(segments: readonly DanmakuSourceSegment[]): Milliseconds {
+  return segments.reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
+}
+
+function createStatus(
+  assetCount: number,
+  segmentCount: number,
+  findings: readonly SourceTimelineFinding[]
+): SourceTimelineStatus {
+  if (assetCount === 0) {
+    return "waiting";
+  }
+  if (segmentCount === 0) {
+    return "needsSegments";
+  }
+  if (findings.some((finding) => finding.severity === "error" || finding.severity === "warning")) {
+    return "needsReview";
+  }
+  return "ready";
+}
+
+function statusToLabel(status: SourceTimelineStatus): string {
+  if (status === "waiting") {
+    return "等待 XML";
+  }
+  if (status === "needsSegments") {
+    return "待标注";
+  }
+  if (status === "needsReview") {
+    return "需复核";
+  }
+  return "已记录";
+}
+
+function statusToHeadline(status: SourceTimelineStatus): string {
+  if (status === "waiting") {
+    return "导入 XML 后开始标注弹幕来源时间轴";
+  }
+  if (status === "needsSegments") {
+    return "把 B 站/XML 时间轴上的正片范围和无意义范围标出来";
+  }
+  if (status === "needsReview") {
+    return "先处理重叠或未关联的来源内容段";
+  }
+  return "来源时间轴已经可用于后续弹幕投影复核";
+}
+
+function createNextActionLabel(status: SourceTimelineStatus): string {
+  if (status === "waiting") {
+    return "先导入 B 站 XML。";
+  }
+  if (status === "needsSegments") {
+    return "新增内容段或忽略段。";
+  }
+  if (status === "needsReview") {
+    return "修正提示中的内容段。";
+  }
+  return "继续逐集目标绑定或对齐复核。";
+}

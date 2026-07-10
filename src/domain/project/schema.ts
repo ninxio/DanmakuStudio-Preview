@@ -38,6 +38,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     !isMediaReference(value.media) ||
     (version >= 4 && !isMediaBindingOrNull(value.mediaBinding)) ||
     (version >= 5 && !isSeasonEpisodeBindings(value.seasonEpisodeBindings)) ||
+    (version >= 6 && !isDanmakuSourceSegments(value.danmakuSourceSegments)) ||
     !Array.isArray(value.assets) ||
     !Array.isArray(value.clips) ||
     !isIntegerMilliseconds(value.globalOffsetMs) ||
@@ -117,7 +118,8 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
       clips: legacyClipRanges.clips,
       alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null,
       mediaBinding: parsedVersion >= 4 ? project.mediaBinding : null,
-      seasonEpisodeBindings: parsedVersion >= 5 ? project.seasonEpisodeBindings : []
+      seasonEpisodeBindings: parsedVersion >= 5 ? project.seasonEpisodeBindings : [],
+      danmakuSourceSegments: parsedVersion >= 6 ? project.danmakuSourceSegments : []
     },
     migration: {
       fromVersion: parsedVersion,
@@ -238,6 +240,36 @@ function isSeasonEpisodeBinding(value: unknown): boolean {
     value.targetBinding !== null &&
     typeof value.linkedAt === "string"
   );
+}
+
+function isDanmakuSourceSegments(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isDanmakuSourceSegment);
+}
+
+function isDanmakuSourceSegment(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.label !== "string" ||
+    !isNonNegativeIntegerMilliseconds(value.sourceStartMs) ||
+    !isNonNegativeIntegerMilliseconds(value.sourceEndMs) ||
+    value.sourceEndMs <= value.sourceStartMs ||
+    typeof value.note !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    return false;
+  }
+  if (value.kind === "content") {
+    return (
+      (typeof value.episodeKey === "string" || value.episodeKey === null) &&
+      (typeof value.episodeLabel === "string" || value.episodeLabel === null)
+    );
+  }
+  if (value.kind === "ignored") {
+    return value.episodeKey === null && value.episodeLabel === null;
+  }
+  return false;
 }
 
 function isDanmakuAsset(value: unknown): boolean {

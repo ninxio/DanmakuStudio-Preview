@@ -1,5 +1,20 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C133 已完成：新增“弹幕来源内容段”，把 B 站/XML 时间轴上的虚拟正片段和忽略范围保存为项目状态。
+  - 项目 schema 升级到 v6，新增 `danmakuSourceSegments`；打开 v1-v5 项目会自动迁移并补空数组，三分 P 示例项目已更新到 v6。
+  - 新增 `src/domain/project/sourceTimeline.ts`，作为不依赖 React 的弹幕来源时间轴模型；支持创建/更新内容段、解析 `00:00:00.000` 时间码、生成来源时间轴摘要，并检测重叠、未关联输出集和已失效分集。
+  - 资源栏高级工具新增“弹幕来源内容段”面板，用户可以新增、更新、删除 B 站/XML 时间轴上的正片内容段或忽略范围，并用小型时间带直观看到覆盖关系；所有操作进入编辑历史并可撤销。
+  - 面板文案明确：这些内容段只标注弹幕来源时间轴，不剪切、不修改、不导出视频；本阶段还不直接改变分集导出算法，后续需要把内容段接入弹幕投影和分集导出规则。
+  - 导出前健康检查已把弹幕来源内容段 ID 纳入重复 ID 检查；README 和架构文档同步 schema v6、项目文件字段和视频非处理边界。
+  - 已补充领域、schema、store 和资源面板测试，覆盖来源段创建/更新、时间码解析、v5 迁移、持久化校验、历史记录和 UI 真实增删改。
+  - 已重新验证：聚焦测试 `corepack pnpm test -- src/domain/project/sourceTimeline.test.ts src/domain/project/schema.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx` 通过（4 个测试文件 / 96 个测试）。
+  - 已重新验证：`corepack pnpm lint` 通过；`corepack pnpm build` 通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、51 个测试文件 / 293 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包；首次普通权限运行在 Vitest 启动 esbuild 时因 Windows `spawn EPERM` 中断，已用提升权限重跑同一命令通过。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12512768` 字节，时间 `2026/07/11 05:42:19`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3102177` 字节，时间 `2026/07/11 05:42:19`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c133-danmaku-source-segments-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C132 已完成：记录项目初衷与产品边界，明确 B 站素材只是弹幕时间轴证据。
   - `AGENTS.md` 新增“项目初衷与产品边界”段，说明项目源于保留弹幕观影氛围，同时使用 Emby 原片获得更高清、更完整的观看体验。
   - 明确 B 站弹幕 XML 与 B 站视频时间轴强关联；项目核心任务是把参考时间轴上的弹幕修正并投影到原片标准时间轴。

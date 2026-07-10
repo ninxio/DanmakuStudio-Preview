@@ -143,12 +143,21 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       label: `同步锚点 ${index + 1}（${formatTimecode(anchor.sourceMs)} -> ${formatTimecode(anchor.targetMs)}）`
     }))
   );
+  const duplicateSourceSegmentIdGroups = findDuplicateGroups(
+    project.danmakuSourceSegments.map((segment, index) => ({
+      value: segment.id,
+      label: `弹幕来源内容段 ${index + 1}（${segment.label} / ${formatTimecode(segment.sourceStartMs)} - ${formatTimecode(
+        segment.sourceEndMs
+      )}）`
+    }))
+  );
   const duplicateIdCount =
     duplicateAssetIdGroups.length +
     duplicateItemIdGroups.length +
     duplicateClipIdGroups.length +
     duplicateCutIdGroups.length +
-    duplicateAnchorIdGroups.length;
+    duplicateAnchorIdGroups.length +
+    duplicateSourceSegmentIdGroups.length;
 
   const findings: ProjectHealthFinding[] = [];
   appendDuplicateFinding(findings, "asset-id", "资源 ID 重复", duplicateAssetIdGroups);
@@ -156,6 +165,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   appendDuplicateFinding(findings, "clip-id", "片段 ID 重复", duplicateClipIdGroups);
   appendDuplicateFinding(findings, "cut-id", "版本差异 ID 重复", duplicateCutIdGroups);
   appendDuplicateFinding(findings, "anchor-id", "同步锚点 ID 重复", duplicateAnchorIdGroups);
+  appendDuplicateFinding(findings, "source-segment-id", "弹幕来源内容段 ID 重复", duplicateSourceSegmentIdGroups);
 
   if (project.assets.length === 0) {
     findings.push({

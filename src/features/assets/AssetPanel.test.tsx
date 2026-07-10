@@ -309,6 +309,64 @@ describe("资源面板", () => {
     await waitFor(() => expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(0));
   });
 
+  it("高级工具可以标注弹幕来源内容段", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="12,1,25,16777215,0,0,u1,r1">第一集</d></i>`,
+      { fileName: "S01E01.xml" }
+    );
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        assets: [asset]
+      },
+      history: createHistoryState(),
+      selection: { kind: "none", ids: [] },
+      exportDraft: null,
+      alignmentProposal: null,
+      cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+
+    const panel = screen.getByRole("region", { name: "弹幕来源内容段" });
+    expect(within(panel).getByText("待标注")).toBeInTheDocument();
+    expect(within(panel).getByText(/不剪切、不修改视频文件/)).toBeInTheDocument();
+
+    await user.clear(within(panel).getByLabelText("来源段开始"));
+    await user.type(within(panel).getByLabelText("来源段开始"), "02:00:00.000");
+    await user.clear(within(panel).getByLabelText("来源段结束"));
+    await user.type(within(panel).getByLabelText("来源段结束"), "02:24:00.000");
+    await user.click(within(panel).getByRole("button", { name: "新增来源段" }));
+
+    await waitFor(() => expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1));
+    expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
+      kind: "content",
+      episodeKey: "S01E01",
+      sourceStartMs: 7_200_000,
+      sourceEndMs: 8_640_000
+    });
+    expect(within(panel).getByText("已记录")).toBeInTheDocument();
+    expect(within(panel).getByText("第 1 集 来源段")).toBeInTheDocument();
+
+    await user.selectOptions(within(panel).getByLabelText("第 1 集 来源段 用途"), "ignored");
+    await user.clear(within(panel).getByLabelText("第 1 集 来源段 名称"));
+    await user.type(within(panel).getByLabelText("第 1 集 来源段 名称"), "前置无意义片段");
+    await user.click(within(panel).getByRole("button", { name: "更新" }));
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
+        kind: "ignored",
+        label: "前置无意义片段",
+        episodeKey: null
+      })
+    );
+
+    await user.click(within(panel).getByRole("button", { name: "删除" }));
+    await waitFor(() => expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(0));
+  });
+
   it("导出检查会展示人话摘要并按需显示诊断详情", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);

@@ -251,6 +251,45 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(1);
   });
 
+  it("可以增删改弹幕来源内容段并支持撤销", () => {
+    useEditorStore.getState().addDanmakuSourceSegment({
+      kind: "content",
+      sourceStartMs: 7_200_000,
+      sourceEndMs: 7_260_000,
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集",
+      note: "正片开始"
+    });
+
+    const segment = useEditorStore.getState().project.danmakuSourceSegments[0];
+    expect(segment).toMatchObject({
+      kind: "content",
+      label: "第 1 集 来源段",
+      sourceStartMs: 7_200_000,
+      episodeKey: "S01E01"
+    });
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("新增弹幕来源内容段");
+
+    useEditorStore.getState().updateDanmakuSourceSegment(segment.id, {
+      kind: "ignored",
+      sourceStartMs: 0,
+      sourceEndMs: 7_200_000,
+      label: "前置无意义片段"
+    });
+
+    expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
+      kind: "ignored",
+      label: "前置无意义片段",
+      episodeKey: null,
+      episodeLabel: null
+    });
+
+    useEditorStore.getState().deleteDanmakuSourceSegment(segment.id);
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(0);
+    useEditorStore.getState().undo();
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
+  });
+
   it("预览对齐提案时同步写入项目文件状态", () => {
     const proposal = createAlignmentProposal();
 

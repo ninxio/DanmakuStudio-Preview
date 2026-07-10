@@ -30,7 +30,7 @@ resolved = applyCutMapping(adjusted, cutMarkers)
 
 ## 目标原片绑定
 
-项目 schema v4 新增 `mediaBinding`，用于表达当前项目最终要对齐到哪一份目标原片。schema v5 新增 `seasonEpisodeBindings`，用于表达剧集批量工作台中每个输出集对应哪份目标原片。绑定模型位于 `src/domain/project`，不依赖 React，后续匹配评分、预览、对齐和导出检查都应读取同一份项目状态。
+项目 schema v4 新增 `mediaBinding`，用于表达当前项目最终要对齐到哪一份目标原片。schema v5 新增 `seasonEpisodeBindings`，用于表达剧集批量工作台中每个输出集对应哪份目标原片。schema v6 新增 `danmakuSourceSegments`，用于表达 B 站/XML 弹幕来源时间轴上的虚拟内容段和忽略范围。绑定与来源时间轴模型位于 `src/domain/project`，不依赖 React，后续匹配评分、预览、对齐和导出检查都应读取同一份项目状态。
 
 当前支持两类绑定：
 
@@ -40,6 +40,8 @@ resolved = applyCutMapping(adjusted, cutMarkers)
 Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等于已经具备播放授权流或下载能力。需要重新验证 Emby 条目时，UI 会通过当前应用设置和本次会话密码重新登录并读取条目元数据，失败时向用户提示需要重新连接。
 
 `seasonEpisodeBindings` 的 key 由 `src/domain/project/seasonEpisodeBinding.ts` 根据批量输出的季集号或文件名生成。资源栏高级工具的“逐集目标绑定”只把当前项目级目标原片复制为某个输出集的目标引用；清除和更新都进入编辑历史。它不改变原始 XML，不影响批量导出的弹幕内容，也不保存 Emby 密码、token 或临时播放 URL。
+
+`danmakuSourceSegments` 由 `src/domain/project/sourceTimeline.ts` 维护。它只记录弹幕来源时间轴上的正片内容段、前后无意义片段和空白范围，以及内容段对应的输出集 key；新增、更新和删除都进入编辑历史。它不剪切视频、不改变原始 XML，后续弹幕投影和分集复核应读取这些虚拟范围作为证据边界。
 
 ## 匹配评分
 

@@ -7,7 +7,7 @@ import type {
 import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 export interface MediaReference {
   id: string;
@@ -72,6 +72,21 @@ export interface SeasonEpisodeBinding {
   linkedAt: string;
 }
 
+export type DanmakuSourceSegmentKind = "content" | "ignored";
+
+export interface DanmakuSourceSegment {
+  id: string;
+  label: string;
+  kind: DanmakuSourceSegmentKind;
+  sourceStartMs: Milliseconds;
+  sourceEndMs: Milliseconds;
+  episodeKey: string | null;
+  episodeLabel: string | null;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TimelineViewState {
   pixelsPerSecond: number;
   scrollMs: Milliseconds;
@@ -91,6 +106,7 @@ export interface EditorProject {
   media: MediaReference | null;
   mediaBinding: MediaBinding | null;
   seasonEpisodeBindings: SeasonEpisodeBinding[];
+  danmakuSourceSegments: DanmakuSourceSegment[];
   assets: DanmakuAsset[];
   clips: DanmakuClip[];
   globalOffsetMs: Milliseconds;

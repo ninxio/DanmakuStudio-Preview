@@ -1,0 +1,171 @@
+import { describe, expect, it } from "vitest";
+import type { BatchMergePlan } from "../danmaku/batchMerge";
+import type { DanmakuAsset } from "../danmaku/types";
+import { createEmptyProject } from "./factory";
+import {
+  createDanmakuSourceSegment,
+  createSourceTimelineSummary,
+  parseSourceTimecode,
+  updateDanmakuSourceSegment
+} from "./sourceTimeline";
+
+describe("danmaku source timeline", () => {
+  it("创建正片内容段并保留对应输出集", () => {
+    const segment = createDanmakuSourceSegment(
+      "segment-1",
+      {
+        kind: "content",
+        sourceStartMs: 7_200_000,
+        sourceEndMs: 7_260_000,
+        episodeKey: "S01E01",
+        episodeLabel: "第 1 集",
+        note: "正片开始"
+      },
+      "2026-07-11T00:00:00.000Z"
+    );
+
+    expect(segment).toMatchObject({
+      id: "segment-1",
+      label: "第 1 集 来源段",
+      kind: "content",
+      sourceStartMs: 7_200_000,
+      sourceEndMs: 7_260_000,
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集",
+      note: "正片开始"
+    });
+  });
+
+  it("忽略范围不会保留分集关联", () => {
+    const segment = createDanmakuSourceSegment("ignored", {
+      kind: "ignored",
+      sourceStartMs: 0,
+      sourceEndMs: 7_200_000,
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集"
+    });
+    const updated = updateDanmakuSourceSegment(segment, {
+      kind: "content",
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集"
+    });
+
+    expect(segment.episodeKey).toBeNull();
+    expect(segment.episodeLabel).toBeNull();
+    expect(updated.kind).toBe("content");
+    expect(updated.episodeKey).toBe("S01E01");
+  });
+
+  it("解析常用来源时间码", () => {
+    expect(parseSourceTimecode("02:00:00.000")).toBe(7_200_000);
+    expect(parseSourceTimecode("24:05.250")).toBe(1_445_250);
+    expect(parseSourceTimecode("00:61")).toBeNull();
+    expect(parseSourceTimecode("bad")).toBeNull();
+  });
+
+  it("摘要提示未标注、重叠和就绪状态", () => {
+    const plan = createPlan();
+    const emptyProject = {
+      ...createEmptyProject(),
+      assets: [createAsset()]
+    };
+
+    expect(createSourceTimelineSummary(emptyProject, plan).status).toBe("needsSegments");
+
+    const segmentA = createDanmakuSourceSegment("segment-a", {
+      kind: "content",
+      sourceStartMs: 0,
+      sourceEndMs: 60_000,
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集"
+    });
+    const segmentB = createDanmakuSourceSegment("segment-b", {
+      kind: "ignored",
+      sourceStartMs: 30_000,
+      sourceEndMs: 90_000,
+      episodeKey: null,
+      episodeLabel: null
+    });
+    expect(
+      createSourceTimelineSummary(
+        {
+          ...emptyProject,
+          danmakuSourceSegments: [segmentA, segmentB]
+        },
+        plan
+      ).findings.some((finding) => finding.title === "来源内容段时间重叠")
+    ).toBe(true);
+
+    const readySummary = createSourceTimelineSummary(
+      {
+        ...emptyProject,
+        danmakuSourceSegments: [
+          segmentA,
+          {
+            ...segmentB,
+            sourceStartMs: 60_000,
+            sourceEndMs: 90_000
+          }
+        ]
+      },
+      plan
+    );
+    expect(readySummary.status).toBe("ready");
+    expect(readySummary.metrics).toContainEqual({ label: "已关联输出", value: "1 集" });
+  });
+});
+
+function createPlan(): BatchMergePlan {
+  return {
+    episodes: [
+      {
+        id: "episode-1",
+        seasonNumber: 1,
+        episodeNumber: 1,
+        label: "第 1 集",
+        fileName: "S01E01.xml",
+        sourceFileNames: ["S01E01.xml"],
+        itemCount: 1,
+        entries: [],
+        warnings: []
+      }
+    ],
+    diagnostics: [],
+    confidence: "high",
+    compensation: {
+      markerCount: 0,
+      totalGapMs: 0,
+      affectedEntryCount: 0,
+      affectedEpisodeCount: 0
+    }
+  };
+}
+
+function createAsset(): DanmakuAsset {
+  return {
+    id: "asset",
+    name: "source",
+    fileName: "source.xml",
+    color: "#4cc9f0",
+    importedAt: "2026-07-11T00:00:00.000Z",
+    warnings: [],
+    items: [
+      {
+        id: "item",
+        assetId: "asset",
+        originalIndex: 0,
+        sourceTimeMs: 0,
+        mode: 1,
+        fontSize: 25,
+        color: 16_777_215,
+        timestamp: 0,
+        pool: 0,
+        userHash: "u",
+        rowId: "r",
+        text: "测试",
+        rawPFields: ["0", "1", "25", "16777215", "0", "0", "u", "r"],
+        enabled: true
+      }
+    ]
+  };
+}

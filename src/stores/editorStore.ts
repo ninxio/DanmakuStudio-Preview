@@ -28,6 +28,12 @@ import {
   summarizeProjectHealthBlockers
 } from "../domain/project/health";
 import { createLocalFileMediaBinding } from "../domain/project/mediaBinding";
+import {
+  createDanmakuSourceSegment,
+  updateDanmakuSourceSegment,
+  type DanmakuSourceSegmentDraft,
+  type DanmakuSourceSegmentPatch
+} from "../domain/project/sourceTimeline";
 import type { EditorProject, EditorSelection, MediaBinding, MediaReference } from "../domain/project/types";
 import {
   getAssetTimeRange,
@@ -112,6 +118,9 @@ interface EditorStore {
   clearMediaBinding: () => void;
   bindCurrentTargetToSeasonEpisode: (episodeKey: string, episodeLabel: string) => void;
   clearSeasonEpisodeBinding: (episodeKey: string) => void;
+  addDanmakuSourceSegment: (draft: DanmakuSourceSegmentDraft) => void;
+  updateDanmakuSourceSegment: (id: string, patch: DanmakuSourceSegmentPatch) => void;
+  deleteDanmakuSourceSegment: (id: string) => void;
   updateMediaDuration: (durationMs: Milliseconds) => void;
   openProjectFromText: (text: string, sourceFileName?: string) => void;
   addAssetToTimeline: (assetId: string) => void;
@@ -346,6 +355,52 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       seasonEpisodeBindings: project.seasonEpisodeBindings.filter((candidate) => candidate.episodeKey !== episodeKey)
     }));
     set({ status: { message: `已清除分集目标原片：${binding.episodeLabel}`, tone: "success" } });
+  },
+
+  addDanmakuSourceSegment: (draft) => {
+    try {
+      const segment = createDanmakuSourceSegment(createId("danmaku_source_segment"), draft);
+      commitProject(set, get, "新增弹幕来源内容段", (project) => ({
+        ...project,
+        danmakuSourceSegments: [...project.danmakuSourceSegments, segment]
+      }));
+      set({ status: { message: `已新增弹幕来源内容段：${segment.label}`, tone: "success" } });
+    } catch (error) {
+      set({ status: createErrorStatus("弹幕来源内容段无效", error) });
+    }
+  },
+
+  updateDanmakuSourceSegment: (id, patch) => {
+    const segment = get().project.danmakuSourceSegments.find((candidate) => candidate.id === id);
+    if (!segment) {
+      set({ status: { message: "弹幕来源内容段不存在。", tone: "warning" } });
+      return;
+    }
+    try {
+      const updatedSegment = updateDanmakuSourceSegment(segment, patch);
+      commitProject(set, get, "更新弹幕来源内容段", (project) => ({
+        ...project,
+        danmakuSourceSegments: project.danmakuSourceSegments.map((candidate) =>
+          candidate.id === id ? updatedSegment : candidate
+        )
+      }));
+      set({ status: { message: `已更新弹幕来源内容段：${updatedSegment.label}`, tone: "success" } });
+    } catch (error) {
+      set({ status: createErrorStatus("弹幕来源内容段更新失败", error) });
+    }
+  },
+
+  deleteDanmakuSourceSegment: (id) => {
+    const segment = get().project.danmakuSourceSegments.find((candidate) => candidate.id === id);
+    if (!segment) {
+      set({ status: { message: "弹幕来源内容段不存在。", tone: "warning" } });
+      return;
+    }
+    commitProject(set, get, "删除弹幕来源内容段", (project) => ({
+      ...project,
+      danmakuSourceSegments: project.danmakuSourceSegments.filter((candidate) => candidate.id !== id)
+    }));
+    set({ status: { message: `已删除弹幕来源内容段：${segment.label}`, tone: "success" } });
   },
 
   updateMediaDuration: (durationMs) => {
