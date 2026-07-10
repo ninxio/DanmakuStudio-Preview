@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
-import { createEmbyItemMediaBinding } from "../../domain/project/mediaBinding";
+import { createEmbyItemMediaBinding, createLocalPathMediaBinding } from "../../domain/project/mediaBinding";
 import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
 import { startTauriAudioAlignmentJob } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
@@ -225,6 +225,45 @@ describe("资源面板", () => {
     expect(screen.queryByLabelText("用户名")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("密码")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "登录" })).not.toBeInTheDocument();
+  });
+
+  it("高级工具展示剧集工作台状态摘要", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="12,1,25,16777215,0,0,u1,r1">第一集</d></i>`,
+      { fileName: "S01E01.xml" }
+    );
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        assets: [asset],
+        mediaBinding: createLocalPathMediaBinding("binding-local", "D:\\media\\full.mkv", 3_000_000),
+        cutMarkers: [
+          {
+            id: "cut-1",
+            name: "片头差异",
+            sourceAtMs: 10_000,
+            targetGapMs: 45_000,
+            note: ""
+          }
+        ]
+      },
+      history: createHistoryState(),
+      selection: { kind: "none", ids: [] },
+      exportDraft: null,
+      alignmentProposal: null,
+      cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+
+    const workbench = screen.getByRole("region", { name: "剧集工作台" });
+    expect(within(workbench).getByText("批量导出就绪")).toBeInTheDocument();
+    expect(within(workbench).getByText("导入 XML")).toBeInTheDocument();
+    expect(within(workbench).getByText("绑定目标原片")).toBeInTheDocument();
+    expect(within(workbench).getByText("导出分集 XML")).toBeInTheDocument();
+    expect(within(workbench).getByText("下一步：导出分集 XML：可使用现有导出按钮生成分集 XML。")).toBeInTheDocument();
   });
 
   it("导出检查会展示人话摘要并按需显示诊断详情", async () => {

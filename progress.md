@@ -1,5 +1,18 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C122 已完成：推进 G7 剧集批量工作台，新增批量整理状态摘要。
+  - 新增 `src/domain/project/seasonWorkbench.ts`，作为不依赖 React 的剧集工作台摘要模型，把 XML 导入、目标原片绑定、分集草案、版本差异复核和导出就绪状态整理成可读步骤。
+  - 资源栏高级工具新增“剧集工作台”面板，展示当前状态、XML 数、目标原片、输出数、版本差异数，以及下一步建议，让用户能从普通使用视角知道一季弹幕现在卡在哪一步。
+  - 面板复用现有真实批量整理、Emby 时长、手动切点、版本差异和“导出分集 XML”流程；不新增假导出按钮，也不直接修改原始 XML。
+  - 分集导出仍走现有序列化和 `validateExportedXml` 复查路径，保持导出前重新解析验证。
+  - 已补充 `seasonWorkbench` 领域测试和资源面板测试，覆盖空项目起步提示、批量导出就绪状态，以及高级工具内的用户可见步骤。
+  - 已重新验证：剧集工作台聚焦测试通过（2 个测试文件 / 36 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、44 个测试文件 / 257 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12376064` 字节，时间 `2026/07/10 23:42:04`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3063831` 字节，时间 `2026/07/10 23:42:04`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c122-season-workbench-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C121 已完成：推进 G7 逐步播放器化第四段，接入 mpv 真实音轨/字幕轨状态。
   - Tauri mpv sidecar 状态新增 `tracks`，轮询时通过 mpv IPC 读取 `track-list`，返回轨道 ID、类型、标题、语言、编码、是否选中和是否外部轨道。
   - 前端 `TauriMpvMediaAdapter` 新增 `getTracks()`，HTML Video fallback 返回空轨道，mpv 后端会把 sidecar 轨道状态同步给预览面板。

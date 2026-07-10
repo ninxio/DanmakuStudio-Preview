@@ -65,6 +65,11 @@ import {
   type ProjectReadinessStatus,
   type ProjectReadinessSummary
 } from "../../domain/project/readiness";
+import {
+  createSeasonWorkbenchSummary,
+  type SeasonWorkbenchStepState,
+  type SeasonWorkbenchSummary
+} from "../../domain/project/seasonWorkbench";
 import type { EditorProject, MediaBinding, MediaReference } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
@@ -196,6 +201,10 @@ export function AssetPanel() {
   const batchMergePlan = useMemo(
     () => buildBatchMergePlan(project.assets, batchMergeOptions),
     [batchMergeOptions, project.assets]
+  );
+  const seasonWorkbench = useMemo(
+    () => createSeasonWorkbenchSummary(project, batchMergePlan, manualRules.warnings),
+    [batchMergePlan, manualRules.warnings, project]
   );
   const cutHintSearch = useMemo(() => createCutHintSearchPlan(cutHintSettings), [cutHintSettings]);
   const suspectedCutCandidates = useMemo(
@@ -541,6 +550,7 @@ export function AssetPanel() {
                           });
                         }}
                       />
+                      <SeasonWorkbenchPanel summary={seasonWorkbench} />
                       <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
                     </>
                   ) : (
@@ -1235,6 +1245,59 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
       ) : null}
     </section>
   );
+}
+
+function SeasonWorkbenchPanel({ summary }: { summary: SeasonWorkbenchSummary }) {
+  return (
+    <section
+      className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+      aria-label="剧集工作台"
+    >
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <WandSparkles size={15} className="text-accent-cyan" />
+        <span>剧集工作台</span>
+        <span className="ml-auto rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
+          {summary.statusLabel}
+        </span>
+      </div>
+      <p className="mt-2 text-[11px] leading-5 text-slate-500">{summary.headline}</p>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {summary.metrics.map((metric) => (
+          <div key={metric.label} className="rounded border border-panel-line bg-[#111318] p-2">
+            <div className="text-[11px] text-slate-500">{metric.label}</div>
+            <div className="mt-1 text-sm font-medium text-slate-100">{metric.value}</div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 grid gap-2">
+        {summary.steps.map((step) => (
+          <div key={step.id} className="grid gap-1 rounded border border-panel-line bg-black/15 p-2">
+            <div className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate text-slate-100">{step.label}</span>
+              <span className={`rounded border px-1.5 py-0.5 text-[11px] ${seasonWorkbenchStepClass(step.state)}`}>
+                {step.stateText}
+              </span>
+            </div>
+            <p className="leading-5 text-slate-500">{step.detail}</p>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 text-[11px] leading-5 text-slate-500">下一步：{summary.nextActionLabel}</p>
+    </section>
+  );
+}
+
+function seasonWorkbenchStepClass(state: SeasonWorkbenchStepState): string {
+  if (state === "complete") {
+    return "border-accent-green/30 bg-accent-green/10 text-accent-green";
+  }
+  if (state === "active") {
+    return "border-accent-cyan/30 bg-accent-cyan/10 text-accent-cyan";
+  }
+  if (state === "blocked") {
+    return "border-accent-yellow/30 bg-accent-yellow/10 text-accent-yellow";
+  }
+  return "border-panel-line bg-black/25 text-slate-500";
 }
 
 function CompensationMarkersPanel({
