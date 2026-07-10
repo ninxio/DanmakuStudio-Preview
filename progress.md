@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C87 已完成：项目持久化封装返回实际下载文件名并补齐 schema v2 文档。
+  - `saveProjectToDownload` 现在会返回 `downloadTextFile` 实际使用的清理后文件名，避免后续 UI 重新接入该封装时只能猜测保存文件名。
+  - 新增项目持久化测试，覆盖项目保存下载名、写出的当前 schemaVersion，以及旧项目文本通过持久化层加载时迁移到当前 schema。
+  - README 项目文件策略已补充当前 schema v2、半开片段源区间 `[sourceInMs, sourceOutMs)`、v1 项目打开迁移和保存时写入当前 schemaVersion 的说明。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/persistence/projectPersistence.test.ts` 成功，1 个测试文件、2 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/180 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:17:06`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997954` 字节，时间 `2026/07/10 13:17:06`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c87-project-persistence-download-name-20260710`。
 - 成熟度提升阶段 C86 已完成：仓库主示例项目升级为 schema v2。
   - `fixtures/projects/three-part-demo.danmaku-project.json` 已从 v1 升到 v2，三个分 P 片段的 `sourceOutMs` 改为半开区间尾界，保证示例本身不再作为旧项目打开。
   - 示例片段的 `timelineStartMs` 已同步微调，保持三个分 P 片段在 v2 半开区间语义下连续排列。
