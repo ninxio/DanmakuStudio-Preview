@@ -64,6 +64,7 @@ describe("资源面板", () => {
     expect(screen.getByText("项目健康")).toBeInTheDocument();
     expect(screen.getByText("需复核")).toBeInTheDocument();
     expect(screen.getByText("没有时间轴片段")).toBeInTheDocument();
+    expect(screen.getByText("01 - 1.1.xml（1 条弹幕）")).toBeInTheDocument();
     expect(screen.getByText("媒体重连")).toBeInTheDocument();
     expect(screen.getByText("不需要")).toBeInTheDocument();
   });
@@ -161,6 +162,7 @@ describe("资源面板", () => {
       }
       await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
       await expect(readBlobText(blob)).resolves.toContain("没有时间轴片段");
+      await expect(readBlobText(blob)).resolves.toContain("01 - 1.1.xml（1 条弹幕）");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
     } finally {

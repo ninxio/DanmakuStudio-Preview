@@ -165,7 +165,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "no-clips",
       severity: "warning",
       title: "没有时间轴片段",
-      detail: "已导入的 XML 还没有放入时间轴，导出前请至少放入一个片段。"
+      detail: "已导入的 XML 还没有放入时间轴，导出前请至少放入一个片段。",
+      evidence: formatNoClipAssetEvidence(project.assets)
     });
   }
   if (missingAssetClipCount > 0) {
@@ -191,7 +192,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "all-clips-disabled",
       severity: "warning",
       title: "所有片段都已禁用",
-      detail: "时间轴上没有启用片段，导出结果可能为空。"
+      detail: "时间轴上没有启用片段，导出结果可能为空。",
+      evidence: formatClipEvidence(project.clips, project.assets)
     });
   }
   if (orphanedDisabledIds.length > 0 || orphanedAdjustmentIds.length > 0) {
@@ -221,7 +223,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "media-needs-reconnect",
       severity: "warning",
       title: "视频引用需要重新连接",
-      detail: "项目文件不会嵌入视频内容，重新打开后需要再次导入本地视频才能恢复预览。"
+      detail: "项目文件不会嵌入视频内容，重新打开后需要再次导入本地视频才能恢复预览。",
+      evidence: formatMediaEvidence(project.media)
     });
   }
   if (project.media && project.media.durationMs === null) {
@@ -229,7 +232,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "media-duration-missing",
       severity: "warning",
       title: "视频时长未知",
-      detail: "预览视频尚未读取到时长，时间轴总长会更多依赖片段和弹幕范围。"
+      detail: "预览视频尚未读取到时长，时间轴总长会更多依赖片段和弹幕范围。",
+      evidence: formatMediaEvidence(project.media)
     });
   }
   if (importWarningCount > 0) {
@@ -440,6 +444,28 @@ function formatNegativeFinalTimeEvidence(events: ResolvedDanmakuEvent[]): string
     } 条：${formatSignedDuration(event.finalTimeMs)}，${formatLimitedText(text)}`;
   });
   return appendOmittedEvidenceNote(evidence, events.length, "条负最终时间");
+}
+
+function formatNoClipAssetEvidence(assets: DanmakuAsset[]): string[] {
+  const evidence = assets.slice(0, EVIDENCE_PREVIEW_LIMIT).map((asset) => {
+    return `${asset.fileName}（${asset.items.length.toLocaleString("zh-CN")} 条弹幕）`;
+  });
+  return appendOmittedEvidenceNote(evidence, assets.length, "个资源");
+}
+
+function formatClipEvidence(clips: DanmakuClip[], assets: DanmakuAsset[]): string[] {
+  const assetFileNames = new Map(assets.map((asset) => [asset.id, asset.fileName]));
+  const evidence = clips.slice(0, EVIDENCE_PREVIEW_LIMIT).map((clip) => {
+    const assetFileName = assetFileNames.get(clip.assetId) ?? `缺失资源 ${clip.assetId}`;
+    return `${clip.name} / ${assetFileName}（时间轴 ${formatTimecode(clip.timelineStartMs)}，源区间 ${formatTimecode(
+      clip.sourceInMs
+    )} - ${formatTimecode(clip.sourceOutMs)}）`;
+  });
+  return appendOmittedEvidenceNote(evidence, clips.length, "个片段");
+}
+
+function formatMediaEvidence(media: NonNullable<EditorProject["media"]>): string[] {
+  return [`${media.fileName}（名称：${media.name}）`];
 }
 
 function formatMissingAssetClipEvidence(clips: DanmakuClip[]): string[] {

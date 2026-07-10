@@ -199,10 +199,61 @@ describe("project health", () => {
     );
     expect(summary.findings).toContainEqual(
       expect.objectContaining({
+        id: "media-needs-reconnect",
+        evidence: ["demo.mp4（名称：示例视频）"]
+      })
+    );
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "media-duration-missing",
+        evidence: ["demo.mp4（名称：示例视频）"]
+      })
+    );
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
         id: "low-confidence-anchors",
         evidence: ["anchor（自动，00:00:01.000 -> 00:00:01.200，置信度 60%）"]
       })
     );
+  });
+
+  it("提示没有时间轴片段和所有片段禁用时显示证据", () => {
+    const asset = createAsset("asset", [createItem("item-1")]);
+    const noClipSummary = createProjectHealthSummary({
+      ...createEmptyProject(),
+      assets: [asset]
+    });
+    const disabledClipSummary = createProjectHealthSummary({
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-disabled",
+          assetId: "asset",
+          name: "禁用片段",
+          timelineStartMs: 5000,
+          sourceInMs: 0,
+          sourceOutMs: 3000,
+          localOffsetMs: 0,
+          enabled: false
+        }
+      ]
+    });
+    const report = createProjectHealthReport("禁用项目", disabledClipSummary);
+
+    expect(noClipSummary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "no-clips",
+        evidence: ["asset.xml（1 条弹幕）"]
+      })
+    );
+    expect(disabledClipSummary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "all-clips-disabled",
+        evidence: ["禁用片段 / asset.xml（时间轴 00:00:05.000，源区间 00:00:00.000 - 00:00:03.000）"]
+      })
+    );
+    expect(report).toContain("禁用片段 / asset.xml");
   });
 
   it("提示空片段和 0ms 补偿点时显示证据", () => {

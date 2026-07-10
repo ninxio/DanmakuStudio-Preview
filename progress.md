@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C60 已完成：补齐基础健康项定位证据。
+  - “没有时间轴片段”现在会列出已导入 XML 资源及弹幕数量，方便确认哪些资源还没放入时间轴。
+  - “所有片段都已禁用”现在会列出禁用片段名、资源文件、时间轴位置和源区间。
+  - “视频引用需要重新连接”和“视频时长未知”现在会列出对应视频文件名和媒体名称，健康报告中也会写入这些证据。
+  - README 已同步健康证据覆盖范围；Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 已补充领域层和资源栏组件测试，覆盖未放入时间轴资源、全部禁用片段和媒体文件证据。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、31 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、32 个测试文件/152 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:03:17`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996113` 字节，时间 `2026/07/10 11:03:17`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c60-health-basic-evidence-20260710`。
 - 成熟度提升阶段 C59 已完成：新增一键 release 验证命令。
   - 新增 `corepack pnpm verify:release`，依次执行统一验证、Playwright E2E 和 Tauri release 打包，方便后续可安装阶段一条命令复现完整验收链路。
   - README 已同步开发命令列表，加入 `verify:release`；Playwright 截图产物已随本轮 E2E 验证重新生成。
