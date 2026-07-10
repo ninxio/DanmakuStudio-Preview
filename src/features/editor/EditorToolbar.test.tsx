@@ -62,6 +62,49 @@ describe("编辑器工具栏", () => {
     expect(screen.getByLabelText("导出 XML")).toBeEnabled();
   });
 
+  it("顶部保存项目时使用实际文件名更新状态", () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:toolbar-project");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+
+    try {
+      useEditorStore.setState({
+        project: {
+          ...createEmptyProject(),
+          name: "保存/项目:草稿"
+        }
+      });
+
+      render(<EditorToolbar />);
+      fireEvent.click(screen.getByLabelText("保存项目"));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("顶部项目保存未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("保存_项目_草稿.danmaku-project.json");
+      expect(useEditorStore.getState().status.message).toBe("已保存项目文件：保存_项目_草稿.danmaku-project.json。");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:toolbar-project");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
   it("顶部导出对齐提案时使用项目名生成文件名", () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
@@ -94,6 +137,9 @@ describe("编辑器工具栏", () => {
         throw new Error("顶部对齐提案下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("工具栏_对齐_项目-alignment-proposal.json");
+      expect(useEditorStore.getState().status.message).toBe(
+        "已导出对齐提案 JSON：工具栏_对齐_项目-alignment-proposal.json。"
+      );
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:toolbar-alignment-proposal");
     } finally {
       clickSpy.mockRestore();

@@ -62,6 +62,24 @@ export function EditorToolbar() {
     resolveProjectDanmakuEvents(state.project).some((event) => event.enabled)
   );
 
+  const saveProjectFile = () => {
+    const fileName = downloadTextFile(
+      createProjectDownloadFileName(project.name, ".danmaku-project.json"),
+      serializeProject(project),
+      "application/json;charset=utf-8"
+    );
+    useEditorStore.setState({ status: { message: `已保存项目文件：${fileName}。`, tone: "success" } });
+  };
+
+  const downloadAlignmentProposal = () => {
+    const fileName = downloadTextFile(
+      createProjectDownloadFileName(project.name, "-alignment-proposal.json"),
+      exportAlignmentProposal(),
+      "application/json"
+    );
+    useEditorStore.setState({ status: { message: `已导出对齐提案 JSON：${fileName}。`, tone: "success" } });
+  };
+
   return (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b border-panel-line bg-[#111318] px-3">
       <IconButton label="新建项目" icon={<FilePlus size={16} />} onClick={newProject} />
@@ -69,13 +87,7 @@ export function EditorToolbar() {
       <IconButton
         label="保存项目"
         icon={<Save size={16} />}
-        onClick={() =>
-          downloadTextFile(
-            createProjectDownloadFileName(project.name, ".danmaku-project.json"),
-            serializeProject(project),
-            "application/json;charset=utf-8"
-          )
-        }
+        onClick={saveProjectFile}
       />
       <span className="mx-1 h-6 w-px bg-panel-line" />
       <IconButton label="导入视频" icon={<Video size={16} />} onClick={() => videoInputRef.current?.click()} />
@@ -130,13 +142,7 @@ export function EditorToolbar() {
       </TextButton>
       <TextButton
         title="导出对齐提案 JSON"
-        onClick={() =>
-          downloadTextFile(
-            createProjectDownloadFileName(project.name, "-alignment-proposal.json"),
-            exportAlignmentProposal(),
-            "application/json"
-          )
-        }
+        onClick={downloadAlignmentProposal}
         className="hidden xl:inline-flex"
       >
         导出对齐

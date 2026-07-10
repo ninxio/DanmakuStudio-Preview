@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C74 已完成：顶部工具栏下载入口显示实际文件名。
+  - 顶部“保存项目”现在会使用浏览器实际下载文件名更新状态提示，显示清理后的 `.danmaku-project.json` 文件名。
+  - 顶部“导出对齐”现在会在状态提示中显示实际对齐提案 JSON 文件名，和资源面板导出入口保持一致。
+  - 已补充工具栏测试，覆盖保存项目下载文件名、状态提示，以及对齐提案导出后的状态提示。
+  - 已重新验证：`corepack pnpm test -- src/features/editor/EditorToolbar.test.tsx` 成功，1 个测试文件、6 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/164 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:13:33`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997381` 字节，时间 `2026/07/10 12:13:33`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c74-toolbar-download-file-name-status-20260710`。
 - 成熟度提升阶段 C73 已完成：项目健康报告导出状态显示实际文件名。
   - 资源面板“项目信息”里的健康报告下载现在复用 `createProjectDownloadFileName`，并在状态提示中显示清理后的实际报告文件名。
   - 已补充资源面板测试，覆盖健康报告下载后的状态提示。
