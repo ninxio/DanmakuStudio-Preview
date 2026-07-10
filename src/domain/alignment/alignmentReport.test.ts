@@ -33,6 +33,7 @@ describe("alignment review report", () => {
     expect(report).toContain("整体置信度：82.0%");
     expect(report).toContain("暂无应用阻断。");
     expect(report).toContain("[anchor-1] 自动");
+    expect(report).toContain("落点状态：待应用");
     expect(report).toContain("偏移：+00:00:20.000 (20000 ms)");
     expect(report).toContain("[audio-gap-1] 音频推断补偿 1");
     expect(report).toContain("不确定区间：00:00:18.000 (18000 ms) - 00:00:22.000 (22000 ms)");
@@ -109,6 +110,11 @@ describe("alignment review report", () => {
       "1 个候选补偿的不确定区间起止顺序异常，请修正后再应用。",
       "1 个候选补偿的源时间不在不确定区间内，请修正后再应用。"
     ]);
+    const report = createAlignmentReviewReport(proposal, new Date("2026-07-10T01:02:03.000Z"));
+    expect(report).toContain("落点状态：阻断（缺少 ID）");
+    expect(report).toContain("落点状态：阻断（提案内 ID 重复）");
+    expect(report).toContain("落点状态：阻断（不确定区间起止异常）");
+    expect(report).toContain("落点状态：阻断（提案内 ID 重复；源时间不在不确定区间内）");
   });
 
   it("识别和当前项目已有 ID 冲突的提案", () => {
@@ -184,5 +190,19 @@ describe("alignment review report", () => {
       "1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
       "1 个候选补偿 ID 已存在于当前项目（ID：cut-existing），应用会丢失新补偿。"
     ]);
+    const equivalentReport = createAlignmentReviewReport(
+      equivalentProposal,
+      new Date("2026-07-10T01:02:03.000Z"),
+      context
+    );
+    const conflictReport = createAlignmentReviewReport(
+      conflictProposal,
+      new Date("2026-07-10T01:02:03.000Z"),
+      context
+    );
+    expect(equivalentReport).toContain("落点状态：已落点（当前项目已有等价锚点）");
+    expect(equivalentReport).toContain("落点状态：已落点（当前项目已有等价补偿点）");
+    expect(conflictReport).toContain("落点状态：阻断（当前项目已有同 ID 锚点）");
+    expect(conflictReport).toContain("落点状态：阻断（当前项目已有同 ID 补偿点）");
   });
 });

@@ -20,6 +20,7 @@ export function createAlignmentReviewReport(
   context: AlignmentApplyBlockerContext = {}
 ): string {
   const applyBlockers = createAlignmentApplyBlockers(proposal, context);
+  const statusContext = createReviewStatusContext(proposal, context);
   const lines = [
     "# 对齐提案复核报告",
     "",
@@ -35,10 +36,10 @@ export function createAlignmentReviewReport(
     ...createAlignmentReviewFocus(proposal).map((item) => `- ${item}`),
     "",
     "## 同步锚点",
-    ...createAnchorLines(proposal),
+    ...createAnchorLines(proposal, statusContext),
     "",
     "## 候选补偿",
-    ...createCutCandidateLines(proposal.cutCandidates),
+    ...createCutCandidateLines(proposal.cutCandidates, statusContext),
     "",
     "## 诊断信息",
     ...createDiagnosticLines(proposal.diagnostics)
@@ -94,15 +95,8 @@ export function createAlignmentApplyBlockers(
     pendingCutCandidates.map((candidate) => candidate.id),
     readExistingCutMarkerIds(context)
   );
-  const invalidRangeCount = pendingCutCandidates.filter(
-    (candidate) => hasCompleteSourceRange(candidate) && candidate.sourceRangeStartMs > candidate.sourceRangeEndMs
-  ).length;
-  const sourceOutsideRangeCount = pendingCutCandidates.filter(
-    (candidate) =>
-      hasCompleteSourceRange(candidate) &&
-      candidate.sourceRangeStartMs <= candidate.sourceRangeEndMs &&
-      (candidate.sourceAtMs < candidate.sourceRangeStartMs || candidate.sourceAtMs > candidate.sourceRangeEndMs)
-  ).length;
+  const invalidRangeCount = pendingCutCandidates.filter(hasInvalidSourceRange).length;
+  const sourceOutsideRangeCount = pendingCutCandidates.filter(isSourceOutsideRange).length;
 
   if (emptyAnchorIdCount > 0) {
     blockers.push(`${emptyAnchorIdCount} 个同步锚点缺少 ID，无法安全写入项目。`);
@@ -143,7 +137,7 @@ export function createAlignmentApplyBlockers(
   return blockers;
 }
 
-function createAnchorLines(proposal: AlignmentProposal): string[] {
+function createAnchorLines(proposal: AlignmentProposal, statusContext: AlignmentReviewStatusContext): string[] {
   if (proposal.anchors.length === 0) {
     return ["- 暂无同步锚点。"];
   }
@@ -152,6 +146,7 @@ function createAnchorLines(proposal: AlignmentProposal): string[] {
     const confidence = anchor.confidence === undefined ? "未提供" : formatConfidence(anchor.confidence);
     return [
       `- ${index + 1}. [${anchor.id}] ${anchor.origin === "automatic" ? "自动" : "手动"}`,
+      `  落点状态：${createAnchorStatus(anchor, statusContext)}`,
       `  源时间：${formatTime(anchor.sourceMs)}`,
       `  目标时间：${formatTime(anchor.targetMs)}`,
       `  偏移：${formatSignedDuration(offsetMs)} (${offsetMs} ms)`,
@@ -160,7 +155,10 @@ function createAnchorLines(proposal: AlignmentProposal): string[] {
   });
 }
 
-function createCutCandidateLines(candidates: CutCandidate[]): string[] {
+function createCutCandidateLines(
+  candidates: CutCandidate[],
+  statusContext: AlignmentReviewStatusContext
+): string[] {
   if (candidates.length === 0) {
     return ["- 暂无候选补偿。"];
   }
@@ -168,6 +166,7 @@ function createCutCandidateLines(candidates: CutCandidate[]): string[] {
     const sourceRangeLine = createSourceRangeLine(candidate);
     return [
       `- ${index + 1}. [${candidate.id}] ${candidate.name}`,
+      `  落点状态：${createCutCandidateStatus(candidate, statusContext)}`,
       `  源时间：${formatTime(candidate.sourceAtMs)}`,
       `  ${sourceRangeLine}`,
       `  补偿：${formatSignedDuration(candidate.targetGapMs)} (${Math.round(candidate.targetGapMs)} ms)`,
@@ -200,6 +199,77 @@ function createApplyBlockerLines(blockers: string[]): string[] {
     return ["- 暂无应用阻断。"];
   }
   return blockers.map((blocker, index) => `- ${index + 1}. ${blocker}`);
+}
+
+interface AlignmentReviewStatusContext {
+  applyContext: AlignmentApplyBlockerContext;
+  duplicateAnchorIds: Set<string>;
+  duplicateCutIds: Set<string>;
+}
+
+function createReviewStatusContext(
+  proposal: AlignmentProposal,
+  context: AlignmentApplyBlockerContext
+): AlignmentReviewStatusContext {
+  return {
+    applyContext: context,
+    duplicateAnchorIds: new Set(findDuplicateIds(proposal.anchors.map((anchor) => anchor.id))),
+    duplicateCutIds: new Set(findDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id)))
+  };
+}
+
+function createAnchorStatus(anchor: SyncAnchor, statusContext: AlignmentReviewStatusContext): string {
+  const context = statusContext.applyContext;
+  if (context.existingAnchors && isAlignmentAnchorApplied(context.existingAnchors, anchor)) {
+    return "已落点（当前项目已有等价锚点）";
+  }
+  const reasons: string[] = [];
+  if (anchor.id.trim().length === 0) {
+    reasons.push("缺少 ID");
+  } else {
+    if (hasExistingId(anchor.id, readExistingAnchorIds(context))) {
+      reasons.push("当前项目已有同 ID 锚点");
+    }
+    if (hasDuplicateId(anchor.id, statusContext.duplicateAnchorIds)) {
+      reasons.push("提案内 ID 重复");
+    }
+  }
+  return createPendingStatus(reasons);
+}
+
+function createCutCandidateStatus(
+  candidate: CutCandidate,
+  statusContext: AlignmentReviewStatusContext
+): string {
+  const context = statusContext.applyContext;
+  if (context.existingCutMarkers && isAlignmentCutCandidateApplied(context.existingCutMarkers, candidate)) {
+    return "已落点（当前项目已有等价补偿点）";
+  }
+  const reasons: string[] = [];
+  if (candidate.id.trim().length === 0) {
+    reasons.push("缺少 ID");
+  } else {
+    if (hasExistingId(candidate.id, readExistingCutMarkerIds(context))) {
+      reasons.push("当前项目已有同 ID 补偿点");
+    }
+    if (hasDuplicateId(candidate.id, statusContext.duplicateCutIds)) {
+      reasons.push("提案内 ID 重复");
+    }
+  }
+  if (hasInvalidSourceRange(candidate)) {
+    reasons.push("不确定区间起止异常");
+  }
+  if (isSourceOutsideRange(candidate)) {
+    reasons.push("源时间不在不确定区间内");
+  }
+  return createPendingStatus(reasons);
+}
+
+function createPendingStatus(blockReasons: string[]): string {
+  if (blockReasons.length === 0) {
+    return "待应用";
+  }
+  return `阻断（${blockReasons.join("；")}）`;
 }
 
 function createPendingAnchorsForBlockers(
@@ -238,6 +308,28 @@ function hasCompleteSourceRange(
   candidate: CutCandidate
 ): candidate is CutCandidate & { sourceRangeStartMs: number; sourceRangeEndMs: number } {
   return candidate.sourceRangeStartMs !== undefined && candidate.sourceRangeEndMs !== undefined;
+}
+
+function hasExistingId(id: string, existingIds: string[]): boolean {
+  const normalized = id.trim();
+  return normalized.length > 0 && existingIds.some((existingId) => existingId.trim() === normalized);
+}
+
+function hasDuplicateId(id: string, duplicateIds: Set<string>): boolean {
+  const normalized = id.trim();
+  return normalized.length > 0 && duplicateIds.has(normalized);
+}
+
+function hasInvalidSourceRange(candidate: CutCandidate): boolean {
+  return hasCompleteSourceRange(candidate) && candidate.sourceRangeStartMs > candidate.sourceRangeEndMs;
+}
+
+function isSourceOutsideRange(candidate: CutCandidate): boolean {
+  return (
+    hasCompleteSourceRange(candidate) &&
+    candidate.sourceRangeStartMs <= candidate.sourceRangeEndMs &&
+    (candidate.sourceAtMs < candidate.sourceRangeStartMs || candidate.sourceAtMs > candidate.sourceRangeEndMs)
+  );
 }
 
 function findDuplicateIds(ids: string[]): string[] {
