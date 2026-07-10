@@ -191,6 +191,12 @@ describe("project health", () => {
         evidence: ["失效禁用：missing-item", "失效微调：missing-item（+00:00:00.100）"]
       })
     );
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "import-warnings",
+        evidence: ["asset.xml / 文件级 / 警告：跳过一条坏弹幕，片段：<d/>"]
+      })
+    );
   });
 
   it("提示会在导出时被限制为 0ms 的负最终时间", () => {

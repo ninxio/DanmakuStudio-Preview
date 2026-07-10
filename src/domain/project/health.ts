@@ -1,4 +1,4 @@
-import type { DanmakuAsset, DanmakuClip, ResolvedDanmakuEvent } from "../danmaku/types";
+import type { DanmakuAsset, DanmakuClip, ImportWarning, ResolvedDanmakuEvent } from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import type { EditorProject } from "./types";
@@ -224,7 +224,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "import-warnings",
       severity: "warning",
       title: "导入时存在警告",
-      detail: `${importWarningCount.toLocaleString("zh-CN")} 条 XML 导入警告会保存在项目中，导出前建议抽样复核。`
+      detail: `${importWarningCount.toLocaleString("zh-CN")} 条 XML 导入警告会保存在项目中，导出前建议抽样复核。`,
+      evidence: formatImportWarningEvidence(project.assets)
     });
   }
   if (lowConfidenceAnchorCount > 0) {
@@ -446,6 +447,31 @@ function formatOrphanedEditEvidence(
   ];
   const evidence = rows.slice(0, EVIDENCE_PREVIEW_LIMIT);
   return appendOmittedEvidenceNote(evidence, rows.length, "条失效编辑引用");
+}
+
+function formatImportWarningEvidence(assets: DanmakuAsset[]): string[] {
+  const rows = assets.flatMap((asset) =>
+    asset.warnings.map((warning) => {
+      const location = warning.originalIndex === null ? "文件级" : `第 ${warning.originalIndex + 1} 条`;
+      const snippet = warning.rawSnippet.trim();
+      const snippetText = snippet.length > 0 ? `，片段：${formatLimitedText(snippet)}` : "";
+      return `${asset.fileName} / ${location} / ${importWarningSeverityLabel(warning.severity)}：${
+        warning.message
+      }${snippetText}`;
+    })
+  );
+  const evidence = rows.slice(0, EVIDENCE_PREVIEW_LIMIT);
+  return appendOmittedEvidenceNote(evidence, rows.length, "条导入警告");
+}
+
+function importWarningSeverityLabel(severity: ImportWarning["severity"]): string {
+  if (severity === "error") {
+    return "错误";
+  }
+  if (severity === "warning") {
+    return "警告";
+  }
+  return "信息";
 }
 
 function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {

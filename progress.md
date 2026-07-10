@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C52 已完成：导入警告健康项显示资源级证据。
+  - 项目健康摘要中的“导入时存在警告”现在会列出资源文件、原始序号或文件级位置、严重度、警告消息和短 raw snippet。
+  - 证据会进入资源栏“项目信息”、健康报告和导出摘要健康预检，用户导出前可以直接看到 XML 导入阶段留下的具体风险。
+  - README 已同步：导入警告也会列出具体出现位置，并写入健康报告。
+  - 已补充领域层测试，确认导入警告证据内容；导出对话框测试确认健康预检直接展示导入警告证据。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/export/ExportDialog.test.tsx` 成功，2 个测试文件、14 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、149 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:19:52`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998453` 字节，时间 `2026/07/10 10:19:52`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c52-health-import-warning-evidence-20260710`。
 - 成熟度提升阶段 C51 已完成：失效编辑引用健康项显示具体 ID。
   - 项目健康摘要中的“存在失效编辑引用”现在会列出失效禁用 item ID，以及失效单条微调 item ID 和对应微调值。
   - 证据会显示在资源栏“项目信息”、健康报告和相关 E2E 复核路径中，清理前用户可以看到将被移除的非破坏性编辑引用。

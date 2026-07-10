@@ -97,6 +97,7 @@ describe("导出摘要", () => {
 
       expect(screen.getAllByText("需复核").length).toBeGreaterThan(0);
       expect(screen.getByText("导入时存在警告")).toBeInTheDocument();
+      expect(screen.getByText("asset.xml / 文件级 / 警告：跳过一条坏弹幕，片段：<d/>")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "下载健康报告" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
