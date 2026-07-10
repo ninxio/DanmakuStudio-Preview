@@ -1,5 +1,5 @@
 import type { DanmakuAsset, DanmakuClip } from "../danmaku/types";
-import type { Milliseconds } from "../shared/time";
+import { formatTimecode, type Milliseconds } from "../shared/time";
 import type { EditorProject } from "./types";
 
 export type ProjectHealthStatus = "ready" | "attention" | "blocked";
@@ -223,6 +223,40 @@ export function cleanupProjectEditReferences(project: EditorProject): ProjectEdi
   };
 }
 
+export function createProjectHealthReport(projectName: string, summary: ProjectHealthSummary): string {
+  const lines = [
+    "项目健康报告",
+    `项目：${projectName.trim().length > 0 ? projectName : "未命名项目"}`,
+    `状态：${summary.statusLabel}`,
+    `说明：${summary.statusDetail}`,
+    "",
+    "关键计数：",
+    `资源：${summary.metrics.assetCount.toLocaleString("zh-CN")} 个`,
+    `弹幕：${summary.metrics.enabledItemCount.toLocaleString("zh-CN")} / ${summary.metrics.itemCount.toLocaleString(
+      "zh-CN"
+    )} 条启用`,
+    `片段：${summary.metrics.activeClipCount.toLocaleString("zh-CN")} / ${summary.metrics.clipCount.toLocaleString(
+      "zh-CN"
+    )} 个启用`,
+    `补偿点：${summary.metrics.cutMarkerCount.toLocaleString("zh-CN")} 个`,
+    `总补偿：${formatSignedDuration(summary.metrics.totalCutGapMs)}`,
+    `同步锚点：${summary.metrics.syncAnchorCount.toLocaleString("zh-CN")} 个`,
+    `导入警告：${summary.metrics.importWarningCount.toLocaleString("zh-CN")} 条`,
+    `单条微调：${summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} 条`,
+    `失效编辑引用：${summary.metrics.orphanedEditReferenceCount.toLocaleString("zh-CN")} 条`,
+    `媒体重连：${summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"}`,
+    "",
+    "复核清单："
+  ];
+  summary.findings.forEach((finding, index) => {
+    lines.push(
+      `${index + 1}. [${severityLabel(finding.severity)}] ${finding.title}`,
+      `   ${finding.detail}`
+    );
+  });
+  return `${lines.join("\n")}\n`;
+}
+
 function collectProjectItemIds(project: EditorProject): Set<string> {
   return new Set(project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
 }
@@ -297,4 +331,19 @@ function statusToDetail(status: ProjectHealthStatus): string {
     return "项目可继续编辑，但保存、重开或导出前建议复核提示项。";
   }
   return "项目结构健康，可继续保存、重开和导出。";
+}
+
+function severityLabel(severity: ProjectHealthFindingSeverity): string {
+  if (severity === "error") {
+    return "需处理";
+  }
+  if (severity === "warning") {
+    return "需复核";
+  }
+  return "信息";
+}
+
+function formatSignedDuration(milliseconds: Milliseconds): string {
+  const sign = milliseconds < 0 ? "-" : "+";
+  return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
 }

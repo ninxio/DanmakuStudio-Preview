@@ -33,6 +33,7 @@ import {
 import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
 import type { CutMarker, SyncAnchor } from "../../domain/danmaku/types";
 import {
+  createProjectHealthReport,
   createProjectHealthSummary,
   type ProjectHealthFinding,
   type ProjectHealthStatus,
@@ -367,7 +368,11 @@ export function AssetPanel() {
         ) : null}
         {tab === "project" ? (
           <div className="grid gap-3 text-xs text-slate-400">
-            <ProjectHealthPanel summary={projectHealth} onCleanupEditReferences={cleanupProjectEditReferences} />
+            <ProjectHealthPanel
+              projectName={project.name}
+              summary={projectHealth}
+              onCleanupEditReferences={cleanupProjectEditReferences}
+            />
             <div className="rounded border border-panel-line bg-panel-soft p-3">
               <h3 className="mb-2 text-sm font-medium text-slate-100">{project.name}</h3>
               <Row label="资源数" value={project.assets.length.toString()} />
@@ -1857,9 +1862,11 @@ function confidenceLabel(confidence: "high" | "medium" | "low"): string {
 }
 
 function ProjectHealthPanel({
+  projectName,
   summary,
   onCleanupEditReferences
 }: {
+  projectName: string;
   summary: ProjectHealthSummary;
   onCleanupEditReferences: () => void;
 }) {
@@ -1903,14 +1910,26 @@ function ProjectHealthPanel({
           <ProjectHealthFindingRow key={finding.id} finding={finding} />
         ))}
       </ul>
-      {summary.metrics.orphanedEditReferenceCount > 0 ? (
-        <div className="mt-3 flex justify-end">
+      <div className="mt-3 flex flex-wrap justify-end gap-2">
+        <TextButton
+          onClick={() =>
+            downloadTextFile(
+              "project-health-report.txt",
+              createProjectHealthReport(projectName, summary),
+              "text/plain;charset=utf-8"
+            )
+          }
+        >
+          <Download size={14} />
+          导出健康报告
+        </TextButton>
+        {summary.metrics.orphanedEditReferenceCount > 0 ? (
           <TextButton onClick={onCleanupEditReferences}>
             <Trash2 size={14} />
             清理失效引用
           </TextButton>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
     </section>
   );
 }

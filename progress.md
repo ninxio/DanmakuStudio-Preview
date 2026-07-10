@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C35 已完成：项目健康摘要支持导出健康报告。
+  - 项目健康领域层新增 `createProjectHealthReport`，可把当前健康状态、关键计数、媒体重连状态和复核清单生成纯文本报告。
+  - 资源栏“项目信息”的项目健康面板新增真实“导出健康报告”按钮，会下载 `project-health-report.txt`，方便保存、重开或导出前留档排查。
+  - README 已同步：项目健康摘要现在可下载健康报告，并继续支持清理失效禁用/微调引用。
+  - 已补充领域报告文本测试和资源面板下载测试。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、22 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、136 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:51:50`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998061` 字节，时间 `2026/07/10 8:51:50`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c35-project-health-report-20260710`。
 - 成熟度提升阶段 C34 已完成：Playwright E2E 覆盖项目健康清理动作的撤销/重做。
   - 核心 E2E 流程会在保存项目后构造一份带失效 `disabledItemIds` 和 `itemTimeAdjustments` 的项目文件，再重新打开该项目。
   - E2E 会进入“项目信息”，确认项目健康面板显示“需复核”和“存在失效编辑引用”，点击“清理失效引用”后断言状态栏显示已清理 2 条失效引用，并确认健康提示恢复。

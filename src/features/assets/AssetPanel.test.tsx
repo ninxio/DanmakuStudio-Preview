@@ -68,6 +68,45 @@ describe("资源面板", () => {
     expect(screen.getByText("不需要")).toBeInTheDocument();
   });
 
+  it("可以从项目健康摘要导出健康报告", async () => {
+    const user = userEvent.setup();
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:project-health-report");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+
+    try {
+      render(<AssetPanel />);
+      await user.click(screen.getByRole("button", { name: "项目信息" }));
+      await user.click(screen.getByRole("button", { name: "导出健康报告" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const [blob] = createObjectUrl.mock.calls[0];
+      if (!(blob instanceof Blob)) {
+        throw new Error("导出的健康报告不是 Blob。");
+      }
+      await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
+      await expect(readBlobText(blob)).resolves.toContain("没有时间轴片段");
+      expect(clickSpy).toHaveBeenCalledTimes(1);
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
   it("可以从项目健康摘要清理失效编辑引用", async () => {
     const user = userEvent.setup();
     const project = useEditorStore.getState().project;

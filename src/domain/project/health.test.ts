@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "./factory";
-import { cleanupProjectEditReferences, createProjectHealthSummary } from "./health";
+import { cleanupProjectEditReferences, createProjectHealthReport, createProjectHealthSummary } from "./health";
 
 describe("project health", () => {
   it("为空项目提示需要导入 XML", () => {
@@ -159,6 +159,22 @@ describe("project health", () => {
     expect(cleanup.removedItemAdjustments).toBe(1);
     expect(cleanup.project.disabledItemIds).toEqual(["item-1"]);
     expect(cleanup.project.itemTimeAdjustments).toEqual({ "item-1": 100 });
+  });
+
+  it("可生成项目健康报告文本", () => {
+    const summary = createProjectHealthSummary({
+      ...createEmptyProject("报告项目"),
+      assets: [createAsset("asset", [createItem("item-1")])],
+      disabledItemIds: ["missing-disabled"]
+    });
+
+    const report = createProjectHealthReport("报告项目", summary);
+
+    expect(report).toContain("项目健康报告");
+    expect(report).toContain("项目：报告项目");
+    expect(report).toContain("状态：需复核");
+    expect(report).toContain("失效编辑引用：1 条");
+    expect(report).toContain("[需复核] 存在失效编辑引用");
   });
 });
 
