@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C76 已完成：单分集导出反馈实际 XML 文件名。
+  - `downloadTextFiles` 现在会统一返回 `downloadedFileName`，单文件下载时为实际 XML 文件名，多文件下载时为实际 ZIP 文件名，空下载时为 `null`。
+  - 资源面板“导出分集”在只有 1 个分集 XML 时会显示实际 XML 文件名；多个分集时继续显示实际 ZIP 文件名。
+  - 已补充下载基础设施和资源面板测试，覆盖单文件批量下载返回值、单分集导出状态和多分集 ZIP 状态。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、28 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/166 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:22:33`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996245` 字节，时间 `2026/07/10 12:22:33`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c76-single-batch-export-file-name-status-20260710`。
 - 成熟度提升阶段 C75 已完成：导出摘要弹窗下载后显示实际文件名。
   - 导出摘要弹窗的“下载健康报告”“下载导出报告”和“下载 XML”现在都会使用 `downloadTextFile` 返回的实际下载文件名更新全局状态提示。
   - 下载 XML 后仍会关闭导出摘要，但保留“已导出 XML：文件名”的成功反馈，避免用户无法确认落盘文件。

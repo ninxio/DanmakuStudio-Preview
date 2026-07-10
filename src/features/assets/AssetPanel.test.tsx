@@ -373,6 +373,58 @@ describe("资源面板", () => {
     }
   });
 
+  it("导出单个分集时状态显示实际 XML 文件名", async () => {
+    const user = userEvent.setup();
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:single-batch-merge");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u1,r1">单集</d></i>`,
+      { fileName: "01 - 1.1.xml" }
+    );
+
+    try {
+      useEditorStore.setState({
+        project: {
+          ...createEmptyProject(),
+          name: "单集/导出:项目",
+          assets: [asset]
+        },
+        history: createHistoryState(),
+        selection: { kind: "none", ids: [] }
+      });
+
+      render(<AssetPanel />);
+      await user.click(screen.getByRole("button", { name: "弹幕文件" }));
+      await user.click(screen.getByRole("button", { name: "导出分集" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("单分集 XML 下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("1 - 1.xml");
+      expect(useEditorStore.getState().status.message).toBe("已触发下载 1 个分集 XML：1 - 1.xml。");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:single-batch-merge");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
   it("可以在补偿点管理面板定位、微调并删除补偿点", async () => {
     const user = userEvent.setup();
     useEditorStore.setState({

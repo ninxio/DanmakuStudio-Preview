@@ -61,6 +61,40 @@ describe("浏览器文件导出", () => {
     }
   });
 
+  it("单文件批量下载返回实际使用的文件名", () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:text-files-download");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+
+    try {
+      const result = downloadTextFiles([{ fileName: "单集/导出?.xml", content: "<i />" }], "application/xml;charset=utf-8");
+
+      expect(result).toEqual({ fileCount: 1, archiveFileName: null, downloadedFileName: "单集_导出_.xml" });
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("单文件批量下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("单集_导出_.xml");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:text-files-download");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
   it("多文件下载支持自定义压缩包名并返回实际下载名", () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
@@ -80,7 +114,11 @@ describe("浏览器文件导出", () => {
         "合集/导出:项目.zip"
       );
 
-      expect(result).toEqual({ fileCount: 2, archiveFileName: "合集_导出_项目.zip" });
+      expect(result).toEqual({
+        fileCount: 2,
+        archiveFileName: "合集_导出_项目.zip",
+        downloadedFileName: "合集_导出_项目.zip"
+      });
       const clickedAnchor = clickSpy.mock.contexts[0];
       if (!(clickedAnchor instanceof HTMLAnchorElement)) {
         throw new Error("多文件下载未通过锚点触发。");

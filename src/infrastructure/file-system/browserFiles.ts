@@ -48,6 +48,7 @@ export interface TextDownloadFile {
 export interface DownloadTextFilesResult {
   fileCount: number;
   archiveFileName: string | null;
+  downloadedFileName: string | null;
 }
 
 const ILLEGAL_DOWNLOAD_FILE_NAME_CHARACTERS = "\\/:*?\"<>|";
@@ -94,14 +95,16 @@ export function downloadTextFiles(
   if (files.length === 0) {
     return {
       fileCount: 0,
-      archiveFileName: null
+      archiveFileName: null,
+      downloadedFileName: null
     };
   }
   if (files.length === 1) {
-    downloadTextFile(files[0].fileName, files[0].content, type);
+    const downloadedFileName = downloadTextFile(files[0].fileName, files[0].content, type);
     return {
       fileCount: 1,
-      archiveFileName: null
+      archiveFileName: null,
+      downloadedFileName
     };
   }
   const safeArchiveFileName = downloadBlob(
@@ -112,7 +115,8 @@ export function downloadTextFiles(
   );
   return {
     fileCount: files.length,
-    archiveFileName: safeArchiveFileName
+    archiveFileName: safeArchiveFileName,
+    downloadedFileName: safeArchiveFileName
   };
 }
 

@@ -50,7 +50,12 @@ import {
   startTauriAudioAlignmentJob,
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
-import { downloadTextFile, downloadTextFiles, readTextFile } from "../../infrastructure/file-system/browserFiles";
+import {
+  downloadTextFile,
+  downloadTextFiles,
+  readTextFile,
+  type DownloadTextFilesResult
+} from "../../infrastructure/file-system/browserFiles";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import {
   authenticateEmby,
@@ -1860,12 +1865,22 @@ function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>, proj
     "application/xml;charset=utf-8",
     createProjectDownloadFileName(projectName, "-danmaku-exports.zip")
   );
-  const archiveText = downloadResult.archiveFileName ? `，已打包为 ${downloadResult.archiveFileName}` : "";
-  setStatus({ message: `已触发下载 ${files.length} 个分集 XML${archiveText}。`, tone: "success" });
+  setStatus({ message: createBatchExportDownloadStatus(downloadResult), tone: "success" });
 }
 
 function setStatus(status: EditorStatus) {
   useEditorStore.setState({ status });
+}
+
+function createBatchExportDownloadStatus(result: DownloadTextFilesResult): string {
+  const fileCount = result.fileCount.toLocaleString("zh-CN");
+  if (result.archiveFileName) {
+    return `已触发下载 ${fileCount} 个分集 XML，已打包为 ${result.archiveFileName}。`;
+  }
+  if (result.downloadedFileName) {
+    return `已触发下载 ${fileCount} 个分集 XML：${result.downloadedFileName}。`;
+  }
+  return `已触发下载 ${fileCount} 个分集 XML。`;
 }
 
 function confidenceLabel(confidence: "high" | "medium" | "low"): string {
