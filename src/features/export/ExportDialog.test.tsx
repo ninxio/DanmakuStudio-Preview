@@ -48,6 +48,7 @@ describe("导出摘要", () => {
       project: { ...createEmptyProject(), assets: [asset], clips: [clip] },
       history: createHistoryState(),
       selection: { kind: "none", ids: [] },
+      status: { message: "准备就绪", tone: "neutral" },
       exportDraft: null
     });
   });
@@ -113,6 +114,7 @@ describe("导出摘要", () => {
         throw new Error("健康报告下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("健康_复核_项目-health-report.txt");
+      expect(useEditorStore.getState().status.message).toBe("已导出健康报告：健康_复核_项目-health-report.txt。");
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
     } finally {
       clickSpy.mockRestore();
@@ -174,6 +176,7 @@ describe("导出摘要", () => {
         throw new Error("导出报告下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("导出_报告_项目-export-report.txt");
+      expect(useEditorStore.getState().status.message).toBe("已导出复核报告：导出_报告_项目-export-report.txt。");
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:compensation-report");
     } finally {
       clickSpy.mockRestore();
@@ -216,6 +219,7 @@ describe("导出摘要", () => {
         throw new Error("XML 下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("导出_XML_项目.xml");
+      expect(useEditorStore.getState().status.message).toBe("已导出 XML：导出_XML_项目.xml。");
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:export-xml");
       expect(useEditorStore.getState().exportDraft).toBeNull();
     } finally {

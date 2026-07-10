@@ -35,6 +35,35 @@ export function ExportDialog() {
   const previewNegativeClamps = summary.negativeClampDetails.slice(0, 3);
   const hiddenNegativeClampCount = Math.max(0, summary.negativeClampDetails.length - previewNegativeClamps.length);
   const hasExportReviewReport = summary.compensationDetails.length > 0 || summary.negativeClampDetails.length > 0;
+
+  const downloadHealthReport = () => {
+    const fileName = downloadTextFile(
+      createProjectDownloadFileName(project.name, "-health-report.txt", "danmaku-export"),
+      createProjectHealthReport(project.name, healthSummary),
+      "text/plain;charset=utf-8"
+    );
+    setExportStatus(`已导出健康报告：${fileName}。`, "success");
+  };
+
+  const downloadExportReviewReport = () => {
+    const fileName = downloadTextFile(
+      createProjectDownloadFileName(project.name, "-export-report.txt", "danmaku-export"),
+      createCompensationReport(project.name, summary),
+      "text/plain;charset=utf-8"
+    );
+    setExportStatus(`已导出复核报告：${fileName}。`, "success");
+  };
+
+  const downloadXml = () => {
+    const fileName = downloadTextFile(
+      createProjectDownloadFileName(project.name, ".xml", "danmaku-export"),
+      exportDraft.xml,
+      "application/xml;charset=utf-8"
+    );
+    setExportStatus(`已导出 XML：${fileName}。`, "success");
+    clearExport();
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65" role="dialog" aria-modal="true">
       <div className="flex max-h-[86vh] w-[560px] flex-col rounded border border-panel-line bg-panel-raised shadow-2xl" data-testid="export-dialog">
@@ -90,45 +119,18 @@ export function ExportDialog() {
           </div>
         </div>
         <footer className="flex flex-wrap justify-end gap-2 border-t border-panel-line p-4">
-          <TextButton
-            onClick={() =>
-              downloadTextFile(
-                createProjectDownloadFileName(project.name, "-health-report.txt", "danmaku-export"),
-                createProjectHealthReport(project.name, healthSummary),
-                "text/plain;charset=utf-8"
-              )
-            }
-          >
+          <TextButton onClick={downloadHealthReport}>
             <Download size={14} />
             下载健康报告
           </TextButton>
           {hasExportReviewReport ? (
-            <TextButton
-              onClick={() =>
-                downloadTextFile(
-                  createProjectDownloadFileName(project.name, "-export-report.txt", "danmaku-export"),
-                  createCompensationReport(project.name, summary),
-                  "text/plain;charset=utf-8"
-                )
-              }
-            >
+            <TextButton onClick={downloadExportReviewReport}>
               <Download size={14} />
               下载导出报告
             </TextButton>
           ) : null}
           <TextButton onClick={clearExport}>取消</TextButton>
-          <TextButton
-            tone="primary"
-            disabled={!validation.ok}
-            onClick={() => {
-              downloadTextFile(
-                createProjectDownloadFileName(project.name, ".xml", "danmaku-export"),
-                exportDraft.xml,
-                "application/xml;charset=utf-8"
-              );
-              clearExport();
-            }}
-          >
+          <TextButton tone="primary" disabled={!validation.ok} onClick={downloadXml}>
             <Download size={14} />
             下载 XML
           </TextButton>
@@ -264,4 +266,8 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
       </dd>
     </div>
   );
+}
+
+function setExportStatus(message: string, tone: "success" | "warning" | "error" | "neutral") {
+  useEditorStore.setState({ status: { message, tone } });
 }

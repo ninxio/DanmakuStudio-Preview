@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C75 已完成：导出摘要弹窗下载后显示实际文件名。
+  - 导出摘要弹窗的“下载健康报告”“下载导出报告”和“下载 XML”现在都会使用 `downloadTextFile` 返回的实际下载文件名更新全局状态提示。
+  - 下载 XML 后仍会关闭导出摘要，但保留“已导出 XML：文件名”的成功反馈，避免用户无法确认落盘文件。
+  - 已补充导出摘要测试，覆盖健康报告、导出复核报告和 XML 下载后的状态提示。
+  - 已重新验证：`corepack pnpm test -- src/features/export/ExportDialog.test.tsx` 成功，1 个测试文件、5 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/164 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:18:04`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998911` 字节，时间 `2026/07/10 12:18:04`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c75-export-dialog-download-status-20260710`。
 - 成熟度提升阶段 C74 已完成：顶部工具栏下载入口显示实际文件名。
   - 顶部“保存项目”现在会使用浏览器实际下载文件名更新状态提示，显示清理后的 `.danmaku-project.json` 文件名。
   - 顶部“导出对齐”现在会在状态提示中显示实际对齐提案 JSON 文件名，和资源面板导出入口保持一致。
