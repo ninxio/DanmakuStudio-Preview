@@ -14,6 +14,7 @@
     "lint": "eslint .",
     "audit:source": "node scripts/audit-source.mjs",
     "verify": "corepack pnpm audit:source && corepack pnpm lint && corepack pnpm test && corepack pnpm build",
+    "verify:release": "corepack pnpm verify && corepack pnpm test:e2e && corepack pnpm tauri:build",
     "format": "prettier --write .",
     "align:audio": "node scripts/audio-align-prototype.mjs",
     "tauri": "tauri",

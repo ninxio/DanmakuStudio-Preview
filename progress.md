@@ -25,6 +25,15 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C59 已完成：新增一键 release 验证命令。
+  - 新增 `corepack pnpm verify:release`，依次执行统一验证、Playwright E2E 和 Tauri release 打包，方便后续可安装阶段一条命令复现完整验收链路。
+  - README 已同步开发命令列表，加入 `verify:release`；Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含 `audit:source`、`lint`、`test`、`build`、`test:e2e` 和 `tauri:build`。
+  - 本轮全量测试为 32 个测试文件、151 个测试通过；E2E 为 3 个 Chromium 测试通过。
+  - 本阶段只新增发布验证脚本和文档，没有修改运行时代码、UI 源码或 Tauri 源码；但 `verify:release` 已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:58:08`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2995857` 字节，时间 `2026/07/10 10:58:08`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c59-verify-release-script-20260710`。
 - 成熟度提升阶段 C58 已完成：下载文件名安全清理与健康报告项目名命名。
   - 浏览器下载基础设施新增统一文件名清理，会替换路径分隔符、Windows 非法字符、控制字符和保留设备名，避免项目名中的特殊字符进入下载文件名。
   - 资源栏“项目信息”的健康报告现在按项目名生成文件名；导出摘要中的健康报告、导出报告和 XML 下载也统一使用修剪后的项目名基准。
