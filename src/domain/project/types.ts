@@ -6,7 +6,7 @@ import type {
 } from "../danmaku/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export interface MediaReference {
   id: string;

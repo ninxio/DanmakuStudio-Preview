@@ -4,6 +4,8 @@ import {
   type ProjectValidationResult
 } from "./types";
 
+const MIN_SUPPORTED_SCHEMA_VERSION = 1;
+
 export function validateProjectSchema(value: unknown): ProjectValidationResult {
   if (!isRecord(value)) {
     return { ok: false, version: null, message: "项目文件不是有效对象。" };
@@ -12,11 +14,11 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
   if (typeof version !== "number") {
     return { ok: false, version: null, message: "项目文件缺少 schemaVersion。" };
   }
-  if (version !== CURRENT_SCHEMA_VERSION) {
+  if (version < MIN_SUPPORTED_SCHEMA_VERSION || version > CURRENT_SCHEMA_VERSION) {
     return {
       ok: false,
       version,
-      message: `项目版本 ${version} 暂不支持，当前支持版本为 ${CURRENT_SCHEMA_VERSION}。`
+      message: `项目版本 ${version} 暂不支持，当前支持版本为 ${MIN_SUPPORTED_SCHEMA_VERSION} 到 ${CURRENT_SCHEMA_VERSION}。`
     };
   }
   if (
@@ -58,12 +60,13 @@ export function parseProjectJson(json: string): EditorProject {
   if (!validation.ok) {
     throw new Error(validation.message);
   }
-  return parsed as EditorProject;
+  return migrateProjectToCurrentSchema(parsed as EditorProject, validation.version);
 }
 
 export function serializeProject(project: EditorProject): string {
   const savedProject: EditorProject = {
     ...project,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     media: project.media
       ? {
           ...project.media,
@@ -76,6 +79,28 @@ export function serializeProject(project: EditorProject): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: number | null): EditorProject {
+  if (parsedVersion === CURRENT_SCHEMA_VERSION) {
+    return project;
+  }
+  return {
+    ...project,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    clips: migrateLegacyClosedClipRanges(project)
+  };
+}
+
+function migrateLegacyClosedClipRanges(project: EditorProject): EditorProject["clips"] {
+  const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
+  return project.clips.map((clip) => {
+    const asset = assetsById.get(clip.assetId);
+    const hasBoundaryItem = asset?.items.some(
+      (item) => item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs === clip.sourceOutMs
+    );
+    return hasBoundaryItem ? { ...clip, sourceOutMs: clip.sourceOutMs + 1 } : clip;
+  });
 }
 
 function isMediaReference(value: unknown): boolean {

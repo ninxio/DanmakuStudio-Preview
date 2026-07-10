@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C83 已完成：项目 schema v2 兼容旧片段边界。
+  - `CURRENT_SCHEMA_VERSION` 已升级到 2，序列化项目时会强制写入当前 schemaVersion，避免新旧语义混杂。
+  - 读取 v1 项目时，如果片段 `sourceOutMs` 处正好存在弹幕，会迁移为 `sourceOutMs + 1`，兼容 C79 后的半开区间 `[sourceInMs, sourceOutMs)`，避免重开旧项目时丢失最后一条边界弹幕。
+  - 读取当前 v2 项目时会保留半开 `sourceOutMs`，不会误改用户刻意排除边界弹幕的片段设置。
+  - 已补充项目 schema 测试，覆盖旧 v1 闭区间迁移、当前 v2 半开区间保留，以及保存时写入当前 schemaVersion。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/schema.test.ts` 成功，1 个测试文件、13 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/177 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:52:47`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998626` 字节，时间 `2026/07/10 12:52:47`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c83-project-schema-v2-clip-range-migration-20260710`。
 - 成熟度提升阶段 C82 已完成：ZIP 内重名条目去重后仍限制长度。
   - `createStoredZip` 生成内部条目名时，重复文件名追加 ` (2)`、` (3)` 等后缀后也会保持 180 字符上限。
   - 超长重名 XML 条目会保留去重后缀和 `.xml` 扩展名，避免 ZIP 内部文件名因追加后缀再次超长或互相覆盖。

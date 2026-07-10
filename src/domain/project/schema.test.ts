@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEmptyProject } from "./factory";
 import { parseProjectJson, serializeProject, validateProjectSchema } from "./schema";
+import { CURRENT_SCHEMA_VERSION } from "./types";
 
 describe("project schema", () => {
   it("序列化后可重新打开，并清除临时 objectUrl", () => {
@@ -17,6 +18,7 @@ describe("project schema", () => {
       }
     };
     const json = serializeProject(project);
+    expect(JSON.parse(json)).toMatchObject({ schemaVersion: CURRENT_SCHEMA_VERSION });
     const parsed = parseProjectJson(json);
     expect(parsed.name).toBe("测试项目");
     expect(parsed.media?.objectUrl).toBeNull();
@@ -39,9 +41,58 @@ describe("project schema", () => {
 
     expect(validateProjectSchema(project)).toEqual({
       ok: true,
-      version: 1,
+      version: CURRENT_SCHEMA_VERSION,
       message: "项目文件可打开。"
     });
+  });
+
+  it("打开 v1 项目时迁移闭区间片段 sourceOutMs", () => {
+    const project = {
+      ...createEmptyProject("旧项目"),
+      schemaVersion: 1,
+      assets: [createValidAsset()],
+      clips: [
+        {
+          id: "clip",
+          assetId: "asset",
+          name: "旧片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+
+    const parsed = parseProjectJson(JSON.stringify(project));
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.clips[0].sourceOutMs).toBe(1001);
+  });
+
+  it("打开当前版本项目时保留半开 sourceOutMs", () => {
+    const project = {
+      ...createEmptyProject("当前项目"),
+      assets: [createValidAsset()],
+      clips: [
+        {
+          id: "clip",
+          assetId: "asset",
+          name: "当前片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+
+    const parsed = parseProjectJson(JSON.stringify(project));
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.clips[0].sourceOutMs).toBe(1000);
   });
 
   it("拒绝不支持的 schema 版本", () => {
