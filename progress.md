@@ -25,6 +25,15 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C72 已完成：设置备份导出状态显示实际文件名。
+  - 设置中心导出非敏感应用设置备份时，现在使用 `downloadTextFile` 返回的实际下载文件名更新状态提示，显示 `danmaku-settings.json`。
+  - 已补充设置中心测试，覆盖设置备份下载文件名和状态提示。
+  - 已重新验证：`corepack pnpm test -- src/features/editor/SettingsDialog.test.tsx` 成功，1 个测试文件、7 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/163 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:04:38`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997647` 字节，时间 `2026/07/10 12:04:38`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c72-settings-export-file-name-status-20260710`。
 - 成熟度提升阶段 C71 已完成：下载工具返回实际文件名并用于对齐导出状态提示。
   - `downloadTextFile` 现在返回清理后的实际下载文件名，内部 `downloadBlob` 同样返回最终写入 `anchor.download` 的名称；多文件 ZIP 下载继续返回清理后的压缩包名。
   - 资源面板导出对齐提案 JSON 和对齐复核报告后，状态提示会显示实际下载文件名，避免用户在多个项目连续导出时需要猜文件落点。

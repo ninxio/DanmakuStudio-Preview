@@ -87,8 +87,12 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
   };
 
   const exportSettingsBackup = () => {
-    downloadTextFile("danmaku-settings.json", `${serializeAppSettings(settings)}\n`, "application/json;charset=utf-8");
-    setStatus("已导出非敏感应用设置备份。", "success");
+    const fileName = downloadTextFile(
+      "danmaku-settings.json",
+      `${serializeAppSettings(settings)}\n`,
+      "application/json;charset=utf-8"
+    );
+    setStatus(`已导出非敏感应用设置备份：${fileName}。`, "success");
   };
 
   const importSettingsBackup = async (file: File) => {

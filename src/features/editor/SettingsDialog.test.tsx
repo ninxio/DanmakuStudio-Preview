@@ -160,6 +160,12 @@ describe("设置中心", () => {
       expect(text).not.toContain("secret-pass");
       expect(text).not.toContain("password");
       expect(text).not.toContain("token");
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("设置备份下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("danmaku-settings.json");
+      expect(useEditorStore.getState().status.message).toBe("已导出非敏感应用设置备份：danmaku-settings.json。");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:settings-backup");
     } finally {
