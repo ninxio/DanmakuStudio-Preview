@@ -139,11 +139,22 @@ describe("资源面板", () => {
     Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
 
     try {
+      useEditorStore.setState({
+        project: {
+          ...useEditorStore.getState().project,
+          name: "健康/报告:项目"
+        }
+      });
       render(<AssetPanel />);
       await user.click(screen.getByRole("button", { name: "项目信息" }));
       await user.click(screen.getByRole("button", { name: "导出健康报告" }));
 
       expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("健康报告下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("健康_报告_项目-health-report.txt");
       const [blob] = createObjectUrl.mock.calls[0];
       if (!(blob instanceof Blob)) {
         throw new Error("导出的健康报告不是 Blob。");

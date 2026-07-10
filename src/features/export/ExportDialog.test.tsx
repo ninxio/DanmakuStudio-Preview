@@ -72,7 +72,7 @@ describe("导出摘要", () => {
     useEditorStore.setState({
       project: {
         ...project,
-        name: "健康复核项目",
+        name: "健康/复核:项目",
         assets: [
           {
             ...project.assets[0],
@@ -108,6 +108,11 @@ describe("导出摘要", () => {
       await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
       await expect(readBlobText(blob)).resolves.toContain("导入时存在警告");
       expect(clickSpy).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("健康报告下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("健康_复核_项目-health-report.txt");
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
     } finally {
       clickSpy.mockRestore();

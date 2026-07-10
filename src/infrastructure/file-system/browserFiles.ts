@@ -50,6 +50,37 @@ export interface DownloadTextFilesResult {
   archiveFileName: string | null;
 }
 
+const ILLEGAL_DOWNLOAD_FILE_NAME_CHARACTERS = "\\/:*?\"<>|";
+const TRAILING_WINDOWS_DOTS_AND_SPACES_PATTERN = /[. ]+$/g;
+const RESERVED_WINDOWS_FILE_NAMES = new Set([
+  "CON",
+  "PRN",
+  "AUX",
+  "NUL",
+  "COM1",
+  "COM2",
+  "COM3",
+  "COM4",
+  "COM5",
+  "COM6",
+  "COM7",
+  "COM8",
+  "COM9",
+  "LPT1",
+  "LPT2",
+  "LPT3",
+  "LPT4",
+  "LPT5",
+  "LPT6",
+  "LPT7",
+  "LPT8",
+  "LPT9"
+]);
+
+export function sanitizeDownloadFileName(fileName: string, fallbackName = "download"): string {
+  return sanitizeFileNameCandidate(fileName) ?? sanitizeFileNameCandidate(fallbackName) ?? "download";
+}
+
 export function downloadTextFile(fileName: string, content: string, type = "text/plain;charset=utf-8"): void {
   const blob = new Blob([content], { type });
   downloadBlob(fileName, blob);
@@ -111,7 +142,7 @@ function downloadBlob(fileName: string, blob: Blob, type?: string): void {
   const url = URL.createObjectURL(resolvedBlob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = fileName;
+  anchor.download = sanitizeDownloadFileName(fileName);
   anchor.click();
   URL.revokeObjectURL(url);
 }
@@ -136,8 +167,33 @@ function createUniqueZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {
 }
 
 function sanitizeZipFileName(fileName: string): string {
-  const trimmed = fileName.trim().replace(/[\\/:*?"<>|]+/g, "_");
-  return trimmed.length > 0 ? trimmed : "export.xml";
+  return sanitizeDownloadFileName(fileName, "export.xml");
+}
+
+function sanitizeFileNameCandidate(fileName: string): string | null {
+  const sanitized = Array.from(fileName.trim())
+    .reduce(replaceIllegalDownloadFileNameCharacter, "")
+    .replace(TRAILING_WINDOWS_DOTS_AND_SPACES_PATTERN, "");
+  if (sanitized.length === 0 || sanitized === "." || sanitized === "..") {
+    return null;
+  }
+  const baseName = sanitized.split(".")[0].toUpperCase();
+  if (RESERVED_WINDOWS_FILE_NAMES.has(baseName)) {
+    return `_${sanitized}`;
+  }
+  return sanitized;
+}
+
+function replaceIllegalDownloadFileNameCharacter(result: string, character: string): string {
+  if (!isIllegalDownloadFileNameCharacter(character)) {
+    return `${result}${character}`;
+  }
+  return result.endsWith("_") ? result : `${result}_`;
+}
+
+function isIllegalDownloadFileNameCharacter(character: string): boolean {
+  const codePoint = character.codePointAt(0) ?? 0;
+  return codePoint < 32 || codePoint === 127 || ILLEGAL_DOWNLOAD_FILE_NAME_CHARACTERS.includes(character);
 }
 
 function createZipLocalHeader(nameBytes: Uint8Array, data: Uint8Array, crc32: number): Uint8Array {

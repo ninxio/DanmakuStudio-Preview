@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C58 已完成：下载文件名安全清理与健康报告项目名命名。
+  - 浏览器下载基础设施新增统一文件名清理，会替换路径分隔符、Windows 非法字符、控制字符和保留设备名，避免项目名中的特殊字符进入下载文件名。
+  - 资源栏“项目信息”的健康报告现在按项目名生成文件名；导出摘要中的健康报告、导出报告和 XML 下载也统一使用修剪后的项目名基准。
+  - README 已同步：健康报告文件名会使用项目名并清理非法路径字符；Playwright 截图产物已随下载行为验证重新生成。
+  - 已补充测试：基础下载工具覆盖非法字符和 Windows 保留名，资源栏与导出摘要测试确认真实 `anchor.download` 文件名。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts src/features/assets/AssetPanel.test.tsx src/features/export/ExportDialog.test.tsx` 成功，3 个测试文件、26 个测试通过。
+  - 已重新验证：`corepack pnpm verify` 成功，包含 `audit:source`、`lint`、`test` 和 `build`；当前 32 个测试文件、151 个测试通过。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:55:02`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999192` 字节，时间 `2026/07/10 10:55:02`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c58-safe-download-filenames-20260710`。
 - 成熟度提升阶段 C57 已完成：项目健康证据长文本换行保护。
   - 资源栏“项目信息”里的项目健康证据行现在会对长资源 ID、长原始片段和长路径类文本执行单词内换行，避免撑破右侧面板。
   - 本阶段只调整健康证据列表的展示约束，不改变项目健康计算、XML 解析、导出或非破坏性编辑模型。

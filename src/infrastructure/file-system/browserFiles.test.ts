@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createStoredZip } from "./browserFiles";
+import { createStoredZip, sanitizeDownloadFileName } from "./browserFiles";
 
 describe("浏览器文件导出", () => {
   it("把多份 XML 打包成包含全部条目的 ZIP", async () => {
@@ -19,6 +19,12 @@ describe("浏览器文件导出", () => {
     ]);
 
     await expect(readCentralDirectoryNames(zip)).resolves.toEqual(["S01_E01.xml", "S01_E01 (2).xml"]);
+  });
+
+  it("下载文件名会清理路径字符和 Windows 保留名", () => {
+    expect(sanitizeDownloadFileName(" 健康/报告:项目?.txt ")).toBe("健康_报告_项目_.txt");
+    expect(sanitizeDownloadFileName("CON.xml")).toBe("_CON.xml");
+    expect(sanitizeDownloadFileName("   ", "export.xml")).toBe("export.xml");
   });
 });
 

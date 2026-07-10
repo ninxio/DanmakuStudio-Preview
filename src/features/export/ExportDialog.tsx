@@ -34,6 +34,7 @@ export function ExportDialog() {
   const previewNegativeClamps = summary.negativeClampDetails.slice(0, 3);
   const hiddenNegativeClampCount = Math.max(0, summary.negativeClampDetails.length - previewNegativeClamps.length);
   const hasExportReviewReport = summary.compensationDetails.length > 0 || summary.negativeClampDetails.length > 0;
+  const exportFileBaseName = project.name.trim() || "danmaku-export";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65" role="dialog" aria-modal="true">
       <div className="flex max-h-[86vh] w-[560px] flex-col rounded border border-panel-line bg-panel-raised shadow-2xl" data-testid="export-dialog">
@@ -92,7 +93,7 @@ export function ExportDialog() {
           <TextButton
             onClick={() =>
               downloadTextFile(
-                `${project.name || "danmaku-export"}-health-report.txt`,
+                `${exportFileBaseName}-health-report.txt`,
                 createProjectHealthReport(project.name, healthSummary),
                 "text/plain;charset=utf-8"
               )
@@ -105,7 +106,7 @@ export function ExportDialog() {
             <TextButton
               onClick={() =>
                 downloadTextFile(
-                  `${project.name || "danmaku-export"}-export-report.txt`,
+                  `${exportFileBaseName}-export-report.txt`,
                   createCompensationReport(project.name, summary),
                   "text/plain;charset=utf-8"
                 )
@@ -120,7 +121,7 @@ export function ExportDialog() {
             tone="primary"
             disabled={!validation.ok}
             onClick={() => {
-              downloadTextFile(`${project.name || "danmaku-export"}.xml`, exportDraft.xml, "application/xml;charset=utf-8");
+              downloadTextFile(`${exportFileBaseName}.xml`, exportDraft.xml, "application/xml;charset=utf-8");
               clearExport();
             }}
           >

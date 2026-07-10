@@ -1875,6 +1875,7 @@ function ProjectHealthPanel({
   onCleanupMissingAssetClips: () => void;
 }) {
   const StatusIcon = summary.status === "blocked" ? CircleAlert : summary.status === "attention" ? TriangleAlert : CircleCheck;
+  const reportFileBaseName = projectName.trim() || "danmaku-project";
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3" data-testid="project-health-panel">
       <div className="flex items-start justify-between gap-3">
@@ -1920,7 +1921,7 @@ function ProjectHealthPanel({
         <TextButton
           onClick={() =>
             downloadTextFile(
-              "project-health-report.txt",
+              `${reportFileBaseName}-health-report.txt`,
               createProjectHealthReport(projectName, summary),
               "text/plain;charset=utf-8"
             )
