@@ -534,13 +534,16 @@ describe("资源面板", () => {
     await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.cutCandidates).toHaveLength(1));
     expect(screen.getByText("复核提示")).toBeInTheDocument();
     expect(screen.getByText("待应用 2 / 已落点 0")).toBeInTheDocument();
+    expect(screen.getByText("复核队列")).toBeInTheDocument();
+    expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("优先复核");
+    expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("候选补偿置信度 72.0%");
     expect(screen.getByText("落点状态")).toBeInTheDocument();
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("audio-anchor-1");
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("音频推断补偿 1");
     expect(screen.getAllByText("待应用")).toHaveLength(2);
     expect(screen.getByText(/1 个候选补偿置信度低于 75%/)).toBeInTheDocument();
     expect(screen.getByText(/1 个候选补偿包含不确定区间/)).toBeInTheDocument();
-    expect(screen.getByText(/区间 00:00:18\.000-00:00:22\.000/)).toBeInTheDocument();
+    expect(screen.getAllByText(/区间 00:00:18\.000-00:00:22\.000/).length).toBeGreaterThan(0);
     await user.click(screen.getByRole("button", { name: "应用候选" }));
 
     await waitFor(() => expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1));
@@ -616,6 +619,8 @@ describe("资源面板", () => {
 
     expect(screen.getByText("应用已暂停")).toBeInTheDocument();
     expect(screen.getByText("待应用 1 / 已落点 0 / 阻断 1")).toBeInTheDocument();
+    expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("先修阻断");
+    expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("不确定区间起止异常");
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（不确定区间起止异常）");
     expect(screen.getAllByText(/不确定区间起止顺序异常/).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();

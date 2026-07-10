@@ -34,6 +34,19 @@ export interface AlignmentReviewStatusSummary {
   blockedCount: number;
 }
 
+export type AlignmentReviewQueueSeverity = "blocked" | "attention" | "pending";
+
+export interface AlignmentReviewQueueItem {
+  kind: AlignmentReviewItemKind;
+  id: string;
+  name: string;
+  sourceAtMs: number;
+  severity: AlignmentReviewQueueSeverity;
+  severityText: string;
+  statusText: string;
+  reasons: string[];
+}
+
 export function createAlignmentReviewReport(
   proposal: AlignmentProposal,
   generatedAt: Date = new Date(),
@@ -54,6 +67,9 @@ export function createAlignmentReviewReport(
     "",
     "## 复核重点",
     ...createAlignmentReviewFocus(proposal).map((item) => `- ${item}`),
+    "",
+    "## 复核队列",
+    ...createReviewQueueLines(createAlignmentReviewQueue(proposal, context)),
     "",
     "## 同步锚点",
     ...createAnchorLines(proposal, statusContext),
@@ -109,6 +125,22 @@ export function createAlignmentReviewStatusSummary(
     appliedCount: statuses.filter((item) => item.state === "applied").length,
     blockedCount: statuses.filter((item) => item.state === "blocked").length
   };
+}
+
+export function createAlignmentReviewQueue(
+  proposal: AlignmentProposal,
+  context: AlignmentApplyBlockerContext = {}
+): AlignmentReviewQueueItem[] {
+  const statuses = createAlignmentReviewItemStatuses(proposal, context);
+  const anchorItems = proposal.anchors
+    .map((anchor, index) => createAnchorReviewQueueItem(anchor, statuses[index]))
+    .filter((item): item is AlignmentReviewQueueItem => item !== null);
+  const cutItems = proposal.cutCandidates
+    .map((candidate, index) =>
+      createCutCandidateReviewQueueItem(candidate, statuses[proposal.anchors.length + index])
+    )
+    .filter((item): item is AlignmentReviewQueueItem => item !== null);
+  return [...anchorItems, ...cutItems].sort(compareReviewQueueItems);
 }
 
 export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[] {
@@ -265,6 +297,20 @@ function createApplyBlockerLines(blockers: string[]): string[] {
   return blockers.map((blocker, index) => `- ${index + 1}. ${blocker}`);
 }
 
+function createReviewQueueLines(queue: AlignmentReviewQueueItem[]): string[] {
+  if (queue.length === 0) {
+    return ["- 暂无待复核项。"];
+  }
+  return queue.map((item, index) =>
+    [
+      `- ${index + 1}. ${item.severityText} / ${formatQueueKind(item.kind)} / [${formatQueueId(item.id)}] ${item.name}`,
+      `  时间：${formatTime(item.sourceAtMs)}`,
+      `  状态：${item.statusText}`,
+      `  建议：${item.reasons.join("；")}`
+    ].join("\n")
+  );
+}
+
 interface AlignmentReviewStatusContext {
   applyContext: AlignmentApplyBlockerContext;
   duplicateAnchorIds: Set<string>;
@@ -286,6 +332,94 @@ function createReviewStatusContext(
     duplicateAnchorIds: new Set(findDuplicateIds(proposal.anchors.map((anchor) => anchor.id))),
     duplicateCutIds: new Set(findDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id)))
   };
+}
+
+function createAnchorReviewQueueItem(
+  anchor: SyncAnchor,
+  status: AlignmentReviewItemStatus | undefined
+): AlignmentReviewQueueItem | null {
+  if (!status || status.state === "applied") {
+    return null;
+  }
+  if (status.state === "blocked") {
+    return {
+      kind: "anchor",
+      id: anchor.id,
+      name: status.name,
+      sourceAtMs: anchor.sourceMs,
+      severity: "blocked",
+      severityText: "先修阻断",
+      statusText: status.statusText,
+      reasons: status.blockReasons
+    };
+  }
+  const attentionReasons = createAnchorAttentionReasons(anchor);
+  return {
+    kind: "anchor",
+    id: anchor.id,
+    name: status.name,
+    sourceAtMs: anchor.sourceMs,
+    severity: attentionReasons.length > 0 ? "attention" : "pending",
+    severityText: attentionReasons.length > 0 ? "优先复核" : "待确认",
+    statusText: status.statusText,
+    reasons:
+      attentionReasons.length > 0
+        ? attentionReasons
+        : ["应用前抽查源时间、目标时间和偏移方向。"]
+  };
+}
+
+function createCutCandidateReviewQueueItem(
+  candidate: CutCandidate,
+  status: AlignmentReviewItemStatus | undefined
+): AlignmentReviewQueueItem | null {
+  if (!status || status.state === "applied") {
+    return null;
+  }
+  if (status.state === "blocked") {
+    return {
+      kind: "cutCandidate",
+      id: candidate.id,
+      name: status.name,
+      sourceAtMs: candidate.sourceAtMs,
+      severity: "blocked",
+      severityText: "先修阻断",
+      statusText: status.statusText,
+      reasons: status.blockReasons
+    };
+  }
+  const attentionReasons = createCutCandidateAttentionReasons(candidate);
+  return {
+    kind: "cutCandidate",
+    id: candidate.id,
+    name: status.name,
+    sourceAtMs: candidate.sourceAtMs,
+    severity: attentionReasons.length > 0 ? "attention" : "pending",
+    severityText: attentionReasons.length > 0 ? "优先复核" : "待确认",
+    statusText: status.statusText,
+    reasons:
+      attentionReasons.length > 0
+        ? attentionReasons
+        : ["应用前抽查补偿边界、缺失时长和下游整体平移影响。"]
+  };
+}
+
+function createAnchorAttentionReasons(anchor: SyncAnchor): string[] {
+  if (anchor.confidence !== undefined && anchor.confidence < 0.75) {
+    return [`锚点置信度 ${formatConfidence(anchor.confidence)}，建议核对源时间和目标时间。`];
+  }
+  return [];
+}
+
+function createCutCandidateAttentionReasons(candidate: CutCandidate): string[] {
+  const reasons: string[] = [];
+  if (candidate.confidence < 0.75) {
+    reasons.push(`候选补偿置信度 ${formatConfidence(candidate.confidence)}，建议核对边界和缺失时长。`);
+  }
+  if (hasCompleteSourceRange(candidate)) {
+    reasons.push(`${formatQueueSourceRange(candidate)} 内存在不确定边界，优先核对真实删减点。`);
+  }
+  return reasons;
 }
 
 function createAnchorStatusResult(
@@ -448,6 +582,42 @@ function findExistingIdConflicts(ids: string[], existingIds: string[]): string[]
     }
   }
   return [...conflicts];
+}
+
+function compareReviewQueueItems(left: AlignmentReviewQueueItem, right: AlignmentReviewQueueItem): number {
+  return (
+    reviewQueueSeverityRank(left.severity) - reviewQueueSeverityRank(right.severity) ||
+    left.sourceAtMs - right.sourceAtMs ||
+    left.kind.localeCompare(right.kind) ||
+    left.id.localeCompare(right.id)
+  );
+}
+
+function reviewQueueSeverityRank(severity: AlignmentReviewQueueSeverity): number {
+  if (severity === "blocked") {
+    return 0;
+  }
+  if (severity === "attention") {
+    return 1;
+  }
+  return 2;
+}
+
+function formatQueueKind(kind: AlignmentReviewItemKind): string {
+  return kind === "anchor" ? "锚点" : "补偿";
+}
+
+function formatQueueId(id: string): string {
+  const trimmed = id.trim();
+  return trimmed.length > 0 ? trimmed : "未命名";
+}
+
+function formatQueueSourceRange(
+  candidate: CutCandidate & { sourceRangeStartMs: number; sourceRangeEndMs: number }
+): string {
+  return `区间 ${formatTimecode(Math.round(candidate.sourceRangeStartMs))}-${formatTimecode(
+    Math.round(candidate.sourceRangeEndMs)
+  )}`;
 }
 
 function formatIdEvidence(ids: string[]): string {

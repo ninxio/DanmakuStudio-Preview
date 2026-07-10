@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C99 已完成：对齐实验室新增结构化复核队列。
+  - 领域层新增 `createAlignmentReviewQueue`，从同一套落点状态中生成可排序复核队列，按“先修阻断 / 优先复核 / 待确认”排序，已落点项不再进入待复核队列。
+  - 复核队列会把当前项目 ID 冲突、提案内重复、区间异常等阻断项排在最前；低置信度候选补偿和带不确定区间的候选补偿会进入优先复核，普通待应用锚点/补偿进入待确认。
+  - 对齐复核报告新增“复核队列”章节，逐条记录类型、ID、源时间、状态和建议，方便真实样本排查时先处理会阻断应用或最需要人工确认的候选。
+  - “视频对齐实验室”现在在复核提示和落点状态之间显示“复核队列”，前几条直接展示优先级、锚点/补偿类型、源时间和复核原因；长队列会明确显示收起数量。
+  - 已补充领域测试和资源面板测试，覆盖优先复核排序、低置信度与不确定区间建议、阻断项置顶，以及 UI 中的复核队列展示。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/alignmentReport.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、29 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/194 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 14:41:51`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999429` 字节，时间 `2026/07/10 14:41:51`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c99-alignment-review-queue-20260710`。
 - 成熟度提升阶段 C98 已完成：顶部“应用对齐”入口复用结构化待应用计数。
   - 顶部工具栏现在和资源面板一样，使用当前项目锚点/补偿点上下文生成结构化落点状态与 summary。
   - “应用对齐”按钮在提案全部已落点、没有新的待应用项时会禁用，并通过 title 显示“当前对齐提案没有新的待应用项。”。

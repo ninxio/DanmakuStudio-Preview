@@ -3,6 +3,7 @@ import {
   createAlignmentApplyBlockers,
   createAlignmentReviewFocus,
   createAlignmentReviewItemStatuses,
+  createAlignmentReviewQueue,
   createAlignmentReviewStatusSummary,
   createAlignmentReviewReport
 } from "./alignmentReport";
@@ -34,6 +35,10 @@ describe("alignment review report", () => {
     expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");
     expect(report).toContain("整体置信度：82.0%");
     expect(report).toContain("暂无应用阻断。");
+    expect(report).toContain("## 复核队列");
+    expect(report).toContain("优先复核 / 补偿 / [audio-gap-1] 音频推断补偿 1");
+    expect(report).toContain("候选补偿置信度 72.0%，建议核对边界和缺失时长。");
+    expect(report).toContain("待确认 / 锚点 / [anchor-1] anchor-1");
     expect(report).toContain("[anchor-1] 自动");
     expect(report).toContain("落点状态：待应用");
     expect(report).toContain("偏移：+00:00:20.000 (20000 ms)");
@@ -44,6 +49,23 @@ describe("alignment review report", () => {
     expect(createAlignmentReviewFocus(proposal)).toEqual([
       "1 个候选补偿置信度低于 75%，建议人工确认边界和缺失时长。",
       "1 个候选补偿包含不确定区间，优先核对区间内的真实删减边界。"
+    ]);
+    expect(createAlignmentReviewQueue(proposal)).toMatchObject([
+      {
+        kind: "cutCandidate",
+        id: "audio-gap-1",
+        severity: "attention",
+        reasons: [
+          "候选补偿置信度 72.0%，建议核对边界和缺失时长。",
+          "区间 00:00:18.000-00:00:22.000 内存在不确定边界，优先核对真实删减点。"
+        ]
+      },
+      {
+        kind: "anchor",
+        id: "anchor-1",
+        severity: "pending",
+        reasons: ["应用前抽查源时间、目标时间和偏移方向。"]
+      }
     ]);
   });
 
@@ -113,6 +135,8 @@ describe("alignment review report", () => {
       "1 个候选补偿的源时间不在不确定区间内，请修正后再应用。"
     ]);
     const report = createAlignmentReviewReport(proposal, new Date("2026-07-10T01:02:03.000Z"));
+    expect(report).toContain("先修阻断 / 锚点 / [未命名] 未命名锚点");
+    expect(createAlignmentReviewQueue(proposal).every((item) => item.severity === "blocked")).toBe(true);
     expect(report).toContain("落点状态：阻断（缺少 ID）");
     expect(report).toContain("落点状态：阻断（提案内 ID 重复）");
     expect(report).toContain("落点状态：阻断（不确定区间起止异常）");
