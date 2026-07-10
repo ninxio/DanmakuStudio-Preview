@@ -306,6 +306,37 @@ describe("编辑器工具栏", () => {
 
     expect(screen.getByRole("button", { name: "应用对齐" })).toBeEnabled();
   });
+
+  it("对齐提案全部已落点时禁用顶部应用入口", () => {
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, confidence: 1, origin: "manual" }],
+        cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 20_000, targetGapMs: 5000, note: "" }]
+      },
+      alignmentProposal: {
+        anchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, origin: "automatic" }],
+        cutCandidates: [
+          {
+            id: "cut-existing",
+            name: "已有补偿",
+            sourceAtMs: 20_000,
+            targetGapMs: 5000,
+            confidence: 0.8,
+            note: ""
+          }
+        ],
+        confidence: 0.8,
+        diagnostics: ["测试"]
+      }
+    });
+
+    render(<EditorToolbar />);
+
+    const applyButton = screen.getByRole("button", { name: "应用对齐" });
+    expect(applyButton).toBeDisabled();
+    expect(applyButton).toHaveAttribute("title", "当前对齐提案没有新的待应用项。");
+  });
 });
 
 function createRejectingTextFile(fileName: string, message: string): File {

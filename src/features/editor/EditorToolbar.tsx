@@ -16,7 +16,11 @@ import {
 import { useRef, useState } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
-import { createAlignmentApplyBlockers } from "../../domain/alignment/alignmentReport";
+import {
+  createAlignmentApplyBlockers,
+  createAlignmentReviewItemStatuses,
+  createAlignmentReviewStatusSummary
+} from "../../domain/alignment/alignmentReport";
 import { createProjectDownloadFileName } from "../../domain/project/fileNames";
 import { serializeProject } from "../../domain/project/schema";
 import { formatTimecode } from "../../domain/shared/time";
@@ -52,12 +56,23 @@ export function EditorToolbar() {
   const exportAlignmentProposal = useEditorStore((state) => state.exportAlignmentProposal);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
+  const alignmentContext = {
+    existingAnchors: project.syncAnchors,
+    existingCutMarkers: project.cutMarkers
+  };
   const alignmentApplyBlockers = alignmentProposal
-    ? createAlignmentApplyBlockers(alignmentProposal, {
-        existingAnchors: project.syncAnchors,
-        existingCutMarkers: project.cutMarkers
-      })
+    ? createAlignmentApplyBlockers(alignmentProposal, alignmentContext)
     : [];
+  const alignmentStatusSummary = createAlignmentReviewStatusSummary(
+    alignmentProposal ? createAlignmentReviewItemStatuses(alignmentProposal, alignmentContext) : []
+  );
+  const alignmentApplyDisabled =
+    !alignmentProposal || alignmentStatusSummary.pendingCount === 0 || alignmentApplyBlockers.length > 0;
+  const alignmentApplyTitle =
+    alignmentApplyBlockers[0] ??
+    (alignmentProposal && alignmentStatusSummary.pendingCount === 0
+      ? "当前对齐提案没有新的待应用项。"
+      : "应用当前对齐提案");
   const canExportXml = useEditorStore((state) =>
     resolveProjectDanmakuEvents(state.project).some((event) => event.enabled)
   );
@@ -148,9 +163,9 @@ export function EditorToolbar() {
         导出对齐
       </TextButton>
       <TextButton
-        title={alignmentApplyBlockers[0] ?? "应用当前对齐提案"}
+        title={alignmentApplyTitle}
         onClick={applyAlignmentProposal}
-        disabled={!alignmentProposal || alignmentApplyBlockers.length > 0}
+        disabled={alignmentApplyDisabled}
         className="hidden xl:inline-flex"
         tone="primary"
       >
