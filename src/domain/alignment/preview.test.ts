@@ -39,7 +39,8 @@ describe("alignment preview", () => {
     const proposal: AlignmentProposal = {
       anchors: [
         { id: "anchor-new", sourceMs: 20_000, targetMs: 22_000, origin: "automatic", confidence: 0.86 },
-        { id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, origin: "automatic", confidence: 0.99 }
+        { id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, origin: "automatic", confidence: 0.99 },
+        { id: "anchor-existing", sourceMs: 12_000, targetMs: 14_000, origin: "automatic", confidence: 0.7 }
       ],
       cutCandidates: [
         {
@@ -59,6 +60,14 @@ describe("alignment preview", () => {
           targetGapMs: 45_000,
           confidence: 0.95,
           note: "已应用"
+        },
+        {
+          id: "cut-existing",
+          name: "同 ID 不同时间",
+          sourceAtMs: 33_000,
+          targetGapMs: 12_000,
+          confidence: 0.7,
+          note: "冲突候选"
         }
       ],
       confidence: 0.8,
@@ -69,10 +78,12 @@ describe("alignment preview", () => {
 
     expect(preview.proposalAnchors.map((anchor) => [anchor.id, anchor.state])).toEqual([
       ["anchor-existing", "applied"],
+      ["anchor-existing", "candidate"],
       ["anchor-new", "candidate"]
     ]);
     expect(preview.proposalCuts.map((candidate) => [candidate.id, candidate.state])).toEqual([
       ["cut-existing", "applied"],
+      ["cut-existing", "candidate"],
       ["cut-new", "candidate"]
     ]);
     expect(preview.proposalCuts.find((candidate) => candidate.id === "cut-new")).toMatchObject({
@@ -80,10 +91,10 @@ describe("alignment preview", () => {
       sourceRangeEndMs: 62_000
     });
     expect(preview.summary).toMatchObject({
-      proposalAnchorCount: 2,
-      proposalCutCount: 2,
-      candidateAnchorCount: 1,
-      candidateCutCount: 1,
+      proposalAnchorCount: 3,
+      proposalCutCount: 3,
+      candidateAnchorCount: 2,
+      candidateCutCount: 2,
       appliedAnchorCount: 1,
       appliedCutCount: 1
     });

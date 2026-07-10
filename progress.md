@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C94 已完成：对齐提案已落点与 ID 冲突判定分离。
+  - 对齐预览不再把“同 ID”本身视为已应用；同步锚点必须源/目标时间等价，候选补偿必须源时间和补偿量等价，才会标记为已落点。
+  - 应用阻断现在优先基于当前项目完整锚点和补偿点上下文过滤已落点等价项；同 ID 且时间等价不会阻断继续应用剩余新项，同 ID 但时间不同仍会作为真实冲突进入阻断和复核报告。
+  - 顶部工具栏、资源面板、对齐复核报告和 store 应用逻辑统一传入当前项目锚点/补偿点上下文，避免按钮可用性、报告解释和实际写入语义不一致。
+  - 保留仅传 ID 数组的旧调用兼容语义；缺少完整上下文时仍按已有 ID 冲突保守阻断。
+  - 已补充预览、阻断报告、store、顶部工具栏和资源面板测试，覆盖“等价已落点不阻断”和“同 ID 不同时间继续阻断”两个边界。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/preview.test.ts src/domain/alignment/alignmentReport.test.ts src/stores/editorStore.test.ts src/features/editor/EditorToolbar.test.tsx src/features/assets/AssetPanel.test.tsx` 成功，5 个测试文件、64 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/192 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 14:06:03`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999405` 字节，时间 `2026/07/10 14:06:03`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c94-alignment-applied-id-conflict-semantics-20260710`。
 - 成熟度提升阶段 C93 已完成：应用对齐提案时只写入待应用项。
   - 对齐预览层的“已应用”判断已导出为领域 helper，store 应用逻辑复用同一套规则，避免 UI 显示已应用但写入时仍重复创建锚点或补偿点。
   - `applyAlignmentProposalData` 现在会跳过已按 ID 或按时间/补偿等价落点的同步锚点与候选补偿，只把真正待应用项写入项目。

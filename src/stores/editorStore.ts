@@ -1047,8 +1047,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   applyAlignmentProposalData: (proposal) => {
     const project = get().project;
     const blockers = createAlignmentApplyBlockers(proposal, {
-      existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
-      existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+      existingAnchors: project.syncAnchors,
+      existingCutMarkers: project.cutMarkers
     });
     if (blockers.length > 0) {
       set({

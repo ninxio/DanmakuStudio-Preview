@@ -142,4 +142,47 @@ describe("alignment review report", () => {
     expect(report).toContain("1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing）");
     expect(report).toContain("1 个候选补偿 ID 已存在于当前项目（ID：cut-existing）");
   });
+
+  it("已有 ID 的等价落点不会阻断应用，时间不同才阻断", () => {
+    const equivalentProposal: AlignmentProposal = {
+      anchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, origin: "automatic" }],
+      cutCandidates: [
+        {
+          id: "cut-existing",
+          name: "已有补偿",
+          sourceAtMs: 3000,
+          targetGapMs: 1200,
+          confidence: 0.9,
+          note: ""
+        }
+      ],
+      confidence: 0.9,
+      diagnostics: []
+    };
+    const conflictProposal: AlignmentProposal = {
+      anchors: [{ id: "anchor-existing", sourceMs: 1200, targetMs: 2400, origin: "automatic" }],
+      cutCandidates: [
+        {
+          id: "cut-existing",
+          name: "同 ID 不同补偿",
+          sourceAtMs: 3000,
+          targetGapMs: 2400,
+          confidence: 0.9,
+          note: ""
+        }
+      ],
+      confidence: 0.9,
+      diagnostics: []
+    };
+    const context = {
+      existingAnchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, origin: "manual" as const }],
+      existingCutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
+    };
+
+    expect(createAlignmentApplyBlockers(equivalentProposal, context)).toEqual([]);
+    expect(createAlignmentApplyBlockers(conflictProposal, context)).toEqual([
+      "1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
+      "1 个候选补偿 ID 已存在于当前项目（ID：cut-existing），应用会丢失新补偿。"
+    ]);
+  });
 });

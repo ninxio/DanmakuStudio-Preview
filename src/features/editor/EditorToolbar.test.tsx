@@ -284,6 +284,28 @@ describe("编辑器工具栏", () => {
       "1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。"
     );
   });
+
+  it("对齐提案包含已落点同 ID 项和新项时允许应用", () => {
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, confidence: 1, origin: "manual" }]
+      },
+      alignmentProposal: {
+        anchors: [
+          { id: "anchor-existing", sourceMs: 10_000, targetMs: 12_000, origin: "automatic" },
+          { id: "anchor-new", sourceMs: 20_000, targetMs: 25_000, origin: "automatic" }
+        ],
+        cutCandidates: [],
+        confidence: 0.8,
+        diagnostics: ["测试"]
+      }
+    });
+
+    render(<EditorToolbar />);
+
+    expect(screen.getByRole("button", { name: "应用对齐" })).toBeEnabled();
+  });
 });
 
 function createRejectingTextFile(fileName: string, message: string): File {

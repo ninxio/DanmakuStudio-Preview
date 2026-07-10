@@ -543,10 +543,10 @@ describe("editor store", () => {
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
-      anchors: [{ id: "anchor-duplicate-time", sourceMs: 10_000, targetMs: 20_000, confidence: 0.8, origin: "automatic" }],
+      anchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 0.8, origin: "automatic" }],
       cutCandidates: [
         {
-          id: "cut-duplicate-time",
+          id: "cut-existing",
           name: "重复时间补偿",
           sourceAtMs: 30_000,
           targetGapMs: 12_000,

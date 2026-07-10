@@ -54,8 +54,8 @@ export function EditorToolbar() {
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
   const alignmentApplyBlockers = alignmentProposal
     ? createAlignmentApplyBlockers(alignmentProposal, {
-        existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
-        existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+        existingAnchors: project.syncAnchors,
+        existingCutMarkers: project.cutMarkers
       })
     : [];
   const canExportXml = useEditorStore((state) =>

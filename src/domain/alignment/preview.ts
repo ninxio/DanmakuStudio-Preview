@@ -95,7 +95,6 @@ export function buildAlignmentPreview(
 export function isAlignmentAnchorApplied(anchors: SyncAnchor[], proposalAnchor: SyncAnchor): boolean {
   return anchors.some(
     (anchor) =>
-      hasSameNonEmptyId(anchor.id, proposalAnchor.id) ||
       (anchor.sourceMs === proposalAnchor.sourceMs && anchor.targetMs === proposalAnchor.targetMs)
   );
 }
@@ -104,15 +103,12 @@ export function isAlignmentCutCandidateApplied(
   markers: EditorProject["cutMarkers"],
   candidate: CutCandidate
 ): boolean {
+  const candidateSourceAtMs = Math.max(0, Math.round(candidate.sourceAtMs));
+  const candidateTargetGapMs = Math.round(candidate.targetGapMs);
   return markers.some(
     (marker) =>
-      hasSameNonEmptyId(marker.id, candidate.id) ||
-      (marker.sourceAtMs === candidate.sourceAtMs && marker.targetGapMs === candidate.targetGapMs)
+      marker.sourceAtMs === candidateSourceAtMs && marker.targetGapMs === candidateTargetGapMs
   );
-}
-
-function hasSameNonEmptyId(left: string, right: string): boolean {
-  return left.length > 0 && left === right;
 }
 
 function compareAnchors(left: SyncAnchor, right: SyncAnchor): number {

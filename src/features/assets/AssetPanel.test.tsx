@@ -770,7 +770,7 @@ describe("资源面板", () => {
               id: "audio-gap-1",
               name: "已有补偿",
               sourceAtMs: 20_000,
-              targetGapMs: 20_000,
+              targetGapMs: 5000,
               note: "已有项目补偿"
             }
           ]

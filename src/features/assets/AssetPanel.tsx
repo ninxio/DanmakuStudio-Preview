@@ -1248,8 +1248,8 @@ function VideoAlignmentLabPanel({
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
   const applyBlockerContext = {
-    existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
-    existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+    existingAnchors: project.syncAnchors,
+    existingCutMarkers: project.cutMarkers
   };
   const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal, applyBlockerContext) : [];
 

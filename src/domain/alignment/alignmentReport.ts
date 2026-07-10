@@ -1,8 +1,16 @@
 import { formatTimecode } from "../shared/time";
+import type { SyncAnchor } from "../danmaku/types";
+import type { EditorProject } from "../project/types";
+import {
+  isAlignmentAnchorApplied,
+  isAlignmentCutCandidateApplied
+} from "./preview";
 import type { AlignmentProposal, CutCandidate } from "./types";
 
 export interface AlignmentApplyBlockerContext {
+  existingAnchors?: SyncAnchor[];
   existingAnchorIds?: string[];
+  existingCutMarkers?: EditorProject["cutMarkers"];
   existingCutMarkerIds?: string[];
 }
 
@@ -72,22 +80,24 @@ export function createAlignmentApplyBlockers(
   context: AlignmentApplyBlockerContext = {}
 ): string[] {
   const blockers: string[] = [];
-  const emptyAnchorIdCount = proposal.anchors.filter((anchor) => anchor.id.trim().length === 0).length;
-  const emptyCutIdCount = proposal.cutCandidates.filter((candidate) => candidate.id.trim().length === 0).length;
-  const duplicateAnchorIds = findDuplicateIds(proposal.anchors.map((anchor) => anchor.id));
-  const duplicateCutIds = findDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id));
+  const pendingAnchors = createPendingAnchorsForBlockers(proposal, context);
+  const pendingCutCandidates = createPendingCutCandidatesForBlockers(proposal, context);
+  const emptyAnchorIdCount = pendingAnchors.filter((anchor) => anchor.id.trim().length === 0).length;
+  const emptyCutIdCount = pendingCutCandidates.filter((candidate) => candidate.id.trim().length === 0).length;
+  const duplicateAnchorIds = findDuplicateIds(pendingAnchors.map((anchor) => anchor.id));
+  const duplicateCutIds = findDuplicateIds(pendingCutCandidates.map((candidate) => candidate.id));
   const existingAnchorIdConflicts = findExistingIdConflicts(
-    proposal.anchors.map((anchor) => anchor.id),
-    context.existingAnchorIds ?? []
+    pendingAnchors.map((anchor) => anchor.id),
+    readExistingAnchorIds(context)
   );
   const existingCutIdConflicts = findExistingIdConflicts(
-    proposal.cutCandidates.map((candidate) => candidate.id),
-    context.existingCutMarkerIds ?? []
+    pendingCutCandidates.map((candidate) => candidate.id),
+    readExistingCutMarkerIds(context)
   );
-  const invalidRangeCount = proposal.cutCandidates.filter(
+  const invalidRangeCount = pendingCutCandidates.filter(
     (candidate) => hasCompleteSourceRange(candidate) && candidate.sourceRangeStartMs > candidate.sourceRangeEndMs
   ).length;
-  const sourceOutsideRangeCount = proposal.cutCandidates.filter(
+  const sourceOutsideRangeCount = pendingCutCandidates.filter(
     (candidate) =>
       hasCompleteSourceRange(candidate) &&
       candidate.sourceRangeStartMs <= candidate.sourceRangeEndMs &&
@@ -190,6 +200,38 @@ function createApplyBlockerLines(blockers: string[]): string[] {
     return ["- 暂无应用阻断。"];
   }
   return blockers.map((blocker, index) => `- ${index + 1}. ${blocker}`);
+}
+
+function createPendingAnchorsForBlockers(
+  proposal: AlignmentProposal,
+  context: AlignmentApplyBlockerContext
+): SyncAnchor[] {
+  const existingAnchors = context.existingAnchors;
+  if (!existingAnchors) {
+    return proposal.anchors;
+  }
+  return proposal.anchors.filter((anchor) => !isAlignmentAnchorApplied(existingAnchors, anchor));
+}
+
+function createPendingCutCandidatesForBlockers(
+  proposal: AlignmentProposal,
+  context: AlignmentApplyBlockerContext
+): CutCandidate[] {
+  const existingCutMarkers = context.existingCutMarkers;
+  if (!existingCutMarkers) {
+    return proposal.cutCandidates;
+  }
+  return proposal.cutCandidates.filter(
+    (candidate) => !isAlignmentCutCandidateApplied(existingCutMarkers, candidate)
+  );
+}
+
+function readExistingAnchorIds(context: AlignmentApplyBlockerContext): string[] {
+  return context.existingAnchorIds ?? context.existingAnchors?.map((anchor) => anchor.id) ?? [];
+}
+
+function readExistingCutMarkerIds(context: AlignmentApplyBlockerContext): string[] {
+  return context.existingCutMarkerIds ?? context.existingCutMarkers?.map((marker) => marker.id) ?? [];
 }
 
 function hasCompleteSourceRange(
