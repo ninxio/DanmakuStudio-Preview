@@ -361,7 +361,7 @@ describe("资源面板", () => {
       await user.click(screen.getByRole("button", { name: "弹幕素材" }));
       await user.click(screen.getByRole("button", { name: "导出分集 XML" }));
 
-      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(createObjectUrl).toHaveBeenCalledTimes(1));
       const clickedAnchor = clickSpy.mock.contexts[0];
       if (!(clickedAnchor instanceof HTMLAnchorElement)) {
         throw new Error("分集 ZIP 下载未通过锚点触发。");
@@ -413,7 +413,7 @@ describe("资源面板", () => {
       await user.click(screen.getByRole("button", { name: "弹幕素材" }));
       await user.click(screen.getByRole("button", { name: "导出分集 XML" }));
 
-      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(createObjectUrl).toHaveBeenCalledTimes(1));
       const clickedAnchor = clickSpy.mock.contexts[0];
       if (!(clickedAnchor instanceof HTMLAnchorElement)) {
         throw new Error("单分集 XML 下载未通过锚点触发。");

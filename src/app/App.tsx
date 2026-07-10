@@ -6,6 +6,7 @@ import { ExportDialog } from "../features/export/ExportDialog";
 import { InspectorPanel } from "../features/inspector/InspectorPanel";
 import { PreviewPanel } from "../features/preview/PreviewPanel";
 import { TimelinePanel } from "../features/timeline/TimelinePanel";
+import { formatExportFileError, openExportDirectoryPath } from "../infrastructure/file-system/exportFiles";
 import { formatDesktopSettingsError, hydrateDesktopAppSettings } from "../infrastructure/settings/desktopAppSettings";
 import { useEditorStore } from "../stores/editorStore";
 import type { PointerEvent as ReactPointerEvent } from "react";
@@ -89,6 +90,20 @@ export function App() {
     event.preventDefault();
   };
 
+  const runStatusAction = () => {
+    if (status.action?.type !== "openDirectory") {
+      return;
+    }
+    void openExportDirectoryPath(status.action.directoryPath).catch((error) => {
+      useEditorStore.setState({
+        status: {
+          message: `打开导出文件夹失败：${formatExportFileError(error)}`,
+          tone: "error"
+        }
+      });
+    });
+  };
+
   return (
     <div className="flex h-screen min-h-0 flex-col bg-[#101216] text-slate-100">
       <KeyboardShortcuts />
@@ -156,7 +171,16 @@ export function App() {
         }`}
         data-testid="status-bar"
       >
-        {status.message}
+        <span className="min-w-0 flex-1 truncate">{status.message}</span>
+        {status.action ? (
+          <button
+            type="button"
+            className="ml-3 shrink-0 rounded border border-current/30 px-2 py-0.5 text-[11px] transition hover:bg-current/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-current"
+            onClick={runStatusAction}
+          >
+            {status.action.label}
+          </button>
+        ) : null}
       </footer>
       <ExportDialog />
     </div>

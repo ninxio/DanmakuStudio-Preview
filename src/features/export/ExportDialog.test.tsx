@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuAsset, DanmakuClip } from "../../domain/danmaku/types";
 import { createHistoryState } from "../../domain/history/history";
@@ -57,9 +57,11 @@ describe("导出摘要", () => {
   it("显示导出摘要和验证状态", () => {
     useEditorStore.getState().prepareExport();
     render(<ExportDialog />);
-    expect(screen.getByText("导出 XML 摘要")).toBeInTheDocument();
-    expect(screen.getByText("导出前检查")).toBeInTheDocument();
-    expect(screen.getByText("导出 XML 可重新导入。 验证条数：1")).toBeInTheDocument();
+      expect(screen.getByText("导出 XML 摘要")).toBeInTheDocument();
+      expect(screen.getByText("导出前检查")).toBeInTheDocument();
+      expect(screen.getByText("导出文件名")).toBeInTheDocument();
+      expect(screen.getByText("浏览器下载")).toBeInTheDocument();
+      expect(screen.getByText("导出 XML 可重新导入。 验证条数：1")).toBeInTheDocument();
   });
 
   it("显示导出前检查项并可下载检查报告", async () => {
@@ -102,7 +104,7 @@ describe("导出摘要", () => {
       expect(screen.getByText("asset.xml / 文件级 / 警告：跳过一条坏弹幕，片段：<d/>")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "下载检查报告" }));
 
-      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(createObjectUrl).toHaveBeenCalledTimes(1));
       const [blob] = createObjectUrl.mock.calls[0];
       if (!(blob instanceof Blob)) {
         throw new Error("检查报告下载对象不是 Blob。");
@@ -165,7 +167,7 @@ describe("导出摘要", () => {
       expect(screen.getByText("手动版本差异")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "下载导出报告" }));
 
-      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(createObjectUrl).toHaveBeenCalledTimes(1));
       const [blob] = createObjectUrl.mock.calls[0];
       if (!(blob instanceof Blob)) {
         throw new Error("导出报告下载对象不是 Blob。");
@@ -196,7 +198,7 @@ describe("导出摘要", () => {
     }
   });
 
-  it("下载 XML 时使用项目名生成文件名", () => {
+  it("导出 XML 时使用项目名生成文件名", async () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
     const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:export-xml");
@@ -214,9 +216,9 @@ describe("导出摘要", () => {
     try {
       useEditorStore.getState().prepareExport();
       render(<ExportDialog />);
-      fireEvent.click(screen.getByRole("button", { name: "下载 XML" }));
+      fireEvent.click(screen.getByRole("button", { name: "导出 XML" }));
 
-      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(createObjectUrl).toHaveBeenCalledTimes(1));
       const clickedAnchor = clickSpy.mock.contexts[0];
       if (!(clickedAnchor instanceof HTMLAnchorElement)) {
         throw new Error("XML 下载未通过锚点触发。");

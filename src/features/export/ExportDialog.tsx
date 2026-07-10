@@ -1,4 +1,5 @@
-import { Download, X } from "lucide-react";
+import { Download, FolderOpen, X } from "lucide-react";
+import { useEffect, useState } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
 import {
@@ -19,8 +20,14 @@ import {
   type ProjectReadinessSummary
 } from "../../domain/project/readiness";
 import { formatTimecode } from "../../domain/shared/time";
-import { downloadTextFile } from "../../infrastructure/file-system/browserFiles";
-import { useEditorStore } from "../../stores/editorStore";
+import {
+  formatExportFileError,
+  saveTextExportFile,
+  type SaveTextExportResult
+} from "../../infrastructure/file-system/exportFiles";
+import { pickExportDirectoryPath } from "../../infrastructure/file-system/nativeDialogs";
+import { loadAppSettings } from "../../infrastructure/settings/appSettings";
+import { useEditorStore, type EditorStatus } from "../../stores/editorStore";
 
 const HEALTH_PREFLIGHT_EVIDENCE_LIMIT = 2;
 
@@ -28,10 +35,19 @@ export function ExportDialog() {
   const project = useEditorStore((state) => state.project);
   const exportDraft = useEditorStore((state) => state.exportDraft);
   const clearExport = useEditorStore((state) => state.clearExport);
+  const [exportDirectory, setExportDirectory] = useState(() => loadAppSettings().export.defaultDirectory);
+  useEffect(() => {
+    if (exportDraft) {
+      setExportDirectory(loadAppSettings().export.defaultDirectory);
+    }
+  }, [exportDraft]);
   if (!exportDraft) {
     return null;
   }
   const { summary, validation } = exportDraft;
+  const xmlFileName = createProjectDownloadFileName(project.name, ".xml", "danmaku-export");
+  const healthReportFileName = createProjectDownloadFileName(project.name, "-health-report.txt", "danmaku-export");
+  const exportReportFileName = createProjectDownloadFileName(project.name, "-export-report.txt", "danmaku-export");
   const healthSummary = createProjectHealthSummary(project);
   const readinessSummary = createProjectReadinessSummary(project);
   const previewCompensations = summary.compensationDetails.slice(0, 3);
@@ -40,32 +56,63 @@ export function ExportDialog() {
   const hiddenNegativeClampCount = Math.max(0, summary.negativeClampDetails.length - previewNegativeClamps.length);
   const hasExportReviewReport = summary.compensationDetails.length > 0 || summary.negativeClampDetails.length > 0;
 
-  const downloadHealthReport = () => {
-    const fileName = downloadTextFile(
-      createProjectDownloadFileName(project.name, "-health-report.txt", "danmaku-export"),
-      createProjectHealthReport(project.name, healthSummary),
-      "text/plain;charset=utf-8"
-    );
-    setExportStatus(`已导出检查报告：${fileName}。`, "success");
+  const chooseExportDirectory = async () => {
+    try {
+      const path = await pickExportDirectoryPath(exportDirectory);
+      if (!path) {
+        return;
+      }
+      setExportDirectory(path);
+      setExportStatus({ message: `本次导出目录已设为：${path}`, tone: "success" });
+    } catch (error) {
+      setExportStatus({ message: `选择导出目录失败：${formatExportFileError(error)}`, tone: "warning" });
+    }
   };
 
-  const downloadExportReviewReport = () => {
-    const fileName = downloadTextFile(
-      createProjectDownloadFileName(project.name, "-export-report.txt", "danmaku-export"),
-      createCompensationReport(project.name, summary),
-      "text/plain;charset=utf-8"
-    );
-    setExportStatus(`已导出复核报告：${fileName}。`, "success");
+  const downloadHealthReport = async () => {
+    try {
+      const result = await saveTextExportFile(
+        {
+          fileName: healthReportFileName,
+          content: createProjectHealthReport(project.name, healthSummary)
+        },
+        { directoryPath: exportDirectory, type: "text/plain;charset=utf-8" }
+      );
+      setExportStatus(createExportSuccessStatus("检查报告", result));
+    } catch (error) {
+      setExportStatus({ message: `导出检查报告失败：${formatExportFileError(error)}`, tone: "error" });
+    }
   };
 
-  const downloadXml = () => {
-    const fileName = downloadTextFile(
-      createProjectDownloadFileName(project.name, ".xml", "danmaku-export"),
-      exportDraft.xml,
-      "application/xml;charset=utf-8"
-    );
-    setExportStatus(`已导出 XML：${fileName}。`, "success");
-    clearExport();
+  const downloadExportReviewReport = async () => {
+    try {
+      const result = await saveTextExportFile(
+        {
+          fileName: exportReportFileName,
+          content: createCompensationReport(project.name, summary)
+        },
+        { directoryPath: exportDirectory, type: "text/plain;charset=utf-8" }
+      );
+      setExportStatus(createExportSuccessStatus("复核报告", result));
+    } catch (error) {
+      setExportStatus({ message: `导出复核报告失败：${formatExportFileError(error)}`, tone: "error" });
+    }
+  };
+
+  const downloadXml = async () => {
+    try {
+      const result = await saveTextExportFile(
+        {
+          fileName: xmlFileName,
+          content: exportDraft.xml
+        },
+        { directoryPath: exportDirectory, type: "application/xml;charset=utf-8" }
+      );
+      setExportStatus(createExportSuccessStatus("XML", result));
+      clearExport();
+    } catch (error) {
+      setExportStatus({ message: `导出 XML 失败：${formatExportFileError(error)}`, tone: "error" });
+    }
   };
 
   return (
@@ -85,6 +132,13 @@ export function ExportDialog() {
           <SummaryRow label="累计调整时长" value={formatSignedCompensationDuration(summary.totalCutGapMs)} />
           <SummaryRow label="存在导入警告" value={summary.hasImportWarnings ? "是" : "否"} />
           <SummaryRow label="负时间限制为 0" value={`${summary.negativeClampCount} 项`} />
+          <SummaryRow label="导出文件名" value={xmlFileName} />
+          <SummaryRow label="导出目录" value={exportDirectory.trim().length > 0 ? exportDirectory : "浏览器下载"} />
+          {exportDirectory.trim().length === 0 ? (
+            <div className="rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs leading-5 text-amber-100">
+              未设置默认导出目录，本次会使用浏览器下载。你也可以先选择本次导出目录。
+            </div>
+          ) : null}
           <ProjectReadinessPreflight summary={readinessSummary} />
           {previewCompensations.length > 0 ? (
             <section className="rounded border border-panel-line bg-[#111318] p-3 text-xs text-slate-300">
@@ -123,20 +177,27 @@ export function ExportDialog() {
           </div>
         </div>
         <footer className="flex flex-wrap justify-end gap-2 border-t border-panel-line p-4">
-          <TextButton onClick={downloadHealthReport}>
+          <TextButton onClick={() => void chooseExportDirectory()}>
+            <FolderOpen size={14} />
+            选择目录
+          </TextButton>
+          {exportDirectory.trim().length > 0 ? (
+            <TextButton onClick={() => setExportDirectory("")}>改用下载</TextButton>
+          ) : null}
+          <TextButton onClick={() => void downloadHealthReport()}>
             <Download size={14} />
             下载检查报告
           </TextButton>
           {hasExportReviewReport ? (
-            <TextButton onClick={downloadExportReviewReport}>
+            <TextButton onClick={() => void downloadExportReviewReport()}>
               <Download size={14} />
               下载导出报告
             </TextButton>
           ) : null}
           <TextButton onClick={clearExport}>取消</TextButton>
-          <TextButton tone="primary" disabled={!validation.ok} onClick={downloadXml}>
+          <TextButton tone="primary" disabled={!validation.ok} onClick={() => void downloadXml()}>
             <Download size={14} />
-            下载 XML
+            导出 XML
           </TextButton>
         </footer>
       </div>
@@ -273,6 +334,25 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function setExportStatus(message: string, tone: "success" | "warning" | "error" | "neutral") {
-  useEditorStore.setState({ status: { message, tone } });
+function createExportSuccessStatus(targetLabel: string, result: SaveTextExportResult): EditorStatus {
+  const readableTargetLabel = targetLabel === "XML" ? " XML" : targetLabel;
+  if (result.mode === "directory") {
+    return {
+      message: `已导出${readableTargetLabel}到 ${result.filePath}${result.wasRenamed ? "（已有同名文件，已自动改名）。" : "。"}`,
+      tone: "success",
+      action: {
+        type: "openDirectory",
+        label: "打开目录",
+        directoryPath: result.directoryPath
+      }
+    };
+  }
+  return {
+    message: `已导出${readableTargetLabel}：${result.downloadedFileName ?? result.fileName ?? "浏览器下载"}。`,
+    tone: "success"
+  };
+}
+
+function setExportStatus(status: EditorStatus) {
+  useEditorStore.setState({ status });
 }

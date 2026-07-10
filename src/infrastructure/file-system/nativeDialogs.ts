@@ -37,6 +37,19 @@ export async function pickFfmpegExecutablePath(
   );
 }
 
+export async function pickExportDirectoryPath(
+  defaultPath = "",
+  dialog: NativeOpenDialog = defaultNativeOpenDialog
+): Promise<string | null> {
+  return pickSingleNativeDirectoryPath(
+    {
+      title: "选择导出文件夹",
+      defaultPath: normalizeDefaultPath(defaultPath)
+    },
+    dialog
+  );
+}
+
 export async function pickSingleNativePath(
   options: OpenDialogOptions,
   dialog: NativeOpenDialog = defaultNativeOpenDialog
@@ -48,6 +61,22 @@ export async function pickSingleNativePath(
     ...options,
     multiple: false,
     directory: false
+  });
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  return path && path.trim().length > 0 ? path : null;
+}
+
+export async function pickSingleNativeDirectoryPath(
+  options: OpenDialogOptions,
+  dialog: NativeOpenDialog = defaultNativeOpenDialog
+): Promise<string | null> {
+  if (dialog === defaultNativeOpenDialog && !isTauri()) {
+    throw new Error("原生目录选择器需要在 Tauri 桌面端运行。");
+  }
+  const selected = await dialog({
+    ...options,
+    multiple: false,
+    directory: true
   });
   const path = Array.isArray(selected) ? selected[0] : selected;
   return path && path.trim().length > 0 ? path : null;

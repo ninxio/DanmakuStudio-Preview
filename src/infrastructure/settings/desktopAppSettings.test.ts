@@ -16,6 +16,9 @@ describe("桌面应用设置桥", () => {
     const bridge: DesktopAppSettingsBridge = {
       load: vi.fn().mockResolvedValue(
         JSON.stringify({
+          export: {
+            defaultDirectory: "D:\\exports"
+          },
           emby: {
             serverUrl: "https://emby.example.test",
             pathPrefix: "emby",
@@ -41,6 +44,7 @@ describe("桌面应用设置桥", () => {
       pathPrefix: "/emby",
       username: "tester"
     });
+    expect(settings?.export.defaultDirectory).toBe("D:\\exports");
     expect(loadAppSettings().alignment.windowMs).toBe(500);
     const raw = window.localStorage.getItem(APP_SETTINGS_STORAGE_KEY) ?? "";
     expect(raw).not.toContain("secret");
@@ -56,6 +60,9 @@ describe("桌面应用设置桥", () => {
     await expect(
       persistDesktopAppSettings(
         {
+          export: {
+            defaultDirectory: " D:\\exports "
+          },
           emby: {
             serverUrl: " https://emby.example.test ",
             pathPrefix: "emby",
@@ -76,6 +83,7 @@ describe("桌面应用设置桥", () => {
     const [content] = vi.mocked(bridge.save).mock.calls[0];
     expect(JSON.parse(content)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(content).toContain("https://emby.example.test");
+    expect(content).toContain("D:\\\\exports");
     expect(content).toContain("/emby");
     expect(content).not.toContain("password");
     expect(loadAppSettings().emby.username).toBe("tester");
@@ -88,6 +96,9 @@ describe("桌面应用设置桥", () => {
       clear: vi.fn().mockResolvedValue(undefined)
     };
     saveAppSettings({
+      export: {
+        defaultDirectory: "D:\\exports"
+      },
       emby: {
         serverUrl: "https://emby.example.test",
         pathPrefix: "/emby",

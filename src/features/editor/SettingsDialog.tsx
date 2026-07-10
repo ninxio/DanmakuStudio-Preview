@@ -1,4 +1,16 @@
-import { Download, Info, MonitorCog, Save, Server, ShieldCheck, SlidersHorizontal, Trash2, Upload, X } from "lucide-react";
+import {
+  Download,
+  FolderOpen,
+  Info,
+  MonitorCog,
+  Save,
+  Server,
+  ShieldCheck,
+  SlidersHorizontal,
+  Trash2,
+  Upload,
+  X
+} from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Field } from "../../components/Field";
 import { IconButton } from "../../components/IconButton";
@@ -14,6 +26,8 @@ import {
   type AppSettings
 } from "../../infrastructure/settings/appSettings";
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
+import { formatExportFileError } from "../../infrastructure/file-system/exportFiles";
+import { pickExportDirectoryPath } from "../../infrastructure/file-system/nativeDialogs";
 import {
   clearDesktopAppSettings,
   formatDesktopSettingsError,
@@ -31,10 +45,11 @@ interface SettingsDialogProps {
   onClose: () => void;
 }
 
-type SettingsTab = "general" | "emby" | "alignment" | "privacy" | "about";
+type SettingsTab = "general" | "export" | "emby" | "alignment" | "privacy" | "about";
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; icon: typeof MonitorCog }> = [
   { id: "general", label: "常规", icon: MonitorCog },
+  { id: "export", label: "导出", icon: FolderOpen },
   { id: "emby", label: "Emby 连接", icon: Server },
   { id: "alignment", label: "FFmpeg 与对齐", icon: SlidersHorizontal },
   { id: "privacy", label: "隐私与本地数据", icon: ShieldCheck },
@@ -184,6 +199,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
                 onPreviewChange={updatePreview}
               />
             ) : null}
+            {tab === "export" ? <ExportSettingsPanel settings={settings} onChange={setSettings} /> : null}
             {tab === "emby" ? (
               <EmbySettingsPanel
                 settings={settings}
@@ -284,6 +300,65 @@ function GeneralSettingsPanel({
           onChange={(event) => onPreviewChange({ opacity: Number(event.target.value) })}
         />
       </label>
+    </SettingsSection>
+  );
+}
+
+function ExportSettingsPanel({
+  settings,
+  onChange
+}: {
+  settings: AppSettings;
+  onChange: (settings: AppSettings) => void;
+}) {
+  const chooseDirectory = async () => {
+    try {
+      const path = await pickExportDirectoryPath(settings.export.defaultDirectory);
+      if (!path) {
+        return;
+      }
+      onChange({
+        ...settings,
+        export: { ...settings.export, defaultDirectory: path }
+      });
+      setStatus("已选择默认导出文件夹，保存设置后生效。", "success");
+    } catch (error) {
+      setStatus(`选择导出文件夹失败：${formatExportFileError(error)}`, "warning");
+    }
+  };
+
+  return (
+    <SettingsSection title="导出" description="设置单集 XML、分集 ZIP 和导出报告的默认去向。">
+      <Field
+        label="默认导出目录"
+        value={settings.export.defaultDirectory}
+        placeholder="留空时使用浏览器下载"
+        onChange={(event) =>
+          onChange({
+            ...settings,
+            export: { ...settings.export, defaultDirectory: event.target.value }
+          })
+        }
+      />
+      <div className="flex flex-wrap gap-2">
+        <TextButton onClick={() => void chooseDirectory()}>
+          <FolderOpen size={14} />
+          选择目录
+        </TextButton>
+        <TextButton
+          onClick={() =>
+            onChange({
+              ...settings,
+              export: { ...settings.export, defaultDirectory: "" }
+            })
+          }
+        >
+          改用下载
+        </TextButton>
+      </div>
+      <InfoBox>
+        默认目录只保存在本机应用设置里；导出的 XML、ZIP 和报告不会额外写入你的本地路径。目录不存在或没有写入权限时，导出时会直接提示你重新选择。
+      </InfoBox>
     </SettingsSection>
   );
 }
@@ -436,7 +511,7 @@ function PrivacySettingsPanel({
         项目文件只保存弹幕、媒体引用和编辑状态，不嵌入视频内容，也不会保存 Emby 密码或 token。
       </InfoBox>
       <InfoBox>
-        本地应用设置只保存服务器地址、路径前缀、用户名、FFmpeg 路径和对齐默认参数。设置备份会带 schemaVersion，旧版无版本备份仍可导入。桌面端优先写入 Tauri 应用配置目录，网页模式使用浏览器本地存储。Emby 密码只保存在当前应用进程内，关闭应用后失效；清除本地设置也会清除会话密码。
+        本地应用设置只保存默认导出目录、服务器地址、路径前缀、用户名、FFmpeg 路径和对齐默认参数。设置备份会带 schemaVersion，旧版无版本备份仍可导入。桌面端优先写入 Tauri 应用配置目录，网页模式使用浏览器本地存储。Emby 密码只保存在当前应用进程内，关闭应用后失效；清除本地设置也会清除会话密码。
       </InfoBox>
       <InfoBox>
         当前版本不实现视频下载、DRM 绕过、账号绕过、私有接口爬取或未授权媒体访问。

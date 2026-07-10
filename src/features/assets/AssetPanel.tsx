@@ -62,10 +62,13 @@ import {
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import {
   downloadTextFile,
-  downloadTextFiles,
-  readTextFile,
-  type DownloadTextFilesResult
+  readTextFile
 } from "../../infrastructure/file-system/browserFiles";
+import {
+  formatExportFileError,
+  saveTextExportFiles,
+  type SaveTextExportResult
+} from "../../infrastructure/file-system/exportFiles";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import {
   authenticateEmby,
@@ -265,7 +268,7 @@ export function AssetPanel() {
                 </TextButton>
                 <TextButton
                   tone="primary"
-                  onClick={() => exportBatchMergePlan(batchMergePlan, project.name)}
+                  onClick={() => void exportBatchMergePlan(batchMergePlan, project.name)}
                   disabled={batchMergePlan.episodes.length === 0}
                   title="按当前批量规则导出多个分集 XML"
                 >
@@ -2028,7 +2031,7 @@ function createBatchMergeOptions({
   return { options, warnings };
 }
 
-function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>, projectName: string) {
+async function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>, projectName: string) {
   const files = plan.episodes.map((episode) => {
     const result = serializeBilibiliXml(episode.entries);
     const validation = validateExportedXml(result.xml);
@@ -2044,27 +2047,51 @@ function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>, proj
     setStatus({ message: `分集 XML 验证失败：${invalid.message}`, tone: "error" });
     return;
   }
-  const downloadResult = downloadTextFiles(
-    files.map((file) => ({ fileName: file.fileName, content: file.content })),
-    "application/xml;charset=utf-8",
-    createProjectDownloadFileName(projectName, "-danmaku-exports.zip")
-  );
-  setStatus({ message: createBatchExportDownloadStatus(downloadResult), tone: "success" });
+  try {
+    const exportResult = await saveTextExportFiles(
+      files.map((file) => ({ fileName: file.fileName, content: file.content })),
+      {
+        directoryPath: loadAppSettings().export.defaultDirectory,
+        type: "application/xml;charset=utf-8",
+        archiveFileName: createProjectDownloadFileName(projectName, "-danmaku-exports.zip")
+      }
+    );
+    setStatus(createBatchExportStatus(exportResult));
+  } catch (error) {
+    setStatus({ message: `分集 XML 导出失败：${formatExportFileError(error)}`, tone: "error" });
+  }
 }
 
 function setStatus(status: EditorStatus) {
   useEditorStore.setState({ status });
 }
 
-function createBatchExportDownloadStatus(result: DownloadTextFilesResult): string {
+function createBatchExportStatus(result: SaveTextExportResult): EditorStatus {
   const fileCount = result.fileCount.toLocaleString("zh-CN");
+  if (result.mode === "directory") {
+    return {
+      message: `已导出 ${fileCount} 个分集 XML 到 ${result.filePath}${result.wasRenamed ? "（已有同名文件，已自动改名）。" : "。"}`,
+      tone: "success",
+      action: {
+        type: "openDirectory",
+        label: "打开目录",
+        directoryPath: result.directoryPath
+      }
+    };
+  }
   if (result.archiveFileName) {
-    return `已触发下载 ${fileCount} 个分集 XML，已打包为 ${result.archiveFileName}。`;
+    return {
+      message: `已触发下载 ${fileCount} 个分集 XML，已打包为 ${result.archiveFileName}。`,
+      tone: "success"
+    };
   }
   if (result.downloadedFileName) {
-    return `已触发下载 ${fileCount} 个分集 XML：${result.downloadedFileName}。`;
+    return {
+      message: `已触发下载 ${fileCount} 个分集 XML：${result.downloadedFileName}。`,
+      tone: "success"
+    };
   }
-  return `已触发下载 ${fileCount} 个分集 XML。`;
+  return { message: `已触发下载 ${fileCount} 个分集 XML。`, tone: "success" };
 }
 
 function confidenceLabel(confidence: "high" | "medium" | "low"): string {

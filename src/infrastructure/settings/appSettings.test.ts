@@ -23,6 +23,9 @@ describe("应用设置持久化", () => {
     const storage = createMemoryStorage();
     const saved = saveAppSettings(
       {
+        export: {
+          defaultDirectory: " D:\\exports "
+        },
         emby: {
           serverUrl: " https://emby.example.test ",
           pathPrefix: "emby",
@@ -38,6 +41,7 @@ describe("应用设置持久化", () => {
       storage
     );
 
+    expect(saved.export.defaultDirectory).toBe("D:\\exports");
     expect(saved.emby).toEqual({
       serverUrl: "https://emby.example.test",
       pathPrefix: "/emby",
@@ -45,6 +49,7 @@ describe("应用设置持久化", () => {
     });
     const raw = storage.getItem(APP_SETTINGS_STORAGE_KEY) ?? "";
     expect(JSON.parse(raw)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
+    expect(raw).toContain("D:\\\\exports");
     expect(raw).toContain("ffmpeg.exe");
     expect(raw).not.toContain("password");
     expect(raw).not.toContain("token");
@@ -56,6 +61,10 @@ describe("应用设置持久化", () => {
     storage.setItem(
       APP_SETTINGS_STORAGE_KEY,
       JSON.stringify({
+        export: {
+          defaultDirectory: "D:\\exports",
+          temporaryDirectory: "D:\\tmp"
+        },
         emby: {
           serverUrl: "https://emby.example.test",
           pathPrefix: "/emby",
@@ -74,6 +83,7 @@ describe("应用设置持久化", () => {
 
     const loaded = loadAppSettings(storage);
 
+    expect(loaded.export.defaultDirectory).toBe("D:\\exports");
     expect(loaded.emby).toEqual({
       serverUrl: "https://emby.example.test",
       pathPrefix: "/emby",
@@ -99,6 +109,10 @@ describe("应用设置持久化", () => {
     const text = serializeAppSettings(
       parseAppSettingsText(
         JSON.stringify({
+          export: {
+            defaultDirectory: "D:\\exports",
+            token: "secret-token"
+          },
           emby: {
             serverUrl: " https://emby.example.test ",
             pathPrefix: "emby",
@@ -117,6 +131,7 @@ describe("应用设置持久化", () => {
     );
 
     expect(JSON.parse(text)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
+    expect(text).toContain("D:\\\\exports");
     expect(text).toContain("https://emby.example.test");
     expect(text).not.toContain("secret");
     expect(text).not.toContain("token");
@@ -126,6 +141,9 @@ describe("应用设置持久化", () => {
     expect(
       parseAppSettingsTextStrict(
         JSON.stringify({
+          export: {
+            defaultDirectory: "D:\\legacy-exports"
+          },
           emby: {
             serverUrl: "https://legacy.example.test",
             pathPrefix: "emby",
@@ -138,11 +156,16 @@ describe("应用设置持久化", () => {
             matchThreshold: 0.25
           }
         })
-      ).emby
-    ).toEqual({
-      serverUrl: "https://legacy.example.test",
-      pathPrefix: "/emby",
-      username: "legacy"
+      )
+    ).toMatchObject({
+      export: {
+        defaultDirectory: "D:\\legacy-exports"
+      },
+      emby: {
+        serverUrl: "https://legacy.example.test",
+        pathPrefix: "/emby",
+        username: "legacy"
+      }
     });
   });
 

@@ -87,6 +87,19 @@ describe("设置中心", () => {
     });
   });
 
+  it("保存默认导出目录", async () => {
+    const user = userEvent.setup();
+    render(<SettingsDialog onClose={() => undefined} />);
+
+    await user.click(screen.getByRole("button", { name: "导出" }));
+    fireEvent.change(screen.getByLabelText("默认导出目录"), {
+      target: { value: " D:\\danmaku exports " }
+    });
+    await user.click(screen.getByRole("button", { name: /保存设置/ }));
+
+    expect(loadAppSettings().export.defaultDirectory).toBe("D:\\danmaku exports");
+  });
+
   it("关于页展示当前成熟度提升主线", async () => {
     const user = userEvent.setup();
     render(<SettingsDialog onClose={() => undefined} />);
@@ -99,6 +112,9 @@ describe("设置中心", () => {
   it("可以清除本地应用设置", async () => {
     const user = userEvent.setup();
     saveAppSettings({
+      export: {
+        defaultDirectory: "D:\\exports"
+      },
       emby: {
         serverUrl: "https://emby.example.test",
         pathPrefix: "/emby",
@@ -130,6 +146,9 @@ describe("设置中心", () => {
     Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
     Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
     saveAppSettings({
+      export: {
+        defaultDirectory: "D:\\exports"
+      },
       emby: {
         serverUrl: "https://emby.example.test",
         pathPrefix: "/emby",
@@ -157,6 +176,7 @@ describe("设置中心", () => {
       const text = await readBlobText(blob);
       expect(JSON.parse(text)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
       expect(text).toContain("https://emby.example.test");
+      expect(text).toContain("D:\\\\exports");
       expect(text).not.toContain("secret-pass");
       expect(text).not.toContain("password");
       expect(text).not.toContain("token");
@@ -201,6 +221,9 @@ describe("设置中心", () => {
             minGapMs: "1500",
             matchThreshold: "0.3",
             token: "secret-token"
+          },
+          export: {
+            defaultDirectory: "D:\\imported-exports"
           }
         })
       ],
@@ -222,6 +245,9 @@ describe("设置中心", () => {
           windowMs: 600,
           minGapMs: 1500,
           matchThreshold: 0.3
+        },
+        export: {
+          defaultDirectory: "D:\\imported-exports"
         }
       })
     );

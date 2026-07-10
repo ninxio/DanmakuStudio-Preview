@@ -8,6 +8,7 @@ use std::time::Duration;
 
 mod app_settings;
 mod audio_alignment;
+mod export_files;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -18,6 +19,8 @@ pub fn run() {
             app_settings::load_app_settings_file,
             app_settings::save_app_settings_file,
             app_settings::clear_app_settings_file,
+            export_files::save_export_file,
+            export_files::open_export_directory,
             emby_http_request,
             audio_alignment::align_audio_files,
             audio_alignment::start_audio_alignment_job,

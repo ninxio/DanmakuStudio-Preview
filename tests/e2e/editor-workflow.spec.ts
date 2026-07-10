@@ -271,7 +271,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.screenshot({ path: screenshotPath("export-dialog.png"), fullPage: true });
 
   const exportedXmlDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "下载 XML" }).click();
+  await page.getByTestId("export-dialog").getByRole("button", { name: "导出 XML" }).click();
   const exportedXmlDownload = await exportedXmlDownloadPromise;
   const exportedXmlPath = resolve(downloadDir, exportedXmlDownload.suggestedFilename());
   await exportedXmlDownload.saveAs(exportedXmlPath);

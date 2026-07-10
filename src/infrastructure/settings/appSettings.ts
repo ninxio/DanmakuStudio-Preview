@@ -1,4 +1,7 @@
 export interface AppSettings {
+  export: {
+    defaultDirectory: string;
+  };
   emby: {
     serverUrl: string;
     pathPrefix: string;
@@ -22,6 +25,9 @@ export const APP_SETTINGS_SCHEMA_VERSION = 1;
 export const APP_SETTINGS_STORAGE_KEY = "danmaku.timelineStudio.appSettings.v1";
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
+  export: {
+    defaultDirectory: ""
+  },
   emby: {
     serverUrl: "",
     pathPrefix: "/emby",
@@ -60,6 +66,7 @@ export function clearAppSettings(storage = getDefaultStorage()): void {
 
 export function cloneAppSettings(settings: AppSettings): AppSettings {
   return {
+    export: { ...settings.export },
     emby: { ...settings.emby },
     alignment: { ...settings.alignment }
   };
@@ -93,9 +100,13 @@ export function normalizeAppSettings(value: unknown): AppSettings {
   if (!isRecord(value)) {
     return cloneAppSettings(DEFAULT_APP_SETTINGS);
   }
+  const exportSettings = isRecord(value.export) ? value.export : {};
   const emby = isRecord(value.emby) ? value.emby : {};
   const alignment = isRecord(value.alignment) ? value.alignment : {};
   return {
+    export: {
+      defaultDirectory: readString(exportSettings.defaultDirectory, DEFAULT_APP_SETTINGS.export.defaultDirectory)
+    },
     emby: {
       serverUrl: readString(emby.serverUrl, DEFAULT_APP_SETTINGS.emby.serverUrl),
       pathPrefix: normalizePathPrefix(readString(emby.pathPrefix, DEFAULT_APP_SETTINGS.emby.pathPrefix)),
