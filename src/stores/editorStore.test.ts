@@ -150,6 +150,34 @@ describe("editor store", () => {
     });
   });
 
+  it("项目健康存在阻断项时不会生成导出草稿", () => {
+    const asset = createAsset("asset-blocked-export", "blocked-export.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-missing-asset",
+          assetId: "missing-asset",
+          name: "坏片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    });
+
+    useEditorStore.getState().prepareExport();
+
+    expect(useEditorStore.getState().exportDraft).toBeNull();
+    expect(useEditorStore.getState().status).toEqual({
+      message: "项目健康检查未通过：片段引用了缺失资源。请在项目信息中处理后再导出。",
+      tone: "warning"
+    });
+  });
+
   it("更新共享疑似删减扫描配置", () => {
     useEditorStore.getState().setCutHintSettings({
       keywordsText: "广告",

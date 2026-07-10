@@ -21,7 +21,10 @@ import {
   cloneProject,
   touchProject
 } from "../domain/project/factory";
-import { cleanupProjectEditReferences as cleanupProjectEditReferencesInProject } from "../domain/project/health";
+import {
+  cleanupProjectEditReferences as cleanupProjectEditReferencesInProject,
+  createProjectHealthSummary
+} from "../domain/project/health";
 import type { EditorProject, EditorSelection, MediaReference } from "../domain/project/types";
 import {
   getAssetTimeRange,
@@ -929,6 +932,18 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   prepareExport: () => {
     const project = get().project;
+    const health = createProjectHealthSummary(project);
+    const blockingFinding = health.findings.find((finding) => finding.severity === "error");
+    if (blockingFinding) {
+      set({
+        exportDraft: null,
+        status: {
+          message: `项目健康检查未通过：${blockingFinding.title}。请在项目信息中处理后再导出。`,
+          tone: "warning"
+        }
+      });
+      return;
+    }
     const events = resolveProjectDanmakuEvents(project);
     const enabledEvents = events.filter((event) => event.enabled);
     if (enabledEvents.length === 0) {
