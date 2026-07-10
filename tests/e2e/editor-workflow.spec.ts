@@ -311,6 +311,8 @@ test("项目健康和导出摘要会展示负时间风险", async ({ page }) => 
   await expect(exportDialog).toContainText("导出前健康检查");
   await expect(exportDialog).toContainText("需复核");
   await expect(exportDialog).toContainText("存在负最终时间");
+  await expect(exportDialog).toContainText("normal.xml / normal / 第 1 条：-00:00:02.000，第一条滚动弹幕");
+  await expect(exportDialog).toContainText("normal.xml / normal / 第 2 条：-00:00:00.250，顶部弹幕");
   await expect(exportDialog).toContainText("负时间限制为 0");
   await expect(exportDialog).toContainText("2 项");
   await expect(exportDialog).toContainText("负时间限制明细");

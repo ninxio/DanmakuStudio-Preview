@@ -18,6 +18,8 @@ import { formatTimecode } from "../../domain/shared/time";
 import { downloadTextFile } from "../../infrastructure/file-system/browserFiles";
 import { useEditorStore } from "../../stores/editorStore";
 
+const HEALTH_PREFLIGHT_EVIDENCE_LIMIT = 2;
+
 export function ExportDialog() {
   const project = useEditorStore((state) => state.project);
   const exportDraft = useEditorStore((state) => state.exportDraft);
@@ -177,11 +179,27 @@ function ProjectHealthPreflight({ summary }: { summary: ProjectHealthSummary }) 
 }
 
 function ProjectHealthFindingPreview({ finding }: { finding: ProjectHealthFinding }) {
+  const evidencePreview = finding.evidence?.slice(0, HEALTH_PREFLIGHT_EVIDENCE_LIMIT) ?? [];
+  const hiddenEvidenceCount = Math.max(0, (finding.evidence?.length ?? 0) - evidencePreview.length);
   return (
     <li className="border-t border-current/15 pt-2 first:border-t-0 first:pt-0">
-      <span className="font-medium">{projectHealthFindingSeverityLabel(finding.severity)}</span>
-      <span className="mx-1">/</span>
-      <span>{finding.title}</span>
+      <div>
+        <span className="font-medium">{projectHealthFindingSeverityLabel(finding.severity)}</span>
+        <span className="mx-1">/</span>
+        <span>{finding.title}</span>
+      </div>
+      {evidencePreview.length > 0 ? (
+        <ul className="mt-1 grid gap-1 opacity-80">
+          {evidencePreview.map((item) => (
+            <li key={item} className="truncate" title={item}>
+              {item}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {hiddenEvidenceCount > 0 ? (
+        <p className="mt-1 opacity-70">另有 {hiddenEvidenceCount.toLocaleString("zh-CN")} 条证据，可下载健康报告查看。</p>
+      ) : null}
     </li>
   );
 }

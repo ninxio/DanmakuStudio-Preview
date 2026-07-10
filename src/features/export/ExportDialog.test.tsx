@@ -180,9 +180,21 @@ describe("导出摘要", () => {
   });
 
   it("显示负时间限制明细", () => {
+    const project = useEditorStore.getState().project;
+    const baseItem = project.assets[0].items[0];
     useEditorStore.setState({
       project: {
-        ...useEditorStore.getState().project,
+        ...project,
+        assets: [
+          {
+            ...project.assets[0],
+            items: [
+              { ...baseItem, id: "item-1", originalIndex: 0, sourceTimeMs: 1000, text: "导出弹幕" },
+              { ...baseItem, id: "item-2", originalIndex: 1, sourceTimeMs: 1100, text: "第二条导出弹幕" },
+              { ...baseItem, id: "item-3", originalIndex: 2, sourceTimeMs: 1200, text: "第三条导出弹幕" }
+            ]
+          }
+        ],
         globalOffsetMs: -1500
       }
     });
@@ -191,7 +203,11 @@ describe("导出摘要", () => {
     render(<ExportDialog />);
 
     expect(screen.getByText("负时间限制为 0")).toBeInTheDocument();
-    expect(screen.getByText("1 项")).toBeInTheDocument();
+    expect(screen.getByText("3 项")).toBeInTheDocument();
+    expect(screen.getByText("存在负最终时间")).toBeInTheDocument();
+    expect(screen.getByText("asset.xml / clip / 第 1 条：-00:00:00.500，导出弹幕")).toBeInTheDocument();
+    expect(screen.getByText("asset.xml / clip / 第 2 条：-00:00:00.400，第二条导出弹幕")).toBeInTheDocument();
+    expect(screen.getByText("另有 1 条证据，可下载健康报告查看。")).toBeInTheDocument();
     expect(screen.getByText("负时间限制明细")).toBeInTheDocument();
     expect(screen.getByText("导出弹幕")).toBeInTheDocument();
     expect(screen.getByText("-00:00:00.500 -> 00:00:00.000")).toBeInTheDocument();

@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C49 已完成：导出摘要健康预检展示证据预览。
+  - `ExportDialog` 的“导出前健康检查”现在会为每个预览健康项展示最多 2 条证据，超过时提示“另有 N 条证据，可下载健康报告查看”。
+  - 负最终时间、重复 ID 等带证据的健康项在导出前就能看到具体来源，不必先下载健康报告才能定位风险。
+  - README 已同步：导出摘要健康预检现在展示少量证据预览，并继续支持下载健康报告。
+  - 已补充导出对话框组件测试，覆盖负最终时间健康项的证据预览和剩余证据提示。
+  - Playwright E2E 已同步断言导出摘要中出现 `normal.xml / normal / 第 1 条` 等健康证据行。
+  - 已重新验证：`corepack pnpm test -- src/features/export/ExportDialog.test.tsx` 成功，1 个测试文件、4 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、149 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:01:45`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998120` 字节，时间 `2026/07/10 10:01:45`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c49-export-health-evidence-preview-20260710`。
 - 成熟度提升阶段 C48 已完成：项目健康证据截断会提示剩余数量。
   - 项目健康领域层新增统一证据预览上限，重复 ID 和负最终时间证据超过 5 条时，会追加“另有 N 项未列出，完整数量见上方计数”的说明。
   - 该说明会同时出现在资源栏“项目信息”面板和可下载健康报告中，避免大 XML 项目误以为只影响当前展示的前 5 条。
