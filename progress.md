@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C51 已完成：失效编辑引用健康项显示具体 ID。
+  - 项目健康摘要中的“存在失效编辑引用”现在会列出失效禁用 item ID，以及失效单条微调 item ID 和对应微调值。
+  - 证据会显示在资源栏“项目信息”、健康报告和相关 E2E 复核路径中，清理前用户可以看到将被移除的非破坏性编辑引用。
+  - README 已同步：失效编辑引用也会列出具体出现位置，并写入健康报告。
+  - 已补充领域层测试，确认失效禁用/微调证据与健康报告内容；资源面板测试确认两类证据可见；Playwright E2E 确认项目健康面板显示 `missing-disabled-item` 和 `missing-adjusted-item`。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、29 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、149 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:15:10`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996518` 字节，时间 `2026/07/10 10:15:10`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c51-health-orphaned-edit-evidence-20260710`。
 - 成熟度提升阶段 C50 已完成：缺失资源片段健康阻断显示定位证据。
   - 项目健康摘要中的“片段引用了缺失资源”阻断项现在会列出片段名、片段 ID、缺失资源 ID、时间轴起点和源区间。
   - 证据会出现在资源栏“项目信息”、健康报告中；由于 C49 已接入导出健康证据预览，后续可导出的非阻断证据也沿用同一展示模式。

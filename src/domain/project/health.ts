@@ -188,7 +188,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       title: "存在失效编辑引用",
       detail: `有 ${(orphanedDisabledIds.length + orphanedAdjustmentIds.length).toLocaleString(
         "zh-CN"
-      )} 条禁用或单条微调引用已不存在的弹幕，保存前建议清理。`
+      )} 条禁用或单条微调引用已不存在的弹幕，保存前建议清理。`,
+      evidence: formatOrphanedEditEvidence(orphanedDisabledIds, orphanedAdjustmentIds, project.itemTimeAdjustments)
     });
   }
   if (negativeFinalTimeEvents.length > 0) {
@@ -432,6 +433,19 @@ function formatMissingAssetClipEvidence(clips: DanmakuClip[]): string[] {
     )}，源区间 ${formatTimecode(clip.sourceInMs)} - ${formatTimecode(clip.sourceOutMs)}）`;
   });
   return appendOmittedEvidenceNote(evidence, clips.length, "个缺失资源片段");
+}
+
+function formatOrphanedEditEvidence(
+  disabledIds: string[],
+  adjustmentIds: string[],
+  itemTimeAdjustments: Record<string, Milliseconds>
+): string[] {
+  const rows = [
+    ...disabledIds.map((id) => `失效禁用：${id}`),
+    ...adjustmentIds.map((id) => `失效微调：${id}（${formatSignedDuration(itemTimeAdjustments[id] ?? 0)}）`)
+  ];
+  const evidence = rows.slice(0, EVIDENCE_PREVIEW_LIMIT);
+  return appendOmittedEvidenceNote(evidence, rows.length, "条失效编辑引用");
 }
 
 function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {

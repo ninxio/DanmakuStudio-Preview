@@ -99,6 +99,8 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(projectHealthPanel).toContainText("项目健康");
   await expect(projectHealthPanel).toContainText("需复核");
   await expect(projectHealthPanel).toContainText("存在失效编辑引用");
+  await expect(projectHealthPanel).toContainText("失效禁用：missing-disabled-item");
+  await expect(projectHealthPanel).toContainText("失效微调：missing-adjusted-item");
   await page.getByRole("button", { name: "清理失效引用" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已清理 2 条失效编辑引用");
   await expect(projectHealthPanel).toContainText("健康");

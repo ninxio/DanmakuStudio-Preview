@@ -185,6 +185,12 @@ describe("project health", () => {
         "orphaned-edits"
       ])
     );
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "orphaned-edits",
+        evidence: ["失效禁用：missing-item", "失效微调：missing-item（+00:00:00.100）"]
+      })
+    );
   });
 
   it("提示会在导出时被限制为 0ms 的负最终时间", () => {
@@ -335,6 +341,7 @@ describe("project health", () => {
     expect(report).toContain("重复 ID：0 个");
     expect(report).toContain("负最终时间：0 条");
     expect(report).toContain("[需复核] 存在失效编辑引用");
+    expect(report).toContain("失效禁用：missing-disabled");
   });
 });
 

@@ -185,6 +185,8 @@ describe("资源面板", () => {
 
     await user.click(screen.getByRole("button", { name: "项目信息" }));
     expect(screen.getByText("存在失效编辑引用")).toBeInTheDocument();
+    expect(screen.getByText("失效禁用：missing-disabled")).toBeInTheDocument();
+    expect(screen.getByText("失效微调：missing-adjustment（+00:00:00.200）")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "清理失效引用" }));
 
     expect(useEditorStore.getState().project.disabledItemIds).toEqual([validItemId]);
