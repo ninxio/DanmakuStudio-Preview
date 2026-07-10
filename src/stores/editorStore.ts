@@ -256,11 +256,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       objectUrl,
       durationMs: null
     };
-    commitProject(set, get, "导入视频", (project) => ({
+    commitProject(set, get, "导入参考视频", (project) => ({
       ...project,
       media
     }));
-    set({ status: { message: `已导入视频：${file.name}`, tone: "success" } });
+    set({ status: { message: `已导入参考视频：${file.name}`, tone: "success" } });
   },
 
   removeMedia: () => {
@@ -280,7 +280,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   bindCurrentMediaAsTarget: () => {
     const media = get().project.media;
     if (!media) {
-      set({ status: { message: "请先导入本地视频，再绑定为目标原片。", tone: "warning" } });
+      set({ status: { message: "请先导入参考视频，再绑定为目标原片。", tone: "warning" } });
       return;
     }
     const binding = createLocalFileMediaBinding(createId("media_binding"), media);

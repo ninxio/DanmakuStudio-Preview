@@ -108,7 +108,7 @@ export function EditorToolbar() {
         onClick={saveProjectFile}
       />
       <span className="mx-1 h-6 w-px bg-panel-line" />
-      <IconButton label="导入视频" icon={<Video size={16} />} onClick={() => videoInputRef.current?.click()} />
+      <IconButton label="导入参考视频" icon={<Video size={16} />} onClick={() => videoInputRef.current?.click()} />
       <IconButton label="导入 XML" icon={<FileUp size={16} />} onClick={() => xmlInputRef.current?.click()} />
       <IconButton
         label={canExportXml ? "导出 XML" : "请先添加时间轴片段再导出 XML"}

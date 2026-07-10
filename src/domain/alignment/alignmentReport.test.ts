@@ -175,6 +175,33 @@ describe("alignment review report", () => {
     expect(report).toContain("1 个候选版本差异 ID 已存在于当前项目（ID：cut-existing）");
   });
 
+  it("阻断噪声过多的自动提案直接全量应用", () => {
+    const proposal: AlignmentProposal = {
+      anchors: Array.from({ length: 60 }, (_, index) => ({
+        id: `anchor-${index}`,
+        sourceMs: index * 1000,
+        targetMs: index * 1000,
+        origin: "automatic" as const,
+        confidence: 0.8
+      })),
+      cutCandidates: Array.from({ length: 31 }, (_, index) => ({
+        id: `cut-${index}`,
+        name: `候选 ${index}`,
+        sourceAtMs: index * 3000,
+        targetGapMs: 3000,
+        confidence: 0.8,
+        note: ""
+      })),
+      confidence: 0.8,
+      diagnostics: ["音频自动提案"]
+    };
+
+    expect(createAlignmentReviewFocus(proposal)[0]).toBe("本次提案包含 31 个候选版本差异，疑似音频噪声过多。");
+    expect(createAlignmentApplyBlockers(proposal)).toEqual([
+      "本次提案包含 31 个候选版本差异，疑似音频噪声过多。 请先逐条接受可信候选，或提高窗口/匹配阈值后重新运行。"
+    ]);
+  });
+
   it("已有 ID 的等价落点不会阻断应用，时间不同才阻断", () => {
     const equivalentProposal: AlignmentProposal = {
       anchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, origin: "automatic" }],

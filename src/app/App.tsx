@@ -9,7 +9,7 @@ import { TimelinePanel } from "../features/timeline/TimelinePanel";
 import { formatExportFileError, openExportDirectoryPath } from "../infrastructure/file-system/exportFiles";
 import { formatDesktopSettingsError, hydrateDesktopAppSettings } from "../infrastructure/settings/desktopAppSettings";
 import { useEditorStore } from "../stores/editorStore";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 
 type ResizeTarget = "left" | "right" | "timeline";
@@ -24,11 +24,15 @@ const RESIZE_STEP = 24;
 
 export function App() {
   const status = useEditorStore((state) => state.status);
+  const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
+  const importVideoFile = useEditorStore((state) => state.importVideoFile);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const activeResizeRef = useRef<ResizeTarget | null>(null);
+  const dragDepthRef = useRef(0);
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelWidth, setRightPanelWidth] = useState(300);
   const [timelineHeight, setTimelineHeight] = useState(320);
+  const [dragActive, setDragActive] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -104,10 +108,78 @@ export function App() {
     });
   };
 
+  const handleDragEnter = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  };
+
+  const handleDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleDragLeave = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    const files = Array.from(event.dataTransfer.files);
+    const xmlFiles = files.filter(isXmlFile);
+    const videoFile = files.find(isSupportedReferenceVideoFile);
+    if (videoFile) {
+      importVideoFile(videoFile);
+    }
+    if (xmlFiles.length > 0) {
+      void importXmlFiles(xmlFiles);
+    }
+    if (!videoFile && xmlFiles.length === 0) {
+      useEditorStore.setState({
+        status: {
+          message: "拖放文件未导入：请拖入 Bilibili XML，或 MP4/WebM 参考视频。",
+          tone: "warning"
+        }
+      });
+    }
+  };
+
   return (
-    <div className="flex h-screen min-h-0 flex-col bg-[#101216] text-slate-100">
+    <div
+      className="relative flex h-screen min-h-0 flex-col bg-[#101216] text-slate-100"
+      data-testid="app-root"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <KeyboardShortcuts />
       <EditorToolbar />
+      {dragActive ? (
+        <div className="pointer-events-none fixed inset-3 z-50 grid place-items-center rounded border-2 border-dashed border-accent-cyan bg-black/70 text-center text-sm text-slate-200 shadow-2xl">
+          <div className="grid gap-2">
+            <div className="text-base font-medium text-slate-100">拖放导入</div>
+            <div className="text-xs text-slate-400">支持 Bilibili XML 和 MP4/WebM 参考视频；目标原片请在“媒体 / 目标原片”中绑定。</div>
+          </div>
+        </div>
+      ) : null}
       <main
         ref={workspaceRef}
         className="grid min-h-0 flex-1 bg-panel-line"
@@ -242,4 +314,23 @@ function ResizeHandle({
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function hasFileDrag(event: ReactDragEvent<HTMLElement>): boolean {
+  return Array.from(event.dataTransfer.types).includes("Files");
+}
+
+function isXmlFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return name.endsWith(".xml") || file.type === "text/xml" || file.type === "application/xml";
+}
+
+function isSupportedReferenceVideoFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return (
+    name.endsWith(".mp4") ||
+    name.endsWith(".webm") ||
+    file.type === "video/mp4" ||
+    file.type === "video/webm"
+  );
 }

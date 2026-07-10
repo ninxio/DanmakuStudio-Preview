@@ -111,12 +111,12 @@ export function createWorkflowOverview(
   const actions: WorkflowActionDescriptor[] = [
     {
       id: "import-video",
-      label: "导入视频",
+      label: "导入参考视频",
       detail: project.media
         ? `当前引用：${project.media.fileName}`
         : localTargetPath
           ? `目标原片路径：${project.mediaBinding?.kind === "localFile" ? project.mediaBinding.fileName : "本地文件"}`
-          : "选择本地 MP4/WebM 或目标原片路径作为预览参照。",
+          : "选择本地 MP4/WebM 作为 B 站删减版参考预览。",
       enabled: true,
       reason: null,
       tone: "neutral"

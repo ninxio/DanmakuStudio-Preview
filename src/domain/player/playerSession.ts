@@ -77,7 +77,7 @@ function describePlayerSource(
   }
   if (project.media?.objectUrl) {
     return {
-      label: "本地预览视频",
+      label: "参考视频",
       detail: project.media.fileName
     };
   }
@@ -89,7 +89,7 @@ function describePlayerSource(
   }
   return {
     label: "尚未连接",
-    detail: "导入本地视频或绑定目标原片后开始预览。"
+    detail: "导入参考视频或绑定目标原片后开始预览。"
   };
 }
 
@@ -188,13 +188,13 @@ function describeNextAction(input: PlayerSessionInput): string {
     return "改用 MP4/WebM、本地路径或 mpv 后端。";
   }
   if (!input.project.media && !input.project.mediaBinding) {
-    return "导入本地视频或绑定目标原片。";
+    return "导入参考视频或绑定目标原片。";
   }
   if (input.project.mediaBinding?.kind === "embyItem" && !input.hasPreviewSource) {
     return "音频对齐可使用 Emby 授权输入；预览可使用 Emby 授权流或本地路径。";
   }
   if (input.project.mediaBinding?.kind === "localFile" && !input.hasPreviewSource) {
-    return "重新导入视频，或在目标原片中选择本地路径。";
+    return "重新导入参考视频，或在目标原片中选择本地路径。";
   }
   if (input.loadState === "loading") {
     return "等待播放器载入完成。";

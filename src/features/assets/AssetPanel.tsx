@@ -316,6 +316,7 @@ export function AssetPanel() {
       <div className="thin-scrollbar min-h-0 flex-1 overflow-auto p-3">
         {tab === "media" ? (
           <div className="grid gap-3">
+            <MediaRoleGuidePanel media={project.media} binding={project.mediaBinding} />
             <TargetMediaBindingPanel
               binding={project.mediaBinding}
               media={project.media}
@@ -330,12 +331,13 @@ export function AssetPanel() {
               <div className="rounded border border-panel-line bg-panel-soft p-3">
                 <div className="flex items-center gap-2 text-sm text-slate-100">
                   <Video size={16} className="text-accent-cyan" />
-                  <span className="truncate">{project.media.fileName}</span>
+                  <span className="truncate">参考视频：{project.media.fileName}</span>
                 </div>
                 <dl className="mt-3 grid gap-2 text-xs text-slate-400">
                   <Row label="名称" value={project.media.name} />
                   <Row label="时长" value={formatTimecode(project.media.durationMs ?? 0)} />
-                  <Row label="引用" value="本地浏览器对象 URL" />
+                  <Row label="用途" value="代表 B 站删减版或当前弹幕原始时间轴" />
+                  <Row label="引用" value="本地浏览器对象 URL，项目文件不会嵌入视频内容" />
                 </dl>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <TextButton tone="danger" onClick={removeMedia}>
@@ -345,7 +347,7 @@ export function AssetPanel() {
                 </div>
               </div>
             ) : (
-              <EmptyState title="尚未导入视频" text="使用顶部“导入视频”选择 MP4 或 WebM。" />
+              <EmptyState title="尚未导入参考视频" text="使用顶部“导入参考视频”选择 MP4/WebM，或直接拖放到窗口中。" />
             )}
           </div>
         ) : null}
@@ -635,15 +637,15 @@ function TargetMediaBindingPanel({
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2">
         <Crosshair size={16} className="text-accent-cyan" />
-        <h3 className="text-sm font-medium text-slate-100">目标原片</h3>
+        <h3 className="text-sm font-medium text-slate-100">目标原片（完整版）</h3>
         <span className="ml-auto rounded border border-panel-line bg-black/20 px-2 py-0.5 text-[11px] text-slate-500">
           {statusText}
         </span>
       </div>
       <p className="mt-2 leading-5 text-slate-500">
         {binding
-          ? "后续匹配评分、对齐和导出检查会读取这里保存的目标来源。"
-          : "绑定本地完整版或 Emby 条目后，项目会记住自己对应哪一部、哪一集。"}
+          ? "后续匹配评分、对齐和导出检查会以这里保存的完整版作为目标来源。"
+          : "绑定本地完整版或 Emby 条目后，项目会记住弹幕最终要对齐到哪一部、哪一集。"}
       </p>
       {binding ? (
         <dl className="mt-3 grid gap-2">
@@ -668,7 +670,7 @@ function TargetMediaBindingPanel({
       <div className="mt-3 flex flex-wrap gap-2">
         <TextButton onClick={onBindLocal} disabled={!media}>
           <Video size={14} />
-          绑定当前视频
+          用参考视频作为目标
         </TextButton>
         <TextButton onClick={onBindLocalPath}>
           <FolderOpen size={14} />
@@ -687,6 +689,25 @@ function TargetMediaBindingPanel({
           </TextButton>
         ) : null}
       </div>
+    </section>
+  );
+}
+
+function MediaRoleGuidePanel({ media, binding }: { media: MediaReference | null; binding: MediaBinding | null }) {
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2">
+        <Video size={16} className="text-accent-cyan" />
+        <h3 className="text-sm font-medium text-slate-100">视频来源</h3>
+      </div>
+      <p className="mt-2 leading-5 text-slate-500">
+        参考视频用于预览 B 站删减版时间轴；目标原片是最终要对齐到的完整版。两个来源可以不同，项目文件不会保存视频内容。
+      </p>
+      <dl className="mt-3 grid gap-2">
+        <Row label="参考视频" value={media ? media.fileName : "未导入"} />
+        <Row label="目标原片" value={formatMediaBindingTitle(binding)} />
+        <Row label="对齐实验室" value="使用完整版输入和 B 站删减版输入做音频差异推断" />
+      </dl>
     </section>
   );
 }
@@ -1799,6 +1820,7 @@ function VideoAlignmentLabPanel({
   const reviewItemStatuses = proposal ? createAlignmentReviewItemStatuses(proposal, applyBlockerContext) : [];
   const reviewStatusSummary = createAlignmentReviewStatusSummary(reviewItemStatuses);
   const reviewQueue = proposal ? createAlignmentReviewQueue(proposal, applyBlockerContext) : [];
+  const noisyProposalMessage = proposal ? createNoisyAlignmentProposalMessage(proposal) : null;
   const visibleReviewQueue = reviewQueue.slice(0, 4);
   const hiddenReviewQueueCount = reviewQueue.length - visibleReviewQueue.length;
   const visibleReviewItemStatuses = reviewItemStatuses.slice(0, 5);
@@ -1873,7 +1895,7 @@ function VideoAlignmentLabPanel({
     }
     const completeInputPath = embyCompleteInput?.url ?? completePath.trim();
     if (completeInputPath.length === 0) {
-      setStatus({ message: "请先选择完整版路径，或使用已绑定 Emby 原片生成授权输入。", tone: "warning" });
+      setStatus({ message: "请先选择完整版输入，或使用已绑定 Emby 原片生成授权输入。", tone: "warning" });
       return;
     }
     const request = {
@@ -2023,11 +2045,11 @@ function VideoAlignmentLabPanel({
       if (path) {
         setEmbyCompleteInput(null);
         setCompletePath(path);
-        setStatus({ message: "已选择完整版路径。", tone: "success" });
+        setStatus({ message: "已选择完整版输入。", tone: "success" });
       }
     } catch (error) {
       setStatus({
-        message: error instanceof Error ? error.message : "完整版路径选择失败。",
+        message: error instanceof Error ? error.message : "完整版输入选择失败。",
         tone: "error"
       });
     }
@@ -2038,11 +2060,11 @@ function VideoAlignmentLabPanel({
       const path = await pickAlignmentMediaPath(sourcePath);
       if (path) {
         setSourcePath(path);
-        setStatus({ message: "已选择当前视频路径。", tone: "success" });
+        setStatus({ message: "已选择 B 站删减版输入。", tone: "success" });
       }
     } catch (error) {
       setStatus({
-        message: error instanceof Error ? error.message : "当前视频路径选择失败。",
+        message: error instanceof Error ? error.message : "B 站删减版输入选择失败。",
         tone: "error"
       });
     }
@@ -2116,10 +2138,10 @@ function VideoAlignmentLabPanel({
       </div>
       <div className="mt-3 grid gap-2">
         <label className="grid gap-1">
-          <span className="text-slate-500">完整版路径</span>
+          <span className="text-slate-500">完整版输入（目标原片）</span>
           <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
-              aria-label="完整版路径"
+              aria-label="完整版输入"
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={completePath}
               placeholder="D:\\media\\full.mkv"
@@ -2171,10 +2193,10 @@ function VideoAlignmentLabPanel({
           </div>
         ) : null}
         <label className="grid gap-1">
-          <span className="text-slate-500">当前视频路径</span>
+          <span className="text-slate-500">B 站删减版输入（参考视频）</span>
           <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
-              aria-label="当前视频路径"
+              aria-label="B 站删减版输入"
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={sourcePath}
               placeholder="D:\\media\\bilibili-cut.mp4"
@@ -2216,29 +2238,29 @@ function VideoAlignmentLabPanel({
             </TextButton>
           </div>
         </label>
-        <div className="grid grid-cols-3 gap-2">
-          <label className="grid gap-1">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(112px,1fr))] gap-2">
+          <label className="grid min-w-0 gap-1">
             <span className="text-slate-500">窗口 ms</span>
             <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               inputMode="numeric"
               value={windowMs}
               onChange={(event) => setWindowMs(event.target.value)}
             />
           </label>
-          <label className="grid gap-1">
+          <label className="grid min-w-0 gap-1">
             <span className="text-slate-500">最小缺失 ms</span>
             <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               inputMode="numeric"
               value={minGapMs}
               onChange={(event) => setMinGapMs(event.target.value)}
             />
           </label>
-          <label className="grid gap-1">
+          <label className="grid min-w-0 gap-1">
             <span className="text-slate-500">匹配阈值</span>
             <input
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               inputMode="decimal"
               value={matchThreshold}
               onChange={(event) => setMatchThreshold(event.target.value)}
@@ -2293,6 +2315,11 @@ function VideoAlignmentLabPanel({
                 </ol>
               </details>
             ) : null}
+          </div>
+        ) : null}
+        {noisyProposalMessage ? (
+          <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
+            {noisyProposalMessage} 已阻断全量应用；请逐条接受可信候选，或提高窗口/匹配阈值后重新运行。
           </div>
         ) : null}
         <textarea
@@ -2585,6 +2612,17 @@ function createCutCandidateDraft(candidate: CutCandidate): CutCandidateDraft {
     sourceAtMs: String(Math.round(candidate.sourceAtMs)),
     targetGapMs: String(Math.round(candidate.targetGapMs))
   };
+}
+
+function createNoisyAlignmentProposalMessage(proposal: AlignmentProposal): string | null {
+  if (proposal.cutCandidates.length > 30) {
+    return `本次音频对齐生成 ${proposal.cutCandidates.length} 个候选版本差异，疑似噪声过多。`;
+  }
+  const pendingCount = proposal.anchors.length + proposal.cutCandidates.length;
+  if (pendingCount > 80) {
+    return `本次音频对齐生成 ${pendingCount} 个待复核项，疑似噪声过多。`;
+  }
+  return null;
 }
 
 function parsePositiveIntegerInput(value: string, label: string): ParsedNumericInput {

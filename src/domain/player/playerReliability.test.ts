@@ -19,7 +19,7 @@ describe("播放器可靠性摘要", () => {
     expect(summary.statusLabel).toBe("等待媒体");
     expect(summary.performanceTargetLabel).toBe("同步目标 240ms 内");
     expect(summary.cachePolicyLabel).toBe("等待媒体后可缓存");
-    expect(summary.recoveryDetail).toContain("导入本地视频");
+    expect(summary.recoveryDetail).toContain("导入参考视频");
   });
 
   it("Emby 授权流说明临时地址不落盘，并给出重新生成路径", () => {

@@ -17,7 +17,7 @@ describe("播放器会话摘要", () => {
 
     expect(summary.sourceLabel).toBe("尚未连接");
     expect(summary.playbackLabel).toBe("等待媒体");
-    expect(summary.nextActionLabel).toBe("导入本地视频或绑定目标原片。");
+    expect(summary.nextActionLabel).toBe("导入参考视频或绑定目标原片。");
   });
 
   it("说明 Emby 目标原片可用于对齐但预览仍需播放器接入", () => {
@@ -90,7 +90,7 @@ describe("播放器会话摘要", () => {
       mpvConfigured: false
     });
 
-    expect(summary.sourceLabel).toBe("本地预览视频");
+    expect(summary.sourceLabel).toBe("参考视频");
     expect(summary.playbackLabel).toBe("播放中");
     expect(summary.nextActionLabel).toBe("播放预览、标记版本差异或运行对齐。");
   });

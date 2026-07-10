@@ -355,20 +355,20 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
                   ? "需要重新连接视频"
                   : canPrepareEmbyPreview
                     ? "可使用 Emby 授权流预览"
-                  : preferredBackend === "nativeMpv" && !hasLocalMediaPath
-                    ? "需要选择本地原片路径"
-                    : "尚未导入视频"}
+                    : preferredBackend === "nativeMpv" && !hasLocalMediaPath
+                      ? "需要选择本地原片路径"
+                    : "尚未导入参考视频"}
               </div>
               <div className="mt-2 text-xs leading-5">
                 {localBindingNeedsReconnect
-                  ? "项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份本地视频。"
+                  ? "项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份参考视频，或在目标原片中选择本地路径。"
                   : mediaReferenceNeedsReconnect
-                    ? "项目里只有媒体引用，没有当前会话可播放的视频对象。请重新导入本地视频。"
+                    ? "项目里只有媒体引用，没有当前会话可播放的视频对象。请重新导入参考视频。"
                     : canPrepareEmbyPreview
                       ? "mpv 可以读取本次会话生成的 Emby 临时播放地址；项目文件不会保存密码、token 或播放 URL。"
                     : preferredBackend === "nativeMpv" && !hasLocalMediaPath
                       ? "mpv 需要真实本地文件路径。请在“媒体 / 目标原片”里选择本地路径。"
-                      : "当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。"}
+                      : "当前仍可编辑弹幕时间轴，导入 MP4/WebM 参考视频后可同步预览。"}
               </div>
               {canPrepareEmbyPreview ? (
                 <div className="mt-3 grid justify-items-center gap-2">

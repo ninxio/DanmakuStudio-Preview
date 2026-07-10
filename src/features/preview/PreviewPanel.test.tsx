@@ -82,12 +82,12 @@ describe("预览面板", () => {
 
   it("无视频时显示占位提示", () => {
     render(<PreviewPanel />);
-    expect(screen.getByText("尚未导入视频")).toBeInTheDocument();
+    expect(screen.getByText("尚未导入参考视频")).toBeInTheDocument();
     expect(screen.getByTestId("preview-panel")).toBeInTheDocument();
     const session = screen.getByLabelText("播放器会话状态");
     expect(within(session).getByText("播放源")).toBeInTheDocument();
     expect(within(session).getByText("尚未连接")).toBeInTheDocument();
-    expect(within(session).getByText("导入本地视频或绑定目标原片。")).toBeInTheDocument();
+    expect(within(session).getByText("导入参考视频或绑定目标原片。")).toBeInTheDocument();
     const reliability = screen.getByLabelText("播放可靠性状态");
     expect(within(reliability).getByText("同步目标 240ms 内")).toBeInTheDocument();
     expect(within(reliability).getByText("等待媒体后可缓存")).toBeInTheDocument();
@@ -113,7 +113,9 @@ describe("预览面板", () => {
     render(<PreviewPanel />);
 
     expect(screen.getByText("需要重新连接视频")).toBeInTheDocument();
-    expect(screen.getByText("项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份本地视频。")).toBeInTheDocument();
+    expect(
+      screen.getByText("项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份参考视频，或在目标原片中选择本地路径。")
+    ).toBeInTheDocument();
   });
 
   it("Emby 目标原片会进入播放器会话状态", () => {
@@ -298,7 +300,7 @@ describe("预览面板", () => {
 
   it("先打开空预览再导入视频时会加载预览并写入时长", async () => {
     render(<PreviewPanel />);
-    expect(screen.getByText("尚未导入视频")).toBeInTheDocument();
+    expect(screen.getByText("尚未导入参考视频")).toBeInTheDocument();
 
     act(() => {
       useEditorStore.setState((state) => ({

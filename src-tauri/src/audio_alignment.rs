@@ -21,6 +21,7 @@ const DEFAULT_MAX_CELLS: usize = 16_000_000;
 const AUDIO_ALIGNMENT_CANCELLED: &str = "音频对齐任务已取消。";
 const MAX_JOB_LOGS: usize = 80;
 const MAX_AUDIO_FEATURE_CACHE_ENTRIES: usize = 12;
+const MERGE_NEARBY_CANDIDATE_MS: u64 = 2_000;
 
 const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
@@ -853,7 +854,7 @@ fn infer_cut_candidates(
             ),
         });
     }
-    candidates
+    merge_nearby_candidates(candidates)
 }
 
 fn estimate_cut_boundary_ms(previous: &AudioFeatureMatch, current: &AudioFeatureMatch) -> u64 {
@@ -861,6 +862,37 @@ fn estimate_cut_boundary_ms(previous: &AudioFeatureMatch, current: &AudioFeature
         .source_time_ms
         .saturating_sub(previous.source_time_ms);
     previous.source_time_ms + source_delta_ms / 2
+}
+
+fn merge_nearby_candidates(candidates: Vec<CutCandidateDto>) -> Vec<CutCandidateDto> {
+    let mut merged: Vec<CutCandidateDto> = Vec::new();
+    for candidate in candidates {
+        if let Some(previous) = merged.last_mut() {
+            let distance = previous.source_at_ms.abs_diff(candidate.source_at_ms);
+            if distance <= MERGE_NEARBY_CANDIDATE_MS {
+                previous.target_gap_ms += candidate.target_gap_ms;
+                previous.confidence = previous.confidence.min(candidate.confidence);
+                previous.source_range_start_ms = previous
+                    .source_range_start_ms
+                    .min(candidate.source_range_start_ms);
+                previous.source_range_end_ms = previous
+                    .source_range_end_ms
+                    .max(candidate.source_range_end_ms);
+                previous.note = format!("{} {}", previous.note, candidate.note);
+                continue;
+            }
+        }
+        merged.push(candidate);
+    }
+    merged
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut candidate)| {
+            candidate.id = format!("audio-gap-{}", index + 1);
+            candidate.name = format!("音频推断差异 {}", index + 1);
+            candidate
+        })
+        .collect()
 }
 
 fn create_anchors(matches: &[AudioFeatureMatch], match_threshold: f64) -> Vec<SyncAnchorDto> {
@@ -931,6 +963,19 @@ mod tests {
             .collect()
     }
 
+    fn cut_candidate(id: &str, source_at_ms: u64, target_gap_ms: u64) -> CutCandidateDto {
+        CutCandidateDto {
+            id: id.to_string(),
+            name: id.to_string(),
+            source_at_ms,
+            source_range_start_ms: source_at_ms.saturating_sub(500),
+            source_range_end_ms: source_at_ms + 500,
+            target_gap_ms,
+            confidence: 0.8,
+            note: format!("候选 {id}"),
+        }
+    }
+
     fn clear_audio_feature_cache_for_tests() {
         audio_feature_cache().lock().unwrap().clear();
     }
@@ -960,6 +1005,26 @@ mod tests {
         assert!(proposal.cut_candidates[0]
             .note
             .contains("候选边界约在当前视频 0:15"));
+    }
+
+    #[test]
+    fn nearby_cut_candidates_are_merged_before_export() {
+        let merged = merge_nearby_candidates(vec![
+            cut_candidate("first", 10_000, 1_200),
+            cut_candidate("second", 11_000, 1_800),
+            cut_candidate("third", 30_000, 4_000),
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "audio-gap-1");
+        assert_eq!(merged[0].name, "音频推断差异 1");
+        assert_eq!(merged[0].source_at_ms, 10_000);
+        assert_eq!(merged[0].source_range_start_ms, 9_500);
+        assert_eq!(merged[0].source_range_end_ms, 11_500);
+        assert_eq!(merged[0].target_gap_ms, 3_000);
+        assert!(merged[0].note.contains("候选 first 候选 second"));
+        assert_eq!(merged[1].id, "audio-gap-2");
+        assert_eq!(merged[1].target_gap_ms, 4_000);
     }
 
     #[test]

@@ -36,6 +36,9 @@ export interface AlignmentReviewStatusSummary {
 
 export type AlignmentReviewQueueSeverity = "blocked" | "attention" | "pending";
 
+const NOISY_PROPOSAL_PENDING_LIMIT = 80;
+const NOISY_PROPOSAL_CUT_LIMIT = 30;
+
 export interface AlignmentReviewQueueItem {
   kind: AlignmentReviewItemKind;
   id: string;
@@ -150,9 +153,13 @@ export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[
   const invalidRangeCuts = rangedCuts.filter(
     (candidate) => candidate.sourceRangeStartMs > candidate.sourceRangeEndMs
   );
+  const noiseWarning = createAlignmentNoiseWarning(proposal.anchors.length, proposal.cutCandidates.length);
 
   if (proposal.cutCandidates.length === 0 && proposal.anchors.length === 0) {
     focus.push("提案没有同步锚点或候选版本差异，需要重新生成或检查输入。");
+  }
+  if (noiseWarning) {
+    focus.push(noiseWarning);
   }
   if (lowConfidenceCuts.length > 0) {
     focus.push(`${lowConfidenceCuts.length} 个候选版本差异置信度低于 75%，建议人工确认边界和相差时长。`);
@@ -232,7 +239,22 @@ export function createAlignmentApplyBlockers(
   if (sourceOutsideRangeCount > 0) {
     blockers.push(`${sourceOutsideRangeCount} 个候选版本差异的发生时间不在不确定区间内，请修正后再应用。`);
   }
+  const noiseWarning = createAlignmentNoiseWarning(pendingAnchors.length, pendingCutCandidates.length);
+  if (noiseWarning) {
+    blockers.push(`${noiseWarning} 请先逐条接受可信候选，或提高窗口/匹配阈值后重新运行。`);
+  }
   return blockers;
+}
+
+function createAlignmentNoiseWarning(anchorCount: number, cutCandidateCount: number): string | null {
+  const totalCount = anchorCount + cutCandidateCount;
+  if (cutCandidateCount > NOISY_PROPOSAL_CUT_LIMIT) {
+    return `本次提案包含 ${cutCandidateCount} 个候选版本差异，疑似音频噪声过多。`;
+  }
+  if (totalCount > NOISY_PROPOSAL_PENDING_LIMIT) {
+    return `本次提案包含 ${totalCount} 个待复核项，疑似音频噪声过多。`;
+  }
+  return null;
 }
 
 function createAnchorLines(proposal: AlignmentProposal, statusContext: AlignmentReviewStatusContext): string[] {

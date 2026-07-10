@@ -650,7 +650,7 @@ function drawVideoTrack(
   if (duration <= 0) {
     context.fillStyle = "#64748b";
     context.font = "12px Segoe UI";
-    context.fillText("导入视频后显示素材长度", LABEL_WIDTH + 12, track.y + 22);
+    context.fillText("导入参考视频后显示素材长度", LABEL_WIDTH + 12, track.y + 22);
     return;
   }
   const x = timeToX(0, project.timeline.scrollMs, project.timeline.pixelsPerSecond);

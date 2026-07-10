@@ -109,7 +109,7 @@ function describeRecoveryDetail(input: PlayerReliabilityInput): string {
     return "改用 MP4/WebM、本地路径或 mpv 后端。";
   }
   if (!input.hasPreviewSource) {
-    return "导入本地视频、绑定本地路径，或为 Emby 目标生成授权流。";
+    return "导入参考视频、绑定本地路径，或为 Emby 目标生成授权流。";
   }
   if (input.sourceKind === "embyStream") {
     return "授权过期或网络失败时，可重新连接 Emby 后再生成本次会话流。";

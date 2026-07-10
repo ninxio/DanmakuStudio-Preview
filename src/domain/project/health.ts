@@ -228,7 +228,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "media-needs-reconnect",
       severity: "warning",
       title: "视频引用需要重新连接",
-      detail: "项目文件不会嵌入视频内容，重新打开后需要再次导入本地视频才能恢复预览。",
+      detail: "项目文件不会嵌入视频内容，重新打开后需要再次导入参考视频才能恢复预览。",
       evidence: formatMediaEvidence(project.media)
     });
   }
@@ -246,7 +246,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "target-local-needs-reconnect",
       severity: "warning",
       title: "目标原片需要重新连接",
-      detail: "项目文件保存了本地目标原片引用，但不会嵌入视频内容。重新打开项目后，请再次导入同一个本地视频再复核。",
+      detail: "项目文件保存了本地目标原片引用，但不会嵌入视频内容。重新打开项目后，请重新导入参考视频，或在目标原片中选择本地路径再复核。",
       evidence: formatMediaBindingEvidence(project)
     });
   }

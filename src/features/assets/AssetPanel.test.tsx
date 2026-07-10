@@ -87,7 +87,9 @@ describe("资源面板", () => {
 
     render(<AssetPanel />);
     await user.click(screen.getByRole("button", { name: "媒体" }));
-    await user.click(screen.getByRole("button", { name: "绑定当前视频" }));
+    expect(screen.getByText("视频来源")).toBeInTheDocument();
+    expect(screen.getByText(/参考视频用于预览 B 站删减版时间轴/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "用参考视频作为目标" }));
 
     expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
       kind: "localFile",
@@ -923,7 +925,7 @@ describe("资源面板", () => {
     render(<AssetPanel />);
     await user.click(screen.getByRole("button", { name: /高级工具/ }));
 
-    await waitFor(() => expect(screen.getByLabelText("完整版路径")).toHaveValue("D:\\media\\full.mkv"));
+    await waitFor(() => expect(screen.getByLabelText("完整版输入")).toHaveValue("D:\\media\\full.mkv"));
     expect(screen.getByText("已使用目标原片绑定中的本地路径作为完整版输入。")).toBeInTheDocument();
   });
 
@@ -1000,8 +1002,8 @@ describe("资源面板", () => {
     await waitFor(() =>
       expect(screen.getByText(/已准备 Emby 授权输入：Episode 1 \/ 媒体源 source-1/)).toBeInTheDocument()
     );
-    expect(screen.getByLabelText("完整版路径")).toHaveValue("");
-    fireEvent.change(screen.getByLabelText("当前视频路径"), {
+    expect(screen.getByLabelText("完整版输入")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("B 站删减版输入"), {
       target: { value: "D:\\media\\cut.mp4" }
     });
     await user.click(screen.getByRole("button", { name: "运行本地对齐" }));
@@ -1011,7 +1013,7 @@ describe("资源面板", () => {
     expect(request.completePath).toContain("https://emby.example.test/emby/Videos/episode-1/stream");
     expect(request.completePath).toContain("api_key=token-secret");
     expect(request.completePath).toContain("MediaSourceId=source-1");
-    expect(screen.getByLabelText("完整版路径")).toHaveValue("");
+    expect(screen.getByLabelText("完整版输入")).toHaveValue("");
   });
 
   it("可以逐个预览、修正、接受或跳过音频候选版本差异", async () => {
@@ -1145,6 +1147,36 @@ describe("资源面板", () => {
     expect(screen.getByLabelText("对齐复核队列")).toHaveTextContent("不确定区间起止异常");
     expect(screen.getByLabelText("对齐落点状态")).toHaveTextContent("阻断（不确定区间起止异常）");
     expect(screen.getAllByText(/不确定区间起止顺序异常/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();
+    expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
+  });
+
+  it("会暂停全量应用噪声过多的音频对齐提案", async () => {
+    const user = userEvent.setup();
+    const proposal = {
+      anchors: [],
+      cutCandidates: Array.from({ length: 31 }, (_, index) => ({
+        id: `audio-gap-${index}`,
+        name: `音频推断差异 ${index + 1}`,
+        sourceAtMs: index * 3000,
+        targetGapMs: 3000,
+        confidence: 0.82,
+        note: "音频自动提案"
+      })),
+      confidence: 0.82,
+      diagnostics: ["测试噪声过多的音频自动提案。"]
+    };
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+
+    fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
+      target: { value: JSON.stringify(proposal) }
+    });
+    await user.click(screen.getByRole("button", { name: "导入提案" }));
+
+    expect(screen.getByText("应用已暂停")).toBeInTheDocument();
+    expect(screen.getByText(/本次音频对齐生成 31 个候选版本差异，疑似噪声过多。/)).toBeInTheDocument();
+    expect(screen.getByText(/请逐条接受可信候选/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
   });
@@ -1373,8 +1405,8 @@ describe("资源面板", () => {
     await user.click(screen.getByRole("button", { name: "选择当前视频" }));
     await user.click(screen.getByRole("button", { name: "选择 FFmpeg" }));
 
-    expect(screen.getByLabelText("完整版路径")).toHaveValue("D:\\media\\full.mkv");
-    expect(screen.getByLabelText("当前视频路径")).toHaveValue("D:\\media\\cut.mp4");
+    expect(screen.getByLabelText("完整版输入")).toHaveValue("D:\\media\\full.mkv");
+    expect(screen.getByLabelText("B 站删减版输入")).toHaveValue("D:\\media\\cut.mp4");
     expect(screen.getByLabelText("FFmpeg 路径")).toHaveValue("C:\\tools\\ffmpeg.exe");
     expect(pickAlignmentMediaPath).toHaveBeenNthCalledWith(1, "");
     expect(pickAlignmentMediaPath).toHaveBeenNthCalledWith(2, "");
@@ -1400,7 +1432,7 @@ function createTimedXml(count: number, intervalSeconds: number): string {
 }
 
 function getTargetMediaBindingPanel(): HTMLElement {
-  const heading = screen.getByRole("heading", { name: "目标原片" });
+  const heading = screen.getByRole("heading", { name: "目标原片（完整版）" });
   const panel = heading.closest("section");
   if (!(panel instanceof HTMLElement)) {
     throw new Error("未找到目标原片面板。");
