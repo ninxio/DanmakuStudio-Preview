@@ -236,6 +236,75 @@ describe("editor store", () => {
     });
   });
 
+  it("清理缺失资源片段并过滤选择状态", () => {
+    const asset = createAsset("asset-missing-clip-cleanup", "missing-clip-cleanup.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-valid",
+          assetId: asset.id,
+          name: "有效片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        },
+        {
+          id: "clip-missing",
+          assetId: "missing-asset",
+          name: "坏片段",
+          timelineStartMs: 1000,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    });
+    useEditorStore.setState({ selection: { kind: "clip", ids: ["clip-valid", "clip-missing"] } });
+
+    useEditorStore.getState().cleanupProjectMissingAssetClips();
+
+    expect(useEditorStore.getState().project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);
+    expect(useEditorStore.getState().selection).toEqual({ kind: "clip", ids: ["clip-valid"] });
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("清理缺失资源片段");
+    expect(useEditorStore.getState().status).toEqual({
+      message: "已清理 1 个缺失资源片段。",
+      tone: "success"
+    });
+  });
+
+  it("没有缺失资源片段时不写入历史", () => {
+    const asset = createAsset("asset-valid-clip-cleanup", "valid-clip-cleanup.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-valid",
+          assetId: asset.id,
+          name: "有效片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    });
+
+    useEditorStore.getState().cleanupProjectMissingAssetClips();
+
+    expect(useEditorStore.getState().history.past).toHaveLength(0);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "当前没有需要清理的缺失资源片段。",
+      tone: "neutral"
+    });
+  });
+
   it("可把对齐提案发送到时间轴预览", () => {
     useEditorStore.getState().previewAlignmentProposalData({
       anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],

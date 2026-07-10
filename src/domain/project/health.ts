@@ -25,6 +25,7 @@ export interface ProjectHealthMetrics {
   importWarningCount: number;
   itemAdjustmentCount: number;
   orphanedEditReferenceCount: number;
+  missingAssetClipCount: number;
   mediaNeedsReconnect: boolean;
 }
 
@@ -40,6 +41,13 @@ export interface ProjectEditReferenceCleanup {
   project: EditorProject;
   removedDisabledItemIds: number;
   removedItemAdjustments: number;
+  changed: boolean;
+}
+
+export interface ProjectMissingAssetClipCleanup {
+  project: EditorProject;
+  removedClipIds: string[];
+  removedClipCount: number;
   changed: boolean;
 }
 
@@ -191,9 +199,28 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       importWarningCount,
       itemAdjustmentCount: adjustedItemIds.length,
       orphanedEditReferenceCount: orphanedDisabledIds.length + orphanedAdjustmentIds.length,
+      missingAssetClipCount,
       mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null)
     },
     findings
+  };
+}
+
+export function cleanupProjectMissingAssetClips(project: EditorProject): ProjectMissingAssetClipCleanup {
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const removedClipIds = project.clips.filter((clip) => !assetIds.has(clip.assetId)).map((clip) => clip.id);
+  const removedClipIdSet = new Set(removedClipIds);
+  const changed = removedClipIds.length > 0;
+  return {
+    project: changed
+      ? {
+          ...project,
+          clips: project.clips.filter((clip) => !removedClipIdSet.has(clip.id))
+        }
+      : project,
+    removedClipIds,
+    removedClipCount: removedClipIds.length,
+    changed
   };
 }
 
@@ -244,6 +271,7 @@ export function createProjectHealthReport(projectName: string, summary: ProjectH
     `导入警告：${summary.metrics.importWarningCount.toLocaleString("zh-CN")} 条`,
     `单条微调：${summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} 条`,
     `失效编辑引用：${summary.metrics.orphanedEditReferenceCount.toLocaleString("zh-CN")} 条`,
+    `缺失资源片段：${summary.metrics.missingAssetClipCount.toLocaleString("zh-CN")} 个`,
     `媒体重连：${summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"}`,
     "",
     "复核清单："

@@ -23,6 +23,7 @@ import {
 } from "../domain/project/factory";
 import {
   cleanupProjectEditReferences as cleanupProjectEditReferencesInProject,
+  cleanupProjectMissingAssetClips as cleanupProjectMissingAssetClipsInProject,
   createProjectHealthSummary
 } from "../domain/project/health";
 import type { EditorProject, EditorSelection, MediaReference } from "../domain/project/types";
@@ -127,6 +128,7 @@ interface EditorStore {
   disableSelectedDanmaku: () => void;
   restoreSelectedDanmaku: () => void;
   cleanupProjectEditReferences: () => void;
+  cleanupProjectMissingAssetClips: () => void;
   addCutMarkerAtPlayhead: () => void;
   addCutMarker: (sourceAtMs: Milliseconds, targetGapMs?: Milliseconds, draft?: CutMarkerDraft) => void;
   updateCutMarker: (id: string, patch: Partial<Omit<CutMarker, "id">>) => void;
@@ -652,6 +654,27 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     });
   },
 
+  cleanupProjectMissingAssetClips: () => {
+    const cleanup = cleanupProjectMissingAssetClipsInProject(get().project);
+    if (!cleanup.changed) {
+      set({ status: { message: "当前没有需要清理的缺失资源片段。", tone: "neutral" } });
+      return;
+    }
+    const removedClipIds = new Set(cleanup.removedClipIds);
+    const selection = get().selection;
+    const nextSelection =
+      selection.kind === "clip"
+        ? createSelection("clip", selection.ids.filter((id) => !removedClipIds.has(id)))
+        : selection;
+    commitProject(set, get, "清理缺失资源片段", () => cleanup.project, nextSelection);
+    set({
+      status: {
+        message: `已清理 ${cleanup.removedClipCount} 个缺失资源片段。`,
+        tone: "success"
+      }
+    });
+  },
+
   addCutMarkerAtPlayhead: () => {
     get().addCutMarker(get().project.timeline.playheadMs, 45_000);
   },
@@ -1133,6 +1156,10 @@ function uniqueById<T extends { id: string }>(values: T[]): T[] {
     }
   }
   return result;
+}
+
+function createSelection(kind: EditorSelection["kind"], ids: string[]): EditorSelection {
+  return ids.length > 0 ? { kind, ids } : emptySelection;
 }
 
 function toggleSelectionId(

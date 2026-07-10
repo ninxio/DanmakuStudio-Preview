@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "./factory";
-import { cleanupProjectEditReferences, createProjectHealthReport, createProjectHealthSummary } from "./health";
+import {
+  cleanupProjectEditReferences,
+  cleanupProjectMissingAssetClips,
+  createProjectHealthReport,
+  createProjectHealthSummary
+} from "./health";
 
 describe("project health", () => {
   it("为空项目提示需要导入 XML", () => {
@@ -77,6 +82,7 @@ describe("project health", () => {
     const summary = createProjectHealthSummary(project);
 
     expect(summary.status).toBe("blocked");
+    expect(summary.metrics.missingAssetClipCount).toBe(1);
     expect(summary.findings).toContainEqual(expect.objectContaining({ id: "item-id", severity: "error" }));
     expect(summary.findings).toContainEqual(expect.objectContaining({ id: "clip-missing-asset", severity: "error" }));
   });
@@ -161,6 +167,43 @@ describe("project health", () => {
     expect(cleanup.project.itemTimeAdjustments).toEqual({ "item-1": 100 });
   });
 
+  it("可清理引用缺失资源的片段", () => {
+    const asset = createAsset("asset", [createItem("item-1")]);
+    const project = {
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-valid",
+          assetId: "asset",
+          name: "有效片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 3000,
+          localOffsetMs: 0,
+          enabled: true
+        },
+        {
+          id: "clip-missing",
+          assetId: "missing-asset",
+          name: "坏片段",
+          timelineStartMs: 3000,
+          sourceInMs: 0,
+          sourceOutMs: 3000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+
+    const cleanup = cleanupProjectMissingAssetClips(project);
+
+    expect(cleanup.changed).toBe(true);
+    expect(cleanup.removedClipIds).toEqual(["clip-missing"]);
+    expect(cleanup.removedClipCount).toBe(1);
+    expect(cleanup.project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);
+  });
+
   it("可生成项目健康报告文本", () => {
     const summary = createProjectHealthSummary({
       ...createEmptyProject("报告项目"),
@@ -174,6 +217,7 @@ describe("project health", () => {
     expect(report).toContain("项目：报告项目");
     expect(report).toContain("状态：需复核");
     expect(report).toContain("失效编辑引用：1 条");
+    expect(report).toContain("缺失资源片段：0 个");
     expect(report).toContain("[需复核] 存在失效编辑引用");
   });
 });

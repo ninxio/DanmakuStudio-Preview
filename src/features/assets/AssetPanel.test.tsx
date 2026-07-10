@@ -132,6 +132,49 @@ describe("资源面板", () => {
     expect(screen.queryByText("存在失效编辑引用")).not.toBeInTheDocument();
   });
 
+  it("可以从项目健康摘要清理缺失资源片段", async () => {
+    const user = userEvent.setup();
+    const project = useEditorStore.getState().project;
+    const assetId = project.assets[0].id;
+    useEditorStore.setState({
+      project: {
+        ...project,
+        clips: [
+          {
+            id: "clip-valid",
+            assetId,
+            name: "有效片段",
+            timelineStartMs: 0,
+            sourceInMs: 0,
+            sourceOutMs: 1,
+            localOffsetMs: 0,
+            enabled: true
+          },
+          {
+            id: "clip-missing",
+            assetId: "missing-asset",
+            name: "坏片段",
+            timelineStartMs: 1,
+            sourceInMs: 0,
+            sourceOutMs: 1,
+            localOffsetMs: 0,
+            enabled: true
+          }
+        ]
+      },
+      selection: { kind: "clip", ids: ["clip-missing"] }
+    });
+    render(<AssetPanel />);
+
+    await user.click(screen.getByRole("button", { name: "项目信息" }));
+    expect(screen.getByText("片段引用了缺失资源")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "清理缺失片段" }));
+
+    expect(useEditorStore.getState().project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);
+    expect(useEditorStore.getState().selection).toEqual({ kind: "none", ids: [] });
+    expect(screen.queryByText("片段引用了缺失资源")).not.toBeInTheDocument();
+  });
+
   it("可以把疑似删减候选转为待确认补偿点", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(

@@ -25,6 +25,22 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C39 已完成：项目健康摘要支持清理缺失资源片段。
+  - 项目健康领域层新增 `cleanupProjectMissingAssetClips`，只清理 `clips` 中引用不存在资源的片段，不修改弹幕资源或原始 XML。
+  - 健康摘要指标和健康报告新增“缺失资源片段”计数；缺失资源片段仍作为阻断项提示，但现在可通过真实清理动作修复。
+  - Store 新增 `cleanupProjectMissingAssetClips`，清理会进入历史栈，可撤销/重做；若当前选中被清理片段，会过滤或清空选择状态，避免悬空选择。
+  - 资源栏“项目信息”在存在缺失资源片段时显示“清理缺失片段”按钮，点击后刷新健康面板并解除对应阻断。
+  - README 已同步：项目健康摘要现在可一键清理指向不存在资源的片段，以及失效禁用/微调引用。
+  - 已补充领域层、store 和资源面板交互测试。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/project/health.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx` 成功，3 个测试文件、38 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、141 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:09:18`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997097` 字节，时间 `2026/07/10 9:09:18`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c39-health-cleanup-missing-clips-20260710`。
 - 成熟度提升阶段 C38 已完成：Playwright E2E 覆盖导出前项目健康阻断。
   - 新增独立 E2E：使用 `fixtures/projects/three-part-demo.danmaku-project.json` 构造一份片段 `assetId` 指向缺失资源的坏项目，重新打开后直接点击“导出 XML”。
   - 测试断言状态栏显示“项目健康检查未通过：片段引用了缺失资源”，且不会弹出导出摘要对话框；随后切到“项目信息”，确认项目健康面板显示“需处理”和对应阻断原因。

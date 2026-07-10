@@ -120,6 +120,7 @@ export function AssetPanel() {
   const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
   const setCutHintSettings = useEditorStore((state) => state.setCutHintSettings);
   const cleanupProjectEditReferences = useEditorStore((state) => state.cleanupProjectEditReferences);
+  const cleanupProjectMissingAssetClips = useEditorStore((state) => state.cleanupProjectMissingAssetClips);
   const manualRules = useMemo(
     () =>
       createBatchMergeOptions({
@@ -372,6 +373,7 @@ export function AssetPanel() {
               projectName={project.name}
               summary={projectHealth}
               onCleanupEditReferences={cleanupProjectEditReferences}
+              onCleanupMissingAssetClips={cleanupProjectMissingAssetClips}
             />
             <div className="rounded border border-panel-line bg-panel-soft p-3">
               <h3 className="mb-2 text-sm font-medium text-slate-100">{project.name}</h3>
@@ -1864,11 +1866,13 @@ function confidenceLabel(confidence: "high" | "medium" | "low"): string {
 function ProjectHealthPanel({
   projectName,
   summary,
-  onCleanupEditReferences
+  onCleanupEditReferences,
+  onCleanupMissingAssetClips
 }: {
   projectName: string;
   summary: ProjectHealthSummary;
   onCleanupEditReferences: () => void;
+  onCleanupMissingAssetClips: () => void;
 }) {
   const StatusIcon = summary.status === "blocked" ? CircleAlert : summary.status === "attention" ? TriangleAlert : CircleCheck;
   return (
@@ -1927,6 +1931,12 @@ function ProjectHealthPanel({
           <TextButton onClick={onCleanupEditReferences}>
             <Trash2 size={14} />
             清理失效引用
+          </TextButton>
+        ) : null}
+        {summary.metrics.missingAssetClipCount > 0 ? (
+          <TextButton tone="danger" onClick={onCleanupMissingAssetClips}>
+            <Trash2 size={14} />
+            清理缺失片段
           </TextButton>
         ) : null}
       </div>
