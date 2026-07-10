@@ -1907,6 +1907,7 @@ function ProjectHealthPanel({
         <HealthMetric label="锚点" value={summary.metrics.syncAnchorCount.toLocaleString("zh-CN")} />
         <HealthMetric label="导入警告" value={summary.metrics.importWarningCount.toLocaleString("zh-CN")} />
         <HealthMetric label="单条微调" value={summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} />
+        <HealthMetric label="重复 ID" value={summary.metrics.duplicateIdCount.toLocaleString("zh-CN")} />
         <HealthMetric label="媒体重连" value={summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"} />
       </dl>
       <ul className="mt-3 divide-y divide-panel-line border-t border-panel-line">
@@ -1964,6 +1965,13 @@ function ProjectHealthFindingRow({ finding }: { finding: ProjectHealthFinding })
       <div className="min-w-0">
         <p className="text-xs font-medium text-slate-200">{finding.title}</p>
         <p className="mt-0.5 text-[11px] leading-5 text-slate-500">{finding.detail}</p>
+        {finding.evidence && finding.evidence.length > 0 ? (
+          <ul className="mt-1 grid gap-1 text-[11px] leading-5 text-slate-400">
+            {finding.evidence.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        ) : null}
       </div>
     </li>
   );

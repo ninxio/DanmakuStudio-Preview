@@ -10,6 +10,7 @@ export interface ProjectHealthFinding {
   severity: ProjectHealthFindingSeverity;
   title: string;
   detail: string;
+  evidence?: string[];
 }
 
 export interface ProjectHealthMetrics {
@@ -26,6 +27,7 @@ export interface ProjectHealthMetrics {
   itemAdjustmentCount: number;
   orphanedEditReferenceCount: number;
   missingAssetClipCount: number;
+  duplicateIdCount: number;
   mediaNeedsReconnect: boolean;
 }
 
@@ -51,6 +53,16 @@ export interface ProjectMissingAssetClipCleanup {
   changed: boolean;
 }
 
+interface DuplicateIdEntry {
+  value: string;
+  label: string;
+}
+
+interface DuplicateIdGroup {
+  value: string;
+  labels: string[];
+}
+
 export function createProjectHealthSummary(project: EditorProject): ProjectHealthSummary {
   const itemIds = collectProjectItemIds(project);
   const disabledIdSet = new Set(project.disabledItemIds);
@@ -74,13 +86,51 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
   const lowConfidenceAnchorCount = project.syncAnchors.filter(
     (anchor) => anchor.confidence !== undefined && anchor.confidence < 0.75
   ).length;
+  const duplicateAssetIdGroups = findDuplicateGroups(
+    project.assets.map((asset, index) => ({
+      value: asset.id,
+      label: `资源 ${index + 1}（${asset.fileName}）`
+    }))
+  );
+  const duplicateItemIdGroups = findDuplicateGroups(
+    project.assets.flatMap((asset) =>
+      asset.items.map((item) => ({
+        value: item.id,
+        label: `资源 ${asset.fileName} 的第 ${item.originalIndex + 1} 条弹幕`
+      }))
+    )
+  );
+  const duplicateClipIdGroups = findDuplicateGroups(
+    project.clips.map((clip, index) => ({
+      value: clip.id,
+      label: `片段 ${index + 1}（${clip.name}）`
+    }))
+  );
+  const duplicateCutIdGroups = findDuplicateGroups(
+    project.cutMarkers.map((marker, index) => ({
+      value: marker.id,
+      label: `补偿点 ${index + 1}（${marker.name} @ ${formatTimecode(marker.sourceAtMs)}）`
+    }))
+  );
+  const duplicateAnchorIdGroups = findDuplicateGroups(
+    project.syncAnchors.map((anchor, index) => ({
+      value: anchor.id,
+      label: `同步锚点 ${index + 1}（${formatTimecode(anchor.sourceMs)} -> ${formatTimecode(anchor.targetMs)}）`
+    }))
+  );
+  const duplicateIdCount =
+    duplicateAssetIdGroups.length +
+    duplicateItemIdGroups.length +
+    duplicateClipIdGroups.length +
+    duplicateCutIdGroups.length +
+    duplicateAnchorIdGroups.length;
 
   const findings: ProjectHealthFinding[] = [];
-  appendDuplicateFinding(findings, "asset-id", "资源 ID 重复", project.assets.map((asset) => asset.id));
-  appendDuplicateFinding(findings, "item-id", "弹幕 ID 重复", project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
-  appendDuplicateFinding(findings, "clip-id", "片段 ID 重复", project.clips.map((clip) => clip.id));
-  appendDuplicateFinding(findings, "cut-id", "补偿点 ID 重复", project.cutMarkers.map((marker) => marker.id));
-  appendDuplicateFinding(findings, "anchor-id", "同步锚点 ID 重复", project.syncAnchors.map((anchor) => anchor.id));
+  appendDuplicateFinding(findings, "asset-id", "资源 ID 重复", duplicateAssetIdGroups);
+  appendDuplicateFinding(findings, "item-id", "弹幕 ID 重复", duplicateItemIdGroups);
+  appendDuplicateFinding(findings, "clip-id", "片段 ID 重复", duplicateClipIdGroups);
+  appendDuplicateFinding(findings, "cut-id", "补偿点 ID 重复", duplicateCutIdGroups);
+  appendDuplicateFinding(findings, "anchor-id", "同步锚点 ID 重复", duplicateAnchorIdGroups);
 
   if (project.assets.length === 0) {
     findings.push({
@@ -200,6 +250,7 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       itemAdjustmentCount: adjustedItemIds.length,
       orphanedEditReferenceCount: orphanedDisabledIds.length + orphanedAdjustmentIds.length,
       missingAssetClipCount,
+      duplicateIdCount,
       mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null)
     },
     findings
@@ -272,6 +323,7 @@ export function createProjectHealthReport(projectName: string, summary: ProjectH
     `单条微调：${summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} 条`,
     `失效编辑引用：${summary.metrics.orphanedEditReferenceCount.toLocaleString("zh-CN")} 条`,
     `缺失资源片段：${summary.metrics.missingAssetClipCount.toLocaleString("zh-CN")} 个`,
+    `重复 ID：${summary.metrics.duplicateIdCount.toLocaleString("zh-CN")} 个`,
     `媒体重连：${summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"}`,
     "",
     "复核清单："
@@ -281,6 +333,9 @@ export function createProjectHealthReport(projectName: string, summary: ProjectH
       `${index + 1}. [${severityLabel(finding.severity)}] ${finding.title}`,
       `   ${finding.detail}`
     );
+    finding.evidence?.forEach((item) => {
+      lines.push(`   - ${item}`);
+    });
   });
   return `${lines.join("\n")}\n`;
 }
@@ -297,31 +352,44 @@ function appendDuplicateFinding(
   findings: ProjectHealthFinding[],
   id: string,
   title: string,
-  values: string[]
+  groups: DuplicateIdGroup[]
 ) {
-  const duplicates = findDuplicateValues(values);
-  if (duplicates.length === 0) {
+  if (groups.length === 0) {
     return;
   }
   findings.push({
     id,
     severity: "error",
     title,
-    detail: `发现重复 ID：${formatLimitedList(duplicates)}。重复 ID 会影响选择、编辑、撤销和项目恢复。`
+    detail: `发现 ${groups.length.toLocaleString("zh-CN")} 个重复 ID：${formatLimitedList(
+      groups.map((group) => group.value)
+    )}。重复 ID 会影响选择、编辑、撤销和项目恢复。`,
+    evidence: formatDuplicateEvidence(groups)
   });
 }
 
-function findDuplicateValues(values: string[]): string[] {
-  const seen = new Set<string>();
-  const duplicates = new Set<string>();
-  values.forEach((value) => {
-    if (seen.has(value)) {
-      duplicates.add(value);
-      return;
+function findDuplicateGroups(entries: DuplicateIdEntry[]): DuplicateIdGroup[] {
+  const labelsByValue = new Map<string, string[]>();
+  entries.forEach((entry) => {
+    const labels = labelsByValue.get(entry.value);
+    if (labels) {
+      labels.push(entry.label);
+    } else {
+      labelsByValue.set(entry.value, [entry.label]);
     }
-    seen.add(value);
   });
-  return [...duplicates].sort((left, right) => left.localeCompare(right));
+  return [...labelsByValue.entries()]
+    .filter(([, labels]) => labels.length > 1)
+    .map(([value, labels]) => ({ value, labels }))
+    .sort((left, right) => left.value.localeCompare(right.value));
+}
+
+function formatDuplicateEvidence(groups: DuplicateIdGroup[]): string[] {
+  return groups.slice(0, 5).map((group) => {
+    const suffix =
+      group.labels.length > 3 ? `；另有 ${group.labels.length - 3} 处` : "";
+    return `${group.value}：${group.labels.slice(0, 3).join("；")}${suffix}`;
+  });
 }
 
 function formatLimitedList(values: string[]): string {

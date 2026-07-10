@@ -68,6 +68,35 @@ describe("资源面板", () => {
     expect(screen.getByText("不需要")).toBeInTheDocument();
   });
 
+  it("项目健康摘要会展示重复 ID 的具体位置", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i>
+        <d p="1,1,25,16777215,0,0,u1,r1">第一条</d>
+        <d p="2,1,25,16777215,0,0,u2,r2">第二条</d>
+      </i>`,
+      { fileName: "duplicate.xml" }
+    );
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        assets: [
+          {
+            ...asset,
+            items: asset.items.map((item, index) => (index === 1 ? { ...item, id: asset.items[0].id } : item))
+          }
+        ]
+      }
+    });
+    render(<AssetPanel />);
+
+    await user.click(screen.getByRole("button", { name: "项目信息" }));
+
+    expect(screen.getByText("弹幕 ID 重复")).toBeInTheDocument();
+    expect(screen.getByText("重复 ID")).toBeInTheDocument();
+    expect(screen.getByText(/资源 duplicate\.xml 的第 1 条弹幕；资源 duplicate\.xml 的第 2 条弹幕/)).toBeInTheDocument();
+  });
+
   it("可以从项目健康摘要导出健康报告", async () => {
     const user = userEvent.setup();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");

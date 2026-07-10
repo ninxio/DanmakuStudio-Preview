@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C41 已完成：项目健康摘要支持重复 ID 定位证据。
+  - 项目健康领域层将资源、弹幕、片段、补偿点和同步锚点的重复 ID 分组，健康指标新增“重复 ID”计数。
+  - 重复 ID 阻断项现在会列出具体出现位置，例如对应资源文件、第几条弹幕、片段名、补偿点时间或同步锚点时间，帮助用户在不破坏原始 XML 的前提下定位问题。
+  - 健康报告同步写入“重复 ID”计数和证据行，资源栏“项目信息”面板也会直接展示这些证据。
+  - README 已同步：项目健康摘要现在会展示重复 ID 出现位置，并写入可下载健康报告。
+  - 已补充领域层报告测试和资源面板交互测试；Playwright 刷新了项目健康等截图产物。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、25 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、142 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:19:42`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996878` 字节，时间 `2026/07/10 9:19:42`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c41-health-duplicate-id-evidence-20260710`。
 - 成熟度提升阶段 C40 已完成：Playwright E2E 覆盖清理缺失资源片段后恢复导出。
   - C38 的导出健康阻断 E2E 已扩展：坏项目触发“片段引用了缺失资源”后，会在“项目信息”点击“清理缺失片段”。
   - 测试断言状态栏显示“已清理 1 个缺失资源片段”，项目健康面板不再显示该阻断原因，随后再次点击“导出 XML”并确认导出摘要对话框恢复出现。

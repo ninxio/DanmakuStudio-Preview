@@ -60,8 +60,8 @@ describe("project health", () => {
     expect(summary.findings).toContainEqual(expect.objectContaining({ id: "ready" }));
   });
 
-  it("阻断缺失资源引用和重复 ID", () => {
-    const asset = createAsset("asset", [createItem("same-id"), createItem("same-id")]);
+  it("阻断缺失资源引用和重复 ID，并记录重复位置", () => {
+    const asset = createAsset("asset", [createItem("same-id"), { ...createItem("same-id"), originalIndex: 1 }]);
     const project = {
       ...createEmptyProject(),
       assets: [asset],
@@ -83,8 +83,19 @@ describe("project health", () => {
 
     expect(summary.status).toBe("blocked");
     expect(summary.metrics.missingAssetClipCount).toBe(1);
-    expect(summary.findings).toContainEqual(expect.objectContaining({ id: "item-id", severity: "error" }));
+    expect(summary.metrics.duplicateIdCount).toBe(1);
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "item-id",
+        severity: "error",
+        evidence: ["same-id：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕"]
+      })
+    );
     expect(summary.findings).toContainEqual(expect.objectContaining({ id: "clip-missing-asset", severity: "error" }));
+
+    const report = createProjectHealthReport("重复项目", summary);
+    expect(report).toContain("重复 ID：1 个");
+    expect(report).toContain("same-id：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕");
   });
 
   it("提示媒体重连、导入警告、低置信锚点和失效编辑引用", () => {
@@ -218,6 +229,7 @@ describe("project health", () => {
     expect(report).toContain("状态：需复核");
     expect(report).toContain("失效编辑引用：1 条");
     expect(report).toContain("缺失资源片段：0 个");
+    expect(report).toContain("重复 ID：0 个");
     expect(report).toContain("[需复核] 存在失效编辑引用");
   });
 });
