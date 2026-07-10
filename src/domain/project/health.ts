@@ -1,4 +1,4 @@
-import type { DanmakuAsset, DanmakuClip, ImportWarning, ResolvedDanmakuEvent } from "../danmaku/types";
+import type { DanmakuAsset, DanmakuClip, ImportWarning, ResolvedDanmakuEvent, SyncAnchor } from "../danmaku/types";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import type { EditorProject } from "./types";
@@ -88,9 +88,10 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
     return asset ? !clipHasVisibleItem(asset, clip) : false;
   }).length;
   const activeClipCount = project.clips.filter((clip) => clip.enabled).length;
-  const lowConfidenceAnchorCount = project.syncAnchors.filter(
+  const lowConfidenceAnchors = project.syncAnchors.filter(
     (anchor) => anchor.confidence !== undefined && anchor.confidence < 0.75
-  ).length;
+  );
+  const lowConfidenceAnchorCount = lowConfidenceAnchors.length;
   const negativeFinalTimeEvents = resolveProjectDanmakuEvents(project).filter(
     (event) => event.enabled && event.finalTimeMs < 0
   );
@@ -233,7 +234,8 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       id: "low-confidence-anchors",
       severity: "warning",
       title: "存在低置信同步锚点",
-      detail: `${lowConfidenceAnchorCount.toLocaleString("zh-CN")} 个自动锚点置信度低于 75%，应用补偿前建议人工复核。`
+      detail: `${lowConfidenceAnchorCount.toLocaleString("zh-CN")} 个自动锚点置信度低于 75%，应用补偿前建议人工复核。`,
+      evidence: formatLowConfidenceAnchorEvidence(lowConfidenceAnchors)
     });
   }
   if (project.cutMarkers.some((marker) => marker.targetGapMs === 0)) {
@@ -472,6 +474,17 @@ function importWarningSeverityLabel(severity: ImportWarning["severity"]): string
     return "警告";
   }
   return "信息";
+}
+
+function formatLowConfidenceAnchorEvidence(anchors: SyncAnchor[]): string[] {
+  const evidence = anchors.slice(0, EVIDENCE_PREVIEW_LIMIT).map((anchor) => {
+    const confidence = anchor.confidence === undefined ? "未知" : `${Math.round(anchor.confidence * 100)}%`;
+    const origin = anchor.origin === "manual" ? "手动" : "自动";
+    return `${anchor.id}（${origin}，${formatTimecode(anchor.sourceMs)} -> ${formatTimecode(
+      anchor.targetMs
+    )}，置信度 ${confidence}）`;
+  });
+  return appendOmittedEvidenceNote(evidence, anchors.length, "个低置信锚点");
 }
 
 function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {

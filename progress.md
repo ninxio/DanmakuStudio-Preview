@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C53 已完成：低置信同步锚点健康项显示证据。
+  - 项目健康摘要中的“存在低置信同步锚点”现在会列出锚点 ID、来源、源时间、目标时间和置信度百分比。
+  - 证据会进入资源栏“项目信息”、健康报告和导出摘要健康预检，便于应用补偿前定位需要人工复核的锚点。
+  - README 已同步：低置信锚点也会列出具体出现位置，并写入健康报告。
+  - 已补充领域层测试，确认低置信自动锚点证据格式。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts` 成功，1 个测试文件、10 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、149 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:24:53`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998808` 字节，时间 `2026/07/10 10:24:53`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c53-health-low-confidence-anchor-evidence-20260710`。
 - 成熟度提升阶段 C52 已完成：导入警告健康项显示资源级证据。
   - 项目健康摘要中的“导入时存在警告”现在会列出资源文件、原始序号或文件级位置、严重度、警告消息和短 raw snippet。
   - 证据会进入资源栏“项目信息”、健康报告和导出摘要健康预检，用户导出前可以直接看到 XML 导入阶段留下的具体风险。

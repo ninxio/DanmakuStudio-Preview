@@ -197,6 +197,12 @@ describe("project health", () => {
         evidence: ["asset.xml / 文件级 / 警告：跳过一条坏弹幕，片段：<d/>"]
       })
     );
+    expect(summary.findings).toContainEqual(
+      expect.objectContaining({
+        id: "low-confidence-anchors",
+        evidence: ["anchor（自动，00:00:01.000 -> 00:00:01.200，置信度 60%）"]
+      })
+    );
   });
 
   it("提示会在导出时被限制为 0ms 的负最终时间", () => {
