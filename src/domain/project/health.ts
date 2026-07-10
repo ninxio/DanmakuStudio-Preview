@@ -1,0 +1,263 @@
+import type { DanmakuAsset, DanmakuClip } from "../danmaku/types";
+import type { Milliseconds } from "../shared/time";
+import type { EditorProject } from "./types";
+
+export type ProjectHealthStatus = "ready" | "attention" | "blocked";
+export type ProjectHealthFindingSeverity = "info" | "warning" | "error";
+
+export interface ProjectHealthFinding {
+  id: string;
+  severity: ProjectHealthFindingSeverity;
+  title: string;
+  detail: string;
+}
+
+export interface ProjectHealthMetrics {
+  assetCount: number;
+  itemCount: number;
+  enabledItemCount: number;
+  disabledItemCount: number;
+  clipCount: number;
+  activeClipCount: number;
+  cutMarkerCount: number;
+  totalCutGapMs: Milliseconds;
+  syncAnchorCount: number;
+  importWarningCount: number;
+  itemAdjustmentCount: number;
+  orphanedEditReferenceCount: number;
+  mediaNeedsReconnect: boolean;
+}
+
+export interface ProjectHealthSummary {
+  status: ProjectHealthStatus;
+  statusLabel: string;
+  statusDetail: string;
+  metrics: ProjectHealthMetrics;
+  findings: ProjectHealthFinding[];
+}
+
+export function createProjectHealthSummary(project: EditorProject): ProjectHealthSummary {
+  const itemIds = new Set(project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
+  const disabledIdSet = new Set(project.disabledItemIds);
+  const orphanedDisabledIds = project.disabledItemIds.filter((id) => !itemIds.has(id));
+  const adjustedItemIds = Object.keys(project.itemTimeAdjustments);
+  const orphanedAdjustmentIds = adjustedItemIds.filter((id) => !itemIds.has(id));
+  const itemCount = project.assets.reduce((total, asset) => total + asset.items.length, 0);
+  const enabledItemCount = project.assets.reduce(
+    (total, asset) => total + asset.items.filter((item) => item.enabled && !disabledIdSet.has(item.id)).length,
+    0
+  );
+  const importWarningCount = project.assets.reduce((total, asset) => total + asset.warnings.length, 0);
+  const totalCutGapMs = project.cutMarkers.reduce((total, marker) => total + marker.targetGapMs, 0);
+  const missingAssetClipCount = project.clips.filter((clip) => !project.assets.some((asset) => asset.id === clip.assetId))
+    .length;
+  const emptyClipCount = project.clips.filter((clip) => {
+    const asset = project.assets.find((candidate) => candidate.id === clip.assetId);
+    return asset ? !clipHasVisibleItem(asset, clip) : false;
+  }).length;
+  const activeClipCount = project.clips.filter((clip) => clip.enabled).length;
+  const lowConfidenceAnchorCount = project.syncAnchors.filter(
+    (anchor) => anchor.confidence !== undefined && anchor.confidence < 0.75
+  ).length;
+
+  const findings: ProjectHealthFinding[] = [];
+  appendDuplicateFinding(findings, "asset-id", "资源 ID 重复", project.assets.map((asset) => asset.id));
+  appendDuplicateFinding(findings, "item-id", "弹幕 ID 重复", project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
+  appendDuplicateFinding(findings, "clip-id", "片段 ID 重复", project.clips.map((clip) => clip.id));
+  appendDuplicateFinding(findings, "cut-id", "补偿点 ID 重复", project.cutMarkers.map((marker) => marker.id));
+  appendDuplicateFinding(findings, "anchor-id", "同步锚点 ID 重复", project.syncAnchors.map((anchor) => anchor.id));
+
+  if (project.assets.length === 0) {
+    findings.push({
+      id: "no-assets",
+      severity: "warning",
+      title: "尚未导入 XML",
+      detail: "项目还没有弹幕资源，保存后可恢复项目壳，但无法导出有效弹幕。"
+    });
+  }
+  if (project.assets.length > 0 && project.clips.length === 0) {
+    findings.push({
+      id: "no-clips",
+      severity: "warning",
+      title: "没有时间轴片段",
+      detail: "已导入的 XML 还没有放入时间轴，导出前请至少放入一个片段。"
+    });
+  }
+  if (missingAssetClipCount > 0) {
+    findings.push({
+      id: "clip-missing-asset",
+      severity: "error",
+      title: "片段引用了缺失资源",
+      detail: `${missingAssetClipCount.toLocaleString("zh-CN")} 个时间轴片段找不到对应弹幕资源，建议重新打开上一个 checkpoint 或删除这些片段。`
+    });
+  }
+  if (emptyClipCount > 0) {
+    findings.push({
+      id: "empty-clips",
+      severity: "warning",
+      title: "存在空片段",
+      detail: `${emptyClipCount.toLocaleString("zh-CN")} 个时间轴片段当前源区间内没有弹幕，导出前建议确认片段裁剪范围。`
+    });
+  }
+  if (project.clips.length > 0 && activeClipCount === 0) {
+    findings.push({
+      id: "all-clips-disabled",
+      severity: "warning",
+      title: "所有片段都已禁用",
+      detail: "时间轴上没有启用片段，导出结果可能为空。"
+    });
+  }
+  if (orphanedDisabledIds.length > 0 || orphanedAdjustmentIds.length > 0) {
+    findings.push({
+      id: "orphaned-edits",
+      severity: "warning",
+      title: "存在失效编辑引用",
+      detail: `有 ${(orphanedDisabledIds.length + orphanedAdjustmentIds.length).toLocaleString(
+        "zh-CN"
+      )} 条禁用或单条微调引用已不存在的弹幕，保存前建议清理。`
+    });
+  }
+  if (project.media && project.media.objectUrl === null) {
+    findings.push({
+      id: "media-needs-reconnect",
+      severity: "warning",
+      title: "视频引用需要重新连接",
+      detail: "项目文件不会嵌入视频内容，重新打开后需要再次导入本地视频才能恢复预览。"
+    });
+  }
+  if (project.media && project.media.durationMs === null) {
+    findings.push({
+      id: "media-duration-missing",
+      severity: "warning",
+      title: "视频时长未知",
+      detail: "预览视频尚未读取到时长，时间轴总长会更多依赖片段和弹幕范围。"
+    });
+  }
+  if (importWarningCount > 0) {
+    findings.push({
+      id: "import-warnings",
+      severity: "warning",
+      title: "导入时存在警告",
+      detail: `${importWarningCount.toLocaleString("zh-CN")} 条 XML 导入警告会保存在项目中，导出前建议抽样复核。`
+    });
+  }
+  if (lowConfidenceAnchorCount > 0) {
+    findings.push({
+      id: "low-confidence-anchors",
+      severity: "warning",
+      title: "存在低置信同步锚点",
+      detail: `${lowConfidenceAnchorCount.toLocaleString("zh-CN")} 个自动锚点置信度低于 75%，应用补偿前建议人工复核。`
+    });
+  }
+  if (project.cutMarkers.some((marker) => marker.targetGapMs === 0)) {
+    findings.push({
+      id: "zero-gap-markers",
+      severity: "info",
+      title: "存在 0ms 补偿点",
+      detail: "0ms 补偿点不会改变时间轴，可保留作标记，也可在确认后删除。"
+    });
+  }
+  if (findings.length === 0) {
+    findings.push({
+      id: "ready",
+      severity: "info",
+      title: "项目结构健康",
+      detail: "当前没有发现保存、重开或导出前需要优先处理的结构问题。"
+    });
+  }
+
+  const status = createStatus(findings);
+  return {
+    status,
+    statusLabel: statusToLabel(status),
+    statusDetail: statusToDetail(status),
+    metrics: {
+      assetCount: project.assets.length,
+      itemCount,
+      enabledItemCount,
+      disabledItemCount: itemCount - enabledItemCount,
+      clipCount: project.clips.length,
+      activeClipCount,
+      cutMarkerCount: project.cutMarkers.length,
+      totalCutGapMs,
+      syncAnchorCount: project.syncAnchors.length,
+      importWarningCount,
+      itemAdjustmentCount: adjustedItemIds.length,
+      orphanedEditReferenceCount: orphanedDisabledIds.length + orphanedAdjustmentIds.length,
+      mediaNeedsReconnect: Boolean(project.media && project.media.objectUrl === null)
+    },
+    findings
+  };
+}
+
+function clipHasVisibleItem(asset: DanmakuAsset, clip: DanmakuClip): boolean {
+  return asset.items.some((item) => item.sourceTimeMs >= clip.sourceInMs && item.sourceTimeMs <= clip.sourceOutMs);
+}
+
+function appendDuplicateFinding(
+  findings: ProjectHealthFinding[],
+  id: string,
+  title: string,
+  values: string[]
+) {
+  const duplicates = findDuplicateValues(values);
+  if (duplicates.length === 0) {
+    return;
+  }
+  findings.push({
+    id,
+    severity: "error",
+    title,
+    detail: `发现重复 ID：${formatLimitedList(duplicates)}。重复 ID 会影响选择、编辑、撤销和项目恢复。`
+  });
+}
+
+function findDuplicateValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  values.forEach((value) => {
+    if (seen.has(value)) {
+      duplicates.add(value);
+      return;
+    }
+    seen.add(value);
+  });
+  return [...duplicates].sort((left, right) => left.localeCompare(right));
+}
+
+function formatLimitedList(values: string[]): string {
+  if (values.length <= 3) {
+    return values.join("、");
+  }
+  return `${values.slice(0, 3).join("、")} 等 ${values.length.toLocaleString("zh-CN")} 项`;
+}
+
+function createStatus(findings: ProjectHealthFinding[]): ProjectHealthStatus {
+  if (findings.some((finding) => finding.severity === "error")) {
+    return "blocked";
+  }
+  if (findings.some((finding) => finding.severity === "warning")) {
+    return "attention";
+  }
+  return "ready";
+}
+
+function statusToLabel(status: ProjectHealthStatus): string {
+  if (status === "blocked") {
+    return "需处理";
+  }
+  if (status === "attention") {
+    return "需复核";
+  }
+  return "健康";
+}
+
+function statusToDetail(status: ProjectHealthStatus): string {
+  if (status === "blocked") {
+    return "发现引用或 ID 层面的结构问题，建议先处理后再导出。";
+  }
+  if (status === "attention") {
+    return "项目可继续编辑，但保存、重开或导出前建议复核提示项。";
+  }
+  return "项目结构健康，可继续保存、重开和导出。";
+}

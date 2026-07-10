@@ -447,7 +447,7 @@ function AboutSettingsPanel() {
       <div className="grid gap-2 text-xs text-slate-300">
         <InfoRow label="版本" value="0.1.0" />
         <InfoRow label="风格方向" value="Windows 11 / PowerToys 式工具外壳 + 深色专业时间线工作区" />
-        <InfoRow label="当前阶段" value="专业壳层与凭证记忆 MVP" />
+        <InfoRow label="当前阶段" value="成熟度提升主线：音频对齐、补偿复核与项目安全硬化" />
         <InfoRow label="数据边界" value="用户主动导入的本地文件和用户授权访问的媒体元数据" />
       </div>
     </SettingsSection>

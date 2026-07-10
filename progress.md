@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C30 已完成：项目信息页新增项目健康摘要。
+  - 新增纯领域层 `createProjectHealthSummary`，用于汇总项目资源、弹幕、片段、补偿点、同步锚点、导入警告、单条微调和媒体重连状态。
+  - 健康摘要会提示重复 ID、片段引用缺失资源、空片段、所有片段禁用、失效禁用/微调引用、媒体引用需重连、视频时长未知、导入警告、低置信锚点和 0ms 补偿点。
+  - 资源栏“项目信息”现在显示“健康 / 需复核 / 需处理”状态、关键计数和复核清单，帮助在保存、重开或导出前发现项目状态风险。
+  - 设置中心“关于”页已从早期 MVP 描述更新为成熟度提升主线当前阶段说明。
+  - README 已同步：当前能力和项目文件策略都补充了项目健康摘要说明。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/project/health.test.ts src/features/assets/AssetPanel.test.tsx src/features/editor/SettingsDialog.test.tsx` 成功，3 个测试文件、24 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、128 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:31:10`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996578` 字节，时间 `2026/07/10 8:31:10`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c30-project-health-summary-20260710`。
 - 成熟度提升阶段 C29 已完成：项目文件内嵌弹幕数据 schema 校验补强。
   - `validateProjectSchema` 现在会进一步校验弹幕条目的 `originalIndex`、`sourceTimeMs`、模式、字号、颜色、时间戳、pool、用户 hash、rowId、原始 `p` 字段和启用状态。
   - 弹幕资源的 `warnings` 不再只检查数组存在，还会校验 warning 的 ID、assetId、原始序号、severity、message 和 rawSnippet，避免坏的导入警告结构进入项目状态。

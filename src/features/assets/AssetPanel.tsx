@@ -1,4 +1,18 @@
-import { Download, FolderOpen, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
+import {
+  CircleAlert,
+  CircleCheck,
+  Download,
+  FolderOpen,
+  Layers,
+  ListPlus,
+  ListX,
+  Search,
+  Shuffle,
+  Trash2,
+  TriangleAlert,
+  Video,
+  WandSparkles
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import {
@@ -18,6 +32,12 @@ import {
 } from "../../domain/danmaku/cutHints";
 import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
 import type { CutMarker, SyncAnchor } from "../../domain/danmaku/types";
+import {
+  createProjectHealthSummary,
+  type ProjectHealthFinding,
+  type ProjectHealthStatus,
+  type ProjectHealthSummary
+} from "../../domain/project/health";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
@@ -143,6 +163,7 @@ export function AssetPanel() {
     () => buildAlignmentPreview(project, alignmentProposal),
     [project, alignmentProposal]
   );
+  const projectHealth = useMemo(() => createProjectHealthSummary(project), [project]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -345,6 +366,7 @@ export function AssetPanel() {
         ) : null}
         {tab === "project" ? (
           <div className="grid gap-3 text-xs text-slate-400">
+            <ProjectHealthPanel summary={projectHealth} />
             <div className="rounded border border-panel-line bg-panel-soft p-3">
               <h3 className="mb-2 text-sm font-medium text-slate-100">{project.name}</h3>
               <Row label="资源数" value={project.assets.length.toString()} />
@@ -1831,6 +1853,106 @@ function confidenceLabel(confidence: "high" | "medium" | "low"): string {
     return "中置信";
   }
   return "需复核";
+}
+
+function ProjectHealthPanel({ summary }: { summary: ProjectHealthSummary }) {
+  const StatusIcon = summary.status === "blocked" ? CircleAlert : summary.status === "attention" ? TriangleAlert : CircleCheck;
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3" data-testid="project-health-panel">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+            <StatusIcon size={16} className={projectHealthIconClass(summary.status)} />
+            <span>项目健康</span>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-slate-500">{summary.statusDetail}</p>
+        </div>
+        <span className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectHealthBadgeClass(summary.status)}`}>
+          {summary.statusLabel}
+        </span>
+      </div>
+      <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2">
+        <HealthMetric label="资源" value={summary.metrics.assetCount.toLocaleString("zh-CN")} />
+        <HealthMetric
+          label="弹幕"
+          value={`${summary.metrics.enabledItemCount.toLocaleString("zh-CN")} / ${summary.metrics.itemCount.toLocaleString(
+            "zh-CN"
+          )}`}
+        />
+        <HealthMetric
+          label="片段"
+          value={`${summary.metrics.activeClipCount.toLocaleString("zh-CN")} / ${summary.metrics.clipCount.toLocaleString(
+            "zh-CN"
+          )}`}
+        />
+        <HealthMetric label="补偿" value={formatSignedDuration(summary.metrics.totalCutGapMs)} />
+        <HealthMetric label="锚点" value={summary.metrics.syncAnchorCount.toLocaleString("zh-CN")} />
+        <HealthMetric label="导入警告" value={summary.metrics.importWarningCount.toLocaleString("zh-CN")} />
+        <HealthMetric label="单条微调" value={summary.metrics.itemAdjustmentCount.toLocaleString("zh-CN")} />
+        <HealthMetric label="媒体重连" value={summary.metrics.mediaNeedsReconnect ? "需要" : "不需要"} />
+      </dl>
+      <ul className="mt-3 divide-y divide-panel-line border-t border-panel-line">
+        {summary.findings.map((finding) => (
+          <ProjectHealthFindingRow key={finding.id} finding={finding} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function HealthMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded border border-panel-line/70 bg-black/15 px-2 py-1.5">
+      <dt className="truncate text-[11px] text-slate-500">{label}</dt>
+      <dd className="truncate text-xs font-medium text-slate-200" title={value}>
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function ProjectHealthFindingRow({ finding }: { finding: ProjectHealthFinding }) {
+  const FindingIcon =
+    finding.severity === "error" ? CircleAlert : finding.severity === "warning" ? TriangleAlert : CircleCheck;
+  return (
+    <li className="flex gap-2 py-2 first:pt-3 last:pb-0">
+      <FindingIcon size={14} className={`mt-0.5 shrink-0 ${projectHealthFindingIconClass(finding.severity)}`} />
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-slate-200">{finding.title}</p>
+        <p className="mt-0.5 text-[11px] leading-5 text-slate-500">{finding.detail}</p>
+      </div>
+    </li>
+  );
+}
+
+function projectHealthIconClass(status: ProjectHealthStatus): string {
+  if (status === "blocked") {
+    return "text-red-300";
+  }
+  if (status === "attention") {
+    return "text-amber-300";
+  }
+  return "text-emerald-300";
+}
+
+function projectHealthBadgeClass(status: ProjectHealthStatus): string {
+  if (status === "blocked") {
+    return "border-red-400/40 bg-red-400/10 text-red-200";
+  }
+  if (status === "attention") {
+    return "border-amber-400/40 bg-amber-400/10 text-amber-200";
+  }
+  return "border-emerald-400/40 bg-emerald-400/10 text-emerald-200";
+}
+
+function projectHealthFindingIconClass(severity: ProjectHealthFinding["severity"]): string {
+  if (severity === "error") {
+    return "text-red-300";
+  }
+  if (severity === "warning") {
+    return "text-amber-300";
+  }
+  return "text-emerald-300";
 }
 
 function confidenceText(confidence: "high" | "medium" | "low"): string {

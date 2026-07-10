@@ -82,6 +82,15 @@ describe("设置中心", () => {
     });
   });
 
+  it("关于页展示当前成熟度提升主线", async () => {
+    const user = userEvent.setup();
+    render(<SettingsDialog onClose={() => undefined} />);
+
+    await user.click(screen.getByRole("button", { name: "关于" }));
+
+    expect(screen.getByText("成熟度提升主线：音频对齐、补偿复核与项目安全硬化")).toBeInTheDocument();
+  });
+
   it("可以清除本地应用设置", async () => {
     const user = userEvent.setup();
     saveAppSettings({

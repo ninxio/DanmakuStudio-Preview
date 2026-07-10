@@ -54,6 +54,20 @@ describe("资源面板", () => {
     expect(screen.queryByRole("button", { name: "登录" })).not.toBeInTheDocument();
   });
 
+  it("项目信息会展示项目健康摘要", async () => {
+    const user = userEvent.setup();
+    render(<AssetPanel />);
+
+    await user.click(screen.getByRole("button", { name: "项目信息" }));
+
+    expect(screen.getByTestId("project-health-panel")).toBeInTheDocument();
+    expect(screen.getByText("项目健康")).toBeInTheDocument();
+    expect(screen.getByText("需复核")).toBeInTheDocument();
+    expect(screen.getByText("没有时间轴片段")).toBeInTheDocument();
+    expect(screen.getByText("媒体重连")).toBeInTheDocument();
+    expect(screen.getByText("不需要")).toBeInTheDocument();
+  });
+
   it("可以把疑似删减候选转为待确认补偿点", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(
