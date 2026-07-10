@@ -81,9 +81,9 @@ export function sanitizeDownloadFileName(fileName: string, fallbackName = "downl
   return sanitizeFileNameCandidate(fileName) ?? sanitizeFileNameCandidate(fallbackName) ?? "download";
 }
 
-export function downloadTextFile(fileName: string, content: string, type = "text/plain;charset=utf-8"): void {
+export function downloadTextFile(fileName: string, content: string, type = "text/plain;charset=utf-8"): string {
   const blob = new Blob([content], { type });
-  downloadBlob(fileName, blob);
+  return downloadBlob(fileName, blob);
 }
 
 export function downloadTextFiles(
@@ -104,8 +104,12 @@ export function downloadTextFiles(
       archiveFileName: null
     };
   }
-  const safeArchiveFileName = sanitizeDownloadFileName(archiveFileName, "danmaku-exports.zip");
-  downloadBlob(safeArchiveFileName, createStoredZip(files), "application/zip");
+  const safeArchiveFileName = downloadBlob(
+    archiveFileName,
+    createStoredZip(files),
+    "application/zip",
+    "danmaku-exports.zip"
+  );
   return {
     fileCount: files.length,
     archiveFileName: safeArchiveFileName
@@ -138,14 +142,16 @@ export function createStoredZip(files: TextDownloadFile[]): Blob {
   return new Blob([...localParts, ...centralParts, endRecord].map(copyBytesToArrayBuffer), { type: "application/zip" });
 }
 
-function downloadBlob(fileName: string, blob: Blob, type?: string): void {
+function downloadBlob(fileName: string, blob: Blob, type?: string, fallbackName = "download"): string {
   const resolvedBlob = type && blob.type !== type ? blob.slice(0, blob.size, type) : blob;
   const url = URL.createObjectURL(resolvedBlob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = sanitizeDownloadFileName(fileName);
+  const safeFileName = sanitizeDownloadFileName(fileName, fallbackName);
+  anchor.download = safeFileName;
   anchor.click();
   URL.revokeObjectURL(url);
+  return safeFileName;
 }
 
 function createUniqueZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {

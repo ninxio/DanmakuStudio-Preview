@@ -1369,12 +1369,12 @@ function VideoAlignmentLabPanel({
       setStatus({ message: "暂无可导出的对齐提案。", tone: "warning" });
       return;
     }
-    downloadTextFile(
+    const fileName = downloadTextFile(
       createProjectDownloadFileName(project.name, "-alignment-proposal.json"),
       downloadContent,
       "application/json;charset=utf-8"
     );
-    setStatus({ message: "已导出对齐提案 JSON。", tone: "success" });
+    setStatus({ message: `已导出对齐提案 JSON：${fileName}。`, tone: "success" });
   };
 
   const exportReviewReport = () => {
@@ -1382,12 +1382,12 @@ function VideoAlignmentLabPanel({
       setStatus({ message: "暂无可导出的对齐报告。", tone: "warning" });
       return;
     }
-    downloadTextFile(
+    const fileName = downloadTextFile(
       createProjectDownloadFileName(project.name, "-alignment-review-report.txt"),
       createAlignmentReviewReport(proposal),
       "text/plain;charset=utf-8"
     );
-    setStatus({ message: "已导出对齐复核报告。", tone: "success" });
+    setStatus({ message: `已导出对齐复核报告：${fileName}。`, tone: "success" });
   };
 
   const chooseCompletePath = async () => {

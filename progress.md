@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C71 已完成：下载工具返回实际文件名并用于对齐导出状态提示。
+  - `downloadTextFile` 现在返回清理后的实际下载文件名，内部 `downloadBlob` 同样返回最终写入 `anchor.download` 的名称；多文件 ZIP 下载继续返回清理后的压缩包名。
+  - 资源面板导出对齐提案 JSON 和对齐复核报告后，状态提示会显示实际下载文件名，避免用户在多个项目连续导出时需要猜文件落点。
+  - 已补充下载工具和资源面板测试，覆盖单文件下载返回值、对齐提案/复核报告导出状态提示。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、26 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/163 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:00:28`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996463` 字节，时间 `2026/07/10 12:00:28`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c71-download-actual-file-name-status-20260710`。
 - 成熟度提升阶段 C70 已完成：导出摘要下载入口复用项目文件名 helper。
   - 导出摘要弹窗的健康报告、导出报告和 XML 下载现在统一通过 `createProjectDownloadFileName` 生成文件名，保留 `danmaku-export` 作为空项目名回退。
   - 已补充导出摘要测试，覆盖导出报告和 XML 下载文件名会按项目名生成并经下载基础设施清理。

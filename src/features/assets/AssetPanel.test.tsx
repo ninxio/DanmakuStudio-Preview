@@ -619,6 +619,9 @@ describe("资源面板", () => {
         throw new Error("对齐提案下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("对齐_提案_项目-alignment-proposal.json");
+      expect(useEditorStore.getState().status.message).toBe(
+        "已导出对齐提案 JSON：对齐_提案_项目-alignment-proposal.json。"
+      );
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:alignment-proposal");
     } finally {
@@ -691,6 +694,9 @@ describe("资源面板", () => {
         throw new Error("对齐复核报告下载未通过锚点触发。");
       }
       expect(clickedAnchor.download).toBe("对齐_报告_项目-alignment-review-report.txt");
+      expect(useEditorStore.getState().status.message).toBe(
+        "已导出对齐复核报告：对齐_报告_项目-alignment-review-report.txt。"
+      );
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:alignment-report");
     } finally {
