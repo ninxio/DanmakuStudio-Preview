@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C33 已完成：项目健康摘要支持清理失效编辑引用。
+  - 项目健康领域层新增 `cleanupProjectEditReferences`，只清理指向不存在弹幕的 `disabledItemIds` 和 `itemTimeAdjustments`，保留仍然有效的禁用和单条微调。
+  - Store 新增真实动作 `cleanupProjectEditReferences`，清理会进入历史栈，可撤销/重做；没有失效引用时只给状态提示，不产生空历史。
+  - 资源栏“项目信息”的项目健康面板在存在失效编辑引用时显示“清理失效引用”按钮，点击后即时清理并刷新健康提示。
+  - README 已同步：项目健康摘要现在可一键清理失效禁用/微调引用，且该动作仍走历史栈。
+  - 已补充领域层、store 和资源面板交互测试。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/project/health.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx` 成功，3 个测试文件、31 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、134 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:44:27`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2993599` 字节，时间 `2026/07/10 8:44:27`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c33-health-cleanup-orphaned-edits-20260710`。
 - 成熟度提升阶段 C32 已完成：应用设置备份格式增加版本化保护。
   - `serializeAppSettings` 现在导出的设置备份会写入 `schemaVersion: 1`，桌面配置文件和浏览器 fallback 都沿用同一套规范化序列化入口。
   - `parseAppSettingsTextStrict` 继续兼容旧版无版本备份；遇到非数字版本或未来版本时会明确报错，不会静默覆盖为默认设置。

@@ -163,6 +163,51 @@ describe("editor store", () => {
     });
   });
 
+  it("清理失效编辑引用并写入历史", () => {
+    const asset = createAsset("asset-cleanup", "cleanup.xml");
+    const validItemId = asset.items[0].id;
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      disabledItemIds: [validItemId, "missing-disabled"],
+      itemTimeAdjustments: {
+        [validItemId]: 100,
+        "missing-adjustment": 200
+      }
+    });
+
+    useEditorStore.getState().cleanupProjectEditReferences();
+
+    expect(useEditorStore.getState().project.disabledItemIds).toEqual([validItemId]);
+    expect(useEditorStore.getState().project.itemTimeAdjustments).toEqual({ [validItemId]: 100 });
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("清理失效编辑引用");
+    expect(useEditorStore.getState().status).toEqual({
+      message: "已清理 2 条失效编辑引用。",
+      tone: "success"
+    });
+  });
+
+  it("没有失效编辑引用时不写入历史", () => {
+    const asset = createAsset("asset-no-cleanup", "no-cleanup.xml");
+    const validItemId = asset.items[0].id;
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      disabledItemIds: [validItemId],
+      itemTimeAdjustments: {
+        [validItemId]: 100
+      }
+    });
+
+    useEditorStore.getState().cleanupProjectEditReferences();
+
+    expect(useEditorStore.getState().history.past).toHaveLength(0);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "当前没有需要清理的失效编辑引用。",
+      tone: "neutral"
+    });
+  });
+
   it("可把对齐提案发送到时间轴预览", () => {
     useEditorStore.getState().previewAlignmentProposalData({
       anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],

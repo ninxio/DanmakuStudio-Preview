@@ -118,6 +118,7 @@ export function AssetPanel() {
   const previewAlignmentProposalData = useEditorStore((state) => state.previewAlignmentProposalData);
   const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
   const setCutHintSettings = useEditorStore((state) => state.setCutHintSettings);
+  const cleanupProjectEditReferences = useEditorStore((state) => state.cleanupProjectEditReferences);
   const manualRules = useMemo(
     () =>
       createBatchMergeOptions({
@@ -366,7 +367,7 @@ export function AssetPanel() {
         ) : null}
         {tab === "project" ? (
           <div className="grid gap-3 text-xs text-slate-400">
-            <ProjectHealthPanel summary={projectHealth} />
+            <ProjectHealthPanel summary={projectHealth} onCleanupEditReferences={cleanupProjectEditReferences} />
             <div className="rounded border border-panel-line bg-panel-soft p-3">
               <h3 className="mb-2 text-sm font-medium text-slate-100">{project.name}</h3>
               <Row label="资源数" value={project.assets.length.toString()} />
@@ -1855,7 +1856,13 @@ function confidenceLabel(confidence: "high" | "medium" | "low"): string {
   return "需复核";
 }
 
-function ProjectHealthPanel({ summary }: { summary: ProjectHealthSummary }) {
+function ProjectHealthPanel({
+  summary,
+  onCleanupEditReferences
+}: {
+  summary: ProjectHealthSummary;
+  onCleanupEditReferences: () => void;
+}) {
   const StatusIcon = summary.status === "blocked" ? CircleAlert : summary.status === "attention" ? TriangleAlert : CircleCheck;
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3" data-testid="project-health-panel">
@@ -1896,6 +1903,14 @@ function ProjectHealthPanel({ summary }: { summary: ProjectHealthSummary }) {
           <ProjectHealthFindingRow key={finding.id} finding={finding} />
         ))}
       </ul>
+      {summary.metrics.orphanedEditReferenceCount > 0 ? (
+        <div className="mt-3 flex justify-end">
+          <TextButton onClick={onCleanupEditReferences}>
+            <Trash2 size={14} />
+            清理失效引用
+          </TextButton>
+        </div>
+      ) : null}
     </section>
   );
 }

@@ -36,8 +36,15 @@ export interface ProjectHealthSummary {
   findings: ProjectHealthFinding[];
 }
 
+export interface ProjectEditReferenceCleanup {
+  project: EditorProject;
+  removedDisabledItemIds: number;
+  removedItemAdjustments: number;
+  changed: boolean;
+}
+
 export function createProjectHealthSummary(project: EditorProject): ProjectHealthSummary {
-  const itemIds = new Set(project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
+  const itemIds = collectProjectItemIds(project);
   const disabledIdSet = new Set(project.disabledItemIds);
   const orphanedDisabledIds = project.disabledItemIds.filter((id) => !itemIds.has(id));
   const adjustedItemIds = Object.keys(project.itemTimeAdjustments);
@@ -188,6 +195,36 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
     },
     findings
   };
+}
+
+export function cleanupProjectEditReferences(project: EditorProject): ProjectEditReferenceCleanup {
+  const itemIds = collectProjectItemIds(project);
+  const disabledItemIds = project.disabledItemIds.filter((id) => itemIds.has(id));
+  const itemTimeAdjustments: Record<string, Milliseconds> = {};
+  for (const [itemId, adjustmentMs] of Object.entries(project.itemTimeAdjustments)) {
+    if (itemIds.has(itemId)) {
+      itemTimeAdjustments[itemId] = adjustmentMs;
+    }
+  }
+  const removedDisabledItemIds = project.disabledItemIds.length - disabledItemIds.length;
+  const removedItemAdjustments = Object.keys(project.itemTimeAdjustments).length - Object.keys(itemTimeAdjustments).length;
+  const changed = removedDisabledItemIds > 0 || removedItemAdjustments > 0;
+  return {
+    project: changed
+      ? {
+          ...project,
+          disabledItemIds,
+          itemTimeAdjustments
+        }
+      : project,
+    removedDisabledItemIds,
+    removedItemAdjustments,
+    changed
+  };
+}
+
+function collectProjectItemIds(project: EditorProject): Set<string> {
+  return new Set(project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
 }
 
 function clipHasVisibleItem(asset: DanmakuAsset, clip: DanmakuClip): boolean {

@@ -21,6 +21,7 @@ import {
   cloneProject,
   touchProject
 } from "../domain/project/factory";
+import { cleanupProjectEditReferences as cleanupProjectEditReferencesInProject } from "../domain/project/health";
 import type { EditorProject, EditorSelection, MediaReference } from "../domain/project/types";
 import {
   getAssetTimeRange,
@@ -122,6 +123,7 @@ interface EditorStore {
   setItemAdjustment: (itemId: string, adjustmentMs: Milliseconds) => void;
   disableSelectedDanmaku: () => void;
   restoreSelectedDanmaku: () => void;
+  cleanupProjectEditReferences: () => void;
   addCutMarkerAtPlayhead: () => void;
   addCutMarker: (sourceAtMs: Milliseconds, targetGapMs?: Milliseconds, draft?: CutMarkerDraft) => void;
   updateCutMarker: (id: string, patch: Partial<Omit<CutMarker, "id">>) => void;
@@ -630,6 +632,21 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       ...project,
       disabledItemIds: project.disabledItemIds.filter((id) => !selection.ids.includes(id))
     }));
+  },
+
+  cleanupProjectEditReferences: () => {
+    const cleanup = cleanupProjectEditReferencesInProject(get().project);
+    if (!cleanup.changed) {
+      set({ status: { message: "当前没有需要清理的失效编辑引用。", tone: "neutral" } });
+      return;
+    }
+    commitProject(set, get, "清理失效编辑引用", () => cleanup.project);
+    set({
+      status: {
+        message: `已清理 ${cleanup.removedDisabledItemIds + cleanup.removedItemAdjustments} 条失效编辑引用。`,
+        tone: "success"
+      }
+    });
   },
 
   addCutMarkerAtPlayhead: () => {

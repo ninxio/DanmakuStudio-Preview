@@ -68,6 +68,31 @@ describe("资源面板", () => {
     expect(screen.getByText("不需要")).toBeInTheDocument();
   });
 
+  it("可以从项目健康摘要清理失效编辑引用", async () => {
+    const user = userEvent.setup();
+    const project = useEditorStore.getState().project;
+    const validItemId = project.assets[0].items[0].id;
+    useEditorStore.setState({
+      project: {
+        ...project,
+        disabledItemIds: [validItemId, "missing-disabled"],
+        itemTimeAdjustments: {
+          [validItemId]: 100,
+          "missing-adjustment": 200
+        }
+      }
+    });
+    render(<AssetPanel />);
+
+    await user.click(screen.getByRole("button", { name: "项目信息" }));
+    expect(screen.getByText("存在失效编辑引用")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "清理失效引用" }));
+
+    expect(useEditorStore.getState().project.disabledItemIds).toEqual([validItemId]);
+    expect(useEditorStore.getState().project.itemTimeAdjustments).toEqual({ [validItemId]: 100 });
+    expect(screen.queryByText("存在失效编辑引用")).not.toBeInTheDocument();
+  });
+
   it("可以把疑似删减候选转为待确认补偿点", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(

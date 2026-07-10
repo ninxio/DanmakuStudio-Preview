@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "./factory";
-import { createProjectHealthSummary } from "./health";
+import { cleanupProjectEditReferences, createProjectHealthSummary } from "./health";
 
 describe("project health", () => {
   it("为空项目提示需要导入 XML", () => {
@@ -138,6 +138,27 @@ describe("project health", () => {
         "orphaned-edits"
       ])
     );
+  });
+
+  it("可清理指向不存在弹幕的禁用和微调引用", () => {
+    const asset = createAsset("asset", [createItem("item-1")]);
+    const project = {
+      ...createEmptyProject(),
+      assets: [asset],
+      disabledItemIds: ["item-1", "missing-disabled"],
+      itemTimeAdjustments: {
+        "item-1": 100,
+        "missing-adjustment": 200
+      }
+    };
+
+    const cleanup = cleanupProjectEditReferences(project);
+
+    expect(cleanup.changed).toBe(true);
+    expect(cleanup.removedDisabledItemIds).toBe(1);
+    expect(cleanup.removedItemAdjustments).toBe(1);
+    expect(cleanup.project.disabledItemIds).toEqual(["item-1"]);
+    expect(cleanup.project.itemTimeAdjustments).toEqual({ "item-1": 100 });
   });
 });
 
