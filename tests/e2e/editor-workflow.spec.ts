@@ -287,7 +287,7 @@ test("导出前会阻断项目健康错误", async ({ page }) => {
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
 });
 
-test("导出摘要会展示负时间限制明细", async ({ page }) => {
+test("项目健康和导出摘要会展示负时间风险", async ({ page }) => {
   await page.goto("/");
 
   await page.getByTestId("xml-input").setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
@@ -297,8 +297,20 @@ test("导出摘要会展示负时间限制明细", async ({ page }) => {
   await page.getByLabel("全局偏移").fill("-2000");
   await page.getByLabel("关闭设置").click();
 
+  await page.getByRole("button", { name: "项目信息" }).click();
+  const projectHealthPanel = page.getByTestId("project-health-panel");
+  await expect(projectHealthPanel).toContainText("负最终时间");
+  await expect(projectHealthPanel).toContainText("存在负最终时间");
+  await expect(projectHealthPanel).toContainText("第一条滚动弹幕");
+  await expect(projectHealthPanel).toContainText("顶部弹幕");
+  await expect(projectHealthPanel).toContainText("-00:00:02.000");
+  await expect(projectHealthPanel).toContainText("-00:00:00.250");
+
   await page.getByLabel("导出 XML").click();
   const exportDialog = page.getByTestId("export-dialog");
+  await expect(exportDialog).toContainText("导出前健康检查");
+  await expect(exportDialog).toContainText("需复核");
+  await expect(exportDialog).toContainText("存在负最终时间");
   await expect(exportDialog).toContainText("负时间限制为 0");
   await expect(exportDialog).toContainText("2 项");
   await expect(exportDialog).toContainText("负时间限制明细");
@@ -306,6 +318,19 @@ test("导出摘要会展示负时间限制明细", async ({ page }) => {
   await expect(exportDialog).toContainText("顶部弹幕");
   await expect(exportDialog).toContainText("-00:00:02.000 -> 00:00:00.000");
   await expect(exportDialog).toContainText("-00:00:00.250 -> 00:00:00.000");
+
+  const exportHealthReportDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载健康报告" }).click();
+  const exportHealthReportDownload = await exportHealthReportDownloadPromise;
+  const exportHealthReportPath = resolve(downloadDir, exportHealthReportDownload.suggestedFilename());
+  await exportHealthReportDownload.saveAs(exportHealthReportPath);
+  const exportHealthReportText = readFileSync(exportHealthReportPath, "utf8");
+  expect(exportHealthReportText).toContain("项目健康报告");
+  expect(exportHealthReportText).toContain("状态：需复核");
+  expect(exportHealthReportText).toContain("负最终时间：2 条");
+  expect(exportHealthReportText).toContain("[需复核] 存在负最终时间");
+  expect(exportHealthReportText).toContain("第一条滚动弹幕");
+  expect(exportHealthReportText).toContain("顶部弹幕");
 
   const exportReportDownloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载导出报告" }).click();
