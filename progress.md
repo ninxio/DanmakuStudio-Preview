@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C38 已完成：Playwright E2E 覆盖导出前项目健康阻断。
+  - 新增独立 E2E：使用 `fixtures/projects/three-part-demo.danmaku-project.json` 构造一份片段 `assetId` 指向缺失资源的坏项目，重新打开后直接点击“导出 XML”。
+  - 测试断言状态栏显示“项目健康检查未通过：片段引用了缺失资源”，且不会弹出导出摘要对话框；随后切到“项目信息”，确认项目健康面板显示“需处理”和对应阻断原因。
+  - 本地 E2E 构造产物：`artifacts/downloads/blocked-health-project.danmaku-project.json`，大小 `7495` 字节，时间 `2026/07/10 9:00:53`。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 本阶段只修改 E2E 测试、截图基线和进度文档，没有修改运行时代码、UI 源码或 Tauri 代码，因此未重新打包；最新可安装 release 产物仍是 C37 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:58:30`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997301` 字节，时间 `2026/07/10 8:58:30`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c38-e2e-export-health-blocker-20260710`。
 - 成熟度提升阶段 C37 已完成：导出 XML 前接入项目健康阻断项。
   - `prepareExport` 现在会先运行 `createProjectHealthSummary`，若项目存在 severity 为 `error` 的健康项，会清空导出草稿并提示“项目健康检查未通过”，要求先到“项目信息”处理。
   - 当前阻断覆盖重复 ID、片段引用缺失资源等结构错误，避免导出时静默跳过坏引用或产出不完整 XML。

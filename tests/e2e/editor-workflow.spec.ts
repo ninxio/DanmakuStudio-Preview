@@ -6,6 +6,7 @@ const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
 const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
 
 interface SavedProjectFile {
+  clips?: Array<{ assetId?: string; [key: string]: unknown }>;
   disabledItemIds?: string[];
   itemTimeAdjustments?: Record<string, number>;
   [key: string]: unknown;
@@ -244,6 +245,30 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
   await expect(page.getByTestId("asset-card")).toContainText(exportedXmlDownload.suggestedFilename());
   await page.screenshot({ path: screenshotPath("reimported-export.png"), fullPage: true });
+});
+
+test("导出前会阻断项目健康错误", async ({ page }) => {
+  await page.goto("/");
+  const fixtureText = readFileSync(resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"), "utf8");
+  const blockedProject = JSON.parse(fixtureText) as SavedProjectFile;
+  if (!blockedProject.clips || blockedProject.clips.length === 0) {
+    throw new Error("测试项目缺少时间轴片段。");
+  }
+  blockedProject.clips[0] = {
+    ...blockedProject.clips[0],
+    assetId: "missing-asset"
+  };
+  const blockedProjectPath = resolve(downloadDir, "blocked-health-project.danmaku-project.json");
+  writeFileSync(blockedProjectPath, JSON.stringify(blockedProject, null, 2), "utf8");
+
+  await page.getByTestId("project-input").setInputFiles(blockedProjectPath);
+  await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
+  await page.getByLabel("导出 XML").click();
+  await expect(page.getByTestId("status-bar")).toContainText("项目健康检查未通过：片段引用了缺失资源");
+  await expect(page.getByTestId("export-dialog")).toHaveCount(0);
+  await page.getByRole("button", { name: "项目信息" }).click();
+  await expect(page.getByTestId("project-health-panel")).toContainText("需处理");
+  await expect(page.getByTestId("project-health-panel")).toContainText("片段引用了缺失资源");
 });
 
 function screenshotPath(fileName: string): string {
