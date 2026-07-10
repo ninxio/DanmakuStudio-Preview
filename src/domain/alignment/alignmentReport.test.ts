@@ -26,7 +26,40 @@ describe("alignment review report", () => {
         }
       ],
       confidence: 0.82,
-      diagnostics: ["音频特征匹配 4 / 4 帧。"]
+      diagnostics: ["音频特征匹配 4 / 4 帧。"],
+      evidence: {
+        algorithm: "time-map-audio",
+        completeFingerprintCount: 10,
+        sourceFingerprintCount: 8,
+        fingerprintMatchCount: 8,
+        monotonicMatchCount: 8,
+        strongAnchorCount: 6,
+        weakAnchorCount: 2,
+        offsetClusterCount: 2,
+        refinedCandidateCount: 1,
+        lowConfidenceRegionCount: 0,
+        quality: "medium",
+        timeMappingSegmentCount: 2,
+        confirmedChangeCount: 1,
+        signals: [
+          {
+            kind: "audio",
+            status: "used",
+            label: "音频时间映射",
+            observations: 8,
+            weight: 1,
+            note: "音频支持"
+          },
+          {
+            kind: "visual",
+            status: "used",
+            label: "鲁棒视觉指纹",
+            observations: 6,
+            weight: 0.25,
+            note: "视觉支持"
+          }
+        ]
+      }
     };
 
     const report = createAlignmentReviewReport(proposal, new Date("2026-07-10T01:02:03.000Z"));
@@ -46,6 +79,8 @@ describe("alignment review report", () => {
     expect(report).toContain("不确定区间：00:00:18.000 (18000 ms) - 00:00:22.000 (22000 ms)");
     expect(report).toContain("1 个候选版本差异置信度低于 75%");
     expect(report).toContain("音频特征匹配 4 / 4 帧。");
+    expect(report).toContain("算法：音频时间映射");
+    expect(report).toContain("鲁棒视觉指纹：已参与，观测 6，权重 25%");
     expect(createAlignmentReviewFocus(proposal)).toEqual([
       "1 个候选版本差异置信度低于 75%，建议人工确认边界和相差时长。",
       "1 个候选版本差异包含不确定区间，优先核对区间内的真实差异边界。"

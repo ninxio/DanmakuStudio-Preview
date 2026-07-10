@@ -992,8 +992,8 @@ describe("资源面板", () => {
       error: null,
       stageKey: "completed",
       stageLabel: "已完成",
-      stageIndex: 8,
-      stageCount: 8,
+      stageIndex: 9,
+      stageCount: 9,
       stageProgress: 1,
       updatedAtMs: 1
     });
@@ -1028,15 +1028,18 @@ describe("资源面板", () => {
     fireEvent.change(screen.getByLabelText("B 站删减版输入"), {
       target: { value: "D:\\media\\cut.mp4" }
     });
+    await user.click(screen.getByLabelText(/鲁棒视觉辅助/));
     await user.click(screen.getByRole("button", { name: "运行本地对齐" }));
 
     await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalled());
-    expect(screen.getByLabelText("音频对齐阶段")).toHaveTextContent("阶段 8/8");
+    expect(screen.getByLabelText("音频对齐阶段")).toHaveTextContent("阶段 9/9");
     expect(screen.getByLabelText("音频对齐阶段")).toHaveTextContent("已完成");
     const request = vi.mocked(startTauriAudioAlignmentJob).mock.calls[0][0];
     expect(request.completePath).toContain("https://emby.example.test/emby/Videos/episode-1/stream");
     expect(request.completePath).toContain("api_key=token-secret");
     expect(request.completePath).toContain("MediaSourceId=source-1");
+    expect(request.enableVisualEvidence).toBe(true);
+    expect(request.visualSampleIntervalMs).toBe(5000);
     expect(screen.getByLabelText("完整版输入")).toHaveValue("");
   });
 

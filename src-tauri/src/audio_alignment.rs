@@ -18,16 +18,23 @@ const DEFAULT_WINDOW_MS: u64 = 1_000;
 const DEFAULT_MATCH_THRESHOLD: f64 = 0.18;
 const DEFAULT_MIN_GAP_MS: u64 = 1_000;
 const DEFAULT_MAX_CELLS: usize = 16_000_000;
+const DEFAULT_VISUAL_SAMPLE_INTERVAL_MS: u64 = 5_000;
+const VISUAL_SAMPLE_WIDTH: usize = 32;
+const VISUAL_SAMPLE_HEIGHT: usize = 18;
+const VISUAL_GRID_COLUMNS: usize = 4;
+const VISUAL_GRID_ROWS: usize = 2;
+const VISUAL_MATCH_THRESHOLD: f64 = 0.16;
 const AUDIO_ALIGNMENT_CANCELLED: &str = "音频对齐任务已取消。";
 const MAX_JOB_LOGS: usize = 80;
 const MAX_AUDIO_FEATURE_CACHE_ENTRIES: usize = 12;
+const MAX_VISUAL_FEATURE_CACHE_ENTRIES: usize = 12;
 const MERGE_NEARBY_CANDIDATE_MS: u64 = 2_000;
 const FINGERPRINT_BUCKET_MS: i64 = 1_000;
 const MAX_COMPLETE_FINGERPRINTS_PER_KEY: usize = 32;
 const MAX_SPARSE_MATCH_CANDIDATES: usize = 80_000;
 const MIN_SPARSE_MATCHES: usize = 3;
 const MIN_SPARSE_COVERAGE: f64 = 0.25;
-const AUDIO_ALIGNMENT_STAGE_COUNT: u8 = 8;
+const AUDIO_ALIGNMENT_STAGE_COUNT: u8 = 9;
 const OFFSET_PATH_TARGET_BLOCK_FRAMES: usize = 24;
 const OFFSET_PATH_MIN_BLOCK_FRAMES: usize = 4;
 const OFFSET_PATH_MIN_SOURCE_FRAMES: usize = 32;
@@ -56,11 +63,20 @@ pub struct AudioAlignmentRequest {
     match_threshold: Option<f64>,
     min_gap_ms: Option<u64>,
     max_cells: Option<usize>,
+    enable_visual_evidence: Option<bool>,
+    visual_sample_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioFeatureFrame {
+    time_ms: u64,
+    values: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualFeatureFrame {
     time_ms: u64,
     values: Vec<f64>,
 }
@@ -173,12 +189,26 @@ struct AudioAlignmentOptions {
     min_gap_ms: u64,
     max_cells: usize,
     ffmpeg_path: String,
+    enable_visual_evidence: bool,
+    visual_sample_interval_ms: u64,
 }
 
 #[derive(Debug, Clone)]
 struct CachedAudioFeatures {
     frames: Vec<AudioFeatureFrame>,
     cache_hit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedVisualFeatures {
+    frames: Vec<VisualFeatureFrame>,
+    cache_hit: bool,
+}
+
+struct VisualTimeMappingEvidence {
+    observations: usize,
+    supported_observations: usize,
+    mean_distance: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +305,8 @@ static AUDIO_ALIGNMENT_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentJobEnt
 static AUDIO_ALIGNMENT_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static AUDIO_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<AudioFeatureFrame>>>> =
     OnceLock::new();
+static VISUAL_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<VisualFeatureFrame>>>> =
+    OnceLock::new();
 
 #[tauri::command]
 pub async fn align_audio_files(
@@ -358,27 +390,48 @@ where
     let options = create_options(&request)?;
     update_progress(0.10, "已确认本地媒体路径和对齐参数。")?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.15, "正在检查或提取完整版音频特征。")?;
+    update_progress(0.12, "正在检查或提取完整版音频特征。")?;
     let complete_features =
         get_audio_features(&request.complete_path, "完整版", &options, cancel_flag)?;
     update_progress(
-        0.42,
+        0.36,
         &format_audio_feature_cache_message("完整版", &complete_features),
     )?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.45, "正在检查或提取当前视频音频特征。")?;
+    update_progress(0.40, "正在检查或提取当前视频音频特征。")?;
     let source_features =
         get_audio_features(&request.source_path, "当前视频", &options, cancel_flag)?;
     update_progress(
-        0.72,
+        0.64,
         &format_audio_feature_cache_message("当前视频", &source_features),
     )?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.76, "正在生成稀疏音频指纹。")?;
+    let mut visual_features: Option<(CachedVisualFeatures, CachedVisualFeatures)> = None;
+    let mut visual_error: Option<String> = None;
+    if options.enable_visual_evidence {
+        update_progress(0.68, "正在提取鲁棒视觉证据。")?;
+        match (
+            get_visual_features(&request.complete_path, "完整版", &options, cancel_flag),
+            get_visual_features(&request.source_path, "当前视频", &options, cancel_flag),
+        ) {
+            (Ok(complete_visual), Ok(source_visual)) => {
+                update_progress(0.74, "鲁棒视觉证据提取完成。")?;
+                visual_features = Some((complete_visual, source_visual));
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                update_progress(0.74, "视觉证据不可用，继续音频时间映射。")?;
+                visual_error = Some(error);
+            }
+        }
+    } else {
+        update_progress(0.74, "未启用视觉辅助，继续音频时间映射。")?;
+    }
     check_cancelled(cancel_flag)?;
-    update_progress(0.82, "正在匹配音频锚点。")?;
+    update_progress(0.78, "正在生成稀疏音频指纹。")?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.88, "正在拟合单调对齐路径。")?;
+    update_progress(0.84, "正在建立候选观测。")?;
+    check_cancelled(cancel_flag)?;
+    update_progress(0.89, "正在拟合时间映射。")?;
     check_cancelled(cancel_flag)?;
     let mut proposal = create_audio_alignment_proposal(
         &complete_features.frames,
@@ -387,6 +440,7 @@ where
     )?;
     update_progress(0.94, "正在精修候选版本差异。")?;
     check_cancelled(cancel_flag)?;
+    apply_visual_evidence_to_proposal(&mut proposal, visual_features.as_ref(), visual_error);
     proposal.diagnostics.push(format!(
         "音频特征缓存：完整版{}，当前视频{}。",
         if complete_features.cache_hit {
@@ -400,6 +454,21 @@ where
             "新提取"
         }
     ));
+    if let Some((complete_visual, source_visual)) = &visual_features {
+        proposal.diagnostics.push(format!(
+            "视觉证据缓存：完整版{}，当前视频{}。",
+            if complete_visual.cache_hit {
+                "命中"
+            } else {
+                "新提取"
+            },
+            if source_visual.cache_hit {
+                "命中"
+            } else {
+                "新提取"
+            }
+        ));
+    }
     update_progress(0.97, "正在生成对齐复核数据。")?;
     Ok(proposal)
 }
@@ -463,6 +532,9 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
     let match_threshold = request.match_threshold.unwrap_or(DEFAULT_MATCH_THRESHOLD);
     let min_gap_ms = request.min_gap_ms.unwrap_or(DEFAULT_MIN_GAP_MS);
     let max_cells = request.max_cells.unwrap_or(DEFAULT_MAX_CELLS);
+    let visual_sample_interval_ms = request
+        .visual_sample_interval_ms
+        .unwrap_or(DEFAULT_VISUAL_SAMPLE_INTERVAL_MS);
     if sample_rate == 0 {
         return Err("音频采样率必须大于 0。".to_string());
     }
@@ -471,6 +543,9 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
     }
     if !match_threshold.is_finite() || match_threshold <= 0.0 {
         return Err("音频匹配阈值必须是大于 0 的数字。".to_string());
+    }
+    if visual_sample_interval_ms == 0 {
+        return Err("视觉采样间隔必须大于 0。".to_string());
     }
     Ok(AudioAlignmentOptions {
         sample_rate,
@@ -485,6 +560,8 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
             .filter(|value| !value.is_empty())
             .unwrap_or("ffmpeg")
             .to_string(),
+        enable_visual_evidence: request.enable_visual_evidence.unwrap_or(false),
+        visual_sample_interval_ms,
     })
 }
 
@@ -593,36 +670,38 @@ fn create_audio_alignment_stage_snapshot(
         };
     }
     let clamped = progress.clamp(0.0, 1.0);
-    if clamped < 0.12 {
-        create_stage_range("validating", "校验输入", 1, clamped, 0.0, 0.12)
-    } else if clamped < 0.44 {
+    if clamped < 0.10 {
+        create_stage_range("validating", "校验输入", 1, clamped, 0.0, 0.10)
+    } else if clamped < 0.38 {
         create_stage_range(
             "extracting-complete",
             "提取完整版特征",
             2,
             clamped,
-            0.12,
-            0.44,
+            0.10,
+            0.38,
         )
-    } else if clamped < 0.74 {
+    } else if clamped < 0.66 {
         create_stage_range(
             "extracting-source",
             "提取删减版特征",
             3,
             clamped,
-            0.44,
-            0.74,
+            0.38,
+            0.66,
         )
-    } else if clamped < 0.80 {
-        create_stage_range("fingerprinting", "生成稀疏指纹", 4, clamped, 0.74, 0.80)
-    } else if clamped < 0.86 {
-        create_stage_range("matching", "建立候选观测", 5, clamped, 0.80, 0.86)
+    } else if clamped < 0.76 {
+        create_stage_range("extracting-visual", "提取视觉证据", 4, clamped, 0.66, 0.76)
+    } else if clamped < 0.81 {
+        create_stage_range("fingerprinting", "生成稀疏指纹", 5, clamped, 0.76, 0.81)
+    } else if clamped < 0.87 {
+        create_stage_range("matching", "建立候选观测", 6, clamped, 0.81, 0.87)
     } else if clamped < 0.92 {
-        create_stage_range("fitting", "拟合时间映射", 6, clamped, 0.86, 0.92)
+        create_stage_range("fitting", "拟合时间映射", 7, clamped, 0.87, 0.92)
     } else if clamped < 0.97 {
-        create_stage_range("refining", "确认持续变点", 7, clamped, 0.92, 0.97)
+        create_stage_range("refining", "确认持续变点", 8, clamped, 0.92, 0.97)
     } else {
-        create_stage_range("reporting", "生成复核数据", 8, clamped, 0.97, 1.0)
+        create_stage_range("reporting", "生成复核数据", 9, clamped, 0.97, 1.0)
     }
 }
 
@@ -784,6 +863,198 @@ fn format_audio_feature_cache_message(label: &str, features: &CachedAudioFeature
         "提取完成并写入缓存"
     };
     format!("{label}音频特征{action}：{} 帧。", features.frames.len())
+}
+
+fn get_visual_features(
+    media_path: &str,
+    label: &str,
+    options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<CachedVisualFeatures, String> {
+    check_cancelled(cancel_flag)?;
+    let cache_key = create_visual_feature_cache_key(media_path, options)?;
+    if let Some(frames) = read_visual_feature_cache(&cache_key)? {
+        return Ok(CachedVisualFeatures {
+            frames,
+            cache_hit: true,
+        });
+    }
+
+    let frames = extract_visual_features(media_path, label, options, cancel_flag)?;
+    write_visual_feature_cache(cache_key, &frames)?;
+    Ok(CachedVisualFeatures {
+        frames,
+        cache_hit: false,
+    })
+}
+
+fn visual_feature_cache() -> &'static Mutex<HashMap<String, Vec<VisualFeatureFrame>>> {
+    VISUAL_FEATURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_visual_feature_cache(cache_key: &str) -> Result<Option<Vec<VisualFeatureFrame>>, String> {
+    let cache = visual_feature_cache()
+        .lock()
+        .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
+    Ok(cache.get(cache_key).cloned())
+}
+
+fn write_visual_feature_cache(
+    cache_key: String,
+    frames: &[VisualFeatureFrame],
+) -> Result<(), String> {
+    let mut cache = visual_feature_cache()
+        .lock()
+        .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
+    if !cache.contains_key(&cache_key) && cache.len() >= MAX_VISUAL_FEATURE_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(cache_key, frames.to_vec());
+    Ok(())
+}
+
+fn create_visual_feature_cache_key(
+    media_path: &str,
+    options: &AudioAlignmentOptions,
+) -> Result<String, String> {
+    if is_remote_media_input(media_path) {
+        return Ok(format!(
+            "remote:{}|visualInterval={}|ffmpeg={}",
+            redact_sensitive_media_text(media_path),
+            options.visual_sample_interval_ms,
+            options.ffmpeg_path
+        ));
+    }
+    let metadata = fs::metadata(media_path)
+        .map_err(|error| format!("无法读取视觉特征缓存文件信息：{error}"))?;
+    let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    Ok(format!(
+        "{}|len={}|modified={modified_ms}|visualInterval={}|ffmpeg={}",
+        canonical_path.to_string_lossy(),
+        metadata.len(),
+        options.visual_sample_interval_ms,
+        options.ffmpeg_path
+    ))
+}
+
+fn extract_visual_features(
+    media_path: &str,
+    label: &str,
+    options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<VisualFeatureFrame>, String> {
+    check_cancelled(cancel_flag)?;
+    let fps = 1000.0 / options.visual_sample_interval_ms.max(1) as f64;
+    let filter = format!(
+        "fps={fps:.6},scale={VISUAL_SAMPLE_WIDTH}:{VISUAL_SAMPLE_HEIGHT}:flags=bilinear,format=gray"
+    );
+    let mut child = Command::new(&options.ffmpeg_path)
+        .args(["-v", "error", "-i", media_path, "-vf", &filter, "-an", "-f", "rawvideo", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("FFmpeg 启动视觉采样失败：{error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "FFmpeg 视觉采样标准输出管道不可用。".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "FFmpeg 视觉采样错误输出管道不可用。".to_string())?;
+    let stdout_reader = thread::spawn(move || read_child_stdout(stdout));
+    let stderr_reader = thread::spawn(move || read_child_stderr(stderr));
+
+    let status = loop {
+        if let Err(error) = check_cancelled(cancel_flag) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_child_output(stdout_reader, "stdout");
+            let _ = join_child_output(stderr_reader, "stderr");
+            return Err(error);
+        }
+        match child
+            .try_wait()
+            .map_err(|error| format!("FFmpeg 视觉采样状态读取失败：{error}"))?
+        {
+            Some(status) => break status,
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let stdout = join_child_output(stdout_reader, "stdout")?;
+    let stderr = join_child_output(stderr_reader, "stderr")?;
+    if !status.success() {
+        let detail = redact_sensitive_media_text(&String::from_utf8_lossy(&stderr));
+        return Err(format!("FFmpeg 提取视觉证据失败：{detail}"));
+    }
+    let frames = raw_visual_frames_to_features(&stdout, options.visual_sample_interval_ms)?;
+    if frames.is_empty() {
+        return Err(format!("{label}未能提取到可用视觉证据。"));
+    }
+    Ok(frames)
+}
+
+fn raw_visual_frames_to_features(
+    raw: &[u8],
+    sample_interval_ms: u64,
+) -> Result<Vec<VisualFeatureFrame>, String> {
+    let frame_size = VISUAL_SAMPLE_WIDTH * VISUAL_SAMPLE_HEIGHT;
+    if raw.len() < frame_size {
+        return Ok(Vec::new());
+    }
+    let mut frames = Vec::new();
+    for (index, chunk) in raw.chunks_exact(frame_size).enumerate() {
+        frames.push(VisualFeatureFrame {
+            time_ms: index as u64 * sample_interval_ms,
+            values: create_robust_visual_values(chunk),
+        });
+    }
+    Ok(frames)
+}
+
+fn create_robust_visual_values(pixels: &[u8]) -> Vec<f64> {
+    let mut totals = vec![0.0; VISUAL_GRID_COLUMNS * VISUAL_GRID_ROWS];
+    let mut counts = vec![0usize; VISUAL_GRID_COLUMNS * VISUAL_GRID_ROWS];
+    for y in 0..VISUAL_SAMPLE_HEIGHT {
+        for x in 0..VISUAL_SAMPLE_WIDTH {
+            if !is_core_visual_pixel(x, y) {
+                continue;
+            }
+            let column = (x * VISUAL_GRID_COLUMNS / VISUAL_SAMPLE_WIDTH).min(VISUAL_GRID_COLUMNS - 1);
+            let row = ((y.saturating_sub(1)) * VISUAL_GRID_ROWS / 13).min(VISUAL_GRID_ROWS - 1);
+            let index = row * VISUAL_GRID_COLUMNS + column;
+            totals[index] += pixels[y * VISUAL_SAMPLE_WIDTH + x] as f64 / 255.0;
+            counts[index] += 1;
+        }
+    }
+    let global_count = counts.iter().sum::<usize>().max(1);
+    let global_mean = totals.iter().sum::<f64>() / global_count as f64;
+    totals
+        .into_iter()
+        .zip(counts)
+        .map(|(total, count)| {
+            if count == 0 {
+                global_mean
+            } else {
+                total / count as f64
+            }
+        })
+        .collect()
+}
+
+fn is_core_visual_pixel(x: usize, y: usize) -> bool {
+    if x < 2 || x >= VISUAL_SAMPLE_WIDTH - 2 || y == 0 || y >= 14 {
+        return false;
+    }
+    !(x >= 24 && y <= 5)
 }
 
 fn extract_audio_features(
@@ -2044,6 +2315,172 @@ fn create_evidence_signals(
     ]
 }
 
+fn apply_visual_evidence_to_proposal(
+    proposal: &mut AudioAlignmentProposal,
+    visual_features: Option<&(CachedVisualFeatures, CachedVisualFeatures)>,
+    visual_error: Option<String>,
+) {
+    let signal = if let Some((complete_visual, source_visual)) = visual_features {
+        match summarize_visual_time_mapping_evidence(
+            &complete_visual.frames,
+            &source_visual.frames,
+            &proposal.anchors,
+        ) {
+            Some(summary) => {
+                let support_ratio =
+                    summary.supported_observations as f64 / summary.observations.max(1) as f64;
+                if support_ratio >= 0.55 && !proposal.cut_candidates.is_empty() {
+                    for candidate in &mut proposal.cut_candidates {
+                        candidate.confidence = (candidate.confidence + 0.02).clamp(0.1, 0.98);
+                        candidate.note.push_str(" 鲁棒视觉辅助与音频时间映射总体一致。");
+                    }
+                }
+                proposal.diagnostics.push(format!(
+                    "鲁棒视觉证据：{} / {} 个时间映射锚点得到画面结构支持，平均距离 {:.3}。",
+                    summary.supported_observations, summary.observations, summary.mean_distance
+                ));
+                AlignmentEvidenceSignalSummary {
+                    kind: "visual",
+                    status: "used",
+                    label: "鲁棒视觉指纹",
+                    observations: summary.observations,
+                    weight: 0.25,
+                    note: format!(
+                        "已用低频画面指纹复核时间映射；右上水印、底部字幕带和边缘区域已降权，支持率 {}%。",
+                        (support_ratio * 100.0).round()
+                    ),
+                }
+            }
+            None => AlignmentEvidenceSignalSummary {
+                kind: "visual",
+                status: "blocked",
+                label: "鲁棒视觉指纹",
+                observations: 0,
+                weight: 0.0,
+                note: "视觉指纹不足，未参与本次结论。".to_string(),
+            },
+        }
+    } else if let Some(error) = visual_error {
+        AlignmentEvidenceSignalSummary {
+            kind: "visual",
+            status: "blocked",
+            label: "鲁棒视觉指纹",
+            observations: 0,
+            weight: 0.0,
+            note: format!("视觉证据不可用：{}", truncate_visual_note(&error)),
+        }
+    } else {
+        AlignmentEvidenceSignalSummary {
+            kind: "visual",
+            status: "notConfigured",
+            label: "鲁棒视觉指纹",
+            observations: 0,
+            weight: 0.0,
+            note: "当前运行未启用视觉辅助；视觉不会参与本次结论。".to_string(),
+        }
+    };
+    replace_visual_evidence_signal(proposal, signal);
+}
+
+fn summarize_visual_time_mapping_evidence(
+    complete_frames: &[VisualFeatureFrame],
+    source_frames: &[VisualFeatureFrame],
+    anchors: &[SyncAnchorDto],
+) -> Option<VisualTimeMappingEvidence> {
+    if complete_frames.is_empty() || source_frames.is_empty() || anchors.is_empty() {
+        return None;
+    }
+    let complete_step_ms = estimate_visual_frame_step_ms(complete_frames);
+    let source_step_ms = estimate_visual_frame_step_ms(source_frames);
+    let max_distance_ms = complete_step_ms.max(source_step_ms) * 2;
+    let stride = (anchors.len() / 160).max(1);
+    let mut observations = 0usize;
+    let mut supported_observations = 0usize;
+    let mut total_distance = 0.0;
+    for anchor in anchors.iter().step_by(stride) {
+        let Some(complete_frame) = find_nearest_visual_frame(complete_frames, anchor.target_ms)
+        else {
+            continue;
+        };
+        let Some(source_frame) = find_nearest_visual_frame(source_frames, anchor.source_ms) else {
+            continue;
+        };
+        if complete_frame.time_ms.abs_diff(anchor.target_ms) > max_distance_ms
+            || source_frame.time_ms.abs_diff(anchor.source_ms) > max_distance_ms
+        {
+            continue;
+        }
+        let distance = get_visual_feature_distance(complete_frame, source_frame);
+        observations += 1;
+        total_distance += distance;
+        if distance <= VISUAL_MATCH_THRESHOLD {
+            supported_observations += 1;
+        }
+    }
+    if observations == 0 {
+        return None;
+    }
+    Some(VisualTimeMappingEvidence {
+        observations,
+        supported_observations,
+        mean_distance: total_distance / observations as f64,
+    })
+}
+
+fn estimate_visual_frame_step_ms(frames: &[VisualFeatureFrame]) -> u64 {
+    if frames.len() >= 2 {
+        frames[1].time_ms.saturating_sub(frames[0].time_ms).max(1)
+    } else {
+        DEFAULT_VISUAL_SAMPLE_INTERVAL_MS
+    }
+}
+
+fn find_nearest_visual_frame(frames: &[VisualFeatureFrame], time_ms: u64) -> Option<&VisualFeatureFrame> {
+    frames
+        .iter()
+        .min_by_key(|frame| frame.time_ms.abs_diff(time_ms))
+}
+
+fn get_visual_feature_distance(left: &VisualFeatureFrame, right: &VisualFeatureFrame) -> f64 {
+    let width = left.values.len().max(right.values.len());
+    if width == 0 {
+        return 1.0;
+    }
+    let total = (0..width)
+        .map(|index| {
+            let delta = left.values.get(index).copied().unwrap_or(0.0)
+                - right.values.get(index).copied().unwrap_or(0.0);
+            delta * delta
+        })
+        .sum::<f64>();
+    (total / width as f64).sqrt()
+}
+
+fn replace_visual_evidence_signal(
+    proposal: &mut AudioAlignmentProposal,
+    signal: AlignmentEvidenceSignalSummary,
+) {
+    if let Some(evidence) = &mut proposal.evidence {
+        let mut signals = evidence.signals.take().unwrap_or_default();
+        signals.retain(|item| item.kind != "visual");
+        let insert_index = signals
+            .iter()
+            .position(|item| item.kind == "danmaku")
+            .unwrap_or(signals.len());
+        signals.insert(insert_index, signal);
+        evidence.signals = Some(signals);
+    }
+}
+
+fn truncate_visual_note(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut truncated: String = text.chars().take(MAX_CHARS).collect();
+    if text.chars().count() > MAX_CHARS {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
 fn estimate_cut_boundary_ms(previous: &AudioFeatureMatch, current: &AudioFeatureMatch) -> u64 {
     let source_delta_ms = current
         .source_time_ms
@@ -2136,6 +2573,8 @@ mod tests {
             min_gap_ms: 1000,
             max_cells: 1_000_000,
             ffmpeg_path: "ffmpeg".to_string(),
+            enable_visual_evidence: false,
+            visual_sample_interval_ms: DEFAULT_VISUAL_SAMPLE_INTERVAL_MS,
         }
     }
 
@@ -2161,6 +2600,39 @@ mod tests {
                 ],
             })
             .collect()
+    }
+
+    fn scene_pixels(level: u8) -> Vec<u8> {
+        let mut pixels = vec![0u8; VISUAL_SAMPLE_WIDTH * VISUAL_SAMPLE_HEIGHT];
+        for y in 0..VISUAL_SAMPLE_HEIGHT {
+            for x in 0..VISUAL_SAMPLE_WIDTH {
+                pixels[y * VISUAL_SAMPLE_WIDTH + x] =
+                    level.saturating_add(x as u8).saturating_add(y as u8);
+            }
+        }
+        pixels
+    }
+
+    fn paint_visual_rect(
+        pixels: &mut [u8],
+        start_x: usize,
+        start_y: usize,
+        width: usize,
+        height: usize,
+        value: u8,
+    ) {
+        for y in start_y..start_y + height {
+            for x in start_x..start_x + width {
+                pixels[y * VISUAL_SAMPLE_WIDTH + x] = value;
+            }
+        }
+    }
+
+    fn visual_frame(time_ms: u64, level: u8) -> VisualFeatureFrame {
+        VisualFeatureFrame {
+            time_ms,
+            values: create_robust_visual_values(&scene_pixels(level)),
+        }
     }
 
     fn cut_candidate(id: &str, source_at_ms: u64, target_gap_ms: u64) -> CutCandidateDto {
@@ -2332,6 +2804,98 @@ mod tests {
     }
 
     #[test]
+    fn visual_features_ignore_watermark_and_subtitle_regions() {
+        let base = scene_pixels(90);
+        let mut noisy = base.clone();
+        paint_visual_rect(&mut noisy, 24, 1, 8, 5, 255);
+        paint_visual_rect(&mut noisy, 0, 14, 32, 4, 0);
+        let base_frame = VisualFeatureFrame {
+            time_ms: 0,
+            values: create_robust_visual_values(&base),
+        };
+        let noisy_frame = VisualFeatureFrame {
+            time_ms: 0,
+            values: create_robust_visual_values(&noisy),
+        };
+
+        assert!(get_visual_feature_distance(&base_frame, &noisy_frame) < 0.01);
+    }
+
+    #[test]
+    fn visual_evidence_updates_proposal_as_auxiliary_signal() {
+        let mut proposal = AudioAlignmentProposal {
+            anchors: vec![
+                SyncAnchorDto {
+                    id: "anchor-1".to_string(),
+                    source_ms: 0,
+                    target_ms: 0,
+                    confidence: 0.9,
+                    origin: "automatic",
+                },
+                SyncAnchorDto {
+                    id: "anchor-2".to_string(),
+                    source_ms: 5_000,
+                    target_ms: 5_000,
+                    confidence: 0.9,
+                    origin: "automatic",
+                },
+            ],
+            cut_candidates: vec![cut_candidate("gap", 5_000, 20_000)],
+            confidence: 0.8,
+            diagnostics: Vec::new(),
+            evidence: Some(AlignmentEvidenceSummary {
+                algorithm: "time-map-audio".to_string(),
+                complete_fingerprint_count: 2,
+                source_fingerprint_count: 2,
+                fingerprint_match_count: 2,
+                monotonic_match_count: 2,
+                strong_anchor_count: 2,
+                weak_anchor_count: 0,
+                offset_cluster_count: 1,
+                refined_candidate_count: 1,
+                low_confidence_region_count: 0,
+                quality: "high".to_string(),
+                time_mapping_segment_count: Some(1),
+                confirmed_change_count: Some(1),
+                signals: Some(vec![AlignmentEvidenceSignalSummary {
+                    kind: "visual",
+                    status: "notConfigured",
+                    label: "鲁棒视觉指纹",
+                    observations: 0,
+                    weight: 0.0,
+                    note: "未启用".to_string(),
+                }]),
+            }),
+        };
+        let complete = CachedVisualFeatures {
+            frames: vec![visual_frame(0, 80), visual_frame(5_000, 100)],
+            cache_hit: false,
+        };
+        let source = CachedVisualFeatures {
+            frames: vec![visual_frame(0, 80), visual_frame(5_000, 100)],
+            cache_hit: false,
+        };
+        let visual_pair = (complete, source);
+
+        apply_visual_evidence_to_proposal(&mut proposal, Some(&visual_pair), None);
+
+        let visual_signal = proposal
+            .evidence
+            .as_ref()
+            .unwrap()
+            .signals
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|signal| signal.kind == "visual")
+            .unwrap();
+        assert_eq!(visual_signal.status, "used");
+        assert_eq!(visual_signal.observations, 2);
+        assert!(proposal.cut_candidates[0].confidence > 0.8);
+        assert!(proposal.cut_candidates[0].note.contains("鲁棒视觉辅助"));
+    }
+
+    #[test]
     fn audio_feature_cache_reuses_frames_for_same_file_and_options() {
         clear_audio_feature_cache_for_tests();
         let path = temp_audio_cache_path("audio-cache-hit");
@@ -2413,6 +2977,8 @@ mod tests {
             match_threshold: None,
             min_gap_ms: None,
             max_cells: None,
+            enable_visual_evidence: None,
+            visual_sample_interval_ms: None,
         };
         assert!(create_options(&request).is_err());
     }

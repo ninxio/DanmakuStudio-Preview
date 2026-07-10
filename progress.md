@@ -1,5 +1,22 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C129 已完成：接入可选鲁棒视觉辅助证据，作为音频时间映射的抗干扰复核信号。
+  - 视频对齐实验室新增真实“鲁棒视觉辅助”开关；开启后 Tauri 会用 FFmpeg 从完整版和 B 站删减版抽取低分辨率灰度视觉指纹，默认每 5 秒采样一次。
+  - 视觉指纹不比较原始像素；特征只保留中上部低频画面结构，主动忽略/降权边缘、底部字幕带和右上角常见水印区域，用于降低 B 站水印、硬字幕、压制差异带来的误报。
+  - 后端新增视觉特征缓存、视觉采样取消边界、敏感 Emby URL 遮蔽和视觉失败降级：视觉抽帧失败不会导致音频对齐失败，只会在证据信号里标记“不可用”。
+  - 视觉证据现在会复核音频时间映射锚点的一致性；支持率较高时只轻微提高候选置信度并写入说明，不会单独宣判删减点，也不会因为视觉低一致性直接否定音频结论。
+  - 对齐任务阶段新增“提取视觉证据”，进度条从校验、音频提取进入视觉、指纹、观测、映射、变点和报告，用户能看到视觉是否参与。
+  - 新增 `src/domain/alignment/visualEvidence.ts`，把 32x18 鲁棒视觉特征和视觉锚点支持率整理为不依赖 React 的领域模型。
+  - 复核报告会列出“鲁棒视觉指纹：已参与/不可用/未启用”的证据信号、观测数和权重；proposal 导入、schema 校验和 UI 证据面板继续兼容旧格式。
+  - 已补充 TS/Rust 测试，覆盖水印/字幕区域被忽略、主体画面变化能拉开距离、视觉支持率统计、视觉信号写入 proposal、资源栏开关真实传入 Tauri 请求。
+  - 已重新验证：聚焦测试 `corepack pnpm test -- src/domain/alignment/visualEvidence.test.ts src/domain/alignment/alignmentReport.test.ts src/domain/alignment/manualProvider.test.ts src/domain/project/schema.test.ts src/infrastructure/alignment/tauriAudioAlignment.test.ts src/features/assets/AssetPanel.test.tsx` 通过（6 个测试文件 / 69 个测试）。
+  - 已重新验证：Rust 聚焦测试 `cargo test --manifest-path src-tauri\Cargo.toml audio_alignment --lib` 通过（17 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、48 个测试文件 / 277 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包；首次普通权限运行仍因 Windows `spawn EPERM` 中断，已用提升权限重跑同一命令通过。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12508672` 字节，时间 `2026/07/11 04:48:06`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3098503` 字节，时间 `2026/07/11 04:48:06`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c129-visual-evidence-fusion-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C128 已完成：将本地音频对齐从候选点差值升级为“音频时间映射 + 持续变点”流程，并为后续多证据融合建立产品模型。
   - 对齐核心不再把相邻匹配点的瞬时 gap 直接当成删减候选；新增音频时间映射路径，先用局部窗口生成 offset 观测，再平滑、稳定、分段，只有 offset 在更长前瞻窗口内持续成立时才输出版本差异候选。
   - `AlignmentEvidenceSummary` 新增可选 `timeMappingSegmentCount`、`confirmedChangeCount` 和 `signals`，用于解释“音频已参与、视觉未启用、弹幕线索未融合”的证据边界；旧 proposal 仍保持兼容。

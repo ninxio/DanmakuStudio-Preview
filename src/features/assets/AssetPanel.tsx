@@ -1796,6 +1796,7 @@ function VideoAlignmentLabPanel({
   const [windowMs, setWindowMs] = useState(String(initialSettingsRef.current.alignment.windowMs));
   const [minGapMs, setMinGapMs] = useState(String(initialSettingsRef.current.alignment.minGapMs));
   const [matchThreshold, setMatchThreshold] = useState(String(initialSettingsRef.current.alignment.matchThreshold));
+  const [enableVisualEvidence, setEnableVisualEvidence] = useState(false);
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [preparingEmbyInput, setPreparingEmbyInput] = useState(false);
@@ -1905,7 +1906,9 @@ function VideoAlignmentLabPanel({
       ffmpegPath: ffmpegPath.trim().length > 0 ? ffmpegPath.trim() : null,
       windowMs: parsedWindowMs.value,
       minGapMs: parsedMinGapMs.value,
-      matchThreshold: parsedMatchThreshold.value
+      matchThreshold: parsedMatchThreshold.value,
+      enableVisualEvidence,
+      visualSampleIntervalMs: 5000
     };
     const runToken = runTokenRef.current + 1;
     runTokenRef.current = runToken;
@@ -2268,6 +2271,16 @@ function VideoAlignmentLabPanel({
             />
           </label>
         </div>
+        <label className="flex items-center gap-2 rounded border border-panel-line bg-[#111318] px-2 py-2 text-[11px] text-slate-300">
+          <input
+            type="checkbox"
+            className="h-3.5 w-3.5 accent-cyan-400"
+            checked={enableVisualEvidence}
+            onChange={(event) => setEnableVisualEvidence(event.target.checked)}
+          />
+          <span className="min-w-0 flex-1">鲁棒视觉辅助</span>
+          <span className="shrink-0 text-slate-500">可选</span>
+        </label>
         <div className="flex flex-wrap gap-2">
           <TextButton
             tone="primary"
@@ -2621,6 +2634,7 @@ const AUDIO_ALIGNMENT_STAGE_ITEMS: Array<Omit<AudioAlignmentStageItem, "state">>
   { key: "validating", label: "校验输入", shortLabel: "校验" },
   { key: "extracting-complete", label: "提取完整版特征", shortLabel: "原片" },
   { key: "extracting-source", label: "提取删减版特征", shortLabel: "参考" },
+  { key: "extracting-visual", label: "提取视觉证据", shortLabel: "视觉" },
   { key: "fingerprinting", label: "生成稀疏指纹", shortLabel: "指纹" },
   { key: "matching", label: "建立候选观测", shortLabel: "观测" },
   { key: "fitting", label: "拟合时间映射", shortLabel: "映射" },

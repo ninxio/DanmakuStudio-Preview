@@ -10,6 +10,8 @@ export interface TauriAudioAlignmentRequest {
   matchThreshold?: number;
   minGapMs?: number;
   maxCells?: number;
+  enableVisualEvidence?: boolean;
+  visualSampleIntervalMs?: number;
 }
 
 export type AudioAlignmentInvoker = (
@@ -23,6 +25,7 @@ export type AudioAlignmentStageKey =
   | "validating"
   | "extracting-complete"
   | "extracting-source"
+  | "extracting-visual"
   | "fingerprinting"
   | "matching"
   | "fitting"
