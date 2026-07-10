@@ -25,6 +25,20 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C48 已完成：项目健康证据截断会提示剩余数量。
+  - 项目健康领域层新增统一证据预览上限，重复 ID 和负最终时间证据超过 5 条时，会追加“另有 N 项未列出，完整数量见上方计数”的说明。
+  - 该说明会同时出现在资源栏“项目信息”面板和可下载健康报告中，避免大 XML 项目误以为只影响当前展示的前 5 条。
+  - README 已同步：项目健康摘要的重复 ID 和负最终时间证据过长时会提示剩余数量。
+  - 已补充领域层测试，覆盖重复 ID 证据截断和负最终时间证据截断。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts` 成功，1 个测试文件、10 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、149 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:56:42`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998632` 字节，时间 `2026/07/10 9:56:42`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c48-health-evidence-overflow-20260710`。
 - 成熟度提升阶段 C47 已完成：Playwright E2E 覆盖负最终时间健康预警。
   - 原“负时间限制明细”E2E 已升级为“项目健康和导出摘要会展示负时间风险”，覆盖真实 UI 路径中的健康预警与导出复核。
   - 测试会导入 `normal.xml`、放入时间轴、通过设置中心把全局偏移设为 `-2000ms`，随后打开资源栏“项目信息”。

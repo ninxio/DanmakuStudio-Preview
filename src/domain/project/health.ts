@@ -3,6 +3,8 @@ import { formatTimecode, type Milliseconds } from "../shared/time";
 import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import type { EditorProject } from "./types";
 
+const EVIDENCE_PREVIEW_LIMIT = 5;
+
 export type ProjectHealthStatus = "ready" | "attention" | "blocked";
 export type ProjectHealthFindingSeverity = "info" | "warning" | "error";
 
@@ -403,20 +405,34 @@ function findDuplicateGroups(entries: DuplicateIdEntry[]): DuplicateIdGroup[] {
 }
 
 function formatDuplicateEvidence(groups: DuplicateIdGroup[]): string[] {
-  return groups.slice(0, 5).map((group) => {
+  const evidence = groups.slice(0, EVIDENCE_PREVIEW_LIMIT).map((group) => {
     const suffix =
       group.labels.length > 3 ? `；另有 ${group.labels.length - 3} 处` : "";
     return `${group.value}：${group.labels.slice(0, 3).join("；")}${suffix}`;
   });
+  return appendOmittedEvidenceNote(evidence, groups.length, "个重复 ID");
 }
 
 function formatNegativeFinalTimeEvidence(events: ResolvedDanmakuEvent[]): string[] {
-  return events.slice(0, 5).map((event) => {
+  const evidence = events.slice(0, EVIDENCE_PREVIEW_LIMIT).map((event) => {
     const text = event.item.text.trim().length > 0 ? event.item.text.trim() : "空文本";
     return `${event.asset.fileName} / ${event.clip.name} / 第 ${
       event.item.originalIndex + 1
     } 条：${formatSignedDuration(event.finalTimeMs)}，${formatLimitedText(text)}`;
   });
+  return appendOmittedEvidenceNote(evidence, events.length, "条负最终时间");
+}
+
+function appendOmittedEvidenceNote(evidence: string[], totalCount: number, unitLabel: string): string[] {
+  const omittedCount = totalCount - EVIDENCE_PREVIEW_LIMIT;
+  if (omittedCount <= 0) {
+    return evidence;
+  }
+  const suffixSeparator = /[A-Za-z0-9]$/.test(unitLabel) ? " " : "";
+  return [
+    ...evidence,
+    `另有 ${omittedCount.toLocaleString("zh-CN")} ${unitLabel}${suffixSeparator}未列出，完整数量见上方计数。`
+  ];
 }
 
 function formatLimitedText(text: string): string {

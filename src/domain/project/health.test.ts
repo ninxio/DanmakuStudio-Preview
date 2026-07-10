@@ -99,6 +99,26 @@ describe("project health", () => {
     expect(report).toContain("same-id：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕");
   });
 
+  it("重复 ID 证据超过预览限制时提示剩余数量", () => {
+    const duplicatedItems = Array.from({ length: 12 }, (_, index) => ({
+      ...createItem(`dup-${Math.floor(index / 2) + 1}`),
+      originalIndex: index
+    }));
+    const project = {
+      ...createEmptyProject(),
+      assets: [createAsset("asset", duplicatedItems)]
+    };
+
+    const summary = createProjectHealthSummary(project);
+    const duplicateFinding = summary.findings.find((finding) => finding.id === "item-id");
+
+    expect(summary.metrics.duplicateIdCount).toBe(6);
+    expect(duplicateFinding?.evidence).toContain("dup-1：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕");
+    expect(duplicateFinding?.evidence).toContain("dup-5：资源 asset.xml 的第 9 条弹幕；资源 asset.xml 的第 10 条弹幕");
+    expect(duplicateFinding?.evidence).toContain("另有 1 个重复 ID 未列出，完整数量见上方计数。");
+    expect(duplicateFinding?.evidence).not.toContain("dup-6：资源 asset.xml 的第 11 条弹幕；资源 asset.xml 的第 12 条弹幕");
+  });
+
   it("提示媒体重连、导入警告、低置信锚点和失效编辑引用", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const project = {
@@ -192,6 +212,43 @@ describe("project health", () => {
     );
     expect(report).toContain("负最终时间：1 条");
     expect(report).toContain("[需复核] 存在负最终时间");
+  });
+
+  it("负最终时间证据超过预览限制时提示剩余数量", () => {
+    const negativeItems = Array.from({ length: 6 }, (_, index) => ({
+      ...createItem(`item-${index + 1}`),
+      originalIndex: index,
+      sourceTimeMs: index * 100,
+      text: `第 ${index + 1} 条`
+    }));
+    const project = {
+      ...createEmptyProject(),
+      globalOffsetMs: -1000,
+      assets: [createAsset("asset", negativeItems)],
+      clips: [
+        {
+          id: "clip",
+          assetId: "asset",
+          name: "片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+
+    const summary = createProjectHealthSummary(project);
+    const negativeFinding = summary.findings.find((finding) => finding.id === "negative-final-times");
+    const report = createProjectHealthReport("负时间项目", summary);
+
+    expect(summary.metrics.negativeFinalTimeItemCount).toBe(6);
+    expect(negativeFinding?.evidence).toContain("asset.xml / 片段 / 第 1 条：-00:00:01.000，第 1 条");
+    expect(negativeFinding?.evidence).toContain("asset.xml / 片段 / 第 5 条：-00:00:00.600，第 5 条");
+    expect(negativeFinding?.evidence).toContain("另有 1 条负最终时间未列出，完整数量见上方计数。");
+    expect(negativeFinding?.evidence).not.toContain("asset.xml / 片段 / 第 6 条：-00:00:00.500，第 6 条");
+    expect(report).toContain("另有 1 条负最终时间未列出，完整数量见上方计数。");
   });
 
   it("可清理指向不存在弹幕的禁用和微调引用", () => {
