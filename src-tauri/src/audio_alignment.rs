@@ -2306,7 +2306,7 @@ fn create_evidence_signals(
         AlignmentEvidenceSignalSummary {
             kind: "danmaku",
             status: "notConfigured",
-            label: "弹幕文本/密度线索",
+            label: "弹幕文本线索",
             observations: 0,
             weight: 0.0,
             note: "当前本地音频对齐未融合弹幕语义；弹幕线索仍保留为人工复核参考。"

@@ -1,5 +1,20 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C130 已完成：将已导入 XML 的弹幕文本线索接入本地对齐 proposal，形成音频、视觉、弹幕三类证据信号闭环。
+  - 新增 `src/domain/alignment/danmakuEvidence.ts`，作为不依赖 React 的弹幕证据融合模型；它只基于用户已导入的 XML 弹幕和现有疑似删减文本聚类工作，不访问外部数据，也不修改原始 XML。
+  - 本地对齐任务完成后，资源栏会用当前项目弹幕素材和疑似删减扫描结果增强 Tauri 返回的 proposal；手动导入外部 proposal 不会被自动改写。
+  - 弹幕文本线索只支持/加权已有音频时间映射候选：当疑似删减文本聚类靠近候选版本差异时，候选置信度小幅提升并追加复核说明；不会凭弹幕文本单独宣判删减点。
+  - `AlignmentEvidenceSummary.signals` 中的弹幕信号从“未融合”升级为“已参与/未参与”，复核报告、证据面板和 proposal JSON 都能看到弹幕文本线索的观测数、权重和说明。
+  - 为避免过度承诺，用户可见标签从“弹幕文本/密度线索”收窄为“弹幕文本线索”；密度统计仍留待后续基准化实现。
+  - 已补充 TS 测试，覆盖无 XML 时弹幕证据未参与、相邻文本聚类支持候选、资源栏本地对齐完成后真实融合弹幕证据。
+  - 已重新验证：聚焦测试 `corepack pnpm test -- src/domain/alignment/danmakuEvidence.test.ts src/domain/alignment/visualEvidence.test.ts src/domain/alignment/alignmentReport.test.ts src/domain/alignment/manualProvider.test.ts src/domain/project/schema.test.ts src/features/assets/AssetPanel.test.tsx` 通过（6 个测试文件 / 70 个测试）。
+  - 已重新验证：Rust 聚焦测试 `cargo test --manifest-path src-tauri\Cargo.toml audio_alignment --lib` 通过（17 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、49 个测试文件 / 280 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包；首次普通权限运行仍因 Windows `spawn EPERM` 中断，已用提升权限重跑同一命令通过。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12508672` 字节，时间 `2026/07/11 04:54:16`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3097061` 字节，时间 `2026/07/11 04:54:16`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c130-danmaku-evidence-fusion-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C129 已完成：接入可选鲁棒视觉辅助证据，作为音频时间映射的抗干扰复核信号。
   - 视频对齐实验室新增真实“鲁棒视觉辅助”开关；开启后 Tauri 会用 FFmpeg 从完整版和 B 站删减版抽取低分辨率灰度视觉指纹，默认每 5 秒采样一次。
   - 视觉指纹不比较原始像素；特征只保留中上部低频画面结构，主动忽略/降权边缘、底部字幕带和右上角常见水印区域，用于降低 B 站水印、硬字幕、压制差异带来的误报。

@@ -27,6 +27,7 @@ import {
   type AlignmentReviewQueueSeverity
 } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
+import { augmentAlignmentProposalWithDanmakuEvidence } from "../../domain/alignment/danmakuEvidence";
 import { serializeAlignmentProposal } from "../../domain/alignment/manualProvider";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal, CutCandidate } from "../../domain/alignment/types";
@@ -530,6 +531,7 @@ export function AssetPanel() {
                       />
                       <VideoAlignmentLabPanel
                         project={project}
+                        suspectedCutCandidates={suspectedCutCandidates}
                         text={alignmentProposalText}
                         proposal={alignmentProposal}
                         preview={alignmentPreview}
@@ -1767,6 +1769,7 @@ function SyncAnchorsPanel({
 
 function VideoAlignmentLabPanel({
   project,
+  suspectedCutCandidates,
   text,
   proposal,
   preview,
@@ -1778,6 +1781,7 @@ function VideoAlignmentLabPanel({
   onFocusQueueItem
 }: {
   project: EditorProject;
+  suspectedCutCandidates: SuspectedCutCandidate[];
   text: string;
   proposal: AlignmentProposal | null;
   preview: ReturnType<typeof buildAlignmentPreview>;
@@ -1942,7 +1946,11 @@ function VideoAlignmentLabPanel({
       if (snapshot.status === "failed" || !snapshot.proposal) {
         throw new Error(snapshot.error ?? snapshot.message ?? "本地音频对齐失败。");
       }
-      const content = `${JSON.stringify(snapshot.proposal, null, 2)}\n`;
+      const proposalWithDanmakuEvidence = augmentAlignmentProposalWithDanmakuEvidence(snapshot.proposal, {
+        assets: project.assets,
+        suspectedCutCandidates
+      });
+      const content = `${JSON.stringify(proposalWithDanmakuEvidence, null, 2)}\n`;
       onTextChange(content);
       onImportText(content);
       setStatus({ message: "本地音频对齐完成，已导入候选提案。", tone: "success" });

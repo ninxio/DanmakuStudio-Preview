@@ -1043,6 +1043,98 @@ describe("资源面板", () => {
     expect(screen.getByLabelText("完整版输入")).toHaveValue("");
   });
 
+  it("本地对齐完成后会融合弹幕文本证据", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="20,1,25,16777215,0,0,u1,r1">这里删了</d><d p="21,1,25,16777215,0,0,u2,r2">是不是删减了</d></i>`,
+      { fileName: "danmaku.xml" }
+    );
+    useEditorStore.setState({
+      project: {
+        ...useEditorStore.getState().project,
+        assets: [asset]
+      }
+    });
+    vi.mocked(startTauriAudioAlignmentJob).mockResolvedValue({
+      jobId: "job-danmaku",
+      status: "completed",
+      progress: 1,
+      message: "本地音频对齐完成。",
+      logs: ["本地音频对齐完成。"],
+      proposal: {
+        anchors: [],
+        cutCandidates: [
+          {
+            id: "audio-gap-1",
+            name: "音频时间映射差异 1",
+            sourceAtMs: 20_000,
+            sourceRangeStartMs: 18_000,
+            sourceRangeEndMs: 22_000,
+            targetGapMs: 20_000,
+            confidence: 0.72,
+            note: "音频候选"
+          }
+        ],
+        confidence: 0.8,
+        diagnostics: [],
+        evidence: {
+          algorithm: "time-map-audio",
+          completeFingerprintCount: 10,
+          sourceFingerprintCount: 8,
+          fingerprintMatchCount: 8,
+          monotonicMatchCount: 8,
+          strongAnchorCount: 6,
+          weakAnchorCount: 2,
+          offsetClusterCount: 2,
+          refinedCandidateCount: 1,
+          lowConfidenceRegionCount: 0,
+          quality: "medium",
+          timeMappingSegmentCount: 2,
+          confirmedChangeCount: 1,
+          signals: [
+            {
+              kind: "audio",
+              status: "used",
+              label: "音频时间映射",
+              observations: 8,
+              weight: 1,
+              note: "音频支持"
+            },
+            {
+              kind: "danmaku",
+              status: "notConfigured",
+              label: "弹幕文本线索",
+              observations: 0,
+              weight: 0,
+              note: "未参与"
+            }
+          ]
+        }
+      },
+      error: null,
+      stageKey: "completed",
+      stageLabel: "已完成",
+      stageIndex: 9,
+      stageCount: 9,
+      stageProgress: 1,
+      updatedAtMs: 1
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+    fireEvent.change(screen.getByLabelText("完整版输入"), { target: { value: "D:\\media\\full.mkv" } });
+    fireEvent.change(screen.getByLabelText("B 站删减版输入"), { target: { value: "D:\\media\\cut.mp4" } });
+    await user.click(screen.getByRole("button", { name: "运行本地对齐" }));
+
+    await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.cutCandidates[0].confidence).toBeCloseTo(0.75));
+    expect(useEditorStore.getState().alignmentProposal?.cutCandidates[0].note).toContain("弹幕文本线索");
+    expect(useEditorStore.getState().alignmentProposal?.diagnostics).toContain(
+      "弹幕证据：1 个文本聚类支持 1 个候选版本差异。"
+    );
+    expect(screen.getByText("弹幕文本线索")).toBeInTheDocument();
+    expect(screen.getAllByText("已参与").length).toBeGreaterThan(0);
+  });
+
   it("可以逐个预览、修正、接受或跳过音频候选版本差异", async () => {
     const user = userEvent.setup();
     const proposal = {
