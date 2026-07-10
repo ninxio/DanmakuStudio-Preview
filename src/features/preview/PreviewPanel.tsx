@@ -1,5 +1,5 @@
 import { Flag, Pause, Play } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
 import type { ResolvedDanmakuEvent } from "../../domain/danmaku/types";
@@ -11,6 +11,7 @@ import {
 import {
   createPlayerSessionSummary,
   type PlayerLoadState,
+  type PlayerMediaTrack,
   type PlayerPreviewBackend,
   type PlayerSessionSummary
 } from "../../domain/player/playerSession";
@@ -76,6 +77,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
   const addCutMarkerAtPlayhead = useEditorStore((state) => state.addCutMarkerAtPlayhead);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadState, setVideoLoadState] = useState<VideoLoadState>("empty");
+  const [playerTracks, setPlayerTracks] = useState<PlayerMediaTrack[]>([]);
   const [embyPreviewInput, setEmbyPreviewInput] = useState<EmbyPreviewInput | null>(null);
   const [preparingEmbyPreview, setPreparingEmbyPreview] = useState(false);
   const [embyPreviewStatus, setEmbyPreviewStatus] = useState<EmbyPreviewStatus | null>(null);
@@ -125,9 +127,10 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
         loadState: videoLoadState,
         hasPreviewSource: Boolean(previewSource),
         videoError,
-        mpvConfigured: mpvPath.trim().length > 0
+        mpvConfigured: mpvPath.trim().length > 0,
+        tracks: playerTracks
       }),
-    [project, isPlaying, previewBackend, videoLoadState, previewSource, videoError, mpvPath]
+    [project, isPlaying, previewBackend, videoLoadState, previewSource, videoError, mpvPath, playerTracks]
   );
   const sourceComparison = useMemo(
     () =>
@@ -206,6 +209,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
     }
     adapterRef.current = adapter;
     loadedSourceRef.current = null;
+    setPlayerTracks([]);
     return () => {
       adapter.dispose();
       if (adapterRef.current === adapter) {
@@ -226,6 +230,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
       }
       setVideoError(null);
       setVideoLoadState("empty");
+      setPlayerTracks([]);
       setPlaying(false);
       return;
     }
@@ -239,6 +244,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
         if (!cancelled) {
           loadedSourceRef.current = sourceKey;
           updateMediaDuration(adapter.getDurationMs());
+          updatePlayerTracks(setPlayerTracks, adapter.getTracks());
           adapter.seek(playheadRef.current);
           setVideoLoadState("ready");
         }
@@ -285,6 +291,7 @@ export function PreviewPanel({ adapterFactory = defaultPreviewAdapterFactory }: 
         const adapter = adapterRef.current;
         if (adapter && previewSource) {
           setPlayhead(adapter.getCurrentTimeMs());
+          updatePlayerTracks(setPlayerTracks, adapter.getTracks());
         } else {
           const delta = now - lastTick;
           setPlayhead(playheadRef.current + delta);
@@ -588,4 +595,30 @@ function formatPreviewBackend(backend: PreviewBackend): string {
 
 function formatEmbyPreviewInputLabel(itemName: string, mediaSourceId: string | null): string {
   return mediaSourceId ? `${itemName} / 媒体源 ${mediaSourceId}` : itemName;
+}
+
+function updatePlayerTracks(
+  setPlayerTracks: Dispatch<SetStateAction<PlayerMediaTrack[]>>,
+  nextTracks: PlayerMediaTrack[]
+): void {
+  setPlayerTracks((currentTracks) => (arePlayerTracksEqual(currentTracks, nextTracks) ? currentTracks : nextTracks));
+}
+
+function arePlayerTracksEqual(left: readonly PlayerMediaTrack[], right: readonly PlayerMediaTrack[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((track, index) => {
+    const other = right[index];
+    return (
+      other !== undefined &&
+      track.id === other.id &&
+      track.trackType === other.trackType &&
+      track.title === other.title &&
+      track.language === other.language &&
+      track.codec === other.codec &&
+      track.selected === other.selected &&
+      track.external === other.external
+    );
+  });
 }

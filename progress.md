@@ -1,5 +1,19 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C121 已完成：推进 G7 逐步播放器化第四段，接入 mpv 真实音轨/字幕轨状态。
+  - Tauri mpv sidecar 状态新增 `tracks`，轮询时通过 mpv IPC 读取 `track-list`，返回轨道 ID、类型、标题、语言、编码、是否选中和是否外部轨道。
+  - 前端 `TauriMpvMediaAdapter` 新增 `getTracks()`，HTML Video fallback 返回空轨道，mpv 后端会把 sidecar 轨道状态同步给预览面板。
+  - 播放器会话模型新增 `PlayerMediaTrack`，状态栏会优先显示真实探测到的当前音轨和当前字幕轨；没有真实轨道时才回退到 Emby 元数据或“未检测到字幕轨”。
+  - 预览面板会在播放器加载和播放轮询中同步轨道状态，并通过相等检查避免每帧无意义刷新。
+  - README 和架构文档已同步 `track-list` 轮询、真实音轨/字幕轨展示和后续更多轨道控制路线。
+  - 已补充播放器会话、媒体适配器和 Rust 测试，覆盖真实音轨/字幕轨摘要、适配器轨道读取和 mpv `track-list` 解析。
+  - 已重新验证：播放器聚焦测试通过（4 个测试文件 / 19 个测试）；`cargo test` 通过（28 个 Rust 测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、43 个测试文件 / 254 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12376064` 字节，时间 `2026/07/10 23:33:49`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3056661` 字节，时间 `2026/07/10 23:33:49`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c121-mpv-track-status-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C120 已完成：推进 G7 逐步播放器化第三段，接入 Emby 本次会话授权流 mpv 预览。
   - `TauriMpvMediaAdapter` 现在支持真实本地文件路径和本次会话生成的 http/https 授权播放地址，继续拒绝浏览器 blob URL；mpv 说明文案同步为本地媒体与 Emby 授权流两类输入。
   - 预览面板在绑定 Emby 目标原片且没有本地路径时新增真实“使用 Emby 授权流预览”动作：用户点击后会读取本次会话密码、重新登录 Emby、确认条目可访问、生成 `/Videos/{itemId}/stream` 临时地址并交给 mpv。

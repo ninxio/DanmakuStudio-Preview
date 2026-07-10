@@ -70,9 +70,9 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 当前实现：
 
 - `HtmlVideoMediaAdapter`：支持浏览器可播放的 MP4/WebM，作为轻量预览 fallback。预览区根据项目媒体引用和加载结果展示未导入、正在载入、可播放、格式不支持、需要重新连接等状态；加载失败会明确提示 HTML Video 限制和后续 mpv 方向。
-- `TauriMpvMediaAdapter`：桌面端 mpv 后端，需要用户在设置中心配置 mpv 路径，并提供真实本地媒体路径或本次会话生成的 Emby 授权播放地址。前端通过 `src/infrastructure/media/tauriMpvPlayer.ts` 调用 Tauri 命令；后端 `src-tauri/src/media_tools.rs` 负责检测 FFmpeg/mpv 版本、启动/停止 mpv sidecar、查询状态和通过 mpv IPC 发送播放、暂停、seek、倍率和属性读取命令。没有 mpv 路径、只有浏览器 blob URL 或未显式生成 Emby 授权流时不会启用该后端。
+- `TauriMpvMediaAdapter`：桌面端 mpv 后端，需要用户在设置中心配置 mpv 路径，并提供真实本地媒体路径或本次会话生成的 Emby 授权播放地址。前端通过 `src/infrastructure/media/tauriMpvPlayer.ts` 调用 Tauri 命令；后端 `src-tauri/src/media_tools.rs` 负责检测 FFmpeg/mpv 版本、启动/停止 mpv sidecar、查询状态和通过 mpv IPC 发送播放、暂停、seek、倍率和属性读取命令；状态轮询会读取 `track-list`，把真实音轨、字幕轨、编码、语言、选中状态和外部轨道标记返回前端。没有 mpv 路径、只有浏览器 blob URL 或未显式生成 Emby 授权流时不会启用该后端。
 
-`src/domain/player/playerSession.ts` 是播放器化阶段的第一层领域模型，不依赖 React。它把当前项目、预览后端、加载状态、播放状态、错误、mpv 配置和目标原片绑定整理成统一的播放器会话摘要：播放源、后端、播放状态、音轨、字幕轨、弹幕轨、缓存和下一步。预览面板只展示这份摘要，不在组件里重新解释播放器能力；后续接入双源对比、真实轨道探测和播放器缓存时应优先扩展该领域模型。
+`src/domain/player/playerSession.ts` 是播放器化阶段的第一层领域模型，不依赖 React。它把当前项目、预览后端、加载状态、播放状态、错误、mpv 配置、播放器轨道和目标原片绑定整理成统一的播放器会话摘要：播放源、后端、播放状态、音轨、字幕轨、弹幕轨、缓存和下一步。预览面板只展示这份摘要，不在组件里重新解释播放器能力；后续接入双源对比、更多轨道控制和播放器缓存时应优先扩展该领域模型。
 
 `src/domain/player/playerComparison.ts` 是双源对比的第一层摘要模型，也不依赖 React。它把当前编辑时间轴位置视为 B 站参考侧时间，通过已确认 `CutMarker` 计算目标原片时间和已应用补偿；预览面板展示参考源、目标源、参考时间、目标时间和下一步。它只是可复核的时间映射状态，不会假装已经具备双播放器同步；Emby 视频流必须由用户显式生成本次会话授权地址后交给 mpv。
 

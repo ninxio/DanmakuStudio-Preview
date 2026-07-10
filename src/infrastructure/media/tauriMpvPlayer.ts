@@ -3,6 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 export type MediaToolKind = "ffmpeg" | "mpv";
 export type MpvPlaybackStatus = "idle" | "playing" | "paused" | "stopped" | "failed";
 export type MpvControlAction = "play" | "pause" | "seek" | "setPlaybackRate";
+export type MpvTrackType = "video" | "audio" | "subtitle" | "unknown";
 
 export interface MediaToolDetectionRequest {
   tool: MediaToolKind;
@@ -30,6 +31,16 @@ export interface MpvControlRequest {
   playbackRate?: number;
 }
 
+export interface MpvTrackSummary {
+  id: number;
+  trackType: MpvTrackType;
+  title: string | null;
+  language: string | null;
+  codec: string | null;
+  selected: boolean;
+  external: boolean;
+}
+
 export interface MpvSidecarStatus {
   running: boolean;
   backend: "native-mpv";
@@ -37,6 +48,7 @@ export interface MpvSidecarStatus {
   mediaPath: string | null;
   positionMs: number;
   durationMs: number;
+  tracks: MpvTrackSummary[];
   message: string;
   error: string | null;
   updatedAtMs: number;

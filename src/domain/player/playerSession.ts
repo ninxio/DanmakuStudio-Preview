@@ -2,6 +2,17 @@ import type { EditorProject, EmbyItemMediaBinding, MediaBinding } from "../proje
 
 export type PlayerPreviewBackend = "htmlVideo" | "nativeMpv";
 export type PlayerLoadState = "empty" | "loading" | "ready" | "unsupported";
+export type PlayerMediaTrackType = "video" | "audio" | "subtitle" | "unknown";
+
+export interface PlayerMediaTrack {
+  id: number;
+  trackType: PlayerMediaTrackType;
+  title: string | null;
+  language: string | null;
+  codec: string | null;
+  selected: boolean;
+  external: boolean;
+}
 
 export interface PlayerSessionInput {
   project: EditorProject;
@@ -11,6 +22,7 @@ export interface PlayerSessionInput {
   hasPreviewSource: boolean;
   videoError: string | null;
   mpvConfigured: boolean;
+  tracks?: readonly PlayerMediaTrack[];
 }
 
 export interface PlayerSessionSummary {
@@ -29,14 +41,15 @@ export interface PlayerSessionSummary {
 
 export function createPlayerSessionSummary(input: PlayerSessionInput): PlayerSessionSummary {
   const source = describePlayerSource(input.project, input.hasPreviewSource);
+  const tracks = input.tracks ?? [];
   return {
     sourceLabel: source.label,
     sourceDetail: source.detail,
     backendLabel: describeBackendLabel(input.backend),
     backendDetail: describeBackendDetail(input),
     playbackLabel: describePlayback(input),
-    audioTrackLabel: describeAudioTrack(input.project.mediaBinding, input.hasPreviewSource),
-    subtitleTrackLabel: input.hasPreviewSource ? "字幕轨尚未接入" : "等待媒体",
+    audioTrackLabel: describeAudioTrack(input.project.mediaBinding, input.hasPreviewSource, tracks),
+    subtitleTrackLabel: describeSubtitleTrack(input.hasPreviewSource, tracks),
     danmakuTrackLabel: describeDanmakuTrack(input.project),
     cacheLabel: input.hasPreviewSource ? "音频特征缓存由对齐任务复用" : "等待媒体后可缓存特征",
     nextActionLabel: describeNextAction(input),
@@ -124,12 +137,40 @@ function describePlayback(input: PlayerSessionInput): string {
   return "等待媒体";
 }
 
-function describeAudioTrack(binding: MediaBinding | null, hasPreviewSource: boolean): string {
+function describeAudioTrack(
+  binding: MediaBinding | null,
+  hasPreviewSource: boolean,
+  tracks: readonly PlayerMediaTrack[]
+): string {
+  const audioTracks = tracks.filter((track) => track.trackType === "audio");
+  const selectedAudio = audioTracks.find((track) => track.selected) ?? audioTracks[0] ?? null;
+  if (selectedAudio) {
+    return `当前音轨：${formatTrackLabel(selectedAudio)}`;
+  }
   if (binding?.kind === "embyItem") {
     const audioCodec = binding.mediaSources.find((source) => source.audioCodec)?.audioCodec;
     return audioCodec ? `Emby 元数据：${audioCodec}` : "Emby 音轨元数据暂缺";
   }
   return hasPreviewSource ? "由播放后端读取" : "等待媒体";
+}
+
+function describeSubtitleTrack(hasPreviewSource: boolean, tracks: readonly PlayerMediaTrack[]): string {
+  const subtitleTracks = tracks.filter((track) => track.trackType === "subtitle");
+  const selectedSubtitle = subtitleTracks.find((track) => track.selected) ?? null;
+  if (selectedSubtitle) {
+    return `当前字幕：${formatTrackLabel(selectedSubtitle)}`;
+  }
+  if (subtitleTracks.length > 0) {
+    return `${subtitleTracks.length} 条字幕轨可选`;
+  }
+  return hasPreviewSource ? "未检测到字幕轨" : "等待媒体";
+}
+
+function formatTrackLabel(track: PlayerMediaTrack): string {
+  const parts = [track.title, track.language, track.codec].filter(
+    (part): part is string => Boolean(part && part.trim().length > 0)
+  );
+  return parts.length > 0 ? parts.join(" / ") : `#${track.id}`;
 }
 
 function describeDanmakuTrack(project: EditorProject): string {

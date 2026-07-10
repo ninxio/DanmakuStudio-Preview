@@ -82,6 +82,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: request.mediaPath,
         positionMs: request.startPositionMs ?? 0,
         durationMs: 0,
+        tracks: [],
         message: "mpv 已启动。",
         error: null,
         updatedAtMs: 1
@@ -95,6 +96,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: null,
         positionMs: 0,
         durationMs: 0,
+        tracks: [],
         message: "mpv 已停止。",
         error: null,
         updatedAtMs: 2
@@ -108,6 +110,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: "D:\\media\\full.mkv",
         positionMs: 1200,
         durationMs: 0,
+        tracks: [],
         message: "mpv 已启动。",
         error: null,
         updatedAtMs: 3
@@ -121,6 +124,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: "D:\\media\\full.mkv",
         positionMs: request.positionMs ?? 1200,
         durationMs: 0,
+        tracks: [],
         message: "mpv 控制命令已发送。",
         error: null,
         updatedAtMs: 4

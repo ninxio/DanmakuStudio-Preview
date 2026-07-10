@@ -4,6 +4,7 @@ import {
   getTauriMpvSidecarStatus,
   startTauriMpvSidecar,
   stopTauriMpvSidecar,
+  type MpvTrackSummary,
   type MpvSidecarStatus,
   type TauriMpvBridge
 } from "./tauriMpvPlayer";
@@ -21,6 +22,7 @@ export interface MediaAdapter {
   seek(timeMs: Milliseconds): void;
   getCurrentTimeMs(): Milliseconds;
   getDurationMs(): Milliseconds;
+  getTracks(): MpvTrackSummary[];
   setPlaybackRate(rate: number): void;
   dispose(): void;
 }
@@ -76,6 +78,10 @@ export class HtmlVideoMediaAdapter implements MediaAdapter {
     return Math.round(this.video.duration * 1000);
   }
 
+  getTracks(): MpvTrackSummary[] {
+    return [];
+  }
+
   setPlaybackRate(rate: number): void {
     this.video.playbackRate = rate;
   }
@@ -99,6 +105,7 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
   private readonly bridge?: TauriMpvBridge;
   private currentTimeMs: Milliseconds = 0;
   private durationMs: Milliseconds = 0;
+  private tracks: MpvTrackSummary[] = [];
   private pollTimer: number | null = null;
 
   constructor(mpvPath: string, bridge?: TauriMpvBridge) {
@@ -159,6 +166,10 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
     return this.durationMs;
   }
 
+  getTracks(): MpvTrackSummary[] {
+    return this.tracks;
+  }
+
   setPlaybackRate(rate: number): void {
     void controlTauriMpvSidecar(
       {
@@ -202,6 +213,7 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
   private updateFromStatus(status: MpvSidecarStatus): void {
     this.currentTimeMs = Math.max(0, Math.round(status.positionMs));
     this.durationMs = Math.max(0, Math.round(status.durationMs));
+    this.tracks = status.tracks;
     if (!status.running) {
       this.stopPolling();
     }

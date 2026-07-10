@@ -94,4 +94,39 @@ describe("播放器会话摘要", () => {
     expect(summary.playbackLabel).toBe("播放中");
     expect(summary.nextActionLabel).toBe("播放预览、标记版本差异或运行对齐。");
   });
+
+  it("优先显示播放器探测到的真实音轨和字幕轨", () => {
+    const summary = createPlayerSessionSummary({
+      project: createEmptyProject(),
+      isPlaying: false,
+      backend: "nativeMpv",
+      loadState: "ready",
+      hasPreviewSource: true,
+      videoError: null,
+      mpvConfigured: true,
+      tracks: [
+        {
+          id: 1,
+          trackType: "audio",
+          title: "日语 2.0",
+          language: "jpn",
+          codec: "aac",
+          selected: true,
+          external: false
+        },
+        {
+          id: 2,
+          trackType: "subtitle",
+          title: "简体中文",
+          language: "chi",
+          codec: "ass",
+          selected: true,
+          external: true
+        }
+      ]
+    });
+
+    expect(summary.audioTrackLabel).toBe("当前音轨：日语 2.0 / jpn / aac");
+    expect(summary.subtitleTrackLabel).toBe("当前字幕：简体中文 / chi / ass");
+  });
 });

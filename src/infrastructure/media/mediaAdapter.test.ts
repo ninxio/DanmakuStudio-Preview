@@ -20,6 +20,17 @@ describe("媒体适配器", () => {
       startPaused: true
     });
     expect(adapter.getDurationMs()).toBe(3_000_000);
+    expect(adapter.getTracks()).toEqual([
+      {
+        id: 1,
+        trackType: "audio",
+        title: "日语",
+        language: "jpn",
+        codec: "aac",
+        selected: true,
+        external: false
+      }
+    ]);
 
     await adapter.play();
     adapter.seek(12_345);
@@ -70,6 +81,17 @@ function createBridge(): TauriMpvBridge {
         mediaPath: request.mediaPath,
         positionMs: request.startPositionMs ?? 0,
         durationMs: 3_000_000,
+        tracks: [
+          {
+            id: 1,
+            trackType: "audio",
+            title: "日语",
+            language: "jpn",
+            codec: "aac",
+            selected: true,
+            external: false
+          }
+        ],
         message: "mpv 已启动。",
         error: null,
         updatedAtMs: 1
@@ -83,6 +105,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: null,
         positionMs: 0,
         durationMs: 0,
+        tracks: [],
         message: "mpv 已停止。",
         error: null,
         updatedAtMs: 2
@@ -96,6 +119,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: "D:\\media\\full.mkv",
         positionMs: 12_345,
         durationMs: 3_000_000,
+        tracks: [],
         message: "mpv 正在播放。",
         error: null,
         updatedAtMs: 3
@@ -109,6 +133,7 @@ function createBridge(): TauriMpvBridge {
         mediaPath: "D:\\media\\full.mkv",
         positionMs: request.positionMs ?? 12_345,
         durationMs: 3_000_000,
+        tracks: [],
         message: "mpv 控制命令已发送。",
         error: null,
         updatedAtMs: 4

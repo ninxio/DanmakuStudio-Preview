@@ -357,6 +357,7 @@ function createFakeMediaAdapter(load: MediaAdapter["load"]): MediaAdapter {
     seek: vi.fn<MediaAdapter["seek"]>(),
     getCurrentTimeMs: vi.fn<MediaAdapter["getCurrentTimeMs"]>(() => 0),
     getDurationMs: vi.fn<MediaAdapter["getDurationMs"]>(() => 3_000_000),
+    getTracks: vi.fn<MediaAdapter["getTracks"]>(() => []),
     setPlaybackRate: vi.fn<MediaAdapter["setPlaybackRate"]>(),
     dispose: vi.fn<MediaAdapter["dispose"]>()
   };

@@ -53,6 +53,18 @@ pub enum MpvPlaybackStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MpvTrackSummary {
+    id: i64,
+    track_type: String,
+    title: Option<String>,
+    language: Option<String>,
+    codec: Option<String>,
+    selected: bool,
+    external: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MpvSidecarStatus {
@@ -62,6 +74,7 @@ pub struct MpvSidecarStatus {
     media_path: Option<String>,
     position_ms: u64,
     duration_ms: u64,
+    tracks: Vec<MpvTrackSummary>,
     message: String,
     error: Option<String>,
     updated_at_ms: u64,
@@ -75,6 +88,7 @@ struct MpvSidecarState {
     playback_status: MpvPlaybackStatus,
     position_ms: u64,
     duration_ms: u64,
+    tracks: Vec<MpvTrackSummary>,
     message: String,
     error: Option<String>,
     updated_at_ms: u64,
@@ -103,6 +117,7 @@ pub fn stop_mpv_sidecar() -> Result<MpvSidecarStatus, String> {
     state.playback_status = MpvPlaybackStatus::Stopped;
     state.position_ms = 0;
     state.duration_ms = 0;
+    state.tracks = Vec::new();
     state.message = "mpv 播放器已停止。".to_string();
     state.error = None;
     state.updated_at_ms = current_time_ms();
@@ -245,6 +260,7 @@ fn start_mpv_sidecar_inner(request: MpvStartRequest) -> Result<MpvSidecarStatus,
     };
     state.position_ms = start_position_ms;
     state.duration_ms = 0;
+    state.tracks = Vec::new();
     state.message = "mpv 播放器已启动。".to_string();
     state.error = None;
     state.updated_at_ms = current_time_ms();
@@ -292,6 +308,7 @@ fn refresh_mpv_state(state: &mut MpvSidecarState) {
             } else {
                 MpvPlaybackStatus::Failed
             };
+            state.tracks = Vec::new();
             state.message = "mpv 播放器已退出。".to_string();
             state.error = stderr;
             state.updated_at_ms = current_time_ms();
@@ -303,6 +320,9 @@ fn refresh_mpv_state(state: &mut MpvSidecarState) {
                 }
                 if let Ok(duration_ms) = read_mpv_number_property_ms(&ipc_path, "duration") {
                     state.duration_ms = duration_ms;
+                }
+                if let Ok(tracks) = read_mpv_tracks(&ipc_path) {
+                    state.tracks = tracks;
                 }
                 state.updated_at_ms = current_time_ms();
             }
@@ -325,6 +345,61 @@ fn read_mpv_number_property_ms(ipc_path: &str, property: &str) -> Result<u64, St
         .filter(|value| value.is_finite() && *value >= 0.0)
         .ok_or_else(|| format!("mpv 未返回可用的 {property}。"))?;
     Ok((seconds * 1000.0).round() as u64)
+}
+
+fn read_mpv_tracks(ipc_path: &str) -> Result<Vec<MpvTrackSummary>, String> {
+    let response = send_mpv_ipc_command(ipc_path, json!({ "command": ["get_property", "track-list"] }))?;
+    ensure_mpv_success(response.clone())?;
+    let tracks = response
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "mpv 未返回可用的 track-list。".to_string())?;
+    Ok(parse_mpv_track_list(tracks))
+}
+
+fn parse_mpv_track_list(tracks: &[Value]) -> Vec<MpvTrackSummary> {
+    tracks
+        .iter()
+        .filter_map(|track| {
+            let track_type = normalize_mpv_track_type(track.get("type").and_then(Value::as_str));
+            if track_type == "unknown" {
+                return None;
+            }
+            Some(MpvTrackSummary {
+                id: track.get("id").and_then(Value::as_i64).unwrap_or(0),
+                track_type,
+                title: read_mpv_optional_string(track, "title"),
+                language: read_mpv_optional_string(track, "lang"),
+                codec: read_mpv_optional_string(track, "codec"),
+                selected: track
+                    .get("selected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                external: track
+                    .get("external")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn normalize_mpv_track_type(track_type: Option<&str>) -> String {
+    match track_type.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "video" => "video".to_string(),
+        "audio" => "audio".to_string(),
+        "sub" | "subtitle" => "subtitle".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn read_mpv_optional_string(track: &Value, key: &str) -> Option<String> {
+    track
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn ensure_mpv_success(response: Value) -> Result<(), String> {
@@ -395,6 +470,7 @@ fn mpv_sidecar_state() -> &'static Mutex<MpvSidecarState> {
             playback_status: MpvPlaybackStatus::Idle,
             position_ms: 0,
             duration_ms: 0,
+            tracks: Vec::new(),
             message: "mpv 播放器尚未启动。".to_string(),
             error: None,
             updated_at_ms: current_time_ms(),
@@ -480,6 +556,7 @@ fn create_mpv_status(state: &MpvSidecarState) -> MpvSidecarStatus {
         media_path: state.media_path.clone(),
         position_ms: state.position_ms,
         duration_ms: state.duration_ms,
+        tracks: state.tracks.clone(),
         message: state.message.clone(),
         error: state.error.clone(),
         updated_at_ms: state.updated_at_ms,
@@ -636,5 +713,36 @@ mod tests {
     fn mpv_success_response_accepts_only_success_error_field() {
         assert!(ensure_mpv_success(json!({ "error": "success" })).is_ok());
         assert!(ensure_mpv_success(json!({ "error": "property unavailable" })).is_err());
+    }
+
+    #[test]
+    fn mpv_track_list_is_summarized_for_player_session() {
+        let tracks = parse_mpv_track_list(&[
+            json!({
+                "id": 1,
+                "type": "audio",
+                "title": "日语 2.0",
+                "lang": "jpn",
+                "codec": "aac",
+                "selected": true,
+                "external": false
+            }),
+            json!({
+                "id": 2,
+                "type": "sub",
+                "title": "简体中文",
+                "lang": "chi",
+                "codec": "ass",
+                "selected": true,
+                "external": true
+            }),
+            json!({ "id": 3, "type": "unknown" }),
+        ]);
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].track_type, "audio");
+        assert_eq!(tracks[0].title.as_deref(), Some("日语 2.0"));
+        assert!(tracks[1].external);
+        assert_eq!(tracks[1].track_type, "subtitle");
     }
 }
