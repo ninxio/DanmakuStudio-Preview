@@ -1225,7 +1225,7 @@ function VideoAlignmentLabPanel({
   proposal: AlignmentProposal | null;
   preview: ReturnType<typeof buildAlignmentPreview>;
   onTextChange: (value: string) => void;
-  onImportText: (value: string) => void;
+  onImportText: (value: string, sourceFileName?: string) => void;
   onApply: () => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1647,7 +1647,7 @@ function VideoAlignmentLabPanel({
               void readTextFile(file)
                 .then((content) => {
                   onTextChange(content);
-                  onImportText(content);
+                  onImportText(content, file.name);
                 })
                 .catch((error: unknown) => {
                   setStatus({

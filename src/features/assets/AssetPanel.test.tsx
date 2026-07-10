@@ -565,6 +565,24 @@ describe("资源面板", () => {
     );
   });
 
+  it("导入音频对齐提案文件校验失败时显示来源文件名", async () => {
+    const file = new File([JSON.stringify({})], "bad-alignment.json", { type: "application/json" });
+    const { container } = render(<AssetPanel />);
+    const input = container.querySelector('input[type="file"][accept=".json,application/json"]');
+    if (!(input instanceof HTMLInputElement)) {
+      throw new Error("未找到对齐提案文件输入。");
+    }
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status).toEqual({
+        message: "对齐提案导入失败：bad-alignment.json：对齐提案 JSON 格式不正确。",
+        tone: "error"
+      })
+    );
+  });
+
   it("会暂停应用区间异常的对齐提案", async () => {
     const user = userEvent.setup();
     const proposal = {

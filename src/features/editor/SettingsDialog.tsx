@@ -108,7 +108,7 @@ export function SettingsDialog({ onClose }: SettingsDialogProps) {
           setStatus(`设置已导入到浏览器本地副本，但写入桌面配置失败：${formatDesktopSettingsError(error)}`, "warning");
         });
     } catch (error) {
-      setStatus(`导入设置失败：${formatDesktopSettingsError(error)}`, "error");
+      setStatus(formatSettingsImportError(file, error), "error");
     }
   };
 
@@ -524,4 +524,12 @@ function readNumericInput(value: string): number {
 
 function setStatus(message: string, tone: "success" | "warning" | "error" | "neutral") {
   useEditorStore.setState({ status: { message, tone } });
+}
+
+function formatSettingsImportError(file: File, error: unknown): string {
+  const detail = formatDesktopSettingsError(error);
+  if (detail.includes(file.name)) {
+    return `导入设置失败：${detail}`;
+  }
+  return `导入设置失败：${file.name}：${detail}`;
 }

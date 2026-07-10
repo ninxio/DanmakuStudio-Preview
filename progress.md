@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C91 已完成：JSON 导入解析失败提示携带来源文件名。
+  - 顶部“打开项目”和“导入对齐”入口现在会把文件名传给解析层；读取成功但项目 schema、JSON 格式或对齐提案结构校验失败时，状态栏会显示 `入口：文件名：具体原因`。
+  - “视频对齐实验室”的对齐提案文件导入同样会在解析失败时显示来源 JSON 文件名，和读取失败路径保持一致。
+  - 设置中心“导入设置”在备份 JSON 版本不支持或格式校验失败时会显示备份文件名；读取失败已避免重复拼接同一文件名。
+  - 已补充工具栏、资源面板和设置中心测试，覆盖项目文件校验失败、对齐提案文件校验失败和设置备份版本不支持时的文件名上下文。
+  - 已重新验证：`corepack pnpm test -- src/stores/editorStore.test.ts src/features/editor/EditorToolbar.test.tsx src/features/assets/AssetPanel.test.tsx src/features/editor/SettingsDialog.test.tsx` 成功，4 个测试文件、61 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/188 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:40:51`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999301` 字节，时间 `2026/07/10 13:40:51`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c91-json-import-error-file-name-20260710`。
 - 成熟度提升阶段 C90 已完成：底层文本文件读取错误携带文件名。
   - `readTextFile(file)` 现在会把读取失败包装为 `读取文件 <文件名> 失败：...`，让 XML 批量导入、打开项目、导入对齐提案等入口都能提示具体失败文件。
   - XML 导入失败、顶部打开项目失败、顶部导入对齐失败和资源面板导入对齐提案失败的状态栏测试已同步断言文件名上下文。

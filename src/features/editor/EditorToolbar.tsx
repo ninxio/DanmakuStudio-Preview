@@ -195,7 +195,7 @@ export function EditorToolbar() {
           const file = event.target.files?.[0];
           if (file) {
             void readTextFile(file)
-              .then(openProjectFromText)
+              .then((content) => openProjectFromText(content, file.name))
               .catch((error: unknown) => {
                 useEditorStore.setState({ status: createFileReadErrorStatus("项目文件读取失败", error) });
               });
@@ -213,7 +213,7 @@ export function EditorToolbar() {
           const file = event.target.files?.[0];
           if (file) {
             void readTextFile(file)
-              .then(importAlignmentProposalText)
+              .then((content) => importAlignmentProposalText(content, file.name))
               .catch((error: unknown) => {
                 useEditorStore.setState({ status: createFileReadErrorStatus("对齐提案读取失败", error) });
               });

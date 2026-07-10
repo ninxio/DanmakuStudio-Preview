@@ -247,7 +247,11 @@ describe("设置中心", () => {
 
     await user.upload(screen.getByTestId("settings-import-input"), file);
 
-    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("暂不支持"));
+    await waitFor(() => {
+      const message = useEditorStore.getState().status.message;
+      expect(message).toContain("future-settings.json");
+      expect(message).toContain("暂不支持");
+    });
   });
 });
 

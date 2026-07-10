@@ -4,6 +4,7 @@ import type { DanmakuClip } from "../../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
+import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "../../stores/editorStore";
 import { EditorToolbar } from "./EditorToolbar";
@@ -119,6 +120,24 @@ describe("编辑器工具栏", () => {
     );
   });
 
+  it("打开项目文件校验失败时显示来源文件名", async () => {
+    const file = new File(
+      [JSON.stringify({ schemaVersion: CURRENT_SCHEMA_VERSION + 1 })],
+      "future-project.danmaku-project.json",
+      { type: "application/json" }
+    );
+
+    render(<EditorToolbar />);
+    fireEvent.change(screen.getByTestId("project-input"), { target: { files: [file] } });
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status).toEqual({
+        message: `项目文件打开失败：future-project.danmaku-project.json：项目版本 ${CURRENT_SCHEMA_VERSION + 1} 暂不支持，当前支持版本为 1 到 ${CURRENT_SCHEMA_VERSION}。`,
+        tone: "error"
+      })
+    );
+  });
+
   it("导入对齐提案文件读取失败时显示错误状态", async () => {
     const file = createRejectingTextFile("bad-alignment.json", "对齐读取被拒绝");
 
@@ -128,6 +147,20 @@ describe("编辑器工具栏", () => {
     await waitFor(() =>
       expect(useEditorStore.getState().status).toEqual({
         message: "对齐提案读取失败：读取文件 bad-alignment.json 失败：对齐读取被拒绝",
+        tone: "error"
+      })
+    );
+  });
+
+  it("导入对齐提案文件校验失败时显示来源文件名", async () => {
+    const file = new File([JSON.stringify({})], "bad-alignment.json", { type: "application/json" });
+
+    render(<EditorToolbar />);
+    fireEvent.change(screen.getByTestId("alignment-input"), { target: { files: [file] } });
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status).toEqual({
+        message: "对齐提案导入失败：bad-alignment.json：对齐提案 JSON 格式不正确。",
         tone: "error"
       })
     );

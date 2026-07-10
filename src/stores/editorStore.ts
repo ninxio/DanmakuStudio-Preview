@@ -98,7 +98,7 @@ interface EditorStore {
   importVideoFile: (file: File) => void;
   removeMedia: () => void;
   updateMediaDuration: (durationMs: Milliseconds) => void;
-  openProjectFromText: (text: string) => void;
+  openProjectFromText: (text: string, sourceFileName?: string) => void;
   addAssetToTimeline: (assetId: string) => void;
   removeAsset: (assetId: string) => void;
   removeAssetFromTimeline: (assetId: string) => void;
@@ -146,7 +146,7 @@ interface EditorStore {
   updatePreview: (patch: Partial<EditorProject["preview"]>) => void;
   prepareExport: () => void;
   clearExport: () => void;
-  importAlignmentProposalText: (text: string) => void;
+  importAlignmentProposalText: (text: string, sourceFileName?: string) => void;
   previewAlignmentProposalData: (proposal: AlignmentProposal) => void;
   exportAlignmentProposal: () => string;
   applyAlignmentProposalData: (proposal: AlignmentProposal) => void;
@@ -272,7 +272,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }));
   },
 
-  openProjectFromText: (text) => {
+  openProjectFromText: (text, sourceFileName) => {
     try {
       const { project, migration } = parseProjectJsonWithMetadata(text);
       revokeObjectUrl(get().project.media?.objectUrl ?? null);
@@ -287,10 +287,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       });
     } catch (error) {
       set({
-        status: {
-          message: error instanceof Error ? error.message : "项目文件打开失败。",
-          tone: "error"
-        }
+        status: createSourceFileErrorStatus("项目文件打开失败", "项目文件打开失败。", error, sourceFileName)
       });
     }
   },
@@ -1012,16 +1009,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   clearExport: () => set({ exportDraft: null }),
 
-  importAlignmentProposalText: (text) => {
+  importAlignmentProposalText: (text, sourceFileName) => {
     try {
       const proposal = parseAlignmentProposal(text);
       get().previewAlignmentProposalData(proposal);
     } catch (error) {
       set({
-        status: {
-          message: error instanceof Error ? error.message : "对齐提案导入失败。",
-          tone: "error"
-        }
+        status: createSourceFileErrorStatus("对齐提案导入失败", "对齐提案导入失败。", error, sourceFileName)
       });
     }
   },
@@ -1162,6 +1156,22 @@ function createErrorStatus(prefix: string, error: unknown): EditorStatus {
     return { message: `${prefix}：${error.message}`, tone: "error" };
   }
   return { message: `${prefix}。`, tone: "error" };
+}
+
+function createSourceFileErrorStatus(
+  prefix: string,
+  fallbackMessage: string,
+  error: unknown,
+  sourceFileName?: string
+): EditorStatus {
+  const detail = error instanceof Error && error.message.trim().length > 0 ? error.message : fallbackMessage;
+  if (!sourceFileName) {
+    return { message: detail, tone: "error" };
+  }
+  if (detail.includes(sourceFileName)) {
+    return { message: `${prefix}：${detail}`, tone: "error" };
+  }
+  return { message: `${prefix}：${sourceFileName}：${detail}`, tone: "error" };
 }
 
 function createClipFromAsset(asset: DanmakuAsset, timelineStartMs: Milliseconds): DanmakuClip {
