@@ -109,6 +109,15 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已重做");
   await expect(projectHealthPanel).not.toContainText("存在失效编辑引用");
   await expect(projectHealthPanel).toContainText("媒体重连");
+  const healthReportDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "导出健康报告" }).click();
+  const healthReportDownload = await healthReportDownloadPromise;
+  const healthReportPath = resolve(downloadDir, healthReportDownload.suggestedFilename());
+  await healthReportDownload.saveAs(healthReportPath);
+  const healthReportText = readFileSync(healthReportPath, "utf8");
+  expect(healthReportText).toContain("项目健康报告");
+  expect(healthReportText).toContain("状态：健康");
+  expect(healthReportText).toContain("媒体重连：不需要");
   await page.screenshot({ path: screenshotPath("project-health.png"), fullPage: true });
   await page.getByRole("button", { name: "弹幕文件" }).click();
 
