@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     process::{ChildStderr, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -19,6 +20,7 @@ const DEFAULT_MIN_GAP_MS: u64 = 1_000;
 const DEFAULT_MAX_CELLS: usize = 16_000_000;
 const AUDIO_ALIGNMENT_CANCELLED: &str = "音频对齐任务已取消。";
 const MAX_JOB_LOGS: usize = 80;
+const MAX_AUDIO_FEATURE_CACHE_ENTRIES: usize = 12;
 
 const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
@@ -115,6 +117,12 @@ struct AudioAlignmentOptions {
     ffmpeg_path: String,
 }
 
+#[derive(Debug, Clone)]
+struct CachedAudioFeatures {
+    frames: Vec<AudioFeatureFrame>,
+    cache_hit: bool,
+}
+
 struct AudioAlignmentJobEntry {
     snapshot: AudioAlignmentJobSnapshot,
     cancel_flag: Arc<AtomicBool>,
@@ -123,6 +131,8 @@ struct AudioAlignmentJobEntry {
 static AUDIO_ALIGNMENT_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentJobEntry>>> =
     OnceLock::new();
 static AUDIO_ALIGNMENT_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static AUDIO_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<AudioFeatureFrame>>>> =
+    OnceLock::new();
 
 #[tauri::command]
 pub async fn align_audio_files(
@@ -201,22 +211,42 @@ where
     let options = create_options(&request)?;
     update_progress(0.10, "已确认本地媒体路径和对齐参数。")?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.15, "正在提取完整版音频特征。")?;
-    let complete_frames = extract_audio_features(&request.complete_path, "完整版", &options, cancel_flag)?;
+    update_progress(0.15, "正在检查或提取完整版音频特征。")?;
+    let complete_features =
+        get_audio_features(&request.complete_path, "完整版", &options, cancel_flag)?;
     update_progress(
         0.42,
-        &format!("完整版音频特征提取完成：{} 帧。", complete_frames.len()),
+        &format_audio_feature_cache_message("完整版", &complete_features),
     )?;
     check_cancelled(cancel_flag)?;
-    update_progress(0.45, "正在提取当前视频音频特征。")?;
-    let source_frames = extract_audio_features(&request.source_path, "当前视频", &options, cancel_flag)?;
+    update_progress(0.45, "正在检查或提取当前视频音频特征。")?;
+    let source_features =
+        get_audio_features(&request.source_path, "当前视频", &options, cancel_flag)?;
     update_progress(
         0.72,
-        &format!("当前视频音频特征提取完成：{} 帧。", source_frames.len()),
+        &format_audio_feature_cache_message("当前视频", &source_features),
     )?;
     check_cancelled(cancel_flag)?;
     update_progress(0.75, "正在匹配音频特征并推断缺失段。")?;
-    create_audio_alignment_proposal(&complete_frames, &source_frames, &options)
+    let mut proposal = create_audio_alignment_proposal(
+        &complete_features.frames,
+        &source_features.frames,
+        &options,
+    )?;
+    proposal.diagnostics.push(format!(
+        "音频特征缓存：完整版{}，当前视频{}。",
+        if complete_features.cache_hit {
+            "命中"
+        } else {
+            "新提取"
+        },
+        if source_features.cache_hit {
+            "命中"
+        } else {
+            "新提取"
+        }
+    ));
+    Ok(proposal)
 }
 
 fn run_audio_alignment_job(
@@ -395,6 +425,86 @@ fn validate_media_file(path: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label}不是可读取的本地文件：{path}"));
     }
     Ok(())
+}
+
+fn get_audio_features(
+    media_path: &str,
+    label: &str,
+    options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<CachedAudioFeatures, String> {
+    check_cancelled(cancel_flag)?;
+    let cache_key = create_audio_feature_cache_key(media_path, options)?;
+    if let Some(frames) = read_audio_feature_cache(&cache_key)? {
+        return Ok(CachedAudioFeatures {
+            frames,
+            cache_hit: true,
+        });
+    }
+
+    let frames = extract_audio_features(media_path, label, options, cancel_flag)?;
+    write_audio_feature_cache(cache_key, &frames)?;
+    Ok(CachedAudioFeatures {
+        frames,
+        cache_hit: false,
+    })
+}
+
+fn audio_feature_cache() -> &'static Mutex<HashMap<String, Vec<AudioFeatureFrame>>> {
+    AUDIO_FEATURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_audio_feature_cache(cache_key: &str) -> Result<Option<Vec<AudioFeatureFrame>>, String> {
+    let cache = audio_feature_cache()
+        .lock()
+        .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
+    Ok(cache.get(cache_key).cloned())
+}
+
+fn write_audio_feature_cache(
+    cache_key: String,
+    frames: &[AudioFeatureFrame],
+) -> Result<(), String> {
+    let mut cache = audio_feature_cache()
+        .lock()
+        .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
+    if !cache.contains_key(&cache_key) && cache.len() >= MAX_AUDIO_FEATURE_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(cache_key, frames.to_vec());
+    Ok(())
+}
+
+fn create_audio_feature_cache_key(
+    media_path: &str,
+    options: &AudioAlignmentOptions,
+) -> Result<String, String> {
+    let metadata = fs::metadata(media_path)
+        .map_err(|error| format!("无法读取音频特征缓存文件信息：{error}"))?;
+    let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    Ok(format!(
+        "{}|len={}|modified={modified_ms}|sampleRate={}|windowMs={}|ffmpeg={}",
+        canonical_path.to_string_lossy(),
+        metadata.len(),
+        options.sample_rate,
+        options.window_ms,
+        options.ffmpeg_path
+    ))
+}
+
+fn format_audio_feature_cache_message(label: &str, features: &CachedAudioFeatures) -> String {
+    let action = if features.cache_hit {
+        "缓存命中"
+    } else {
+        "提取完成并写入缓存"
+    };
+    format!("{label}音频特征{action}：{} 帧。", features.frames.len())
 }
 
 fn extract_audio_features(
@@ -771,6 +881,18 @@ mod tests {
             .collect()
     }
 
+    fn clear_audio_feature_cache_for_tests() {
+        audio_feature_cache().lock().unwrap().clear();
+    }
+
+    fn temp_audio_cache_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{name}-{}-{}.media",
+            std::process::id(),
+            current_time_ms()
+        ))
+    }
+
     #[test]
     fn audio_alignment_infers_missing_segment() {
         let options = test_options();
@@ -801,6 +923,42 @@ mod tests {
         assert_eq!(extracted.len(), 1);
         assert!(extracted[0].values[0] > 0.9);
         assert!(extracted[0].values[1] > 0.9);
+    }
+
+    #[test]
+    fn audio_feature_cache_reuses_frames_for_same_file_and_options() {
+        clear_audio_feature_cache_for_tests();
+        let path = temp_audio_cache_path("audio-cache-hit");
+        std::fs::write(&path, b"not-a-real-media-file").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let options = test_options();
+        let cached_frames = frames(&[0.1, 0.2]);
+        let cache_key = create_audio_feature_cache_key(&path_text, &options).unwrap();
+        write_audio_feature_cache(cache_key, &cached_frames).unwrap();
+
+        let cached = get_audio_features(&path_text, "完整版", &options, None).unwrap();
+
+        assert!(cached.cache_hit);
+        assert_eq!(cached.frames.len(), cached_frames.len());
+        assert_eq!(cached.frames[1].time_ms, cached_frames[1].time_ms);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn audio_feature_cache_key_changes_with_feature_window() {
+        clear_audio_feature_cache_for_tests();
+        let path = temp_audio_cache_path("audio-cache-key");
+        std::fs::write(&path, b"media").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let options = test_options();
+        let mut changed_options = test_options();
+        changed_options.window_ms = 2_000;
+
+        let original_key = create_audio_feature_cache_key(&path_text, &options).unwrap();
+        let changed_key = create_audio_feature_cache_key(&path_text, &changed_options).unwrap();
+
+        assert_ne!(original_key, changed_key);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
