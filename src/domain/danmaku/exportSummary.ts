@@ -99,6 +99,7 @@ export function createCompensationReport(projectName: string, summary: ExportSum
     summary.compensationDetails.forEach((detail, index) => {
       lines.push(
         `${index + 1}. ${detail.name}`,
+        `   ID：${detail.id}`,
         `   源时间：${formatTimecode(detail.sourceAtMs)} (${detail.sourceAtMs} ms)`,
         `   补偿：${formatSignedCompensationDuration(detail.targetGapMs)} (${detail.targetGapMs} ms)`,
         `   影响：此时间点之后的弹幕最终时间会按该补偿继续平移。`,
@@ -112,6 +113,7 @@ export function createCompensationReport(projectName: string, summary: ExportSum
     summary.negativeClampDetails.forEach((detail, index) => {
       lines.push(
         `${index + 1}. ${detail.assetFileName} / ${detail.clipName}`,
+        `   事件 ID：${detail.id}`,
         `   XML 序号：${detail.originalIndex + 1}`,
         `   原最终时间：${formatSignedCompensationDuration(detail.finalTimeMs)} (${detail.finalTimeMs} ms)`,
         `   导出时间：00:00:00.000`,

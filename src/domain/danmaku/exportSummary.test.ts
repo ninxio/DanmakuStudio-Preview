@@ -38,6 +38,7 @@ describe("导出补偿报告", () => {
     expect(report).toContain("导入警告：无");
     expect(report).toContain("负时间限制：0 项");
     expect(report).toContain("1. 前段补偿");
+    expect(report).toContain("ID：cut-early");
     expect(report).toContain("备注：人工复核");
   });
 
@@ -62,6 +63,7 @@ describe("导出补偿报告", () => {
     expect(report).toContain("最早最终时间：00:00:00.000");
     expect(report).toContain("负时间限制：1 项");
     expect(report).toContain("负时间限制明细");
+    expect(report).toContain("事件 ID：clip:item");
     expect(report).toContain("原最终时间：-00:00:00.500 (-500 ms)");
     expect(report).toContain("文本：过早弹幕");
   });
