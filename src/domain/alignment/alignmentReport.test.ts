@@ -109,4 +109,32 @@ describe("alignment review report", () => {
       "1 个候选补偿的源时间不在不确定区间内，请修正后再应用。"
     ]);
   });
+
+  it("识别和当前项目已有 ID 冲突的提案", () => {
+    const proposal: AlignmentProposal = {
+      anchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, origin: "automatic" }],
+      cutCandidates: [
+        {
+          id: "cut-existing",
+          name: "已有补偿",
+          sourceAtMs: 3000,
+          targetGapMs: 1200,
+          confidence: 0.9,
+          note: ""
+        }
+      ],
+      confidence: 0.9,
+      diagnostics: []
+    };
+
+    expect(
+      createAlignmentApplyBlockers(proposal, {
+        existingAnchorIds: ["anchor-existing"],
+        existingCutMarkerIds: ["cut-existing"]
+      })
+    ).toEqual([
+      "1 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。",
+      "1 个候选补偿 ID 已存在于当前项目，应用会丢失新补偿。"
+    ]);
+  });
 });

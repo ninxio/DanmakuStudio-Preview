@@ -1,6 +1,11 @@
 import { formatTimecode } from "../shared/time";
 import type { AlignmentProposal, CutCandidate } from "./types";
 
+export interface AlignmentApplyBlockerContext {
+  existingAnchorIds?: string[];
+  existingCutMarkerIds?: string[];
+}
+
 export function createAlignmentReviewReport(proposal: AlignmentProposal, generatedAt: Date = new Date()): string {
   const lines = [
     "# 对齐提案复核报告",
@@ -54,12 +59,23 @@ export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[
   return focus;
 }
 
-export function createAlignmentApplyBlockers(proposal: AlignmentProposal): string[] {
+export function createAlignmentApplyBlockers(
+  proposal: AlignmentProposal,
+  context: AlignmentApplyBlockerContext = {}
+): string[] {
   const blockers: string[] = [];
   const emptyAnchorIdCount = proposal.anchors.filter((anchor) => anchor.id.trim().length === 0).length;
   const emptyCutIdCount = proposal.cutCandidates.filter((candidate) => candidate.id.trim().length === 0).length;
   const duplicateAnchorIdCount = countDuplicateIds(proposal.anchors.map((anchor) => anchor.id));
   const duplicateCutIdCount = countDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id));
+  const existingAnchorIdConflictCount = countExistingIdConflicts(
+    proposal.anchors.map((anchor) => anchor.id),
+    context.existingAnchorIds ?? []
+  );
+  const existingCutIdConflictCount = countExistingIdConflicts(
+    proposal.cutCandidates.map((candidate) => candidate.id),
+    context.existingCutMarkerIds ?? []
+  );
   const invalidRangeCount = proposal.cutCandidates.filter(
     (candidate) => hasCompleteSourceRange(candidate) && candidate.sourceRangeStartMs > candidate.sourceRangeEndMs
   ).length;
@@ -81,6 +97,12 @@ export function createAlignmentApplyBlockers(proposal: AlignmentProposal): strin
   }
   if (duplicateCutIdCount > 0) {
     blockers.push(`${duplicateCutIdCount} 个候选补偿 ID 在提案内重复，应用会丢失补偿。`);
+  }
+  if (existingAnchorIdConflictCount > 0) {
+    blockers.push(`${existingAnchorIdConflictCount} 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。`);
+  }
+  if (existingCutIdConflictCount > 0) {
+    blockers.push(`${existingCutIdConflictCount} 个候选补偿 ID 已存在于当前项目，应用会丢失新补偿。`);
   }
   if (invalidRangeCount > 0) {
     blockers.push(`${invalidRangeCount} 个候选补偿的不确定区间起止顺序异常，请修正后再应用。`);
@@ -164,6 +186,18 @@ function countDuplicateIds(ids: string[]): number {
     seen.add(id);
   }
   return duplicates.size;
+}
+
+function countExistingIdConflicts(ids: string[], existingIds: string[]): number {
+  const existing = new Set(existingIds.map((id) => id.trim()).filter((id) => id.length > 0));
+  const conflicts = new Set<string>();
+  for (const rawId of ids) {
+    const id = rawId.trim();
+    if (id.length > 0 && existing.has(id)) {
+      conflicts.add(id);
+    }
+  }
+  return conflicts.size;
 }
 
 function formatConfidence(confidence: number): string {

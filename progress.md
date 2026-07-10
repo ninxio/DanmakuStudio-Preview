@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C66 已完成：阻断对齐提案复用当前项目 ID。
+  - 对齐提案应用前现在同时检查提案内部重复 ID，以及提案锚点/候选补偿点和当前项目已有同步锚点/补偿点之间的 ID 冲突。
+  - “视频对齐实验室”里的“应用候选”会提前显示“应用已暂停”，store 直接调用同样会阻断，避免合并时因为 `uniqueById([...existing, ...proposal])` 静默丢失新锚点或新补偿点。
+  - 已补充领域层、store 和资源面板相关测试，覆盖当前项目已有 ID 与提案 ID 冲突时的阻断行为。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/alignmentReport.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx` 成功，3 个测试文件、39 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、32 个测试文件/155 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:31:21`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2995895` 字节，时间 `2026/07/10 11:31:21`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c66-alignment-existing-id-blockers-20260710`。
 - 成熟度提升阶段 C65 已完成：导出报告补充标题与生成时间。
   - `createCompensationReport` 现在输出“导出复核报告”标题，并写入 ISO 格式生成时间，和健康报告、对齐复核报告保持一致。
   - 报告生成函数保留默认当前时间，同时支持测试传入固定 `Date`；README 已同步导出摘要可下载带生成时间的健康报告和导出报告。

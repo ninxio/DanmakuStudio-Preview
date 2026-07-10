@@ -344,6 +344,38 @@ describe("editor store", () => {
     });
   });
 
+  it("阻止对齐提案使用当前项目已有 ID", () => {
+    resetStore({
+      ...createEmptyProject(),
+      syncAnchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, confidence: 1, origin: "manual" }],
+      cutMarkers: [{ id: "cut-existing", name: "已有补偿", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
+    });
+
+    useEditorStore.getState().applyAlignmentProposalData({
+      anchors: [{ id: "anchor-existing", sourceMs: 4000, targetMs: 6000, confidence: 0.9, origin: "automatic" }],
+      cutCandidates: [
+        {
+          id: "cut-existing",
+          name: "冲突补偿",
+          sourceAtMs: 7000,
+          targetGapMs: 2000,
+          confidence: 0.9,
+          note: ""
+        }
+      ],
+      confidence: 0.9,
+      diagnostics: ["测试"]
+    });
+
+    expect(useEditorStore.getState().project.syncAnchors).toHaveLength(1);
+    expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1);
+    expect(useEditorStore.getState().history.past).toHaveLength(0);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "对齐提案存在应用阻断：1 个同步锚点 ID 已存在于当前项目，应用会丢失新锚点。",
+      tone: "warning"
+    });
+  });
+
   it("更新和删除同步锚点", () => {
     resetStore({
       ...createEmptyProject(),

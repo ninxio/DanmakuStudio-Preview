@@ -39,6 +39,7 @@ import {
   type ProjectHealthStatus,
   type ProjectHealthSummary
 } from "../../domain/project/health";
+import type { EditorProject } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
@@ -295,6 +296,7 @@ export function AssetPanel() {
                   onDelete={deleteSyncAnchor}
                 />
                 <VideoAlignmentLabPanel
+                  project={project}
                   text={alignmentProposalText}
                   proposal={alignmentProposal}
                   preview={alignmentPreview}
@@ -1204,6 +1206,7 @@ function SyncAnchorsPanel({
 }
 
 function VideoAlignmentLabPanel({
+  project,
   text,
   proposal,
   preview,
@@ -1211,6 +1214,7 @@ function VideoAlignmentLabPanel({
   onImportText,
   onApply
 }: {
+  project: EditorProject;
   text: string;
   proposal: AlignmentProposal | null;
   preview: ReturnType<typeof buildAlignmentPreview>;
@@ -1237,7 +1241,12 @@ function VideoAlignmentLabPanel({
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
-  const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal) : [];
+  const applyBlockers = proposal
+    ? createAlignmentApplyBlockers(proposal, {
+        existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
+        existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+      })
+    : [];
 
   useEffect(() => {
     let mounted = true;

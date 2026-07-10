@@ -1038,7 +1038,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   applyAlignmentProposalData: (proposal) => {
-    const blockers = createAlignmentApplyBlockers(proposal);
+    const project = get().project;
+    const blockers = createAlignmentApplyBlockers(proposal, {
+      existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
+      existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+    });
     if (blockers.length > 0) {
       set({
         status: {
@@ -1048,11 +1052,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       });
       return;
     }
-    commitProject(set, get, "应用对齐提案", (project) => ({
-      ...project,
-      syncAnchors: uniqueById([...project.syncAnchors, ...proposal.anchors]),
+    commitProject(set, get, "应用对齐提案", (currentProject) => ({
+      ...currentProject,
+      syncAnchors: uniqueById([...currentProject.syncAnchors, ...proposal.anchors]),
       cutMarkers: uniqueById([
-        ...project.cutMarkers,
+        ...currentProject.cutMarkers,
         ...proposal.cutCandidates.map((candidate, index) => ({
           ...cutCandidateToMarker(candidate),
           id: candidate.id.length > 0 ? candidate.id : createId("cut"),
