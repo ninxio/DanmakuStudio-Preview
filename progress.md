@@ -25,6 +25,15 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C61 已完成：导出摘要健康证据长文本换行保护。
+  - 导出摘要“导出前健康检查”的证据预览不再使用单行截断，改为可在弹窗内换行展示，避免长资源 ID、长路径或 raw snippet 只能靠悬浮标题查看。
+  - 已补充导出摘要组件测试，确认健康证据行使用 `break-words` 且不再回退到 `truncate`。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 已重新验证：`corepack pnpm test -- src/features/export/ExportDialog.test.tsx` 成功，1 个测试文件、4 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、32 个测试文件/152 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:06:47`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997678` 字节，时间 `2026/07/10 11:06:47`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c61-export-health-evidence-wrap-20260710`。
 - 成熟度提升阶段 C60 已完成：补齐基础健康项定位证据。
   - “没有时间轴片段”现在会列出已导入 XML 资源及弹幕数量，方便确认哪些资源还没放入时间轴。
   - “所有片段都已禁用”现在会列出禁用片段名、资源文件、时间轴位置和源区间。

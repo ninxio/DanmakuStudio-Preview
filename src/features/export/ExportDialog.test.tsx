@@ -211,7 +211,10 @@ describe("导出摘要", () => {
     expect(screen.getByText("负时间限制为 0")).toBeInTheDocument();
     expect(screen.getByText("3 项")).toBeInTheDocument();
     expect(screen.getByText("存在负最终时间")).toBeInTheDocument();
-    expect(screen.getByText("asset.xml / clip / 第 1 条：-00:00:00.500，导出弹幕")).toBeInTheDocument();
+    const firstHealthEvidence = screen.getByText("asset.xml / clip / 第 1 条：-00:00:00.500，导出弹幕");
+    expect(firstHealthEvidence).toBeInTheDocument();
+    expect(firstHealthEvidence).toHaveClass("break-words");
+    expect(firstHealthEvidence).not.toHaveClass("truncate");
     expect(screen.getByText("asset.xml / clip / 第 2 条：-00:00:00.400，第二条导出弹幕")).toBeInTheDocument();
     expect(screen.getByText("另有 1 条证据，可下载健康报告查看。")).toBeInTheDocument();
     expect(screen.getByText("负时间限制明细")).toBeInTheDocument();

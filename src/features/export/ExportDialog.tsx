@@ -192,7 +192,7 @@ function ProjectHealthFindingPreview({ finding }: { finding: ProjectHealthFindin
       {evidencePreview.length > 0 ? (
         <ul className="mt-1 grid gap-1 opacity-80">
           {evidencePreview.map((item) => (
-            <li key={item} className="truncate" title={item}>
+            <li key={item} className="break-words" title={item}>
               {item}
             </li>
           ))}
