@@ -25,6 +25,15 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C89 已完成：资源面板对齐提案文件读取失败提示补充入口上下文。
+  - “视频对齐实验室”的“导入文件”入口在读取 JSON 失败时，现在会显示 `对齐提案文件读取失败：...`，不再只透出底层错误文本。
+  - 已补充资源面板测试，直接模拟隐藏文件输入读取失败，覆盖该入口的状态栏错误反馈。
+  - 已重新验证：`corepack pnpm test -- src/features/assets/AssetPanel.test.tsx` 成功，1 个测试文件、23 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/184 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:27:15`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999074` 字节，时间 `2026/07/10 13:27:15`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c89-asset-alignment-read-error-context-20260710`。
 - 成熟度提升阶段 C88 已完成：文件读取失败进入状态栏反馈。
   - `importXmlFiles` 现在会捕获 XML 文件读取或导入过程异常，清除导入进度，并在状态栏显示 `XML 导入失败：...`，避免失败后进度停留或静默无响应。
   - 顶部“打开项目”和“导入对齐”入口现在会捕获 `readTextFile` 失败，并分别显示项目文件读取失败或对齐提案读取失败。

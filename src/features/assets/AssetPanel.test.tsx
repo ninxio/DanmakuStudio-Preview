@@ -547,6 +547,24 @@ describe("资源面板", () => {
     });
   });
 
+  it("导入音频对齐提案文件读取失败时显示入口上下文", async () => {
+    const file = createRejectingTextFile("bad-alignment.json", "读取被拒绝");
+    const { container } = render(<AssetPanel />);
+    const input = container.querySelector('input[type="file"][accept=".json,application/json"]');
+    if (!(input instanceof HTMLInputElement)) {
+      throw new Error("未找到对齐提案文件输入。");
+    }
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status).toEqual({
+        message: "对齐提案文件读取失败：读取被拒绝",
+        tone: "error"
+      })
+    );
+  });
+
   it("会暂停应用区间异常的对齐提案", async () => {
     const user = userEvent.setup();
     const proposal = {
@@ -791,6 +809,15 @@ describe("资源面板", () => {
     expect(pickFfmpegExecutablePath).toHaveBeenCalledWith("");
   });
 });
+
+function createRejectingTextFile(fileName: string, message: string): File {
+  const file = new File([""], fileName, { type: "application/json" });
+  Object.defineProperty(file, "text", {
+    configurable: true,
+    value: vi.fn<() => Promise<string>>(() => Promise.reject(new Error(message)))
+  });
+  return file;
+}
 
 function readBlobText(blob: Blob): Promise<string> {
   const modernBlob = blob as Blob & { text?: () => Promise<string> };

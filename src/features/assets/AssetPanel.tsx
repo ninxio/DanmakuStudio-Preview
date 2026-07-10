@@ -1651,7 +1651,10 @@ function VideoAlignmentLabPanel({
                 })
                 .catch((error: unknown) => {
                   setStatus({
-                    message: error instanceof Error ? error.message : "对齐提案文件读取失败。",
+                    message:
+                      error instanceof Error && error.message.trim().length > 0
+                        ? `对齐提案文件读取失败：${error.message}`
+                        : "对齐提案文件读取失败。",
                     tone: "error"
                   });
                 });
