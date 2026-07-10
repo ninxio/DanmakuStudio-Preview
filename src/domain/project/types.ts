@@ -7,7 +7,7 @@ import type {
 import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 export interface MediaReference {
   id: string;
@@ -64,6 +64,14 @@ export interface EmbyItemMediaBinding extends MediaBindingBase {
 
 export type MediaBinding = LocalFileMediaBinding | EmbyItemMediaBinding;
 
+export interface SeasonEpisodeBinding {
+  id: string;
+  episodeKey: string;
+  episodeLabel: string;
+  targetBinding: MediaBinding;
+  linkedAt: string;
+}
+
 export interface TimelineViewState {
   pixelsPerSecond: number;
   scrollMs: Milliseconds;
@@ -82,6 +90,7 @@ export interface EditorProject {
   name: string;
   media: MediaReference | null;
   mediaBinding: MediaBinding | null;
+  seasonEpisodeBindings: SeasonEpisodeBinding[];
   assets: DanmakuAsset[];
   clips: DanmakuClip[];
   globalOffsetMs: Milliseconds;

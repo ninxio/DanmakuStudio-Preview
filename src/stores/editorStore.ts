@@ -110,6 +110,8 @@ interface EditorStore {
   bindCurrentMediaAsTarget: () => void;
   setMediaBinding: (binding: MediaBinding) => void;
   clearMediaBinding: () => void;
+  bindCurrentTargetToSeasonEpisode: (episodeKey: string, episodeLabel: string) => void;
+  clearSeasonEpisodeBinding: (episodeKey: string) => void;
   updateMediaDuration: (durationMs: Milliseconds) => void;
   openProjectFromText: (text: string, sourceFileName?: string) => void;
   addAssetToTimeline: (assetId: string) => void;
@@ -308,6 +310,42 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       mediaBinding: null
     }));
     set({ status: { message: `已解除目标原片绑定：${binding.displayName}`, tone: "success" } });
+  },
+
+  bindCurrentTargetToSeasonEpisode: (episodeKey, episodeLabel) => {
+    const binding = get().project.mediaBinding;
+    if (!binding) {
+      set({ status: { message: "请先绑定目标原片，再分配给这一集。", tone: "warning" } });
+      return;
+    }
+    const seasonBinding = {
+      id: createId("season_episode_binding"),
+      episodeKey,
+      episodeLabel,
+      targetBinding: structuredClone(binding),
+      linkedAt: new Date().toISOString()
+    };
+    commitProject(set, get, "绑定分集目标原片", (project) => ({
+      ...project,
+      seasonEpisodeBindings: [
+        ...project.seasonEpisodeBindings.filter((candidate) => candidate.episodeKey !== episodeKey),
+        seasonBinding
+      ]
+    }));
+    set({ status: { message: `已把当前目标原片绑定到：${episodeLabel}`, tone: "success" } });
+  },
+
+  clearSeasonEpisodeBinding: (episodeKey) => {
+    const binding = get().project.seasonEpisodeBindings.find((candidate) => candidate.episodeKey === episodeKey);
+    if (!binding) {
+      set({ status: { message: "这一集还没有单独绑定目标原片。", tone: "warning" } });
+      return;
+    }
+    commitProject(set, get, "清除分集目标原片", (project) => ({
+      ...project,
+      seasonEpisodeBindings: project.seasonEpisodeBindings.filter((candidate) => candidate.episodeKey !== episodeKey)
+    }));
+    set({ status: { message: `已清除分集目标原片：${binding.episodeLabel}`, tone: "success" } });
   },
 
   updateMediaDuration: (durationMs) => {

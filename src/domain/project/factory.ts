@@ -15,6 +15,7 @@ export function createEmptyProject(name = "未命名项目"): EditorProject {
     name,
     media: null,
     mediaBinding: null,
+    seasonEpisodeBindings: [],
     assets: [],
     clips: [],
     globalOffsetMs: 0,

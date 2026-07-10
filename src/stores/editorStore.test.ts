@@ -225,6 +225,32 @@ describe("editor store", () => {
     expect(JSON.stringify(useEditorStore.getState().project.mediaBinding)).not.toContain("token");
   });
 
+  it("可以把当前目标原片绑定到分集并支持清除", () => {
+    resetStore({
+      ...createEmptyProject("逐集绑定项目"),
+      mediaBinding: createEmbyBinding()
+    });
+
+    useEditorStore.getState().bindCurrentTargetToSeasonEpisode("S01E02", "第 2 集");
+
+    expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(1);
+    expect(useEditorStore.getState().project.seasonEpisodeBindings[0]).toMatchObject({
+      episodeKey: "S01E02",
+      episodeLabel: "第 2 集",
+      targetBinding: {
+        kind: "embyItem",
+        itemId: "emby-item-1"
+      }
+    });
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("绑定分集目标原片");
+
+    useEditorStore.getState().clearSeasonEpisodeBinding("S01E02");
+
+    expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(0);
+    useEditorStore.getState().undo();
+    expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(1);
+  });
+
   it("预览对齐提案时同步写入项目文件状态", () => {
     const proposal = createAlignmentProposal();
 

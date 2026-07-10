@@ -87,6 +87,37 @@ describe("project schema", () => {
     expect(JSON.stringify(parsed.mediaBinding)).not.toContain("token");
   });
 
+  it("允许保存逐集目标原片绑定摘要", () => {
+    const project = {
+      ...createEmptyProject("逐集绑定项目"),
+      seasonEpisodeBindings: [
+        {
+          id: "season-binding-1",
+          episodeKey: "S01E02",
+          episodeLabel: "第 2 集",
+          targetBinding: createValidEmbyBinding(),
+          linkedAt: "2026-07-10T00:00:00.000Z"
+        }
+      ]
+    };
+
+    expect(validateProjectSchema(project)).toEqual({
+      ok: true,
+      version: CURRENT_SCHEMA_VERSION,
+      message: "项目文件可打开。"
+    });
+    const parsed = parseProjectJson(serializeProject(project));
+    expect(parsed.seasonEpisodeBindings[0]).toMatchObject({
+      episodeKey: "S01E02",
+      episodeLabel: "第 2 集",
+      targetBinding: {
+        kind: "embyItem",
+        itemId: "emby-item-1"
+      }
+    });
+    expect(JSON.stringify(parsed.seasonEpisodeBindings)).not.toContain("token");
+  });
+
   it("打开 v1 项目时迁移闭区间片段 sourceOutMs", () => {
     const project = {
       ...createEmptyProject("旧项目"),
@@ -166,8 +197,30 @@ describe("project schema", () => {
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
     expect(parsed.mediaBinding).toBeNull();
+    expect(parsed.seasonEpisodeBindings).toEqual([]);
     expect(migration).toEqual({
       fromVersion: 3,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+  });
+
+  it("打开 v4 项目时补齐逐集目标绑定字段", () => {
+    const currentProject = {
+      ...createEmptyProject("v4 项目"),
+      schemaVersion: 4,
+      mediaBinding: createValidLocalFileBinding()
+    };
+    const v4Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
+    delete v4Project.seasonEpisodeBindings;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v4Project));
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.mediaBinding?.kind).toBe("localFile");
+    expect(parsed.seasonEpisodeBindings).toEqual([]);
+    expect(migration).toEqual({
+      fromVersion: 4,
       toVersion: CURRENT_SCHEMA_VERSION,
       adjustedClipRangeCount: 0
     });

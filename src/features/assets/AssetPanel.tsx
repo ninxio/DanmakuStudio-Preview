@@ -70,7 +70,8 @@ import {
   type SeasonWorkbenchStepState,
   type SeasonWorkbenchSummary
 } from "../../domain/project/seasonWorkbench";
-import type { EditorProject, MediaBinding, MediaReference } from "../../domain/project/types";
+import { createSeasonEpisodeKey, findSeasonEpisodeBinding } from "../../domain/project/seasonEpisodeBinding";
+import type { EditorProject, MediaBinding, MediaReference, SeasonEpisodeBinding } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
@@ -154,6 +155,8 @@ export function AssetPanel() {
   const bindCurrentMediaAsTarget = useEditorStore((state) => state.bindCurrentMediaAsTarget);
   const setMediaBinding = useEditorStore((state) => state.setMediaBinding);
   const clearMediaBinding = useEditorStore((state) => state.clearMediaBinding);
+  const bindCurrentTargetToSeasonEpisode = useEditorStore((state) => state.bindCurrentTargetToSeasonEpisode);
+  const clearSeasonEpisodeBinding = useEditorStore((state) => state.clearSeasonEpisodeBinding);
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
   const select = useEditorStore((state) => state.select);
   const setPlayhead = useEditorStore((state) => state.setPlayhead);
@@ -551,6 +554,16 @@ export function AssetPanel() {
                         }}
                       />
                       <SeasonWorkbenchPanel summary={seasonWorkbench} />
+                      <SeasonEpisodeBindingPanel
+                        plan={batchMergePlan}
+                        bindings={project.seasonEpisodeBindings}
+                        currentBinding={project.mediaBinding}
+                        onBindCurrent={(episodeKey, episodeLabel) =>
+                          bindCurrentTargetToSeasonEpisode(episodeKey, episodeLabel)
+                        }
+                        onClear={clearSeasonEpisodeBinding}
+                        onOpenMediaTab={() => setTab("media")}
+                      />
                       <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
                     </>
                   ) : (
@@ -1283,6 +1296,98 @@ function SeasonWorkbenchPanel({ summary }: { summary: SeasonWorkbenchSummary }) 
         ))}
       </div>
       <p className="mt-3 text-[11px] leading-5 text-slate-500">下一步：{summary.nextActionLabel}</p>
+    </section>
+  );
+}
+
+function SeasonEpisodeBindingPanel({
+  plan,
+  bindings,
+  currentBinding,
+  onBindCurrent,
+  onClear,
+  onOpenMediaTab
+}: {
+  plan: ReturnType<typeof buildBatchMergePlan>;
+  bindings: SeasonEpisodeBinding[];
+  currentBinding: MediaBinding | null;
+  onBindCurrent: (episodeKey: string, episodeLabel: string) => void;
+  onClear: (episodeKey: string) => void;
+  onOpenMediaTab: () => void;
+}) {
+  const previewEpisodes = plan.episodes.slice(0, 6);
+  const hiddenCount = Math.max(0, plan.episodes.length - previewEpisodes.length);
+  return (
+    <section
+      className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+      aria-label="逐集目标绑定"
+    >
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
+        <Layers size={15} className="text-accent-cyan" />
+        <span>逐集目标绑定</span>
+        <span className="ml-auto rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
+          {bindings.length} 个已绑定
+        </span>
+      </div>
+      <p className="mt-2 text-[11px] leading-5 text-slate-500">
+        把当前目标原片分配给具体输出集，保存项目后仍可恢复；这里不保存视频内容、密码或临时播放地址。
+      </p>
+      {previewEpisodes.length > 0 ? (
+        <div className="mt-3 grid gap-2">
+          {previewEpisodes.map((episode) => {
+            const episodeKey = createSeasonEpisodeKey(episode);
+            const savedBinding = findSeasonEpisodeBinding(bindings, episodeKey);
+            const canBindCurrent = Boolean(currentBinding);
+            return (
+              <div key={episodeKey} className="grid gap-2 rounded border border-panel-line bg-black/15 p-2">
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-slate-100" title={`${episode.label}：${episode.sourceFileNames.join("、")}`}>
+                      {episode.label}
+                    </div>
+                    <div className="mt-0.5 truncate text-[11px] text-slate-500">
+                      {episode.sourceFileNames.join("、")} / {episode.itemCount.toLocaleString("zh-CN")} 条
+                    </div>
+                  </div>
+                  <span
+                    className={`h-fit rounded border px-1.5 py-0.5 text-[11px] ${
+                      savedBinding
+                        ? "border-accent-green/30 bg-accent-green/10 text-accent-green"
+                        : canBindCurrent
+                          ? "border-accent-cyan/30 bg-accent-cyan/10 text-accent-cyan"
+                          : "border-panel-line bg-black/25 text-slate-500"
+                    }`}
+                  >
+                    {savedBinding ? "已绑定" : canBindCurrent ? "可绑定" : "待目标"}
+                  </span>
+                </div>
+                <div className="text-[11px] leading-5 text-slate-500">
+                  {savedBinding
+                    ? `目标原片：${formatMediaBindingTitle(savedBinding.targetBinding)}`
+                    : currentBinding
+                      ? `当前目标：${formatMediaBindingTitle(currentBinding)}`
+                      : "先在“媒体”页绑定本地文件或 Emby 条目。"}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {currentBinding ? (
+                    <TextButton onClick={() => onBindCurrent(episodeKey, episode.label)}>
+                      {savedBinding ? "更新目标" : "绑定当前目标"}
+                    </TextButton>
+                  ) : (
+                    <TextButton onClick={onOpenMediaTab}>去绑定目标</TextButton>
+                  )}
+                  {savedBinding ? <TextButton onClick={() => onClear(episodeKey)}>清除</TextButton> : null}
+                </div>
+              </div>
+            );
+          })}
+          {hiddenCount > 0 ? <p className="text-[11px] text-slate-500">另有 {hiddenCount} 个输出，可继续调整规则后查看。</p> : null}
+        </div>
+      ) : (
+        <div className="mt-3 rounded border border-panel-line bg-black/15 p-2 text-slate-500">
+          先生成分集草案，再为每一集绑定目标原片。
+        </div>
+      )}
     </section>
   );
 }

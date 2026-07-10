@@ -37,6 +37,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     typeof value.name !== "string" ||
     !isMediaReference(value.media) ||
     (version >= 4 && !isMediaBindingOrNull(value.mediaBinding)) ||
+    (version >= 5 && !isSeasonEpisodeBindings(value.seasonEpisodeBindings)) ||
     !Array.isArray(value.assets) ||
     !Array.isArray(value.clips) ||
     !isIntegerMilliseconds(value.globalOffsetMs) ||
@@ -115,7 +116,8 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
       schemaVersion: CURRENT_SCHEMA_VERSION,
       clips: legacyClipRanges.clips,
       alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null,
-      mediaBinding: parsedVersion >= 4 ? project.mediaBinding : null
+      mediaBinding: parsedVersion >= 4 ? project.mediaBinding : null,
+      seasonEpisodeBindings: parsedVersion >= 5 ? project.seasonEpisodeBindings : []
     },
     migration: {
       fromVersion: parsedVersion,
@@ -219,6 +221,22 @@ function isEmbyMediaSourceSummary(value: unknown): boolean {
     (isNonNegativeInteger(value.bitrate) || value.bitrate === null) &&
     (isNonNegativeInteger(value.sizeBytes) || value.sizeBytes === null) &&
     (isNonNegativeIntegerMilliseconds(value.runtimeMs) || value.runtimeMs === null)
+  );
+}
+
+function isSeasonEpisodeBindings(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isSeasonEpisodeBinding);
+}
+
+function isSeasonEpisodeBinding(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.episodeKey === "string" &&
+    typeof value.episodeLabel === "string" &&
+    isMediaBindingOrNull(value.targetBinding) &&
+    value.targetBinding !== null &&
+    typeof value.linkedAt === "string"
   );
 }
 

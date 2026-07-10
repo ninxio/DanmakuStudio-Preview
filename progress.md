@@ -1,5 +1,19 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C124 已完成：推进 G7 剧集批量工作台，新增逐集目标原片绑定。
+  - 项目 schema 升级到 v5，新增 `seasonEpisodeBindings`，用于保存批量输出中每一集对应的目标原片引用；打开 v1-v4 项目会自动迁移并补空数组。
+  - 新增 `src/domain/project/seasonEpisodeBinding.ts`，按季集号或文件名生成稳定分集 key，并提供已保存绑定查找能力；该领域逻辑不依赖 React。
+  - 资源栏高级工具新增“逐集目标绑定”面板，用户可把当前项目级目标原片绑定到某个分集输出，也可清除或更新；操作进入编辑历史并可撤销。
+  - 逐集绑定只保存非敏感目标原片摘要，不保存视频内容、Emby 密码、token 或临时播放 URL，也不改变原始 XML 或导出弹幕内容。
+  - README、架构文档和三分 P 示例项目已同步 schema v5、逐集绑定字段、迁移边界和安全边界。
+  - 已补充 schema、领域、store 和资源面板测试，覆盖 v4 迁移、逐集绑定保存/清除、稳定 key 和 UI 真实按钮。
+  - 已重新验证：逐集绑定聚焦测试通过（4 个测试文件 / 88 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、46 个测试文件 / 267 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12376064` 字节，时间 `2026/07/10 23:57:02`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3058266` 字节，时间 `2026/07/10 23:57:02`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c124-season-episode-bindings-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C123 已完成：补齐 G7 播放器化验收中的性能目标、缓存策略和错误恢复覆盖。
   - 新增 `src/domain/player/playerReliability.ts`，作为不依赖 React 的播放器可靠性摘要模型，把播放头同步目标、缓存边界和错误恢复路径整理成统一输出。
   - 播放头同步阈值抽为 `PLAYER_SEEK_SYNC_TOLERANCE_MS = 240`，预览面板纠偏 seek 逻辑与用户可见状态共用同一个可测试常量。

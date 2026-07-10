@@ -266,6 +266,47 @@ describe("资源面板", () => {
     expect(within(workbench).getByText("下一步：导出分集 XML：可使用现有导出按钮生成分集 XML。")).toBeInTheDocument();
   });
 
+  it("高级工具可以把当前目标原片绑定到分集输出", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="12,1,25,16777215,0,0,u1,r1">第一集</d></i>`,
+      { fileName: "S01E01.xml" }
+    );
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject(),
+        assets: [asset],
+        mediaBinding: createLocalPathMediaBinding("binding-local", "D:\\media\\full.mkv", 3_000_000)
+      },
+      history: createHistoryState(),
+      selection: { kind: "none", ids: [] },
+      exportDraft: null,
+      alignmentProposal: null,
+      cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: /高级工具/ }));
+
+    const bindingPanel = screen.getByRole("region", { name: "逐集目标绑定" });
+    expect(within(bindingPanel).getByText("当前目标：full")).toBeInTheDocument();
+    await user.click(within(bindingPanel).getByRole("button", { name: "绑定当前目标" }));
+
+    await waitFor(() => expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(1));
+    expect(useEditorStore.getState().project.seasonEpisodeBindings[0]).toMatchObject({
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集",
+      targetBinding: {
+        kind: "localFile",
+        fileName: "full.mkv"
+      }
+    });
+    expect(within(bindingPanel).getByText("已绑定")).toBeInTheDocument();
+
+    await user.click(within(bindingPanel).getByRole("button", { name: "清除" }));
+    await waitFor(() => expect(useEditorStore.getState().project.seasonEpisodeBindings).toHaveLength(0));
+  });
+
   it("导出检查会展示人话摘要并按需显示诊断详情", async () => {
     const user = userEvent.setup();
     render(<AssetPanel />);
