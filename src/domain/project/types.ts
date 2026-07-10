@@ -4,9 +4,10 @@ import type {
   DanmakuClip,
   SyncAnchor
 } from "../danmaku/types";
+import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 export interface MediaReference {
   id: string;
@@ -38,6 +39,7 @@ export interface EditorProject {
   globalOffsetMs: Milliseconds;
   cutMarkers: CutMarker[];
   syncAnchors: SyncAnchor[];
+  alignmentProposal: AlignmentProposal | null;
   itemTimeAdjustments: Record<string, Milliseconds>;
   disabledItemIds: string[];
   timeline: TimelineViewState;

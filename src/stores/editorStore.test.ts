@@ -33,6 +33,34 @@ function createAsset(assetId: string, fileName: string) {
   );
 }
 
+function createAlignmentProposal() {
+  return {
+    anchors: [
+      {
+        id: "proposal-anchor",
+        sourceMs: 10_000,
+        targetMs: 12_000,
+        confidence: 0.9,
+        origin: "automatic" as const
+      }
+    ],
+    cutCandidates: [
+      {
+        id: "proposal-cut",
+        name: "候选补偿",
+        sourceAtMs: 20_000,
+        sourceRangeStartMs: 18_000,
+        sourceRangeEndMs: 22_000,
+        targetGapMs: 5000,
+        confidence: 0.8,
+        note: "测试"
+      }
+    ],
+    confidence: 0.85,
+    diagnostics: ["测试诊断"]
+  };
+}
+
 function mockRevokeObjectUrl(): ReturnType<typeof vi.fn> {
   const revokeObjectUrl = vi.fn();
   Object.defineProperty(URL, "revokeObjectURL", {
@@ -112,9 +140,30 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(useEditorStore.getState().project.clips[0].sourceOutMs).toBe(1001);
     expect(useEditorStore.getState().status).toEqual({
-      message: "已打开旧版项目：旧版项目。已从 v1 升级到 v2，并兼容调整 1 个片段边界。",
+      message: `已打开旧版项目：旧版项目。已从 v1 升级到 v${CURRENT_SCHEMA_VERSION}，并兼容调整 1 个片段边界。`,
       tone: "warning"
     });
+  });
+
+  it("打开项目时恢复持久化的对齐提案", () => {
+    const project = {
+      ...createEmptyProject("带提案项目"),
+      alignmentProposal: createAlignmentProposal()
+    };
+
+    useEditorStore.getState().openProjectFromText(serializeProject(project));
+
+    expect(useEditorStore.getState().alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
+    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+  });
+
+  it("预览对齐提案时同步写入项目文件状态", () => {
+    const proposal = createAlignmentProposal();
+
+    useEditorStore.getState().previewAlignmentProposalData(proposal);
+
+    expect(useEditorStore.getState().alignmentProposal).toBe(proposal);
+    expect(useEditorStore.getState().project.alignmentProposal).toBe(proposal);
   });
 
   it("追加片段时使用已有片段包含 localOffsetMs 的视觉结束点", () => {

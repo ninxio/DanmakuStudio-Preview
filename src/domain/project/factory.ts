@@ -19,6 +19,7 @@ export function createEmptyProject(name = "未命名项目"): EditorProject {
     globalOffsetMs: 0,
     cutMarkers: [],
     syncAnchors: [],
+    alignmentProposal: null,
     itemTimeAdjustments: {},
     disabledItemIds: [],
     timeline: {

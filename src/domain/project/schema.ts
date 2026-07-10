@@ -41,6 +41,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     !isIntegerMilliseconds(value.globalOffsetMs) ||
     !Array.isArray(value.cutMarkers) ||
     !Array.isArray(value.syncAnchors) ||
+    (version >= 3 && !isAlignmentProposalOrNull(value.alignmentProposal)) ||
     !isMillisecondsRecord(value.itemTimeAdjustments) ||
     !isStringArray(value.disabledItemIds) ||
     !isTimelineState(value.timeline) ||
@@ -103,12 +104,16 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
   if (parsedVersion === CURRENT_SCHEMA_VERSION) {
     return { project, migration: null };
   }
-  const legacyClipRanges = migrateLegacyClosedClipRanges(project);
+  const legacyClipRanges =
+    parsedVersion < 2
+      ? migrateLegacyClosedClipRanges(project)
+      : { clips: project.clips, adjustedClipRangeCount: 0 };
   return {
     project: {
       ...project,
       schemaVersion: CURRENT_SCHEMA_VERSION,
-      clips: legacyClipRanges.clips
+      clips: legacyClipRanges.clips,
+      alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null
     },
     migration: {
       fromVersion: parsedVersion,
@@ -234,6 +239,36 @@ function isSyncAnchor(value: unknown): boolean {
     isNonNegativeIntegerMilliseconds(value.targetMs) &&
     (value.origin === "manual" || value.origin === "automatic") &&
     (value.confidence === undefined || isUnitNumber(value.confidence))
+  );
+}
+
+function isAlignmentProposalOrNull(value: unknown): boolean {
+  if (value === null) {
+    return true;
+  }
+  return (
+    isRecord(value) &&
+    Array.isArray(value.anchors) &&
+    value.anchors.every(isSyncAnchor) &&
+    Array.isArray(value.cutCandidates) &&
+    value.cutCandidates.every(isCutCandidate) &&
+    isUnitNumber(value.confidence) &&
+    Array.isArray(value.diagnostics) &&
+    value.diagnostics.every((diagnostic) => typeof diagnostic === "string")
+  );
+}
+
+function isCutCandidate(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    isNonNegativeIntegerMilliseconds(value.sourceAtMs) &&
+    (value.sourceRangeStartMs === undefined || isNonNegativeIntegerMilliseconds(value.sourceRangeStartMs)) &&
+    (value.sourceRangeEndMs === undefined || isNonNegativeIntegerMilliseconds(value.sourceRangeEndMs)) &&
+    isIntegerMilliseconds(value.targetGapMs) &&
+    isUnitNumber(value.confidence) &&
+    typeof value.note === "string"
   );
 }
 

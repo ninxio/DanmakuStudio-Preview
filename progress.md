@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C101 已完成：项目文件持久化当前对齐提案与复核状态。
+  - 项目 schema 升级到 v3，`EditorProject` 新增 `alignmentProposal` 字段，用于保存当前导入或生成的对齐提案；项目文件仍只保存媒体引用、弹幕数据和编辑/复核状态，不嵌入视频内容。
+  - 预览或导入对齐提案时会同步写入 `project.alignmentProposal`；保存 `.danmaku-project.json` 后再次打开，会恢复顶部“应用对齐”、资源栏复核队列和时间轴对齐预览所需的提案状态。
+  - 打开 v1/v2 旧项目时会自动补齐 `alignmentProposal: null`；迁移管线改为按版本分段执行，只有 v1 项目会重新做旧闭区间片段边界兼容，避免 v2 项目升级到 v3 时被重复调整。
+  - 仓库内三分 P 示例项目已更新为 schema v3，并显式保存 `alignmentProposal: null`，避免示例项目在当前版本中被当成旧项目迁移。
+  - 已补充 schema、持久化和 store 测试，覆盖保存/打开对齐提案、v2 到 v3 不重复迁移片段边界、结构错误提案拒绝，以及打开项目后恢复顶层 store 提案。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/schema.test.ts src/infrastructure/persistence/projectPersistence.test.ts src/stores/editorStore.test.ts` 成功，3 个测试文件、41 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/198 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 14:55:30`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999706` 字节，时间 `2026/07/10 14:55:30`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c101-persist-alignment-proposal-20260710`。
 - 成熟度提升阶段 C100 已完成：对齐复核队列可直接定位到时间轴。
   - “视频对齐实验室”的复核队列每条记录新增真实“定位”按钮，可把时间轴播放头跳到该锚点或候选补偿的源时间，便于按队列顺序逐条核对真实删减边界。
   - 定位动作会走现有 `setPlayhead`，由 store 统一钳制合法时间范围，并在状态栏显示已定位的复核项名称和时间码。

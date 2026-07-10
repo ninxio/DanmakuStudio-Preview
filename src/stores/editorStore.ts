@@ -285,7 +285,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         selection: emptySelection,
         history: createHistoryState<EditorProject>(),
         exportDraft: null,
-        alignmentProposal: null,
+        alignmentProposal: project.alignmentProposal,
         timelineTool: "select",
         status: createOpenProjectStatus(project.name, migration)
       });
@@ -1025,13 +1025,17 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   previewAlignmentProposalData: (proposal) => {
-    set({
+    set((state) => ({
+      project: touchProject({
+        ...state.project,
+        alignmentProposal: proposal
+      }),
       alignmentProposal: proposal,
       status: {
         message: `已发送到时间轴预览：${proposal.anchors.length} 个锚点，${proposal.cutCandidates.length} 个候选补偿点。`,
         tone: "success"
       }
-    });
+    }));
   },
 
   exportAlignmentProposal: () => {

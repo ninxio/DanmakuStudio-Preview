@@ -20,13 +20,21 @@ describe("project schema", () => {
         fileName: "demo.mp4",
         objectUrl: "blob:test",
         durationMs: 1000
-      }
+      },
+      alignmentProposal: createValidAlignmentProposal()
     };
     const json = serializeProject(project);
-    expect(JSON.parse(json)).toMatchObject({ schemaVersion: CURRENT_SCHEMA_VERSION });
+    expect(JSON.parse(json)).toMatchObject({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      alignmentProposal: {
+        anchors: [{ id: "proposal-anchor" }],
+        cutCandidates: [{ id: "proposal-cut" }]
+      }
+    });
     const parsed = parseProjectJson(json);
     expect(parsed.name).toBe("测试项目");
     expect(parsed.media?.objectUrl).toBeNull();
+    expect(parsed.alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
   });
 
   it("可打开仓库内三分 P 示例项目", () => {
@@ -80,6 +88,39 @@ describe("project schema", () => {
       fromVersion: 1,
       toVersion: CURRENT_SCHEMA_VERSION,
       adjustedClipRangeCount: 1
+    });
+  });
+
+  it("打开 v2 项目时补齐对齐提案字段但不重复迁移片段边界", () => {
+    const currentProject = {
+      ...createEmptyProject("v2 项目"),
+      schemaVersion: 2,
+      assets: [createValidAsset()],
+      clips: [
+        {
+          id: "clip",
+          assetId: "asset",
+          name: "v2 片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1000,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ]
+    };
+    const v2Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
+    delete v2Project.alignmentProposal;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v2Project));
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.alignmentProposal).toBeNull();
+    expect(parsed.clips[0].sourceOutMs).toBe(1000);
+    expect(migration).toEqual({
+      fromVersion: 2,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
     });
   });
 
@@ -225,6 +266,24 @@ describe("project schema", () => {
     expect(validation.message).toContain("同步锚点");
   });
 
+  it("拒绝结构错误的持久化对齐提案", () => {
+    const project = {
+      ...createEmptyProject(),
+      alignmentProposal: {
+        ...createValidAlignmentProposal(),
+        cutCandidates: [
+          {
+            ...createValidAlignmentProposal().cutCandidates[0],
+            sourceAtMs: 10.5
+          }
+        ]
+      }
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("必要字段");
+  });
+
   it("拒绝非整数毫秒的单条弹幕调整", () => {
     const project = {
       ...createEmptyProject(),
@@ -264,5 +323,33 @@ function createValidDanmakuItem() {
     text: "测试",
     rawPFields: ["1", "1", "25", "16777215", "0", "0", "u", "r"],
     enabled: true
+  };
+}
+
+function createValidAlignmentProposal() {
+  return {
+    anchors: [
+      {
+        id: "proposal-anchor",
+        sourceMs: 10_000,
+        targetMs: 12_000,
+        confidence: 0.9,
+        origin: "automatic" as const
+      }
+    ],
+    cutCandidates: [
+      {
+        id: "proposal-cut",
+        name: "候选补偿",
+        sourceAtMs: 20_000,
+        sourceRangeStartMs: 18_000,
+        sourceRangeEndMs: 22_000,
+        targetGapMs: 5000,
+        confidence: 0.8,
+        note: "测试"
+      }
+    ],
+    confidence: 0.85,
+    diagnostics: ["测试诊断"]
   };
 }
