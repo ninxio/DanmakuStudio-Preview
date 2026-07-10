@@ -3,6 +3,7 @@ import {
   pickAlignmentMediaPath,
   pickExportDirectoryPath,
   pickFfmpegExecutablePath,
+  pickMpvExecutablePath,
   pickSingleNativeDirectoryPath,
   pickSingleNativePath
 } from "./nativeDialogs";
@@ -43,6 +44,21 @@ describe("原生文件选择器封装", () => {
       expect.objectContaining({
         title: "选择 FFmpeg 可执行文件",
         defaultPath: "C:\\tools\\ffmpeg.exe",
+        multiple: false,
+        directory: false
+      })
+    );
+  });
+
+  it("为 mpv 路径选择保留用户当前输入", async () => {
+    const dialog = vi.fn().mockResolvedValue("C:\\tools\\mpv.exe");
+    const path = await pickMpvExecutablePath(" C:\\tools ", dialog);
+
+    expect(path).toBe("C:\\tools\\mpv.exe");
+    expect(dialog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "选择 mpv 可执行文件",
+        defaultPath: "C:\\tools",
         multiple: false,
         directory: false
       })

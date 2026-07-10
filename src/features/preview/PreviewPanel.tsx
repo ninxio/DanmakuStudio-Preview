@@ -10,14 +10,20 @@ import {
 } from "../../domain/preview/visibleEvents";
 import { formatTimecode } from "../../domain/shared/time";
 import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
-import { HtmlVideoMediaAdapter } from "../../infrastructure/media/mediaAdapter";
+import {
+  HtmlVideoMediaAdapter,
+  TauriMpvMediaAdapter,
+  type MediaAdapter
+} from "../../infrastructure/media/mediaAdapter";
+import { loadAppSettings } from "../../infrastructure/settings/appSettings";
 import { useEditorStore } from "../../stores/editorStore";
 
 type VideoLoadState = "empty" | "loading" | "ready" | "unsupported";
+type PreviewBackend = "htmlVideo" | "nativeMpv";
 
 export function PreviewPanel() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const adapterRef = useRef<HtmlVideoMediaAdapter | null>(null);
+  const adapterRef = useRef<MediaAdapter | null>(null);
   const playheadRef = useRef(0);
   const loadedSourceRef = useRef<string | null>(null);
   const project = useEditorStore((state) => state.project);
@@ -30,11 +36,27 @@ export function PreviewPanel() {
   const addCutMarkerAtPlayhead = useEditorStore((state) => state.addCutMarkerAtPlayhead);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadState, setVideoLoadState] = useState<VideoLoadState>("empty");
+  const appSettings = loadAppSettings();
+  const preferredBackend = appSettings.player.preferredBackend;
+  const mpvPath = appSettings.player.mpvPath;
   const mediaObjectUrl = project.media?.objectUrl ?? null;
   const mediaName = project.media?.name ?? "视频";
-  const mediaFileName = project.media?.fileName ?? mediaName;
+  const localMediaPath =
+    project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath?.trim() ?? "" : "";
+  const localMediaFileName = project.mediaBinding?.kind === "localFile" ? project.mediaBinding.fileName : mediaName;
+  const hasLocalMediaPath = localMediaPath.length > 0;
+  const canUseNativeMpv = mpvPath.trim().length > 0 && hasLocalMediaPath;
+  const previewBackend: PreviewBackend =
+    canUseNativeMpv && (preferredBackend === "nativeMpv" || (preferredBackend === "auto" && !mediaObjectUrl))
+      ? "nativeMpv"
+      : "htmlVideo";
+  const previewSource = previewBackend === "nativeMpv" ? localMediaPath : mediaObjectUrl;
+  const previewSourceName = previewBackend === "nativeMpv" ? localMediaFileName : mediaName;
+  const mediaFileName = previewBackend === "nativeMpv" ? localMediaFileName : project.media?.fileName ?? mediaName;
+  const previewDurationMs = project.media?.durationMs ?? project.mediaBinding?.runtimeMs ?? 0;
   const localBindingNeedsReconnect =
     project.mediaBinding?.kind === "localFile" &&
+    !hasLocalMediaPath &&
     (!project.media ||
       !project.media.objectUrl ||
       (project.mediaBinding.mediaId
@@ -54,23 +76,31 @@ export function PreviewPanel() {
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) {
+    const adapter =
+      previewBackend === "nativeMpv"
+        ? new TauriMpvMediaAdapter(mpvPath)
+        : video
+          ? new HtmlVideoMediaAdapter(video)
+          : null;
+    if (!adapter) {
       return;
     }
-    const adapter = new HtmlVideoMediaAdapter(video);
     adapterRef.current = adapter;
+    loadedSourceRef.current = null;
     return () => {
       adapter.dispose();
-      adapterRef.current = null;
+      if (adapterRef.current === adapter) {
+        adapterRef.current = null;
+      }
     };
-  }, []);
+  }, [mpvPath, previewBackend]);
 
   useEffect(() => {
     const adapter = adapterRef.current;
     if (!adapter) {
       return;
     }
-    if (!mediaObjectUrl) {
+    if (!previewSource) {
       if (loadedSourceRef.current) {
         adapter.dispose();
         loadedSourceRef.current = null;
@@ -81,13 +111,14 @@ export function PreviewPanel() {
       return;
     }
     let cancelled = false;
+    const sourceKey = `${previewBackend}:${previewSource}`;
     setVideoLoadState("loading");
     setVideoError(null);
     void adapter
-      .load({ kind: "file", name: mediaName, url: mediaObjectUrl })
+      .load({ kind: "file", name: previewSourceName, url: previewSource })
       .then(() => {
         if (!cancelled) {
-          loadedSourceRef.current = mediaObjectUrl;
+          loadedSourceRef.current = sourceKey;
           updateMediaDuration(adapter.getDurationMs());
           adapter.seek(playheadRef.current);
           setVideoLoadState("ready");
@@ -103,7 +134,7 @@ export function PreviewPanel() {
     return () => {
       cancelled = true;
     };
-  }, [mediaName, mediaObjectUrl, setPlaying, updateMediaDuration]);
+  }, [previewBackend, previewSource, previewSourceName, setPlaying, updateMediaDuration]);
 
   useEffect(() => {
     const adapter = adapterRef.current;
@@ -133,7 +164,7 @@ export function PreviewPanel() {
     const tick = (now: number): void => {
       if (isPlaying) {
         const adapter = adapterRef.current;
-        if (adapter && mediaObjectUrl) {
+        if (adapter && previewSource) {
           setPlayhead(adapter.getCurrentTimeMs());
         } else {
           const delta = now - lastTick;
@@ -145,7 +176,7 @@ export function PreviewPanel() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [isPlaying, mediaObjectUrl, setPlayhead]);
+  }, [isPlaying, previewSource, setPlayhead]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[#0d0f13]">
@@ -156,36 +187,54 @@ export function PreviewPanel() {
         <video
           ref={videoRef}
           aria-label="视频预览画面"
-          className={`h-full w-full object-contain transition-opacity ${mediaObjectUrl ? "opacity-100" : "opacity-0"}`}
+          className={`h-full w-full object-contain transition-opacity ${
+            previewBackend === "htmlVideo" && mediaObjectUrl ? "opacity-100" : "opacity-0"
+          }`}
           data-testid="preview-video"
           playsInline
           preload="metadata"
           onPause={() => setPlaying(false)}
         />
-        {!mediaObjectUrl ? (
+        {!previewSource ? (
           <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-slate-500">
             <div className="max-w-[min(420px,calc(100%-32px))]">
               <div className="text-slate-300">
-                {localBindingNeedsReconnect || mediaReferenceNeedsReconnect ? "需要重新连接视频" : "尚未导入视频"}
+                {localBindingNeedsReconnect || mediaReferenceNeedsReconnect
+                  ? "需要重新连接视频"
+                  : preferredBackend === "nativeMpv" && !hasLocalMediaPath
+                    ? "需要选择本地原片路径"
+                    : "尚未导入视频"}
               </div>
               <div className="mt-2 text-xs leading-5">
                 {localBindingNeedsReconnect
                   ? "项目保存了目标原片引用，但没有保存视频内容。请重新导入同一份本地视频。"
                   : mediaReferenceNeedsReconnect
                     ? "项目里只有媒体引用，没有当前会话可播放的视频对象。请重新导入本地视频。"
-                    : "当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。"}
+                    : preferredBackend === "nativeMpv" && !hasLocalMediaPath
+                      ? "mpv 需要真实本地文件路径。请在“媒体 / 目标原片”里选择本地路径。"
+                      : "当前仍可编辑弹幕时间轴，导入 MP4/WebM 后可同步预览。"}
               </div>
             </div>
           </div>
         ) : null}
-        {mediaObjectUrl ? (
+        {previewBackend === "nativeMpv" && previewSource ? (
+          <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-slate-500">
+            <div className="max-w-[min(420px,calc(100%-32px))]">
+              <div className="text-slate-300">mpv 桌面播放器</div>
+              <div className="mt-2 text-xs leading-5">
+                本地视频正在 mpv 窗口中播放；这里继续显示播放头、时间和弹幕预览状态。
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {previewSource ? (
           <div className="absolute left-3 top-3 max-w-[min(420px,calc(100%-24px))] rounded border border-white/10 bg-black/55 px-3 py-2 text-xs text-slate-300 shadow-lg backdrop-blur">
             <div className="truncate font-medium text-slate-100">{mediaFileName}</div>
             <div className="mt-1 text-slate-400">
               {videoLoadState === "loading"
                 ? "正在加载预览..."
                 : videoLoadState === "ready"
-                  ? `预览已就绪 / ${formatTimecode(project.media?.durationMs ?? 0)}`
+                  ? `${formatPreviewBackend(previewBackend)} 已就绪 / ${formatTimecode(previewDurationMs)}`
                   : videoLoadState === "unsupported"
                     ? "格式不支持"
                     : "等待视频载入"}
@@ -220,7 +269,10 @@ export function PreviewPanel() {
           {formatTimecode(project.timeline.playheadMs)}
         </div>
         <div className="text-xs text-slate-500">
-          / {formatTimecode(project.media?.durationMs ?? 0)}
+          / {formatTimecode(previewDurationMs)}
+        </div>
+        <div className="text-xs text-slate-500">
+          {formatPreviewBackend(previewBackend)}
         </div>
         <TextButton
           onClick={() => updatePreview({ danmakuVisible: !project.preview.danmakuVisible })}
@@ -312,4 +364,8 @@ function DanmakuOverlay({
       })}
     </div>
   );
+}
+
+function formatPreviewBackend(backend: PreviewBackend): string {
+  return backend === "nativeMpv" ? "mpv" : "HTML Video";
 }

@@ -37,6 +37,19 @@ export async function pickFfmpegExecutablePath(
   );
 }
 
+export async function pickMpvExecutablePath(
+  defaultPath = "",
+  dialog: NativeOpenDialog = defaultNativeOpenDialog
+): Promise<string | null> {
+  return pickSingleNativePath(
+    {
+      title: "选择 mpv 可执行文件",
+      defaultPath: normalizeDefaultPath(defaultPath)
+    },
+    dialog
+  );
+}
+
 export async function pickExportDirectoryPath(
   defaultPath = "",
   dialog: NativeOpenDialog = defaultNativeOpenDialog

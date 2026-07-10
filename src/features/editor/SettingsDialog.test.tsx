@@ -60,13 +60,19 @@ describe("设置中心", () => {
     expect(raw).not.toContain("secret-pass");
   });
 
-  it("保存 FFmpeg 和对齐默认参数", async () => {
+  it("保存播放器工具和对齐默认参数", async () => {
     const user = userEvent.setup();
     render(<SettingsDialog onClose={() => undefined} />);
 
-    await user.click(screen.getByRole("button", { name: "FFmpeg 与对齐" }));
+    await user.click(screen.getByRole("button", { name: "播放器与工具" }));
     fireEvent.change(screen.getByLabelText("FFmpeg 路径"), {
       target: { value: "C:\\tools\\ffmpeg.exe" }
+    });
+    fireEvent.change(screen.getByLabelText("mpv 路径"), {
+      target: { value: "C:\\tools\\mpv.exe" }
+    });
+    fireEvent.change(screen.getByLabelText("播放后端"), {
+      target: { value: "nativeMpv" }
     });
     fireEvent.change(screen.getByLabelText("窗口 ms"), {
       target: { value: "500" }
@@ -84,6 +90,10 @@ describe("设置中心", () => {
       windowMs: 500,
       minGapMs: 1200,
       matchThreshold: 0.22
+    });
+    expect(loadAppSettings().player).toEqual({
+      mpvPath: "C:\\tools\\mpv.exe",
+      preferredBackend: "nativeMpv"
     });
   });
 
@@ -106,7 +116,7 @@ describe("设置中心", () => {
 
     await user.click(screen.getByRole("button", { name: "关于" }));
 
-    expect(screen.getByText("成熟度提升主线：音频对齐、版本差异复核与项目安全硬化")).toBeInTheDocument();
+    expect(screen.getByText("成熟度提升主线：播放器工具链、音频对齐与项目安全硬化")).toBeInTheDocument();
   });
 
   it("可以清除本地应用设置", async () => {
@@ -114,6 +124,10 @@ describe("设置中心", () => {
     saveAppSettings({
       export: {
         defaultDirectory: "D:\\exports"
+      },
+      player: {
+        mpvPath: "C:\\tools\\mpv.exe",
+        preferredBackend: "nativeMpv"
       },
       emby: {
         serverUrl: "https://emby.example.test",
@@ -149,6 +163,10 @@ describe("设置中心", () => {
       export: {
         defaultDirectory: "D:\\exports"
       },
+      player: {
+        mpvPath: "C:\\tools\\mpv.exe",
+        preferredBackend: "nativeMpv"
+      },
       emby: {
         serverUrl: "https://emby.example.test",
         pathPrefix: "/emby",
@@ -177,6 +195,7 @@ describe("设置中心", () => {
       expect(JSON.parse(text)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
       expect(text).toContain("https://emby.example.test");
       expect(text).toContain("D:\\\\exports");
+      expect(text).toContain("mpv.exe");
       expect(text).not.toContain("secret-pass");
       expect(text).not.toContain("password");
       expect(text).not.toContain("token");
@@ -224,6 +243,11 @@ describe("设置中心", () => {
           },
           export: {
             defaultDirectory: "D:\\imported-exports"
+          },
+          player: {
+            mpvPath: " C:\\tools\\mpv.exe ",
+            preferredBackend: "nativeMpv",
+            token: "secret-token"
           }
         })
       ],
@@ -245,6 +269,10 @@ describe("设置中心", () => {
           windowMs: 600,
           minGapMs: 1500,
           matchThreshold: 0.3
+        },
+        player: {
+          mpvPath: "C:\\tools\\mpv.exe",
+          preferredBackend: "nativeMpv"
         },
         export: {
           defaultDirectory: "D:\\imported-exports"

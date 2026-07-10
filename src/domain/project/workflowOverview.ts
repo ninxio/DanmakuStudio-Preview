@@ -86,6 +86,9 @@ export function createWorkflowOverview(
   const itemCount = project.assets.reduce((sum, asset) => sum + asset.items.length, 0);
   const health = createProjectHealthSummary(project);
   const matchAssessment = createProjectMatchAssessment(project);
+  const localTargetPath =
+    project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath?.trim() ?? "" : "";
+  const hasLocalMediaReference = Boolean(project.media || localTargetPath);
   const alignmentContext = {
     existingAnchors: project.syncAnchors,
     existingCutMarkers: project.cutMarkers
@@ -109,7 +112,11 @@ export function createWorkflowOverview(
     {
       id: "import-video",
       label: "导入视频",
-      detail: project.media ? `当前引用：${project.media.fileName}` : "选择本地 MP4 或 WebM 作为预览参照。",
+      detail: project.media
+        ? `当前引用：${project.media.fileName}`
+        : localTargetPath
+          ? `目标原片路径：${project.mediaBinding?.kind === "localFile" ? project.mediaBinding.fileName : "本地文件"}`
+          : "选择本地 MP4/WebM 或目标原片路径作为预览参照。",
       enabled: true,
       reason: null,
       tone: "neutral"
@@ -188,7 +195,7 @@ export function createWorkflowOverview(
       headline: assetCount > 0 ? "弹幕素材已经进入项目" : "先选择本地视频和 XML",
       detail: "视频只用于预览，XML 会变成可调整的弹幕素材；原始 XML 不会被改写。",
       metrics: [
-        { label: "视频", value: project.media ? project.media.fileName : "未导入" },
+        { label: "视频", value: project.media ? project.media.fileName : localTargetPath ? "已绑定本地路径" : "未导入" },
         { label: "目标原片", value: project.mediaBinding ? formatMediaBindingTitle(project.mediaBinding) : "未绑定" },
         { label: "匹配评分", value: createMatchMetricValue(matchAssessment, assetCount) },
         { label: "XML", value: `${formatCount(assetCount)} 个` },
@@ -280,7 +287,7 @@ export function createWorkflowOverview(
       hasAssets: assetCount > 0,
       hasTimeline,
       hasAlignmentProposal: Boolean(alignmentProposal),
-      mediaLoaded: Boolean(project.media),
+      mediaLoaded: hasLocalMediaReference,
       matchAssessment,
       project
     })

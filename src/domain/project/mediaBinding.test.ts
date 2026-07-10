@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createEmbyItemMediaBinding,
   createLocalFileMediaBinding,
+  createLocalPathMediaBinding,
   formatMediaBindingEpisode,
   formatMediaBindingSource,
   formatMediaBindingTitle,
@@ -30,6 +31,25 @@ describe("目标原片绑定", () => {
     });
     expect(formatMediaBindingTitle(binding)).toBe("完整版");
     expect(formatMediaBindingSource(binding)).toBe("本地文件 / full.mp4");
+  });
+
+  it("可从本地路径创建 mpv 可用的目标原片绑定", () => {
+    const binding = createLocalPathMediaBinding(
+      "binding-path",
+      " D:\\media\\测试剧集 S01E02.mkv ",
+      3_100_000,
+      "2026-07-10T00:00:00.000Z"
+    );
+
+    expect(binding).toMatchObject({
+      kind: "localFile",
+      displayName: "测试剧集 S01E02",
+      fileName: "测试剧集 S01E02.mkv",
+      mediaId: null,
+      localPath: "D:\\media\\测试剧集 S01E02.mkv",
+      runtimeMs: 3_100_000
+    });
+    expect(formatMediaBindingSource(binding)).toBe("本地文件 / 测试剧集 S01E02.mkv");
   });
 
   it("可从 Emby 条目创建不含 token 的目标原片绑定", () => {

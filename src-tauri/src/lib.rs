@@ -9,6 +9,7 @@ use std::time::Duration;
 mod app_settings;
 mod audio_alignment;
 mod export_files;
+mod media_tools;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -25,7 +26,12 @@ pub fn run() {
             audio_alignment::align_audio_files,
             audio_alignment::start_audio_alignment_job,
             audio_alignment::get_audio_alignment_job,
-            audio_alignment::cancel_audio_alignment_job
+            audio_alignment::cancel_audio_alignment_job,
+            media_tools::detect_media_tool,
+            media_tools::start_mpv_sidecar,
+            media_tools::stop_mpv_sidecar,
+            media_tools::get_mpv_sidecar_status,
+            media_tools::control_mpv_sidecar
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

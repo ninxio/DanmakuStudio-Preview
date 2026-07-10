@@ -34,7 +34,7 @@ resolved = applyCutMapping(adjusted, cutMarkers)
 
 当前支持两类绑定：
 
-- `localFile`：保存当前本地媒体引用的媒体 ID、显示名、文件名和运行时长。项目文件不保存浏览器对象 URL 或视频内容，重开项目后如本地视频未重新导入，会由导出前检查提示需要重新连接。
+- `localFile`：保存当前本地媒体引用的媒体 ID、显示名、文件名、运行时长，以及用户主动选择的本地路径引用。项目文件不保存浏览器对象 URL 或视频内容；如果只有浏览器对象 URL，重开项目后会由导出前检查提示需要重新连接。如果保存了真实本地路径，桌面端 mpv 后端可用该路径重新播放。
 - `embyItem`：保存用户授权 Emby 媒体库中的条目 ID、标题、剧名、季集号、媒体源摘要、运行时长和服务器配置引用。项目文件不保存 Emby 密码、访问 token 或临时播放 URL。
 
 Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等于已经具备播放授权流或下载能力。需要重新验证 Emby 条目时，UI 会通过当前应用设置和本次会话密码重新登录并读取条目元数据，失败时向用户提示需要重新连接。
@@ -70,10 +70,11 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 当前实现：
 
 - `HtmlVideoMediaAdapter`：支持浏览器可播放的 MP4/WebM，作为轻量预览 fallback。预览区根据项目媒体引用和加载结果展示未导入、正在载入、可播放、格式不支持、需要重新连接等状态；加载失败会明确提示 HTML Video 限制和后续 mpv 方向。
+- `TauriMpvMediaAdapter`：桌面端 mpv 后端，需要用户在设置中心配置 mpv 路径，并在目标原片中选择真实本地媒体路径。前端通过 `src/infrastructure/media/tauriMpvPlayer.ts` 调用 Tauri 命令；后端 `src-tauri/src/media_tools.rs` 负责检测 FFmpeg/mpv 版本、启动/停止 mpv sidecar、查询状态和通过 mpv IPC 发送播放、暂停、seek、倍率和属性读取命令。没有 mpv 路径或只有浏览器 blob URL 时不会启用该后端。
 
 预留：
 
-- `NativeMpvMediaAdapter`：仅接口占位，不声明已支持 MKV。后续 Tauri 桌面模式可通过 sidecar 或 IPC 接入 mpv。
+- mpv 画面嵌入、Emby 授权流媒体播放、截图/缩略图采样和更完整的硬解/字幕状态诊断仍属于后续播放器化阶段。
 
 ## 智能对齐扩展
 

@@ -2,6 +2,10 @@ export interface AppSettings {
   export: {
     defaultDirectory: string;
   };
+  player: {
+    mpvPath: string;
+    preferredBackend: PreviewBackendPreference;
+  };
   emby: {
     serverUrl: string;
     pathPrefix: string;
@@ -15,6 +19,8 @@ export interface AppSettings {
   };
 }
 
+export type PreviewBackendPreference = "auto" | "htmlVideo" | "nativeMpv";
+
 export interface AppSettingsStorage {
   getItem: (key: string) => string | null;
   setItem: (key: string, value: string) => void;
@@ -27,6 +33,10 @@ export const APP_SETTINGS_STORAGE_KEY = "danmaku.timelineStudio.appSettings.v1";
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   export: {
     defaultDirectory: ""
+  },
+  player: {
+    mpvPath: "",
+    preferredBackend: "auto"
   },
   emby: {
     serverUrl: "",
@@ -67,6 +77,7 @@ export function clearAppSettings(storage = getDefaultStorage()): void {
 export function cloneAppSettings(settings: AppSettings): AppSettings {
   return {
     export: { ...settings.export },
+    player: { ...settings.player },
     emby: { ...settings.emby },
     alignment: { ...settings.alignment }
   };
@@ -101,11 +112,16 @@ export function normalizeAppSettings(value: unknown): AppSettings {
     return cloneAppSettings(DEFAULT_APP_SETTINGS);
   }
   const exportSettings = isRecord(value.export) ? value.export : {};
+  const player = isRecord(value.player) ? value.player : {};
   const emby = isRecord(value.emby) ? value.emby : {};
   const alignment = isRecord(value.alignment) ? value.alignment : {};
   return {
     export: {
       defaultDirectory: readString(exportSettings.defaultDirectory, DEFAULT_APP_SETTINGS.export.defaultDirectory)
+    },
+    player: {
+      mpvPath: readString(player.mpvPath, DEFAULT_APP_SETTINGS.player.mpvPath),
+      preferredBackend: readPreviewBackendPreference(player.preferredBackend)
     },
     emby: {
       serverUrl: readString(emby.serverUrl, DEFAULT_APP_SETTINGS.emby.serverUrl),
@@ -152,6 +168,12 @@ function validateAppSettingsVersion(value: Record<string, unknown>): void {
 
 function readString(value: unknown, fallback: string): string {
   return typeof value === "string" ? value.trim() : fallback;
+}
+
+function readPreviewBackendPreference(value: unknown): PreviewBackendPreference {
+  return value === "auto" || value === "htmlVideo" || value === "nativeMpv"
+    ? value
+    : DEFAULT_APP_SETTINGS.player.preferredBackend;
 }
 
 function normalizePathPrefix(value: string): string {

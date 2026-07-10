@@ -26,6 +26,10 @@ describe("应用设置持久化", () => {
         export: {
           defaultDirectory: " D:\\exports "
         },
+        player: {
+          mpvPath: " C:\\tools\\mpv.exe ",
+          preferredBackend: "nativeMpv"
+        },
         emby: {
           serverUrl: " https://emby.example.test ",
           pathPrefix: "emby",
@@ -51,8 +55,13 @@ describe("应用设置持久化", () => {
     expect(JSON.parse(raw)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(raw).toContain("D:\\\\exports");
     expect(raw).toContain("ffmpeg.exe");
+    expect(raw).toContain("mpv.exe");
     expect(raw).not.toContain("password");
     expect(raw).not.toContain("token");
+    expect(loadAppSettings(storage).player).toEqual({
+      mpvPath: "C:\\tools\\mpv.exe",
+      preferredBackend: "nativeMpv"
+    });
     expect(loadAppSettings(storage).alignment.windowMs).toBe(500);
   });
 
@@ -64,6 +73,11 @@ describe("应用设置持久化", () => {
         export: {
           defaultDirectory: "D:\\exports",
           temporaryDirectory: "D:\\tmp"
+        },
+        player: {
+          mpvPath: "mpv",
+          preferredBackend: "bad-backend",
+          token: "token-2"
         },
         emby: {
           serverUrl: "https://emby.example.test",
@@ -92,8 +106,13 @@ describe("应用设置持久化", () => {
     expect(loaded.alignment.windowMs).toBe(DEFAULT_APP_SETTINGS.alignment.windowMs);
     expect(loaded.alignment.minGapMs).toBe(DEFAULT_APP_SETTINGS.alignment.minGapMs);
     expect(loaded.alignment.matchThreshold).toBe(DEFAULT_APP_SETTINGS.alignment.matchThreshold);
+    expect(loaded.player).toEqual({
+      mpvPath: "mpv",
+      preferredBackend: DEFAULT_APP_SETTINGS.player.preferredBackend
+    });
     expect(JSON.stringify(loaded)).not.toContain("secret");
     expect(JSON.stringify(loaded)).not.toContain("token-1");
+    expect(JSON.stringify(loaded)).not.toContain("token-2");
   });
 
   it("可以清除本地设置", () => {
@@ -111,6 +130,11 @@ describe("应用设置持久化", () => {
         JSON.stringify({
           export: {
             defaultDirectory: "D:\\exports",
+            token: "secret-token"
+          },
+          player: {
+            mpvPath: "mpv",
+            preferredBackend: "nativeMpv",
             token: "secret-token"
           },
           emby: {
@@ -133,6 +157,7 @@ describe("应用设置持久化", () => {
     expect(JSON.parse(text)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(text).toContain("D:\\\\exports");
     expect(text).toContain("https://emby.example.test");
+    expect(text).toContain("nativeMpv");
     expect(text).not.toContain("secret");
     expect(text).not.toContain("token");
   });

@@ -19,6 +19,10 @@ describe("桌面应用设置桥", () => {
           export: {
             defaultDirectory: "D:\\exports"
           },
+          player: {
+            mpvPath: "mpv",
+            preferredBackend: "nativeMpv"
+          },
           emby: {
             serverUrl: "https://emby.example.test",
             pathPrefix: "emby",
@@ -45,6 +49,10 @@ describe("桌面应用设置桥", () => {
       username: "tester"
     });
     expect(settings?.export.defaultDirectory).toBe("D:\\exports");
+    expect(settings?.player).toEqual({
+      mpvPath: "mpv",
+      preferredBackend: "nativeMpv"
+    });
     expect(loadAppSettings().alignment.windowMs).toBe(500);
     const raw = window.localStorage.getItem(APP_SETTINGS_STORAGE_KEY) ?? "";
     expect(raw).not.toContain("secret");
@@ -62,6 +70,10 @@ describe("桌面应用设置桥", () => {
         {
           export: {
             defaultDirectory: " D:\\exports "
+          },
+          player: {
+            mpvPath: " C:\\tools\\mpv.exe ",
+            preferredBackend: "nativeMpv"
           },
           emby: {
             serverUrl: " https://emby.example.test ",
@@ -84,6 +96,7 @@ describe("桌面应用设置桥", () => {
     expect(JSON.parse(content)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(content).toContain("https://emby.example.test");
     expect(content).toContain("D:\\\\exports");
+    expect(content).toContain("mpv.exe");
     expect(content).toContain("/emby");
     expect(content).not.toContain("password");
     expect(loadAppSettings().emby.username).toBe("tester");
@@ -98,6 +111,10 @@ describe("桌面应用设置桥", () => {
     saveAppSettings({
       export: {
         defaultDirectory: "D:\\exports"
+      },
+      player: {
+        mpvPath: "mpv",
+        preferredBackend: "nativeMpv"
       },
       emby: {
         serverUrl: "https://emby.example.test",

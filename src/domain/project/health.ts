@@ -510,6 +510,9 @@ function isLocalMediaBindingDisconnected(project: EditorProject): boolean {
   if (!binding || binding.kind !== "localFile") {
     return false;
   }
+  if (binding.localPath && binding.localPath.trim().length > 0) {
+    return false;
+  }
   if (!project.media || project.media.objectUrl === null) {
     return true;
   }

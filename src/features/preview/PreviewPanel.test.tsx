@@ -8,6 +8,7 @@ import { PreviewPanel } from "./PreviewPanel";
 
 describe("预览面板", () => {
   beforeEach(() => {
+    window.localStorage.clear();
     useEditorStore.setState({
       project: createEmptyProject(),
       selection: { kind: "none", ids: [] },
@@ -125,7 +126,7 @@ describe("预览面板", () => {
       expect(useEditorStore.getState().project.media?.durationMs).toBe(12_345)
     );
     expect(screen.getByText("demo.mp4")).toBeInTheDocument();
-    expect(screen.getByText("预览已就绪 / 00:00:12.345")).toBeInTheDocument();
+    expect(screen.getByText("HTML Video 已就绪 / 00:00:12.345")).toBeInTheDocument();
   });
 
   it("视频格式不支持时说明 HTML Video 限制和 mpv 后续方向", async () => {

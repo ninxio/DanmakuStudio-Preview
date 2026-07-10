@@ -247,6 +247,26 @@ describe("project health", () => {
     expect(createProjectHealthReport("目标绑定项目", summary)).toContain("目标原片重连：需要");
   });
 
+  it("本地目标原片已有路径时不提示目标重连", () => {
+    const summary = createProjectHealthSummary({
+      ...createEmptyProject(),
+      mediaBinding: {
+        id: "binding-local-path",
+        kind: "localFile",
+        displayName: "本地完整版",
+        fileName: "full.mkv",
+        mediaId: null,
+        localPath: "D:\\media\\full.mkv",
+        runtimeMs: 3_000_000,
+        linkedAt: "2026-07-10T00:00:00.000Z"
+      }
+    });
+
+    expect(summary.metrics.mediaBindingKind).toBe("localFile");
+    expect(summary.metrics.mediaBindingNeedsReconnect).toBe(false);
+    expect(summary.findings.some((finding) => finding.id === "target-local-needs-reconnect")).toBe(false);
+  });
+
   it("提示没有时间轴片段和所有片段禁用时显示证据", () => {
     const asset = createAsset("asset", [createItem("item-1")]);
     const noClipSummary = createProjectHealthSummary({

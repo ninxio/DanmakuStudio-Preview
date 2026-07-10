@@ -1,5 +1,22 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-10：成熟度提升阶段 C114 已完成：完成 G5 FFmpeg / mpv sidecar 管理能力。
+  - 设置中心将“FFmpeg 与对齐”升级为“播放器与工具”，支持保存 FFmpeg 路径、mpv 路径和播放器后端偏好；设置备份仍只包含非敏感字段，不保存密码、token 或临时播放 URL。
+  - 设置中心新增真实 FFmpeg/mpv 版本检测和 mpv 停止动作；网页模式不会伪装成本地桌面能力，会提示需要在 Tauri 桌面端运行。
+  - 资源面板“目标原片”新增“选择本地路径”，用户可把本地高码率 MKV 等真实文件路径绑定为目标原片；项目文件只保存路径引用和编辑状态，不嵌入视频内容。
+  - 新增 Tauri `media_tools` 后端，提供 FFmpeg/mpv 可执行文件检测、mpv sidecar 启动、停止、状态查询和控制命令；mpv 控制通过 IPC 发送播放、暂停、seek、倍率和属性读取，错误转换为普通用户可处理的中文提示。
+  - `NativeMpvMediaAdapter` 从占位推进为 `TauriMpvMediaAdapter` 真实实现：配置 mpv 且目标原片有真实本地路径时可使用 mpv；未配置 mpv 或只有浏览器 blob URL 时继续 HTML Video fallback，不假装支持 MKV。
+  - 预览区会显示当前后端；mpv 后端由外部 mpv 窗口播放，本应用继续同步播放头、时间、弹幕叠加状态和版本差异标记。
+  - 导出前检查和工作流总览已把带 `localPath` 的本地目标原片视为可重连媒体，不再误报目标原片缺失。
+  - README 和架构文档已同步播放器工具链、mpv sidecar 边界、本地路径引用和后续播放器化限制。
+  - 已补充设置、原生路径选择、mpv bridge、媒体适配器、目标原片绑定、资源面板、预览、导出前检查和工作流总览测试。
+  - 已重新验证：`cargo test` 通过（20 个 Rust 测试）；相关前端单测通过（11 个测试文件 / 86 个测试）；`corepack pnpm lint` 通过；`corepack pnpm test` 通过（41 个测试文件 / 239 个测试）；`corepack pnpm build` 通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、41 个测试文件 / 239 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12332544` 字节，时间 `2026/07/10 22:24:11`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3041191` 字节，时间 `2026/07/10 22:24:11`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c114-mpv-tooling-20260710`。
+
 - 2026-07-10：成熟度提升阶段 C113 已完成：完成 G4 轻量播放预览，用于实时看效果和打版本差异。
   - 预览区继续使用 HTML Video 作为轻量 fallback，不伪装完整播放器能力；界面会明确显示未导入、正在载入、可播放、格式不支持和需要重新连接等状态。
   - 本地目标原片绑定或项目媒体引用恢复后，如果当前会话缺少真实视频对象，预览区会提示重新导入同一份本地视频，不会把项目文件中的媒体引用误当成可播放内容。
@@ -97,7 +114,7 @@
 ## 当前主目标
 
 - 当前 goal：按 `docs/player-goal.md` 分阶段实现播放器化与全量对齐能力，让用户能把 B 站删减版弹幕对齐到自己的完整版视频上。
-- 下一阶段：G5 FFmpeg / mpv sidecar 管理能力。
+- 下一阶段：G6 音频对齐实用化。
 - 总体路线：
   1. 默认导出文件夹 / 自定义导出目录。
   2. Emby 原片绑定项目，不只是查时长。

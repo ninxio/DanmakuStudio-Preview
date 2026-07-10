@@ -1,4 +1,12 @@
 import type { Milliseconds } from "../../domain/shared/time";
+import {
+  controlTauriMpvSidecar,
+  getTauriMpvSidecarStatus,
+  startTauriMpvSidecar,
+  stopTauriMpvSidecar,
+  type MpvSidecarStatus,
+  type TauriMpvBridge
+} from "./tauriMpvPlayer";
 
 export interface MediaSource {
   kind: "file" | "url";
@@ -82,4 +90,120 @@ export class HtmlVideoMediaAdapter implements MediaAdapter {
 export interface NativeMpvMediaAdapter extends MediaAdapter {
   readonly kind: "native-mpv";
   getSupportedContainerNote(): string;
+}
+
+export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
+  readonly kind = "native-mpv";
+
+  private readonly mpvPath: string;
+  private readonly bridge?: TauriMpvBridge;
+  private currentTimeMs: Milliseconds = 0;
+  private durationMs: Milliseconds = 0;
+  private pollTimer: number | null = null;
+
+  constructor(mpvPath: string, bridge?: TauriMpvBridge) {
+    this.mpvPath = mpvPath.trim();
+    this.bridge = bridge;
+  }
+
+  async load(source: MediaSource): Promise<void> {
+    if (this.mpvPath.length === 0) {
+      throw new Error("尚未配置 mpv 路径。请在“设置中心 / 播放器与工具”里选择 mpv 可执行文件。");
+    }
+    if (source.kind !== "file" || source.url.startsWith("blob:")) {
+      throw new Error("mpv 播放需要真实本地文件路径。请在“目标原片”里选择本地原片路径。");
+    }
+    const status = await startTauriMpvSidecar(
+      {
+        mpvPath: this.mpvPath,
+        mediaPath: source.url,
+        startPositionMs: this.currentTimeMs,
+        startPaused: true
+      },
+      this.bridge
+    );
+    this.updateFromStatus(status);
+    this.startPolling();
+  }
+
+  async play(): Promise<void> {
+    const status = await controlTauriMpvSidecar({ action: "play" }, this.bridge);
+    this.updateFromStatus(status);
+    this.startPolling();
+  }
+
+  pause(): void {
+    void controlTauriMpvSidecar({ action: "pause" }, this.bridge)
+      .then((status) => this.updateFromStatus(status))
+      .catch(() => undefined);
+  }
+
+  seek(timeMs: Milliseconds): void {
+    this.currentTimeMs = Math.max(0, Math.round(timeMs));
+    void controlTauriMpvSidecar(
+      {
+        action: "seek",
+        positionMs: this.currentTimeMs
+      },
+      this.bridge
+    )
+      .then((status) => this.updateFromStatus(status))
+      .catch(() => undefined);
+  }
+
+  getCurrentTimeMs(): Milliseconds {
+    return this.currentTimeMs;
+  }
+
+  getDurationMs(): Milliseconds {
+    return this.durationMs;
+  }
+
+  setPlaybackRate(rate: number): void {
+    void controlTauriMpvSidecar(
+      {
+        action: "setPlaybackRate",
+        playbackRate: rate
+      },
+      this.bridge
+    )
+      .then((status) => this.updateFromStatus(status))
+      .catch(() => undefined);
+  }
+
+  dispose(): void {
+    this.stopPolling();
+    void stopTauriMpvSidecar(this.bridge).catch(() => undefined);
+  }
+
+  getSupportedContainerNote(): string {
+    return "mpv 后端用于本地 MKV、高码率或复杂编码视频；需要桌面端和真实本地文件路径。";
+  }
+
+  private startPolling(): void {
+    if (this.pollTimer) {
+      return;
+    }
+    this.pollTimer = window.setInterval(() => {
+      void getTauriMpvSidecarStatus(this.bridge)
+        .then((status) => this.updateFromStatus(status))
+        .catch(() => this.stopPolling());
+    }, 250);
+  }
+
+  private stopPolling(): void {
+    if (!this.pollTimer) {
+      return;
+    }
+    window.clearInterval(this.pollTimer);
+    this.pollTimer = null;
+  }
+
+  private updateFromStatus(status: MpvSidecarStatus): void {
+    this.currentTimeMs = Math.max(0, Math.round(status.positionMs));
+    this.durationMs = Math.max(0, Math.round(status.durationMs));
+    if (!status.running) {
+      this.stopPolling();
+    }
+  }
 }

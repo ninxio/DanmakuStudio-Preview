@@ -73,6 +73,27 @@ describe("资源面板", () => {
     expect(within(targetPanel).getByText("本地完整版")).toBeInTheDocument();
   });
 
+  it("媒体页可以选择本地路径作为 mpv 目标原片", async () => {
+    const user = userEvent.setup();
+    vi.mocked(pickAlignmentMediaPath).mockResolvedValue("D:\\media\\full.mkv");
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "媒体" }));
+    await user.click(screen.getByRole("button", { name: "选择本地路径" }));
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
+        kind: "localFile",
+        displayName: "full",
+        fileName: "full.mkv",
+        localPath: "D:\\media\\full.mkv"
+      })
+    );
+    const targetPanel = getTargetMediaBindingPanel();
+    expect(within(targetPanel).getByText("本地文件已连接")).toBeInTheDocument();
+    expect(within(targetPanel).getByText("D:\\media\\full.mkv")).toBeInTheDocument();
+  });
+
   it("媒体页显示保存恢复的 Emby 目标原片绑定", async () => {
     const user = userEvent.setup();
     useEditorStore.setState({

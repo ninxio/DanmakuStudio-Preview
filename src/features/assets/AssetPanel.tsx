@@ -50,7 +50,8 @@ import {
   formatMediaBindingEpisode,
   formatMediaBindingSource,
   formatMediaBindingTitle,
-  formatMediaSourceSummary
+  formatMediaSourceSummary,
+  createLocalPathMediaBinding
 } from "../../domain/project/mediaBinding";
 import {
   createProjectMatchAssessment,
@@ -216,6 +217,24 @@ export function AssetPanel() {
   const projectReadiness = useMemo(() => createProjectReadinessSummary(project), [project]);
   const projectMatchAssessment = useMemo(() => createProjectMatchAssessment(project), [project]);
 
+  const bindLocalPathAsTarget = async () => {
+    const currentPath = project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath ?? "" : "";
+    try {
+      const path = await pickAlignmentMediaPath(currentPath);
+      if (!path) {
+        return;
+      }
+      const binding = createLocalPathMediaBinding(createId("media_binding"), path);
+      setMediaBinding(binding);
+      setStatus({ message: `已绑定本地目标原片路径：${binding.fileName}`, tone: "success" });
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "选择本地目标原片失败。",
+        tone: "warning"
+      });
+    }
+  };
+
   const validateEmbyTargetBinding = async () => {
     const binding = project.mediaBinding;
     if (!binding || binding.kind !== "embyItem") {
@@ -289,6 +308,7 @@ export function AssetPanel() {
               media={project.media}
               validating={targetValidationLoading}
               onBindLocal={bindCurrentMediaAsTarget}
+              onBindLocalPath={() => void bindLocalPathAsTarget()}
               onValidateEmby={() => void validateEmbyTargetBinding()}
               onClear={clearMediaBinding}
             />
@@ -560,6 +580,7 @@ function TargetMediaBindingPanel({
   media,
   validating,
   onBindLocal,
+  onBindLocalPath,
   onValidateEmby,
   onClear
 }: {
@@ -567,13 +588,15 @@ function TargetMediaBindingPanel({
   media: MediaReference | null;
   validating: boolean;
   onBindLocal: () => void;
+  onBindLocalPath: () => void;
   onValidateEmby: () => void;
   onClear: () => void;
 }) {
   const localBindingConnected =
     binding?.kind === "localFile" &&
-    Boolean(media?.objectUrl) &&
-    (binding.mediaId ? media?.id === binding.mediaId : media?.fileName === binding.fileName);
+    (Boolean(binding.localPath) ||
+      (Boolean(media?.objectUrl) &&
+        (binding.mediaId ? media?.id === binding.mediaId : media?.fileName === binding.fileName)));
   const statusText = !binding
     ? "未绑定"
     : binding.kind === "localFile"
@@ -601,6 +624,9 @@ function TargetMediaBindingPanel({
           <Row label="来源" value={formatMediaBindingSource(binding)} />
           <Row label="位置" value={formatMediaBindingEpisode(binding)} />
           <Row label="时长" value={binding.runtimeMs === null ? "未知" : formatTimecode(binding.runtimeMs)} />
+          {binding.kind === "localFile" ? (
+            <Row label="本地路径" value={binding.localPath ? binding.localPath : "未保存路径"} />
+          ) : null}
           {binding.kind === "embyItem" ? (
             <>
               <Row label="条目 ID" value={binding.itemId} />
@@ -616,6 +642,10 @@ function TargetMediaBindingPanel({
         <TextButton onClick={onBindLocal} disabled={!media}>
           <Video size={14} />
           绑定当前视频
+        </TextButton>
+        <TextButton onClick={onBindLocalPath}>
+          <FolderOpen size={14} />
+          选择本地路径
         </TextButton>
         {binding?.kind === "embyItem" ? (
           <TextButton onClick={onValidateEmby} disabled={validating}>

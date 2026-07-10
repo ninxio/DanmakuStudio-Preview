@@ -36,6 +36,26 @@ export function createLocalFileMediaBinding(
   };
 }
 
+export function createLocalPathMediaBinding(
+  id: string,
+  localPath: string,
+  runtimeMs: Milliseconds | null = null,
+  linkedAt = new Date().toISOString()
+): LocalFileMediaBinding {
+  const normalizedPath = localPath.trim();
+  const fileName = extractFileName(normalizedPath);
+  return {
+    id,
+    kind: "localFile",
+    displayName: stripExtension(fileName),
+    fileName,
+    mediaId: null,
+    localPath: normalizedPath,
+    runtimeMs,
+    linkedAt
+  };
+}
+
 export function createEmbyItemMediaBinding(
   id: string,
   item: EmbyItemBindingInput,
@@ -121,6 +141,15 @@ function createEmbyDisplayName(item: EmbyItemBindingInput): string {
   }
   episodeParts.push(item.name);
   return episodeParts.join(" / ");
+}
+
+function extractFileName(path: string): string {
+  const parts = path.split(/[\\/]/).filter((part) => part.length > 0);
+  return parts.at(-1) ?? path;
+}
+
+function stripExtension(fileName: string): string {
+  return fileName.replace(/\.[^.]+$/, "");
 }
 
 function normalizeMediaSourceSummary(source: EmbyMediaSourceSummary): EmbyMediaSourceSummary {
