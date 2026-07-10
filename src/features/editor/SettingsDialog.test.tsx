@@ -3,7 +3,12 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
-import { APP_SETTINGS_STORAGE_KEY, loadAppSettings, saveAppSettings } from "../../infrastructure/settings/appSettings";
+import {
+  APP_SETTINGS_SCHEMA_VERSION,
+  APP_SETTINGS_STORAGE_KEY,
+  loadAppSettings,
+  saveAppSettings
+} from "../../infrastructure/settings/appSettings";
 import {
   clearVolatileEmbyCredentials,
   loadVolatileEmbyPassword,
@@ -150,6 +155,7 @@ describe("设置中心", () => {
         throw new Error("导出的设置备份不是 Blob。");
       }
       const text = await readBlobText(blob);
+      expect(JSON.parse(text)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
       expect(text).toContain("https://emby.example.test");
       expect(text).not.toContain("secret-pass");
       expect(text).not.toContain("password");
@@ -216,6 +222,26 @@ describe("设置中心", () => {
     const raw = window.localStorage.getItem(APP_SETTINGS_STORAGE_KEY) ?? "";
     expect(raw).not.toContain("secret");
     expect(raw).not.toContain("token");
+  });
+
+  it("导入不支持版本的设置备份会提示错误", async () => {
+    const user = userEvent.setup();
+    render(<SettingsDialog onClose={() => undefined} />);
+    const file = new File(
+      [
+        JSON.stringify({
+          schemaVersion: APP_SETTINGS_SCHEMA_VERSION + 1,
+          emby: {},
+          alignment: {}
+        })
+      ],
+      "future-settings.json",
+      { type: "application/json" }
+    );
+
+    await user.upload(screen.getByTestId("settings-import-input"), file);
+
+    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("暂不支持"));
   });
 });
 

@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C32 已完成：应用设置备份格式增加版本化保护。
+  - `serializeAppSettings` 现在导出的设置备份会写入 `schemaVersion: 1`，桌面配置文件和浏览器 fallback 都沿用同一套规范化序列化入口。
+  - `parseAppSettingsTextStrict` 继续兼容旧版无版本备份；遇到非数字版本或未来版本时会明确报错，不会静默覆盖为默认设置。
+  - 设置中心导入未来版本备份时会把“不支持版本”反馈到状态栏；隐私页文案已说明备份带 schemaVersion 且旧版无版本备份仍可导入。
+  - README 已同步：设置中心现在导出/导入版本化应用设置备份，后续路线调整为后续 schema 升级时补迁移界面和冲突提示。
+  - 已补充应用设置、桌面设置桥和设置中心导入/导出测试。
+  - 已重新验证：`corepack pnpm test -- --run src/infrastructure/settings/appSettings.test.ts src/infrastructure/settings/desktopAppSettings.test.ts src/features/editor/SettingsDialog.test.tsx` 成功，3 个测试文件、17 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、130 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:38:37`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997395` 字节，时间 `2026/07/10 8:38:37`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c32-versioned-settings-backup-20260710`。
 - 成熟度提升阶段 C31 已完成：Playwright E2E 覆盖项目健康摘要。
   - 核心 E2E 流程在保存并重新打开项目后，会切换到“项目信息”，断言“项目健康”面板可见、状态为“健康”，并确认“媒体重连”指标存在。
   - 已新增真实浏览器截图基线：`artifacts/screenshots/project-health.png`，大小 `79007` 字节，时间 `2026/07/10 8:33:34`。

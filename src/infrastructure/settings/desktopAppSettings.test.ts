@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { APP_SETTINGS_STORAGE_KEY, loadAppSettings, saveAppSettings } from "./appSettings";
+import { APP_SETTINGS_SCHEMA_VERSION, APP_SETTINGS_STORAGE_KEY, loadAppSettings, saveAppSettings } from "./appSettings";
 import {
   clearDesktopAppSettings,
   hydrateDesktopAppSettings,
@@ -74,6 +74,7 @@ describe("桌面应用设置桥", () => {
 
     expect(bridge.save).toHaveBeenCalledTimes(1);
     const [content] = vi.mocked(bridge.save).mock.calls[0];
+    expect(JSON.parse(content)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(content).toContain("https://emby.example.test");
     expect(content).toContain("/emby");
     expect(content).not.toContain("password");

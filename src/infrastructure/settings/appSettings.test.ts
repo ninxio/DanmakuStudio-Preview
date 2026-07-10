@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  APP_SETTINGS_SCHEMA_VERSION,
   APP_SETTINGS_STORAGE_KEY,
   DEFAULT_APP_SETTINGS,
   clearAppSettings,
@@ -43,6 +44,7 @@ describe("应用设置持久化", () => {
       username: "tester"
     });
     const raw = storage.getItem(APP_SETTINGS_STORAGE_KEY) ?? "";
+    expect(JSON.parse(raw)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(raw).toContain("ffmpeg.exe");
     expect(raw).not.toContain("password");
     expect(raw).not.toContain("token");
@@ -114,14 +116,45 @@ describe("应用设置持久化", () => {
       )
     );
 
+    expect(JSON.parse(text)).toMatchObject({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION });
     expect(text).toContain("https://emby.example.test");
     expect(text).not.toContain("secret");
     expect(text).not.toContain("token");
   });
 
+  it("严格解析设置备份时兼容无版本的旧备份", () => {
+    expect(
+      parseAppSettingsTextStrict(
+        JSON.stringify({
+          emby: {
+            serverUrl: "https://legacy.example.test",
+            pathPrefix: "emby",
+            username: "legacy"
+          },
+          alignment: {
+            ffmpegPath: "ffmpeg",
+            windowMs: 500,
+            minGapMs: 1200,
+            matchThreshold: 0.25
+          }
+        })
+      ).emby
+    ).toEqual({
+      serverUrl: "https://legacy.example.test",
+      pathPrefix: "/emby",
+      username: "legacy"
+    });
+  });
+
   it("严格解析设置备份时保留 JSON 语法错误", () => {
     expect(() => parseAppSettingsTextStrict("not json")).toThrow();
     expect(() => parseAppSettingsTextStrict("[]")).toThrow("设置备份必须是 JSON 对象。");
+    expect(() => parseAppSettingsTextStrict(JSON.stringify({ schemaVersion: "1" }))).toThrow(
+      "设置备份 schemaVersion 必须是数字。"
+    );
+    expect(() => parseAppSettingsTextStrict(JSON.stringify({ schemaVersion: APP_SETTINGS_SCHEMA_VERSION + 1 }))).toThrow(
+      `设置备份版本 ${APP_SETTINGS_SCHEMA_VERSION + 1} 暂不支持`
+    );
   });
 });
 

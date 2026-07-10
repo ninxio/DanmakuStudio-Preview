@@ -18,6 +18,7 @@ export interface AppSettingsStorage {
   removeItem: (key: string) => void;
 }
 
+export const APP_SETTINGS_SCHEMA_VERSION = 1;
 export const APP_SETTINGS_STORAGE_KEY = "danmaku.timelineStudio.appSettings.v1";
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -77,11 +78,15 @@ export function parseAppSettingsTextStrict(text: string): AppSettings {
   if (!isRecord(parsed)) {
     throw new Error("设置备份必须是 JSON 对象。");
   }
+  validateAppSettingsVersion(parsed);
   return normalizeAppSettings(parsed);
 }
 
 export function serializeAppSettings(settings: AppSettings): string {
-  return JSON.stringify(normalizeAppSettings(settings));
+  return JSON.stringify({
+    schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
+    ...normalizeAppSettings(settings)
+  });
 }
 
 export function normalizeAppSettings(value: unknown): AppSettings {
@@ -118,6 +123,20 @@ function getDefaultStorage(): AppSettingsStorage | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateAppSettingsVersion(value: Record<string, unknown>): void {
+  if (value.schemaVersion === undefined) {
+    return;
+  }
+  if (typeof value.schemaVersion !== "number") {
+    throw new Error("设置备份 schemaVersion 必须是数字。");
+  }
+  if (value.schemaVersion !== APP_SETTINGS_SCHEMA_VERSION) {
+    throw new Error(
+      `设置备份版本 ${value.schemaVersion} 暂不支持，当前支持版本为 ${APP_SETTINGS_SCHEMA_VERSION}。`
+    );
+  }
 }
 
 function readString(value: unknown, fallback: string): string {
