@@ -24,7 +24,8 @@ import {
 import {
   cleanupProjectEditReferences as cleanupProjectEditReferencesInProject,
   cleanupProjectMissingAssetClips as cleanupProjectMissingAssetClipsInProject,
-  createProjectHealthSummary
+  createProjectHealthSummary,
+  summarizeProjectHealthBlockers
 } from "../domain/project/health";
 import type { EditorProject, EditorSelection, MediaReference } from "../domain/project/types";
 import {
@@ -958,10 +959,11 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const health = createProjectHealthSummary(project);
     const blockingFinding = health.findings.find((finding) => finding.severity === "error");
     if (blockingFinding) {
+      const blockingDetail = summarizeProjectHealthBlockers(health) ?? blockingFinding.title;
       set({
         exportDraft: null,
         status: {
-          message: `项目健康检查未通过：${blockingFinding.title}。请在项目信息中处理后再导出。`,
+          message: `项目健康检查未通过：${blockingDetail}。请在项目信息中处理后再导出。`,
           tone: "warning"
         }
       });

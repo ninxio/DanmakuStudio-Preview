@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C80 已完成：导出前健康阻断提示汇总多个问题。
+  - 新增 `summarizeProjectHealthBlockers` 领域 helper，用于从项目健康摘要中生成导出阻断项标题概览。
+  - `prepareExport` 在项目存在多个结构阻断时，现在会在状态栏同时提示多个阻断标题，不再只显示第一个问题。
+  - 单个阻断项的提示保持原有文案风格；多个阻断项会用中文顿号汇总，并继续引导用户到“项目信息”处理。
+  - 已补充项目健康和 store 测试，覆盖阻断摘要 helper 以及导出前多阻断项状态提示。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts src/stores/editorStore.test.ts` 成功，2 个测试文件、31 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/172 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 12:39:18`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2998135` 字节，时间 `2026/07/10 12:39:18`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c80-export-blocker-summary-status-20260710`。
 - 成熟度提升阶段 C79 已完成：片段源区间统一为半开区间。
   - `isItemInsideClip` 现在按 `[sourceInMs, sourceOutMs)` 判断片段源区间，避免刚好落在剪切边界的弹幕同时进入左右两个片段而重复导出。
   - 新增片段和自动排列片段现在会把 `sourceOutMs` 设置为最后一条弹幕后 1ms，保持半开区间语义下不丢尾条弹幕。

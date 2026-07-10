@@ -388,6 +388,14 @@ export function createProjectHealthReport(
   return `${lines.join("\n")}\n`;
 }
 
+export function summarizeProjectHealthBlockers(summary: ProjectHealthSummary): string | null {
+  const blockers = summary.findings.filter((finding) => finding.severity === "error");
+  if (blockers.length === 0) {
+    return null;
+  }
+  return formatLimitedList(blockers.map((finding) => finding.title));
+}
+
 function collectProjectItemIds(project: EditorProject): Set<string> {
   return new Set(project.assets.flatMap((asset) => asset.items.map((item) => item.id)));
 }

@@ -5,7 +5,8 @@ import {
   cleanupProjectEditReferences,
   cleanupProjectMissingAssetClips,
   createProjectHealthReport,
-  createProjectHealthSummary
+  createProjectHealthSummary,
+  summarizeProjectHealthBlockers
 } from "./health";
 
 describe("project health", () => {
@@ -106,6 +107,7 @@ describe("project health", () => {
     expect(report).toContain("重复 ID：1 个");
     expect(report).toContain("same-id：资源 asset.xml 的第 1 条弹幕；资源 asset.xml 的第 2 条弹幕");
     expect(report).toContain("缺失资源 ID：missing-asset");
+    expect(summarizeProjectHealthBlockers(summary)).toBe("弹幕 ID 重复、片段引用了缺失资源");
   });
 
   it("重复 ID 证据超过预览限制时提示剩余数量", () => {
