@@ -163,6 +163,7 @@ describe("资源面板", () => {
       await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
       await expect(readBlobText(blob)).resolves.toContain("没有时间轴片段");
       await expect(readBlobText(blob)).resolves.toContain("01 - 1.1.xml（1 条弹幕）");
+      expect(useEditorStore.getState().status.message).toBe("已导出项目健康报告：健康_报告_项目-health-report.txt。");
       expect(clickSpy).toHaveBeenCalledTimes(1);
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
     } finally {
