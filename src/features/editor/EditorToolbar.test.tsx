@@ -61,4 +61,30 @@ describe("编辑器工具栏", () => {
 
     expect(screen.getByLabelText("导出 XML")).toBeEnabled();
   });
+
+  it("对齐提案存在应用阻断时禁用顶部应用入口", () => {
+    useEditorStore.setState({
+      alignmentProposal: {
+        anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, origin: "automatic" }],
+        cutCandidates: [
+          {
+            id: "cut",
+            name: "异常区间",
+            sourceAtMs: 20_000,
+            sourceRangeStartMs: 22_000,
+            sourceRangeEndMs: 18_000,
+            targetGapMs: 20_000,
+            confidence: 0.8,
+            note: ""
+          }
+        ],
+        confidence: 0.8,
+        diagnostics: ["测试"]
+      }
+    });
+
+    render(<EditorToolbar />);
+
+    expect(screen.getByRole("button", { name: "应用对齐" })).toBeDisabled();
+  });
 });

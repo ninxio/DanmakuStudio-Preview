@@ -46,6 +46,7 @@ import {
   validateExportedXml
 } from "../infrastructure/xml/bilibiliXml";
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
+import { createAlignmentApplyBlockers } from "../domain/alignment/alignmentReport";
 import { parseAlignmentProposal } from "../domain/alignment/manualProvider";
 import { pickAssetColor } from "../domain/shared/assetColors";
 import {
@@ -983,6 +984,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   applyAlignmentProposalData: (proposal) => {
+    const blockers = createAlignmentApplyBlockers(proposal);
+    if (blockers.length > 0) {
+      set({
+        status: {
+          message: `对齐提案存在应用阻断：${blockers[0]}`,
+          tone: "warning"
+        }
+      });
+      return;
+    }
     commitProject(set, get, "应用对齐提案", (project) => ({
       ...project,
       syncAnchors: uniqueById([...project.syncAnchors, ...proposal.anchors]),

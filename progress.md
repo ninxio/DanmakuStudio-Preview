@@ -25,6 +25,22 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C26 已完成：对齐提案新增应用阻断校验。
+  - `alignmentReport` 领域模块新增 `createAlignmentApplyBlockers`，用于识别不能安全写入项目的明显异常：同步锚点或候选补偿 ID 为空、提案内重复 ID、不确定区间起止反向、候选源时间落在不确定区间外。
+  - Store 层 `applyAlignmentProposalData` 增加兜底校验；异常提案可以导入、预览和导出报告，但不会被写入 `syncAnchors` 或 `cutMarkers`，状态栏会给出第一条阻断原因。
+  - “视频对齐实验室”新增“应用已暂停”提示块，并禁用“应用候选”；顶部工具栏“应用对齐”也会在同一规则下禁用，避免绕过资源栏保护。
+  - 低置信度仍只是复核提示，不会阻断应用；阻断只覆盖会造成项目状态歧义或明显坏数据的结构问题。
+  - README 已同步：本地音频对齐实验室支持异常提案应用阻断。
+  - 已补充领域、store、资源栏和顶部工具栏测试。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/alignment/alignmentReport.test.ts src/stores/editorStore.test.ts src/features/assets/AssetPanel.test.tsx src/features/editor/EditorToolbar.test.tsx` 成功，4 个测试文件、28 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 31 个测试文件、115 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12235264` 字节，时间 `2026/07/10 8:06:58`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2989575` 字节，时间 `2026/07/10 8:06:58`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c26-alignment-apply-blockers-20260710`。
 - 成熟度提升阶段 C25 已完成：对齐提案在应用前展示复核提示。
   - `alignmentReport` 领域模块新增可复用的 `createAlignmentReviewFocus`，报告下载和 UI 预览共用同一套风险判断。
   - “视频对齐实验室”在导入或生成提案后，会直接显示“复核提示”，标出低置信度候选、源时间不确定区间、区间起止异常、缺失诊断信息等风险点。
@@ -1086,7 +1102,7 @@
    - 已接入 UI 的 proposal 导入、复核和一键应用 MVP。
    - 已接入 Tauri 本地命令，可直接从桌面 UI 运行音频对齐任务。
    - 已支持音频特征窗口、最小缺失时长和匹配阈值调参。
-   - 已支持导出当前对齐提案 JSON、应用前复核提示和复核报告，用于复现、回放和人工确认。
+   - 已支持导出当前对齐提案 JSON、应用前复核提示、异常提案应用阻断和复核报告，用于复现、回放和人工确认。
    - 已支持后台任务状态、进度轮询和任务级取消请求。
    - 已补强：使用原生文件选择器选择完整片源、删减版视频和 FFmpeg 路径。
    - 已补强：FFmpeg 音频提取阶段支持任务取消时终止子进程，并补充任务日志面板。

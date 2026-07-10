@@ -16,16 +16,17 @@ import {
 import { useRef, useState } from "react";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
+import { createAlignmentApplyBlockers } from "../../domain/alignment/alignmentReport";
+import { serializeProject } from "../../domain/project/schema";
 import { formatTimecode } from "../../domain/shared/time";
+import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import {
   sliderValueToZoom,
   TIMELINE_ZOOM_SLIDER_MAX,
   TIMELINE_ZOOM_SLIDER_MIN,
   zoomToSliderValue
 } from "../../domain/timeline/view";
-import { resolveProjectDanmakuEvents } from "../../domain/timeline/mapping";
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
-import { serializeProject } from "../../domain/project/schema";
 import { useEditorStore } from "../../stores/editorStore";
 import { SettingsDialog } from "./SettingsDialog";
 
@@ -50,6 +51,7 @@ export function EditorToolbar() {
   const exportAlignmentProposal = useEditorStore((state) => state.exportAlignmentProposal);
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
+  const alignmentApplyBlockers = alignmentProposal ? createAlignmentApplyBlockers(alignmentProposal) : [];
   const canExportXml = useEditorStore((state) =>
     resolveProjectDanmakuEvents(state.project).some((event) => event.enabled)
   );
@@ -128,9 +130,9 @@ export function EditorToolbar() {
         导出对齐
       </TextButton>
       <TextButton
-        title="应用当前对齐提案"
+        title={alignmentApplyBlockers[0] ?? "应用当前对齐提案"}
         onClick={applyAlignmentProposal}
-        disabled={!alignmentProposal}
+        disabled={!alignmentProposal || alignmentApplyBlockers.length > 0}
         className="hidden xl:inline-flex"
         tone="primary"
       >

@@ -54,6 +54,43 @@ export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[
   return focus;
 }
 
+export function createAlignmentApplyBlockers(proposal: AlignmentProposal): string[] {
+  const blockers: string[] = [];
+  const emptyAnchorIdCount = proposal.anchors.filter((anchor) => anchor.id.trim().length === 0).length;
+  const emptyCutIdCount = proposal.cutCandidates.filter((candidate) => candidate.id.trim().length === 0).length;
+  const duplicateAnchorIdCount = countDuplicateIds(proposal.anchors.map((anchor) => anchor.id));
+  const duplicateCutIdCount = countDuplicateIds(proposal.cutCandidates.map((candidate) => candidate.id));
+  const invalidRangeCount = proposal.cutCandidates.filter(
+    (candidate) => hasCompleteSourceRange(candidate) && candidate.sourceRangeStartMs > candidate.sourceRangeEndMs
+  ).length;
+  const sourceOutsideRangeCount = proposal.cutCandidates.filter(
+    (candidate) =>
+      hasCompleteSourceRange(candidate) &&
+      candidate.sourceRangeStartMs <= candidate.sourceRangeEndMs &&
+      (candidate.sourceAtMs < candidate.sourceRangeStartMs || candidate.sourceAtMs > candidate.sourceRangeEndMs)
+  ).length;
+
+  if (emptyAnchorIdCount > 0) {
+    blockers.push(`${emptyAnchorIdCount} 个同步锚点缺少 ID，无法安全写入项目。`);
+  }
+  if (emptyCutIdCount > 0) {
+    blockers.push(`${emptyCutIdCount} 个候选补偿缺少 ID，无法安全写入项目。`);
+  }
+  if (duplicateAnchorIdCount > 0) {
+    blockers.push(`${duplicateAnchorIdCount} 个同步锚点 ID 在提案内重复，应用会丢失锚点。`);
+  }
+  if (duplicateCutIdCount > 0) {
+    blockers.push(`${duplicateCutIdCount} 个候选补偿 ID 在提案内重复，应用会丢失补偿。`);
+  }
+  if (invalidRangeCount > 0) {
+    blockers.push(`${invalidRangeCount} 个候选补偿的不确定区间起止顺序异常，请修正后再应用。`);
+  }
+  if (sourceOutsideRangeCount > 0) {
+    blockers.push(`${sourceOutsideRangeCount} 个候选补偿的源时间不在不确定区间内，请修正后再应用。`);
+  }
+  return blockers;
+}
+
 function createAnchorLines(proposal: AlignmentProposal): string[] {
   if (proposal.anchors.length === 0) {
     return ["- 暂无同步锚点。"];
@@ -110,6 +147,23 @@ function hasCompleteSourceRange(
   candidate: CutCandidate
 ): candidate is CutCandidate & { sourceRangeStartMs: number; sourceRangeEndMs: number } {
   return candidate.sourceRangeStartMs !== undefined && candidate.sourceRangeEndMs !== undefined;
+}
+
+function countDuplicateIds(ids: string[]): number {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const rawId of ids) {
+    const id = rawId.trim();
+    if (id.length === 0) {
+      continue;
+    }
+    if (seen.has(id)) {
+      duplicates.add(id);
+      continue;
+    }
+    seen.add(id);
+  }
+  return duplicates.size;
 }
 
 function formatConfidence(confidence: number): string {

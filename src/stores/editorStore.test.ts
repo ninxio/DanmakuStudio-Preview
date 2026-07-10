@@ -175,6 +175,33 @@ describe("editor store", () => {
     expect(useEditorStore.getState().status.message).toContain("时间轴预览");
   });
 
+  it("阻止明显异常的对齐提案写入项目", () => {
+    useEditorStore.getState().applyAlignmentProposalData({
+      anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
+      cutCandidates: [
+        {
+          id: "cut",
+          name: "异常区间",
+          sourceAtMs: 20_000,
+          sourceRangeStartMs: 22_000,
+          sourceRangeEndMs: 18_000,
+          targetGapMs: 20_000,
+          confidence: 0.8,
+          note: ""
+        }
+      ],
+      confidence: 0.8,
+      diagnostics: ["测试"]
+    });
+
+    expect(useEditorStore.getState().project.syncAnchors).toHaveLength(0);
+    expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
+    expect(useEditorStore.getState().status).toEqual({
+      message: "对齐提案存在应用阻断：1 个候选补偿的不确定区间起止顺序异常，请修正后再应用。",
+      tone: "warning"
+    });
+  });
+
   it("更新和删除同步锚点", () => {
     resetStore({
       ...createEmptyProject(),

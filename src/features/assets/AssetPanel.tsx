@@ -1,7 +1,11 @@
 import { Download, FolderOpen, Layers, ListPlus, ListX, Search, Shuffle, Trash2, Video, WandSparkles } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
-import { createAlignmentReviewFocus, createAlignmentReviewReport } from "../../domain/alignment/alignmentReport";
+import {
+  createAlignmentApplyBlockers,
+  createAlignmentReviewFocus,
+  createAlignmentReviewReport
+} from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
@@ -1203,6 +1207,7 @@ function VideoAlignmentLabPanel({
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
+  const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal) : [];
 
   useEffect(() => {
     let mounted = true;
@@ -1576,7 +1581,8 @@ function VideoAlignmentLabPanel({
           <TextButton
             tone="primary"
             onClick={onApply}
-            disabled={!proposal || pendingCount === 0}
+            disabled={!proposal || pendingCount === 0 || applyBlockers.length > 0}
+            title={applyBlockers[0] ?? "应用候选"}
           >
             应用候选
           </TextButton>
@@ -1611,6 +1617,16 @@ function VideoAlignmentLabPanel({
                 <div className="mb-1 font-medium">复核提示</div>
                 <ul className="grid list-disc gap-1 pl-4">
                   {reviewFocus.slice(0, 3).map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {applyBlockers.length > 0 ? (
+              <div className="rounded border border-accent-red/30 bg-accent-red/10 p-2 text-[11px] text-red-100">
+                <div className="mb-1 font-medium">应用已暂停</div>
+                <ul className="grid list-disc gap-1 pl-4">
+                  {applyBlockers.slice(0, 3).map((item) => (
                     <li key={item}>{item}</li>
                   ))}
                 </ul>

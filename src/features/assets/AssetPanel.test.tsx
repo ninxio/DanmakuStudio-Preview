@@ -237,6 +237,38 @@ describe("资源面板", () => {
     });
   });
 
+  it("会暂停应用区间异常的对齐提案", async () => {
+    const user = userEvent.setup();
+    const proposal = {
+      anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
+      cutCandidates: [
+        {
+          id: "audio-gap-1",
+          name: "音频推断补偿 1",
+          sourceAtMs: 20_000,
+          sourceRangeStartMs: 22_000,
+          sourceRangeEndMs: 18_000,
+          targetGapMs: 20_000,
+          confidence: 0.9,
+          note: "音频对齐候选"
+        }
+      ],
+      confidence: 0.9,
+      diagnostics: ["音频特征匹配 4 / 4 帧。"]
+    };
+    render(<AssetPanel />);
+
+    fireEvent.change(screen.getByPlaceholderText("AlignmentProposal JSON"), {
+      target: { value: JSON.stringify(proposal) }
+    });
+    await user.click(screen.getByRole("button", { name: "导入提案" }));
+
+    expect(screen.getByText("应用已暂停")).toBeInTheDocument();
+    expect(screen.getAllByText(/不确定区间起止顺序异常/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "应用候选" })).toBeDisabled();
+    expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
+  });
+
   it("可以导出当前音频对齐提案 JSON", async () => {
     const user = userEvent.setup();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");

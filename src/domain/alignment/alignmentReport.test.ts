@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createAlignmentReviewFocus, createAlignmentReviewReport } from "./alignmentReport";
+import {
+  createAlignmentApplyBlockers,
+  createAlignmentReviewFocus,
+  createAlignmentReviewReport
+} from "./alignmentReport";
 import type { AlignmentProposal } from "./types";
 
 describe("alignment review report", () => {
@@ -54,5 +58,55 @@ describe("alignment review report", () => {
     expect(report).toContain("没有诊断信息");
     expect(report).toContain("暂无同步锚点。");
     expect(report).toContain("暂无候选补偿。");
+  });
+
+  it("识别会阻断应用的结构异常", () => {
+    const proposal: AlignmentProposal = {
+      anchors: [
+        { id: "", sourceMs: 1000, targetMs: 1000, origin: "automatic" },
+        { id: "anchor-dup", sourceMs: 2000, targetMs: 3000, origin: "automatic" },
+        { id: "anchor-dup", sourceMs: 4000, targetMs: 5000, origin: "automatic" }
+      ],
+      cutCandidates: [
+        {
+          id: "range-reversed",
+          name: "区间反向",
+          sourceAtMs: 20_000,
+          sourceRangeStartMs: 22_000,
+          sourceRangeEndMs: 18_000,
+          targetGapMs: 20_000,
+          confidence: 0.8,
+          note: ""
+        },
+        {
+          id: "source-outside",
+          name: "源时间越界",
+          sourceAtMs: 30_000,
+          sourceRangeStartMs: 18_000,
+          sourceRangeEndMs: 22_000,
+          targetGapMs: 20_000,
+          confidence: 0.8,
+          note: ""
+        },
+        {
+          id: "source-outside",
+          name: "重复 ID",
+          sourceAtMs: 40_000,
+          targetGapMs: 20_000,
+          confidence: 0.8,
+          note: ""
+        }
+      ],
+      confidence: 0.8,
+      diagnostics: ["测试"]
+    };
+
+    expect(createAlignmentApplyBlockers(proposal)).toEqual([
+      "1 个同步锚点缺少 ID，无法安全写入项目。",
+      "1 个同步锚点 ID 在提案内重复，应用会丢失锚点。",
+      "1 个候选补偿 ID 在提案内重复，应用会丢失补偿。",
+      "1 个候选补偿的不确定区间起止顺序异常，请修正后再应用。",
+      "1 个候选补偿的源时间不在不确定区间内，请修正后再应用。"
+    ]);
   });
 });
