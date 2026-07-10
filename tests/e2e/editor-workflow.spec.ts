@@ -17,6 +17,17 @@ test.beforeAll(() => {
   mkdirSync(downloadDir, { recursive: true });
 });
 
+test.beforeEach(async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-07-10T01:02:03.000Z"));
+  await page.addInitScript(() => {
+    let seed = 13_579;
+    Math.random = () => {
+      seed = (seed * 48_271) % 2_147_483_647;
+      return seed / 2_147_483_647;
+    };
+  });
+});
+
 test("核心编辑流程可导入、编辑、导出并重新导入 XML", async ({ page }) => {
   await page.goto("/");
 
