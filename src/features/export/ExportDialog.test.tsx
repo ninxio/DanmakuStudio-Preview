@@ -56,7 +56,71 @@ describe("导出摘要", () => {
     useEditorStore.getState().prepareExport();
     render(<ExportDialog />);
     expect(screen.getByText("导出 XML 摘要")).toBeInTheDocument();
+    expect(screen.getByText("导出前健康检查")).toBeInTheDocument();
     expect(screen.getByText("导出 XML 可重新导入。 验证条数：1")).toBeInTheDocument();
+  });
+
+  it("显示导出前健康复核项并可下载健康报告", async () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:project-health-report");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+    const project = useEditorStore.getState().project;
+    useEditorStore.setState({
+      project: {
+        ...project,
+        name: "健康复核项目",
+        assets: [
+          {
+            ...project.assets[0],
+            warnings: [
+              {
+                id: "warning",
+                assetId: project.assets[0].id,
+                originalIndex: null,
+                severity: "warning" as const,
+                message: "跳过一条坏弹幕",
+                rawSnippet: "<d/>"
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    try {
+      useEditorStore.getState().prepareExport();
+      render(<ExportDialog />);
+
+      expect(screen.getAllByText("需复核").length).toBeGreaterThan(0);
+      expect(screen.getByText("导入时存在警告")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "下载健康报告" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const [blob] = createObjectUrl.mock.calls[0];
+      if (!(blob instanceof Blob)) {
+        throw new Error("健康报告下载对象不是 Blob。");
+      }
+      await expect(readBlobText(blob)).resolves.toContain("项目健康报告");
+      await expect(readBlobText(blob)).resolves.toContain("导入时存在警告");
+      expect(clickSpy).toHaveBeenCalledTimes(1);
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:project-health-report");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
   });
 
   it("显示补偿明细并可下载补偿报告", async () => {

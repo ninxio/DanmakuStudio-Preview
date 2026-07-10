@@ -25,6 +25,21 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C42 已完成：导出摘要接入项目健康预检。
+  - `ExportDialog` 现在在导出 XML 摘要中显示“导出前健康检查”，包含当前项目健康状态、状态说明和最多 3 条非 ready 复核项。
+  - 导出摘要新增真实“下载健康报告”按钮，下载内容复用项目健康报告生成逻辑，便于在最终下载 XML 前留档当前风险状态。
+  - 导出摘要底部按钮支持换行，避免健康报告、补偿报告、取消和 XML 下载按钮在窄宽度下挤压。
+  - README 已同步：导出摘要现在会展示健康预检，并可下载健康报告。
+  - 已补充 `ExportDialog` 组件测试，覆盖健康复核项展示和健康报告下载 Blob 内容。
+  - 已重新验证：`corepack pnpm test -- src/features/export/ExportDialog.test.tsx` 成功，1 个测试文件、3 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 32 个测试文件、143 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过，导出摘要截图已刷新。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:25:13`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997814` 字节，时间 `2026/07/10 9:25:13`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c42-export-health-preflight-20260710`。
 - 成熟度提升阶段 C41 已完成：项目健康摘要支持重复 ID 定位证据。
   - 项目健康领域层将资源、弹幕、片段、补偿点和同步锚点的重复 ID 分组，健康指标新增“重复 ID”计数。
   - 重复 ID 阻断项现在会列出具体出现位置，例如对应资源文件、第几条弹幕、片段名、补偿点时间或同步锚点时间，帮助用户在不破坏原始 XML 的前提下定位问题。

@@ -6,6 +6,13 @@ import {
   formatSignedCompensationDuration,
   type ExportCompensationDetail
 } from "../../domain/danmaku/exportSummary";
+import {
+  createProjectHealthReport,
+  createProjectHealthSummary,
+  type ProjectHealthFinding,
+  type ProjectHealthStatus,
+  type ProjectHealthSummary
+} from "../../domain/project/health";
 import { formatTimecode } from "../../domain/shared/time";
 import { downloadTextFile } from "../../infrastructure/file-system/browserFiles";
 import { useEditorStore } from "../../stores/editorStore";
@@ -18,6 +25,7 @@ export function ExportDialog() {
     return null;
   }
   const { summary, validation } = exportDraft;
+  const healthSummary = createProjectHealthSummary(project);
   const previewCompensations = summary.compensationDetails.slice(0, 3);
   const hiddenCompensationCount = Math.max(0, summary.compensationDetails.length - previewCompensations.length);
   return (
@@ -37,6 +45,7 @@ export function ExportDialog() {
           <SummaryRow label="总补偿时长" value={formatSignedCompensationDuration(summary.totalCutGapMs)} />
           <SummaryRow label="存在导入警告" value={summary.hasImportWarnings ? "是" : "否"} />
           <SummaryRow label="负时间限制为 0" value={`${summary.negativeClampCount} 项`} />
+          <ProjectHealthPreflight summary={healthSummary} />
           {previewCompensations.length > 0 ? (
             <section className="rounded border border-panel-line bg-[#111318] p-3 text-xs text-slate-300">
               <h3 className="font-medium text-slate-100">补偿明细</h3>
@@ -60,7 +69,19 @@ export function ExportDialog() {
             {validation.message} 验证条数：{validation.count}
           </div>
         </div>
-        <footer className="flex justify-end gap-2 border-t border-panel-line p-4">
+        <footer className="flex flex-wrap justify-end gap-2 border-t border-panel-line p-4">
+          <TextButton
+            onClick={() =>
+              downloadTextFile(
+                `${project.name || "danmaku-export"}-health-report.txt`,
+                createProjectHealthReport(project.name, healthSummary),
+                "text/plain;charset=utf-8"
+              )
+            }
+          >
+            <Download size={14} />
+            下载健康报告
+          </TextButton>
           {summary.compensationDetails.length > 0 ? (
             <TextButton
               onClick={() =>
@@ -93,6 +114,43 @@ export function ExportDialog() {
   );
 }
 
+function ProjectHealthPreflight({ summary }: { summary: ProjectHealthSummary }) {
+  const reviewFindings = summary.findings.filter((finding) => finding.id !== "ready");
+  const previewFindings = reviewFindings.slice(0, 3);
+  const hiddenFindingCount = Math.max(0, reviewFindings.length - previewFindings.length);
+  return (
+    <section className={`rounded border p-3 text-xs ${projectHealthPanelClass(summary.status)}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="font-medium">导出前健康检查</h3>
+          <p className="mt-1 leading-5 opacity-80">{summary.statusDetail}</p>
+        </div>
+        <span className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectHealthBadgeClass(summary.status)}`}>
+          {summary.statusLabel}
+        </span>
+      </div>
+      {previewFindings.length > 0 ? (
+        <ul className="mt-2 grid gap-2">
+          {previewFindings.map((finding) => (
+            <ProjectHealthFindingPreview key={finding.id} finding={finding} />
+          ))}
+          {hiddenFindingCount > 0 ? <li className="opacity-70">另有 {hiddenFindingCount} 项，可下载健康报告查看。</li> : null}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
+
+function ProjectHealthFindingPreview({ finding }: { finding: ProjectHealthFinding }) {
+  return (
+    <li className="border-t border-current/15 pt-2 first:border-t-0 first:pt-0">
+      <span className="font-medium">{projectHealthFindingSeverityLabel(finding.severity)}</span>
+      <span className="mx-1">/</span>
+      <span>{finding.title}</span>
+    </li>
+  );
+}
+
 function CompensationDetailRow({ detail }: { detail: ExportCompensationDetail }) {
   return (
     <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 border-t border-panel-line pt-2 first:border-t-0 first:pt-0">
@@ -107,6 +165,36 @@ function CompensationDetailRow({ detail }: { detail: ExportCompensationDetail })
       <span className="text-slate-500">后续整体平移</span>
     </div>
   );
+}
+
+function projectHealthPanelClass(status: ProjectHealthStatus): string {
+  if (status === "blocked") {
+    return "border-accent-red/40 bg-accent-red/10 text-red-100";
+  }
+  if (status === "attention") {
+    return "border-amber-400/40 bg-amber-400/10 text-amber-100";
+  }
+  return "border-accent-green/40 bg-accent-green/10 text-accent-green";
+}
+
+function projectHealthBadgeClass(status: ProjectHealthStatus): string {
+  if (status === "blocked") {
+    return "border-red-300/50 bg-red-300/10 text-red-100";
+  }
+  if (status === "attention") {
+    return "border-amber-300/50 bg-amber-300/10 text-amber-100";
+  }
+  return "border-accent-green/50 bg-accent-green/10 text-accent-green";
+}
+
+function projectHealthFindingSeverityLabel(severity: ProjectHealthFinding["severity"]): string {
+  if (severity === "error") {
+    return "需处理";
+  }
+  if (severity === "warning") {
+    return "需复核";
+  }
+  return "信息";
 }
 
 function SummaryRow({ label, value }: { label: string; value: string }) {
