@@ -50,7 +50,9 @@ function isAlignmentEvidence(value: unknown): boolean {
   }
   const record = value as Record<string, unknown>;
   return (
-    (record.algorithm === "sparse-fingerprint" ||
+    (record.algorithm === "time-map-audio" ||
+      record.algorithm === "sparse-fingerprint" ||
+      record.algorithm === "offset-path" ||
       record.algorithm === "sparse-fingerprint-fallback" ||
       record.algorithm === "dense-dp") &&
     isNonNegativeInteger(record.completeFingerprintCount) &&
@@ -62,7 +64,28 @@ function isAlignmentEvidence(value: unknown): boolean {
     isNonNegativeInteger(record.offsetClusterCount) &&
     isNonNegativeInteger(record.refinedCandidateCount) &&
     isNonNegativeInteger(record.lowConfidenceRegionCount) &&
+    (record.timeMappingSegmentCount === undefined || isNonNegativeInteger(record.timeMappingSegmentCount)) &&
+    (record.confirmedChangeCount === undefined || isNonNegativeInteger(record.confirmedChangeCount)) &&
+    (record.signals === undefined || (Array.isArray(record.signals) && record.signals.every(isEvidenceSignal))) &&
     (record.quality === "high" || record.quality === "medium" || record.quality === "low" || record.quality === "blocked")
+  );
+}
+
+function isEvidenceSignal(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    (record.kind === "audio" || record.kind === "visual" || record.kind === "danmaku") &&
+    (record.status === "used" || record.status === "notConfigured" || record.status === "blocked") &&
+    typeof record.label === "string" &&
+    isNonNegativeInteger(record.observations) &&
+    typeof record.weight === "number" &&
+    Number.isFinite(record.weight) &&
+    record.weight >= 0 &&
+    record.weight <= 1 &&
+    typeof record.note === "string"
   );
 }
 

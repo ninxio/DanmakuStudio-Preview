@@ -1,5 +1,21 @@
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
 
+- 2026-07-11：成熟度提升阶段 C128 已完成：将本地音频对齐从候选点差值升级为“音频时间映射 + 持续变点”流程，并为后续多证据融合建立产品模型。
+  - 对齐核心不再把相邻匹配点的瞬时 gap 直接当成删减候选；新增音频时间映射路径，先用局部窗口生成 offset 观测，再平滑、稳定、分段，只有 offset 在更长前瞻窗口内持续成立时才输出版本差异候选。
+  - `AlignmentEvidenceSummary` 新增可选 `timeMappingSegmentCount`、`confirmedChangeCount` 和 `signals`，用于解释“音频已参与、视觉未启用、弹幕线索未融合”的证据边界；旧 proposal 仍保持兼容。
+  - Tauri 后端同步输出 `time-map-audio` 算法、时间映射段、持续变点和证据信号；短暂误配到后方片段不会再把后续整段时间轴错误平移。
+  - 资源栏视频对齐实验室的阶段文案调整为“建立候选观测 / 拟合时间映射 / 确认持续变点”，证据面板新增时间段、持续变点和证据信号说明，避免把调阈值误导成主要解决方案。
+  - 鲁棒视觉指纹和弹幕文本/密度线索本阶段只进入证据模型边界，界面明确标记未启用；后续接入时只能作为水印、字幕降权后的辅助确认，不单独宣判删减。
+  - 已删除临时 `_tmp_offset_diagnose.mjs` 诊断脚本，避免把单样本验证入口误认为正式产品能力。
+  - 已补充 TS/Rust 测试，覆盖持续 20 秒 offset 阶跃可识别，以及短暂后跳误配不会生成候选版本差异。
+  - 已重新验证：聚焦测试 `corepack pnpm test -- src/domain/alignment/audioAlignment.test.ts src/domain/project/schema.test.ts src/domain/alignment/alignmentReport.test.ts src/features/assets/AssetPanel.test.tsx` 通过（4 个测试文件 / 70 个测试）。
+  - 已重新验证：Rust 聚焦测试 `cargo test --manifest-path src-tauri\Cargo.toml audio_alignment --lib` 通过（15 个测试）。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、47 个测试文件 / 274 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包；首次普通权限运行因 Windows `spawn EPERM` 中断，已用提升权限重跑同一命令通过。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12486656` 字节，时间 `2026/07/11 04:37:41`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3085548` 字节，时间 `2026/07/11 04:37:41`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c128-time-map-alignment-20260711`。
+
 - 2026-07-11：成熟度提升阶段 C127 已完成：按多阶段音频指纹思路重构本地视频对齐流程。
   - Tauri 原生音频对齐从默认密集 DP 改为“稀疏音频指纹 → 锚点候选匹配 → offset 簇筛选 → 单调路径拟合 → 候选差异精修”的多阶段流程；密集 DP 只在稀疏锚点不足且单元规模安全时作为明确回退。
   - 当稀疏锚点已经足够时，`maxCells` 不再成为 50 分钟音频对齐的主要阻塞点；如果稀疏锚点不足且 DP 规模过大，会返回低置信诊断而不是继续平方级爆算。

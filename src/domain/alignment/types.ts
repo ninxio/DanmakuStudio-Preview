@@ -20,7 +20,25 @@ export interface CutCandidate {
 
 export type AlignmentEvidenceQuality = "high" | "medium" | "low" | "blocked";
 
-export type AlignmentEvidenceAlgorithm = "sparse-fingerprint" | "sparse-fingerprint-fallback" | "dense-dp";
+export type AlignmentEvidenceAlgorithm =
+  | "time-map-audio"
+  | "offset-path"
+  | "sparse-fingerprint"
+  | "sparse-fingerprint-fallback"
+  | "dense-dp";
+
+export type AlignmentEvidenceSignalKind = "audio" | "visual" | "danmaku";
+
+export type AlignmentEvidenceSignalStatus = "used" | "notConfigured" | "blocked";
+
+export interface AlignmentEvidenceSignalSummary {
+  kind: AlignmentEvidenceSignalKind;
+  status: AlignmentEvidenceSignalStatus;
+  label: string;
+  observations: number;
+  weight: number;
+  note: string;
+}
 
 export interface AlignmentEvidenceSummary {
   algorithm: AlignmentEvidenceAlgorithm;
@@ -34,6 +52,9 @@ export interface AlignmentEvidenceSummary {
   refinedCandidateCount: number;
   lowConfidenceRegionCount: number;
   quality: AlignmentEvidenceQuality;
+  timeMappingSegmentCount?: number;
+  confirmedChangeCount?: number;
+  signals?: AlignmentEvidenceSignalSummary[];
 }
 
 export interface AlignmentProposal {

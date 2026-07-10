@@ -1,7 +1,13 @@
 import type { SyncAnchor } from "../danmaku/types";
 import type { Milliseconds } from "../shared/time";
 import { clampMilliseconds } from "../shared/time";
-import type { AlignmentEvidenceAlgorithm, AlignmentEvidenceQuality, AlignmentProposal, CutCandidate } from "./types";
+import type {
+  AlignmentEvidenceAlgorithm,
+  AlignmentEvidenceQuality,
+  AlignmentEvidenceSignalSummary,
+  AlignmentProposal,
+  CutCandidate
+} from "./types";
 
 export interface AudioFeatureFrame {
   timeMs: Milliseconds;
@@ -32,6 +38,17 @@ const MAX_COMPLETE_FINGERPRINTS_PER_KEY = 32;
 const MAX_SPARSE_MATCH_CANDIDATES = 80_000;
 const MIN_SPARSE_MATCHES = 3;
 const MIN_SPARSE_COVERAGE = 0.25;
+const OFFSET_PATH_TARGET_BLOCK_FRAMES = 24;
+const OFFSET_PATH_MIN_BLOCK_FRAMES = 4;
+const OFFSET_PATH_MIN_SOURCE_FRAMES = 32;
+const OFFSET_PATH_STEP_DIVISOR = 4;
+const OFFSET_PATH_SEARCH_MARGIN_MS = 60_000;
+const OFFSET_PATH_MAX_SEARCH_MS = 240_000;
+const OFFSET_PATH_MIN_OBSERVATIONS = 2;
+const OFFSET_PATH_STABLE_OBSERVATIONS = 5;
+const OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER = 3;
+const OFFSET_PATH_STABLE_SUPPORT_RATIO = 0.7;
+const TIME_MAPPING_MIN_STABLE_SPAN_MS = 10_000;
 
 const DIRECTION_SKIP_COMPLETE = 1;
 const DIRECTION_SKIP_SOURCE = 2;
@@ -53,6 +70,37 @@ interface SparseAudioCandidate {
   offsetBucket: number;
 }
 
+interface OffsetPathObservation {
+  sourceIndex: number;
+  sourceTimeMs: Milliseconds;
+  offsetMs: number;
+  distance: number;
+}
+
+interface TimeMappingSegment {
+  sourceStartMs: Milliseconds;
+  sourceEndMs: Milliseconds;
+  offsetMs: number;
+  observationCount: number;
+  meanDistance: number;
+}
+
+interface TimeMappingChangePoint {
+  sourceAtMs: Milliseconds;
+  sourceRangeStartMs: Milliseconds;
+  sourceRangeEndMs: Milliseconds;
+  targetGapMs: Milliseconds;
+  confidence: number;
+  supportCount: number;
+}
+
+interface TimeMappingResult {
+  observations: OffsetPathObservation[];
+  segments: TimeMappingSegment[];
+  changePoints: TimeMappingChangePoint[];
+  diagnostics: string[];
+}
+
 interface SparseAudioAlignmentResult {
   matches: AudioFeatureMatch[];
   completeFingerprintCount: number;
@@ -61,6 +109,8 @@ interface SparseAudioAlignmentResult {
   offsetClusterCount: number;
   lowConfidenceRegionCount: number;
   diagnostics: string[];
+  timeMappingSegmentCount?: number;
+  changePoints?: TimeMappingChangePoint[];
 }
 
 interface MultistageAudioAlignmentResult extends SparseAudioAlignmentResult {
@@ -96,10 +146,13 @@ export function createAudioAlignmentProposal(
 
   const matchThreshold = options.matchThreshold ?? DEFAULT_MATCH_THRESHOLD;
   const alignment = createMultistageAudioAlignment(completeFrames, sourceFrames, options);
-  const cutCandidates = refineAudioCutCandidates(inferAudioCutCandidates(alignment.matches, {
-    matchThreshold,
-    minGapMs: options.minGapMs ?? DEFAULT_MIN_GAP_MS
-  }));
+  const rawCutCandidates = alignment.changePoints
+    ? createCutCandidatesFromTimeMappingChanges(alignment.changePoints)
+    : inferAudioCutCandidates(alignment.matches, {
+        matchThreshold,
+        minGapMs: options.minGapMs ?? DEFAULT_MIN_GAP_MS
+      });
+  const cutCandidates = refineAudioCutCandidates(rawCutCandidates);
   const anchors = createAnchorsFromMatches(alignment.matches, options.anchorStride ?? DEFAULT_ANCHOR_STRIDE, matchThreshold);
   const coverage = alignment.matches.length / Math.max(1, sourceFrames.length);
   const diagnostics = [
@@ -128,6 +181,9 @@ export function createAudioAlignmentProposal(
       offsetClusterCount: alignment.offsetClusterCount,
       refinedCandidateCount: cutCandidates.length,
       lowConfidenceRegionCount: alignment.lowConfidenceRegionCount,
+      timeMappingSegmentCount: alignment.timeMappingSegmentCount,
+      confirmedChangeCount: alignment.changePoints ? cutCandidates.length : undefined,
+      signals: createEvidenceSignals(alignment, cutCandidates.length),
       quality: createEvidenceQuality(coverage, strongAnchorCount, weakAnchorCount, alignment.lowConfidenceRegionCount)
     }
   };
@@ -146,6 +202,17 @@ function createMultistageAudioAlignment(
   sourceFrames: AudioFeatureFrame[],
   options: AudioAlignmentOptions = {}
 ): MultistageAudioAlignmentResult {
+  if (sourceFrames.length >= OFFSET_PATH_MIN_SOURCE_FRAMES) {
+    const offsetPath = createOffsetPathAudioAlignment(completeFrames, sourceFrames, options);
+    const offsetPathCoverage = offsetPath.matches.length / Math.max(1, sourceFrames.length);
+    if (offsetPath.fingerprintMatchCount >= OFFSET_PATH_MIN_OBSERVATIONS && offsetPathCoverage >= 0.6) {
+      return {
+        ...offsetPath,
+        algorithm: "time-map-audio"
+      };
+    }
+  }
+
   const sparse = createSparseAudioAlignment(completeFrames, sourceFrames, options);
   const sparseCoverage = sparse.matches.length / Math.max(1, sourceFrames.length);
   const requiredMatches = Math.min(MIN_SPARSE_MATCHES, sourceFrames.length);
@@ -183,6 +250,352 @@ function createMultistageAudioAlignment(
       `稀疏锚点不足，已回退到密集 DP：${denseMatches.length} 个匹配点。`
     ]
   };
+}
+
+function createOffsetPathAudioAlignment(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  options: AudioAlignmentOptions = {}
+): SparseAudioAlignmentResult {
+  const frameStepMs = estimateFrameStepMs(sourceFrames, options);
+  const blockSize = createOffsetPathBlockSize(sourceFrames.length);
+  const stepSize = Math.max(1, Math.round(blockSize / OFFSET_PATH_STEP_DIVISOR));
+  const rawObservations = createOffsetPathObservations(completeFrames, sourceFrames, options, blockSize, stepSize, frameStepMs);
+  const timeMapping = createTimeMappingFromOffsetObservations(rawObservations, options, frameStepMs);
+  const matches = expandOffsetPathMatches(completeFrames, sourceFrames, timeMapping.observations);
+  const offsetClusterCount = timeMapping.segments.length;
+  const lowConfidenceRegionCount = rawObservations.filter(
+    (observation) => observation.distance > (options.matchThreshold ?? DEFAULT_MATCH_THRESHOLD)
+  ).length;
+
+  return {
+    matches,
+    completeFingerprintCount: completeFrames.length,
+    sourceFingerprintCount: sourceFrames.length,
+    fingerprintMatchCount: rawObservations.length,
+    offsetClusterCount,
+    lowConfidenceRegionCount,
+    timeMappingSegmentCount: timeMapping.segments.length,
+    changePoints: timeMapping.changePoints,
+    diagnostics: [
+      `音频时间映射：用 ${blockSize} 帧局部窗口生成 ${rawObservations.length} 个 offset 观测。`,
+      ...timeMapping.diagnostics,
+      `音频时间映射：展开为 ${matches.length} 个单调匹配点。`
+    ]
+  };
+}
+
+function createTimeMappingFromOffsetObservations(
+  observations: OffsetPathObservation[],
+  options: AudioAlignmentOptions,
+  frameStepMs: number
+): TimeMappingResult {
+  const stableObservations = stabilizeOffsetObservations(
+    smoothOffsetObservations(observations),
+    options.minGapMs ?? DEFAULT_MIN_GAP_MS,
+    frameStepMs
+  );
+  const segments = createTimeMappingSegments(stableObservations, frameStepMs);
+  const changePoints = createTimeMappingChangePoints(segments, options.minGapMs ?? DEFAULT_MIN_GAP_MS, frameStepMs);
+  return {
+    observations: stableObservations,
+    segments,
+    changePoints,
+    diagnostics: [
+      `时间映射：稳定后得到 ${segments.length} 个持续 offset 段。`,
+      changePoints.length > 0
+        ? `时间映射：确认 ${changePoints.length} 个持续阶跃变点。`
+        : "时间映射：未确认持续阶跃变点。"
+    ]
+  };
+}
+
+function createTimeMappingSegments(observations: OffsetPathObservation[], frameStepMs: number): TimeMappingSegment[] {
+  const segments: TimeMappingSegment[] = [];
+  for (const observation of observations) {
+    const offsetMs = roundToStep(observation.offsetMs, frameStepMs);
+    const previous = segments.at(-1);
+    if (previous && previous.offsetMs === offsetMs) {
+      previous.sourceEndMs = observation.sourceTimeMs;
+      previous.observationCount += 1;
+      previous.meanDistance =
+        (previous.meanDistance * (previous.observationCount - 1) + observation.distance) / previous.observationCount;
+    } else {
+      segments.push({
+        sourceStartMs: observation.sourceTimeMs,
+        sourceEndMs: observation.sourceTimeMs,
+        offsetMs,
+        observationCount: 1,
+        meanDistance: observation.distance
+      });
+    }
+  }
+  return segments;
+}
+
+function createTimeMappingChangePoints(
+  segments: TimeMappingSegment[],
+  minGapMs: number,
+  frameStepMs: number
+): TimeMappingChangePoint[] {
+  const changePoints: TimeMappingChangePoint[] = [];
+  const minStableSpanMs = Math.max(TIME_MAPPING_MIN_STABLE_SPAN_MS, frameStepMs * OFFSET_PATH_STABLE_OBSERVATIONS);
+  for (let index = 1; index < segments.length; index += 1) {
+    const previous = segments[index - 1];
+    const current = segments[index];
+    const targetGapMs = current.offsetMs - previous.offsetMs;
+    const currentSpanMs = Math.max(frameStepMs, current.sourceEndMs - current.sourceStartMs + frameStepMs);
+    if (targetGapMs < minGapMs || currentSpanMs < minStableSpanMs) {
+      continue;
+    }
+    const sourceAtMs = clampMilliseconds(Math.round((previous.sourceEndMs + current.sourceStartMs) / 2));
+    const supportScore = clampNumber(current.observationCount / OFFSET_PATH_STABLE_OBSERVATIONS, 0, 1);
+    const distanceScore = clampNumber(1 - current.meanDistance / DEFAULT_MATCH_THRESHOLD, 0, 1);
+    changePoints.push({
+      sourceAtMs,
+      sourceRangeStartMs: previous.sourceEndMs,
+      sourceRangeEndMs: current.sourceStartMs,
+      targetGapMs,
+      supportCount: current.observationCount,
+      confidence: clampNumber(0.45 + supportScore * 0.35 + distanceScore * 0.15, 0.1, 0.98)
+    });
+  }
+  return changePoints;
+}
+
+function createOffsetPathObservations(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  options: AudioAlignmentOptions,
+  blockSize: number,
+  stepSize: number,
+  frameStepMs: number
+): OffsetPathObservation[] {
+  const halfBlock = Math.floor(blockSize / 2);
+  const offsetSteps = createOffsetSearchSteps(completeFrames, sourceFrames, frameStepMs);
+  const observations: OffsetPathObservation[] = [];
+  for (let sourceIndex = halfBlock; sourceIndex < sourceFrames.length - halfBlock; sourceIndex += stepSize) {
+    const observation = findBestOffsetObservation(completeFrames, sourceFrames, sourceIndex, blockSize, offsetSteps);
+    if (observation) {
+      observations.push(observation);
+    }
+  }
+  if (observations.length === 0 && sourceFrames.length > 0) {
+    const observation = findBestOffsetObservation(
+      completeFrames,
+      sourceFrames,
+      Math.floor(sourceFrames.length / 2),
+      Math.min(blockSize, sourceFrames.length),
+      offsetSteps
+    );
+    if (observation) {
+      observations.push(observation);
+    }
+  }
+  void options;
+  return observations;
+}
+
+function findBestOffsetObservation(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  sourceIndex: number,
+  blockSize: number,
+  offsetSteps: number[]
+): OffsetPathObservation | null {
+  const halfBlock = Math.floor(blockSize / 2);
+  let best: OffsetPathObservation | null = null;
+  for (const offsetStep of offsetSteps) {
+    const completeCenterIndex = sourceIndex + offsetStep;
+    const sourceStart = sourceIndex - halfBlock;
+    const completeStart = completeCenterIndex - halfBlock;
+    if (
+      sourceStart < 0 ||
+      completeStart < 0 ||
+      sourceStart + blockSize > sourceFrames.length ||
+      completeStart + blockSize > completeFrames.length
+    ) {
+      continue;
+    }
+    let totalDistance = 0;
+    for (let blockOffset = 0; blockOffset < blockSize; blockOffset += 1) {
+      totalDistance += getFeatureDistance(
+        completeFrames[completeStart + blockOffset],
+        sourceFrames[sourceStart + blockOffset]
+      );
+    }
+    const distance = totalDistance / blockSize;
+    if (!best || distance < best.distance) {
+      best = {
+        sourceIndex,
+        sourceTimeMs: sourceFrames[sourceIndex].timeMs,
+        offsetMs: completeFrames[completeCenterIndex].timeMs - sourceFrames[sourceIndex].timeMs,
+        distance
+      };
+    }
+  }
+  return best;
+}
+
+function createOffsetSearchSteps(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  frameStepMs: number
+): number[] {
+  const completeEndMs = completeFrames.at(-1)?.timeMs ?? 0;
+  const sourceEndMs = sourceFrames.at(-1)?.timeMs ?? 0;
+  const durationDeltaMs = completeEndMs - sourceEndMs;
+  const minOffsetMs = Math.max(
+    -OFFSET_PATH_MAX_SEARCH_MS,
+    Math.min(0, durationDeltaMs) - OFFSET_PATH_SEARCH_MARGIN_MS
+  );
+  const maxOffsetMs = Math.min(
+    OFFSET_PATH_MAX_SEARCH_MS,
+    Math.max(0, durationDeltaMs) + OFFSET_PATH_SEARCH_MARGIN_MS
+  );
+  const minStep = Math.floor(minOffsetMs / frameStepMs);
+  const maxStep = Math.ceil(maxOffsetMs / frameStepMs);
+  const steps: number[] = [];
+  for (let step = minStep; step <= maxStep; step += 1) {
+    steps.push(step);
+  }
+  return steps;
+}
+
+function smoothOffsetObservations(observations: OffsetPathObservation[]): OffsetPathObservation[] {
+  return observations.map((observation, index) => {
+    const nearbyOffsets = observations
+      .slice(Math.max(0, index - 2), Math.min(observations.length, index + 3))
+      .map((item) => item.offsetMs)
+      .sort((left, right) => left - right);
+    return {
+      ...observation,
+      offsetMs: nearbyOffsets[Math.floor(nearbyOffsets.length / 2)] ?? observation.offsetMs
+    };
+  });
+}
+
+function stabilizeOffsetObservations(
+  observations: OffsetPathObservation[],
+  minGapMs: number,
+  frameStepMs: number
+): OffsetPathObservation[] {
+  if (observations.length === 0) {
+    return [];
+  }
+  const stable: OffsetPathObservation[] = [];
+  let activeOffsetMs = roundToStep(observations[0].offsetMs, frameStepMs);
+  for (let index = 0; index < observations.length; index += 1) {
+    const candidateOffsetMs = roundToStep(observations[index].offsetMs, frameStepMs);
+    if (candidateOffsetMs - activeOffsetMs >= minGapMs) {
+      const supportCount = countOffsetSupport(observations, index, candidateOffsetMs, frameStepMs);
+      const supportWindowSize = Math.min(
+        observations.length - index,
+        OFFSET_PATH_STABLE_OBSERVATIONS * OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER
+      );
+      const requiredSupport = Math.max(
+        Math.min(OFFSET_PATH_STABLE_OBSERVATIONS, supportWindowSize),
+        Math.ceil(supportWindowSize * OFFSET_PATH_STABLE_SUPPORT_RATIO)
+      );
+      if (supportCount >= requiredSupport) {
+        activeOffsetMs = candidateOffsetMs;
+      }
+    }
+    stable.push({
+      ...observations[index],
+      offsetMs: activeOffsetMs
+    });
+  }
+  return stable;
+}
+
+function countOffsetSupport(
+  observations: OffsetPathObservation[],
+  startIndex: number,
+  offsetMs: number,
+  frameStepMs: number
+): number {
+  let count = 0;
+  const endIndex = Math.min(
+    observations.length,
+    startIndex + OFFSET_PATH_STABLE_OBSERVATIONS * OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER
+  );
+  for (let index = startIndex; index < endIndex; index += 1) {
+    if (Math.abs(roundToStep(observations[index].offsetMs, frameStepMs) - offsetMs) <= frameStepMs) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function expandOffsetPathMatches(
+  completeFrames: AudioFeatureFrame[],
+  sourceFrames: AudioFeatureFrame[],
+  observations: OffsetPathObservation[]
+): AudioFeatureMatch[] {
+  if (observations.length === 0) {
+    return [];
+  }
+  const matches: AudioFeatureMatch[] = [];
+  let observationIndex = 0;
+  for (let sourceIndex = 0; sourceIndex < sourceFrames.length; sourceIndex += 1) {
+    const sourceFrame = sourceFrames[sourceIndex];
+    while (
+      observationIndex + 1 < observations.length &&
+      Math.abs(observations[observationIndex + 1].sourceTimeMs - sourceFrame.timeMs) <=
+        Math.abs(observations[observationIndex].sourceTimeMs - sourceFrame.timeMs)
+    ) {
+      observationIndex += 1;
+    }
+    const completeTimeMs = sourceFrame.timeMs + observations[observationIndex].offsetMs;
+    const completeIndex = findNearestFrameIndex(completeFrames, completeTimeMs);
+    if (completeIndex === null) {
+      continue;
+    }
+    matches.push({
+      completeIndex,
+      sourceIndex,
+      completeTimeMs: completeFrames[completeIndex].timeMs,
+      sourceTimeMs: sourceFrame.timeMs,
+      distance: getFeatureDistance(completeFrames[completeIndex], sourceFrame)
+    });
+  }
+  return matches;
+}
+
+function findNearestFrameIndex(frames: AudioFeatureFrame[], timeMs: number): number | null {
+  if (frames.length === 0 || timeMs < frames[0].timeMs || timeMs > frames[frames.length - 1].timeMs) {
+    return null;
+  }
+  let bestIndex = 0;
+  let bestDistance = Math.abs(frames[0].timeMs - timeMs);
+  for (let index = 1; index < frames.length; index += 1) {
+    const distance = Math.abs(frames[index].timeMs - timeMs);
+    if (distance > bestDistance) {
+      break;
+    }
+    bestIndex = index;
+    bestDistance = distance;
+  }
+  return bestIndex;
+}
+
+function createOffsetPathBlockSize(sourceFrameCount: number): number {
+  if (sourceFrameCount <= OFFSET_PATH_MIN_BLOCK_FRAMES) {
+    return Math.max(1, sourceFrameCount);
+  }
+  return Math.min(OFFSET_PATH_TARGET_BLOCK_FRAMES, Math.max(OFFSET_PATH_MIN_BLOCK_FRAMES, Math.floor(sourceFrameCount / 4)));
+}
+
+function estimateFrameStepMs(frames: AudioFeatureFrame[], options: AudioAlignmentOptions): number {
+  if (frames.length >= 2) {
+    return Math.max(1, frames[1].timeMs - frames[0].timeMs);
+  }
+  return Math.max(1, Math.round(options.minGapMs ?? DEFAULT_MIN_GAP_MS));
+}
+
+function roundToStep(value: number, step: number): number {
+  return Math.round(value / step) * step;
 }
 
 function createSparseAudioAlignment(
@@ -442,6 +855,21 @@ export function inferAudioCutCandidates(
   return mergeNearbyCandidates(candidates);
 }
 
+function createCutCandidatesFromTimeMappingChanges(changePoints: TimeMappingChangePoint[]): CutCandidate[] {
+  return changePoints.map((changePoint, index) => ({
+    id: `audio-gap-${index + 1}`,
+    name: `音频时间映射差异 ${index + 1}`,
+    sourceAtMs: changePoint.sourceAtMs,
+    sourceRangeStartMs: changePoint.sourceRangeStartMs,
+    sourceRangeEndMs: changePoint.sourceRangeEndMs,
+    targetGapMs: changePoint.targetGapMs,
+    confidence: changePoint.confidence,
+    note: `音频时间映射显示 offset 在当前视频 ${formatDuration(changePoint.sourceAtMs)} 附近持续增加 ${formatDuration(
+      changePoint.targetGapMs
+    )}，后续 ${changePoint.supportCount} 个观测窗口保持稳定，建议在该区间试听复核。`
+  }));
+}
+
 function refineAudioCutCandidates(candidates: CutCandidate[]): CutCandidate[] {
   return candidates.map((candidate) => {
     const rangeStartMs = candidate.sourceRangeStartMs ?? candidate.sourceAtMs;
@@ -483,6 +911,41 @@ function createEvidenceQuality(
     return "medium";
   }
   return "low";
+}
+
+function createEvidenceSignals(
+  alignment: MultistageAudioAlignmentResult,
+  confirmedChangeCount: number
+): AlignmentEvidenceSignalSummary[] {
+  return [
+    {
+      kind: "audio",
+      status: alignment.matches.length > 0 ? "used" : "blocked",
+      label: "音频时间映射",
+      observations: alignment.fingerprintMatchCount,
+      weight: 1,
+      note:
+        alignment.algorithm === "time-map-audio"
+          ? `已用音频指纹建立 ${alignment.timeMappingSegmentCount ?? alignment.offsetClusterCount} 个稳定时间段，确认 ${confirmedChangeCount} 个持续变点。`
+          : "已用音频指纹生成单调锚点；未进入持续时间映射路径。"
+    },
+    {
+      kind: "visual",
+      status: "notConfigured",
+      label: "鲁棒视觉指纹",
+      observations: 0,
+      weight: 0,
+      note: "当前版本未采样视觉证据；未来只作为水印/字幕降权后的辅助确认，不单独宣判删减。"
+    },
+    {
+      kind: "danmaku",
+      status: "notConfigured",
+      label: "弹幕文本/密度线索",
+      observations: 0,
+      weight: 0,
+      note: "当前本地音频对齐未融合弹幕语义；弹幕线索仍保留为人工复核参考。"
+    }
+  ];
 }
 
 function estimateCutBoundaryMs(previous: AudioFeatureMatch, current: AudioFeatureMatch): Milliseconds {

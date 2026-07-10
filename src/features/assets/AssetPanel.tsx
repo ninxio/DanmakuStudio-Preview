@@ -2622,9 +2622,9 @@ const AUDIO_ALIGNMENT_STAGE_ITEMS: Array<Omit<AudioAlignmentStageItem, "state">>
   { key: "extracting-complete", label: "提取完整版特征", shortLabel: "原片" },
   { key: "extracting-source", label: "提取删减版特征", shortLabel: "参考" },
   { key: "fingerprinting", label: "生成稀疏指纹", shortLabel: "指纹" },
-  { key: "matching", label: "匹配音频锚点", shortLabel: "匹配" },
-  { key: "fitting", label: "拟合单调路径", shortLabel: "拟合" },
-  { key: "refining", label: "精修候选差异", shortLabel: "精修" },
+  { key: "matching", label: "建立候选观测", shortLabel: "观测" },
+  { key: "fitting", label: "拟合时间映射", shortLabel: "映射" },
+  { key: "refining", label: "确认持续变点", shortLabel: "变点" },
   { key: "reporting", label: "生成复核数据", shortLabel: "报告" }
 ];
 
@@ -2659,6 +2659,12 @@ function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
         <EvidenceMetric label="offset 簇" value={`${evidence.offsetClusterCount}`} />
         <EvidenceMetric label="低置信区" value={`${evidence.lowConfidenceRegionCount}`} />
         <EvidenceMetric label="精修候选" value={`${evidence.refinedCandidateCount}`} />
+        {evidence.timeMappingSegmentCount !== undefined ? (
+          <EvidenceMetric label="时间段" value={`${evidence.timeMappingSegmentCount}`} />
+        ) : null}
+        {evidence.confirmedChangeCount !== undefined ? (
+          <EvidenceMetric label="持续变点" value={`${evidence.confirmedChangeCount}`} />
+        ) : null}
       </div>
       <svg
         className="h-12 w-full overflow-visible"
@@ -2699,6 +2705,25 @@ function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
             : "锚点不足"}
         </span>
       </div>
+      {evidence.signals && evidence.signals.length > 0 ? (
+        <div className="grid gap-1 border-t border-panel-line pt-2">
+          <div className="text-slate-500">证据信号</div>
+          {evidence.signals.map((signal) => (
+            <div key={signal.kind} className="grid gap-0.5 rounded border border-panel-line/70 bg-[#111318] p-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate text-slate-200">{signal.label}</span>
+                <span className={`shrink-0 ${getEvidenceSignalStatusClassName(signal.status)}`}>
+                  {formatEvidenceSignalStatus(signal.status)}
+                </span>
+              </div>
+              <div className="text-slate-500">
+                观测 {signal.observations} / 权重 {Math.round(signal.weight * 100)}%
+              </div>
+              <div className="leading-5 text-slate-400">{signal.note}</div>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2871,6 +2896,12 @@ function getAudioAlignmentStageClassName(state: AudioAlignmentStageState): strin
 }
 
 function formatAlignmentEvidenceAlgorithm(algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]): string {
+  if (algorithm === "time-map-audio") {
+    return "音频时间映射";
+  }
+  if (algorithm === "offset-path") {
+    return "offset 路径";
+  }
   if (algorithm === "sparse-fingerprint") {
     return "稀疏指纹";
   }
@@ -2904,6 +2935,30 @@ function getAlignmentEvidenceQualityClassName(quality: NonNullable<AlignmentProp
     return "text-amber-200";
   }
   return "text-red-200";
+}
+
+function formatEvidenceSignalStatus(
+  status: NonNullable<NonNullable<AlignmentProposal["evidence"]>["signals"]>[number]["status"]
+): string {
+  if (status === "used") {
+    return "已参与";
+  }
+  if (status === "blocked") {
+    return "不可用";
+  }
+  return "未启用";
+}
+
+function getEvidenceSignalStatusClassName(
+  status: NonNullable<NonNullable<AlignmentProposal["evidence"]>["signals"]>[number]["status"]
+): string {
+  if (status === "used") {
+    return "text-emerald-300";
+  }
+  if (status === "blocked") {
+    return "text-red-200";
+  }
+  return "text-slate-500";
 }
 
 function createAlignmentOffsetSummary(proposal: AlignmentProposal): AlignmentOffsetSummary | null {

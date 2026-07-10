@@ -28,6 +28,18 @@ const MAX_SPARSE_MATCH_CANDIDATES: usize = 80_000;
 const MIN_SPARSE_MATCHES: usize = 3;
 const MIN_SPARSE_COVERAGE: f64 = 0.25;
 const AUDIO_ALIGNMENT_STAGE_COUNT: u8 = 8;
+const OFFSET_PATH_TARGET_BLOCK_FRAMES: usize = 24;
+const OFFSET_PATH_MIN_BLOCK_FRAMES: usize = 4;
+const OFFSET_PATH_MIN_SOURCE_FRAMES: usize = 32;
+const OFFSET_PATH_STEP_DIVISOR: usize = 4;
+const OFFSET_PATH_SEARCH_MARGIN_MS: i64 = 60_000;
+const OFFSET_PATH_MAX_SEARCH_MS: i64 = 240_000;
+const OFFSET_PATH_MIN_OBSERVATIONS: usize = 2;
+const OFFSET_PATH_STABLE_OBSERVATIONS: usize = 5;
+const OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER: usize = 3;
+const OFFSET_PATH_STABLE_SUPPORT_RATIO: f64 = 0.7;
+const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
+const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 
 const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
@@ -97,6 +109,23 @@ pub struct AlignmentEvidenceSummary {
     refined_candidate_count: usize,
     low_confidence_region_count: usize,
     quality: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_mapping_segment_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed_change_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signals: Option<Vec<AlignmentEvidenceSignalSummary>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentEvidenceSignalSummary {
+    kind: &'static str,
+    status: &'static str,
+    label: &'static str,
+    observations: usize,
+    weight: f64,
+    note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +199,39 @@ struct SparseAudioCandidate {
     offset_bucket: i64,
 }
 
+#[derive(Debug, Clone)]
+struct OffsetPathObservation {
+    source_time_ms: u64,
+    offset_ms: i64,
+    distance: f64,
+}
+
+#[derive(Debug, Clone)]
+struct TimeMappingSegment {
+    source_start_ms: u64,
+    source_end_ms: u64,
+    offset_ms: i64,
+    observation_count: usize,
+    mean_distance: f64,
+}
+
+#[derive(Debug, Clone)]
+struct TimeMappingChangePoint {
+    source_at_ms: u64,
+    source_range_start_ms: u64,
+    source_range_end_ms: u64,
+    target_gap_ms: u64,
+    confidence: f64,
+    support_count: usize,
+}
+
+struct TimeMappingResult {
+    observations: Vec<OffsetPathObservation>,
+    segments: Vec<TimeMappingSegment>,
+    change_points: Vec<TimeMappingChangePoint>,
+    diagnostics: Vec<String>,
+}
+
 struct SparseAudioAlignmentResult {
     matches: Vec<AudioFeatureMatch>,
     complete_fingerprint_count: usize,
@@ -178,6 +240,8 @@ struct SparseAudioAlignmentResult {
     offset_cluster_count: usize,
     low_confidence_region_count: usize,
     diagnostics: Vec<String>,
+    time_mapping_segment_count: Option<usize>,
+    change_points: Option<Vec<TimeMappingChangePoint>>,
 }
 
 struct MultistageAudioAlignmentResult {
@@ -189,6 +253,8 @@ struct MultistageAudioAlignmentResult {
     offset_cluster_count: usize,
     low_confidence_region_count: usize,
     diagnostics: Vec<String>,
+    time_mapping_segment_count: Option<usize>,
+    change_points: Option<Vec<TimeMappingChangePoint>>,
 }
 
 struct AudioAlignmentStageSnapshot {
@@ -550,11 +616,11 @@ fn create_audio_alignment_stage_snapshot(
     } else if clamped < 0.80 {
         create_stage_range("fingerprinting", "生成稀疏指纹", 4, clamped, 0.74, 0.80)
     } else if clamped < 0.86 {
-        create_stage_range("matching", "匹配音频锚点", 5, clamped, 0.80, 0.86)
+        create_stage_range("matching", "建立候选观测", 5, clamped, 0.80, 0.86)
     } else if clamped < 0.92 {
-        create_stage_range("fitting", "拟合单调路径", 6, clamped, 0.86, 0.92)
+        create_stage_range("fitting", "拟合时间映射", 6, clamped, 0.86, 0.92)
     } else if clamped < 0.97 {
-        create_stage_range("refining", "精修候选差异", 7, clamped, 0.92, 0.97)
+        create_stage_range("refining", "确认持续变点", 7, clamped, 0.92, 0.97)
     } else {
         create_stage_range("reporting", "生成复核数据", 8, clamped, 0.97, 1.0)
     }
@@ -861,6 +927,7 @@ fn pcm_to_feature_frames(
     let mut frames = Vec::new();
     let mut offset = 0usize;
     while offset + frame_samples <= sample_count {
+        let mut frame_samples_values = Vec::with_capacity(frame_samples);
         let mut square_sum = 0.0;
         let mut crossing_count = 0usize;
         let mut previous = 0.0f32;
@@ -877,12 +944,18 @@ fn pcm_to_feature_frames(
                 crossing_count += 1;
             }
             previous = sample;
+            frame_samples_values.push(f64::from(sample));
         }
         let rms = (square_sum / frame_samples as f64).sqrt();
         let zero_crossing_rate = crossing_count as f64 / frame_samples as f64;
+        let mut values = vec![(rms * 8.0).min(1.0), (zero_crossing_rate * 12.0).min(1.0)];
+        values.extend(calculate_spectral_features(
+            &frame_samples_values,
+            options.sample_rate,
+        ));
         frames.push(AudioFeatureFrame {
             time_ms: ((offset as u64 * 1000) / options.sample_rate as u64),
-            values: vec![(rms * 8.0).min(1.0), (zero_crossing_rate * 12.0).min(1.0)],
+            values,
         });
         offset += frame_samples;
     }
@@ -890,6 +963,34 @@ fn pcm_to_feature_frames(
         return Err("未能提取到可用音频特征。".to_string());
     }
     Ok(frames)
+}
+
+fn calculate_spectral_features(samples: &[f64], sample_rate: u32) -> Vec<f64> {
+    let powers: Vec<f64> = SPECTRAL_FREQUENCIES_HZ
+        .iter()
+        .map(|frequency| calculate_goertzel_power(samples, f64::from(sample_rate), *frequency))
+        .collect();
+    let total_power = powers.iter().sum::<f64>().max(0.000_001);
+    powers
+        .into_iter()
+        .map(|power| (power / total_power).sqrt().min(1.0))
+        .collect()
+}
+
+fn calculate_goertzel_power(samples: &[f64], sample_rate: f64, frequency: f64) -> f64 {
+    if samples.is_empty() || sample_rate <= 0.0 {
+        return 0.0;
+    }
+    let normalized_frequency = frequency / sample_rate;
+    let coefficient = 2.0 * (2.0 * std::f64::consts::PI * normalized_frequency).cos();
+    let mut previous = 0.0;
+    let mut previous2 = 0.0;
+    for sample in samples {
+        let current = sample + coefficient * previous - previous2;
+        previous2 = previous;
+        previous = current;
+    }
+    previous2 * previous2 + previous * previous - coefficient * previous * previous2
 }
 
 fn create_audio_alignment_proposal(
@@ -915,13 +1016,25 @@ fn create_audio_alignment_proposal(
                 refined_candidate_count: 0,
                 low_confidence_region_count: 1,
                 quality: "blocked".to_string(),
+                time_mapping_segment_count: None,
+                confirmed_change_count: None,
+                signals: None,
             }),
         });
     }
     let alignment = create_multistage_audio_alignment(complete_frames, source_frames, options)?;
-    let matches = alignment.matches;
-    let cut_candidates = refine_cut_candidates(infer_cut_candidates(&matches, options));
+    let cut_candidates = if let Some(change_points) = &alignment.change_points {
+        refine_cut_candidates(create_cut_candidates_from_time_mapping_changes(change_points))
+    } else {
+        refine_cut_candidates(infer_cut_candidates(&alignment.matches, options))
+    };
     let cut_candidate_count = cut_candidates.len();
+    let signals = create_evidence_signals(&alignment, cut_candidate_count, alignment.matches.len());
+    let confirmed_change_count = alignment
+        .change_points
+        .as_ref()
+        .map(|_| cut_candidate_count);
+    let matches = alignment.matches;
     let anchors = create_anchors(&matches, options.match_threshold);
     let coverage = matches.len() as f64 / source_frames.len().max(1) as f64;
     let strong_anchor_count = matches
@@ -957,6 +1070,9 @@ fn create_audio_alignment_proposal(
             offset_cluster_count: alignment.offset_cluster_count,
             refined_candidate_count: cut_candidate_count,
             low_confidence_region_count: alignment.low_confidence_region_count,
+            time_mapping_segment_count: alignment.time_mapping_segment_count,
+            confirmed_change_count,
+            signals: Some(signals),
             quality: create_evidence_quality(
                 coverage,
                 strong_anchor_count,
@@ -972,6 +1088,29 @@ fn create_multistage_audio_alignment(
     source_frames: &[AudioFeatureFrame],
     options: &AudioAlignmentOptions,
 ) -> Result<MultistageAudioAlignmentResult, String> {
+    if source_frames.len() >= OFFSET_PATH_MIN_SOURCE_FRAMES {
+        let offset_path =
+            create_offset_path_audio_alignment(complete_frames, source_frames, options);
+        let offset_path_coverage =
+            offset_path.matches.len() as f64 / source_frames.len().max(1) as f64;
+        if offset_path.fingerprint_match_count >= OFFSET_PATH_MIN_OBSERVATIONS
+            && offset_path_coverage >= 0.6
+        {
+            return Ok(MultistageAudioAlignmentResult {
+                algorithm: "time-map-audio".to_string(),
+                matches: offset_path.matches,
+                complete_fingerprint_count: offset_path.complete_fingerprint_count,
+                source_fingerprint_count: offset_path.source_fingerprint_count,
+                fingerprint_match_count: offset_path.fingerprint_match_count,
+                offset_cluster_count: offset_path.offset_cluster_count,
+                low_confidence_region_count: offset_path.low_confidence_region_count,
+                diagnostics: offset_path.diagnostics,
+                time_mapping_segment_count: offset_path.time_mapping_segment_count,
+                change_points: offset_path.change_points,
+            });
+        }
+    }
+
     let sparse = create_sparse_audio_alignment(complete_frames, source_frames, options);
     let sparse_coverage = sparse.matches.len() as f64 / source_frames.len().max(1) as f64;
     let required_matches = MIN_SPARSE_MATCHES.min(source_frames.len());
@@ -985,6 +1124,8 @@ fn create_multistage_audio_alignment(
             offset_cluster_count: sparse.offset_cluster_count,
             low_confidence_region_count: sparse.low_confidence_region_count,
             diagnostics: sparse.diagnostics,
+            time_mapping_segment_count: None,
+            change_points: None,
         });
     }
 
@@ -1003,6 +1144,8 @@ fn create_multistage_audio_alignment(
             offset_cluster_count: sparse.offset_cluster_count,
             low_confidence_region_count: sparse.low_confidence_region_count,
             diagnostics,
+            time_mapping_segment_count: None,
+            change_points: None,
         });
     }
 
@@ -1028,7 +1171,406 @@ fn create_multistage_audio_alignment(
         offset_cluster_count: sparse.offset_cluster_count,
         low_confidence_region_count,
         diagnostics,
+        time_mapping_segment_count: None,
+        change_points: None,
     })
+}
+
+fn create_offset_path_audio_alignment(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    options: &AudioAlignmentOptions,
+) -> SparseAudioAlignmentResult {
+    let frame_step_ms = estimate_frame_step_ms(source_frames, options);
+    let block_size = create_offset_path_block_size(source_frames.len());
+    let step_size = (block_size / OFFSET_PATH_STEP_DIVISOR).max(1);
+    let raw_observations = create_offset_path_observations(
+        complete_frames,
+        source_frames,
+        block_size,
+        step_size,
+        frame_step_ms,
+    );
+    let time_mapping =
+        create_time_mapping_from_offset_observations(&raw_observations, options, frame_step_ms);
+    let matches =
+        expand_offset_path_matches(complete_frames, source_frames, &time_mapping.observations);
+    let match_count = matches.len();
+    let offset_cluster_count = time_mapping.segments.len();
+    let low_confidence_region_count = raw_observations
+        .iter()
+        .filter(|observation| observation.distance > options.match_threshold)
+        .count();
+    let mut diagnostics = vec![format!(
+        "音频时间映射：用 {block_size} 帧局部窗口生成 {} 个 offset 观测。",
+        raw_observations.len()
+    )];
+    diagnostics.extend(time_mapping.diagnostics.clone());
+    diagnostics.push(format!("音频时间映射：展开为 {match_count} 个单调匹配点。"));
+    SparseAudioAlignmentResult {
+        matches,
+        complete_fingerprint_count: complete_frames.len(),
+        source_fingerprint_count: source_frames.len(),
+        fingerprint_match_count: raw_observations.len(),
+        offset_cluster_count,
+        low_confidence_region_count,
+        diagnostics,
+        time_mapping_segment_count: Some(time_mapping.segments.len()),
+        change_points: Some(time_mapping.change_points),
+    }
+}
+
+fn create_time_mapping_from_offset_observations(
+    observations: &[OffsetPathObservation],
+    options: &AudioAlignmentOptions,
+    frame_step_ms: u64,
+) -> TimeMappingResult {
+    let stable_observations = stabilize_offset_observations(
+        smooth_offset_observations(observations),
+        options.min_gap_ms,
+        frame_step_ms,
+    );
+    let segments = create_time_mapping_segments(&stable_observations, frame_step_ms);
+    let change_points =
+        create_time_mapping_change_points(&segments, options.min_gap_ms, frame_step_ms);
+    TimeMappingResult {
+        observations: stable_observations,
+        diagnostics: vec![
+            format!("时间映射：稳定后得到 {} 个持续 offset 段。", segments.len()),
+            if change_points.is_empty() {
+                "时间映射：未确认持续阶跃变点。".to_string()
+            } else {
+                format!("时间映射：确认 {} 个持续阶跃变点。", change_points.len())
+            },
+        ],
+        segments,
+        change_points,
+    }
+}
+
+fn create_time_mapping_segments(
+    observations: &[OffsetPathObservation],
+    frame_step_ms: u64,
+) -> Vec<TimeMappingSegment> {
+    let mut segments: Vec<TimeMappingSegment> = Vec::new();
+    for observation in observations {
+        let offset_ms = round_to_step(observation.offset_ms, frame_step_ms);
+        if let Some(previous) = segments.last_mut() {
+            if previous.offset_ms == offset_ms {
+                previous.source_end_ms = observation.source_time_ms;
+                previous.observation_count += 1;
+                previous.mean_distance = (previous.mean_distance
+                    * (previous.observation_count - 1) as f64
+                    + observation.distance)
+                    / previous.observation_count as f64;
+                continue;
+            }
+        }
+        segments.push(TimeMappingSegment {
+            source_start_ms: observation.source_time_ms,
+            source_end_ms: observation.source_time_ms,
+            offset_ms,
+            observation_count: 1,
+            mean_distance: observation.distance,
+        });
+    }
+    segments
+}
+
+fn create_time_mapping_change_points(
+    segments: &[TimeMappingSegment],
+    min_gap_ms: u64,
+    frame_step_ms: u64,
+) -> Vec<TimeMappingChangePoint> {
+    let mut change_points = Vec::new();
+    let min_stable_span_ms =
+        TIME_MAPPING_MIN_STABLE_SPAN_MS.max(frame_step_ms * OFFSET_PATH_STABLE_OBSERVATIONS as u64);
+    for index in 1..segments.len() {
+        let previous = &segments[index - 1];
+        let current = &segments[index];
+        let target_gap_ms = current.offset_ms - previous.offset_ms;
+        let current_span_ms = current
+            .source_end_ms
+            .saturating_sub(current.source_start_ms)
+            + frame_step_ms;
+        if target_gap_ms < min_gap_ms as i64 || current_span_ms < min_stable_span_ms {
+            continue;
+        }
+        let support_score =
+            (current.observation_count as f64 / OFFSET_PATH_STABLE_OBSERVATIONS as f64)
+                .clamp(0.0, 1.0);
+        let distance_score = (1.0 - current.mean_distance / DEFAULT_MATCH_THRESHOLD)
+            .clamp(0.0, 1.0);
+        change_points.push(TimeMappingChangePoint {
+            source_at_ms: (previous.source_end_ms + current.source_start_ms) / 2,
+            source_range_start_ms: previous.source_end_ms,
+            source_range_end_ms: current.source_start_ms,
+            target_gap_ms: target_gap_ms as u64,
+            support_count: current.observation_count,
+            confidence: (0.45 + support_score * 0.35 + distance_score * 0.15).clamp(0.1, 0.98),
+        });
+    }
+    change_points
+}
+
+fn create_offset_path_observations(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    block_size: usize,
+    step_size: usize,
+    frame_step_ms: u64,
+) -> Vec<OffsetPathObservation> {
+    let half_block = block_size / 2;
+    let offset_steps = create_offset_search_steps(complete_frames, source_frames, frame_step_ms);
+    let mut observations = Vec::new();
+    let mut source_index = half_block;
+    while source_index < source_frames.len().saturating_sub(half_block) {
+        if let Some(observation) = find_best_offset_observation(
+            complete_frames,
+            source_frames,
+            source_index,
+            block_size,
+            &offset_steps,
+        ) {
+            observations.push(observation);
+        }
+        source_index += step_size;
+    }
+    if observations.is_empty() && !source_frames.is_empty() {
+        if let Some(observation) = find_best_offset_observation(
+            complete_frames,
+            source_frames,
+            source_frames.len() / 2,
+            block_size.min(source_frames.len()),
+            &offset_steps,
+        ) {
+            observations.push(observation);
+        }
+    }
+    observations
+}
+
+fn find_best_offset_observation(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    source_index: usize,
+    block_size: usize,
+    offset_steps: &[i64],
+) -> Option<OffsetPathObservation> {
+    let half_block = block_size / 2;
+    let mut best: Option<OffsetPathObservation> = None;
+    for offset_step in offset_steps {
+        let complete_center_index = source_index as i64 + offset_step;
+        if complete_center_index < 0 {
+            continue;
+        }
+        let source_start = source_index as i64 - half_block as i64;
+        let complete_start = complete_center_index - half_block as i64;
+        if source_start < 0
+            || complete_start < 0
+            || source_start as usize + block_size > source_frames.len()
+            || complete_start as usize + block_size > complete_frames.len()
+        {
+            continue;
+        }
+        let mut total_distance = 0.0;
+        for block_offset in 0..block_size {
+            total_distance += get_feature_distance(
+                &complete_frames[complete_start as usize + block_offset],
+                &source_frames[source_start as usize + block_offset],
+            );
+        }
+        let distance = total_distance / block_size as f64;
+        if best
+            .as_ref()
+            .map(|current| distance < current.distance)
+            .unwrap_or(true)
+        {
+            let complete_index = complete_center_index as usize;
+            best = Some(OffsetPathObservation {
+                source_time_ms: source_frames[source_index].time_ms,
+                offset_ms: complete_frames[complete_index].time_ms as i64
+                    - source_frames[source_index].time_ms as i64,
+                distance,
+            });
+        }
+    }
+    best
+}
+
+fn create_offset_search_steps(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    frame_step_ms: u64,
+) -> Vec<i64> {
+    let complete_end_ms = complete_frames
+        .last()
+        .map(|frame| frame.time_ms)
+        .unwrap_or(0) as i64;
+    let source_end_ms = source_frames.last().map(|frame| frame.time_ms).unwrap_or(0) as i64;
+    let duration_delta_ms = complete_end_ms - source_end_ms;
+    let min_offset_ms =
+        (-OFFSET_PATH_MAX_SEARCH_MS).max(duration_delta_ms.min(0) - OFFSET_PATH_SEARCH_MARGIN_MS);
+    let max_offset_ms =
+        OFFSET_PATH_MAX_SEARCH_MS.min(duration_delta_ms.max(0) + OFFSET_PATH_SEARCH_MARGIN_MS);
+    let frame_step = frame_step_ms.max(1) as f64;
+    let min_step = (min_offset_ms as f64 / frame_step).floor() as i64;
+    let max_step = (max_offset_ms as f64 / frame_step).ceil() as i64;
+    (min_step..=max_step).collect()
+}
+
+fn smooth_offset_observations(
+    observations: &[OffsetPathObservation],
+) -> Vec<OffsetPathObservation> {
+    observations
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            let start = index.saturating_sub(2);
+            let end = (index + 3).min(observations.len());
+            let mut nearby_offsets: Vec<i64> = observations[start..end]
+                .iter()
+                .map(|item| item.offset_ms)
+                .collect();
+            nearby_offsets.sort_unstable();
+            OffsetPathObservation {
+                offset_ms: nearby_offsets
+                    .get(nearby_offsets.len() / 2)
+                    .copied()
+                    .unwrap_or(observation.offset_ms),
+                ..observation.clone()
+            }
+        })
+        .collect()
+}
+
+fn stabilize_offset_observations(
+    observations: Vec<OffsetPathObservation>,
+    min_gap_ms: u64,
+    frame_step_ms: u64,
+) -> Vec<OffsetPathObservation> {
+    if observations.is_empty() {
+        return Vec::new();
+    }
+    let mut stable = Vec::new();
+    let mut active_offset_ms = round_to_step(observations[0].offset_ms, frame_step_ms);
+    for index in 0..observations.len() {
+        let candidate_offset_ms = round_to_step(observations[index].offset_ms, frame_step_ms);
+        if candidate_offset_ms - active_offset_ms >= min_gap_ms as i64 {
+            let support_count =
+                count_offset_support(&observations, index, candidate_offset_ms, frame_step_ms);
+            let support_window_size = (observations.len() - index).min(
+                OFFSET_PATH_STABLE_OBSERVATIONS * OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER,
+            );
+            let required_support = OFFSET_PATH_STABLE_OBSERVATIONS
+                .min(support_window_size)
+                .max((support_window_size as f64 * OFFSET_PATH_STABLE_SUPPORT_RATIO).ceil() as usize);
+            if support_count >= required_support {
+                active_offset_ms = candidate_offset_ms;
+            }
+        }
+        stable.push(OffsetPathObservation {
+            offset_ms: active_offset_ms,
+            ..observations[index].clone()
+        });
+    }
+    stable
+}
+
+fn count_offset_support(
+    observations: &[OffsetPathObservation],
+    start_index: usize,
+    offset_ms: i64,
+    frame_step_ms: u64,
+) -> usize {
+    let mut count = 0;
+    let end_index = (start_index
+        + OFFSET_PATH_STABLE_OBSERVATIONS * OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER)
+        .min(observations.len());
+    for index in start_index..end_index {
+        if round_to_step(observations[index].offset_ms, frame_step_ms).abs_diff(offset_ms)
+            <= frame_step_ms
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn expand_offset_path_matches(
+    complete_frames: &[AudioFeatureFrame],
+    source_frames: &[AudioFeatureFrame],
+    observations: &[OffsetPathObservation],
+) -> Vec<AudioFeatureMatch> {
+    if observations.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let mut observation_index = 0usize;
+    for (source_index, source_frame) in source_frames.iter().enumerate() {
+        while observation_index + 1 < observations.len()
+            && observations[observation_index + 1]
+                .source_time_ms
+                .abs_diff(source_frame.time_ms)
+                <= observations[observation_index]
+                    .source_time_ms
+                    .abs_diff(source_frame.time_ms)
+        {
+            observation_index += 1;
+        }
+        let complete_time_ms =
+            source_frame.time_ms as i64 + observations[observation_index].offset_ms;
+        if complete_time_ms < 0 {
+            continue;
+        }
+        let Some(complete_index) =
+            find_nearest_frame_index(complete_frames, complete_time_ms as u64)
+        else {
+            continue;
+        };
+        matches.push(AudioFeatureMatch {
+            complete_time_ms: complete_frames[complete_index].time_ms,
+            source_time_ms: source_frame.time_ms,
+            distance: get_feature_distance(&complete_frames[complete_index], source_frame),
+        });
+        let _ = source_index;
+    }
+    matches
+}
+
+fn find_nearest_frame_index(frames: &[AudioFeatureFrame], time_ms: u64) -> Option<usize> {
+    if frames.is_empty() || time_ms < frames[0].time_ms || time_ms > frames.last()?.time_ms {
+        return None;
+    }
+    let mut best_index = 0usize;
+    let mut best_distance = frames[0].time_ms.abs_diff(time_ms);
+    for (index, frame) in frames.iter().enumerate().skip(1) {
+        let distance = frame.time_ms.abs_diff(time_ms);
+        if distance > best_distance {
+            break;
+        }
+        best_index = index;
+        best_distance = distance;
+    }
+    Some(best_index)
+}
+
+fn create_offset_path_block_size(source_frame_count: usize) -> usize {
+    if source_frame_count <= OFFSET_PATH_MIN_BLOCK_FRAMES {
+        return source_frame_count.max(1);
+    }
+    OFFSET_PATH_TARGET_BLOCK_FRAMES.min(OFFSET_PATH_MIN_BLOCK_FRAMES.max(source_frame_count / 4))
+}
+
+fn estimate_frame_step_ms(frames: &[AudioFeatureFrame], options: &AudioAlignmentOptions) -> u64 {
+    if frames.len() >= 2 {
+        return frames[1].time_ms.saturating_sub(frames[0].time_ms).max(1);
+    }
+    options.window_ms.max(1)
+}
+
+fn round_to_step(value: i64, step: u64) -> i64 {
+    ((value as f64 / step.max(1) as f64).round() * step.max(1) as f64) as i64
 }
 
 fn create_sparse_audio_alignment(
@@ -1071,6 +1613,8 @@ fn create_sparse_audio_alignment(
                 offset_clusters.len()
             ),
         ],
+        time_mapping_segment_count: None,
+        change_points: None,
     }
 }
 
@@ -1382,6 +1926,30 @@ fn infer_cut_candidates(
     merge_nearby_candidates(candidates)
 }
 
+fn create_cut_candidates_from_time_mapping_changes(
+    change_points: &[TimeMappingChangePoint],
+) -> Vec<CutCandidateDto> {
+    change_points
+        .iter()
+        .enumerate()
+        .map(|(index, change_point)| CutCandidateDto {
+            id: format!("audio-gap-{}", index + 1),
+            name: format!("音频时间映射差异 {}", index + 1),
+            source_at_ms: change_point.source_at_ms,
+            source_range_start_ms: change_point.source_range_start_ms,
+            source_range_end_ms: change_point.source_range_end_ms,
+            target_gap_ms: change_point.target_gap_ms,
+            confidence: change_point.confidence,
+            note: format!(
+                "音频时间映射显示 offset 在当前视频 {} 附近持续增加 {}，后续 {} 个观测窗口保持稳定，建议在该区间试听复核。",
+                format_duration(change_point.source_at_ms),
+                format_duration(change_point.target_gap_ms),
+                change_point.support_count
+            ),
+        })
+        .collect()
+}
+
 fn refine_cut_candidates(candidates: Vec<CutCandidateDto>) -> Vec<CutCandidateDto> {
     candidates
         .into_iter()
@@ -1430,6 +1998,50 @@ fn create_evidence_quality(
         return "medium".to_string();
     }
     "low".to_string()
+}
+
+fn create_evidence_signals(
+    alignment: &MultistageAudioAlignmentResult,
+    confirmed_change_count: usize,
+    match_count: usize,
+) -> Vec<AlignmentEvidenceSignalSummary> {
+    vec![
+        AlignmentEvidenceSignalSummary {
+            kind: "audio",
+            status: if match_count > 0 { "used" } else { "blocked" },
+            label: "音频时间映射",
+            observations: alignment.fingerprint_match_count,
+            weight: 1.0,
+            note: if alignment.algorithm == "time-map-audio" {
+                format!(
+                    "已用音频指纹建立 {} 个稳定时间段，确认 {confirmed_change_count} 个持续变点。",
+                    alignment
+                        .time_mapping_segment_count
+                        .unwrap_or(alignment.offset_cluster_count)
+                )
+            } else {
+                "已用音频指纹生成单调锚点；未进入持续时间映射路径。".to_string()
+            },
+        },
+        AlignmentEvidenceSignalSummary {
+            kind: "visual",
+            status: "notConfigured",
+            label: "鲁棒视觉指纹",
+            observations: 0,
+            weight: 0.0,
+            note: "当前版本未采样视觉证据；未来只作为水印/字幕降权后的辅助确认，不单独宣判删减。"
+                .to_string(),
+        },
+        AlignmentEvidenceSignalSummary {
+            kind: "danmaku",
+            status: "notConfigured",
+            label: "弹幕文本/密度线索",
+            observations: 0,
+            weight: 0.0,
+            note: "当前本地音频对齐未融合弹幕语义；弹幕线索仍保留为人工复核参考。"
+                .to_string(),
+        },
+    ]
 }
 
 fn estimate_cut_boundary_ms(previous: &AudioFeatureMatch, current: &AudioFeatureMatch) -> u64 {
@@ -1538,6 +2150,19 @@ mod tests {
             .collect()
     }
 
+    fn pattern_frames(count: usize) -> Vec<AudioFeatureFrame> {
+        (0..count)
+            .map(|index| AudioFeatureFrame {
+                time_ms: index as u64 * 1_000,
+                values: vec![
+                    0.5 + (index as f64 * 0.37).sin() * 0.25,
+                    0.5 + (index as f64 * 0.19).cos() * 0.2,
+                    0.5 + (index as f64 * 0.11 + 0.4).sin() * 0.18,
+                ],
+            })
+            .collect()
+    }
+
     fn cut_candidate(id: &str, source_at_ms: u64, target_gap_ms: u64) -> CutCandidateDto {
         CutCandidateDto {
             id: id.to_string(),
@@ -1603,6 +2228,73 @@ mod tests {
         assert_eq!(
             proposal.evidence.as_ref().unwrap().algorithm,
             "sparse-fingerprint"
+        );
+    }
+
+    #[test]
+    fn offset_path_detects_single_sustained_gap() {
+        let mut options = test_options();
+        options.match_threshold = 0.35;
+        options.min_gap_ms = 3_000;
+        let complete = pattern_frames(120);
+        let mut source = Vec::new();
+        source.extend_from_slice(&complete[0..30]);
+        source.extend_from_slice(&complete[50..]);
+        for (index, frame) in source.iter_mut().enumerate() {
+            frame.time_ms = index as u64 * 1_000;
+        }
+
+        let proposal = create_audio_alignment_proposal(&complete, &source, &options).unwrap();
+
+        assert_eq!(proposal.evidence.as_ref().unwrap().algorithm, "time-map-audio");
+        assert_eq!(
+            proposal
+                .evidence
+                .as_ref()
+                .unwrap()
+                .time_mapping_segment_count,
+            Some(2)
+        );
+        assert_eq!(
+            proposal.evidence.as_ref().unwrap().confirmed_change_count,
+            Some(1)
+        );
+        assert_eq!(proposal.cut_candidates.len(), 1);
+        assert_eq!(proposal.cut_candidates[0].target_gap_ms, 20_000);
+        assert!(proposal.cut_candidates[0].source_at_ms >= 24_000);
+        assert!(proposal.cut_candidates[0].source_at_ms <= 36_000);
+        assert!(proposal
+            .diagnostics
+            .join("\n")
+            .contains("时间映射：确认 1 个持续阶跃变点"));
+    }
+
+    #[test]
+    fn offset_path_rejects_short_forward_mismatch() {
+        let mut options = test_options();
+        options.match_threshold = 0.35;
+        options.min_gap_ms = 3_000;
+        let complete = pattern_frames(180);
+        let source: Vec<AudioFeatureFrame> = complete
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| AudioFeatureFrame {
+                time_ms: index as u64 * 1_000,
+                values: if (60..70).contains(&index) {
+                    complete[index + 20].values.clone()
+                } else {
+                    frame.values.clone()
+                },
+            })
+            .collect();
+
+        let proposal = create_audio_alignment_proposal(&complete, &source, &options).unwrap();
+
+        assert_eq!(proposal.evidence.as_ref().unwrap().algorithm, "time-map-audio");
+        assert_eq!(proposal.cut_candidates.len(), 0);
+        assert_eq!(
+            proposal.evidence.as_ref().unwrap().confirmed_change_count,
+            Some(0)
         );
     }
 

@@ -322,7 +322,7 @@ function createEvidenceLines(proposal: AlignmentProposal): string[] {
     return ["- 暂无对齐证据。"];
   }
   const evidence = proposal.evidence;
-  return [
+  const lines = [
     `- 算法：${formatEvidenceAlgorithm(evidence.algorithm)}`,
     `- 质量：${formatEvidenceQuality(evidence.quality)}`,
     `- 指纹数量：完整版 ${evidence.completeFingerprintCount}，B 站删减版 ${evidence.sourceFingerprintCount}`,
@@ -332,9 +332,33 @@ function createEvidenceLines(proposal: AlignmentProposal): string[] {
     `- 低置信区：${evidence.lowConfidenceRegionCount}`,
     `- 精修候选：${evidence.refinedCandidateCount}`
   ];
+  if (evidence.timeMappingSegmentCount !== undefined) {
+    lines.push(`- 时间映射段：${evidence.timeMappingSegmentCount}`);
+  }
+  if (evidence.confirmedChangeCount !== undefined) {
+    lines.push(`- 持续变点：${evidence.confirmedChangeCount}`);
+  }
+  if (evidence.signals && evidence.signals.length > 0) {
+    lines.push("- 证据信号：");
+    lines.push(
+      ...evidence.signals.map(
+        (signal) =>
+          `  - ${signal.label}：${formatEvidenceSignalStatus(signal.status)}，观测 ${signal.observations}，权重 ${Math.round(
+            signal.weight * 100
+          )}%`
+      )
+    );
+  }
+  return lines;
 }
 
 function formatEvidenceAlgorithm(algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]): string {
+  if (algorithm === "time-map-audio") {
+    return "音频时间映射";
+  }
+  if (algorithm === "offset-path") {
+    return "offset 路径";
+  }
   if (algorithm === "sparse-fingerprint") {
     return "稀疏指纹";
   }
@@ -355,6 +379,18 @@ function formatEvidenceQuality(quality: NonNullable<AlignmentProposal["evidence"
     return "低可信";
   }
   return "需重跑";
+}
+
+function formatEvidenceSignalStatus(
+  status: NonNullable<NonNullable<AlignmentProposal["evidence"]>["signals"]>[number]["status"]
+): string {
+  if (status === "used") {
+    return "已参与";
+  }
+  if (status === "blocked") {
+    return "不可用";
+  }
+  return "未启用";
 }
 
 function createApplyBlockerLines(blockers: string[]): string[] {
