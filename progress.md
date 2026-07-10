@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C34 已完成：Playwright E2E 覆盖项目健康清理动作的撤销/重做。
+  - 核心 E2E 流程会在保存项目后构造一份带失效 `disabledItemIds` 和 `itemTimeAdjustments` 的项目文件，再重新打开该项目。
+  - E2E 会进入“项目信息”，确认项目健康面板显示“需复核”和“存在失效编辑引用”，点击“清理失效引用”后断言状态栏显示已清理 2 条失效引用，并确认健康提示恢复。
+  - E2E 随后执行全局撤销与重做，确认失效引用提示会随历史恢复/重做而正确出现和消失，再继续后续对齐、补偿、导出和重新导入流程。
+  - 已更新真实浏览器截图基线：`artifacts/screenshots/project-health.png`，大小 `78389` 字节，时间 `2026/07/10 8:46:23`。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 本阶段只修改 E2E 测试、截图基线和进度文档，没有修改运行时代码、UI 源码或 Tauri 代码，因此未重新打包；最新可安装 release 产物仍是 C33 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 8:44:27`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2993599` 字节，时间 `2026/07/10 8:44:27`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c34-e2e-health-cleanup-history-20260710`。
 - 成熟度提升阶段 C33 已完成：项目健康摘要支持清理失效编辑引用。
   - 项目健康领域层新增 `cleanupProjectEditReferences`，只清理指向不存在弹幕的 `disabledItemIds` 和 `itemTimeAdjustments`，保留仍然有效的禁用和单条微调。
   - Store 新增真实动作 `cleanupProjectEditReferences`，清理会进入历史栈，可撤销/重做；没有失效引用时只给状态提示，不产生空历史。

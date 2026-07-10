@@ -5,6 +5,12 @@ import { expect, test, type Page } from "@playwright/test";
 const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
 const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
 
+interface SavedProjectFile {
+  disabledItemIds?: string[];
+  itemTimeAdjustments?: Record<string, number>;
+  [key: string]: unknown;
+}
+
 test.beforeAll(() => {
   mkdirSync(screenshotDir, { recursive: true });
   mkdirSync(downloadDir, { recursive: true });
@@ -71,17 +77,38 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   const projectDownload = await projectDownloadPromise;
   const projectFilePath = resolve(downloadDir, projectDownload.suggestedFilename());
   await projectDownload.saveAs(projectFilePath);
-  expect(readFileSync(projectFilePath, "utf8")).toContain("normal.xml");
+  const savedProjectText = readFileSync(projectFilePath, "utf8");
+  expect(savedProjectText).toContain("normal.xml");
+  const projectWithOrphans = JSON.parse(savedProjectText) as SavedProjectFile;
+  projectWithOrphans.disabledItemIds = [...(projectWithOrphans.disabledItemIds ?? []), "missing-disabled-item"];
+  projectWithOrphans.itemTimeAdjustments = {
+    ...(projectWithOrphans.itemTimeAdjustments ?? {}),
+    "missing-adjusted-item": 1200
+  };
+  const projectWithOrphansPath = resolve(downloadDir, "project-with-orphaned-edits.danmaku-project.json");
+  writeFileSync(projectWithOrphansPath, JSON.stringify(projectWithOrphans, null, 2), "utf8");
 
   await page.getByLabel("新建项目").click();
   await expect(page.getByTestId("status-bar")).toContainText("已创建新项目");
-  await page.getByTestId("project-input").setInputFiles(projectFilePath);
+  await page.getByTestId("project-input").setInputFiles(projectWithOrphansPath);
   await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
   await page.getByRole("button", { name: "项目信息" }).click();
-  await expect(page.getByTestId("project-health-panel")).toContainText("项目健康");
-  await expect(page.getByTestId("project-health-panel")).toContainText("健康");
-  await expect(page.getByTestId("project-health-panel")).toContainText("媒体重连");
+  const projectHealthPanel = page.getByTestId("project-health-panel");
+  await expect(projectHealthPanel).toContainText("项目健康");
+  await expect(projectHealthPanel).toContainText("需复核");
+  await expect(projectHealthPanel).toContainText("存在失效编辑引用");
+  await page.getByRole("button", { name: "清理失效引用" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText("已清理 2 条失效编辑引用");
+  await expect(projectHealthPanel).toContainText("健康");
+  await expect(projectHealthPanel).not.toContainText("存在失效编辑引用");
+  await page.getByLabel("撤销").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已撤销");
+  await expect(projectHealthPanel).toContainText("存在失效编辑引用");
+  await page.getByLabel("重做").click();
+  await expect(page.getByTestId("status-bar")).toContainText("已重做");
+  await expect(projectHealthPanel).not.toContainText("存在失效编辑引用");
+  await expect(projectHealthPanel).toContainText("媒体重连");
   await page.screenshot({ path: screenshotPath("project-health.png"), fullPage: true });
   await page.getByRole("button", { name: "弹幕文件" }).click();
 
