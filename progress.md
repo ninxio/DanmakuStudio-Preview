@@ -25,6 +25,19 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C29 已完成：项目文件内嵌弹幕数据 schema 校验补强。
+  - `validateProjectSchema` 现在会进一步校验弹幕条目的 `originalIndex`、`sourceTimeMs`、模式、字号、颜色、时间戳、pool、用户 hash、rowId、原始 `p` 字段和启用状态。
+  - 弹幕资源的 `warnings` 不再只检查数组存在，还会校验 warning 的 ID、assetId、原始序号、severity、message 和 rawSnippet，避免坏的导入警告结构进入项目状态。
+  - 仓库内三分 P 示例项目继续通过打开测试；新增坏 metadata 和坏 warning 的拒绝测试。
+  - 已重新验证：`corepack pnpm test -- --run src/domain/project/schema.test.ts` 成功，1 个测试文件、11 个测试通过。
+  - 已重新验证：`corepack pnpm test` 成功，当前 31 个测试文件、122 个测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 1 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12235264` 字节，时间 `2026/07/10 8:21:50`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2994617` 字节，时间 `2026/07/10 8:21:50`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c29-project-asset-schema-hardening-20260710`。
 - 成熟度提升阶段 C28 已完成：项目文件 schema 校验补强。
   - `validateProjectSchema` 现在会校验删减补偿点、同步锚点、整数毫秒时间字段、时间轴视图和预览设置，不再只检查数组是否存在。
   - 打开 `.danmaku-project.json` 时，字段类型错误的补偿点、置信度越界的同步锚点、非整数毫秒调整、非正时间轴缩放等坏数据会被拒绝，避免非法非破坏性规则进入运行时状态。

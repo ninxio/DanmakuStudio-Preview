@@ -68,6 +68,50 @@ describe("project schema", () => {
     expect(validation.message).toContain("弹幕资源");
   });
 
+  it("拒绝弹幕条目 metadata 类型错误的资源", () => {
+    const project = {
+      ...createEmptyProject(),
+      assets: [
+        {
+          ...createValidAsset(),
+          items: [
+            {
+              ...createValidDanmakuItem(),
+              mode: "1"
+            }
+          ]
+        }
+      ]
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("弹幕资源");
+  });
+
+  it("拒绝导入警告结构错误的资源", () => {
+    const project = {
+      ...createEmptyProject(),
+      assets: [
+        {
+          ...createValidAsset(),
+          warnings: [
+            {
+              id: "warning",
+              assetId: "asset",
+              originalIndex: null,
+              severity: "notice",
+              message: "bad",
+              rawSnippet: ""
+            }
+          ]
+        }
+      ]
+    };
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("弹幕资源");
+  });
+
   it("拒绝关键字段类型错误的时间轴片段", () => {
     const project = {
       ...createEmptyProject(),
@@ -127,3 +171,34 @@ describe("project schema", () => {
     expect(validation.message).toContain("必要字段");
   });
 });
+
+function createValidAsset() {
+  return {
+    id: "asset",
+    name: "valid",
+    fileName: "valid.xml",
+    color: "#4cc9f0",
+    items: [createValidDanmakuItem()],
+    warnings: [],
+    importedAt: "2026-07-03T00:00:00.000Z"
+  };
+}
+
+function createValidDanmakuItem() {
+  return {
+    id: "item",
+    assetId: "asset",
+    originalIndex: 0,
+    sourceTimeMs: 1000,
+    mode: 1,
+    fontSize: 25,
+    color: 16_777_215,
+    timestamp: 0,
+    pool: 0,
+    userHash: "u",
+    rowId: "r",
+    text: "测试",
+    rawPFields: ["1", "1", "25", "16777215", "0", "0", "u", "r"],
+    enabled: true
+  };
+}

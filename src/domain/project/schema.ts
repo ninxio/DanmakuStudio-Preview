@@ -102,7 +102,8 @@ function isDanmakuAsset(value: unknown): boolean {
     Array.isArray(value.items) &&
     Array.isArray(value.warnings) &&
     typeof value.importedAt === "string" &&
-    value.items.every(isDanmakuItem)
+    value.items.every(isDanmakuItem) &&
+    value.warnings.every(isImportWarning)
   );
 }
 
@@ -111,12 +112,31 @@ function isDanmakuItem(value: unknown): boolean {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.assetId === "string" &&
-    typeof value.originalIndex === "number" &&
+    isNonNegativeInteger(value.originalIndex) &&
     isNonNegativeIntegerMilliseconds(value.sourceTimeMs) &&
+    isFiniteNumberOrNull(value.mode) &&
+    isFiniteNumberOrNull(value.fontSize) &&
+    isFiniteNumberOrNull(value.color) &&
+    isFiniteNumberOrNull(value.timestamp) &&
+    isFiniteNumberOrNull(value.pool) &&
+    isStringOrNull(value.userHash) &&
+    isStringOrNull(value.rowId) &&
     typeof value.text === "string" &&
     Array.isArray(value.rawPFields) &&
     value.rawPFields.every((field) => typeof field === "string") &&
     typeof value.enabled === "boolean"
+  );
+}
+
+function isImportWarning(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.assetId === "string" &&
+    (isNonNegativeInteger(value.originalIndex) || value.originalIndex === null) &&
+    (value.severity === "info" || value.severity === "warning" || value.severity === "error") &&
+    typeof value.message === "string" &&
+    typeof value.rawSnippet === "string"
   );
 }
 
@@ -187,6 +207,10 @@ function isIntegerMilliseconds(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value);
 }
 
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function isNonNegativeIntegerMilliseconds(value: unknown): value is number {
   return isIntegerMilliseconds(value) && value >= 0;
 }
@@ -197,4 +221,12 @@ function isPositiveFiniteNumber(value: unknown): value is number {
 
 function isUnitNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function isFiniteNumberOrNull(value: unknown): boolean {
+  return (typeof value === "number" && Number.isFinite(value)) || value === null;
+}
+
+function isStringOrNull(value: unknown): boolean {
+  return typeof value === "string" || value === null;
 }
