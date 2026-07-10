@@ -559,7 +559,7 @@ describe("资源面板", () => {
 
     await waitFor(() =>
       expect(useEditorStore.getState().status).toEqual({
-        message: "对齐提案文件读取失败：读取被拒绝",
+        message: "对齐提案文件读取失败：读取文件 bad-alignment.json 失败：读取被拒绝",
         tone: "error"
       })
     );

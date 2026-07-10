@@ -206,7 +206,7 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.assets).toHaveLength(0);
     expect(useEditorStore.getState().importProgress).toBeNull();
     expect(useEditorStore.getState().status).toEqual({
-      message: "XML 导入失败：读取被拒绝",
+      message: "XML 导入失败：读取文件 broken.xml 失败：读取被拒绝",
       tone: "error"
     });
   });

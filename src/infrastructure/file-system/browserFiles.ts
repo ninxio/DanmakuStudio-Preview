@@ -1,7 +1,15 @@
 export async function readTextFile(file: File): Promise<string> {
-  if (typeof file.text === "function") {
-    return file.text();
+  try {
+    if (typeof file.text === "function") {
+      return await file.text();
+    }
+    return await readTextFileWithReader(file);
+  } catch (error) {
+    throw createFileReadError(file, error);
   }
+}
+
+function readTextFileWithReader(file: File): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -18,6 +26,11 @@ export async function readTextFile(file: File): Promise<string> {
     reader.onerror = () => reject(new Error("读取文件失败。"));
     reader.readAsText(file);
   });
+}
+
+function createFileReadError(file: File, error: unknown): Error {
+  const detail = error instanceof Error && error.message.trim().length > 0 ? `：${error.message}` : "";
+  return new Error(`读取文件 ${file.name} 失败${detail}`);
 }
 
 export async function readFilesAsText(files: FileList | File[]): Promise<Array<{ file: File; text: string }>> {

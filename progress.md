@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C90 已完成：底层文本文件读取错误携带文件名。
+  - `readTextFile(file)` 现在会把读取失败包装为 `读取文件 <文件名> 失败：...`，让 XML 批量导入、打开项目、导入对齐提案等入口都能提示具体失败文件。
+  - XML 导入失败、顶部打开项目失败、顶部导入对齐失败和资源面板导入对齐提案失败的状态栏测试已同步断言文件名上下文。
+  - 已补充文件系统基础测试，直接覆盖 `readTextFile` 读取失败时包含文件名。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts src/stores/editorStore.test.ts src/features/editor/EditorToolbar.test.tsx src/features/assets/AssetPanel.test.tsx` 成功，4 个测试文件、61 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/185 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:32:41`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997562` 字节，时间 `2026/07/10 13:32:41`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c90-file-read-error-file-name-20260710`。
 - 成熟度提升阶段 C89 已完成：资源面板对齐提案文件读取失败提示补充入口上下文。
   - “视频对齐实验室”的“导入文件”入口在读取 JSON 失败时，现在会显示 `对齐提案文件读取失败：...`，不再只透出底层错误文本。
   - 已补充资源面板测试，直接模拟隐藏文件输入读取失败，覆盖该入口的状态栏错误反馈。

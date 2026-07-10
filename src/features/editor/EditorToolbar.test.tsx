@@ -113,7 +113,7 @@ describe("编辑器工具栏", () => {
 
     await waitFor(() =>
       expect(useEditorStore.getState().status).toEqual({
-        message: "项目文件读取失败：项目读取被拒绝",
+        message: "项目文件读取失败：读取文件 bad.danmaku-project.json 失败：项目读取被拒绝",
         tone: "error"
       })
     );
@@ -127,7 +127,7 @@ describe("编辑器工具栏", () => {
 
     await waitFor(() =>
       expect(useEditorStore.getState().status).toEqual({
-        message: "对齐提案读取失败：对齐读取被拒绝",
+        message: "对齐提案读取失败：读取文件 bad-alignment.json 失败：对齐读取被拒绝",
         tone: "error"
       })
     );

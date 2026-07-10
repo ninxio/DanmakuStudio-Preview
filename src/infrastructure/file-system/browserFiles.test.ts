@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createStoredZip, downloadTextFile, downloadTextFiles, sanitizeDownloadFileName } from "./browserFiles";
+import { createStoredZip, downloadTextFile, downloadTextFiles, readTextFile, sanitizeDownloadFileName } from "./browserFiles";
 
 describe("浏览器文件导出", () => {
   it("把多份 XML 打包成包含全部条目的 ZIP", async () => {
@@ -55,6 +55,16 @@ describe("浏览器文件导出", () => {
 
     expect(Array.from(result).length).toBeLessThanOrEqual(180);
     expect(result.startsWith("_CON.")).toBe(true);
+  });
+
+  it("读取文本文件失败时包含文件名", async () => {
+    const file = new File([""], "broken.xml", { type: "application/xml" });
+    Object.defineProperty(file, "text", {
+      configurable: true,
+      value: vi.fn<() => Promise<string>>(() => Promise.reject(new Error("读取被拒绝")))
+    });
+
+    await expect(readTextFile(file)).rejects.toThrow("读取文件 broken.xml 失败：读取被拒绝");
   });
 
   it("单文件下载返回实际使用的文件名", () => {
