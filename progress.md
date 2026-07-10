@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C96 已完成：资源面板直接展示对齐提案落点状态。
+  - 对齐复核状态从报告私有逻辑提升为领域层结构化结果：新增 `createAlignmentReviewItemStatuses`，输出每条锚点/补偿的类型、名称、源时间、状态、状态文案和阻断原因。
+  - 复核报告继续复用同一套状态计算，避免报告、按钮禁用和面板展示出现三套判断。
+  - “视频对齐实验室”在导入或生成提案后新增“落点状态”列表，直接展示前几条锚点/补偿是“待应用”“已落点”还是具体“阻断”原因，不必先下载报告才能判断。
+  - 状态列表带 `aria-label="对齐落点状态"`，测试覆盖正常待应用、区间异常阻断、当前项目同 ID 阻断和结构化领域状态输出。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/alignmentReport.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、29 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/192 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 14:20:30`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3000028` 字节，时间 `2026/07/10 14:20:30`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c96-alignment-status-panel-20260710`。
 - 成熟度提升阶段 C95 已完成：对齐复核报告标注每条提案的落点状态。
   - `createAlignmentReviewReport` 现在会在每个同步锚点和候选补偿明细中写入“落点状态”，直接标明“待应用”“已落点”或“阻断”。
   - 状态标注复用 C94 的等价已落点判断：已有等价锚点/补偿点会标为已落点；同 ID 但时间或补偿不同仍会标为当前项目同 ID 阻断。

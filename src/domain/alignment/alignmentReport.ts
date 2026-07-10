@@ -14,6 +14,19 @@ export interface AlignmentApplyBlockerContext {
   existingCutMarkerIds?: string[];
 }
 
+export type AlignmentReviewItemKind = "anchor" | "cutCandidate";
+export type AlignmentReviewItemState = "pending" | "applied" | "blocked";
+
+export interface AlignmentReviewItemStatus {
+  kind: AlignmentReviewItemKind;
+  id: string;
+  name: string;
+  sourceAtMs: number;
+  state: AlignmentReviewItemState;
+  statusText: string;
+  blockReasons: string[];
+}
+
 export function createAlignmentReviewReport(
   proposal: AlignmentProposal,
   generatedAt: Date = new Date(),
@@ -45,6 +58,39 @@ export function createAlignmentReviewReport(
     ...createDiagnosticLines(proposal.diagnostics)
   ];
   return `${lines.join("\n")}\n`;
+}
+
+export function createAlignmentReviewItemStatuses(
+  proposal: AlignmentProposal,
+  context: AlignmentApplyBlockerContext = {}
+): AlignmentReviewItemStatus[] {
+  const statusContext = createReviewStatusContext(proposal, context);
+  return [
+    ...proposal.anchors.map((anchor): AlignmentReviewItemStatus => {
+      const status = createAnchorStatusResult(anchor, statusContext);
+      return {
+        kind: "anchor",
+        id: anchor.id,
+        name: anchor.id.trim().length > 0 ? anchor.id : "未命名锚点",
+        sourceAtMs: anchor.sourceMs,
+        state: status.state,
+        statusText: status.text,
+        blockReasons: status.blockReasons
+      };
+    }),
+    ...proposal.cutCandidates.map((candidate): AlignmentReviewItemStatus => {
+      const status = createCutCandidateStatusResult(candidate, statusContext);
+      return {
+        kind: "cutCandidate",
+        id: candidate.id,
+        name: candidate.name,
+        sourceAtMs: candidate.sourceAtMs,
+        state: status.state,
+        statusText: status.text,
+        blockReasons: status.blockReasons
+      };
+    })
+  ];
 }
 
 export function createAlignmentReviewFocus(proposal: AlignmentProposal): string[] {
@@ -146,7 +192,7 @@ function createAnchorLines(proposal: AlignmentProposal, statusContext: Alignment
     const confidence = anchor.confidence === undefined ? "未提供" : formatConfidence(anchor.confidence);
     return [
       `- ${index + 1}. [${anchor.id}] ${anchor.origin === "automatic" ? "自动" : "手动"}`,
-      `  落点状态：${createAnchorStatus(anchor, statusContext)}`,
+      `  落点状态：${createAnchorStatusResult(anchor, statusContext).text}`,
       `  源时间：${formatTime(anchor.sourceMs)}`,
       `  目标时间：${formatTime(anchor.targetMs)}`,
       `  偏移：${formatSignedDuration(offsetMs)} (${offsetMs} ms)`,
@@ -166,7 +212,7 @@ function createCutCandidateLines(
     const sourceRangeLine = createSourceRangeLine(candidate);
     return [
       `- ${index + 1}. [${candidate.id}] ${candidate.name}`,
-      `  落点状态：${createCutCandidateStatus(candidate, statusContext)}`,
+      `  落点状态：${createCutCandidateStatusResult(candidate, statusContext).text}`,
       `  源时间：${formatTime(candidate.sourceAtMs)}`,
       `  ${sourceRangeLine}`,
       `  补偿：${formatSignedDuration(candidate.targetGapMs)} (${Math.round(candidate.targetGapMs)} ms)`,
@@ -207,6 +253,12 @@ interface AlignmentReviewStatusContext {
   duplicateCutIds: Set<string>;
 }
 
+interface AlignmentItemStatusResult {
+  state: AlignmentReviewItemState;
+  text: string;
+  blockReasons: string[];
+}
+
 function createReviewStatusContext(
   proposal: AlignmentProposal,
   context: AlignmentApplyBlockerContext
@@ -218,10 +270,17 @@ function createReviewStatusContext(
   };
 }
 
-function createAnchorStatus(anchor: SyncAnchor, statusContext: AlignmentReviewStatusContext): string {
+function createAnchorStatusResult(
+  anchor: SyncAnchor,
+  statusContext: AlignmentReviewStatusContext
+): AlignmentItemStatusResult {
   const context = statusContext.applyContext;
   if (context.existingAnchors && isAlignmentAnchorApplied(context.existingAnchors, anchor)) {
-    return "已落点（当前项目已有等价锚点）";
+    return {
+      state: "applied",
+      text: "已落点（当前项目已有等价锚点）",
+      blockReasons: []
+    };
   }
   const reasons: string[] = [];
   if (anchor.id.trim().length === 0) {
@@ -234,16 +293,20 @@ function createAnchorStatus(anchor: SyncAnchor, statusContext: AlignmentReviewSt
       reasons.push("提案内 ID 重复");
     }
   }
-  return createPendingStatus(reasons);
+  return createPendingStatusResult(reasons);
 }
 
-function createCutCandidateStatus(
+function createCutCandidateStatusResult(
   candidate: CutCandidate,
   statusContext: AlignmentReviewStatusContext
-): string {
+): AlignmentItemStatusResult {
   const context = statusContext.applyContext;
   if (context.existingCutMarkers && isAlignmentCutCandidateApplied(context.existingCutMarkers, candidate)) {
-    return "已落点（当前项目已有等价补偿点）";
+    return {
+      state: "applied",
+      text: "已落点（当前项目已有等价补偿点）",
+      blockReasons: []
+    };
   }
   const reasons: string[] = [];
   if (candidate.id.trim().length === 0) {
@@ -262,14 +325,22 @@ function createCutCandidateStatus(
   if (isSourceOutsideRange(candidate)) {
     reasons.push("源时间不在不确定区间内");
   }
-  return createPendingStatus(reasons);
+  return createPendingStatusResult(reasons);
 }
 
-function createPendingStatus(blockReasons: string[]): string {
+function createPendingStatusResult(blockReasons: string[]): AlignmentItemStatusResult {
   if (blockReasons.length === 0) {
-    return "待应用";
+    return {
+      state: "pending",
+      text: "待应用",
+      blockReasons: []
+    };
   }
-  return `阻断（${blockReasons.join("；")}）`;
+  return {
+    state: "blocked",
+    text: `阻断（${blockReasons.join("；")}）`,
+    blockReasons
+  };
 }
 
 function createPendingAnchorsForBlockers(

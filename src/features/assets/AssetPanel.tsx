@@ -18,7 +18,9 @@ import { TextButton } from "../../components/TextButton";
 import {
   createAlignmentApplyBlockers,
   createAlignmentReviewFocus,
-  createAlignmentReviewReport
+  createAlignmentReviewItemStatuses,
+  createAlignmentReviewReport,
+  type AlignmentReviewItemState
 } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
@@ -1252,6 +1254,9 @@ function VideoAlignmentLabPanel({
     existingCutMarkers: project.cutMarkers
   };
   const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal, applyBlockerContext) : [];
+  const reviewItemStatuses = proposal ? createAlignmentReviewItemStatuses(proposal, applyBlockerContext) : [];
+  const visibleReviewItemStatuses = reviewItemStatuses.slice(0, 5);
+  const hiddenReviewItemStatusCount = reviewItemStatuses.length - visibleReviewItemStatuses.length;
 
   useEffect(() => {
     let mounted = true;
@@ -1683,6 +1688,29 @@ function VideoAlignmentLabPanel({
                 </ul>
               </div>
             ) : null}
+            {reviewItemStatuses.length > 0 ? (
+              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
+                <div className="mb-1 font-medium text-slate-200">落点状态</div>
+                <ul className="grid gap-1" aria-label="对齐落点状态">
+                  {visibleReviewItemStatuses.map((item, index) => (
+                    <li
+                      key={`${item.kind}-${item.id}-${index}`}
+                      className="grid grid-cols-[44px_minmax(0,1fr)] gap-2"
+                    >
+                      <span className="text-slate-500">{item.kind === "anchor" ? "锚点" : "补偿"}</span>
+                      <span className="min-w-0">
+                        <span className="text-slate-100">{item.name}</span>
+                        <span className="text-slate-500"> / {formatTimecode(item.sourceAtMs)} / </span>
+                        <span className={getAlignmentReviewStatusClassName(item.state)}>{item.statusText}</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {hiddenReviewItemStatusCount > 0 ? (
+                  <div className="mt-1 text-slate-500">另有 {hiddenReviewItemStatusCount} 条状态已收起。</div>
+                ) : null}
+              </div>
+            ) : null}
             <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
               <span className="text-slate-500">锚点</span>
               <span>
@@ -1791,6 +1819,16 @@ function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): st
     return "失败";
   }
   return "已取消";
+}
+
+function getAlignmentReviewStatusClassName(state: AlignmentReviewItemState): string {
+  if (state === "applied") {
+    return "text-emerald-300";
+  }
+  if (state === "blocked") {
+    return "text-red-200";
+  }
+  return "text-amber-200";
 }
 
 function createBatchMergeOptions({

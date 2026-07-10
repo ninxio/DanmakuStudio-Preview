@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createAlignmentApplyBlockers,
   createAlignmentReviewFocus,
+  createAlignmentReviewItemStatuses,
   createAlignmentReviewReport
 } from "./alignmentReport";
 import type { AlignmentProposal } from "./types";
@@ -204,5 +205,37 @@ describe("alignment review report", () => {
     expect(equivalentReport).toContain("落点状态：已落点（当前项目已有等价补偿点）");
     expect(conflictReport).toContain("落点状态：阻断（当前项目已有同 ID 锚点）");
     expect(conflictReport).toContain("落点状态：阻断（当前项目已有同 ID 补偿点）");
+    expect(createAlignmentReviewItemStatuses(equivalentProposal, context)).toMatchObject([
+      {
+        kind: "anchor",
+        id: "anchor-existing",
+        state: "applied",
+        statusText: "已落点（当前项目已有等价锚点）",
+        blockReasons: []
+      },
+      {
+        kind: "cutCandidate",
+        id: "cut-existing",
+        state: "applied",
+        statusText: "已落点（当前项目已有等价补偿点）",
+        blockReasons: []
+      }
+    ]);
+    expect(createAlignmentReviewItemStatuses(conflictProposal, context)).toMatchObject([
+      {
+        kind: "anchor",
+        id: "anchor-existing",
+        state: "blocked",
+        statusText: "阻断（当前项目已有同 ID 锚点）",
+        blockReasons: ["当前项目已有同 ID 锚点"]
+      },
+      {
+        kind: "cutCandidate",
+        id: "cut-existing",
+        state: "blocked",
+        statusText: "阻断（当前项目已有同 ID 补偿点）",
+        blockReasons: ["当前项目已有同 ID 补偿点"]
+      }
+    ]);
   });
 });
