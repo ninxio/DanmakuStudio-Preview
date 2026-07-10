@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C105 已完成：导入/预览对齐提案纳入撤销/重做历史。
+  - `previewAlignmentProposalData` 现在复用项目快照提交机制，导入 JSON、锚点校准“预览到时间轴”和本地音频对齐生成提案后，`project.alignmentProposal` 的变更会成为可撤销/重做的项目操作。
+  - 撤销对齐提案预览会只回退提案状态，保留之前已有的片段、锚点或其他项目编辑；重做会恢复同一个对齐提案，并同步顶层 `alignmentProposal`。
+  - 重复预览内容完全相同的提案不会追加新的历史记录，只刷新“已发送到时间轴预览”的状态提示，避免用户反复点击预览时污染撤销栈。
+  - 已补充 store 测试，覆盖预览提案写入项目历史、重复预览不追加历史、撤销/重做预览时顶层提案和项目提案同步恢复。
+  - 已重新验证：`corepack pnpm test -- src/stores/editorStore.test.ts` 成功，1 个测试文件、27 个测试通过。
+  - 已重新验证：`corepack pnpm test -- src/features/assets/AssetPanel.test.tsx` 成功，1 个测试文件、26 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/203 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 15:23:56`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3002208` 字节，时间 `2026/07/10 15:23:56`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c105-alignment-proposal-preview-history-20260710`。
 - 成熟度提升阶段 C104 已完成：对齐提案支持从资源面板显式清空，并进入撤销/重做链路。
   - `editorStore` 新增 `clearAlignmentProposal`，通过现有项目快照提交机制把 `project.alignmentProposal` 置空，并同步顶层 `alignmentProposal`，避免对齐提案持久化后旧候选长期残留在项目状态里。
   - “视频对齐实验室”新增真实“清空提案”按钮；当前已有项目提案时会清空项目内提案、复核队列和 `AlignmentProposal JSON` 文本框，没有项目提案但有本地草稿时会仅清空草稿。

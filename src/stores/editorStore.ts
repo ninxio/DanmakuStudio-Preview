@@ -57,7 +57,7 @@ import {
   isAlignmentAnchorApplied,
   isAlignmentCutCandidateApplied
 } from "../domain/alignment/preview";
-import { parseAlignmentProposal } from "../domain/alignment/manualProvider";
+import { parseAlignmentProposal, serializeAlignmentProposal } from "../domain/alignment/manualProvider";
 import { pickAssetColor } from "../domain/shared/assetColors";
 import {
   DEFAULT_CUT_HINT_SEARCH_SETTINGS,
@@ -1026,17 +1026,19 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   previewAlignmentProposalData: (proposal) => {
-    set((state) => ({
-      project: touchProject({
-        ...state.project,
-        alignmentProposal: proposal
-      }),
-      alignmentProposal: proposal,
-      status: {
-        message: `已发送到时间轴预览：${proposal.anchors.length} 个锚点，${proposal.cutCandidates.length} 个候选补偿点。`,
-        tone: "success"
-      }
+    const existingProposal = get().project.alignmentProposal;
+    if (isSameAlignmentProposal(existingProposal, proposal)) {
+      set({
+        alignmentProposal: existingProposal,
+        status: createAlignmentProposalPreviewStatus(proposal)
+      });
+      return;
+    }
+    commitProject(set, get, "预览对齐提案", (currentProject) => ({
+      ...currentProject,
+      alignmentProposal: proposal
     }));
+    set({ status: createAlignmentProposalPreviewStatus(proposal) });
   },
 
   exportAlignmentProposal: () => {
@@ -1171,6 +1173,17 @@ function commitProject(
     selection: selection ?? state.selection,
     exportDraft: null
   }));
+}
+
+function createAlignmentProposalPreviewStatus(proposal: AlignmentProposal): EditorStatus {
+  return {
+    message: `已发送到时间轴预览：${proposal.anchors.length} 个锚点，${proposal.cutCandidates.length} 个候选补偿点。`,
+    tone: "success"
+  };
+}
+
+function isSameAlignmentProposal(current: AlignmentProposal | null, next: AlignmentProposal): boolean {
+  return current ? serializeAlignmentProposal(current) === serializeAlignmentProposal(next) : false;
 }
 
 function createOpenProjectStatus(

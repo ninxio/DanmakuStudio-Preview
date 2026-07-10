@@ -164,6 +164,17 @@ describe("editor store", () => {
 
     expect(useEditorStore.getState().alignmentProposal).toBe(proposal);
     expect(useEditorStore.getState().project.alignmentProposal).toBe(proposal);
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("预览对齐提案");
+  });
+
+  it("重复预览相同对齐提案时不追加历史记录", () => {
+    const proposal = createAlignmentProposal();
+
+    useEditorStore.getState().previewAlignmentProposalData(proposal);
+    useEditorStore.getState().previewAlignmentProposalData(createAlignmentProposal());
+
+    expect(useEditorStore.getState().history.past).toHaveLength(1);
+    expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
   });
 
   it("清空对齐提案时同步项目状态并支持撤销重做", () => {
@@ -190,7 +201,7 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
   });
 
-  it("撤销和重做项目快照时同步顶层对齐提案", () => {
+  it("撤销和重做对齐提案预览时同步顶层对齐提案", () => {
     const asset = createAsset("asset-with-preview", "preview.xml");
     resetStore({
       ...createEmptyProject(),
@@ -204,13 +215,14 @@ describe("editor store", () => {
 
     useEditorStore.getState().undo();
 
+    expect(useEditorStore.getState().project.clips).toHaveLength(1);
     expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
     expect(useEditorStore.getState().alignmentProposal).toBeNull();
 
     useEditorStore.getState().redo();
 
-    expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
-    expect(useEditorStore.getState().alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
   });
 
   it("追加片段时使用已有片段包含 localOffsetMs 的视觉结束点", () => {
