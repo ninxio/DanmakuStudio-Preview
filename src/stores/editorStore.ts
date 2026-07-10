@@ -1120,6 +1120,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return {
         project: result.value,
         history: result.history,
+        alignmentProposal: result.value.alignmentProposal,
         status: { message: "已撤销。", tone: "success" }
       };
     });
@@ -1134,6 +1135,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return {
         project: result.value,
         history: result.history,
+        alignmentProposal: result.value.alignmentProposal,
         status: { message: "已重做。", tone: "success" }
       };
     });
@@ -1152,6 +1154,7 @@ function commitProject(
   set((state) => ({
     project: after,
     history: pushHistory(state.history, label, before, after),
+    alignmentProposal: after.alignmentProposal,
     selection: selection ?? state.selection,
     exportDraft: null
   }));

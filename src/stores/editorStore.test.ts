@@ -166,6 +166,29 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.alignmentProposal).toBe(proposal);
   });
 
+  it("撤销和重做项目快照时同步顶层对齐提案", () => {
+    const asset = createAsset("asset-with-preview", "preview.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset]
+    });
+    useEditorStore.getState().addAssetToTimeline(asset.id);
+    useEditorStore.getState().previewAlignmentProposalData(createAlignmentProposal());
+
+    expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+
+    useEditorStore.getState().undo();
+
+    expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().alignmentProposal).toBeNull();
+
+    useEditorStore.getState().redo();
+
+    expect(useEditorStore.getState().project.alignmentProposal).toBeNull();
+    expect(useEditorStore.getState().alignmentProposal).toBeNull();
+  });
+
   it("追加片段时使用已有片段包含 localOffsetMs 的视觉结束点", () => {
     const firstAsset = createAsset("asset-a", "a.xml");
     const secondAsset = createAsset("asset-b", "b.xml");

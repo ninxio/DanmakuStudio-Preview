@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C102 已完成：撤销/重做时同步项目内对齐提案状态。
+  - C101 将对齐提案纳入项目文件后，顶层 store 的 `alignmentProposal` 现在会在所有项目快照提交、撤销和重做时从 `project.alignmentProposal` 同步，避免顶部工具栏、资源栏和时间轴读取到旧提案。
+  - 通用 `commitProject` 会把提交后的项目提案同步到顶层状态；`undo` / `redo` 恢复历史快照时也会同步恢复或清空提案。
+  - 已补充 store 测试，覆盖“预览提案不进入历史，但撤销旧项目操作后顶层提案和项目提案都清空，重做后仍与项目快照一致”的边界。
+  - 已重新验证：`corepack pnpm test -- src/stores/editorStore.test.ts` 成功，1 个测试文件、25 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、35 个测试文件/199 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12243456` 字节，时间 `2026/07/10 15:00:55`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3002034` 字节，时间 `2026/07/10 15:00:55`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c102-sync-alignment-proposal-history-20260710`。
 - 成熟度提升阶段 C101 已完成：项目文件持久化当前对齐提案与复核状态。
   - 项目 schema 升级到 v3，`EditorProject` 新增 `alignmentProposal` 字段，用于保存当前导入或生成的对齐提案；项目文件仍只保存媒体引用、弹幕数据和编辑/复核状态，不嵌入视频内容。
   - 预览或导入对齐提案时会同步写入 `project.alignmentProposal`；保存 `.danmaku-project.json` 后再次打开，会恢复顶部“应用对齐”、资源栏复核队列和时间轴对齐预览所需的提案状态。
