@@ -7,6 +7,11 @@ import type { AlignmentProposal } from "../alignment/types";
 import { resolveProjectDanmakuEvents } from "../timeline/mapping";
 import { createProjectHealthSummary } from "./health";
 import { formatMediaBindingSource, formatMediaBindingTitle } from "./mediaBinding";
+import {
+  createProjectMatchAssessment,
+  formatProjectMatchScore,
+  type ProjectMatchAssessment
+} from "./matchAssessment";
 import type { EditorProject } from "./types";
 
 export type WorkflowStageId = "source" | "timeline" | "alignment" | "review" | "export";
@@ -80,6 +85,7 @@ export function createWorkflowOverview(
   const enabledEvents = resolveProjectDanmakuEvents(project).filter((event) => event.enabled);
   const itemCount = project.assets.reduce((sum, asset) => sum + asset.items.length, 0);
   const health = createProjectHealthSummary(project);
+  const matchAssessment = createProjectMatchAssessment(project);
   const alignmentContext = {
     existingAnchors: project.syncAnchors,
     existingCutMarkers: project.cutMarkers
@@ -184,10 +190,11 @@ export function createWorkflowOverview(
       metrics: [
         { label: "视频", value: project.media ? project.media.fileName : "未导入" },
         { label: "目标原片", value: project.mediaBinding ? formatMediaBindingTitle(project.mediaBinding) : "未绑定" },
+        { label: "匹配评分", value: createMatchMetricValue(matchAssessment, assetCount) },
         { label: "XML", value: `${formatCount(assetCount)} 个` },
         { label: "弹幕", value: `${formatCount(itemCount)} 条` }
       ],
-      capabilityIds: ["local-media", "target-media", "multi-xml", "raw-xml-safe"],
+      capabilityIds: ["local-media", "target-media", "match-score", "multi-xml", "raw-xml-safe"],
       actionIds: ["import-xml", "import-video"]
     },
     {
@@ -274,6 +281,7 @@ export function createWorkflowOverview(
       hasTimeline,
       hasAlignmentProposal: Boolean(alignmentProposal),
       mediaLoaded: Boolean(project.media),
+      matchAssessment,
       project
     })
   };
@@ -325,17 +333,29 @@ function createExportReason(enabledEventCount: number, healthStatus: "ready" | "
   return null;
 }
 
+function createMatchMetricValue(assessment: ProjectMatchAssessment, assetCount: number): string {
+  if (assetCount === 0) {
+    return "等待 XML";
+  }
+  if (assessment.targetTitle === "未绑定目标原片") {
+    return "未绑定目标";
+  }
+  return `${formatProjectMatchScore(assessment.score)} / ${assessment.conclusionLabel}`;
+}
+
 function createCapabilities({
   hasAssets,
   hasTimeline,
   hasAlignmentProposal,
   mediaLoaded,
+  matchAssessment,
   project
 }: {
   hasAssets: boolean;
   hasTimeline: boolean;
   hasAlignmentProposal: boolean;
   mediaLoaded: boolean;
+  matchAssessment: ProjectMatchAssessment;
   project: EditorProject;
 }): WorkflowCapability[] {
   return [
@@ -356,6 +376,14 @@ function createCapabilities({
       visibleWhen: "always",
       stateText: project.mediaBinding ? "已绑定" : "可绑定",
       active: Boolean(project.mediaBinding)
+    },
+    {
+      id: "match-score",
+      title: "匹配评分",
+      detail: `${matchAssessment.conclusionLabel}：${matchAssessment.headline}`,
+      visibleWhen: "always",
+      stateText: project.mediaBinding && hasAssets ? formatProjectMatchScore(matchAssessment.score) : "待评分",
+      active: Boolean(project.mediaBinding && hasAssets)
     },
     {
       id: "multi-xml",

@@ -25,9 +25,11 @@ describe("workflow overview", () => {
   });
 
   it("目标原片绑定会进入来源阶段和能力地图", () => {
+    const asset = parseBilibiliXml(createTimedXml(240, 15), { fileName: "测试剧集 S01E02.xml" });
     const overview = createWorkflowOverview(
       {
         ...createEmptyProject(),
+        assets: [asset],
         mediaBinding: {
           id: "binding-emby",
           kind: "embyItem",
@@ -38,7 +40,7 @@ describe("workflow overview", () => {
           seriesName: "测试剧集",
           seasonNumber: 1,
           episodeNumber: 2,
-          runtimeMs: 3_000_000,
+          runtimeMs: 3_600_000,
           linkedAt: "2026-07-10T00:00:00.000Z",
           server: { serverUrl: "https://emby.example.test", pathPrefix: "/emby", username: "tester" },
           mediaSources: []
@@ -51,8 +53,15 @@ describe("workflow overview", () => {
       label: "目标原片",
       value: "测试剧集 / S01E02 / 第二集"
     });
+    const matchMetric = overview.stages
+      .find((stage) => stage.id === "source")
+      ?.metrics.find((metric) => metric.label === "匹配评分");
+    expect(matchMetric?.value).toContain("很可能匹配");
     expect(overview.capabilities.find((capability) => capability.id === "target-media")).toMatchObject({
       stateText: "已绑定",
+      active: true
+    });
+    expect(overview.capabilities.find((capability) => capability.id === "match-score")).toMatchObject({
       active: true
     });
   });
@@ -117,3 +126,11 @@ describe("workflow overview", () => {
     expect(overview.capabilities.find((capability) => capability.id === "alignment-review")?.active).toBe(true);
   });
 });
+
+function createTimedXml(count: number, intervalSeconds: number): string {
+  const lines = Array.from(
+    { length: count },
+    (_, index) => `<d p="${index * intervalSeconds},1,25,16777215,0,0,u${index},r${index}">测试 ${index + 1}</d>`
+  );
+  return `<?xml version="1.0" encoding="UTF-8"?><i>${lines.join("")}</i>`;
+}

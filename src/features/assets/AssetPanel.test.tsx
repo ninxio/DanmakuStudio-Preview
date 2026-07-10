@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
 import { createHistoryState } from "../../domain/history/history";
 import { createEmptyProject } from "../../domain/project/factory";
+import { createEmbyItemMediaBinding } from "../../domain/project/mediaBinding";
 import { CURRENT_SCHEMA_VERSION } from "../../domain/project/types";
 import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
@@ -115,9 +116,53 @@ describe("资源面板", () => {
     render(<AssetPanel />);
     await user.click(screen.getByRole("button", { name: "媒体" }));
 
-    expect(screen.getByText("Emby 条目已保存")).toBeInTheDocument();
-    expect(screen.getByText("测试剧集 / S01E02 / 第二集")).toBeInTheDocument();
-    expect(screen.getByText("主媒体源 / mkv / h264 / aac / 1920x1080")).toBeInTheDocument();
+    const targetPanel = getTargetMediaBindingPanel();
+    expect(within(targetPanel).getByText("Emby 条目已保存")).toBeInTheDocument();
+    expect(within(targetPanel).getByText("测试剧集 / S01E02 / 第二集")).toBeInTheDocument();
+    expect(within(targetPanel).getByText("主媒体源 / mkv / h264 / aac / 1920x1080")).toBeInTheDocument();
+  });
+
+  it("媒体页展示匹配评分并可发送评分提案到时间轴预览", async () => {
+    const user = userEvent.setup();
+    const asset = parseBilibiliXml(createTimedXml(240, 15), { fileName: "测试剧集 S01E02.xml" });
+    useEditorStore.setState({
+      project: {
+        ...createEmptyProject("测试剧集 S01E02"),
+        assets: [asset],
+        mediaBinding: createEmbyItemMediaBinding(
+          "binding-emby",
+          {
+            id: "emby-item-2",
+            name: "第二集",
+            type: "Episode",
+            seriesName: "测试剧集",
+            seasonNumber: 1,
+            episodeNumber: 2,
+            durationMs: 3_600_000,
+            mediaSources: []
+          },
+          {
+            serverUrl: "https://emby.example.test",
+            pathPrefix: "/emby",
+            username: "tester"
+          },
+          "2026-07-10T00:00:00.000Z"
+        )
+      }
+    });
+
+    render(<AssetPanel />);
+    await user.click(screen.getByRole("button", { name: "媒体" }));
+
+    expect(screen.getByText("匹配评分")).toBeInTheDocument();
+    expect(screen.getByText("很可能匹配")).toBeInTheDocument();
+    expect(screen.getByText("片名与季集")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "预览评分提案" }));
+
+    await waitFor(() => expect(useEditorStore.getState().alignmentProposal?.anchors).toHaveLength(1));
+    expect(useEditorStore.getState().alignmentProposal?.diagnostics[0]).toContain("匹配评分");
+    expect(useEditorStore.getState().status.message).toBe("已发送到时间轴预览：1 个同步线索，0 个候选版本差异。");
   });
 
   it("高级工具默认收起，展开后 Emby 时长面板只保留搜索入口", async () => {
@@ -1047,6 +1092,14 @@ function createRejectingTextFile(fileName: string, message: string): File {
     value: vi.fn<() => Promise<string>>(() => Promise.reject(new Error(message)))
   });
   return file;
+}
+
+function createTimedXml(count: number, intervalSeconds: number): string {
+  const lines = Array.from(
+    { length: count },
+    (_, index) => `<d p="${index * intervalSeconds},1,25,16777215,0,0,u${index},r${index}">测试 ${index + 1}</d>`
+  );
+  return `<?xml version="1.0" encoding="UTF-8"?><i>${lines.join("")}</i>`;
 }
 
 function getTargetMediaBindingPanel(): HTMLElement {

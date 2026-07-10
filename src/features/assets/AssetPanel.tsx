@@ -53,6 +53,12 @@ import {
   formatMediaSourceSummary
 } from "../../domain/project/mediaBinding";
 import {
+  createProjectMatchAssessment,
+  formatProjectMatchScore,
+  type ProjectMatchAssessment,
+  type ProjectMatchCriterionState
+} from "../../domain/project/matchAssessment";
+import {
   createProjectReadinessSummary,
   type ProjectReadinessItem,
   type ProjectReadinessStatus,
@@ -208,6 +214,7 @@ export function AssetPanel() {
   );
   const projectHealth = useMemo(() => createProjectHealthSummary(project), [project]);
   const projectReadiness = useMemo(() => createProjectReadinessSummary(project), [project]);
+  const projectMatchAssessment = useMemo(() => createProjectMatchAssessment(project), [project]);
 
   const validateEmbyTargetBinding = async () => {
     const binding = project.mediaBinding;
@@ -237,6 +244,14 @@ export function AssetPanel() {
     } finally {
       setTargetValidationLoading(false);
     }
+  };
+
+  const previewProjectMatchProposal = () => {
+    if (!projectMatchAssessment.proposal) {
+      setStatus({ message: "先绑定目标原片并导入 XML 后，才能生成匹配评分提案。", tone: "warning" });
+      return;
+    }
+    previewAlignmentProposalData(projectMatchAssessment.proposal);
   };
 
   useEffect(() => {
@@ -277,6 +292,7 @@ export function AssetPanel() {
               onValidateEmby={() => void validateEmbyTargetBinding()}
               onClear={clearMediaBinding}
             />
+            <ProjectMatchAssessmentPanel assessment={projectMatchAssessment} onPreview={previewProjectMatchProposal} />
             {project.media ? (
               <div className="rounded border border-panel-line bg-panel-soft p-3">
                 <div className="flex items-center gap-2 text-sm text-slate-100">
@@ -613,6 +629,71 @@ function TargetMediaBindingPanel({
             解除绑定
           </TextButton>
         ) : null}
+      </div>
+    </section>
+  );
+}
+
+function ProjectMatchAssessmentPanel({
+  assessment,
+  onPreview
+}: {
+  assessment: ProjectMatchAssessment;
+  onPreview: () => void;
+}) {
+  const canPreview = Boolean(assessment.proposal);
+  return (
+    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+      <div className="flex items-center gap-2">
+        <WandSparkles size={16} className="text-accent-cyan" />
+        <h3 className="text-sm font-medium text-slate-100">匹配评分</h3>
+        <span className={`ml-auto rounded border px-2 py-0.5 text-[11px] ${projectMatchBadgeClass(assessment.conclusion)}`}>
+          {assessment.conclusionLabel}
+        </span>
+      </div>
+      <div className="mt-3 grid grid-cols-[64px_minmax(0,1fr)] gap-3">
+        <div className={`flex h-14 items-center justify-center rounded border text-lg font-semibold ${projectMatchScoreClass(assessment.conclusion)}`}>
+          {formatProjectMatchScore(assessment.score)}
+        </div>
+        <div className="min-w-0">
+          <p className="text-sm font-medium leading-5 text-slate-100">{assessment.headline}</p>
+          <p className="mt-1 leading-5 text-slate-500">{assessment.detail}</p>
+        </div>
+      </div>
+      <dl className="mt-3 grid gap-2">
+        <Row label="目标" value={assessment.targetTitle} />
+        <Row label="XML" value={formatMatchSourceSummary(assessment)} />
+      </dl>
+      <div className="mt-3 grid gap-2">
+        {assessment.criteria.map((criterion) => (
+          <div key={criterion.id} className="rounded border border-panel-line/70 bg-black/15 p-2">
+            <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+              <span className={`text-[11px] ${projectMatchCriterionClass(criterion.state)}`}>
+                {projectMatchCriterionStateText(criterion.state)}
+              </span>
+              <span className="min-w-0">
+                <span className="text-slate-100">{criterion.label}</span>
+                <span className="text-slate-500"> / {criterion.summary}</span>
+              </span>
+            </div>
+            <p className="mt-1 leading-5 text-slate-500">{criterion.detail}</p>
+            {criterion.evidence.length > 0 ? (
+              <p className="mt-1 truncate text-[11px] text-slate-400" title={criterion.evidence.join("；")}>
+                {criterion.evidence.join("；")}
+              </p>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex flex-wrap justify-end gap-2">
+        <TextButton
+          onClick={onPreview}
+          disabled={!canPreview}
+          title={canPreview ? "把评分诊断和候选同步线索送入时间轴预览" : "绑定目标原片并导入 XML 后可生成提案"}
+        >
+          <Crosshair size={14} />
+          预览评分提案
+        </TextButton>
       </div>
     </section>
   );
@@ -2411,6 +2492,60 @@ function projectReadinessItemIconClass(severity: ProjectReadinessItem["severity"
     return "text-amber-300";
   }
   return "text-emerald-300";
+}
+
+function formatMatchSourceSummary(assessment: ProjectMatchAssessment): string {
+  if (assessment.source.itemCount === 0) {
+    return `${assessment.source.assetCount} 个 XML / 暂无弹幕`;
+  }
+  const endText = assessment.source.sourceEndMs === null ? "未知" : formatTimecode(assessment.source.sourceEndMs);
+  return `${assessment.source.assetCount} 个 XML / ${assessment.source.itemCount.toLocaleString("zh-CN")} 条 / 到 ${endText}`;
+}
+
+function projectMatchBadgeClass(conclusion: ProjectMatchAssessment["conclusion"]): string {
+  if (conclusion === "likely") {
+    return "border-emerald-400/40 bg-emerald-400/10 text-emerald-200";
+  }
+  if (conclusion === "unlikely") {
+    return "border-red-400/40 bg-red-400/10 text-red-200";
+  }
+  return "border-amber-400/40 bg-amber-400/10 text-amber-200";
+}
+
+function projectMatchScoreClass(conclusion: ProjectMatchAssessment["conclusion"]): string {
+  if (conclusion === "likely") {
+    return "border-emerald-400/30 bg-emerald-400/10 text-emerald-100";
+  }
+  if (conclusion === "unlikely") {
+    return "border-red-400/30 bg-red-400/10 text-red-100";
+  }
+  return "border-amber-400/30 bg-amber-400/10 text-amber-100";
+}
+
+function projectMatchCriterionClass(state: ProjectMatchCriterionState): string {
+  if (state === "positive") {
+    return "text-emerald-300";
+  }
+  if (state === "negative") {
+    return "text-red-300";
+  }
+  if (state === "warning") {
+    return "text-amber-300";
+  }
+  return "text-slate-400";
+}
+
+function projectMatchCriterionStateText(state: ProjectMatchCriterionState): string {
+  if (state === "positive") {
+    return "有利";
+  }
+  if (state === "negative") {
+    return "冲突";
+  }
+  if (state === "warning") {
+    return "待确认";
+  }
+  return "中性";
 }
 
 function confidenceText(confidence: "high" | "medium" | "low"): string {
