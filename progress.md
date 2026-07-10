@@ -25,6 +25,14 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C63 已完成：源码审计输出改为 1 基列号。
+  - `scripts/audit-source.mjs` 的发现位置现在输出常见的 1 基列号，后续若发现待办标记或 TypeScript 裸 `any`，终端定位会和编辑器列号一致。
+  - 已重新验证：`corepack pnpm audit:source` 成功，未发现待办标记或 TypeScript 裸 `any`。
+  - 已重新验证：`corepack pnpm verify` 成功，包含源码审计、lint、32 个测试文件/152 个测试和前端构建。
+  - 本阶段只修改开发审计脚本，没有修改运行时代码、UI 源码或 Tauri 源码，因此未重新打包；最新可安装 release 产物仍是 C61 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:06:47`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997678` 字节，时间 `2026/07/10 11:06:47`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c63-audit-source-columns-20260710`。
 - 成熟度提升阶段 C62 已完成：稳定 E2E 截图生成环境。
   - Playwright E2E 现在会在每个页面加载前固定浏览器时间，并把 `Math.random` 替换为确定性序列，减少项目创建时间、更新时间和随机 ID 对截图产物造成的噪声。
   - 已连续两次验证：`corepack pnpm test:e2e` 成功，均为 3 个 Chromium E2E 测试通过；截图产物已更新到新的固定基线。

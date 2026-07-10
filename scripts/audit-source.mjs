@@ -88,7 +88,7 @@ function positionForOffset(text, offset) {
   const lines = prefix.split("\n");
   return {
     line: lines.length,
-    column: lines.at(-1)?.length ?? 0
+    column: (lines.at(-1)?.length ?? 0) + 1
   };
 }
 
