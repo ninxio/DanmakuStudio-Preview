@@ -287,6 +287,39 @@ test("导出前会阻断项目健康错误", async ({ page }) => {
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
 });
 
+test("导出摘要会展示负时间限制明细", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("xml-input").setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
+  await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
+  await page.getByRole("button", { name: "放入时间轴" }).click();
+  await page.getByLabel("设置").click();
+  await page.getByLabel("全局偏移").fill("-2000");
+  await page.getByLabel("关闭设置").click();
+
+  await page.getByLabel("导出 XML").click();
+  const exportDialog = page.getByTestId("export-dialog");
+  await expect(exportDialog).toContainText("负时间限制为 0");
+  await expect(exportDialog).toContainText("2 项");
+  await expect(exportDialog).toContainText("负时间限制明细");
+  await expect(exportDialog).toContainText("第一条滚动弹幕");
+  await expect(exportDialog).toContainText("顶部弹幕");
+  await expect(exportDialog).toContainText("-00:00:02.000 -> 00:00:00.000");
+  await expect(exportDialog).toContainText("-00:00:00.250 -> 00:00:00.000");
+
+  const exportReportDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载导出报告" }).click();
+  const exportReportDownload = await exportReportDownloadPromise;
+  const exportReportPath = resolve(downloadDir, exportReportDownload.suggestedFilename());
+  await exportReportDownload.saveAs(exportReportPath);
+  const exportReportText = readFileSync(exportReportPath, "utf8");
+  expect(exportReportText).toContain("负时间限制明细");
+  expect(exportReportText).toContain("第一条滚动弹幕");
+  expect(exportReportText).toContain("顶部弹幕");
+  expect(exportReportText).toContain("原最终时间：-00:00:02.000 (-2000 ms)");
+  expect(exportReportText).toContain("原最终时间：-00:00:00.250 (-250 ms)");
+});
+
 function screenshotPath(fileName: string): string {
   return resolve(screenshotDir, fileName);
 }

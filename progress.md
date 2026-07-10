@@ -25,6 +25,18 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C45 已完成：Playwright E2E 覆盖负时间限制明细。
+  - 新增独立 E2E：导入 `normal.xml`，放入时间轴后通过设置中心把全局偏移设为 `-2000ms`，再打开导出摘要。
+  - 测试断言导出摘要显示“负时间限制为 0”“2 项”“负时间限制明细”，并列出“第一条滚动弹幕”“顶部弹幕”及对应负最终时间。
+  - 测试会点击“下载导出报告”，保存 `未命名项目-export-report.txt` 并读取文本，确认报告包含负时间限制明细和两条负时间来源。
+  - 本地 E2E 下载产物：`artifacts/downloads/未命名项目-export-report.txt`，大小 `466` 字节，时间 `2026/07/10 9:41:31`。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 本阶段只修改 E2E 测试、截图基线和进度文档，没有修改运行时代码、UI 源码或 Tauri 代码，因此未重新打包；最新可安装 release 产物仍是 C44 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:36:00`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2994788` 字节，时间 `2026/07/10 9:36:00`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c45-e2e-negative-clamp-export-20260710`。
 - 成熟度提升阶段 C44 已完成：导出摘要支持负时间限制明细。
   - `ExportSummary` 现在会从已解析导出事件中收集被限制到 0ms 的负最终时间弹幕，记录资源文件、片段名、XML 原序号、原最终时间和文本。
   - 导出摘要在存在负时间时显示“负时间限制明细”，最多预览 3 条，并继续显示总数。
