@@ -1247,12 +1247,11 @@ function VideoAlignmentLabPanel({
   const canRunAlignment = completePath.trim().length > 0 && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
-  const applyBlockers = proposal
-    ? createAlignmentApplyBlockers(proposal, {
-        existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
-        existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
-      })
-    : [];
+  const applyBlockerContext = {
+    existingAnchorIds: project.syncAnchors.map((anchor) => anchor.id),
+    existingCutMarkerIds: project.cutMarkers.map((marker) => marker.id)
+  };
+  const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal, applyBlockerContext) : [];
 
   useEffect(() => {
     let mounted = true;
@@ -1389,7 +1388,7 @@ function VideoAlignmentLabPanel({
     }
     const fileName = downloadTextFile(
       createProjectDownloadFileName(project.name, "-alignment-review-report.txt"),
-      createAlignmentReviewReport(proposal),
+      createAlignmentReviewReport(proposal, new Date(), applyBlockerContext),
       "text/plain;charset=utf-8"
     );
     setStatus({ message: `已导出对齐复核报告：${fileName}。`, tone: "success" });

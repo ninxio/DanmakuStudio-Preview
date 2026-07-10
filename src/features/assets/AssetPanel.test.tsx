@@ -763,7 +763,17 @@ describe("资源面板", () => {
       useEditorStore.setState({
         project: {
           ...useEditorStore.getState().project,
-          name: "对齐/报告:项目"
+          name: "对齐/报告:项目",
+          syncAnchors: [{ id: "audio-anchor-1", sourceMs: 10_000, targetMs: 15_000, confidence: 1, origin: "manual" }],
+          cutMarkers: [
+            {
+              id: "audio-gap-1",
+              name: "已有补偿",
+              sourceAtMs: 20_000,
+              targetGapMs: 20_000,
+              note: "已有项目补偿"
+            }
+          ]
         }
       });
       render(<AssetPanel />);
@@ -779,6 +789,9 @@ describe("资源面板", () => {
         throw new Error("导出的对象不是 Blob。");
       }
       await expect(readBlobText(blob)).resolves.toContain("对齐提案复核报告");
+      await expect(readBlobText(blob)).resolves.toContain("应用阻断");
+      await expect(readBlobText(blob)).resolves.toContain("1 个同步锚点 ID 已存在于当前项目（ID：audio-anchor-1）");
+      await expect(readBlobText(blob)).resolves.toContain("1 个候选补偿 ID 已存在于当前项目（ID：audio-gap-1）");
       await expect(readBlobText(blob)).resolves.toContain("audio-gap-1");
       await expect(readBlobText(blob)).resolves.toContain("不确定区间：00:00:18.000");
       await expect(readBlobText(blob)).resolves.toContain("音频特征匹配 4 / 4 帧。");

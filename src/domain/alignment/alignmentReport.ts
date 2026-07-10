@@ -6,7 +6,12 @@ export interface AlignmentApplyBlockerContext {
   existingCutMarkerIds?: string[];
 }
 
-export function createAlignmentReviewReport(proposal: AlignmentProposal, generatedAt: Date = new Date()): string {
+export function createAlignmentReviewReport(
+  proposal: AlignmentProposal,
+  generatedAt: Date = new Date(),
+  context: AlignmentApplyBlockerContext = {}
+): string {
+  const applyBlockers = createAlignmentApplyBlockers(proposal, context);
   const lines = [
     "# 对齐提案复核报告",
     "",
@@ -14,6 +19,9 @@ export function createAlignmentReviewReport(proposal: AlignmentProposal, generat
     `整体置信度：${formatConfidence(proposal.confidence)}`,
     `同步锚点：${proposal.anchors.length} 个`,
     `候选补偿：${proposal.cutCandidates.length} 个`,
+    "",
+    "## 应用阻断",
+    ...createApplyBlockerLines(applyBlockers),
     "",
     "## 复核重点",
     ...createAlignmentReviewFocus(proposal).map((item) => `- ${item}`),
@@ -175,6 +183,13 @@ function createDiagnosticLines(diagnostics: string[]): string[] {
     return ["- 暂无诊断信息。"];
   }
   return diagnostics.map((diagnostic, index) => `- ${index + 1}. ${diagnostic}`);
+}
+
+function createApplyBlockerLines(blockers: string[]): string[] {
+  if (blockers.length === 0) {
+    return ["- 暂无应用阻断。"];
+  }
+  return blockers.map((blocker, index) => `- ${index + 1}. ${blocker}`);
 }
 
 function hasCompleteSourceRange(

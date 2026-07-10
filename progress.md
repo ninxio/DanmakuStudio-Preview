@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C92 已完成：对齐复核报告记录应用阻断。
+  - `createAlignmentReviewReport` 新增“应用阻断”章节；没有阻断时写入“暂无应用阻断”，存在结构异常、重复 ID 或当前项目 ID 冲突时逐条记录原因。
+  - 资源面板导出“对齐复核报告”时会传入当前项目已有同步锚点和补偿点 ID，让报告能解释为什么“应用候选”按钮被禁用。
+  - 已补充领域测试和资源面板导出测试，覆盖无阻断报告、已有 ID 冲突阻断，以及导出报告携带当前项目阻断上下文。
+  - 已重新验证：`corepack pnpm test -- src/domain/alignment/alignmentReport.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、28 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/188 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:45:51`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2999960` 字节，时间 `2026/07/10 13:45:51`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c92-alignment-review-apply-blockers-20260710`。
 - 成熟度提升阶段 C91 已完成：JSON 导入解析失败提示携带来源文件名。
   - 顶部“打开项目”和“导入对齐”入口现在会把文件名传给解析层；读取成功但项目 schema、JSON 格式或对齐提案结构校验失败时，状态栏会显示 `入口：文件名：具体原因`。
   - “视频对齐实验室”的对齐提案文件导入同样会在解析失败时显示来源 JSON 文件名，和读取失败路径保持一致。

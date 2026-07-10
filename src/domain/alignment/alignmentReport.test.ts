@@ -31,6 +31,7 @@ describe("alignment review report", () => {
     expect(report).toContain("# 对齐提案复核报告");
     expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");
     expect(report).toContain("整体置信度：82.0%");
+    expect(report).toContain("暂无应用阻断。");
     expect(report).toContain("[anchor-1] 自动");
     expect(report).toContain("偏移：+00:00:20.000 (20000 ms)");
     expect(report).toContain("[audio-gap-1] 音频推断补偿 1");
@@ -127,14 +128,18 @@ describe("alignment review report", () => {
       diagnostics: []
     };
 
-    expect(
-      createAlignmentApplyBlockers(proposal, {
-        existingAnchorIds: ["anchor-existing"],
-        existingCutMarkerIds: ["cut-existing"]
-      })
-    ).toEqual([
+    const context = {
+      existingAnchorIds: ["anchor-existing"],
+      existingCutMarkerIds: ["cut-existing"]
+    };
+
+    expect(createAlignmentApplyBlockers(proposal, context)).toEqual([
       "1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
       "1 个候选补偿 ID 已存在于当前项目（ID：cut-existing），应用会丢失新补偿。"
     ]);
+    const report = createAlignmentReviewReport(proposal, new Date("2026-07-10T01:02:03.000Z"), context);
+    expect(report).toContain("## 应用阻断");
+    expect(report).toContain("1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing）");
+    expect(report).toContain("1 个候选补偿 ID 已存在于当前项目（ID：cut-existing）");
   });
 });
