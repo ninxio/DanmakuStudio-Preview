@@ -194,6 +194,23 @@ describe("editor store", () => {
     ]);
   });
 
+  it("XML 文件读取失败时清除导入进度并显示错误", async () => {
+    const file = new File([""], "broken.xml", { type: "application/xml" });
+    Object.defineProperty(file, "text", {
+      configurable: true,
+      value: vi.fn<() => Promise<string>>(() => Promise.reject(new Error("读取被拒绝")))
+    });
+
+    await useEditorStore.getState().importXmlFiles([file]);
+
+    expect(useEditorStore.getState().project.assets).toHaveLength(0);
+    expect(useEditorStore.getState().importProgress).toBeNull();
+    expect(useEditorStore.getState().status).toEqual({
+      message: "XML 导入失败：读取被拒绝",
+      tone: "error"
+    });
+  });
+
   it("没有可导出弹幕时不会生成空 XML 草稿", () => {
     const asset = createAsset("asset-empty-export", "empty-export.xml");
     resetStore({

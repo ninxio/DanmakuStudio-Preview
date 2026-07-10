@@ -193,31 +193,38 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return;
     }
     set({ importProgress: 0, status: { message: "正在读取 XML...", tone: "neutral" } });
-    const texts = await readFilesAsText(fileArray);
-    const assets: DanmakuAsset[] = [];
-    for (let index = 0; index < texts.length; index += 1) {
-      const { file, text } = texts[index];
-      assets.push(
-        parseBilibiliXml(text, {
-          fileName: file.name,
-          assetName: file.name.replace(/\.[^.]+$/, ""),
-          color: pickAssetColor(get().project.assets.length + index)
-        })
-      );
-      set({ importProgress: (index + 1) / texts.length });
-      await Promise.resolve();
-    }
-    commitProject(set, get, "导入 XML", (project) => ({
-      ...project,
-      assets: [...project.assets, ...assets]
-    }));
-    set({
-      importProgress: null,
-      status: {
-        message: `已导入 ${assets.length} 个 XML，共 ${assets.reduce((sum, asset) => sum + asset.items.length, 0)} 条弹幕。`,
-        tone: "success"
+    try {
+      const texts = await readFilesAsText(fileArray);
+      const assets: DanmakuAsset[] = [];
+      for (let index = 0; index < texts.length; index += 1) {
+        const { file, text } = texts[index];
+        assets.push(
+          parseBilibiliXml(text, {
+            fileName: file.name,
+            assetName: file.name.replace(/\.[^.]+$/, ""),
+            color: pickAssetColor(get().project.assets.length + index)
+          })
+        );
+        set({ importProgress: (index + 1) / texts.length });
+        await Promise.resolve();
       }
-    });
+      commitProject(set, get, "导入 XML", (project) => ({
+        ...project,
+        assets: [...project.assets, ...assets]
+      }));
+      set({
+        importProgress: null,
+        status: {
+          message: `已导入 ${assets.length} 个 XML，共 ${assets.reduce((sum, asset) => sum + asset.items.length, 0)} 条弹幕。`,
+          tone: "success"
+        }
+      });
+    } catch (error) {
+      set({
+        importProgress: null,
+        status: createErrorStatus("XML 导入失败", error)
+      });
+    }
   },
 
   importVideoFile: (file) => {
@@ -1148,6 +1155,13 @@ function createOpenProjectStatus(
     message: `已打开旧版项目：${projectName}。已从 v${migration.fromVersion} 升级到 v${migration.toVersion}${adjustedClipRangeSuffix}。`,
     tone: migration.adjustedClipRangeCount > 0 ? "warning" : "success"
   };
+}
+
+function createErrorStatus(prefix: string, error: unknown): EditorStatus {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return { message: `${prefix}：${error.message}`, tone: "error" };
+  }
+  return { message: `${prefix}。`, tone: "error" };
 }
 
 function createClipFromAsset(asset: DanmakuAsset, timelineStartMs: Milliseconds): DanmakuClip {

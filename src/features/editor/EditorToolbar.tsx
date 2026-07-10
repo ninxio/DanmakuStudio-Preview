@@ -194,7 +194,11 @@ export function EditorToolbar() {
         onChange={(event) => {
           const file = event.target.files?.[0];
           if (file) {
-            void readTextFile(file).then(openProjectFromText);
+            void readTextFile(file)
+              .then(openProjectFromText)
+              .catch((error: unknown) => {
+                useEditorStore.setState({ status: createFileReadErrorStatus("项目文件读取失败", error) });
+              });
           }
           event.target.value = "";
         }}
@@ -208,7 +212,11 @@ export function EditorToolbar() {
         onChange={(event) => {
           const file = event.target.files?.[0];
           if (file) {
-            void readTextFile(file).then(importAlignmentProposalText);
+            void readTextFile(file)
+              .then(importAlignmentProposalText)
+              .catch((error: unknown) => {
+                useEditorStore.setState({ status: createFileReadErrorStatus("对齐提案读取失败", error) });
+              });
           }
           event.target.value = "";
         }}
@@ -216,4 +224,14 @@ export function EditorToolbar() {
       {settingsOpen ? <SettingsDialog onClose={() => setSettingsOpen(false)} /> : null}
     </header>
   );
+}
+
+function createFileReadErrorStatus(
+  prefix: string,
+  error: unknown
+): { message: string; tone: "error" } {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return { message: `${prefix}：${error.message}`, tone: "error" };
+  }
+  return { message: `${prefix}。`, tone: "error" };
 }

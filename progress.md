@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C88 已完成：文件读取失败进入状态栏反馈。
+  - `importXmlFiles` 现在会捕获 XML 文件读取或导入过程异常，清除导入进度，并在状态栏显示 `XML 导入失败：...`，避免失败后进度停留或静默无响应。
+  - 顶部“打开项目”和“导入对齐”入口现在会捕获 `readTextFile` 失败，并分别显示项目文件读取失败或对齐提案读取失败。
+  - 已补充 store 与工具栏测试，覆盖 XML 读取失败、项目文件读取失败和对齐提案文件读取失败三条错误路径。
+  - 已重新验证：`corepack pnpm test -- src/stores/editorStore.test.ts src/features/editor/EditorToolbar.test.tsx` 成功，2 个测试文件、28 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、34 个测试文件/183 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 13:21:55`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3000420` 字节，时间 `2026/07/10 13:21:55`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c88-file-read-failure-status-20260710`。
 - 成熟度提升阶段 C87 已完成：项目持久化封装返回实际下载文件名并补齐 schema v2 文档。
   - `saveProjectToDownload` 现在会返回 `downloadTextFile` 实际使用的清理后文件名，避免后续 UI 重新接入该封装时只能猜测保存文件名。
   - 新增项目持久化测试，覆盖项目保存下载名、写出的当前 schemaVersion，以及旧项目文本通过持久化层加载时迁移到当前 schema。

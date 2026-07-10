@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuClip } from "../../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../../domain/danmaku/cutHints";
@@ -103,6 +103,34 @@ describe("编辑器工具栏", () => {
         Reflect.deleteProperty(URL, "revokeObjectURL");
       }
     }
+  });
+
+  it("打开项目文件读取失败时显示错误状态", async () => {
+    const file = createRejectingTextFile("bad.danmaku-project.json", "项目读取被拒绝");
+
+    render(<EditorToolbar />);
+    fireEvent.change(screen.getByTestId("project-input"), { target: { files: [file] } });
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status).toEqual({
+        message: "项目文件读取失败：项目读取被拒绝",
+        tone: "error"
+      })
+    );
+  });
+
+  it("导入对齐提案文件读取失败时显示错误状态", async () => {
+    const file = createRejectingTextFile("bad-alignment.json", "对齐读取被拒绝");
+
+    render(<EditorToolbar />);
+    fireEvent.change(screen.getByTestId("alignment-input"), { target: { files: [file] } });
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status).toEqual({
+        message: "对齐提案读取失败：对齐读取被拒绝",
+        tone: "error"
+      })
+    );
   });
 
   it("顶部导出对齐提案时使用项目名生成文件名", () => {
@@ -224,3 +252,12 @@ describe("编辑器工具栏", () => {
     );
   });
 });
+
+function createRejectingTextFile(fileName: string, message: string): File {
+  const file = new File([""], fileName, { type: "application/json" });
+  Object.defineProperty(file, "text", {
+    configurable: true,
+    value: vi.fn<() => Promise<string>>(() => Promise.reject(new Error(message)))
+  });
+  return file;
+}
