@@ -343,10 +343,15 @@ export function cleanupProjectEditReferences(project: EditorProject): ProjectEdi
   };
 }
 
-export function createProjectHealthReport(projectName: string, summary: ProjectHealthSummary): string {
+export function createProjectHealthReport(
+  projectName: string,
+  summary: ProjectHealthSummary,
+  generatedAt = new Date()
+): string {
   const lines = [
     "项目健康报告",
     `项目：${projectName.trim().length > 0 ? projectName : "未命名项目"}`,
+    `生成时间：${generatedAt.toISOString()}`,
     `状态：${summary.statusLabel}`,
     `说明：${summary.statusDetail}`,
     "",

@@ -433,10 +433,11 @@ describe("project health", () => {
       disabledItemIds: ["missing-disabled"]
     });
 
-    const report = createProjectHealthReport("报告项目", summary);
+    const report = createProjectHealthReport("报告项目", summary, new Date("2026-07-10T01:02:03.000Z"));
 
     expect(report).toContain("项目健康报告");
     expect(report).toContain("项目：报告项目");
+    expect(report).toContain("生成时间：2026-07-10T01:02:03.000Z");
     expect(report).toContain("状态：需复核");
     expect(report).toContain("失效编辑引用：1 条");
     expect(report).toContain("缺失资源片段：0 个");

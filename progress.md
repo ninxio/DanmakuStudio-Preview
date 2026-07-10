@@ -25,6 +25,15 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C64 已完成：健康报告写入生成时间。
+  - `createProjectHealthReport` 现在会在报告正文中写入 ISO 格式生成时间，方便用户保存多份健康报告后追溯报告生成时刻。
+  - 报告生成函数保留默认当前时间，同时支持测试传入固定 `Date`；README 已同步健康报告正文包含生成时间。
+  - 已补充领域层测试，固定 `2026-07-10T01:02:03.000Z` 验证报告生成时间行。
+  - 已重新验证：`corepack pnpm test -- src/domain/project/health.test.ts` 成功，1 个测试文件、12 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、32 个测试文件/152 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:17:41`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997523` 字节，时间 `2026/07/10 11:17:40`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c64-health-report-generated-at-20260710`。
 - 成熟度提升阶段 C63 已完成：源码审计输出改为 1 基列号。
   - `scripts/audit-source.mjs` 的发现位置现在输出常见的 1 基列号，后续若发现待办标记或 TypeScript 裸 `any`，终端定位会和编辑器列号一致。
   - 已重新验证：`corepack pnpm audit:source` 成功，未发现待办标记或 TypeScript 裸 `any`。
