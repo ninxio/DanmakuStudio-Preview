@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C69 已完成：多分集导出 ZIP 按项目名命名。
+  - `downloadTextFiles` 新增可选压缩包名参数，多文件下载会返回并使用清理后的实际 ZIP 文件名，状态提示和浏览器下载名保持一致。
+  - 资源面板“导出分集”现在把多分集 XML 打包为 `项目名-danmaku-exports.zip`，不再固定使用 `danmaku-exports.zip`；项目名中的非法路径字符仍由统一下载基础设施清理。
+  - README 已同步：多分集导出 ZIP 会按项目名命名。
+  - 已重新验证：`corepack pnpm test -- src/infrastructure/file-system/browserFiles.test.ts src/features/assets/AssetPanel.test.tsx` 成功，2 个测试文件、25 个测试通过。
+  - 已重新验证：`corepack pnpm verify:release` 成功，包含源码审计、lint、33 个测试文件/161 个测试、前端构建、3 个 Chromium E2E 测试和 Tauri release 打包。
+  - Playwright 截图产物已随本轮 E2E 验证重新生成。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 11:50:38`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2996574` 字节，时间 `2026/07/10 11:50:38`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c69-project-named-batch-export-zip-20260710`。
 - 成熟度提升阶段 C68 已完成：对齐提案与复核报告按项目名导出。
   - 新增项目下载文件名 helper，统一用修剪后的项目名加后缀生成下载文件名，空项目名回退到 `danmaku-project`；非法路径字符仍由下载基础设施统一清理。
   - 资源面板“导出提案”和顶部工具栏“导出对齐”现在下载为 `项目名-alignment-proposal.json`，资源面板“导出报告”下载为 `项目名-alignment-review-report.txt`，避免多个项目的对齐产物都落成固定文件名。

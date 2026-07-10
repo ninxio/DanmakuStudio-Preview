@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { createStoredZip, sanitizeDownloadFileName } from "./browserFiles";
+import { describe, expect, it, vi } from "vitest";
+import { createStoredZip, downloadTextFiles, sanitizeDownloadFileName } from "./browserFiles";
 
 describe("浏览器文件导出", () => {
   it("把多份 XML 打包成包含全部条目的 ZIP", async () => {
@@ -25,6 +25,47 @@ describe("浏览器文件导出", () => {
     expect(sanitizeDownloadFileName(" 健康/报告:项目?.txt ")).toBe("健康_报告_项目_.txt");
     expect(sanitizeDownloadFileName("CON.xml")).toBe("_CON.xml");
     expect(sanitizeDownloadFileName("   ", "export.xml")).toBe("export.xml");
+  });
+
+  it("多文件下载支持自定义压缩包名并返回实际下载名", () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:danmaku-archive");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+
+    try {
+      const result = downloadTextFiles(
+        [
+          { fileName: "S01E01.xml", content: "<i />" },
+          { fileName: "S01E02.xml", content: "<i />" }
+        ],
+        "application/xml;charset=utf-8",
+        "合集/导出:项目.zip"
+      );
+
+      expect(result).toEqual({ fileCount: 2, archiveFileName: "合集_导出_项目.zip" });
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("多文件下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("合集_导出_项目.zip");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:danmaku-archive");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
   });
 });
 

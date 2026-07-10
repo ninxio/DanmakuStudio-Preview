@@ -316,6 +316,62 @@ describe("资源面板", () => {
     expect(useEditorStore.getState().project.cutMarkers[0].note).toContain("广告");
   });
 
+  it("导出多分集时使用项目名生成 ZIP 文件名", async () => {
+    const user = userEvent.setup();
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>(() => "blob:batch-merge-archive");
+    const revokeObjectUrl = vi.fn<(url: string) => void>();
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectUrl });
+    const firstAsset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u1,r1">第一集</d></i>`,
+      { fileName: "S01E01.xml" }
+    );
+    const secondAsset = parseBilibiliXml(
+      `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u2,r2">第二集</d></i>`,
+      { fileName: "S01E02.xml" }
+    );
+
+    try {
+      useEditorStore.setState({
+        project: {
+          ...createEmptyProject(),
+          name: "合集/导出:项目",
+          assets: [firstAsset, secondAsset]
+        },
+        history: createHistoryState(),
+        selection: { kind: "none", ids: [] }
+      });
+
+      render(<AssetPanel />);
+      await user.click(screen.getByRole("button", { name: "弹幕文件" }));
+      await user.click(screen.getByRole("button", { name: "导出分集" }));
+
+      expect(createObjectUrl).toHaveBeenCalledTimes(1);
+      const clickedAnchor = clickSpy.mock.contexts[0];
+      if (!(clickedAnchor instanceof HTMLAnchorElement)) {
+        throw new Error("分集 ZIP 下载未通过锚点触发。");
+      }
+      expect(clickedAnchor.download).toBe("合集_导出_项目-danmaku-exports.zip");
+      expect(useEditorStore.getState().status.message).toContain("合集_导出_项目-danmaku-exports.zip");
+      expect(revokeObjectUrl).toHaveBeenCalledWith("blob:batch-merge-archive");
+    } finally {
+      clickSpy.mockRestore();
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+      if (revokeDescriptor) {
+        Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "revokeObjectURL");
+      }
+    }
+  });
+
   it("可以在补偿点管理面板定位、微调并删除补偿点", async () => {
     const user = userEvent.setup();
     useEditorStore.setState({

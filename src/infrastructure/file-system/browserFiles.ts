@@ -88,7 +88,8 @@ export function downloadTextFile(fileName: string, content: string, type = "text
 
 export function downloadTextFiles(
   files: TextDownloadFile[],
-  type = "text/plain;charset=utf-8"
+  type = "text/plain;charset=utf-8",
+  archiveFileName = "danmaku-exports.zip"
 ): DownloadTextFilesResult {
   if (files.length === 0) {
     return {
@@ -103,11 +104,11 @@ export function downloadTextFiles(
       archiveFileName: null
     };
   }
-  const archiveFileName = "danmaku-exports.zip";
-  downloadBlob(archiveFileName, createStoredZip(files), "application/zip");
+  const safeArchiveFileName = sanitizeDownloadFileName(archiveFileName, "danmaku-exports.zip");
+  downloadBlob(safeArchiveFileName, createStoredZip(files), "application/zip");
   return {
     fileCount: files.length,
-    archiveFileName
+    archiveFileName: safeArchiveFileName
   };
 }
 

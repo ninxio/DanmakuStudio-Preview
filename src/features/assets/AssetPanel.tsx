@@ -218,7 +218,7 @@ export function AssetPanel() {
               </TextButton>
               <TextButton
                 tone="primary"
-                onClick={() => exportBatchMergePlan(batchMergePlan)}
+                onClick={() => exportBatchMergePlan(batchMergePlan, project.name)}
                 disabled={batchMergePlan.episodes.length === 0}
               >
                 <Download size={14} />
@@ -1839,7 +1839,7 @@ function createBatchMergeOptions({
   return { options, warnings };
 }
 
-function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>) {
+function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>, projectName: string) {
   const files = plan.episodes.map((episode) => {
     const result = serializeBilibiliXml(episode.entries);
     const validation = validateExportedXml(result.xml);
@@ -1857,7 +1857,8 @@ function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>) {
   }
   const downloadResult = downloadTextFiles(
     files.map((file) => ({ fileName: file.fileName, content: file.content })),
-    "application/xml;charset=utf-8"
+    "application/xml;charset=utf-8",
+    createProjectDownloadFileName(projectName, "-danmaku-exports.zip")
   );
   const archiveText = downloadResult.archiveFileName ? `，已打包为 ${downloadResult.archiveFileName}` : "";
   setStatus({ message: `已触发下载 ${files.length} 个分集 XML${archiveText}。`, tone: "success" });
