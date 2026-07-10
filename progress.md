@@ -25,6 +25,16 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C57 已完成：项目健康证据长文本换行保护。
+  - 资源栏“项目信息”里的项目健康证据行现在会对长资源 ID、长原始片段和长路径类文本执行单词内换行，避免撑破右侧面板。
+  - 本阶段只调整健康证据列表的展示约束，不改变项目健康计算、XML 解析、导出或非破坏性编辑模型。
+  - Playwright 截图产物已随布局细节重新生成。
+  - 已重新验证：`corepack pnpm verify` 成功，包含 `audit:source`、`lint`、`test` 和 `build`；当前 32 个测试文件、150 个测试通过。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 3 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm tauri:build` 成功，已重新生成 release exe 和 NSIS 安装包。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 10:43:55`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997351` 字节，时间 `2026/07/10 10:43:55`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c57-health-evidence-wrap-20260710`。
 - 成熟度提升阶段 C56 已完成：新增统一验证命令。
   - 新增 `corepack pnpm verify`，依次执行源码审计、lint、全量测试和前端构建。
   - `verify` 内部显式调用 `corepack pnpm ...`，避免 Windows 上误用全局 pnpm 造成 Node 版本不兼容。

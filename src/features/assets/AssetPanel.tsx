@@ -1969,7 +1969,9 @@ function ProjectHealthFindingRow({ finding }: { finding: ProjectHealthFinding })
         {finding.evidence && finding.evidence.length > 0 ? (
           <ul className="mt-1 grid gap-1 text-[11px] leading-5 text-slate-400">
             {finding.evidence.map((item) => (
-              <li key={item}>{item}</li>
+              <li key={item} className="break-words">
+                {item}
+              </li>
             ))}
           </ul>
         ) : null}
