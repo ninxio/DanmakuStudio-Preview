@@ -25,6 +25,17 @@
 
 ## 2026-07-10 最新同步
 
+- 成熟度提升阶段 C43 已完成：Playwright E2E 覆盖导出摘要健康报告下载。
+  - 核心 E2E 在打开导出摘要后会确认“导出前健康检查”和“健康”状态可见，再点击“下载健康报告”。
+  - 测试会保存浏览器下载的 `未命名项目-health-report.txt`，读取文本并断言包含“项目健康报告”“状态：健康”和“重复 ID：0 个”。
+  - 本地 E2E 下载产物：`artifacts/downloads/未命名项目-health-report.txt`，大小 `546` 字节，时间 `2026/07/10 9:27:35`。
+  - 已重新验证：`corepack pnpm test:e2e` 成功，当前 2 个 Chromium E2E 测试通过。
+  - 已重新验证：`corepack pnpm lint` 成功。
+  - 已重新验证：`corepack pnpm build` 成功。
+  - 本阶段只修改 E2E 测试、截图基线和进度文档，没有修改运行时代码、UI 源码或 Tauri 代码，因此未重新打包；最新可安装 release 产物仍是 C42 打包结果。
+  - 最新 release 产物：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12239360` 字节，时间 `2026/07/10 9:25:13`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `2997814` 字节，时间 `2026/07/10 9:25:13`。
+  - 本阶段对应 checkpoint 标签：`checkpoint/c43-e2e-export-health-report-20260710`。
 - 成熟度提升阶段 C42 已完成：导出摘要接入项目健康预检。
   - `ExportDialog` 现在在导出 XML 摘要中显示“导出前健康检查”，包含当前项目健康状态、状态说明和最多 3 条非 ready 复核项。
   - 导出摘要新增真实“下载健康报告”按钮，下载内容复用项目健康报告生成逻辑，便于在最终下载 XML 前留档当前风险状态。

@@ -220,8 +220,19 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
 
   await page.getByLabel("导出 XML").click();
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
+  await expect(page.getByTestId("export-dialog")).toContainText("导出前健康检查");
+  await expect(page.getByTestId("export-dialog")).toContainText("健康");
   await expect(page.getByTestId("export-dialog")).toContainText("验证条数");
   await expect(page.getByTestId("export-dialog")).toContainText("总补偿时长");
+  const exportHealthReportDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载健康报告" }).click();
+  const exportHealthReportDownload = await exportHealthReportDownloadPromise;
+  const exportHealthReportPath = resolve(downloadDir, exportHealthReportDownload.suggestedFilename());
+  await exportHealthReportDownload.saveAs(exportHealthReportPath);
+  const exportHealthReportText = readFileSync(exportHealthReportPath, "utf8");
+  expect(exportHealthReportText).toContain("项目健康报告");
+  expect(exportHealthReportText).toContain("状态：健康");
+  expect(exportHealthReportText).toContain("重复 ID：0 个");
   const compensationReportDownloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载补偿报告" }).click();
   const compensationReportDownload = await compensationReportDownloadPromise;
