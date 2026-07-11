@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  pickMediaPaths,
+  pickMultipleNativePaths,
   pickAlignmentMediaPath,
   pickExportDirectoryPath,
   pickFfmpegExecutablePath,
@@ -11,7 +13,53 @@ import {
 describe("原生文件选择器封装", () => {
   it("网页模式下不会伪装成可选择真实本地路径", async () => {
     await expect(pickSingleNativePath({ title: "选择文件" })).rejects.toThrow("Tauri 桌面端");
+    await expect(pickMultipleNativePaths({ title: "选择多个文件" })).rejects.toThrow("Tauri 桌面端");
     await expect(pickSingleNativeDirectoryPath({ title: "选择目录" })).rejects.toThrow("Tauri 桌面端");
+  });
+
+  it("按原片角色打开原生视频多选并规范化结果", async () => {
+    const dialog = vi.fn().mockResolvedValue([
+      " D:\\media\\S01E01.mkv ",
+      "",
+      "d:\\MEDIA\\s01e01.MKV",
+      "D:\\media\\S01E02.mp4"
+    ]);
+
+    const paths = await pickMediaPaths("targetOriginal", dialog);
+
+    expect(paths).toEqual(["D:\\media\\S01E01.mkv", "D:\\media\\S01E02.mp4"]);
+    expect(dialog).toHaveBeenCalledWith({
+      title: "选择原片素材",
+      filters: [
+        {
+          name: "视频文件",
+          extensions: ["mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "m2ts"]
+        }
+      ],
+      multiple: true,
+      directory: false
+    });
+  });
+
+  it("按参考素材角色设置标题并兼容原生选择器返回单一路径", async () => {
+    const dialog = vi.fn().mockResolvedValue(" D:\\media\\bilibili.mp4 ");
+
+    const paths = await pickMediaPaths("bilibiliReference", dialog);
+
+    expect(paths).toEqual(["D:\\media\\bilibili.mp4"]);
+    expect(dialog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "选择 B 站参考素材",
+        multiple: true,
+        directory: false
+      })
+    );
+  });
+
+  it("多选取消时返回空数组", async () => {
+    const dialog = vi.fn().mockResolvedValue(null);
+
+    await expect(pickMultipleNativePaths({ title: "选择多个文件" }, dialog)).resolves.toEqual([]);
   });
 
   it("为音频对齐视频路径传递标题、过滤器和默认路径", async () => {

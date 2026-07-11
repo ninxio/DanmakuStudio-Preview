@@ -78,11 +78,14 @@ export function updateDanmakuSourceSegment(
     label: patch.label ?? segment.label,
     kind: patch.kind ?? segment.kind,
     assetId: patch.assetId !== undefined ? patch.assetId : segment.assetId,
-    sourceMediaId: patch.sourceMediaId !== undefined ? patch.sourceMediaId : segment.sourceMediaId,
+    sourceMediaId:
+      patch.sourceMediaId !== undefined ? patch.sourceMediaId : segment.sourceMediaId,
     sourceStartMs: patch.sourceStartMs ?? segment.sourceStartMs,
     sourceEndMs: patch.sourceEndMs ?? segment.sourceEndMs,
-    targetMediaId: patch.targetMediaId !== undefined ? patch.targetMediaId : segment.targetMediaId,
-    targetStartMs: patch.targetStartMs !== undefined ? patch.targetStartMs : segment.targetStartMs,
+    targetMediaId:
+      patch.targetMediaId !== undefined ? patch.targetMediaId : segment.targetMediaId,
+    targetStartMs:
+      patch.targetStartMs !== undefined ? patch.targetStartMs : segment.targetStartMs,
     timingRules: patch.timingRules !== undefined ? patch.timingRules : segment.timingRules,
     episodeKey: patch.episodeKey !== undefined ? patch.episodeKey : segment.episodeKey,
     episodeLabel: patch.episodeLabel !== undefined ? patch.episodeLabel : segment.episodeLabel,
@@ -104,11 +107,13 @@ export function createSourceTimelineSummary(
   const ignoredSegments = segments.filter((segment) => segment.kind === "ignored");
   const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
   const mediaById = new Map(project.mediaLibrary.map((media) => [media.id, media]));
-  const episodeLabelsByKey = new Map(plan.episodes.map((episode) => [createSeasonEpisodeKey(episode), episode.label]));
-  const mappedEpisodeKeys = new Set(
+  const episodeLabelsByKey = new Map(
+    plan.episodes.map((episode) => [createSeasonEpisodeKey(episode), episode.label])
+  );
+  const mappedTargetMediaIds = new Set(
     contentSegments
-      .map((segment) => segment.episodeKey)
-      .filter((episodeKey): episodeKey is string => Boolean(episodeKey))
+      .map((segment) => segment.targetMediaId)
+      .filter((targetMediaId): targetMediaId is string => Boolean(targetMediaId))
   );
   const findings: SourceTimelineFinding[] = [];
 
@@ -140,7 +145,11 @@ export function createSourceTimelineSummary(
     });
 
   segments
-    .filter((segment) => !segment.sourceMediaId || mediaById.get(segment.sourceMediaId)?.role !== "bilibiliReference")
+    .filter(
+      (segment) =>
+        !segment.sourceMediaId ||
+        mediaById.get(segment.sourceMediaId)?.role !== "bilibiliReference"
+    )
     .forEach((segment) => {
       findings.push({
         id: `segment-without-source-media-${segment.id}`,
@@ -162,7 +171,10 @@ export function createSourceTimelineSummary(
     });
 
   contentSegments
-    .filter((segment) => segment.targetMediaId && mediaById.get(segment.targetMediaId)?.role !== "targetOriginal")
+    .filter(
+      (segment) =>
+        segment.targetMediaId && mediaById.get(segment.targetMediaId)?.role !== "targetOriginal"
+    )
     .forEach((segment) => {
       findings.push({
         id: `content-invalid-target-media-${segment.id}`,
@@ -177,9 +189,9 @@ export function createSourceTimelineSummary(
       const sourceMedia = segment.sourceMediaId ? mediaById.get(segment.sourceMediaId) : null;
       return Boolean(
         sourceMedia &&
-          sourceMedia.role === "bilibiliReference" &&
-          sourceMedia.durationMs !== null &&
-          segment.sourceEndMs > sourceMedia.durationMs
+        sourceMedia.role === "bilibiliReference" &&
+        sourceMedia.durationMs !== null &&
+        segment.sourceEndMs > sourceMedia.durationMs
       );
     })
     .forEach((segment) => {
@@ -192,18 +204,12 @@ export function createSourceTimelineSummary(
     });
 
   contentSegments
-    .filter((segment) => !segment.episodeKey)
-    .forEach((segment) => {
-      findings.push({
-        id: `content-without-episode-${segment.id}`,
-        severity: "warning",
-        title: "内容段未关联输出集",
-        detail: `${segment.label} 还没有指向某一集原片输出。`
-      });
-    });
-
-  contentSegments
-    .filter((segment) => segment.episodeKey && !episodeLabelsByKey.has(segment.episodeKey))
+    .filter(
+      (segment) =>
+        !segment.targetMediaId &&
+        segment.episodeKey &&
+        !episodeLabelsByKey.has(segment.episodeKey)
+    )
     .forEach((segment) => {
       findings.push({
         id: `unknown-episode-${segment.id}`,
@@ -240,7 +246,7 @@ export function createSourceTimelineSummary(
     metrics: [
       { label: "内容段", value: `${contentSegments.length} 个` },
       { label: "忽略段", value: `${ignoredSegments.length} 个` },
-      { label: "已关联输出", value: `${mappedEpisodeKeys.size} 集` },
+      { label: "已关联原片", value: `${mappedTargetMediaIds.size} 个` },
       { label: "覆盖时长", value: formatTimecode(sumSegmentDuration(segments)) }
     ],
     findings
@@ -283,7 +289,9 @@ export function parseSourceTimecode(value: string): Milliseconds | null {
   return Number.isSafeInteger(totalMs) ? totalMs : null;
 }
 
-function normalizeSegmentDraft(draft: DanmakuSourceSegmentDraft): Omit<DanmakuSourceSegment, "id" | "createdAt" | "updatedAt"> {
+function normalizeSegmentDraft(
+  draft: DanmakuSourceSegmentDraft
+): Omit<DanmakuSourceSegment, "id" | "createdAt" | "updatedAt"> {
   assertFiniteMilliseconds(draft.sourceStartMs, "内容段开始时间无效。");
   assertFiniteMilliseconds(draft.sourceEndMs, "内容段结束时间无效。");
   const sourceStartMs = Math.max(0, Math.round(draft.sourceStartMs));
@@ -302,7 +310,9 @@ function normalizeSegmentDraft(draft: DanmakuSourceSegmentDraft): Omit<DanmakuSo
   const episodeLabel = kind === "content" ? normalizeOptionalText(draft.episodeLabel) : null;
   const targetStartMs = kind === "content" ? normalizeTargetStart(draft.targetStartMs) : null;
   const timingRules =
-    kind === "content" ? normalizeTimingRules(draft.timingRules ?? [], sourceStartMs, sourceEndMs) : [];
+    kind === "content"
+      ? normalizeTimingRules(draft.timingRules ?? [], sourceStartMs, sourceEndMs)
+      : [];
   return {
     label: normalizeLabel(draft.label, kind, episodeLabel, sourceStartMs, sourceEndMs),
     kind,
@@ -335,7 +345,11 @@ function normalizeTimingRules(
   return rules
     .map((rule, index) => {
       assertFiniteMilliseconds(rule.sourceAtMs, "删减修正点时间无效。");
-      if (typeof rule.gapMs !== "number" || !Number.isFinite(rule.gapMs) || !Number.isSafeInteger(Math.round(rule.gapMs))) {
+      if (
+        typeof rule.gapMs !== "number" ||
+        !Number.isFinite(rule.gapMs) ||
+        !Number.isSafeInteger(Math.round(rule.gapMs))
+      ) {
         throw new Error("删减修正时长无效。");
       }
       const sourceAtMs = Math.round(rule.sourceAtMs);
@@ -343,7 +357,10 @@ function normalizeTimingRules(
         throw new Error("删减修正点必须位于内容段范围内。");
       }
       return {
-        id: rule.id && rule.id.trim().length > 0 ? rule.id.trim() : `timing_rule_${index}_${sourceAtMs}`,
+        id:
+          rule.id && rule.id.trim().length > 0
+            ? rule.id.trim()
+            : `timing_rule_${index}_${sourceAtMs}`,
         sourceAtMs,
         gapMs: Math.round(rule.gapMs),
         note: rule.note?.trim() ?? ""
@@ -353,7 +370,12 @@ function normalizeTimingRules(
 }
 
 function assertFiniteMilliseconds(value: Milliseconds, message: string): void {
-  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(Math.round(value)) || value < 0) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    !Number.isSafeInteger(Math.round(value)) ||
+    value < 0
+  ) {
     throw new Error(message);
   }
 }
@@ -385,11 +407,14 @@ function normalizeOptionalText(value: string | null | undefined): string | null 
 
 function sortSegments(segments: readonly DanmakuSourceSegment[]): DanmakuSourceSegment[] {
   return [...segments].sort(
-    (left, right) => left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs
+    (left, right) =>
+      left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs
   );
 }
 
-function collectOverlaps(segments: readonly DanmakuSourceSegment[]): Array<[DanmakuSourceSegment, DanmakuSourceSegment]> {
+function collectOverlaps(
+  segments: readonly DanmakuSourceSegment[]
+): Array<[DanmakuSourceSegment, DanmakuSourceSegment]> {
   const overlaps: Array<[DanmakuSourceSegment, DanmakuSourceSegment]> = [];
   const groups = new Map<string, DanmakuSourceSegment[]>();
   segments.forEach((segment) => {
@@ -403,11 +428,22 @@ function collectOverlaps(segments: readonly DanmakuSourceSegment[]): Array<[Danm
   });
   groups.forEach((group) => {
     const sorted = sortSegments(group);
-    for (let index = 1; index < sorted.length; index += 1) {
-      const previous = sorted[index - 1];
-      const current = sorted[index];
-      if (current.sourceStartMs < previous.sourceEndMs) {
-        overlaps.push([previous, current]);
+    for (let leftIndex = 0; leftIndex < sorted.length; leftIndex += 1) {
+      const left = sorted[leftIndex];
+      for (let rightIndex = leftIndex + 1; rightIndex < sorted.length; rightIndex += 1) {
+        const right = sorted[rightIndex];
+        if (right.sourceStartMs >= left.sourceEndMs) {
+          break;
+        }
+        const conflictsWithIgnored = left.kind === "ignored" || right.kind === "ignored";
+        const duplicatesSameTarget =
+          left.kind === "content" &&
+          right.kind === "content" &&
+          Boolean(left.targetMediaId) &&
+          left.targetMediaId === right.targetMediaId;
+        if (conflictsWithIgnored || duplicatesSameTarget) {
+          overlaps.push([left, right]);
+        }
       }
     }
   });
@@ -415,7 +451,10 @@ function collectOverlaps(segments: readonly DanmakuSourceSegment[]): Array<[Danm
 }
 
 function sumSegmentDuration(segments: readonly DanmakuSourceSegment[]): Milliseconds {
-  return segments.reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
+  return segments.reduce(
+    (total, segment) => total + segment.sourceEndMs - segment.sourceStartMs,
+    0
+  );
 }
 
 function createStatus(
@@ -429,7 +468,9 @@ function createStatus(
   if (segmentCount === 0) {
     return "needsSegments";
   }
-  if (findings.some((finding) => finding.severity === "error" || finding.severity === "warning")) {
+  if (
+    findings.some((finding) => finding.severity === "error" || finding.severity === "warning")
+  ) {
     return "needsReview";
   }
   return "ready";

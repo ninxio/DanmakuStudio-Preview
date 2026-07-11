@@ -65,6 +65,7 @@ pub struct AudioAlignmentRequest {
     max_cells: Option<usize>,
     enable_visual_evidence: Option<bool>,
     visual_sample_interval_ms: Option<u64>,
+    localization_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +153,18 @@ pub struct AudioAlignmentProposal {
     confidence: f64,
     diagnostics: Vec<String>,
     evidence: Option<AlignmentEvidenceSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_range: Option<AlignmentMatchRange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentMatchRange {
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+    coverage: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -191,6 +204,7 @@ struct AudioAlignmentOptions {
     ffmpeg_path: String,
     enable_visual_evidence: bool,
     visual_sample_interval_ms: u64,
+    localization_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +576,7 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
             .to_string(),
         enable_visual_evidence: request.enable_visual_evidence.unwrap_or(false),
         visual_sample_interval_ms,
+        localization_mode: request.localization_mode.unwrap_or(false),
     })
 }
 
@@ -1291,11 +1306,18 @@ fn create_audio_alignment_proposal(
                 confirmed_change_count: None,
                 signals: None,
             }),
+            match_range: None,
         });
     }
-    let alignment = create_multistage_audio_alignment(complete_frames, source_frames, options)?;
+    let alignment = if options.localization_mode {
+        create_localization_audio_alignment(complete_frames, source_frames, options)
+    } else {
+        create_multistage_audio_alignment(complete_frames, source_frames, options)?
+    };
     let cut_candidates = if let Some(change_points) = &alignment.change_points {
-        refine_cut_candidates(create_cut_candidates_from_time_mapping_changes(change_points))
+        refine_cut_candidates(create_cut_candidates_from_time_mapping_changes(
+            change_points,
+        ))
     } else {
         refine_cut_candidates(infer_cut_candidates(&alignment.matches, options))
     };
@@ -1305,9 +1327,19 @@ fn create_audio_alignment_proposal(
         .change_points
         .as_ref()
         .map(|_| cut_candidate_count);
+    let match_range = if options.localization_mode {
+        create_localization_match_range(&alignment.matches, complete_frames, source_frames, options)
+    } else {
+        None
+    };
     let matches = alignment.matches;
     let anchors = create_anchors(&matches, options.match_threshold);
-    let coverage = matches.len() as f64 / source_frames.len().max(1) as f64;
+    let coverage_frame_count = if options.localization_mode {
+        complete_frames.len()
+    } else {
+        source_frames.len()
+    };
+    let coverage = matches.len() as f64 / coverage_frame_count.max(1) as f64;
     let strong_anchor_count = matches
         .iter()
         .filter(|item| item.distance <= options.match_threshold * 0.5)
@@ -1317,9 +1349,19 @@ fn create_audio_alignment_proposal(
     diagnostics.push(format!(
         "音频特征匹配 {} / {} 帧，覆盖率 {}%。",
         matches.len(),
-        source_frames.len(),
+        coverage_frame_count,
         (coverage * 100.0).round()
     ));
+    if let Some(range) = &match_range {
+        diagnostics.push(format!(
+            "长参考定位范围：参考 {}-{}，目标 {}-{}，目标覆盖率 {}%。",
+            format_duration(range.source_start_ms),
+            format_duration(range.source_end_ms),
+            format_duration(range.target_start_ms),
+            format_duration(range.target_end_ms),
+            (range.coverage * 100.0).round()
+        ));
+    }
     diagnostics.push(if cut_candidate_count == 0 {
         "未发现超过阈值的候选缺失段。".to_string()
     } else {
@@ -1351,6 +1393,7 @@ fn create_audio_alignment_proposal(
                 alignment.low_confidence_region_count,
             ),
         }),
+        match_range,
     })
 }
 
@@ -1445,6 +1488,202 @@ fn create_multistage_audio_alignment(
         time_mapping_segment_count: None,
         change_points: None,
     })
+}
+
+fn create_localization_audio_alignment(
+    target_frames: &[AudioFeatureFrame],
+    reference_frames: &[AudioFeatureFrame],
+    options: &AudioAlignmentOptions,
+) -> MultistageAudioAlignmentResult {
+    let reference_fingerprints = create_audio_fingerprints(reference_frames);
+    let target_fingerprints = create_audio_fingerprints(target_frames);
+    let candidates = create_sparse_audio_candidates(
+        reference_frames,
+        target_frames,
+        &reference_fingerprints,
+        &target_fingerprints,
+        options.match_threshold,
+    );
+    let offset_clusters = create_offset_clusters(&candidates);
+    let matches = select_monotonic_localization_matches(
+        &candidates,
+        &offset_clusters,
+        options.match_threshold,
+    );
+    let match_count = matches.len();
+    MultistageAudioAlignmentResult {
+        algorithm: "sparse-fingerprint".to_string(),
+        matches,
+        complete_fingerprint_count: target_fingerprints.len(),
+        source_fingerprint_count: reference_fingerprints.len(),
+        fingerprint_match_count: candidates.len(),
+        offset_cluster_count: offset_clusters.len(),
+        low_confidence_region_count: estimate_low_confidence_region_count(
+            match_count,
+            target_frames.len(),
+        ),
+        diagnostics: vec![
+            format!(
+                "长参考定位：在 {} 个参考特征中检索 {} 个目标原片特征。",
+                reference_frames.len(),
+                target_frames.len()
+            ),
+            format!(
+                "长参考定位：生成 {} 对稀疏候选，单调路径保留 {} 个目标锚点，offset 簇 {} 个。",
+                candidates.len(),
+                match_count,
+                offset_clusters.len()
+            ),
+        ],
+        time_mapping_segment_count: None,
+        change_points: None,
+    }
+}
+
+fn select_monotonic_localization_matches(
+    candidates: &[SparseAudioCandidate],
+    offset_clusters: &HashSet<i64>,
+    match_threshold: f64,
+) -> Vec<AudioFeatureMatch> {
+    let mut by_target_index: HashMap<usize, Vec<&SparseAudioCandidate>> = HashMap::new();
+    for candidate in candidates {
+        if !offset_clusters.contains(&candidate.offset_bucket) {
+            continue;
+        }
+        by_target_index
+            .entry(candidate.source_index)
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut target_indexes: Vec<usize> = by_target_index.keys().copied().collect();
+    target_indexes.sort_unstable();
+    let mut matches = Vec::new();
+    let mut previous_reference_index: Option<usize> = None;
+    let mut previous_offset_ms: Option<i64> = None;
+    for target_index in target_indexes {
+        let Some(group) = by_target_index.get(&target_index) else {
+            continue;
+        };
+        let candidate = group
+            .iter()
+            .copied()
+            .filter(|item| {
+                previous_reference_index
+                    .map(|previous| item.complete_index > previous)
+                    .unwrap_or(true)
+            })
+            .filter(|item| {
+                previous_offset_ms
+                    .map(|previous| item.offset_ms <= previous + FINGERPRINT_BUCKET_MS)
+                    .unwrap_or(true)
+            })
+            .max_by(|left, right| {
+                score_sparse_candidate(left, previous_offset_ms, offset_clusters, match_threshold)
+                    .total_cmp(&score_sparse_candidate(
+                        right,
+                        previous_offset_ms,
+                        offset_clusters,
+                        match_threshold,
+                    ))
+                    .then_with(|| right.complete_index.cmp(&left.complete_index))
+            });
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        matches.push(AudioFeatureMatch {
+            complete_time_ms: candidate.source_time_ms,
+            source_time_ms: candidate.complete_time_ms,
+            distance: candidate.distance,
+        });
+        previous_reference_index = Some(candidate.complete_index);
+        previous_offset_ms = Some(
+            previous_offset_ms
+                .map(|previous| previous.min(candidate.offset_ms))
+                .unwrap_or(candidate.offset_ms),
+        );
+    }
+    matches
+}
+
+fn create_localization_match_range(
+    matches: &[AudioFeatureMatch],
+    target_frames: &[AudioFeatureFrame],
+    reference_frames: &[AudioFeatureFrame],
+    options: &AudioAlignmentOptions,
+) -> Option<AlignmentMatchRange> {
+    if matches.is_empty() || target_frames.is_empty() || reference_frames.is_empty() {
+        return None;
+    }
+    let mut ordered_matches = matches.to_vec();
+    ordered_matches.sort_by_key(|item| (item.complete_time_ms, item.source_time_ms));
+    let sample_count = (ordered_matches.len() / 5).clamp(1, 12);
+    let early_offset_ms = median_offset(
+        ordered_matches
+            .iter()
+            .take(sample_count)
+            .map(|item| signed_time_offset(item.source_time_ms, item.complete_time_ms))
+            .collect(),
+    );
+    let late_offset_ms = median_offset(
+        ordered_matches
+            .iter()
+            .rev()
+            .take(sample_count)
+            .map(|item| signed_time_offset(item.source_time_ms, item.complete_time_ms))
+            .collect(),
+    );
+    let target_step_ms = estimate_frame_step_ms(target_frames, options);
+    let reference_step_ms = estimate_frame_step_ms(reference_frames, options);
+    let target_start_ms = target_frames.first()?.time_ms;
+    let target_end_ms = target_frames.last()?.time_ms.saturating_add(target_step_ms);
+    let reference_end_ms = reference_frames
+        .last()?
+        .time_ms
+        .saturating_add(reference_step_ms);
+    let observed_source_start_ms = ordered_matches
+        .iter()
+        .map(|item| item.source_time_ms)
+        .min()?;
+    let observed_source_end_ms = ordered_matches
+        .iter()
+        .map(|item| item.source_time_ms)
+        .max()?
+        .saturating_add(reference_step_ms)
+        .min(reference_end_ms);
+    let extrapolated_source_start_ms =
+        add_signed_milliseconds(target_start_ms, early_offset_ms, reference_end_ms);
+    let extrapolated_source_end_ms =
+        add_signed_milliseconds(target_end_ms, late_offset_ms, reference_end_ms);
+    let source_start_ms = extrapolated_source_start_ms.min(observed_source_start_ms);
+    let source_end_ms = extrapolated_source_end_ms.max(observed_source_end_ms);
+    if source_end_ms <= source_start_ms || target_end_ms <= target_start_ms {
+        return None;
+    }
+    Some(AlignmentMatchRange {
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        target_end_ms,
+        coverage: (matches.len() as f64 / target_frames.len().max(1) as f64).clamp(0.0, 1.0),
+    })
+}
+
+fn median_offset(mut offsets: Vec<i64>) -> i64 {
+    offsets.sort_unstable();
+    offsets
+        .get(offsets.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn signed_time_offset(source_time_ms: u64, target_time_ms: u64) -> i64 {
+    let offset = source_time_ms as i128 - target_time_ms as i128;
+    offset.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn add_signed_milliseconds(base_ms: u64, offset_ms: i64, upper_bound_ms: u64) -> u64 {
+    (base_ms as i128 + offset_ms as i128).clamp(0, upper_bound_ms as i128) as u64
 }
 
 fn create_offset_path_audio_alignment(
@@ -2575,6 +2814,7 @@ mod tests {
             ffmpeg_path: "ffmpeg".to_string(),
             enable_visual_evidence: false,
             visual_sample_interval_ms: DEFAULT_VISUAL_SAMPLE_INTERVAL_MS,
+            localization_mode: false,
         }
     }
 
@@ -2597,6 +2837,20 @@ mod tests {
                     0.5 + (index as f64 * 0.37).sin() * 0.25,
                     0.5 + (index as f64 * 0.19).cos() * 0.2,
                     0.5 + (index as f64 * 0.11 + 0.4).sin() * 0.18,
+                ],
+            })
+            .collect()
+    }
+
+    fn localization_target_frames(count: usize) -> Vec<AudioFeatureFrame> {
+        (0..count)
+            .map(|index| AudioFeatureFrame {
+                time_ms: index as u64 * 1_000,
+                values: vec![
+                    ((index % 20) + 1) as f64 / 32.0,
+                    (((index / 20) % 20) + 1) as f64 / 32.0,
+                    (((index / 400) % 20) + 1) as f64 / 32.0,
+                    0.125,
                 ],
             })
             .collect()
@@ -2683,6 +2937,7 @@ mod tests {
         assert_eq!(evidence.monotonic_match_count, 4);
         assert_eq!(evidence.refined_candidate_count, 1);
         assert!(proposal.diagnostics.join("\n").contains("稀疏音频指纹"));
+        assert!(proposal.match_range.is_none());
     }
 
     #[test]
@@ -2701,6 +2956,81 @@ mod tests {
             proposal.evidence.as_ref().unwrap().algorithm,
             "sparse-fingerprint"
         );
+    }
+
+    #[test]
+    fn localization_finds_target_in_late_half_of_long_reference() {
+        let target = localization_target_frames(120);
+        let mut reference: Vec<AudioFeatureFrame> = (0..720)
+            .map(|index| AudioFeatureFrame {
+                time_ms: index as u64 * 1_000,
+                values: vec![0.97, 0.97, 0.97, 0.97],
+            })
+            .collect();
+        for (index, frame) in target.iter().enumerate() {
+            reference[500 + index].values = frame.values.clone();
+        }
+        let mut options = test_options();
+        options.localization_mode = true;
+        options.max_cells = 1;
+
+        let proposal = create_audio_alignment_proposal(&target, &reference, &options).unwrap();
+        let range = proposal.match_range.as_ref().expect("应返回长参考定位范围");
+
+        assert_eq!(range.source_start_ms, 500_000);
+        assert_eq!(range.source_end_ms, 620_000);
+        assert_eq!(range.target_start_ms, 0);
+        assert_eq!(range.target_end_ms, 120_000);
+        assert_eq!(range.coverage, 1.0);
+        assert_eq!(proposal.confidence, 1.0);
+        assert_eq!(
+            proposal.evidence.as_ref().unwrap().monotonic_match_count,
+            target.len()
+        );
+        assert_eq!(
+            proposal.evidence.as_ref().unwrap().algorithm,
+            "sparse-fingerprint"
+        );
+        assert!(proposal.anchors.iter().all(|anchor| {
+            anchor.source_ms >= range.source_start_ms
+                && anchor.source_ms < range.source_end_ms
+                && anchor.target_ms < range.target_end_ms
+        }));
+        assert!(proposal.diagnostics.join("\n").contains("目标覆盖率 100%"));
+    }
+
+    #[test]
+    fn localization_keeps_absolute_range_across_reference_cut() {
+        let target = localization_target_frames(120);
+        let mut reference: Vec<AudioFeatureFrame> = (0..720)
+            .map(|index| AudioFeatureFrame {
+                time_ms: index as u64 * 1_000,
+                values: vec![0.97, 0.97, 0.97, 0.97],
+            })
+            .collect();
+        let mut reference_index = 500;
+        for (target_index, frame) in target.iter().enumerate() {
+            if (40..60).contains(&target_index) {
+                continue;
+            }
+            reference[reference_index].values = frame.values.clone();
+            reference_index += 1;
+        }
+        let mut options = test_options();
+        options.localization_mode = true;
+
+        let proposal = create_audio_alignment_proposal(&target, &reference, &options).unwrap();
+        let range = proposal.match_range.as_ref().expect("应返回删减版绝对范围");
+
+        assert_eq!(range.source_start_ms, 500_000);
+        assert_eq!(range.source_end_ms, 600_000);
+        assert_eq!(range.target_start_ms, 0);
+        assert_eq!(range.target_end_ms, 120_000);
+        assert!((range.coverage - 100.0 / 120.0).abs() < f64::EPSILON);
+        assert_eq!(proposal.cut_candidates.len(), 1);
+        assert_eq!(proposal.cut_candidates[0].target_gap_ms, 20_000);
+        assert!(proposal.cut_candidates[0].source_at_ms >= range.source_start_ms);
+        assert!(proposal.cut_candidates[0].source_at_ms < range.source_end_ms);
     }
 
     #[test]
@@ -2866,6 +3196,7 @@ mod tests {
                     note: "未启用".to_string(),
                 }]),
             }),
+            match_range: None,
         };
         let complete = CachedVisualFeatures {
             frames: vec![visual_frame(0, 80), visual_frame(5_000, 100)],
@@ -2979,6 +3310,7 @@ mod tests {
             max_cells: None,
             enable_visual_evidence: None,
             visual_sample_interval_ms: None,
+            localization_mode: None,
         };
         assert!(create_options(&request).is_err());
     }

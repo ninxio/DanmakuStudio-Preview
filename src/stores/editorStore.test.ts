@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DanmakuClip } from "../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../domain/danmaku/cutHints";
 import { createHistoryState } from "../domain/history/history";
+import { createMediaMatchCandidate } from "../domain/alignment/mediaMatching";
 import { createEmptyProject } from "../domain/project/factory";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -180,8 +181,12 @@ describe("editor store", () => {
 
     useEditorStore.getState().openProjectFromText(serializeProject(project));
 
-    expect(useEditorStore.getState().alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
-    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(useEditorStore.getState().alignmentProposal?.cutCandidates[0].id).toBe(
+      "proposal-cut"
+    );
+    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe(
+      "proposal-anchor"
+    );
   });
 
   it("可把当前本地视频绑定为目标原片并随时解除", () => {
@@ -227,7 +232,9 @@ describe("editor store", () => {
       seriesName: "测试剧集",
       episodeNumber: 2
     });
-    expect(JSON.stringify(useEditorStore.getState().project.mediaBinding)).not.toContain("token");
+    expect(JSON.stringify(useEditorStore.getState().project.mediaBinding)).not.toContain(
+      "token"
+    );
   });
 
   it("可以把当前目标原片绑定到分集并支持清除", () => {
@@ -264,6 +271,15 @@ describe("editor store", () => {
       mediaLibrary: [
         createProjectMediaReference("source-media", "bilibiliReference"),
         createProjectMediaReference("target-media", "targetOriginal")
+      ],
+      danmakuSourceBindings: [
+        {
+          id: "binding-source-segment",
+          assetId: asset.id,
+          sourceMediaId: "source-media",
+          linkedAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
       ]
     });
 
@@ -309,6 +325,123 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
   });
 
+  it("来源段存在时阻止 XML 改绑或解绑，并拒绝不一致的来源段新增与更新", () => {
+    const asset = createAsset("asset-binding-consistency", "binding-consistency.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      mediaLibrary: [
+        createProjectMediaReference("source-a", "bilibiliReference"),
+        createProjectMediaReference("source-b", "bilibiliReference"),
+        createProjectMediaReference("target", "targetOriginal")
+      ],
+      danmakuSourceBindings: [
+        {
+          id: "binding-consistency",
+          assetId: asset.id,
+          sourceMediaId: "source-a",
+          linkedAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    });
+    useEditorStore.getState().addDanmakuSourceSegment({
+      kind: "content",
+      assetId: asset.id,
+      sourceMediaId: "source-a",
+      sourceStartMs: 0,
+      sourceEndMs: 60_000,
+      targetMediaId: "target",
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集"
+    });
+    const segment = useEditorStore.getState().project.danmakuSourceSegments[0];
+    const historyLength = useEditorStore.getState().history.past.length;
+
+    useEditorStore.getState().bindXmlToSourceMedia(asset.id, "source-b");
+    expect(useEditorStore.getState().project.danmakuSourceBindings[0].sourceMediaId).toBe(
+      "source-a"
+    );
+    expect(useEditorStore.getState().status.tone).toBe("warning");
+    expect(useEditorStore.getState().status.message).toContain("不能更换 XML 来源");
+
+    useEditorStore.getState().clearXmlSourceBinding(asset.id);
+    expect(useEditorStore.getState().project.danmakuSourceBindings).toHaveLength(1);
+    expect(useEditorStore.getState().status.tone).toBe("warning");
+    expect(useEditorStore.getState().status.message).toContain("不能解除 XML 来源绑定");
+
+    useEditorStore.getState().addDanmakuSourceSegment({
+      kind: "content",
+      assetId: asset.id,
+      sourceMediaId: "source-b",
+      sourceStartMs: 60_000,
+      sourceEndMs: 90_000,
+      targetMediaId: "target",
+      episodeKey: "S01E02",
+      episodeLabel: "第 2 集"
+    });
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
+    expect(useEditorStore.getState().status.message).toContain(
+      "必须与所属 XML 在素材页的绑定一致"
+    );
+
+    useEditorStore
+      .getState()
+      .updateDanmakuSourceSegment(segment.id, { sourceMediaId: "source-b" });
+    expect(useEditorStore.getState().project.danmakuSourceSegments[0].sourceMediaId).toBe(
+      "source-a"
+    );
+    expect(useEditorStore.getState().status.message).toContain(
+      "必须与所属 XML 在素材页的绑定一致"
+    );
+    expect(useEditorStore.getState().history.past).toHaveLength(historyLength);
+  });
+
+  it("绑定、解绑或删除 XML 后会统一刷新待复核候选的派生状态", () => {
+    const project = createEmptyProject();
+    const asset = createAsset("asset-reconcile", "reconcile.xml");
+    project.assets = [asset];
+    project.mediaLibrary = [
+      createProjectMediaReference("source-reconcile", "bilibiliReference"),
+      createProjectMediaReference("target-reconcile", "targetOriginal")
+    ];
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-reconcile",
+        batchId: "batch-reconcile",
+        sourceMediaId: "source-reconcile",
+        targetMediaId: "target-reconcile",
+        proposal: {
+          anchors: [],
+          cutCandidates: [],
+          confidence: 0.9,
+          diagnostics: [],
+          matchRange: {
+            sourceStartMs: 0,
+            sourceEndMs: 60_000,
+            targetStartMs: 0,
+            targetEndMs: 60_000,
+            coverage: 0.9
+          }
+        }
+      })
+    ];
+    resetStore(project);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("blocked");
+
+    useEditorStore.getState().bindXmlToSourceMedia(asset.id, "source-reconcile");
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
+
+    useEditorStore.getState().clearXmlSourceBinding(asset.id);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("blocked");
+
+    useEditorStore.getState().bindXmlToSourceMedia(asset.id, "source-reconcile");
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
+
+    useEditorStore.getState().removeAsset(asset.id);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("blocked");
+  });
+
   it("阻止删除仍被引用的媒体素材，并允许删除空闲素材", () => {
     const revokeSpy = mockRevokeObjectUrl();
     const asset = createAsset("asset-media-delete", "delete.xml");
@@ -316,9 +449,15 @@ describe("editor store", () => {
       ...createEmptyProject(),
       assets: [asset],
       mediaLibrary: [
-        createProjectMediaReference("source-media", "bilibiliReference", { objectUrl: "blob:source" }),
-        createProjectMediaReference("target-media", "targetOriginal", { objectUrl: "blob:target" }),
-        createProjectMediaReference("loose-media", "bilibiliReference", { objectUrl: "blob:loose" })
+        createProjectMediaReference("source-media", "bilibiliReference", {
+          objectUrl: "blob:source"
+        }),
+        createProjectMediaReference("target-media", "targetOriginal", {
+          objectUrl: "blob:target"
+        }),
+        createProjectMediaReference("loose-media", "bilibiliReference", {
+          objectUrl: "blob:loose"
+        })
       ],
       mediaBinding: {
         id: "target-binding",
@@ -349,6 +488,8 @@ describe("editor store", () => {
           sourceStartMs: 0,
           sourceEndMs: 60_000,
           targetMediaId: "target-media",
+          targetStartMs: null,
+          timingRules: [],
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "",
@@ -360,7 +501,9 @@ describe("editor store", () => {
 
     useEditorStore.getState().removeMediaReference("source-media");
     expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(3);
-    expect(useEditorStore.getState().status.message).toContain("不能删除该素材：XML 绑定：delete.xml");
+    expect(useEditorStore.getState().status.message).toContain(
+      "不能删除该素材：XML 绑定：delete.xml"
+    );
 
     useEditorStore.getState().removeMediaReference("loose-media");
     expect(useEditorStore.getState().project.mediaLibrary.map((media) => media.id)).toEqual([
@@ -375,7 +518,10 @@ describe("editor store", () => {
     const createObjectUrl = vi.fn<(object: Blob | MediaSource) => string>((object) =>
       object instanceof File ? `blob:${object.name}` : "blob:media"
     );
-    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectUrl });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectUrl
+    });
     const asset = createAsset("asset-media-reconnect", "reconnect.xml");
     resetStore({
       ...createEmptyProject(),
@@ -419,6 +565,8 @@ describe("editor store", () => {
           sourceStartMs: 0,
           sourceEndMs: 60_000,
           targetMediaId: "target-media",
+          targetStartMs: null,
+          timingRules: [],
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "",
@@ -431,7 +579,10 @@ describe("editor store", () => {
     try {
       useEditorStore
         .getState()
-        .reconnectMediaReference("source-media", new File(["source"], "source-new.mp4", { type: "video/mp4" }));
+        .reconnectMediaReference(
+          "source-media",
+          new File(["source"], "source-new.mp4", { type: "video/mp4" })
+        );
       expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(2);
       expect(useEditorStore.getState().project.mediaLibrary[0]).toMatchObject({
         id: "source-media",
@@ -443,7 +594,9 @@ describe("editor store", () => {
         id: "source-media",
         fileName: "source-new.mp4"
       });
-      expect(useEditorStore.getState().project.danmakuSourceBindings[0].sourceMediaId).toBe("source-media");
+      expect(useEditorStore.getState().project.danmakuSourceBindings[0].sourceMediaId).toBe(
+        "source-media"
+      );
       expect(useEditorStore.getState().project.danmakuSourceSegments[0]).toMatchObject({
         sourceMediaId: "source-media",
         targetMediaId: "target-media"
@@ -451,14 +604,19 @@ describe("editor store", () => {
 
       useEditorStore
         .getState()
-        .reconnectMediaReference("target-media", new File(["target"], "target-new.webm", { type: "video/webm" }));
+        .reconnectMediaReference(
+          "target-media",
+          new File(["target"], "target-new.webm", { type: "video/webm" })
+        );
       expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(2);
       expect(useEditorStore.getState().project.mediaBinding).toMatchObject({
         kind: "localFile",
         mediaId: "target-media",
         fileName: "target-new.webm"
       });
-      expect(useEditorStore.getState().project.danmakuSourceSegments[0].targetMediaId).toBe("target-media");
+      expect(useEditorStore.getState().project.danmakuSourceSegments[0].targetMediaId).toBe(
+        "target-media"
+      );
       expect(createObjectUrl).toHaveBeenCalledTimes(2);
     } finally {
       if (createDescriptor) {
@@ -467,6 +625,161 @@ describe("editor store", () => {
         Reflect.deleteProperty(URL, "createObjectURL");
       }
     }
+  });
+
+  it("接受媒体匹配候选会生成段内映射，并可显式撤销确认后撤销/重做", () => {
+    const project = createEmptyProject();
+    const asset = createAsset("asset-match", "match.xml");
+    project.assets = [asset];
+    project.mediaLibrary = [
+      createProjectMediaReference("source-match", "bilibiliReference"),
+      createProjectMediaReference("target-match", "targetOriginal")
+    ];
+    project.danmakuSourceBindings = [
+      {
+        id: "binding-match",
+        assetId: asset.id,
+        sourceMediaId: "source-match",
+        linkedAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z"
+      }
+    ];
+    resetStore(project);
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-match",
+      batchId: "batch-match",
+      sourceMediaId: "source-match",
+      targetMediaId: "target-match",
+      proposal: {
+        anchors: [
+          { id: "anchor-1", sourceMs: 0, targetMs: 0, origin: "automatic", confidence: 0.9 },
+          {
+            id: "anchor-2",
+            sourceMs: 50_000,
+            targetMs: 55_000,
+            origin: "automatic",
+            confidence: 0.9
+          }
+        ],
+        cutCandidates: [
+          {
+            id: "cut-1",
+            name: "删减",
+            sourceAtMs: 20_000,
+            targetGapMs: 5_000,
+            confidence: 0.9,
+            note: "测试"
+          }
+        ],
+        confidence: 0.9,
+        diagnostics: [],
+        matchRange: {
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetStartMs: 0,
+          targetEndMs: 65_000,
+          coverage: 0.9
+        }
+      }
+    });
+
+    useEditorStore.getState().addMediaMatchCandidate(candidate);
+    useEditorStore.getState().acceptMediaMatchCandidate(candidate.id, [asset.id]);
+
+    const accepted = useEditorStore.getState().project;
+    expect(accepted.mediaMatchCandidates[0]?.state).toBe("accepted");
+    expect(accepted.danmakuSourceSegments[0]).toMatchObject({
+      sourceMediaId: "source-match",
+      targetMediaId: "target-match",
+      targetStartMs: 0,
+      timingRules: [expect.objectContaining({ sourceAtMs: 20_000, gapMs: 5_000 })]
+    });
+    expect(accepted.syncAnchors).toEqual([]);
+    expect(accepted.cutMarkers).toEqual([]);
+
+    useEditorStore.getState().revokeMediaMatchCandidateAcceptance(candidate.id);
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toEqual([]);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
+    expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("撤销媒体匹配确认");
+
+    useEditorStore.getState().undo();
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("accepted");
+
+    useEditorStore.getState().redo();
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toEqual([]);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
+
+    useEditorStore.getState().acceptMediaMatchCandidate(candidate.id, [asset.id]);
+    const generatedSegmentId = useEditorStore.getState().project.danmakuSourceSegments[0]?.id;
+    expect(generatedSegmentId).toBeTruthy();
+    useEditorStore.getState().deleteDanmakuSourceSegment(generatedSegmentId ?? "");
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
+      state: "pending",
+      appliedSegmentIds: []
+    });
+
+    useEditorStore.getState().removeAsset(asset.id);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
+      state: "blocked",
+      appliedSegmentIds: []
+    });
+
+    const staleAcceptedProject = {
+      ...accepted,
+      danmakuSourceSegments: []
+    };
+    resetStore(createEmptyProject());
+    useEditorStore
+      .getState()
+      .openProjectFromText(serializeProject(staleAcceptedProject), "stale-accepted.json");
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
+      state: "pending",
+      appliedSegmentIds: []
+    });
+  });
+
+  it("批量导入本地路径会保留全部素材、跳过重复项并只产生一次历史记录", () => {
+    resetStore(createEmptyProject());
+
+    useEditorStore
+      .getState()
+      .importMediaPaths(
+        [
+          "D:\\Dark\\S01E01.mkv",
+          "D:\\Dark\\S01E02.mp4",
+          " d:\\dark\\s01e01.MKV ",
+          "D:\\Dark\\notes.txt"
+        ],
+        "targetOriginal"
+      );
+
+    const imported = useEditorStore.getState();
+    expect(imported.project.mediaLibrary).toHaveLength(2);
+    expect(imported.project.mediaLibrary).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "targetOriginal",
+          referenceKind: "localPath",
+          localPath: "D:\\Dark\\S01E01.mkv",
+          connectionState: "connected"
+        }),
+        expect.objectContaining({ localPath: "D:\\Dark\\S01E02.mp4" })
+      ])
+    );
+    expect(imported.project.media).toBeNull();
+    expect(imported.project.mediaBinding).toBeNull();
+    expect(imported.history.past).toHaveLength(1);
+    expect(imported.history.past[0]?.label).toBe("批量导入原片素材");
+
+    useEditorStore
+      .getState()
+      .importMediaPaths(["D:\\Dark\\S01E02.mp4", "D:\\Dark\\S01E03.mov"], "targetOriginal");
+    expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(3);
+    expect(useEditorStore.getState().status.message).toContain("跳过 1 个重复路径");
+
+    useEditorStore.getState().undo();
+    expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(2);
   });
 
   it("更新媒体时长时可以按稳定 ID 写回目标原片素材", () => {
@@ -537,7 +850,9 @@ describe("editor store", () => {
     useEditorStore.getState().undo();
 
     expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
-    expect(useEditorStore.getState().project.alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
+    expect(useEditorStore.getState().project.alignmentProposal?.cutCandidates[0].id).toBe(
+      "proposal-cut"
+    );
 
     useEditorStore.getState().redo();
 
@@ -555,7 +870,9 @@ describe("editor store", () => {
     useEditorStore.getState().previewAlignmentProposalData(createAlignmentProposal());
 
     expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
-    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe(
+      "proposal-anchor"
+    );
 
     useEditorStore.getState().undo();
 
@@ -565,7 +882,9 @@ describe("editor store", () => {
 
     useEditorStore.getState().redo();
 
-    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
+    expect(useEditorStore.getState().project.alignmentProposal?.anchors[0].id).toBe(
+      "proposal-anchor"
+    );
     expect(useEditorStore.getState().alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
   });
 
@@ -714,7 +1033,9 @@ describe("editor store", () => {
       assets: [
         {
           ...asset,
-          items: asset.items.map((item, index) => (index === 1 ? { ...item, id: asset.items[0].id } : item))
+          items: asset.items.map((item, index) =>
+            index === 1 ? { ...item, id: asset.items[0].id } : item
+          )
         }
       ],
       clips: [
@@ -735,7 +1056,8 @@ describe("editor store", () => {
 
     expect(useEditorStore.getState().exportDraft).toBeNull();
     expect(useEditorStore.getState().status).toEqual({
-      message: "导出前检查未通过：弹幕 ID 重复、片段引用了缺失资源。请在导出检查中处理后再导出。",
+      message:
+        "导出前检查未通过：弹幕 ID 重复、片段引用了缺失资源。请在导出检查中处理后再导出。",
       tone: "warning"
     });
   });
@@ -769,7 +1091,9 @@ describe("editor store", () => {
     useEditorStore.getState().cleanupProjectEditReferences();
 
     expect(useEditorStore.getState().project.disabledItemIds).toEqual([validItemId]);
-    expect(useEditorStore.getState().project.itemTimeAdjustments).toEqual({ [validItemId]: 100 });
+    expect(useEditorStore.getState().project.itemTimeAdjustments).toEqual({
+      [validItemId]: 100
+    });
     expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("清理失效编辑引用");
     expect(useEditorStore.getState().status).toEqual({
       message: "已清理 2 条失效编辑引用。",
@@ -826,11 +1150,15 @@ describe("editor store", () => {
         }
       ]
     });
-    useEditorStore.setState({ selection: { kind: "clip", ids: ["clip-valid", "clip-missing"] } });
+    useEditorStore.setState({
+      selection: { kind: "clip", ids: ["clip-valid", "clip-missing"] }
+    });
 
     useEditorStore.getState().cleanupProjectMissingAssetClips();
 
-    expect(useEditorStore.getState().project.clips.map((clip) => clip.id)).toEqual(["clip-valid"]);
+    expect(useEditorStore.getState().project.clips.map((clip) => clip.id)).toEqual([
+      "clip-valid"
+    ]);
     expect(useEditorStore.getState().selection).toEqual({ kind: "clip", ids: ["clip-valid"] });
     expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("清理缺失资源片段");
     expect(useEditorStore.getState().status).toEqual({
@@ -869,7 +1197,9 @@ describe("editor store", () => {
 
   it("可把对齐提案发送到时间轴预览", () => {
     useEditorStore.getState().previewAlignmentProposalData({
-      anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
+      anchors: [
+        { id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }
+      ],
       cutCandidates: [],
       confidence: 0.5,
       diagnostics: []
@@ -881,7 +1211,9 @@ describe("editor store", () => {
 
   it("阻止明显异常的对齐提案写入项目", () => {
     useEditorStore.getState().applyAlignmentProposalData({
-      anchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
+      anchors: [
+        { id: "anchor", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }
+      ],
       cutCandidates: [
         {
           id: "cut",
@@ -901,7 +1233,8 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.syncAnchors).toHaveLength(0);
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(0);
     expect(useEditorStore.getState().status).toEqual({
-      message: "对齐提案存在应用阻断：1 个候选版本差异的不确定区间起止顺序异常，请修正后再应用。",
+      message:
+        "对齐提案存在应用阻断：1 个候选版本差异的不确定区间起止顺序异常，请修正后再应用。",
       tone: "warning"
     });
   });
@@ -909,12 +1242,36 @@ describe("editor store", () => {
   it("阻止对齐提案使用当前项目已有 ID", () => {
     resetStore({
       ...createEmptyProject(),
-      syncAnchors: [{ id: "anchor-existing", sourceMs: 1000, targetMs: 2000, confidence: 1, origin: "manual" }],
-      cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 3000, targetGapMs: 1200, note: "" }]
+      syncAnchors: [
+        {
+          id: "anchor-existing",
+          sourceMs: 1000,
+          targetMs: 2000,
+          confidence: 1,
+          origin: "manual"
+        }
+      ],
+      cutMarkers: [
+        {
+          id: "cut-existing",
+          name: "已有版本差异",
+          sourceAtMs: 3000,
+          targetGapMs: 1200,
+          note: ""
+        }
+      ]
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
-      anchors: [{ id: "anchor-existing", sourceMs: 4000, targetMs: 6000, confidence: 0.9, origin: "automatic" }],
+      anchors: [
+        {
+          id: "anchor-existing",
+          sourceMs: 4000,
+          targetMs: 6000,
+          confidence: 0.9,
+          origin: "automatic"
+        }
+      ],
       cutCandidates: [
         {
           id: "cut-existing",
@@ -933,7 +1290,8 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.cutMarkers).toHaveLength(1);
     expect(useEditorStore.getState().history.past).toHaveLength(0);
     expect(useEditorStore.getState().status).toEqual({
-      message: "对齐提案存在应用阻断：1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
+      message:
+        "对齐提案存在应用阻断：1 个同步锚点 ID 已存在于当前项目（ID：anchor-existing），应用会丢失新锚点。",
       tone: "warning"
     });
   });
@@ -941,14 +1299,42 @@ describe("editor store", () => {
   it("应用对齐提案时跳过已经按时间落点的项目", () => {
     resetStore({
       ...createEmptyProject(),
-      syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
-      cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
+      syncAnchors: [
+        {
+          id: "anchor-existing",
+          sourceMs: 10_000,
+          targetMs: 20_000,
+          confidence: 1,
+          origin: "manual"
+        }
+      ],
+      cutMarkers: [
+        {
+          id: "cut-existing",
+          name: "已有版本差异",
+          sourceAtMs: 30_000,
+          targetGapMs: 12_000,
+          note: ""
+        }
+      ]
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
       anchors: [
-        { id: "anchor-duplicate-time", sourceMs: 10_000, targetMs: 20_000, confidence: 0.8, origin: "automatic" },
-        { id: "anchor-new", sourceMs: 40_000, targetMs: 52_000, confidence: 0.8, origin: "automatic" }
+        {
+          id: "anchor-duplicate-time",
+          sourceMs: 10_000,
+          targetMs: 20_000,
+          confidence: 0.8,
+          origin: "automatic"
+        },
+        {
+          id: "anchor-new",
+          sourceMs: 40_000,
+          targetMs: 52_000,
+          confidence: 0.8,
+          origin: "automatic"
+        }
       ],
       cutCandidates: [
         {
@@ -990,12 +1376,36 @@ describe("editor store", () => {
   it("对齐提案全部已落点时不写入历史", () => {
     resetStore({
       ...createEmptyProject(),
-      syncAnchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 1, origin: "manual" }],
-      cutMarkers: [{ id: "cut-existing", name: "已有版本差异", sourceAtMs: 30_000, targetGapMs: 12_000, note: "" }]
+      syncAnchors: [
+        {
+          id: "anchor-existing",
+          sourceMs: 10_000,
+          targetMs: 20_000,
+          confidence: 1,
+          origin: "manual"
+        }
+      ],
+      cutMarkers: [
+        {
+          id: "cut-existing",
+          name: "已有版本差异",
+          sourceAtMs: 30_000,
+          targetGapMs: 12_000,
+          note: ""
+        }
+      ]
     });
 
     useEditorStore.getState().applyAlignmentProposalData({
-      anchors: [{ id: "anchor-existing", sourceMs: 10_000, targetMs: 20_000, confidence: 0.8, origin: "automatic" }],
+      anchors: [
+        {
+          id: "anchor-existing",
+          sourceMs: 10_000,
+          targetMs: 20_000,
+          confidence: 0.8,
+          origin: "automatic"
+        }
+      ],
       cutCandidates: [
         {
           id: "cut-existing",
@@ -1010,8 +1420,12 @@ describe("editor store", () => {
       diagnostics: []
     });
 
-    expect(useEditorStore.getState().project.syncAnchors.map((anchor) => anchor.id)).toEqual(["anchor-existing"]);
-    expect(useEditorStore.getState().project.cutMarkers.map((marker) => marker.id)).toEqual(["cut-existing"]);
+    expect(useEditorStore.getState().project.syncAnchors.map((anchor) => anchor.id)).toEqual([
+      "anchor-existing"
+    ]);
+    expect(useEditorStore.getState().project.cutMarkers.map((marker) => marker.id)).toEqual([
+      "cut-existing"
+    ]);
     expect(useEditorStore.getState().history.past).toHaveLength(0);
     expect(useEditorStore.getState().status).toEqual({
       message: "对齐提案没有新的可应用项。",
@@ -1022,7 +1436,9 @@ describe("editor store", () => {
   it("更新和删除同步锚点", () => {
     resetStore({
       ...createEmptyProject(),
-      syncAnchors: [{ id: "anchor", sourceMs: 1000, targetMs: 2000, confidence: 1, origin: "manual" }]
+      syncAnchors: [
+        { id: "anchor", sourceMs: 1000, targetMs: 2000, confidence: 1, origin: "manual" }
+      ]
     });
     useEditorStore.setState({ selection: { kind: "anchor", ids: ["anchor"] } });
 
@@ -1047,9 +1463,10 @@ function createProjectMediaReference(
     id,
     role,
     name: overrides.name ?? (role === "bilibiliReference" ? "B 站参考素材" : "目标原片"),
-    fileName: overrides.fileName ?? (role === "bilibiliReference" ? "reference.mp4" : "target.mp4"),
-    objectUrl: "objectUrl" in overrides ? overrides.objectUrl ?? null : "blob:test",
-    durationMs: "durationMs" in overrides ? overrides.durationMs ?? null : 120_000,
+    fileName:
+      overrides.fileName ?? (role === "bilibiliReference" ? "reference.mp4" : "target.mp4"),
+    objectUrl: "objectUrl" in overrides ? (overrides.objectUrl ?? null) : "blob:test",
+    durationMs: "durationMs" in overrides ? (overrides.durationMs ?? null) : 120_000,
     referenceKind: overrides.referenceKind ?? "browserFile",
     connectionState: overrides.connectionState ?? "connected",
     sourceSummary: overrides.sourceSummary ?? "测试媒体",

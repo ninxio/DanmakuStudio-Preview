@@ -30,6 +30,7 @@ import {
 import {
   createBrowserFileMediaReference,
   createDanmakuSourceBinding,
+  createLocalPathMediaReference,
   createMediaReferenceFromBinding,
   findDanmakuSourceBinding,
   findProjectMedia,
@@ -52,6 +53,7 @@ import type {
   EditorProject,
   EditorSelection,
   MediaBinding,
+  MediaMatchCandidate,
   MediaReference,
   ProjectMediaReference,
   ProjectMediaRole
@@ -62,7 +64,10 @@ import {
   getProjectDurationMs,
   resolveProjectDanmakuEvents
 } from "../domain/timeline/mapping";
-import { parseProjectJsonWithMetadata, type ProjectSchemaMigration } from "../domain/project/schema";
+import {
+  parseProjectJsonWithMetadata,
+  type ProjectSchemaMigration
+} from "../domain/project/schema";
 import type { Milliseconds } from "../domain/shared/time";
 import { clamp, clampMilliseconds } from "../domain/shared/time";
 import {
@@ -80,12 +85,23 @@ import {
   validateExportedXml
 } from "../infrastructure/xml/bilibiliXml";
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
+import {
+  acceptMediaMatchCandidate as acceptProjectMediaMatchCandidate,
+  reconcileMediaMatchCandidates,
+  rejectMediaMatchCandidate as rejectProjectMediaMatchCandidate,
+  revokeMediaMatchCandidateAcceptance as revokeProjectMediaMatchCandidateAcceptance,
+  updateMediaMatchCandidateRange as updateProjectMediaMatchCandidateRange,
+  type MediaMatchRangePatch
+} from "../domain/alignment/mediaMatching";
 import { createAlignmentApplyBlockers } from "../domain/alignment/alignmentReport";
 import {
   isAlignmentAnchorApplied,
   isAlignmentCutCandidateApplied
 } from "../domain/alignment/preview";
-import { parseAlignmentProposal, serializeAlignmentProposal } from "../domain/alignment/manualProvider";
+import {
+  parseAlignmentProposal,
+  serializeAlignmentProposal
+} from "../domain/alignment/manualProvider";
 import { pickAssetColor } from "../domain/shared/assetColors";
 import {
   DEFAULT_CUT_HINT_SEARCH_SETTINGS,
@@ -119,6 +135,8 @@ export interface CutMarkerDraft {
   note?: string;
 }
 
+export type WorkspacePage = "materials" | "matching" | "editing" | "export";
+
 interface EditorStore {
   project: EditorProject;
   selection: EditorSelection;
@@ -130,9 +148,18 @@ interface EditorStore {
   alignmentProposal: AlignmentProposal | null;
   cutHintSettings: CutHintSearchSettings;
   timelineTool: TimelineTool;
+  workspacePage: WorkspacePage;
+  projectEpoch: number;
+  setWorkspacePage: (page: WorkspacePage) => void;
   newProject: () => void;
   importXmlFiles: (files: FileList | File[]) => Promise<void>;
   importMediaFiles: (files: FileList | File[], role: ProjectMediaRole) => void;
+  importMediaPaths: (paths: string[], role: ProjectMediaRole) => void;
+  addMediaMatchCandidate: (candidate: MediaMatchCandidate) => void;
+  updateMediaMatchCandidateRange: (candidateId: string, patch: MediaMatchRangePatch) => void;
+  acceptMediaMatchCandidate: (candidateId: string, assetIds: string[]) => void;
+  revokeMediaMatchCandidateAcceptance: (candidateId: string) => void;
+  rejectMediaMatchCandidate: (candidateId: string) => void;
   importVideoFile: (file: File) => void;
   removeMedia: () => void;
   removeMediaReference: (mediaId: string) => void;
@@ -181,7 +208,11 @@ interface EditorStore {
   cleanupProjectEditReferences: () => void;
   cleanupProjectMissingAssetClips: () => void;
   addCutMarkerAtPlayhead: () => void;
-  addCutMarker: (sourceAtMs: Milliseconds, targetGapMs?: Milliseconds, draft?: CutMarkerDraft) => void;
+  addCutMarker: (
+    sourceAtMs: Milliseconds,
+    targetGapMs?: Milliseconds,
+    draft?: CutMarkerDraft
+  ) => void;
   updateCutMarker: (id: string, patch: Partial<Omit<CutMarker, "id">>) => void;
   deleteCutMarker: (id: string) => void;
   deleteSelection: () => void;
@@ -220,6 +251,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   alignmentProposal: null,
   cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS },
   timelineTool: "select",
+  workspacePage: "materials",
+  projectEpoch: 0,
+
+  setWorkspacePage: (page) => set({ workspacePage: page }),
 
   newProject: () => {
     revokeProjectObjectUrls(get().project);
@@ -231,7 +266,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       status: { message: "已创建新项目", tone: "success" },
       exportDraft: null,
       alignmentProposal: null,
-      timelineTool: "select"
+      timelineTool: "select",
+      projectEpoch: get().projectEpoch + 1
     });
   },
 
@@ -281,7 +317,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   importMediaFiles: (files, role) => {
     const fileArray = Array.from(files).filter(isSupportedVideoFile);
     if (fileArray.length === 0) {
-      set({ status: { message: "请选择 MP4 或 WebM 视频文件。", tone: "warning" } });
+      set({ status: { message: "请选择受支持的视频文件。", tone: "warning" } });
       return;
     }
     const importedMedia = fileArray.map((file) =>
@@ -292,24 +328,15 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         durationMs: null
       })
     );
-    commitProject(set, get, role === "targetOriginal" ? "导入原片素材" : "导入 B 站参考素材", (project) => {
-      const nextMediaLibrary = [...project.mediaLibrary, ...importedMedia];
-      const firstImported = importedMedia[0];
-      const mediaBinding =
-        role === "targetOriginal" && !project.mediaBinding
-          ? createLocalFileMediaBinding(createId("media_binding"), toLegacyMediaReference(firstImported))
-          : project.mediaBinding;
-      const normalizedMediaBinding =
-        mediaBinding && role === "targetOriginal" && !project.mediaBinding && mediaBinding.kind === "localFile"
-          ? { ...mediaBinding, mediaId: firstImported.id }
-          : mediaBinding;
-      return {
+    commitProject(
+      set,
+      get,
+      role === "targetOriginal" ? "导入原片素材" : "导入 B 站参考素材",
+      (project) => ({
         ...project,
-        mediaLibrary: nextMediaLibrary,
-        media: role === "bilibiliReference" ? toLegacyMediaReference(firstImported) : project.media,
-        mediaBinding: normalizedMediaBinding
-      };
-    });
+        mediaLibrary: [...project.mediaLibrary, ...importedMedia]
+      })
+    );
     set({
       status: {
         message:
@@ -321,8 +348,129 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     });
   },
 
+  importMediaPaths: (paths, role) => {
+    const uniquePaths = uniqueSupportedMediaPaths(paths);
+    if (uniquePaths.length === 0) {
+      set({ status: { message: "请选择受支持的视频文件。", tone: "warning" } });
+      return;
+    }
+    const project = get().project;
+    const existingKeys = new Set(
+      project.mediaLibrary
+        .filter((media) => media.role === role && media.localPath)
+        .map((media) => normalizeMediaPathKey(media.localPath ?? ""))
+    );
+    const importedPaths = uniquePaths.filter(
+      (path) => !existingKeys.has(normalizeMediaPathKey(path))
+    );
+    const skippedCount = uniquePaths.length - importedPaths.length;
+    if (importedPaths.length === 0) {
+      set({
+        status: {
+          message: `所选 ${uniquePaths.length} 个视频已在${role === "targetOriginal" ? "原片" : "B 站参考"}素材中，未重复导入。`,
+          tone: "neutral"
+        }
+      });
+      return;
+    }
+    const importedMedia = importedPaths.map((path) =>
+      createLocalPathMediaReference(createId("media"), role, path)
+    );
+    commitProject(
+      set,
+      get,
+      role === "targetOriginal" ? "批量导入原片素材" : "批量导入 B 站参考素材",
+      (current) => ({
+        ...current,
+        mediaLibrary: [...current.mediaLibrary, ...importedMedia]
+      })
+    );
+    set({
+      status: {
+        message: `已导入 ${importedMedia.length} 个${role === "targetOriginal" ? "原片" : "B 站参考"}素材${
+          skippedCount > 0 ? `，跳过 ${skippedCount} 个重复路径` : ""
+        }。`,
+        tone: "success"
+      }
+    });
+  },
+
   importVideoFile: (file) => {
     get().importMediaFiles([file], "bilibiliReference");
+  },
+
+  addMediaMatchCandidate: (candidate) => {
+    const existing = get().project.mediaMatchCandidates.some(
+      (item) => item.id === candidate.id
+    );
+    commitProject(set, get, existing ? "更新媒体匹配候选" : "新增媒体匹配候选", (project) => ({
+      ...project,
+      mediaMatchCandidates: existing
+        ? project.mediaMatchCandidates.map((item) =>
+            item.id === candidate.id ? candidate : item
+          )
+        : [...project.mediaMatchCandidates, candidate]
+    }));
+    set({
+      status: {
+        message:
+          candidate.state === "blocked"
+            ? "匹配候选已保存，但需要先为参考素材绑定 XML。"
+            : "匹配候选已加入复核队列。",
+        tone: candidate.state === "blocked" ? "warning" : "success"
+      }
+    });
+  },
+
+  updateMediaMatchCandidateRange: (candidateId, patch) => {
+    try {
+      commitProject(set, get, "调整媒体匹配候选", (project) =>
+        updateProjectMediaMatchCandidateRange(project, candidateId, patch)
+      );
+      set({ status: { message: "已更新候选匹配范围。", tone: "success" } });
+    } catch (error) {
+      set({ status: createErrorStatus("匹配候选范围无效", error) });
+    }
+  },
+
+  acceptMediaMatchCandidate: (candidateId, assetIds) => {
+    try {
+      const beforeCount = get().project.danmakuSourceSegments.length;
+      commitProject(set, get, "接受媒体匹配候选", (project) =>
+        acceptProjectMediaMatchCandidate(project, candidateId, assetIds)
+      );
+      const addedCount = get().project.danmakuSourceSegments.length - beforeCount;
+      set({
+        status: {
+          message: `已确认匹配关系，新增 ${Math.max(0, addedCount)} 个来源段。`,
+          tone: "success"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法接受匹配候选", error) });
+    }
+  },
+
+  revokeMediaMatchCandidateAcceptance: (candidateId) => {
+    try {
+      commitProject(set, get, "撤销媒体匹配确认", (project) =>
+        revokeProjectMediaMatchCandidateAcceptance(project, candidateId)
+      );
+      set({ status: { message: "已撤销匹配确认，候选已恢复到复核队列。", tone: "success" } });
+    } catch (error) {
+      set({ status: createErrorStatus("无法撤销匹配确认", error) });
+    }
+  },
+
+  rejectMediaMatchCandidate: (candidateId) => {
+    try {
+      commitProject(set, get, "忽略媒体匹配候选", (project) =>
+        rejectProjectMediaMatchCandidate(project, candidateId)
+      );
+      set({ status: { message: "已忽略该匹配候选。", tone: "neutral" } });
+    } catch (error) {
+      set({ status: createErrorStatus("无法忽略匹配候选", error) });
+    }
   },
 
   removeMedia: () => {
@@ -344,13 +492,18 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     if (!result.ok) {
       const detail =
         result.usages.length > 0
-          ? result.usages.slice(0, 3).map((usage) => usage.label).join("；")
+          ? result.usages
+              .slice(0, 3)
+              .map((usage) => usage.label)
+              .join("；")
           : "未找到可删除的媒体素材。";
       set({ status: { message: `不能删除该素材：${detail}`, tone: "warning" } });
       return;
     }
     revokeObjectUrlIfUnused(get().project, media.objectUrl, media.id);
-    commitProject(set, get, "删除媒体素材", () => result.project);
+    commitProject(set, get, "删除媒体素材", () =>
+      reconcileMediaMatchCandidates(result.project)
+    );
     set({ status: { message: `已删除媒体素材：${media.fileName}`, tone: "success" } });
   },
 
@@ -361,7 +514,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return;
     }
     if (!isSupportedVideoFile(file)) {
-      set({ status: { message: "请选择 MP4 或 WebM 视频文件重新连接。", tone: "warning" } });
+      set({ status: { message: "请选择受支持的视频文件重新连接。", tone: "warning" } });
       return;
     }
     const objectUrl = createObjectUrl(file);
@@ -374,7 +527,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     revokeObjectUrlIfUnused(get().project, media.objectUrl, media.id);
     commitProject(set, get, "重新连接媒体素材", (project) => ({
       ...project,
-      mediaLibrary: project.mediaLibrary.map((candidate) => (candidate.id === mediaId ? reconnected : candidate)),
+      mediaLibrary: project.mediaLibrary.map((candidate) =>
+        candidate.id === mediaId ? reconnected : candidate
+      ),
       media:
         project.media?.id === mediaId || (media.role === "bilibiliReference" && !project.media)
           ? toLegacyMediaReference(reconnected)
@@ -399,7 +554,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return;
     }
     if (!media.objectUrl) {
-      set({ status: { message: "该视频需要重新连接后才能作为本次会话的目标原片。", tone: "warning" } });
+      set({
+        status: { message: "该视频需要重新连接后才能作为本次会话的目标原片。", tone: "warning" }
+      });
       return;
     }
     const targetMedia = createBrowserFileMediaReference(createId("media"), "targetOriginal", {
@@ -408,7 +565,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       objectUrl: media.objectUrl,
       durationMs: media.durationMs
     });
-    const binding = createLocalFileMediaBinding(createId("media_binding"), toLegacyMediaReference(targetMedia));
+    const binding = createLocalFileMediaBinding(
+      createId("media_binding"),
+      toLegacyMediaReference(targetMedia)
+    );
     commitProject(set, get, "绑定本地目标原片", (project) => ({
       ...project,
       mediaLibrary: [...project.mediaLibrary, targetMedia],
@@ -429,7 +589,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       mediaLibrary: upsertMediaById(project.mediaLibrary, targetMedia),
       mediaBinding: normalizedBinding
     }));
-    set({ status: { message: `已绑定目标原片：${normalizedBinding.displayName}`, tone: "success" } });
+    set({
+      status: { message: `已绑定目标原片：${normalizedBinding.displayName}`, tone: "success" }
+    });
   },
 
   clearMediaBinding: () => {
@@ -446,19 +608,44 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   bindXmlToSourceMedia: (assetId, sourceMediaId) => {
-    const validationMessage = validateDanmakuSourceBinding(get().project, assetId, sourceMediaId);
+    const conflictingSegment = get().project.danmakuSourceSegments.find(
+      (segment) => segment.assetId === assetId && segment.sourceMediaId !== sourceMediaId
+    );
+    if (conflictingSegment) {
+      set({
+        status: {
+          message: `不能更换 XML 来源：已有来源段“${conflictingSegment.label}”使用当前参考素材，请先删除或调整该来源段。`,
+          tone: "warning"
+        }
+      });
+      return;
+    }
+    const validationMessage = validateDanmakuSourceBinding(
+      get().project,
+      assetId,
+      sourceMediaId
+    );
     if (validationMessage) {
       set({ status: { message: validationMessage, tone: "warning" } });
       return;
     }
     const existing = findDanmakuSourceBinding(get().project.danmakuSourceBindings, assetId);
-    const binding = createDanmakuSourceBinding(existing?.id ?? createId("danmaku_source_binding"), assetId, sourceMediaId);
+    const binding = createDanmakuSourceBinding(
+      existing?.id ?? createId("danmaku_source_binding"),
+      assetId,
+      sourceMediaId
+    );
     const asset = get().project.assets.find((candidate) => candidate.id === assetId);
     const sourceMedia = findProjectMedia(get().project, sourceMediaId);
-    commitProject(set, get, "绑定 XML 来源视频", (project) => ({
-      ...project,
-      danmakuSourceBindings: upsertDanmakuSourceBinding(project.danmakuSourceBindings, binding)
-    }));
+    commitProject(set, get, "绑定 XML 来源视频", (project) =>
+      reconcileMediaMatchCandidates({
+        ...project,
+        danmakuSourceBindings: upsertDanmakuSourceBinding(
+          project.danmakuSourceBindings,
+          binding
+        )
+      })
+    );
     set({
       status: {
         message: `已绑定 XML 来源：${asset?.fileName ?? assetId} -> ${sourceMedia?.fileName ?? sourceMediaId}`,
@@ -473,12 +660,31 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({ status: { message: "该 XML 尚未绑定 B 站参考素材。", tone: "warning" } });
       return;
     }
+    const referencedSegment = get().project.danmakuSourceSegments.find(
+      (segment) => segment.assetId === assetId
+    );
+    if (referencedSegment) {
+      set({
+        status: {
+          message: `不能解除 XML 来源绑定：来源段“${referencedSegment.label}”仍在使用，请先删除该来源段。`,
+          tone: "warning"
+        }
+      });
+      return;
+    }
     const asset = get().project.assets.find((candidate) => candidate.id === assetId);
-    commitProject(set, get, "解除 XML 来源视频绑定", (project) => ({
-      ...project,
-      danmakuSourceBindings: removeDanmakuSourceBinding(project.danmakuSourceBindings, assetId)
-    }));
-    set({ status: { message: `已解除 XML 来源绑定：${asset?.fileName ?? assetId}`, tone: "success" } });
+    commitProject(set, get, "解除 XML 来源视频绑定", (project) =>
+      reconcileMediaMatchCandidates({
+        ...project,
+        danmakuSourceBindings: removeDanmakuSourceBinding(
+          project.danmakuSourceBindings,
+          assetId
+        )
+      })
+    );
+    set({
+      status: { message: `已解除 XML 来源绑定：${asset?.fileName ?? assetId}`, tone: "success" }
+    });
   },
 
   bindCurrentTargetToSeasonEpisode: (episodeKey, episodeLabel) => {
@@ -497,7 +703,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     commitProject(set, get, "绑定分集目标原片", (project) => ({
       ...project,
       seasonEpisodeBindings: [
-        ...project.seasonEpisodeBindings.filter((candidate) => candidate.episodeKey !== episodeKey),
+        ...project.seasonEpisodeBindings.filter(
+          (candidate) => candidate.episodeKey !== episodeKey
+        ),
         seasonBinding
       ]
     }));
@@ -505,16 +713,22 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   clearSeasonEpisodeBinding: (episodeKey) => {
-    const binding = get().project.seasonEpisodeBindings.find((candidate) => candidate.episodeKey === episodeKey);
+    const binding = get().project.seasonEpisodeBindings.find(
+      (candidate) => candidate.episodeKey === episodeKey
+    );
     if (!binding) {
       set({ status: { message: "这一集还没有单独绑定目标原片。", tone: "warning" } });
       return;
     }
     commitProject(set, get, "清除分集目标原片", (project) => ({
       ...project,
-      seasonEpisodeBindings: project.seasonEpisodeBindings.filter((candidate) => candidate.episodeKey !== episodeKey)
+      seasonEpisodeBindings: project.seasonEpisodeBindings.filter(
+        (candidate) => candidate.episodeKey !== episodeKey
+      )
     }));
-    set({ status: { message: `已清除分集目标原片：${binding.episodeLabel}`, tone: "success" } });
+    set({
+      status: { message: `已清除分集目标原片：${binding.episodeLabel}`, tone: "success" }
+    });
   },
 
   addDanmakuSourceSegment: (draft) => {
@@ -544,7 +758,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   updateDanmakuSourceSegment: (id, patch) => {
-    const segment = get().project.danmakuSourceSegments.find((candidate) => candidate.id === id);
+    const segment = get().project.danmakuSourceSegments.find(
+      (candidate) => candidate.id === id
+    );
     if (!segment) {
       set({ status: { message: "弹幕来源内容段不存在。", tone: "warning" } });
       return;
@@ -577,31 +793,39 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
   },
 
   deleteDanmakuSourceSegment: (id) => {
-    const segment = get().project.danmakuSourceSegments.find((candidate) => candidate.id === id);
+    const segment = get().project.danmakuSourceSegments.find(
+      (candidate) => candidate.id === id
+    );
     if (!segment) {
       set({ status: { message: "弹幕来源内容段不存在。", tone: "warning" } });
       return;
     }
-    commitProject(set, get, "删除弹幕来源内容段", (project) => ({
-      ...project,
-      danmakuSourceSegments: project.danmakuSourceSegments.filter((candidate) => candidate.id !== id)
-    }));
+    commitProject(set, get, "删除弹幕来源内容段", (project) =>
+      reconcileMediaMatchCandidates({
+        ...project,
+        danmakuSourceSegments: project.danmakuSourceSegments.filter(
+          (candidate) => candidate.id !== id
+        )
+      })
+    );
     set({ status: { message: `已删除弹幕来源内容段：${segment.label}`, tone: "success" } });
   },
 
   updateMediaDuration: (durationMs, mediaId = null) => {
     const normalizedDuration = clampMilliseconds(durationMs);
     set((state) => {
-      const localBinding = state.project.mediaBinding?.kind === "localFile" ? state.project.mediaBinding : null;
-      const fallbackMediaId =
-        state.project.media?.id ?? localBinding?.mediaId ?? null;
+      const localBinding =
+        state.project.mediaBinding?.kind === "localFile" ? state.project.mediaBinding : null;
+      const fallbackMediaId = state.project.media?.id ?? localBinding?.mediaId ?? null;
       const activeMediaId = mediaId ?? fallbackMediaId;
       if (!activeMediaId) {
         return { project: state.project };
       }
       const legacyMedia = state.project.media;
       const updatesLegacyMedia = legacyMedia?.id === activeMediaId;
-      const updatesMediaLibrary = state.project.mediaLibrary.some((media) => media.id === activeMediaId);
+      const updatesMediaLibrary = state.project.mediaLibrary.some(
+        (media) => media.id === activeMediaId
+      );
       const updatesLocalBinding = localBinding?.mediaId === activeMediaId;
       if (!updatesLegacyMedia && !updatesMediaLibrary && !updatesLocalBinding) {
         return { project: state.project };
@@ -609,13 +833,19 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       return {
         project: touchProject({
           ...state.project,
-          media: updatesLegacyMedia && legacyMedia ? { ...legacyMedia, durationMs: normalizedDuration } : legacyMedia,
+          media:
+            updatesLegacyMedia && legacyMedia
+              ? { ...legacyMedia, durationMs: normalizedDuration }
+              : legacyMedia,
           mediaLibrary: state.project.mediaLibrary.map((media) =>
-            media.id === activeMediaId ? updateProjectMediaDuration(media, normalizedDuration) : media
+            media.id === activeMediaId
+              ? updateProjectMediaDuration(media, normalizedDuration)
+              : media
           ),
-          mediaBinding: updatesLocalBinding && localBinding
-            ? { ...localBinding, runtimeMs: normalizedDuration }
-            : state.project.mediaBinding
+          mediaBinding:
+            updatesLocalBinding && localBinding
+              ? { ...localBinding, runtimeMs: normalizedDuration }
+              : state.project.mediaBinding
         })
       };
     });
@@ -623,7 +853,8 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   openProjectFromText: (text, sourceFileName) => {
     try {
-      const { project, migration } = parseProjectJsonWithMetadata(text);
+      const { project: parsedProject, migration } = parseProjectJsonWithMetadata(text);
+      const project = reconcileMediaMatchCandidates(parsedProject, parsedProject.updatedAt);
       revokeProjectObjectUrls(get().project);
       set({
         project,
@@ -632,11 +863,17 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         exportDraft: null,
         alignmentProposal: project.alignmentProposal,
         timelineTool: "select",
+        projectEpoch: get().projectEpoch + 1,
         status: createOpenProjectStatus(project.name, migration)
       });
     } catch (error) {
       set({
-        status: createSourceFileErrorStatus("项目文件打开失败", "项目文件打开失败。", error, sourceFileName)
+        status: createSourceFileErrorStatus(
+          "项目文件打开失败",
+          "项目文件打开失败。",
+          error,
+          sourceFileName
+        )
       });
     }
   },
@@ -686,11 +923,13 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
             ([itemId]) => !itemIds.has(itemId)
           )
         );
-        return {
+        return reconcileMediaMatchCandidates({
           ...currentProject,
           assets: currentProject.assets.filter((candidate) => candidate.id !== assetId),
           clips: currentProject.clips.filter((clip) => clip.assetId !== assetId),
-          danmakuSourceBindings: currentProject.danmakuSourceBindings.filter((binding) => binding.assetId !== assetId),
+          danmakuSourceBindings: currentProject.danmakuSourceBindings.filter(
+            (binding) => binding.assetId !== assetId
+          ),
           danmakuSourceSegments: currentProject.danmakuSourceSegments.map((segment) =>
             segment.assetId === assetId ? { ...segment, assetId: null } : segment
           ),
@@ -698,7 +937,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
             (itemId) => !itemIds.has(itemId)
           ),
           itemTimeAdjustments
-        };
+        });
       },
       emptySelection
     );
@@ -1022,7 +1261,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const selection = get().selection;
     const nextSelection =
       selection.kind === "clip"
-        ? createSelection("clip", selection.ids.filter((id) => !removedClipIds.has(id)))
+        ? createSelection(
+            "clip",
+            selection.ids.filter((id) => !removedClipIds.has(id))
+          )
         : selection;
     commitProject(set, get, "清理缺失资源片段", () => cleanup.project, nextSelection);
     set({
@@ -1058,7 +1300,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       }),
       { kind: "cut", ids: [markerId] }
     );
-    set({ status: { message: draft ? "已添加待确认版本差异。" : "已添加版本差异。", tone: "success" } });
+    set({
+      status: {
+        message: draft ? "已添加待确认版本差异。" : "已添加版本差异。",
+        tone: "success"
+      }
+    });
   },
 
   updateCutMarker: (id, patch) => {
@@ -1217,7 +1464,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const mergedClip = mergeAdjacentClips(selectedClips);
     if (!mergedClip) {
       set({
-        status: { message: "只能合并同一 XML 且原弹幕时间、时间轴连续的片段。", tone: "warning" }
+        status: {
+          message: "只能合并同一 XML 且原弹幕时间、时间轴连续的片段。",
+          tone: "warning"
+        }
       });
       return;
     }
@@ -1288,7 +1538,9 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         ...project,
         syncAnchors: project.syncAnchors.filter((anchor) => anchor.id !== id)
       }),
-      get().selection.kind === "anchor" && get().selection.ids.includes(id) ? emptySelection : get().selection
+      get().selection.kind === "anchor" && get().selection.ids.includes(id)
+        ? emptySelection
+        : get().selection
     );
   },
 
@@ -1368,7 +1620,12 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       get().previewAlignmentProposalData(proposal);
     } catch (error) {
       set({
-        status: createSourceFileErrorStatus("对齐提案导入失败", "对齐提案导入失败。", error, sourceFileName)
+        status: createSourceFileErrorStatus(
+          "对齐提案导入失败",
+          "对齐提案导入失败。",
+          error,
+          sourceFileName
+        )
       });
     }
   },
@@ -1536,11 +1793,17 @@ function revokeProjectObjectUrls(project: EditorProject): void {
   urls.forEach((url) => revokeObjectUrl(url));
 }
 
-function revokeObjectUrlIfUnused(project: EditorProject, objectUrl: string | null, removedMediaId: string): void {
+function revokeObjectUrlIfUnused(
+  project: EditorProject,
+  objectUrl: string | null,
+  removedMediaId: string
+): void {
   if (!objectUrl) {
     return;
   }
-  const stillUsed = project.mediaLibrary.some((media) => media.id !== removedMediaId && media.objectUrl === objectUrl);
+  const stillUsed = project.mediaLibrary.some(
+    (media) => media.id !== removedMediaId && media.objectUrl === objectUrl
+  );
   if (!stillUsed) {
     revokeObjectUrl(objectUrl);
   }
@@ -1548,7 +1811,43 @@ function revokeObjectUrlIfUnused(project: EditorProject, objectUrl: string | nul
 
 function isSupportedVideoFile(file: File): boolean {
   const name = file.name.toLowerCase();
-  return name.endsWith(".mp4") || name.endsWith(".webm") || file.type === "video/mp4" || file.type === "video/webm";
+  return isSupportedVideoPath(name) || file.type.startsWith("video/");
+}
+
+const SUPPORTED_VIDEO_EXTENSIONS = [
+  ".mp4",
+  ".mkv",
+  ".webm",
+  ".mov",
+  ".m4v",
+  ".avi",
+  ".flv",
+  ".ts",
+  ".m2ts"
+];
+
+function uniqueSupportedMediaPaths(paths: readonly string[]): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  paths.forEach((path) => {
+    const trimmed = path.trim();
+    const key = normalizeMediaPathKey(trimmed);
+    if (trimmed.length === 0 || !isSupportedVideoPath(trimmed) || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    result.push(trimmed);
+  });
+  return result;
+}
+
+function isSupportedVideoPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return SUPPORTED_VIDEO_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function normalizeMediaPathKey(path: string): string {
+  return path.trim().replace(/\//g, "\\").replace(/\\+/g, "\\").toLocaleLowerCase("en-US");
 }
 
 function toLegacyMediaReference(media: ProjectMediaReference): MediaReference {
@@ -1586,8 +1885,13 @@ function createAlignmentProposalPreviewStatus(proposal: AlignmentProposal): Edit
   };
 }
 
-function isSameAlignmentProposal(current: AlignmentProposal | null, next: AlignmentProposal): boolean {
-  return current ? serializeAlignmentProposal(current) === serializeAlignmentProposal(next) : false;
+function isSameAlignmentProposal(
+  current: AlignmentProposal | null,
+  next: AlignmentProposal
+): boolean {
+  return current
+    ? serializeAlignmentProposal(current) === serializeAlignmentProposal(next)
+    : false;
 }
 
 function createOpenProjectStatus(
@@ -1620,7 +1924,8 @@ function createSourceFileErrorStatus(
   error: unknown,
   sourceFileName?: string
 ): EditorStatus {
-  const detail = error instanceof Error && error.message.trim().length > 0 ? error.message : fallbackMessage;
+  const detail =
+    error instanceof Error && error.message.trim().length > 0 ? error.message : fallbackMessage;
   if (!sourceFileName) {
     return { message: detail, tone: "error" };
   }

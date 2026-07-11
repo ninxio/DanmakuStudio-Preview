@@ -78,7 +78,10 @@ describe("danmaku source timeline", () => {
     const emptyProject = {
       ...createEmptyProject(),
       assets: [createAsset()],
-      mediaLibrary: [createMedia("source-media", "bilibiliReference"), createMedia("target-media", "targetOriginal")]
+      mediaLibrary: [
+        createMedia("source-media", "bilibiliReference"),
+        createMedia("target-media", "targetOriginal")
+      ]
     };
 
     expect(createSourceTimelineSummary(emptyProject, plan).status).toBe("needsSegments");
@@ -128,7 +131,49 @@ describe("danmaku source timeline", () => {
       plan
     );
     expect(readySummary.status).toBe("ready");
-    expect(readySummary.metrics).toContainEqual({ label: "已关联输出", value: "1 集" });
+    expect(readySummary.metrics).toContainEqual({ label: "已关联原片", value: "1 个" });
+
+    const targetOnlySummary = createSourceTimelineSummary(
+      {
+        ...emptyProject,
+        danmakuSourceSegments: [
+          {
+            ...segmentA,
+            episodeKey: null,
+            episodeLabel: null
+          }
+        ]
+      },
+      { ...plan, episodes: [] }
+    );
+    expect(targetOnlySummary.status).toBe("ready");
+    expect(
+      targetOnlySummary.findings.some((finding) => finding.title === "内容段未关联输出集")
+    ).toBe(false);
+
+    const multiTargetSummary = createSourceTimelineSummary(
+      {
+        ...emptyProject,
+        mediaLibrary: [
+          ...emptyProject.mediaLibrary,
+          createMedia("target-media-2", "targetOriginal")
+        ],
+        danmakuSourceSegments: [
+          segmentA,
+          {
+            ...segmentA,
+            id: "segment-same-source-other-target",
+            targetMediaId: "target-media-2"
+          }
+        ]
+      },
+      plan
+    );
+    expect(multiTargetSummary.status).toBe("ready");
+    expect(
+      multiTargetSummary.findings.some((finding) => finding.title === "来源内容段时间重叠")
+    ).toBe(false);
+    expect(multiTargetSummary.metrics).toContainEqual({ label: "已关联原片", value: "2 个" });
   });
 });
 

@@ -19,7 +19,14 @@ export interface BrowserMediaDraft {
 }
 
 export interface MediaReferenceUsage {
-  kind: "xmlBinding" | "sourceSegmentSource" | "sourceSegmentTarget" | "mediaBinding" | "seasonEpisodeBinding";
+  kind:
+    | "xmlBinding"
+    | "sourceSegmentSource"
+    | "sourceSegmentTarget"
+    | "matchCandidateSource"
+    | "matchCandidateTarget"
+    | "mediaBinding"
+    | "seasonEpisodeBinding";
   label: string;
 }
 
@@ -196,7 +203,7 @@ export function validateDanmakuSourceBinding(
 }
 
 export function validateSourceSegmentReferences(
-  project: Pick<EditorProject, "assets" | "mediaLibrary">,
+  project: Pick<EditorProject, "assets" | "mediaLibrary" | "danmakuSourceBindings">,
   segment: {
     kind: "content" | "ignored";
     assetId: string | null;
@@ -210,6 +217,13 @@ export function validateSourceSegmentReferences(
   const asset = project.assets.find((candidate) => candidate.id === segment.assetId);
   if (!asset) {
     issues.push({ severity: "error", message: "来源段必须选择所属 XML。" });
+  } else {
+    const binding = findDanmakuSourceBinding(project.danmakuSourceBindings, asset.id);
+    if (!binding) {
+      issues.push({ severity: "error", message: "请先在素材页把所属 XML 绑定到 B 站参考素材。" });
+    } else if (binding.sourceMediaId !== segment.sourceMediaId) {
+      issues.push({ severity: "error", message: "来源段的参考素材必须与所属 XML 在素材页的绑定一致。" });
+    }
   }
   const sourceMedia = findProjectMedia(project, segment.sourceMediaId);
   if (!sourceMedia) {
@@ -265,6 +279,22 @@ export function collectMediaReferenceUsages(
         label: `来源段目标：${segment.label}`
       })
     );
+  project.mediaMatchCandidates
+    .filter((candidate) => candidate.state !== "rejected" && candidate.sourceMediaId === mediaId)
+    .forEach((candidate) =>
+      usages.push({
+        kind: "matchCandidateSource",
+        label: `匹配候选来源：${candidate.id}`
+      })
+    );
+  project.mediaMatchCandidates
+    .filter((candidate) => candidate.state !== "rejected" && candidate.targetMediaId === mediaId)
+    .forEach((candidate) =>
+      usages.push({
+        kind: "matchCandidateTarget",
+        label: `匹配候选目标：${candidate.id}`
+      })
+    );
   if (project.mediaBinding?.kind === "localFile" && project.mediaBinding.mediaId === mediaId) {
     usages.push({
       kind: "mediaBinding",
@@ -295,7 +325,10 @@ export function removeMediaReference(
     return { ok: false, project, usages: [] };
   }
   const usages = collectMediaReferenceUsages(project, mediaId);
-  if (usages.length > 0) {
+  const blockingUsages = usages.filter(
+    (usage) => usage.kind !== "matchCandidateSource" && usage.kind !== "matchCandidateTarget"
+  );
+  if (blockingUsages.length > 0) {
     return { ok: false, project, usages };
   }
   const nextMedia = project.media?.id === mediaId ? null : project.media;
@@ -305,7 +338,10 @@ export function removeMediaReference(
     project: {
       ...project,
       media: nextMedia,
-      mediaLibrary: project.mediaLibrary.filter((candidate) => candidate.id !== mediaId)
+      mediaLibrary: project.mediaLibrary.filter((candidate) => candidate.id !== mediaId),
+      mediaMatchCandidates: project.mediaMatchCandidates.filter(
+        (candidate) => candidate.sourceMediaId !== mediaId && candidate.targetMediaId !== mediaId
+      )
     }
   };
 }

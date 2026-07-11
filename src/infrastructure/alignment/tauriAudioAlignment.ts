@@ -12,6 +12,7 @@ export interface TauriAudioAlignmentRequest {
   maxCells?: number;
   enableVisualEvidence?: boolean;
   visualSampleIntervalMs?: number;
+  localizationMode?: boolean;
 }
 
 export type AudioAlignmentInvoker = (

@@ -39,7 +39,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   const workflowOverview = page.getByTestId("workflow-overview-dialog");
   await expect(workflowOverview).toContainText("开始 / 下一步");
   await expect(workflowOverview).toContainText("建议下一步");
-  await expect(workflowOverview).toContainText("先选择本地视频和 XML");
+  await expect(workflowOverview).toContainText("先导入原片、参考视频和弹幕 XML");
   await expect(workflowOverview).toContainText("常用操作");
   await page.screenshot({ path: screenshotPath("workflow-overview.png"), fullPage: true });
   await page.getByLabel("关闭新手引导").click();
@@ -81,16 +81,24 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已导入设置");
   await page.getByLabel("关闭设置").click();
 
-  await page.getByTestId("xml-input").setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
+  await page
+    .getByTestId("xml-input")
+    .setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
   await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
   await page.getByLabel("新手引导").click();
-  await expect(page.getByTestId("workflow-overview-dialog")).toContainText("1 个 XML / 0 个片段");
-  await expect(page.getByTestId("workflow-overview-dialog")).toContainText("按顺序排列");
+  await expect(page.getByTestId("workflow-overview-dialog")).toContainText(
+    "1 个 XML · 0/0 个原片已确认 · 0 个待复核"
+  );
+  await expect(page.getByTestId("workflow-overview-dialog")).toContainText("按顺序放入时间轴");
   await page.getByLabel("关闭新手引导").click();
   await page.screenshot({ path: screenshotPath("imported-project.png"), fullPage: true });
 
-  await page.getByTestId("asset-card").getByRole("button", { name: "放入时间轴", exact: true }).click();
+  await page.getByTestId("workspace-nav-editing").click();
+  await page
+    .getByTestId("asset-card")
+    .getByRole("button", { name: "放入时间轴", exact: true })
+    .click();
   await expect(page.getByTestId("inspector-clip")).toContainText("片段检查器");
   await page.setViewportSize({ width: 1024, height: 720 });
   await expect(page.getByTestId("timeline-panel")).toBeVisible();
@@ -106,12 +114,18 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   const savedProjectText = readFileSync(projectFilePath, "utf8");
   expect(savedProjectText).toContain("normal.xml");
   const projectWithOrphans = JSON.parse(savedProjectText) as SavedProjectFile;
-  projectWithOrphans.disabledItemIds = [...(projectWithOrphans.disabledItemIds ?? []), "missing-disabled-item"];
+  projectWithOrphans.disabledItemIds = [
+    ...(projectWithOrphans.disabledItemIds ?? []),
+    "missing-disabled-item"
+  ];
   projectWithOrphans.itemTimeAdjustments = {
     ...(projectWithOrphans.itemTimeAdjustments ?? {}),
     "missing-adjusted-item": 1200
   };
-  const projectWithOrphansPath = resolve(downloadDir, "project-with-orphaned-edits.danmaku-project.json");
+  const projectWithOrphansPath = resolve(
+    downloadDir,
+    "project-with-orphaned-edits.danmaku-project.json"
+  );
   writeFileSync(projectWithOrphansPath, JSON.stringify(projectWithOrphans, null, 2), "utf8");
 
   await page.getByLabel("新建项目").click();
@@ -119,7 +133,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByTestId("project-input").setInputFiles(projectWithOrphansPath);
   await expect(page.getByTestId("status-bar")).toContainText("已打开项目");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
-  await page.getByRole("button", { name: "导出检查" }).click();
+  await page.getByTestId("workspace-nav-export").click();
   const projectHealthPanel = page.getByTestId("project-health-panel");
   await expect(projectHealthPanel).toContainText("导出前检查");
   await expect(projectHealthPanel).toContainText("建议检查");
@@ -148,11 +162,22 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   expect(healthReportText).toContain("状态：健康");
   expect(healthReportText).toContain("媒体重连：不需要");
   await page.screenshot({ path: screenshotPath("project-health.png"), fullPage: true });
-  await page.getByRole("button", { name: "弹幕素材" }).click();
-  await page.getByRole("button", { name: /高级工具/ }).click();
+  await page.getByTestId("workspace-nav-matching").click();
+  await page
+    .getByTestId("legacy-alignment-diagnostics")
+    .getByText("高级诊断：旧单对单实验室与对齐 JSON")
+    .click();
 
   const blockedAudioAlignmentProposal = {
-    anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
+    anchors: [
+      {
+        id: "audio-anchor-1",
+        sourceMs: 20_000,
+        targetMs: 40_000,
+        origin: "automatic",
+        confidence: 0.9
+      }
+    ],
     cutCandidates: [
       {
         id: "audio-gap-1",
@@ -168,14 +193,24 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
     confidence: 0.82,
     diagnostics: ["音频特征匹配 4 / 4 帧。"]
   };
-  await page.getByPlaceholder("AlignmentProposal JSON").fill(JSON.stringify(blockedAudioAlignmentProposal, null, 2));
+  await page
+    .getByPlaceholder("AlignmentProposal JSON")
+    .fill(JSON.stringify(blockedAudioAlignmentProposal, null, 2));
   await page.getByRole("button", { name: "导入提案" }).click();
   await expect(page.getByText("应用已暂停")).toBeVisible();
   await expect(page.getByText(/不确定区间起止顺序异常/).last()).toBeVisible();
   await expect(page.getByRole("button", { name: "应用候选" })).toBeDisabled();
 
   const audioAlignmentProposal = {
-    anchors: [{ id: "audio-anchor-1", sourceMs: 20_000, targetMs: 40_000, origin: "automatic", confidence: 0.9 }],
+    anchors: [
+      {
+        id: "audio-anchor-1",
+        sourceMs: 20_000,
+        targetMs: 40_000,
+        origin: "automatic",
+        confidence: 0.9
+      }
+    ],
     cutCandidates: [
       {
         id: "audio-gap-1",
@@ -191,7 +226,9 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
     confidence: 0.82,
     diagnostics: ["音频特征匹配 4 / 4 帧。"]
   };
-  await page.getByPlaceholder("AlignmentProposal JSON").fill(JSON.stringify(audioAlignmentProposal, null, 2));
+  await page
+    .getByPlaceholder("AlignmentProposal JSON")
+    .fill(JSON.stringify(audioAlignmentProposal, null, 2));
   await page.getByRole("button", { name: "导入提案" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已发送到时间轴预览");
   await expect(page.getByText("应用已暂停")).toHaveCount(0);
@@ -210,6 +247,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByPlaceholder(/每行一个对应点/).fill("00:10 -> 00:10\n00:20 -> 00:30");
   await page.getByRole("button", { name: "应用线索与差异" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已应用对齐提案");
+  await page.getByTestId("workspace-nav-editing").click();
   const secondAnchorTargetInput = page.getByLabel("同步锚点 2 完整版时间 ms");
   await expect(secondAnchorTargetInput).toHaveValue("30000");
   await secondAnchorTargetInput.fill("32000");
@@ -247,16 +285,20 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已重做");
   await expect(cutGapInput).toHaveValue("12000");
 
-  await page.getByLabel("导出 XML").click();
+  await page.getByTestId("workspace-nav-export").click();
+  await page.getByRole("button", { name: "预览并导出单个 XML" }).click();
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
   await expect(page.getByTestId("export-dialog")).toContainText("导出前检查");
   await expect(page.getByTestId("export-dialog")).toContainText("可以导出");
   await expect(page.getByTestId("export-dialog")).toContainText("验证条数");
   await expect(page.getByTestId("export-dialog")).toContainText("累计调整时长");
   const exportHealthReportDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "下载检查报告" }).click();
+  await page.getByTestId("export-dialog").getByRole("button", { name: "下载检查报告" }).click();
   const exportHealthReportDownload = await exportHealthReportDownloadPromise;
-  const exportHealthReportPath = resolve(downloadDir, exportHealthReportDownload.suggestedFilename());
+  const exportHealthReportPath = resolve(
+    downloadDir,
+    exportHealthReportDownload.suggestedFilename()
+  );
   await exportHealthReportDownload.saveAs(exportHealthReportPath);
   const exportHealthReportText = readFileSync(exportHealthReportPath, "utf8");
   expect(exportHealthReportText).toContain("导出前检查报告");
@@ -265,7 +307,10 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   const compensationReportDownloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "下载导出报告" }).click();
   const compensationReportDownload = await compensationReportDownloadPromise;
-  const compensationReportPath = resolve(downloadDir, compensationReportDownload.suggestedFilename());
+  const compensationReportPath = resolve(
+    downloadDir,
+    compensationReportDownload.suggestedFilename()
+  );
   await compensationReportDownload.saveAs(compensationReportPath);
   expect(readFileSync(compensationReportPath, "utf8")).toContain("版本差异明细");
   await page.screenshot({ path: screenshotPath("export-dialog.png"), fullPage: true });
@@ -281,15 +326,21 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
 
   await page.getByLabel("新建项目").click();
   await expect(page.getByTestId("status-bar")).toContainText("已创建新项目");
+  await page.getByTestId("workspace-nav-materials").click();
   await page.getByTestId("xml-input").setInputFiles(exportedXmlPath);
   await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
-  await expect(page.getByTestId("asset-card")).toContainText(exportedXmlDownload.suggestedFilename());
+  await expect(page.getByTestId("asset-card")).toContainText(
+    exportedXmlDownload.suggestedFilename()
+  );
   await page.screenshot({ path: screenshotPath("reimported-export.png"), fullPage: true });
 });
 
 test("导出前会阻断必须处理的问题", async ({ page }) => {
   await page.goto("/");
-  const fixtureText = readFileSync(resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"), "utf8");
+  const fixtureText = readFileSync(
+    resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"),
+    "utf8"
+  );
   const blockedProject = JSON.parse(fixtureText) as SavedProjectFile;
   if (!blockedProject.clips || blockedProject.clips.length === 0) {
     throw new Error("测试项目缺少时间轴片段。");
@@ -303,37 +354,54 @@ test("导出前会阻断必须处理的问题", async ({ page }) => {
     ...blockedProject.clips[0],
     assetId: "missing-asset"
   };
-  const blockedProjectPath = resolve(downloadDir, "blocked-health-project.danmaku-project.json");
+  const blockedProjectPath = resolve(
+    downloadDir,
+    "blocked-health-project.danmaku-project.json"
+  );
   writeFileSync(blockedProjectPath, JSON.stringify(blockedProject, null, 2), "utf8");
 
   await page.getByTestId("project-input").setInputFiles(blockedProjectPath);
   await expect(page.getByTestId("status-bar")).toContainText("已打开旧版项目");
-  await page.getByLabel("导出 XML").click();
-  await expect(page.getByTestId("status-bar")).toContainText("导出前检查未通过：片段引用了缺失资源");
+  await page.getByTestId("workspace-nav-export").click();
+  await page.getByRole("button", { name: "预览并导出单个 XML" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText(
+    "导出前检查未通过：片段引用了缺失资源"
+  );
   await expect(page.getByTestId("export-dialog")).toHaveCount(0);
-  await page.getByRole("button", { name: "导出检查" }).click();
   await expect(page.getByTestId("project-health-panel")).toContainText("需要处理");
-  await expect(page.getByTestId("project-health-panel")).toContainText("有时间轴片段找不到原来的 XML");
+  await expect(page.getByTestId("project-health-panel")).toContainText(
+    "有时间轴片段找不到原来的 XML"
+  );
   await expect(page.getByTestId("project-health-panel")).toContainText("part-1 时间轴片段");
-  await expect(page.getByTestId("project-health-panel")).toContainText("缺失资源 ID：missing-asset");
+  await expect(page.getByTestId("project-health-panel")).toContainText(
+    "缺失资源 ID：missing-asset"
+  );
   await page.getByRole("button", { name: "移除缺失片段" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已清理 1 个缺失资源片段");
-  await expect(page.getByTestId("project-health-panel")).not.toContainText("有时间轴片段找不到原来的 XML");
-  await page.getByLabel("导出 XML").click();
+  await expect(page.getByTestId("project-health-panel")).not.toContainText(
+    "有时间轴片段找不到原来的 XML"
+  );
+  await page.getByRole("button", { name: "预览并导出单个 XML" }).click();
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
 });
 
 test("导出前检查和导出摘要会展示负时间风险", async ({ page }) => {
   await page.goto("/");
 
-  await page.getByTestId("xml-input").setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
+  await page
+    .getByTestId("xml-input")
+    .setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
   await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
-  await page.getByTestId("asset-card").getByRole("button", { name: "放入时间轴", exact: true }).click();
+  await page.getByTestId("workspace-nav-editing").click();
+  await page
+    .getByTestId("asset-card")
+    .getByRole("button", { name: "放入时间轴", exact: true })
+    .click();
   await page.getByLabel("设置").click();
   await page.getByLabel("全局偏移").fill("-2000");
   await page.getByLabel("关闭设置").click();
 
-  await page.getByRole("button", { name: "导出检查" }).click();
+  await page.getByTestId("workspace-nav-export").click();
   const projectHealthPanel = page.getByTestId("project-health-panel");
   await expect(projectHealthPanel).toContainText("有弹幕会被挤到 0 秒");
   await expect(projectHealthPanel).toContainText("第一条滚动弹幕");
@@ -341,13 +409,17 @@ test("导出前检查和导出摘要会展示负时间风险", async ({ page }) 
   await expect(projectHealthPanel).toContainText("-00:00:02.000");
   await expect(projectHealthPanel).toContainText("-00:00:00.250");
 
-  await page.getByLabel("导出 XML").click();
+  await page.getByRole("button", { name: "预览并导出单个 XML" }).click();
   const exportDialog = page.getByTestId("export-dialog");
   await expect(exportDialog).toContainText("导出前检查");
   await expect(exportDialog).toContainText("建议检查");
   await expect(exportDialog).toContainText("有弹幕会被挤到 0 秒");
-  await expect(exportDialog).toContainText("normal.xml / normal / 第 1 条：-00:00:02.000，第一条滚动弹幕");
-  await expect(exportDialog).toContainText("normal.xml / normal / 第 2 条：-00:00:00.250，顶部弹幕");
+  await expect(exportDialog).toContainText(
+    "normal.xml / normal / 第 1 条：-00:00:02.000，第一条滚动弹幕"
+  );
+  await expect(exportDialog).toContainText(
+    "normal.xml / normal / 第 2 条：-00:00:00.250，顶部弹幕"
+  );
   await expect(exportDialog).toContainText("负时间限制为 0");
   await expect(exportDialog).toContainText("2 项");
   await expect(exportDialog).toContainText("负时间限制明细");
@@ -359,7 +431,10 @@ test("导出前检查和导出摘要会展示负时间风险", async ({ page }) 
   const exportHealthReportDownloadPromise = page.waitForEvent("download");
   await exportDialog.getByRole("button", { name: "下载检查报告" }).click();
   const exportHealthReportDownload = await exportHealthReportDownloadPromise;
-  const exportHealthReportPath = resolve(downloadDir, exportHealthReportDownload.suggestedFilename());
+  const exportHealthReportPath = resolve(
+    downloadDir,
+    exportHealthReportDownload.suggestedFilename()
+  );
   await exportHealthReportDownload.saveAs(exportHealthReportPath);
   const exportHealthReportText = readFileSync(exportHealthReportPath, "utf8");
   expect(exportHealthReportText).toContain("导出前检查报告");
@@ -401,10 +476,13 @@ interface ToolbarBox {
 async function expectTimelineToolbarLayout(page: Page): Promise<void> {
   const boxes: ToolbarBox[] = await page.getByTestId("timeline-toolbar").evaluate((toolbar) => {
     const toolbarRect = toolbar.getBoundingClientRect();
-    return Array.from(toolbar.querySelectorAll<HTMLElement>("button, [data-toolbar-chip='true']")).map((element) => {
+    return Array.from(
+      toolbar.querySelectorAll<HTMLElement>("button, [data-toolbar-chip='true']")
+    ).map((element) => {
       const rect = element.getBoundingClientRect();
       return {
-        label: element.textContent?.trim() || element.getAttribute("aria-label") || "toolbar item",
+        label:
+          element.textContent?.trim() || element.getAttribute("aria-label") || "toolbar item",
         left: rect.left,
         right: rect.right,
         top: rect.top,
@@ -427,8 +505,10 @@ async function expectTimelineToolbarLayout(page: Page): Promise<void> {
     for (let secondIndex = firstIndex + 1; secondIndex < boxes.length; secondIndex += 1) {
       const first = boxes[firstIndex];
       const second = boxes[secondIndex];
-      const horizontalOverlap = Math.min(first.right, second.right) - Math.max(first.left, second.left);
-      const verticalOverlap = Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top);
+      const horizontalOverlap =
+        Math.min(first.right, second.right) - Math.max(first.left, second.left);
+      const verticalOverlap =
+        Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top);
       expect(
         Math.min(horizontalOverlap, verticalOverlap),
         `${first.label} overlaps ${second.label}`

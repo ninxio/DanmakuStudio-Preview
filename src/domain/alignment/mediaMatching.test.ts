@@ -1,0 +1,621 @@
+import { describe, expect, it } from "vitest";
+import type { AlignmentProposal } from "./types";
+import { createEmptyProject } from "../project/factory";
+import { createDanmakuSourceBinding } from "../project/mediaLibrary";
+import { createDanmakuSourceSegment } from "../project/sourceTimeline";
+import { validateProjectSchema } from "../project/schema";
+import type { EditorProject, ProjectMediaReference, ProjectMediaRole } from "../project/types";
+import { projectDanmakuToTargets } from "../timeline/sourceProjection";
+import {
+  acceptMediaMatchCandidate,
+  createAppliedSegmentId,
+  createMediaMatchCandidate,
+  reconcileMediaMatchCandidates,
+  rejectMediaMatchCandidate,
+  revokeMediaMatchCandidateAcceptance,
+  updateMediaMatchCandidateRange
+} from "./mediaMatching";
+
+const TIMESTAMP = "2026-07-11T00:00:00.000Z";
+
+describe("media matching candidates", () => {
+  it("从带 matchRange 的提案创建候选，并为提案与规则 ID 加候选命名空间", () => {
+    const project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 0,
+      targetEndMs: 65_000
+    });
+
+    const candidate = createMediaMatchCandidate(
+      project,
+      {
+        id: "candidate-1",
+        batchId: "batch-1",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal
+      },
+      TIMESTAMP
+    );
+
+    expect(candidate).toMatchObject({
+      id: "candidate-1",
+      batchId: "batch-1",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 0,
+      targetEndMs: 65_000,
+      confidence: 0.9,
+      state: "pending",
+      appliedSegmentIds: []
+    });
+    expect(candidate.proposal.anchors[0].id).toBe("candidate-1:anchor:0:anchor-shared");
+    expect(candidate.proposal.cutCandidates[0].id).toBe("candidate-1:cut:0:cut-shared");
+    expect(candidate.timingRules[0]).toMatchObject({
+      id: "candidate-1:rule:0:candidate-1:cut:0:cut-shared",
+      sourceAtMs: 40_000,
+      gapMs: 5_000
+    });
+    expect(proposal.anchors[0].id).toBe("anchor-shared");
+  });
+
+  it("没有绑定 XML 时把合法候选标记为 blocked，并严格拒绝角色与区间错误", () => {
+    const project = createMatchingProject();
+    project.danmakuSourceBindings = [];
+    const proposal = createProposal();
+    const blocked = createMediaMatchCandidate(project, {
+      id: "blocked",
+      batchId: "batch",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      proposal
+    });
+    expect(blocked.state).toBe("blocked");
+
+    expect(() =>
+      createMediaMatchCandidate(project, {
+        id: "wrong-role",
+        batchId: "batch",
+        sourceMediaId: "target-1",
+        targetMediaId: "source-1",
+        proposal
+      })
+    ).toThrow("来源必须是 B 站参考素材");
+
+    const outOfRange = createProposal({ sourceEndMs: 300_000, targetEndMs: 300_000 });
+    expect(() =>
+      createMediaMatchCandidate(project, {
+        id: "out-of-range",
+        batchId: "batch",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal: outOfRange
+      })
+    ).toThrow("超出素材已知时长");
+  });
+
+  it("更新待复核区间并拒绝候选，不改写已确认片段", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-1",
+      "source-1",
+      "target-1"
+    );
+    const updated = updateMediaMatchCandidateRange(
+      project,
+      "candidate-1",
+      { sourceStartMs: 5_000, targetEndMs: 75_000 },
+      "2026-07-11T00:01:00.000Z"
+    );
+    expect(updated.mediaMatchCandidates[0]).toMatchObject({
+      sourceStartMs: 5_000,
+      targetEndMs: 75_000,
+      state: "pending",
+      updatedAt: "2026-07-11T00:01:00.000Z"
+    });
+    expect(updated.mediaMatchCandidates[0].proposal.matchRange).toMatchObject({
+      sourceStartMs: 5_000,
+      targetEndMs: 75_000
+    });
+
+    const rejected = rejectMediaMatchCandidate(
+      updated,
+      "candidate-1",
+      "2026-07-11T00:02:00.000Z"
+    );
+    expect(rejected.mediaMatchCandidates[0]).toMatchObject({
+      state: "rejected",
+      appliedSegmentIds: []
+    });
+    expect(rejected.danmakuSourceSegments).toEqual([]);
+    expect(() => acceptMediaMatchCandidate(rejected, "candidate-1", ["asset-1"])).toThrow(
+      "已拒绝"
+    );
+  });
+
+  it("整体平移候选范围时同步平移 proposal 锚点、差异坐标和段内规则", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-shift",
+      "source-1",
+      "target-1"
+    );
+
+    const updated = updateMediaMatchCandidateRange(project, "candidate-shift", {
+      sourceStartMs: 20_000,
+      sourceEndMs: 80_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    const candidate = updated.mediaMatchCandidates[0];
+
+    expect(candidate.proposal.matchRange).toMatchObject({
+      sourceStartMs: 20_000,
+      sourceEndMs: 80_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    expect(candidate.proposal.anchors[0]).toMatchObject({ sourceMs: 25_000, targetMs: 35_000 });
+    expect(candidate.proposal.cutCandidates[0]).toMatchObject({
+      sourceAtMs: 50_000,
+      sourceRangeStartMs: 49_000,
+      sourceRangeEndMs: 51_000
+    });
+    expect(candidate.timingRules[0].sourceAtMs).toBe(50_000);
+  });
+
+  it("只调整范围边界时保留范围内证据，并排除被裁出的旧证据", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-trim",
+      "source-1",
+      "target-1"
+    );
+    const expanded = updateMediaMatchCandidateRange(project, "candidate-trim", {
+      sourceStartMs: 5_000
+    });
+
+    expect(expanded.mediaMatchCandidates[0].proposal.anchors[0].sourceMs).toBe(15_000);
+    expect(expanded.mediaMatchCandidates[0].timingRules[0].sourceAtMs).toBe(40_000);
+    const trimmed = updateMediaMatchCandidateRange(expanded, "candidate-trim", {
+      sourceStartMs: 16_000,
+      sourceEndMs: 39_000
+    });
+    expect(trimmed.mediaMatchCandidates[0].proposal.anchors).toHaveLength(0);
+    expect(trimmed.mediaMatchCandidates[0].proposal.cutCandidates).toHaveLength(0);
+    expect(trimmed.mediaMatchCandidates[0].timingRules).toHaveLength(0);
+    expect(trimmed.mediaMatchCandidates[0].proposal.diagnostics).toContain(
+      "人工调整范围后排除了 2 条范围外匹配证据。"
+    );
+  });
+
+  it("一条参考素材可接受为多个目标原片的独立来源段（1→N）", () => {
+    let project = createMatchingProject();
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-target-1",
+        batchId: "batch",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal: createProposal({
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetStartMs: 0,
+          targetEndMs: 65_000
+        })
+      }),
+      createMediaMatchCandidate(project, {
+        id: "candidate-target-2",
+        batchId: "batch",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-2",
+        proposal: createProposal({
+          sourceStartMs: 70_000,
+          sourceEndMs: 130_000,
+          targetStartMs: 0,
+          targetEndMs: 65_000
+        })
+      })
+    ];
+
+    project = acceptMediaMatchCandidate(project, "candidate-target-1", ["asset-1"]);
+    project = acceptMediaMatchCandidate(project, "candidate-target-2", ["asset-1"]);
+
+    expect(project.danmakuSourceSegments).toHaveLength(2);
+    expect(project.danmakuSourceSegments.map((segment) => segment.targetMediaId)).toEqual([
+      "target-1",
+      "target-2"
+    ]);
+    expect(project.mediaMatchCandidates.map((candidate) => candidate.state)).toEqual([
+      "accepted",
+      "accepted"
+    ]);
+  });
+
+  it("多条参考素材可分别落到同一目标原片，并只接受各自绑定的 XML（N→1）", () => {
+    let project = createMatchingProject();
+    project.mediaLibrary.push(createMedia("source-2", "bilibiliReference"));
+    project.assets.push(createAsset("asset-2", "source-2.xml"));
+    project.danmakuSourceBindings.push(
+      createDanmakuSourceBinding("binding-2", "asset-2", "source-2", TIMESTAMP)
+    );
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-source-1",
+        batchId: "batch",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal: createProposal({ targetStartMs: 0, targetEndMs: 65_000 })
+      }),
+      createMediaMatchCandidate(project, {
+        id: "candidate-source-2",
+        batchId: "batch",
+        sourceMediaId: "source-2",
+        targetMediaId: "target-1",
+        proposal: createProposal({ targetStartMs: 80_000, targetEndMs: 145_000 })
+      })
+    ];
+
+    project = acceptMediaMatchCandidate(project, "candidate-source-1", ["asset-1"]);
+    expect(() => acceptMediaMatchCandidate(project, "candidate-source-2", ["asset-1"])).toThrow(
+      "不一致"
+    );
+    project = acceptMediaMatchCandidate(project, "candidate-source-2", ["asset-2"]);
+
+    expect(project.danmakuSourceSegments).toHaveLength(2);
+    expect(project.danmakuSourceSegments.map((segment) => segment.sourceMediaId)).toEqual([
+      "source-1",
+      "source-2"
+    ]);
+    expect(project.danmakuSourceSegments.map((segment) => segment.targetMediaId)).toEqual([
+      "target-1",
+      "target-1"
+    ]);
+    expect(project.danmakuSourceSegments[1].targetStartMs).toBe(80_000);
+  });
+
+  it("已有同素材对重叠来源段时拒绝重复确认，避免同一 XML 重复投影", () => {
+    let project = withCandidate(
+      createMatchingProject(),
+      "candidate-first",
+      "source-1",
+      "target-1"
+    );
+    project = acceptMediaMatchCandidate(project, "candidate-first", ["asset-1"]);
+    project.mediaMatchCandidates.push(
+      createMediaMatchCandidate(project, {
+        id: "candidate-duplicate",
+        batchId: "batch-duplicate",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal: createProposal()
+      })
+    );
+
+    expect(() =>
+      acceptMediaMatchCandidate(project, "candidate-duplicate", ["asset-1"])
+    ).toThrow("不能重复确认");
+    expect(project.danmakuSourceSegments).toHaveLength(1);
+  });
+
+  it("候选范围与同一 XML 的忽略段重叠时拒绝确认", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-ignored",
+      "source-1",
+      "target-1"
+    );
+    project.danmakuSourceSegments = [
+      createDanmakuSourceSegment("ignored-range", {
+        label: "已确认片头忽略范围",
+        kind: "ignored",
+        assetId: "asset-1",
+        sourceMediaId: "source-1",
+        sourceStartMs: 0,
+        sourceEndMs: 20_000,
+        targetMediaId: null,
+        episodeKey: null,
+        episodeLabel: null
+      })
+    ];
+
+    expect(() => acceptMediaMatchCandidate(project, "candidate-ignored", ["asset-1"])).toThrow(
+      "与当前候选范围冲突"
+    );
+    expect(project.danmakuSourceSegments).toHaveLength(1);
+  });
+
+  it("重复接受候选保持幂等，且不写入全局 anchors/cutMarkers", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-1",
+      "source-1",
+      "target-1"
+    );
+    project.syncAnchors = [
+      { id: "existing-anchor", sourceMs: 1_000, targetMs: 2_000, origin: "manual" }
+    ];
+    project.cutMarkers = [
+      { id: "existing-cut", name: "已有差异", sourceAtMs: 1_000, targetGapMs: 500, note: "" }
+    ];
+
+    const accepted = acceptMediaMatchCandidate(project, "candidate-1", ["asset-1"], TIMESTAMP);
+    const acceptedAgain = acceptMediaMatchCandidate(
+      accepted,
+      "candidate-1",
+      ["asset-1"],
+      "2026-07-11T01:00:00.000Z"
+    );
+
+    expect(acceptedAgain.danmakuSourceSegments).toHaveLength(1);
+    expect(acceptedAgain.mediaMatchCandidates[0].appliedSegmentIds).toEqual([
+      createAppliedSegmentId("candidate-1", "asset-1")
+    ]);
+    expect(acceptedAgain.syncAnchors).toEqual(project.syncAnchors);
+    expect(acceptedAgain.cutMarkers).toEqual(project.cutMarkers);
+  });
+
+  it("撤销确认会删除候选生成的来源段并恢复待复核，且可重新接受", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-revoke",
+      "source-1",
+      "target-1"
+    );
+    const accepted = acceptMediaMatchCandidate(
+      project,
+      "candidate-revoke",
+      ["asset-1"],
+      TIMESTAMP
+    );
+
+    const revoked = revokeMediaMatchCandidateAcceptance(
+      accepted,
+      "candidate-revoke",
+      "2026-07-11T00:03:00.000Z"
+    );
+    expect(revoked.danmakuSourceSegments).toEqual([]);
+    expect(revoked.mediaMatchCandidates[0]).toMatchObject({
+      state: "pending",
+      appliedSegmentIds: [],
+      updatedAt: "2026-07-11T00:03:00.000Z"
+    });
+
+    const acceptedAgain = acceptMediaMatchCandidate(revoked, "candidate-revoke", ["asset-1"]);
+    expect(acceptedAgain.mediaMatchCandidates[0].state).toBe("accepted");
+    expect(acceptedAgain.danmakuSourceSegments).toHaveLength(1);
+  });
+
+  it("来源段、XML 或媒体删除后清理候选的已应用引用与状态", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-cleanup",
+      "source-1",
+      "target-1"
+    );
+    const accepted = acceptMediaMatchCandidate(
+      project,
+      "candidate-cleanup",
+      ["asset-1"],
+      TIMESTAMP
+    );
+    const withoutSegment = reconcileMediaMatchCandidates({
+      ...accepted,
+      danmakuSourceSegments: []
+    });
+    expect(withoutSegment.mediaMatchCandidates[0]).toMatchObject({
+      state: "pending",
+      appliedSegmentIds: []
+    });
+
+    const withoutAsset = reconcileMediaMatchCandidates({
+      ...accepted,
+      assets: [],
+      danmakuSourceBindings: []
+    });
+    expect(withoutAsset.mediaMatchCandidates[0]).toMatchObject({
+      state: "blocked",
+      appliedSegmentIds: []
+    });
+
+    const withoutTarget = reconcileMediaMatchCandidates({
+      ...accepted,
+      mediaLibrary: accepted.mediaLibrary.filter((media) => media.id !== "target-1")
+    });
+    expect(withoutTarget.mediaMatchCandidates).toEqual([]);
+    expect(validateProjectSchema(withoutSegment).ok).toBe(true);
+    expect(validateProjectSchema(withoutAsset).ok).toBe(true);
+    expect(validateProjectSchema(withoutTarget).ok).toBe(true);
+  });
+
+  it("接受候选后，targetStartMs 与 timingRules 会共同驱动最终弹幕投影时间", () => {
+    let project = createMatchingProject();
+    project.assets[0].items = [
+      createDanmakuItem("asset-1", 0, 20_000),
+      createDanmakuItem("asset-1", 1, 50_000)
+    ];
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-projection",
+        batchId: "batch-projection",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal: createProposal({
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetStartMs: 30_000,
+          targetEndMs: 95_000
+        })
+      })
+    ];
+
+    project = acceptMediaMatchCandidate(
+      project,
+      "candidate-projection",
+      ["asset-1"],
+      TIMESTAMP
+    );
+    const appliedSegment = project.danmakuSourceSegments[0];
+    expect(appliedSegment).toMatchObject({
+      targetStartMs: 30_000,
+      timingRules: [{ sourceAtMs: 40_000, gapMs: 5_000 }]
+    });
+
+    const projection = projectDanmakuToTargets(project);
+    const targetGroup = projection.groups.find((group) => group.targetMediaId === "target-1");
+
+    // 20s - 10s + 30s = 40s；50s - 10s + 30s + 5s（版本差异）= 75s。
+    expect(targetGroup?.entries.map((entry) => entry.finalTimeMs)).toEqual([40_000, 75_000]);
+    expect(targetGroup?.appliedRules).toMatchObject([
+      { sourceAtMs: 40_000, gapMs: 5_000, affectedCount: 1 }
+    ]);
+  });
+});
+
+function withCandidate(
+  project: EditorProject,
+  id: string,
+  sourceMediaId: string,
+  targetMediaId: string
+): EditorProject {
+  return {
+    ...project,
+    mediaMatchCandidates: [
+      createMediaMatchCandidate(project, {
+        id,
+        batchId: "batch",
+        sourceMediaId,
+        targetMediaId,
+        proposal: createProposal()
+      })
+    ]
+  };
+}
+
+function createMatchingProject(): EditorProject {
+  const project = createEmptyProject("媒体匹配测试");
+  project.mediaLibrary = [
+    createMedia("source-1", "bilibiliReference"),
+    createMedia("target-1", "targetOriginal", {
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集"
+    }),
+    createMedia("target-2", "targetOriginal", { episodeKey: "S01E02", episodeLabel: "第 2 集" })
+  ];
+  project.assets = [createAsset("asset-1", "source-1.xml")];
+  project.danmakuSourceBindings = [
+    createDanmakuSourceBinding("binding-1", "asset-1", "source-1", TIMESTAMP)
+  ];
+  return project;
+}
+
+function createProposal(
+  overrides: Partial<NonNullable<AlignmentProposal["matchRange"]>> = {}
+): AlignmentProposal {
+  const matchRange = {
+    sourceStartMs: 10_000,
+    sourceEndMs: 70_000,
+    targetStartMs: 0,
+    targetEndMs: 65_000,
+    coverage: 0.95,
+    ...overrides
+  };
+  const sourceAnchorMs = matchRange.sourceStartMs + 5_000;
+  const targetAnchorMs = matchRange.targetStartMs + 5_000;
+  const cutSourceMs = matchRange.sourceStartMs + 30_000;
+  return {
+    anchors: [
+      {
+        id: "anchor-shared",
+        sourceMs: sourceAnchorMs,
+        targetMs: targetAnchorMs,
+        confidence: 0.92,
+        origin: "automatic"
+      }
+    ],
+    cutCandidates: [
+      {
+        id: "cut-shared",
+        name: "删减候选",
+        sourceAtMs: cutSourceMs,
+        sourceRangeStartMs: cutSourceMs - 1_000,
+        sourceRangeEndMs: cutSourceMs + 1_000,
+        targetGapMs: 5_000,
+        confidence: 0.88,
+        note: "音频持续阶跃"
+      }
+    ],
+    confidence: 0.9,
+    diagnostics: ["匹配测试"],
+    matchRange
+  };
+}
+
+function createMedia(
+  id: string,
+  role: ProjectMediaRole,
+  overrides: Partial<ProjectMediaReference> = {}
+): ProjectMediaReference {
+  return {
+    id,
+    role,
+    name: id,
+    fileName: `${id}.mkv`,
+    objectUrl: null,
+    durationMs: 200_000,
+    referenceKind: "localPath",
+    connectionState: "connected",
+    sourceSummary: "本地文件",
+    localPath: `D:\\media\\${id}.mkv`,
+    emby: null,
+    episodeKey: null,
+    episodeLabel: null,
+    createdAt: TIMESTAMP,
+    updatedAt: TIMESTAMP,
+    ...overrides
+  };
+}
+
+function createAsset(id: string, fileName: string) {
+  return {
+    id,
+    name: id,
+    fileName,
+    color: "#ffffff",
+    items: [],
+    warnings: [],
+    importedAt: TIMESTAMP
+  };
+}
+
+function createDanmakuItem(assetId: string, index: number, sourceTimeMs: number) {
+  return {
+    id: `${assetId}-item-${index}`,
+    assetId,
+    originalIndex: index,
+    sourceTimeMs,
+    mode: 1,
+    fontSize: 25,
+    color: 16_777_215,
+    timestamp: 0,
+    pool: 0,
+    userHash: "hash",
+    rowId: String(index),
+    text: `弹幕 ${index}`,
+    rawPFields: [
+      String(sourceTimeMs / 1_000),
+      "1",
+      "25",
+      "16777215",
+      "0",
+      "0",
+      "hash",
+      String(index)
+    ],
+    enabled: true
+  };
+}

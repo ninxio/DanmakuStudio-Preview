@@ -25,8 +25,11 @@ export interface ProjectParseResult {
   migration: ProjectSchemaMigration | null;
 }
 
-type LegacyEditorProject = Omit<EditorProject, "mediaLibrary" | "danmakuSourceBindings"> &
-  Partial<Pick<EditorProject, "mediaLibrary" | "danmakuSourceBindings">>;
+type LegacyEditorProject = Omit<
+  EditorProject,
+  "mediaLibrary" | "danmakuSourceBindings" | "mediaMatchCandidates"
+> &
+  Partial<Pick<EditorProject, "mediaLibrary" | "danmakuSourceBindings" | "mediaMatchCandidates">>;
 
 interface MediaSchemaMigrationResult {
   mediaLibrary: ProjectMediaReference[];
@@ -61,6 +64,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     (version >= 5 && !isSeasonEpisodeBindings(value.seasonEpisodeBindings)) ||
     (version >= 7 && !isDanmakuSourceBindings(value.danmakuSourceBindings)) ||
     (version >= 6 && !isDanmakuSourceSegments(value.danmakuSourceSegments, version)) ||
+    (version >= 9 && !isMediaMatchCandidates(value.mediaMatchCandidates)) ||
     !Array.isArray(value.assets) ||
     !Array.isArray(value.clips) ||
     !isIntegerMilliseconds(value.globalOffsetMs) ||
@@ -150,6 +154,10 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
       danmakuSourceSegments:
         parsedVersion >= 6
           ? migrateLegacyDanmakuSourceSegments(project.danmakuSourceSegments, mediaMigration, parsedVersion)
+          : [],
+      mediaMatchCandidates:
+        parsedVersion >= 9 && legacyProject.mediaMatchCandidates
+          ? legacyProject.mediaMatchCandidates
           : []
     },
     migration: {
@@ -502,6 +510,59 @@ function isSegmentTimingRule(value: unknown): boolean {
   );
 }
 
+function isMediaMatchCandidates(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isMediaMatchCandidate);
+}
+
+function isMediaMatchCandidate(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.batchId !== "string" ||
+    typeof value.sourceMediaId !== "string" ||
+    typeof value.targetMediaId !== "string" ||
+    !isNonNegativeIntegerMilliseconds(value.sourceStartMs) ||
+    !isNonNegativeIntegerMilliseconds(value.sourceEndMs) ||
+    value.sourceEndMs <= value.sourceStartMs ||
+    !isNonNegativeIntegerMilliseconds(value.targetStartMs) ||
+    !isNonNegativeIntegerMilliseconds(value.targetEndMs) ||
+    value.targetEndMs <= value.targetStartMs ||
+    !Array.isArray(value.timingRules) ||
+    !value.timingRules.every(isSegmentTimingRule) ||
+    !isUnitNumber(value.confidence) ||
+    !isAlignmentProposal(value.proposal) ||
+    !isRecord(value.proposal) ||
+    !isRecord(value.proposal.matchRange) ||
+    value.proposal.matchRange.sourceStartMs !== value.sourceStartMs ||
+    value.proposal.matchRange.sourceEndMs !== value.sourceEndMs ||
+    value.proposal.matchRange.targetStartMs !== value.targetStartMs ||
+    value.proposal.matchRange.targetEndMs !== value.targetEndMs ||
+    (value.state !== "pending" &&
+      value.state !== "accepted" &&
+      value.state !== "rejected" &&
+      value.state !== "blocked") ||
+    !isStringArray(value.appliedSegmentIds) ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    return false;
+  }
+  const sourceStartMs = value.sourceStartMs;
+  const sourceEndMs = value.sourceEndMs;
+  const timingRulesInRange = value.timingRules.every(
+    (rule) =>
+      isRecord(rule) &&
+      typeof rule.sourceAtMs === "number" &&
+      rule.sourceAtMs >= sourceStartMs &&
+      rule.sourceAtMs < sourceEndMs
+  );
+  const appliedSegmentIds = value.appliedSegmentIds;
+  if (!timingRulesInRange || new Set(appliedSegmentIds).size !== appliedSegmentIds.length) {
+    return false;
+  }
+  return value.state === "accepted" ? appliedSegmentIds.length > 0 : appliedSegmentIds.length === 0;
+}
+
 function isDanmakuAsset(value: unknown): boolean {
   return (
     isRecord(value) &&
@@ -588,9 +649,10 @@ function isSyncAnchor(value: unknown): boolean {
 }
 
 function isAlignmentProposalOrNull(value: unknown): boolean {
-  if (value === null) {
-    return true;
-  }
+  return value === null || isAlignmentProposal(value);
+}
+
+function isAlignmentProposal(value: unknown): boolean {
   return (
     isRecord(value) &&
     Array.isArray(value.anchors) &&
@@ -600,7 +662,21 @@ function isAlignmentProposalOrNull(value: unknown): boolean {
     isUnitNumber(value.confidence) &&
     Array.isArray(value.diagnostics) &&
     value.diagnostics.every((diagnostic) => typeof diagnostic === "string") &&
-    (value.evidence === undefined || isAlignmentEvidence(value.evidence))
+    (value.evidence === undefined || isAlignmentEvidence(value.evidence)) &&
+    (value.matchRange === undefined || isAlignmentMatchRange(value.matchRange))
+  );
+}
+
+function isAlignmentMatchRange(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    isNonNegativeIntegerMilliseconds(value.sourceStartMs) &&
+    isNonNegativeIntegerMilliseconds(value.sourceEndMs) &&
+    value.sourceEndMs > value.sourceStartMs &&
+    isNonNegativeIntegerMilliseconds(value.targetStartMs) &&
+    isNonNegativeIntegerMilliseconds(value.targetEndMs) &&
+    value.targetEndMs > value.targetStartMs &&
+    isUnitNumber(value.coverage)
   );
 }
 
@@ -675,7 +751,7 @@ function isPreviewSettings(value: unknown): boolean {
   );
 }
 
-function isStringArray(value: unknown): boolean {
+function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 

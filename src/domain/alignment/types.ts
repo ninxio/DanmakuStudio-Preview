@@ -57,12 +57,21 @@ export interface AlignmentEvidenceSummary {
   signals?: AlignmentEvidenceSignalSummary[];
 }
 
+export interface AlignmentMatchRange {
+  sourceStartMs: number;
+  sourceEndMs: number;
+  targetStartMs: number;
+  targetEndMs: number;
+  coverage: number;
+}
+
 export interface AlignmentProposal {
   anchors: SyncAnchor[];
   cutCandidates: CutCandidate[];
   confidence: number;
   diagnostics: string[];
   evidence?: AlignmentEvidenceSummary;
+  matchRange?: AlignmentMatchRange;
 }
 
 export interface AlignmentProvider {

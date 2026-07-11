@@ -12,3 +12,10 @@ artifacts/*.err
 artifacts/*.log
 playwright-report
 test-results
+
+# AI assistant local context / planning docs
+AGENTS.md
+agents.md
+docs/player-goal.md
+.agents/
+.codex/

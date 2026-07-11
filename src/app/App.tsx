@@ -1,4 +1,5 @@
 import { Panel } from "../components/Panel";
+import { TextButton } from "../components/TextButton";
 import { AssetPanel } from "../features/assets/AssetPanel";
 import { EditorToolbar } from "../features/editor/EditorToolbar";
 import { KeyboardShortcuts } from "../features/editor/KeyboardShortcuts";
@@ -6,8 +7,14 @@ import { ExportDialog } from "../features/export/ExportDialog";
 import { InspectorPanel } from "../features/inspector/InspectorPanel";
 import { PreviewPanel } from "../features/preview/PreviewPanel";
 import { TimelinePanel } from "../features/timeline/TimelinePanel";
-import { formatExportFileError, openExportDirectoryPath } from "../infrastructure/file-system/exportFiles";
-import { formatDesktopSettingsError, hydrateDesktopAppSettings } from "../infrastructure/settings/desktopAppSettings";
+import {
+  formatExportFileError,
+  openExportDirectoryPath
+} from "../infrastructure/file-system/exportFiles";
+import {
+  formatDesktopSettingsError,
+  hydrateDesktopAppSettings
+} from "../infrastructure/settings/desktopAppSettings";
 import { useEditorStore } from "../stores/editorStore";
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
@@ -24,6 +31,8 @@ const RESIZE_STEP = 24;
 
 export function App() {
   const status = useEditorStore((state) => state.status);
+  const workspacePage = useEditorStore((state) => state.workspacePage);
+  const setWorkspacePage = useEditorStore((state) => state.setWorkspacePage);
   const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
   const importMediaFiles = useEditorStore((state) => state.importMediaFiles);
   const workspaceRef = useRef<HTMLElement | null>(null);
@@ -33,6 +42,7 @@ export function App() {
   const [rightPanelWidth, setRightPanelWidth] = useState(300);
   const [timelineHeight, setTimelineHeight] = useState(320);
   const [dragActive, setDragActive] = useState(false);
+  const [pendingDroppedVideos, setPendingDroppedVideos] = useState<File[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -61,15 +71,25 @@ export function App() {
       }
       const bounds = workspace.getBoundingClientRect();
       if (target === "left") {
-        setLeftPanelWidth(clampNumber(event.clientX - bounds.left, LEFT_PANEL_MIN, LEFT_PANEL_MAX));
+        setLeftPanelWidth(
+          clampNumber(event.clientX - bounds.left, LEFT_PANEL_MIN, LEFT_PANEL_MAX)
+        );
         return;
       }
       if (target === "right") {
-        setRightPanelWidth(clampNumber(bounds.right - event.clientX, RIGHT_PANEL_MIN, RIGHT_PANEL_MAX));
+        setRightPanelWidth(
+          clampNumber(bounds.right - event.clientX, RIGHT_PANEL_MIN, RIGHT_PANEL_MAX)
+        );
         return;
       }
       const availableHeight = bounds.height;
-      setTimelineHeight(clampNumber(bounds.bottom - event.clientY, TIMELINE_MIN, Math.min(TIMELINE_MAX, availableHeight - 260)));
+      setTimelineHeight(
+        clampNumber(
+          bounds.bottom - event.clientY,
+          TIMELINE_MIN,
+          Math.min(TIMELINE_MAX, availableHeight - 260)
+        )
+      );
     };
 
     const handlePointerUp = () => {
@@ -86,13 +106,14 @@ export function App() {
     };
   }, []);
 
-  const beginResize = (target: ResizeTarget) => (event: ReactPointerEvent<HTMLButtonElement>) => {
-    activeResizeRef.current = target;
-    document.body.style.cursor = target === "timeline" ? "row-resize" : "col-resize";
-    document.body.style.userSelect = "none";
-    event.currentTarget.setPointerCapture(event.pointerId);
-    event.preventDefault();
-  };
+  const beginResize =
+    (target: ResizeTarget) => (event: ReactPointerEvent<HTMLButtonElement>) => {
+      activeResizeRef.current = target;
+      document.body.style.cursor = target === "timeline" ? "row-resize" : "col-resize";
+      document.body.style.userSelect = "none";
+      event.currentTarget.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    };
 
   const runStatusAction = () => {
     if (status.action?.type !== "openDirectory") {
@@ -146,7 +167,13 @@ export function App() {
     const xmlFiles = files.filter(isXmlFile);
     const videoFiles = files.filter(isSupportedReferenceVideoFile);
     if (videoFiles.length > 0) {
-      importMediaFiles(videoFiles, "bilibiliReference");
+      setPendingDroppedVideos(videoFiles);
+      useEditorStore.setState({
+        status: {
+          message: `已收到 ${videoFiles.length} 个视频，请确认它们是原片素材还是 B 站参考素材。`,
+          tone: "neutral"
+        }
+      });
     }
     if (xmlFiles.length > 0) {
       void importXmlFiles(xmlFiles);
@@ -154,11 +181,13 @@ export function App() {
     if (videoFiles.length === 0 && xmlFiles.length === 0) {
       useEditorStore.setState({
         status: {
-          message: "拖放文件未导入：请拖入 Bilibili XML，或 MP4/WebM 参考视频。",
+          message: "拖放文件未导入：请拖入 Bilibili XML 或受支持的视频文件。",
           tone: "warning"
         }
       });
+      return;
     }
+    setWorkspacePage("materials");
   };
 
   return (
@@ -176,61 +205,144 @@ export function App() {
         <div className="pointer-events-none fixed inset-3 z-50 grid place-items-center rounded border-2 border-dashed border-accent-cyan bg-black/70 text-center text-sm text-slate-200 shadow-2xl">
           <div className="grid gap-2">
             <div className="text-base font-medium text-slate-100">拖放导入</div>
-            <div className="text-xs text-slate-400">支持 Bilibili XML 和 MP4/WebM 参考视频；目标原片请在“媒体 / 目标原片”中绑定。</div>
+            <div className="text-xs text-slate-400">
+              支持 Bilibili XML 和视频；视频放下后需要确认素材角色。
+            </div>
           </div>
         </div>
       ) : null}
-      <main
-        ref={workspaceRef}
-        className="grid min-h-0 flex-1 bg-panel-line"
-        style={{
-          gridTemplateColumns: `${leftPanelWidth}px 6px minmax(420px, 1fr) 6px ${rightPanelWidth}px`,
-          gridTemplateRows: `minmax(260px, 1fr) 6px ${timelineHeight}px`
-        }}
-      >
-        <Panel title="资源" className="row-span-3">
-          <AssetPanel />
-        </Panel>
-        <ResizeHandle
-          label="调整资源栏宽度"
-          orientation="vertical"
-          value={leftPanelWidth}
-          min={LEFT_PANEL_MIN}
-          max={LEFT_PANEL_MAX}
-          className="row-span-3"
-          onPointerDown={beginResize("left")}
-          onKeyboardStep={(delta) => setLeftPanelWidth((width) => clampNumber(width + delta, LEFT_PANEL_MIN, LEFT_PANEL_MAX))}
-        />
-        <Panel title="预览" className="min-h-0">
-          <PreviewPanel />
-        </Panel>
-        <ResizeHandle
-          label="调整检查器宽度"
-          orientation="vertical"
-          value={rightPanelWidth}
-          min={RIGHT_PANEL_MIN}
-          max={RIGHT_PANEL_MAX}
-          className="row-span-3"
-          onPointerDown={beginResize("right")}
-          onKeyboardStep={(delta) => setRightPanelWidth((width) => clampNumber(width - delta, RIGHT_PANEL_MIN, RIGHT_PANEL_MAX))}
-        />
-        <Panel title="检查器" className="row-span-3">
-          <InspectorPanel />
-        </Panel>
-        <ResizeHandle
-          label="调整时间轴高度"
-          orientation="horizontal"
-          value={timelineHeight}
-          min={TIMELINE_MIN}
-          max={TIMELINE_MAX}
-          className="col-start-3"
-          onPointerDown={beginResize("timeline")}
-          onKeyboardStep={(delta) => setTimelineHeight((height) => clampNumber(height - delta, TIMELINE_MIN, TIMELINE_MAX))}
-        />
-        <Panel className="min-h-0">
-          <TimelinePanel />
-        </Panel>
-      </main>
+      {pendingDroppedVideos.length > 0 ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="drop-role-title"
+        >
+          <div className="w-full max-w-md rounded border border-panel-line bg-[#171a20] p-4 shadow-2xl">
+            <h2 id="drop-role-title" className="text-base font-semibold text-slate-100">
+              确认视频角色
+            </h2>
+            <p className="mt-2 text-sm leading-6 text-slate-400">
+              共 {pendingDroppedVideos.length} 个视频。原片是最终观看的标准时间轴；B
+              站参考只用于确定弹幕原始时间和删减关系。
+            </p>
+            <p className="mt-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-xs leading-5 text-accent-yellow">
+              拖放视频会作为本次会话的临时引用。若要保存本地路径并运行自动匹配，请改用素材页的批量导入按钮。
+            </p>
+            <div className="mt-3 max-h-32 overflow-auto rounded border border-panel-line bg-black/20 p-2 text-xs text-slate-500">
+              {pendingDroppedVideos.map((file) => (
+                <div key={`${file.name}-${file.size}`}>{file.name}</div>
+              ))}
+            </div>
+            <div className="mt-4 flex flex-wrap justify-end gap-2">
+              <TextButton onClick={() => setPendingDroppedVideos([])}>取消</TextButton>
+              <TextButton
+                onClick={() => {
+                  importMediaFiles(pendingDroppedVideos, "bilibiliReference");
+                  setPendingDroppedVideos([]);
+                }}
+              >
+                作为 B 站参考导入
+              </TextButton>
+              <TextButton
+                tone="primary"
+                onClick={() => {
+                  importMediaFiles(pendingDroppedVideos, "targetOriginal");
+                  setPendingDroppedVideos([]);
+                }}
+              >
+                作为原片导入
+              </TextButton>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {workspacePage === "editing" ? (
+        <main
+          ref={workspaceRef}
+          className="grid min-h-0 flex-1 bg-panel-line"
+          data-testid="workspace-editing"
+          style={{
+            gridTemplateColumns: `${leftPanelWidth}px 6px minmax(420px, 1fr) 6px ${rightPanelWidth}px`,
+            gridTemplateRows: `minmax(260px, 1fr) 6px ${timelineHeight}px`
+          }}
+        >
+          <Panel title="编辑素材" className="row-span-3">
+            <AssetPanel section="editing" />
+          </Panel>
+          <ResizeHandle
+            label="调整资源栏宽度"
+            orientation="vertical"
+            value={leftPanelWidth}
+            min={LEFT_PANEL_MIN}
+            max={LEFT_PANEL_MAX}
+            className="row-span-3"
+            onPointerDown={beginResize("left")}
+            onKeyboardStep={(delta) =>
+              setLeftPanelWidth((width) =>
+                clampNumber(width + delta, LEFT_PANEL_MIN, LEFT_PANEL_MAX)
+              )
+            }
+          />
+          <Panel title="预览" className="min-h-0">
+            <PreviewPanel />
+          </Panel>
+          <ResizeHandle
+            label="调整检查器宽度"
+            orientation="vertical"
+            value={rightPanelWidth}
+            min={RIGHT_PANEL_MIN}
+            max={RIGHT_PANEL_MAX}
+            className="row-span-3"
+            onPointerDown={beginResize("right")}
+            onKeyboardStep={(delta) =>
+              setRightPanelWidth((width) =>
+                clampNumber(width - delta, RIGHT_PANEL_MIN, RIGHT_PANEL_MAX)
+              )
+            }
+          />
+          <Panel title="检查器" className="row-span-3">
+            <InspectorPanel />
+          </Panel>
+          <ResizeHandle
+            label="调整时间轴高度"
+            orientation="horizontal"
+            value={timelineHeight}
+            min={TIMELINE_MIN}
+            max={TIMELINE_MAX}
+            className="col-start-3"
+            onPointerDown={beginResize("timeline")}
+            onKeyboardStep={(delta) =>
+              setTimelineHeight((height) =>
+                clampNumber(height - delta, TIMELINE_MIN, TIMELINE_MAX)
+              )
+            }
+          />
+          <Panel className="min-h-0">
+            <TimelinePanel />
+          </Panel>
+        </main>
+      ) : (
+        <main
+          className="flex min-h-0 flex-1 justify-center overflow-hidden"
+          data-testid={`workspace-${workspacePage}`}
+        >
+          <div className="flex h-full w-full max-w-5xl min-h-0 flex-col px-4">
+            <Panel
+              title={
+                workspacePage === "materials"
+                  ? "素材：导入并关联原片、参考视频和弹幕 XML"
+                  : workspacePage === "matching"
+                    ? "匹配：确定参考视频与原片的对应关系"
+                    : "导出：按原片分集导出修正后的弹幕 XML"
+              }
+              className="min-h-0 flex-1"
+            >
+              <AssetPanel section={workspacePage} />
+            </Panel>
+          </div>
+        </main>
+      )}
       <footer
         className={`flex h-7 shrink-0 items-center border-t border-panel-line px-3 text-xs ${
           status.tone === "error"
@@ -328,9 +440,8 @@ function isXmlFile(file: File): boolean {
 function isSupportedReferenceVideoFile(file: File): boolean {
   const name = file.name.toLowerCase();
   return (
-    name.endsWith(".mp4") ||
-    name.endsWith(".webm") ||
-    file.type === "video/mp4" ||
-    file.type === "video/webm"
+    [".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".ts", ".m2ts"].some(
+      (extension) => name.endsWith(extension)
+    ) || file.type.startsWith("video/")
   );
 }

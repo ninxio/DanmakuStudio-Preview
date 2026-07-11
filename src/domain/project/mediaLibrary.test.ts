@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createMediaMatchCandidate } from "../alignment/mediaMatching";
 import type { DanmakuAsset } from "../danmaku/types";
 import { createEmptyProject } from "./factory";
 import {
@@ -162,6 +163,8 @@ describe("project media library", () => {
           sourceStartMs: 0,
           sourceEndMs: 60_000,
           targetMediaId: "target-media",
+          targetStartMs: null,
+          timingRules: [],
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "",
@@ -186,6 +189,59 @@ describe("project media library", () => {
     const removed = removeMediaReference(project, "loose-media");
     expect(removed.ok).toBe(true);
     expect(removed.project.mediaLibrary.map((media) => media.id)).toEqual(["source-media", "target-media"]);
+  });
+
+  it("删除仅被匹配候选引用的媒体时同步清理候选，真实 XML 绑定仍阻止误删", () => {
+    const baseProject = {
+      ...createEmptyProject(),
+      assets: [createAsset()],
+      mediaLibrary: [
+        createMediaReference("source-media", "bilibiliReference"),
+        createMediaReference("target-media", "targetOriginal")
+      ],
+      danmakuSourceBindings: [createDanmakuSourceBinding("xml-binding", "asset", "source-media", TIMESTAMP)]
+    };
+    const candidate = createMediaMatchCandidate(baseProject, {
+      id: "candidate",
+      batchId: "batch",
+      sourceMediaId: "source-media",
+      targetMediaId: "target-media",
+      proposal: {
+        anchors: [],
+        cutCandidates: [],
+        confidence: 0.9,
+        diagnostics: [],
+        matchRange: {
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetStartMs: 0,
+          targetEndMs: 60_000,
+          coverage: 1
+        }
+      }
+    });
+    const project = { ...baseProject, mediaMatchCandidates: [candidate] };
+
+    expect(collectMediaReferenceUsages(project, "source-media").map((usage) => usage.kind)).toEqual([
+      "xmlBinding",
+      "matchCandidateSource"
+    ]);
+    expect(collectMediaReferenceUsages(project, "target-media").map((usage) => usage.kind)).toEqual([
+      "matchCandidateTarget"
+    ]);
+    expect(removeMediaReference(project, "source-media").ok).toBe(false);
+    const removedTarget = removeMediaReference(project, "target-media");
+    expect(removedTarget.ok).toBe(true);
+    expect(removedTarget.project.mediaMatchCandidates).toEqual([]);
+    expect(removedTarget.project.mediaLibrary.map((media) => media.id)).toEqual(["source-media"]);
+
+    const rejectedProject = {
+      ...project,
+      mediaMatchCandidates: [{ ...candidate, state: "rejected" as const }]
+    };
+    const removedRejectedTarget = removeMediaReference(rejectedProject, "target-media");
+    expect(removedRejectedTarget.ok).toBe(true);
+    expect(removedRejectedTarget.project.mediaMatchCandidates).toEqual([]);
   });
 
   it("重新连接素材保留稳定 ID 和角色，只更新会话文件引用", () => {

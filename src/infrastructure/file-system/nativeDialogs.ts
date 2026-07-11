@@ -1,14 +1,30 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { open, type OpenDialogOptions } from "@tauri-apps/plugin-dialog";
+import type { ProjectMediaRole } from "../../domain/project/types";
 
 export type NativeOpenDialog = (options: OpenDialogOptions) => Promise<string | string[] | null>;
 
-const alignmentMediaFilters = [
+export const VIDEO_FILE_EXTENSIONS = ["mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "m2ts"];
+
+export const VIDEO_FILE_FILTERS = [
   {
     name: "视频文件",
-    extensions: ["mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "m2ts"]
+    extensions: VIDEO_FILE_EXTENSIONS
   }
 ];
+
+export async function pickMediaPaths(
+  role: ProjectMediaRole,
+  dialog: NativeOpenDialog = defaultNativeOpenDialog
+): Promise<string[]> {
+  return pickMultipleNativePaths(
+    {
+      title: role === "targetOriginal" ? "选择原片素材" : "选择 B 站参考素材",
+      filters: VIDEO_FILE_FILTERS
+    },
+    dialog
+  );
+}
 
 export async function pickAlignmentMediaPath(
   defaultPath = "",
@@ -17,7 +33,7 @@ export async function pickAlignmentMediaPath(
   return pickSingleNativePath(
     {
       title: "选择完整版或当前视频",
-      filters: alignmentMediaFilters,
+      filters: VIDEO_FILE_FILTERS,
       defaultPath: normalizeDefaultPath(defaultPath)
     },
     dialog
@@ -79,6 +95,21 @@ export async function pickSingleNativePath(
   return path && path.trim().length > 0 ? path : null;
 }
 
+export async function pickMultipleNativePaths(
+  options: OpenDialogOptions,
+  dialog: NativeOpenDialog = defaultNativeOpenDialog
+): Promise<string[]> {
+  if (dialog === defaultNativeOpenDialog && !isTauri()) {
+    throw new Error("原生文件选择器需要在 Tauri 桌面端运行。");
+  }
+  const selected = await dialog({
+    ...options,
+    multiple: true,
+    directory: false
+  });
+  return normalizeSelectedPaths(selected);
+}
+
 export async function pickSingleNativeDirectoryPath(
   options: OpenDialogOptions,
   dialog: NativeOpenDialog = defaultNativeOpenDialog
@@ -102,4 +133,20 @@ function defaultNativeOpenDialog(options: OpenDialogOptions): Promise<string | s
 function normalizeDefaultPath(path: string): string | undefined {
   const trimmed = path.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeSelectedPaths(selected: string | string[] | null): string[] {
+  const paths = selected === null ? [] : Array.isArray(selected) ? selected : [selected];
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  paths.forEach((path) => {
+    const trimmed = path.trim();
+    const key = trimmed.toLowerCase();
+    if (trimmed.length === 0 || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    normalized.push(trimmed);
+  });
+  return normalized;
 }

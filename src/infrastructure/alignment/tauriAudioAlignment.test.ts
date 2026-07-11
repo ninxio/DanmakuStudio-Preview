@@ -14,19 +14,36 @@ describe("Tauri 音频对齐调用", () => {
     const request: TauriAudioAlignmentRequest = {
       completePath: "full.mp4",
       sourcePath: "cut.mp4",
-      ffmpegPath: null
+      ffmpegPath: null,
+      localizationMode: true
     };
     const proposal = await runTauriAudioAlignment(request, (received) =>
       Promise.resolve({
         anchors: [{ id: "a", sourceMs: 1000, targetMs: 2000, origin: "automatic", confidence: 0.9 }],
         cutCandidates: [],
         confidence: received.completePath === "full.mp4" ? 1 : 0,
-        diagnostics: []
+        diagnostics: [],
+        matchRange: received.localizationMode
+          ? {
+              sourceStartMs: 500_000,
+              sourceEndMs: 620_000,
+              targetStartMs: 0,
+              targetEndMs: 120_000,
+              coverage: 1
+            }
+          : undefined
       })
     );
 
     expect(proposal.anchors).toHaveLength(1);
     expect(proposal.confidence).toBe(1);
+    expect(proposal.matchRange).toEqual({
+      sourceStartMs: 500_000,
+      sourceEndMs: 620_000,
+      targetStartMs: 0,
+      targetEndMs: 120_000,
+      coverage: 1
+    });
   });
 
   it("支持启动、查询和取消后台任务", async () => {

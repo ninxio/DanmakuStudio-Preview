@@ -79,10 +79,17 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   const issues: ProjectionIssue[] = [];
   const mediaById = new Map(project.mediaLibrary.map((media) => [media.id, media]));
   const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
+  const sourceBindingByAssetId = new Map(
+    project.danmakuSourceBindings.map((binding) => [binding.assetId, binding.sourceMediaId])
+  );
   const disabled = new Set(project.disabledItemIds);
 
-  const contentSegments = project.danmakuSourceSegments.filter((segment) => segment.kind === "content");
-  const ignoredSegments = project.danmakuSourceSegments.filter((segment) => segment.kind === "ignored");
+  const contentSegments = project.danmakuSourceSegments.filter(
+    (segment) => segment.kind === "content"
+  );
+  const ignoredSegments = project.danmakuSourceSegments.filter(
+    (segment) => segment.kind === "ignored"
+  );
 
   if (contentSegments.length === 0) {
     return {
@@ -100,13 +107,30 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       ignoredSegmentCount: ignoredSegments.length,
       projectedItemCount: 0,
       ignoredItemCount: 0,
-      unmappedItemCount: 0
+      unmappedItemCount: project.assets.reduce((count, asset) => count + asset.items.length, 0)
     };
   }
 
+  const overlappingSegmentIds = new Set<string>();
+  findOverlappingProjectionSegments([...contentSegments, ...ignoredSegments]).forEach(
+    ([left, right]) => {
+      overlappingSegmentIds.add(left.id);
+      overlappingSegmentIds.add(right.id);
+      issues.push({
+        id: `segment-overlap-${left.id}-${right.id}`,
+        severity: "error",
+        segmentId: right.id,
+        message: `${left.label} 与 ${right.label} 的来源范围冲突，继续投影会产生重复弹幕或覆盖已标记的忽略范围。`
+      });
+    }
+  );
+
   const usableSegments: DanmakuSourceSegment[] = [];
   for (const segment of contentSegments) {
-    const problem = findSegmentBlocker(segment, assetsById, mediaById);
+    if (overlappingSegmentIds.has(segment.id)) {
+      continue;
+    }
+    const problem = findSegmentBlocker(segment, assetsById, mediaById, sourceBindingByAssetId);
     if (problem) {
       issues.push({
         id: `segment-blocked-${segment.id}`,
@@ -117,6 +141,28 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       continue;
     }
     usableSegments.push(segment);
+  }
+
+  const usableIgnoredSegments: DanmakuSourceSegment[] = [];
+  for (const segment of ignoredSegments) {
+    const problem = findSourceSegmentBlocker(
+      segment,
+      assetsById,
+      mediaById,
+      sourceBindingByAssetId
+    );
+    if (problem) {
+      issues.push({
+        id: `ignored-segment-blocked-${segment.id}`,
+        severity: "error",
+        segmentId: segment.id,
+        message: problem
+      });
+      continue;
+    }
+    if (!overlappingSegmentIds.has(segment.id)) {
+      usableIgnoredSegments.push(segment);
+    }
   }
 
   const groupsByTarget = new Map<string, TargetProjectionGroup>();
@@ -132,12 +178,17 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     const group = ensureGroup(groupsByTarget, target);
     group.segments.push(segment);
 
-    const sortedRules = [...segment.timingRules].sort((left, right) => left.sourceAtMs - right.sourceAtMs);
+    const sortedRules = [...segment.timingRules].sort(
+      (left, right) => left.sourceAtMs - right.sourceAtMs
+    );
     const ruleHits = new Map<string, number>();
     let disabledCount = 0;
 
     for (const item of asset.items) {
-      if (item.sourceTimeMs < segment.sourceStartMs || item.sourceTimeMs >= segment.sourceEndMs) {
+      if (
+        item.sourceTimeMs < segment.sourceStartMs ||
+        item.sourceTimeMs >= segment.sourceEndMs
+      ) {
         continue;
       }
       if (!item.enabled || disabled.has(item.id)) {
@@ -147,7 +198,11 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       const gapMs = accumulateGap(sortedRules, item.sourceTimeMs, ruleHits);
       const adjustmentMs = project.itemTimeAdjustments[item.id] ?? 0;
       const finalTimeMs =
-        item.sourceTimeMs - segment.sourceStartMs + (segment.targetStartMs ?? 0) + gapMs + adjustmentMs;
+        item.sourceTimeMs -
+        segment.sourceStartMs +
+        (segment.targetStartMs ?? 0) +
+        gapMs +
+        adjustmentMs;
       group.entries.push({ item, finalTimeMs, segmentId: segment.id });
       projectedItemCount += 1;
     }
@@ -168,9 +223,12 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   }
 
   const groups = Array.from(groupsByTarget.values());
+  ensureUniqueExportFileNames(groups);
   for (const group of groups) {
     group.entries.sort(
-      (left, right) => left.finalTimeMs - right.finalTimeMs || left.item.originalIndex - right.item.originalIndex
+      (left, right) =>
+        left.finalTimeMs - right.finalTimeMs ||
+        left.item.originalIndex - right.item.originalIndex
     );
     if (group.entries.length === 0) {
       group.warnings.push(`${group.targetName} 的来源段内没有可导出的弹幕。`);
@@ -185,13 +243,32 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     if (negativeCount > 0) {
       group.warnings.push(`${negativeCount} 条弹幕投影后时间为负，导出时会被限制为 0。`);
     }
+    const targetDurationMs = mediaById.get(group.targetMediaId)?.durationMs ?? null;
+    if (targetDurationMs !== null) {
+      const overflowCount = group.entries.filter(
+        (entry) => entry.finalTimeMs > targetDurationMs
+      ).length;
+      if (overflowCount > 0) {
+        const message = `${group.targetName} 有 ${overflowCount} 条弹幕投影后超出原片时长，请复核来源范围或目标起点。`;
+        group.warnings.push(message);
+        issues.push({
+          id: `target-overflow-${group.targetMediaId}`,
+          severity: "warning",
+          segmentId: null,
+          message
+        });
+      }
+    }
   }
-  groups.sort((left, right) =>
-    compareGroupOrder(left, right)
-  );
+  groups.sort((left, right) => compareGroupOrder(left, right));
 
-  const ignoredItemCount = countItemsInSegments(ignoredSegments, assetsById);
-  const unmappedItemCount = countUnmappedItems(project, contentSegments, ignoredSegments, assetsById);
+  const ignoredItemCount = countItemsInSegments(usableIgnoredSegments, assetsById);
+  const unmappedItemCount = countUnmappedItems(
+    project,
+    usableSegments,
+    usableIgnoredSegments,
+    assetsById
+  );
   if (unmappedItemCount > 0) {
     issues.push({
       id: "unmapped-items",
@@ -220,22 +297,90 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   };
 }
 
+function findOverlappingProjectionSegments(
+  segments: readonly DanmakuSourceSegment[]
+): Array<[DanmakuSourceSegment, DanmakuSourceSegment]> {
+  const groups = new Map<string, DanmakuSourceSegment[]>();
+  segments.forEach((segment) => {
+    if (!segment.assetId || !segment.sourceMediaId) {
+      return;
+    }
+    const key = `${segment.assetId}\u0000${segment.sourceMediaId}`;
+    groups.set(key, [...(groups.get(key) ?? []), segment]);
+  });
+  const overlaps: Array<[DanmakuSourceSegment, DanmakuSourceSegment]> = [];
+  groups.forEach((group) => {
+    const sorted = [...group].sort(
+      (left, right) =>
+        left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs
+    );
+    for (let leftIndex = 0; leftIndex < sorted.length; leftIndex += 1) {
+      const left = sorted[leftIndex];
+      for (let rightIndex = leftIndex + 1; rightIndex < sorted.length; rightIndex += 1) {
+        const right = sorted[rightIndex];
+        if (right.sourceStartMs >= left.sourceEndMs) {
+          break;
+        }
+        const conflictsWithIgnored = left.kind === "ignored" || right.kind === "ignored";
+        const duplicatesSameTarget =
+          left.kind === "content" &&
+          right.kind === "content" &&
+          Boolean(left.targetMediaId) &&
+          left.targetMediaId === right.targetMediaId;
+        if (conflictsWithIgnored || duplicatesSameTarget) {
+          overlaps.push([left, right]);
+        }
+      }
+    }
+  });
+  return overlaps;
+}
+
 function findSegmentBlocker(
   segment: DanmakuSourceSegment,
   assetsById: Map<string, EditorProject["assets"][number]>,
-  mediaById: Map<string, ProjectMediaReference>
+  mediaById: Map<string, ProjectMediaReference>,
+  sourceBindingByAssetId: Map<string, string>
 ): string | null {
-  if (!segment.assetId || !assetsById.has(segment.assetId)) {
-    return `${segment.label} 还没有关联弹幕 XML，无法投影。`;
-  }
-  if (!segment.sourceMediaId || mediaById.get(segment.sourceMediaId)?.role !== "bilibiliReference") {
-    return `${segment.label} 还没有关联 B 站参考素材，无法投影。`;
+  const sourceProblem = findSourceSegmentBlocker(
+    segment,
+    assetsById,
+    mediaById,
+    sourceBindingByAssetId
+  );
+  if (sourceProblem) {
+    return sourceProblem;
   }
   if (!segment.targetMediaId) {
     return `${segment.label} 还没有选择目标原片，无法投影。`;
   }
   if (mediaById.get(segment.targetMediaId)?.role !== "targetOriginal") {
     return `${segment.label} 的目标素材不是原片角色，无法投影。`;
+  }
+  return null;
+}
+
+function findSourceSegmentBlocker(
+  segment: DanmakuSourceSegment,
+  assetsById: Map<string, EditorProject["assets"][number]>,
+  mediaById: Map<string, ProjectMediaReference>,
+  sourceBindingByAssetId: Map<string, string>
+): string | null {
+  if (!segment.assetId || !assetsById.has(segment.assetId)) {
+    return `${segment.label} 还没有关联弹幕 XML，无法投影。`;
+  }
+  if (
+    !segment.sourceMediaId ||
+    mediaById.get(segment.sourceMediaId)?.role !== "bilibiliReference"
+  ) {
+    return `${segment.label} 还没有关联 B 站参考素材，无法投影。`;
+  }
+  const boundSourceMediaId = sourceBindingByAssetId.get(segment.assetId);
+  if (!boundSourceMediaId) {
+    return `${segment.label} 所属 XML 尚未在素材页绑定 B 站参考素材，无法投影。`;
+  }
+  if (boundSourceMediaId !== segment.sourceMediaId) {
+    return `${segment.label} 使用的参考素材与所属 XML 在素材页的绑定不一致，无法投影。`;
   }
   return null;
 }
@@ -270,8 +415,40 @@ function createExportFileName(target: ProjectMediaReference): string {
   return `${sanitized}.xml`;
 }
 
+function ensureUniqueExportFileNames(groups: TargetProjectionGroup[]): void {
+  const groupsByName = new Map<string, TargetProjectionGroup[]>();
+  groups.forEach((group) => {
+    const key = group.exportFileName.toLocaleLowerCase("en-US");
+    groupsByName.set(key, [...(groupsByName.get(key) ?? []), group]);
+  });
+  const usedNames = new Set(
+    [...groupsByName.entries()]
+      .filter(([, sameNameGroups]) => sameNameGroups.length === 1)
+      .map(([name]) => name)
+  );
+  groupsByName.forEach((duplicates) => {
+    if (duplicates.length < 2) {
+      return;
+    }
+    duplicates
+      .sort((left, right) => left.targetMediaId.localeCompare(right.targetMediaId))
+      .forEach((group) => {
+        const base = group.exportFileName.replace(/\.xml$/i, "");
+        let sequence = 1;
+        let nextName = `${base}-${sequence}.xml`;
+        while (usedNames.has(nextName.toLocaleLowerCase("en-US"))) {
+          sequence += 1;
+          nextName = `${base}-${sequence}.xml`;
+        }
+        group.exportFileName = nextName;
+        usedNames.add(nextName.toLocaleLowerCase("en-US"));
+        group.warnings.push("存在同名原片，导出文件名已自动添加序号以避免覆盖。");
+      });
+  });
+}
+
 function stripVideoExtension(fileName: string): string {
-  return fileName.replace(/\.(mp4|webm|mkv|avi|mov|ts|flv|m2ts)$/i, "");
+  return fileName.replace(/\.(mp4|webm|mkv|avi|mov|m4v|ts|flv|m2ts)$/i, "");
 }
 
 function accumulateGap(
@@ -303,7 +480,8 @@ function countItemsInSegments(
       continue;
     }
     count += asset.items.filter(
-      (item) => item.sourceTimeMs >= segment.sourceStartMs && item.sourceTimeMs < segment.sourceEndMs
+      (item) =>
+        item.sourceTimeMs >= segment.sourceStartMs && item.sourceTimeMs < segment.sourceEndMs
     ).length;
   }
   return count;
@@ -315,23 +493,16 @@ function countUnmappedItems(
   ignoredSegments: readonly DanmakuSourceSegment[],
   assetsById: Map<string, EditorProject["assets"][number]>
 ): number {
-  const coveredAssetIds = new Set(
-    [...contentSegments, ...ignoredSegments]
-      .map((segment) => segment.assetId)
-      .filter((assetId): assetId is string => Boolean(assetId))
-  );
   let unmapped = 0;
-  for (const assetId of coveredAssetIds) {
-    const asset = assetsById.get(assetId);
-    if (!asset) {
-      continue;
-    }
+  for (const asset of assetsById.values()) {
+    const assetId = asset.id;
     const assetSegments = [...contentSegments, ...ignoredSegments].filter(
       (segment) => segment.assetId === assetId
     );
     for (const item of asset.items) {
       const covered = assetSegments.some(
-        (segment) => item.sourceTimeMs >= segment.sourceStartMs && item.sourceTimeMs < segment.sourceEndMs
+        (segment) =>
+          item.sourceTimeMs >= segment.sourceStartMs && item.sourceTimeMs < segment.sourceEndMs
       );
       if (!covered) {
         unmapped += 1;

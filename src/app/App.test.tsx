@@ -8,7 +8,8 @@ import { App } from "./App";
 
 vi.mock("../infrastructure/settings/desktopAppSettings", () => ({
   hydrateDesktopAppSettings: vi.fn(() => Promise.resolve(null)),
-  formatDesktopSettingsError: (error: unknown) => (error instanceof Error ? error.message : String(error))
+  formatDesktopSettingsError: (error: unknown) =>
+    error instanceof Error ? error.message : String(error)
 }));
 
 describe("App 拖放导入", () => {
@@ -27,7 +28,9 @@ describe("App 拖放导入", () => {
     });
     Object.defineProperty(URL, "createObjectURL", {
       configurable: true,
-      value: vi.fn<(object: Blob | MediaSource) => string>(() => "blob:dropped-video")
+      value: vi.fn<(object: Blob | MediaSource) => string>((object) =>
+        object instanceof File ? `blob:${object.name}` : "blob:dropped-video"
+      )
     });
     Object.defineProperty(URL, "revokeObjectURL", {
       configurable: true,
@@ -43,7 +46,7 @@ describe("App 拖放导入", () => {
     vi.restoreAllMocks();
   });
 
-  it("拖放 XML 和 MP4 时同时导入弹幕与参考视频", async () => {
+  it("拖放 XML 和视频时先确认视频角色，不再静默当作参考素材", async () => {
     render(<App />);
     const root = screen.getByTestId("app-root");
     const xmlFile = new File(
@@ -51,19 +54,51 @@ describe("App 拖放导入", () => {
       "episode.xml",
       { type: "text/xml" }
     );
-    const videoFile = new File(["video"], "bilibili-cut.mp4", { type: "video/mp4" });
+    const videoFiles = [
+      new File(["video-a"], "bilibili-cut-a.mp4", { type: "video/mp4" }),
+      new File(["video-b"], "bilibili-cut-b.webm", { type: "video/webm" })
+    ];
 
-    fireEvent.dragEnter(root, { dataTransfer: createFileDataTransfer([xmlFile, videoFile]) });
+    fireEvent.dragEnter(root, {
+      dataTransfer: createFileDataTransfer([xmlFile, ...videoFiles])
+    });
     expect(screen.getByText("拖放导入")).toBeInTheDocument();
 
-    fireEvent.drop(root, { dataTransfer: createFileDataTransfer([xmlFile, videoFile]) });
+    fireEvent.drop(root, { dataTransfer: createFileDataTransfer([xmlFile, ...videoFiles]) });
 
     await waitFor(() => expect(useEditorStore.getState().project.assets).toHaveLength(1));
     expect(useEditorStore.getState().project.assets[0].fileName).toBe("episode.xml");
-    expect(useEditorStore.getState().project.media).toMatchObject({
-      fileName: "bilibili-cut.mp4",
-      objectUrl: "blob:dropped-video"
-    });
+    expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(0);
+    expect(screen.getByRole("dialog", { name: "确认视频角色" })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "共 2 个视频。原片是最终观看的标准时间轴；B 站参考只用于确定弹幕原始时间和删减关系。"
+      )
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "作为 B 站参考导入" }));
+
+    expect(useEditorStore.getState().project.mediaLibrary).toEqual([
+      expect.objectContaining({
+        role: "bilibiliReference",
+        fileName: "bilibili-cut-a.mp4",
+        objectUrl: "blob:bilibili-cut-a.mp4",
+        referenceKind: "browserFile",
+        sourceSummary: "本地浏览器文件引用",
+        localPath: null
+      }),
+      expect.objectContaining({
+        role: "bilibiliReference",
+        fileName: "bilibili-cut-b.webm",
+        objectUrl: "blob:bilibili-cut-b.webm",
+        referenceKind: "browserFile",
+        sourceSummary: "本地浏览器文件引用",
+        localPath: null
+      })
+    ]);
+    expect(useEditorStore.getState().project.media).toBeNull();
+    expect(useEditorStore.getState().project.mediaBinding).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "确认视频角色" })).not.toBeInTheDocument();
     expect(screen.queryByText("拖放导入")).not.toBeInTheDocument();
   });
 });

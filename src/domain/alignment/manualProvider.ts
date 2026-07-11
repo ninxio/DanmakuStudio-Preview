@@ -40,7 +40,27 @@ function isProposal(value: unknown): value is AlignmentProposal {
     Number.isFinite(record.confidence) &&
     Array.isArray(record.diagnostics) &&
     record.diagnostics.every((diagnostic) => typeof diagnostic === "string") &&
-    (record.evidence === undefined || isAlignmentEvidence(record.evidence))
+    (record.evidence === undefined || isAlignmentEvidence(record.evidence)) &&
+    (record.matchRange === undefined || isAlignmentMatchRange(record.matchRange))
+  );
+}
+
+function isAlignmentMatchRange(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    isNonNegativeInteger(record.sourceStartMs) &&
+    isNonNegativeInteger(record.sourceEndMs) &&
+    record.sourceEndMs > record.sourceStartMs &&
+    isNonNegativeInteger(record.targetStartMs) &&
+    isNonNegativeInteger(record.targetEndMs) &&
+    record.targetEndMs > record.targetStartMs &&
+    typeof record.coverage === "number" &&
+    Number.isFinite(record.coverage) &&
+    record.coverage >= 0 &&
+    record.coverage <= 1
   );
 }
 

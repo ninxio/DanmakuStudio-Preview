@@ -28,6 +28,7 @@ interface WorkflowOverviewDialogProps {
   onClose: () => void;
   onImportVideo: () => void;
   onImportXml: () => void;
+  onGoMatching: () => void;
   onSaveProject: () => void;
   onExportXml: () => void;
 }
@@ -36,6 +37,7 @@ export function WorkflowOverviewDialog({
   onClose,
   onImportVideo,
   onImportXml,
+  onGoMatching,
   onSaveProject,
   onExportXml
 }: WorkflowOverviewDialogProps) {
@@ -43,9 +45,12 @@ export function WorkflowOverviewDialog({
   const project = useEditorStore((state) => state.project);
   const alignmentProposal = useEditorStore((state) => state.alignmentProposal);
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
-  const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
-  const cleanupProjectEditReferences = useEditorStore((state) => state.cleanupProjectEditReferences);
-  const cleanupProjectMissingAssetClips = useEditorStore((state) => state.cleanupProjectMissingAssetClips);
+  const cleanupProjectEditReferences = useEditorStore(
+    (state) => state.cleanupProjectEditReferences
+  );
+  const cleanupProjectMissingAssetClips = useEditorStore(
+    (state) => state.cleanupProjectMissingAssetClips
+  );
   const overview = useMemo(
     () => createWorkflowOverview(project, alignmentProposal ?? project.alignmentProposal),
     [alignmentProposal, project]
@@ -54,7 +59,10 @@ export function WorkflowOverviewDialog({
     "import-video": onImportVideo,
     "import-xml": onImportXml,
     "auto-arrange": autoArrangeClips,
-    "apply-alignment": applyAlignmentProposal,
+    "review-matches": () => {
+      onClose();
+      onGoMatching();
+    },
     "cleanup-edit-references": cleanupProjectEditReferences,
     "cleanup-missing-clips": cleanupProjectMissingAssetClips,
     "save-project": onSaveProject,
@@ -79,9 +87,14 @@ export function WorkflowOverviewDialog({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
-  const nextAction = overview.actions.find((action) => action.id === overview.nextActionId) ?? overview.actions[0];
+  const nextAction =
+    overview.actions.find((action) => action.id === overview.nextActionId) ??
+    overview.actions[0];
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-6" data-testid="workflow-overview-dialog">
+    <div
+      className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-6"
+      data-testid="workflow-overview-dialog"
+    >
       <section
         role="dialog"
         aria-modal="true"
@@ -95,10 +108,16 @@ export function WorkflowOverviewDialog({
                 <Sparkles size={16} />
               </span>
               <div className="min-w-0">
-                <h2 id="workflow-overview-title" className="truncate text-base font-semibold text-slate-100">
+                <h2
+                  id="workflow-overview-title"
+                  className="truncate text-base font-semibold text-slate-100"
+                >
                   开始 / 下一步
                 </h2>
-                <p className="mt-1 truncate text-xs text-slate-500" title={overview.projectName}>
+                <p
+                  className="mt-1 truncate text-xs text-slate-500"
+                  title={overview.projectName}
+                >
                   {overview.projectName} · {overview.liveSummary}
                 </p>
               </div>
@@ -152,7 +171,9 @@ export function WorkflowOverviewDialog({
             <aside className="grid content-start gap-4">
               <section className="rounded border border-accent-cyan/40 bg-accent-cyan/10 p-4">
                 <p className="text-xs text-cyan-100/80">建议下一步</p>
-                <h3 className="mt-1 text-sm font-semibold text-slate-100">{overview.nextActionLabel}</h3>
+                <h3 className="mt-1 text-sm font-semibold text-slate-100">
+                  {overview.nextActionLabel}
+                </h3>
                 <p className="mt-2 text-xs leading-5 text-slate-300">{nextAction.detail}</p>
                 <ActionButton
                   action={nextAction}
@@ -205,7 +226,9 @@ function WorkflowStageCard({ stage }: { stage: WorkflowStage }) {
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-slate-500">0{stage.order}</span>
             <h3 className="text-sm font-semibold text-slate-100">{stage.title}</h3>
-            <span className={`rounded border px-2 py-0.5 text-[11px] ${stageStateBadgeClass(stage.state)}`}>
+            <span
+              className={`rounded border px-2 py-0.5 text-[11px] ${stageStateBadgeClass(stage.state)}`}
+            >
               {stage.stateText}
             </span>
           </div>
@@ -213,9 +236,15 @@ function WorkflowStageCard({ stage }: { stage: WorkflowStage }) {
           <p className="mt-1 text-xs leading-5 text-slate-500">{stage.detail}</p>
           <dl className="mt-3 grid gap-2 sm:grid-cols-3">
             {stage.metrics.map((metric) => (
-              <div key={metric.label} className="min-w-0 rounded border border-panel-line/70 bg-black/15 px-2 py-1.5">
+              <div
+                key={metric.label}
+                className="min-w-0 rounded border border-panel-line/70 bg-black/15 px-2 py-1.5"
+              >
                 <dt className="truncate text-[11px] text-slate-500">{metric.label}</dt>
-                <dd className="truncate text-xs font-medium text-slate-200" title={metric.value}>
+                <dd
+                  className="truncate text-xs font-medium text-slate-200"
+                  title={metric.value}
+                >
                   {metric.value}
                 </dd>
               </div>
@@ -260,7 +289,7 @@ function actionIcon(actionId: WorkflowActionId): ReactNode {
   if (actionId === "auto-arrange") {
     return <Shuffle size={14} />;
   }
-  if (actionId === "apply-alignment") {
+  if (actionId === "review-matches") {
     return <Sparkles size={14} />;
   }
   if (actionId === "cleanup-edit-references" || actionId === "cleanup-missing-clips") {

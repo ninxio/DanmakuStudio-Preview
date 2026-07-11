@@ -1,4 +1,34 @@
+- 2026-07-11：成熟度提升阶段 C136 的实现、自动验收和 release 打包已完成：多视频批量导入、多对一/多对多匹配与项目素材对齐工作台进入投影导出主链；原生系统文件选择器的 5+1 人工点击烟测待补。
+  - 素材页新增桌面原生批量多选入口，原片与 B 站参考素材分别导入；统一支持 mp4/mkv/webm/mov/m4v/avi/flv/ts/m2ts，批量路径以一次历史事务写入，取消不改项目，同角色重复路径会跳过并显示摘要。浏览器多选回退明确标记重开后需要重连，不再把批次第一项写成旧版唯一媒体。
+  - 项目 schema 升级到 v9，新增持久化 `mediaMatchCandidates`；候选保存来源/目标素材、绝对来源范围、目标起点、段内修正规则、证据、状态和已生成来源段 ID，支持接受、拒绝、撤销、重做、保存重开以及删除引用后的状态协调。
+  - 匹配页升级为项目素材关系工作台：默认选择项目内全部可用参考与原片，按 N×M 编排任务，支持取消、失败后继续和避免重复运行；候选确认后写入 `danmakuSourceSegments`、`targetStartMs` 与 `timingRules`，可表达 1→N、N→1 和 N↔M，并真实参与按原片投影导出。
+  - 本地对齐新增长参考稀疏定位模式，可在长参考后半段得到绝对来源范围；普通流程不再要求重复选择视频路径，旧单对单路径实验室、参数、日志和 JSON 收进高级诊断。
+  - 多素材一致性已收紧：XML 绑定与来源素材不一致时阻止创建或导出；未映射 XML 会计入检查；匹配进度按全部目标统计；不同来源使用独立时间 lane；同名输出全局避让，非法重叠和越界投影会给出健康检查问题。
+  - 北极星 Playwright E2E 从空项目模拟原生批量导入 5 个原片和 1 个参考，生成并确认 5 组候选，最终导出 5 组 / 15 条弹幕；4/4 通过。关键截图：`artifacts/screenshots/c136-materials-batch.png`、`artifacts/screenshots/c136-matching-candidates.png`、`artifacts/screenshots/c136-export-multi-target.png`。
+  - 已重新验证：`corepack pnpm audit:source` 通过；`corepack pnpm lint` 通过；Vitest 通过（57 个测试文件 / 351 个测试）；`cargo test --locked` 通过（36 个测试）；Playwright 通过（4/4）；`corepack pnpm build` 与 `corepack pnpm tauri:build` 通过。
+  - release 安装器：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3128930` 字节，SHA256 `6682D0E167D02CF043616BE61509312F6126EF55FB595BD9ACE155D386085375`。
+  - release portable exe：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12567040` 字节，SHA256 `8A4DEF64D6DF2150F7A4817396F9517E1BD4929B673BFBD64FAB8FF819B3FA2B`。
+  - 已启动 release 桌面窗口，并从无障碍树确认新版批量入口；但 Windows Graphics Capture 对该 Tauri 窗口返回 `SetIsBorderRequired` / `0x80004002`，未能自动点击系统文件对话框。原生 dialog 多选契约、批量逻辑和模拟 Tauri E2E 已通过，实际系统选择器 5+1 操作不宣称已通过，留待人工烟测。
+  - 本阶段目标文档：`docs/goals/C136-multi-media-batch-matching.md`。
+  - 本阶段 checkpoint 标签：`checkpoint/c136-multi-media-batch-matching-20260711`。
+
 - 2026-07-10：决定将 c0f9 worktree 的成熟度提升成果作为主线；旧主线归档为 archive/pre-c0f9-main-20260710，后续阶段按“提交 + 标签 + 打包产物”形成可回退点。
+
+- 2026-07-11：成熟度提升阶段 C135 已完成：产品 1.0 动线重构，统一四页工作流与投影导出主线。
+  - 新增 `docs/ux-charter.md` 已在 AGENTS.md 中引用；本阶段按其四页动线（素材 → 匹配 → 编辑 → 导出）重构用户可见流程。
+  - 新增 `src/domain/project/workspaceProgress.ts`：不依赖 React 的四页进度模型，感知 `mediaLibrary`、XML 绑定、来源段和 `projectDanmakuToTargets` 投影结果，给出每步完成状态、阻断原因和推荐下一步。
+  - 新增 `src/features/workspace/WorkspaceProgressBanner.tsx`：素材/匹配/导出页顶部显示步骤条、当前页说明和「去下一步」引导；支持点击步骤跳转页面。
+  - 重构 `src/domain/project/workflowOverview.ts`：新手引导阶段从旧的五段模型改为四页模型，导出能力以「按原片分集投影导出」为主路径，时间轴单文件导出为次要说明。
+  - 素材页收拢：旧版 `TargetMediaBindingPanel` 和 `ProjectMatchAssessmentPanel` 折叠到「高级：单目标绑定与匹配评分（兼容旧项目）」；主路径只保留多媒体库、XML 导入与绑定。
+  - 导出页层级调整：「按原片分集导出」置顶；单文件导出和传统分 P 合并明确标注为「其他导出方式」。
+  - 素材/匹配/导出工作区布局从 `max-w-3xl` 加宽到 `max-w-5xl`，减少面板挤压。
+  - 已补充 `workspaceProgress.test.ts`、`WorkspaceProgressBanner.test.tsx`，并更新 `workflowOverview.test.ts` 和 `AssetPanel.test.tsx` 兼容折叠面板。
+  - 已重新验证：源码审计与 `corepack pnpm lint` 通过；`corepack pnpm test` 通过（55 个测试文件 / 317 个测试）；`corepack pnpm build` 与 `cargo check --locked` 通过。
+  - 首次 E2E 验收发现 3 处仍引用重构前工作流文案的断言；已同步为四页工作流的新文案，随后 `corepack pnpm test:e2e` 通过（3 个 Chromium E2E 测试）。
+  - 已完成 Tauri release 打包；前端生产构建、Rust release 优化编译与 NSIS 封装全部成功。
+  - 最新 release 可执行文件：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `12520960` 字节，时间 `2026/07/11 09:52:04`。
+  - 最新安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3113291` 字节，时间 `2026/07/11 09:52:04`。
+  - 本阶段目标文档：`docs/goals/C135-product-1.0-workflow-refactor.md`。
 
 - 2026-07-11：成熟度提升阶段 C134 已完成：实现“多视频素材导入与弹幕匹配到原片时间轴”基础工作流。
   - 项目 schema 升级到 v7，新增 `mediaLibrary` 和 `danmakuSourceBindings`；`danmakuSourceSegments` 增加所属 XML、B 站参考素材、目标原片等稳定 ID 关系，旧 `project.media`、`mediaBinding` 和 v6 来源段会确定性迁移。

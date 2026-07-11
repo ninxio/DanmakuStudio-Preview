@@ -7,7 +7,7 @@ import type {
 import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 export interface MediaReference {
   id: string;
@@ -127,6 +127,30 @@ export interface SegmentTimingRule {
   note: string;
 }
 
+export type MediaMatchCandidateState = "pending" | "accepted" | "rejected" | "blocked";
+
+/**
+ * 媒体级匹配候选。候选只描述参考素材与目标原片之间的时间关系；
+ * 用户接受后，才会按 XML 来源绑定展开为非破坏性的 DanmakuSourceSegment。
+ */
+export interface MediaMatchCandidate {
+  id: string;
+  batchId: string;
+  sourceMediaId: string;
+  targetMediaId: string;
+  sourceStartMs: Milliseconds;
+  sourceEndMs: Milliseconds;
+  targetStartMs: Milliseconds;
+  targetEndMs: Milliseconds;
+  timingRules: SegmentTimingRule[];
+  confidence: number;
+  proposal: AlignmentProposal;
+  state: MediaMatchCandidateState;
+  appliedSegmentIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DanmakuSourceSegment {
   id: string;
   label: string;
@@ -169,6 +193,7 @@ export interface EditorProject {
   seasonEpisodeBindings: SeasonEpisodeBinding[];
   danmakuSourceBindings: DanmakuSourceBinding[];
   danmakuSourceSegments: DanmakuSourceSegment[];
+  mediaMatchCandidates: MediaMatchCandidate[];
   assets: DanmakuAsset[];
   clips: DanmakuClip[];
   globalOffsetMs: Milliseconds;

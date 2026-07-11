@@ -8,7 +8,11 @@ import {
   serializeProject,
   validateProjectSchema
 } from "./schema";
-import { CURRENT_SCHEMA_VERSION, type ProjectMediaReference, type ProjectMediaRole } from "./types";
+import {
+  CURRENT_SCHEMA_VERSION,
+  type ProjectMediaReference,
+  type ProjectMediaRole
+} from "./types";
 
 describe("project schema", () => {
   it("序列化后可重新打开，并清除临时 objectUrl", () => {
@@ -61,12 +65,55 @@ describe("project schema", () => {
     expect(parsed.alignmentProposal?.cutCandidates[0].id).toBe("proposal-cut");
   });
 
+  it("localPath 素材序列化并重新打开后仍保持已连接", () => {
+    const project = {
+      ...createEmptyProject("桌面素材项目"),
+      mediaLibrary: [
+        createValidProjectMediaReference({
+          id: "local-reference",
+          role: "bilibiliReference",
+          referenceKind: "localPath",
+          connectionState: "connected",
+          localPath: "D:\\media\\reference.mkv"
+        })
+      ]
+    };
+
+    const json = serializeProject(project);
+    expect(JSON.parse(json) as unknown).toMatchObject({
+      mediaLibrary: [
+        {
+          referenceKind: "localPath",
+          connectionState: "connected",
+          localPath: "D:\\media\\reference.mkv",
+          objectUrl: null
+        }
+      ]
+    });
+
+    const parsed = parseProjectJson(json);
+    expect(parsed.mediaLibrary[0]).toMatchObject({
+      referenceKind: "localPath",
+      connectionState: "connected",
+      localPath: "D:\\media\\reference.mkv",
+      objectUrl: null
+    });
+  });
+
   it("可打开仓库内三分 P 示例项目", () => {
-    const fixture = readFileSync(resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"), "utf8");
+    const fixture = readFileSync(
+      resolve("fixtures", "projects", "three-part-demo.danmaku-project.json"),
+      "utf8"
+    );
     const { project: parsed, migration } = parseProjectJsonWithMetadata(fixture);
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
-    expect(migration).toBeNull();
+    expect(migration).toEqual({
+      fromVersion: 8,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+    expect(parsed.mediaMatchCandidates).toEqual([]);
     expect(parsed.assets).toHaveLength(3);
     expect(parsed.cutMarkers).toHaveLength(1);
   });
@@ -74,8 +121,24 @@ describe("project schema", () => {
   it("允许包含合法版本差异和同步锚点的项目", () => {
     const project = {
       ...createEmptyProject("带版本差异项目"),
-      cutMarkers: [{ id: "cut-1", name: "缺失片段", sourceAtMs: 30_000, targetGapMs: 45_000, note: "复核通过" }],
-      syncAnchors: [{ id: "anchor-1", sourceMs: 10_000, targetMs: 12_000, confidence: 0.9, origin: "manual" as const }]
+      cutMarkers: [
+        {
+          id: "cut-1",
+          name: "缺失片段",
+          sourceAtMs: 30_000,
+          targetGapMs: 45_000,
+          note: "复核通过"
+        }
+      ],
+      syncAnchors: [
+        {
+          id: "anchor-1",
+          sourceMs: 10_000,
+          targetMs: 12_000,
+          confidence: 0.9,
+          origin: "manual" as const
+        }
+      ]
     };
 
     expect(validateProjectSchema(project)).toEqual({
@@ -198,6 +261,74 @@ describe("project schema", () => {
     });
   });
 
+  it("允许保存带素材对上下文的媒体匹配候选并完整往返", () => {
+    const project = {
+      ...createEmptyProject("媒体匹配候选项目"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [createValidMediaMatchCandidate()]
+    };
+
+    expect(validateProjectSchema(project).ok).toBe(true);
+    const parsed = parseProjectJson(serializeProject(project));
+    expect(parsed.mediaMatchCandidates).toHaveLength(1);
+    expect(parsed.mediaMatchCandidates[0]).toMatchObject({
+      id: "candidate-1",
+      batchId: "batch-1",
+      sourceMediaId: "source-media",
+      targetMediaId: "target-media",
+      state: "pending",
+      timingRules: [{ id: "candidate-1:rule:0" }],
+      proposal: {
+        matchRange: {
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetStartMs: 0,
+          targetEndMs: 65_000
+        }
+      }
+    });
+  });
+
+  it("已接受和已拒绝的媒体匹配候选连同应用片段 ID 完整往返", () => {
+    const acceptedCandidate = {
+      ...createValidMediaMatchCandidate(),
+      state: "accepted" as const,
+      appliedSegmentIds: ["candidate-1:segment:asset-1"]
+    };
+    const rejectedCandidate = {
+      ...createValidMediaMatchCandidate(),
+      id: "candidate-rejected",
+      state: "rejected" as const,
+      appliedSegmentIds: []
+    };
+    const project = {
+      ...createEmptyProject("候选状态往返项目"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [acceptedCandidate, rejectedCandidate]
+    };
+
+    expect(validateProjectSchema(project).ok).toBe(true);
+    const parsed = parseProjectJson(serializeProject(project));
+
+    expect(parsed.mediaMatchCandidates).toHaveLength(2);
+    expect(parsed.mediaMatchCandidates[0]).toMatchObject({
+      id: "candidate-1",
+      state: "accepted",
+      appliedSegmentIds: ["candidate-1:segment:asset-1"]
+    });
+    expect(parsed.mediaMatchCandidates[1]).toMatchObject({
+      id: "candidate-rejected",
+      state: "rejected",
+      appliedSegmentIds: []
+    });
+  });
+
   it("打开 v1 项目时迁移闭区间片段 sourceOutMs", () => {
     const project = {
       ...createEmptyProject("旧项目"),
@@ -217,7 +348,9 @@ describe("project schema", () => {
       ]
     };
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(project)
+    );
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.clips[0].sourceOutMs).toBe(1001);
@@ -249,7 +382,9 @@ describe("project schema", () => {
     const v2Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
     delete v2Project.alignmentProposal;
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v2Project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v2Project)
+    );
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.alignmentProposal).toBeNull();
@@ -272,7 +407,9 @@ describe("project schema", () => {
     const v3Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
     delete v3Project.mediaBinding;
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v3Project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v3Project)
+    );
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.alignmentProposal?.anchors[0].id).toBe("proposal-anchor");
@@ -294,7 +431,9 @@ describe("project schema", () => {
     const v4Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
     delete v4Project.seasonEpisodeBindings;
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v4Project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v4Project)
+    );
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.mediaBinding?.kind).toBe("localFile");
@@ -316,7 +455,9 @@ describe("project schema", () => {
     const v5Project = JSON.parse(JSON.stringify(currentProject)) as Record<string, unknown>;
     delete v5Project.danmakuSourceSegments;
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v5Project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v5Project)
+    );
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.seasonEpisodeBindings).toEqual([]);
@@ -359,7 +500,9 @@ describe("project schema", () => {
     delete v6Project.mediaLibrary;
     delete v6Project.danmakuSourceBindings;
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v6Project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v6Project)
+    );
 
     expect(migration).toEqual({
       fromVersion: 6,
@@ -438,7 +581,9 @@ describe("project schema", () => {
       ["migrated_target_binding-local", "bilibiliReference"],
       ["migrated_target_binding-local_2", "targetOriginal"]
     ]);
-    expect(new Set(parsed.mediaLibrary.map((media) => media.id)).size).toBe(parsed.mediaLibrary.length);
+    expect(new Set(parsed.mediaLibrary.map((media) => media.id)).size).toBe(
+      parsed.mediaLibrary.length
+    );
     expect(parsed.mediaBinding).toMatchObject({
       kind: "localFile",
       mediaId: "migrated_target_binding-local_2"
@@ -476,7 +621,9 @@ describe("project schema", () => {
       danmakuSourceSegments: [v7Segment]
     } as Record<string, unknown>;
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v7Project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v7Project)
+    );
 
     expect(migration).toEqual({
       fromVersion: 7,
@@ -494,6 +641,28 @@ describe("project schema", () => {
       targetStartMs: null,
       timingRules: []
     });
+  });
+
+  it("打开 v8 项目时补齐媒体匹配候选集合", () => {
+    const v8Project = JSON.parse(JSON.stringify(createEmptyProject("v8 项目"))) as Record<
+      string,
+      unknown
+    >;
+    v8Project.schemaVersion = 8;
+    delete v8Project.mediaMatchCandidates;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(v8Project)
+    );
+
+    expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(parsed.mediaMatchCandidates).toEqual([]);
+    expect(migration).toEqual({
+      fromVersion: 8,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+    expect(parseProjectJson(serializeProject(parsed)).mediaMatchCandidates).toEqual([]);
   });
 
   it("打开当前版本项目时保留半开 sourceOutMs", () => {
@@ -514,7 +683,9 @@ describe("project schema", () => {
       ]
     };
 
-    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(project));
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(
+      JSON.stringify(project)
+    );
 
     expect(parsed.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(parsed.clips[0].sourceOutMs).toBe(1000);
@@ -631,7 +802,15 @@ describe("project schema", () => {
   it("拒绝结构错误的同步锚点", () => {
     const project = {
       ...createEmptyProject(),
-      syncAnchors: [{ id: "anchor", sourceMs: 10_000, targetMs: 12_000, confidence: 1.5, origin: "automatic" }]
+      syncAnchors: [
+        {
+          id: "anchor",
+          sourceMs: 10_000,
+          targetMs: 12_000,
+          confidence: 1.5,
+          origin: "automatic"
+        }
+      ]
     };
     const validation = validateProjectSchema(project);
     expect(validation.ok).toBe(false);
@@ -654,6 +833,41 @@ describe("project schema", () => {
     const validation = validateProjectSchema(project);
     expect(validation.ok).toBe(false);
     expect(validation.message).toContain("必要字段");
+  });
+
+  it("拒绝区间或 proposal.matchRange 不一致的媒体匹配候选", () => {
+    const candidate = createValidMediaMatchCandidate();
+    const project = {
+      ...createEmptyProject(),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [
+        {
+          ...candidate,
+          sourceEndMs: candidate.sourceStartMs
+        }
+      ]
+    };
+    expect(validateProjectSchema(project).ok).toBe(false);
+
+    const mismatchedRangeProject = {
+      ...project,
+      mediaMatchCandidates: [
+        {
+          ...candidate,
+          proposal: {
+            ...candidate.proposal,
+            matchRange: {
+              ...candidate.proposal.matchRange,
+              targetStartMs: 1_000
+            }
+          }
+        }
+      ]
+    };
+    expect(validateProjectSchema(mismatchedRangeProject).ok).toBe(false);
   });
 
   it("拒绝结构错误的目标原片绑定", () => {
@@ -768,6 +982,57 @@ function createValidAlignmentProposal() {
     ],
     confidence: 0.85,
     diagnostics: ["测试诊断"]
+  };
+}
+
+function createValidMediaMatchCandidate() {
+  const proposal = {
+    ...createValidAlignmentProposal(),
+    anchors: [
+      {
+        id: "candidate-1:anchor:0",
+        sourceMs: 15_000,
+        targetMs: 5_000,
+        confidence: 0.9,
+        origin: "automatic" as const
+      }
+    ],
+    cutCandidates: [
+      {
+        id: "candidate-1:cut:0",
+        name: "候选版本差异",
+        sourceAtMs: 40_000,
+        sourceRangeStartMs: 39_000,
+        sourceRangeEndMs: 41_000,
+        targetGapMs: 5_000,
+        confidence: 0.8,
+        note: "测试"
+      }
+    ],
+    matchRange: {
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 0,
+      targetEndMs: 65_000,
+      coverage: 0.95
+    }
+  };
+  return {
+    id: "candidate-1",
+    batchId: "batch-1",
+    sourceMediaId: "source-media",
+    targetMediaId: "target-media",
+    sourceStartMs: 10_000,
+    sourceEndMs: 70_000,
+    targetStartMs: 0,
+    targetEndMs: 65_000,
+    timingRules: [{ id: "candidate-1:rule:0", sourceAtMs: 40_000, gapMs: 5_000, note: "测试" }],
+    confidence: 0.85,
+    proposal,
+    state: "pending" as const,
+    appliedSegmentIds: [],
+    createdAt: "2026-07-11T00:00:00.000Z",
+    updatedAt: "2026-07-11T00:00:00.000Z"
   };
 }
 

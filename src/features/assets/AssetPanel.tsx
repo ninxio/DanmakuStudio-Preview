@@ -15,6 +15,7 @@ import {
   Video,
   WandSparkles
 } from "lucide-react";
+import { isTauri } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import {
@@ -39,7 +40,11 @@ import {
   isSuspectedCutCandidateApplied,
   type SuspectedCutCandidate
 } from "../../domain/danmaku/cutHints";
-import { parseCutPointsText, parseEpisodeDurationsText, parseMinutesInput } from "../../domain/danmaku/manualRules";
+import {
+  parseCutPointsText,
+  parseEpisodeDurationsText,
+  parseMinutesInput
+} from "../../domain/danmaku/manualRules";
 import type { CutMarker, SyncAnchor } from "../../domain/danmaku/types";
 import {
   createProjectHealthReport,
@@ -78,12 +83,16 @@ import {
   type SeasonWorkbenchStepState,
   type SeasonWorkbenchSummary
 } from "../../domain/project/seasonWorkbench";
-import { createSeasonEpisodeKey, findSeasonEpisodeBinding } from "../../domain/project/seasonEpisodeBinding";
+import {
+  createSeasonEpisodeKey,
+  findSeasonEpisodeBinding
+} from "../../domain/project/seasonEpisodeBinding";
 import {
   createSourceTimelineSummary,
   parseSourceTimecode,
   type DanmakuSourceSegmentDraft,
   type DanmakuSourceSegmentPatch,
+  type SegmentTimingRuleDraft,
   type SourceTimelineFinding,
   type SourceTimelineSummary
 } from "../../domain/project/sourceTimeline";
@@ -100,22 +109,29 @@ import type {
 import { formatTimecode, type Milliseconds } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
+  projectDanmakuToTargets,
+  type SourceProjectionResult,
+  type TargetProjectionGroup
+} from "../../domain/timeline/sourceProjection";
+import {
   cancelTauriAudioAlignmentJob,
   getTauriAudioAlignmentJob,
   isAudioAlignmentJobFinished,
   startTauriAudioAlignmentJob,
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
-import {
-  downloadTextFile,
-  readTextFile
-} from "../../infrastructure/file-system/browserFiles";
+import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import {
   formatExportFileError,
   saveTextExportFiles,
   type SaveTextExportResult
 } from "../../infrastructure/file-system/exportFiles";
-import { pickAlignmentMediaPath, pickFfmpegExecutablePath } from "../../infrastructure/file-system/nativeDialogs";
+import {
+  pickAlignmentMediaPath,
+  pickFfmpegExecutablePath,
+  pickMediaPaths,
+  VIDEO_FILE_EXTENSIONS
+} from "../../infrastructure/file-system/nativeDialogs";
 import {
   authenticateEmby,
   createEmbyAuthorizedStreamUrl,
@@ -130,10 +146,15 @@ import {
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
 import { hydrateDesktopAppSettings } from "../../infrastructure/settings/desktopAppSettings";
 import { loadVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
-import { serializeBilibiliXml, validateExportedXml } from "../../infrastructure/xml/bilibiliXml";
+import {
+  serializeBilibiliXml,
+  validateExportedXml
+} from "../../infrastructure/xml/bilibiliXml";
+import { WorkspaceProgressBanner } from "../workspace/WorkspaceProgressBanner";
+import { MediaMatchingPanel } from "../matching/MediaMatchingPanel";
 import { useEditorStore, type EditorStatus } from "../../stores/editorStore";
 
-type AssetTab = "media" | "danmaku" | "project";
+export type AssetPanelSection = "materials" | "matching" | "editing" | "export";
 type PartWindowMode = "full" | "prefix" | "suffix" | "range";
 type LongSplitMode = "auto" | "durations" | "cuts";
 type EmbyLoadingKind = "auth" | "search" | "item" | "episodes";
@@ -153,9 +174,9 @@ interface EmbyConnectionState {
   sessionKey: string;
 }
 
-export function AssetPanel() {
-  const [tab, setTab] = useState<AssetTab>("danmaku");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+export function AssetPanel({ section }: { section: AssetPanelSection }) {
+  const [legacyMaterialsOpen, setLegacyMaterialsOpen] = useState(false);
+  const [legacyExportOpen, setLegacyExportOpen] = useState(false);
   const [partWindowMode, setPartWindowMode] = useState<PartWindowMode>("full");
   const [partWindowMinutes, setPartWindowMinutes] = useState("9");
   const [partRangeStartMinutes, setPartRangeStartMinutes] = useState("0");
@@ -170,6 +191,7 @@ export function AssetPanel() {
   const targetMediaInputRef = useRef<HTMLInputElement | null>(null);
   const sourceMediaInputRef = useRef<HTMLInputElement | null>(null);
   const reconnectMediaInputRef = useRef<HTMLInputElement | null>(null);
+  const xmlInputRef = useRef<HTMLInputElement | null>(null);
   const lastSyncedAlignmentProposalTextRef = useRef("");
   const lastAlignmentProjectIdRef = useRef<string | null>(null);
   const project = useEditorStore((state) => state.project);
@@ -178,6 +200,9 @@ export function AssetPanel() {
   const cutHintSettings = useEditorStore((state) => state.cutHintSettings);
   const importProgress = useEditorStore((state) => state.importProgress);
   const importMediaFiles = useEditorStore((state) => state.importMediaFiles);
+  const importMediaPaths = useEditorStore((state) => state.importMediaPaths);
+  const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
+  const setWorkspacePage = useEditorStore((state) => state.setWorkspacePage);
   const addAssetToTimeline = useEditorStore((state) => state.addAssetToTimeline);
   const removeAsset = useEditorStore((state) => state.removeAsset);
   const removeAssetFromTimeline = useEditorStore((state) => state.removeAssetFromTimeline);
@@ -187,11 +212,17 @@ export function AssetPanel() {
   const clearMediaBinding = useEditorStore((state) => state.clearMediaBinding);
   const bindXmlToSourceMedia = useEditorStore((state) => state.bindXmlToSourceMedia);
   const clearXmlSourceBinding = useEditorStore((state) => state.clearXmlSourceBinding);
-  const bindCurrentTargetToSeasonEpisode = useEditorStore((state) => state.bindCurrentTargetToSeasonEpisode);
+  const bindCurrentTargetToSeasonEpisode = useEditorStore(
+    (state) => state.bindCurrentTargetToSeasonEpisode
+  );
   const clearSeasonEpisodeBinding = useEditorStore((state) => state.clearSeasonEpisodeBinding);
   const addDanmakuSourceSegment = useEditorStore((state) => state.addDanmakuSourceSegment);
-  const updateDanmakuSourceSegment = useEditorStore((state) => state.updateDanmakuSourceSegment);
-  const deleteDanmakuSourceSegment = useEditorStore((state) => state.deleteDanmakuSourceSegment);
+  const updateDanmakuSourceSegment = useEditorStore(
+    (state) => state.updateDanmakuSourceSegment
+  );
+  const deleteDanmakuSourceSegment = useEditorStore(
+    (state) => state.deleteDanmakuSourceSegment
+  );
   const autoArrangeClips = useEditorStore((state) => state.autoArrangeClips);
   const select = useEditorStore((state) => state.select);
   const setPlayhead = useEditorStore((state) => state.setPlayhead);
@@ -200,14 +231,25 @@ export function AssetPanel() {
   const deleteCutMarker = useEditorStore((state) => state.deleteCutMarker);
   const updateSyncAnchor = useEditorStore((state) => state.updateSyncAnchor);
   const deleteSyncAnchor = useEditorStore((state) => state.deleteSyncAnchor);
-  const importAlignmentProposalText = useEditorStore((state) => state.importAlignmentProposalText);
+  const importAlignmentProposalText = useEditorStore(
+    (state) => state.importAlignmentProposalText
+  );
   const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const clearAlignmentProposal = useEditorStore((state) => state.clearAlignmentProposal);
-  const previewAlignmentProposalData = useEditorStore((state) => state.previewAlignmentProposalData);
-  const applyAlignmentProposalData = useEditorStore((state) => state.applyAlignmentProposalData);
+  const previewAlignmentProposalData = useEditorStore(
+    (state) => state.previewAlignmentProposalData
+  );
+  const applyAlignmentProposalData = useEditorStore(
+    (state) => state.applyAlignmentProposalData
+  );
   const setCutHintSettings = useEditorStore((state) => state.setCutHintSettings);
-  const cleanupProjectEditReferences = useEditorStore((state) => state.cleanupProjectEditReferences);
-  const cleanupProjectMissingAssetClips = useEditorStore((state) => state.cleanupProjectMissingAssetClips);
+  const cleanupProjectEditReferences = useEditorStore(
+    (state) => state.cleanupProjectEditReferences
+  );
+  const cleanupProjectMissingAssetClips = useEditorStore(
+    (state) => state.cleanupProjectMissingAssetClips
+  );
+  const prepareExport = useEditorStore((state) => state.prepareExport);
   const manualRules = useMemo(
     () =>
       createBatchMergeOptions({
@@ -248,7 +290,28 @@ export function AssetPanel() {
     () => createSourceTimelineSummary(project, batchMergePlan),
     [batchMergePlan, project]
   );
-  const cutHintSearch = useMemo(() => createCutHintSearchPlan(cutHintSettings), [cutHintSettings]);
+  const cutHintSearch = useMemo(
+    () => createCutHintSearchPlan(cutHintSettings),
+    [cutHintSettings]
+  );
+
+  const openMediaImport = async (role: ProjectMediaRole) => {
+    if (!isTauri()) {
+      (role === "targetOriginal" ? targetMediaInputRef : sourceMediaInputRef).current?.click();
+      return;
+    }
+    try {
+      const paths = await pickMediaPaths(role);
+      if (paths.length > 0) {
+        importMediaPaths(paths, role);
+      }
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "视频批量导入失败。",
+        tone: "error"
+      });
+    }
+  };
   const suspectedCutCandidates = useMemo(
     () => findSuspectedCutCandidates(project.assets, cutHintSearch.options),
     [cutHintSearch, project.assets]
@@ -267,7 +330,11 @@ export function AssetPanel() {
   );
   const projectHealth = useMemo(() => createProjectHealthSummary(project), [project]);
   const projectReadiness = useMemo(() => createProjectReadinessSummary(project), [project]);
-  const projectMatchAssessment = useMemo(() => createProjectMatchAssessment(project), [project]);
+  const projectMatchAssessment = useMemo(
+    () => createProjectMatchAssessment(project),
+    [project]
+  );
+  const sourceProjection = useMemo(() => projectDanmakuToTargets(project), [project]);
   const targetOriginalMedia = useMemo(
     () => project.mediaLibrary.filter((media) => media.role === "targetOriginal"),
     [project.mediaLibrary]
@@ -278,7 +345,8 @@ export function AssetPanel() {
   );
 
   const bindLocalPathAsTarget = async () => {
-    const currentPath = project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath ?? "" : "";
+    const currentPath =
+      project.mediaBinding?.kind === "localFile" ? (project.mediaBinding.localPath ?? "") : "";
     try {
       const path = await pickAlignmentMediaPath(currentPath);
       if (!path) {
@@ -314,7 +382,10 @@ export function AssetPanel() {
       const item = await fetchEmbyItem(connection.config, session, binding.itemId);
       const updatedBinding = createEmbyBindingFromItem(item, connection);
       setMediaBinding(updatedBinding);
-      setStatus({ message: `已重新确认目标原片：${updatedBinding.displayName}`, tone: "success" });
+      setStatus({
+        message: `已重新确认目标原片：${updatedBinding.displayName}`,
+        tone: "success"
+      });
     } catch (error) {
       setStatus({
         message: `目标原片需要重新连接：${error instanceof Error ? error.message : "Emby 请求失败。"}`,
@@ -327,7 +398,10 @@ export function AssetPanel() {
 
   const previewProjectMatchProposal = () => {
     if (!projectMatchAssessment.proposal) {
-      setStatus({ message: "先绑定目标原片并导入 XML 后，才能生成匹配评分提案。", tone: "warning" });
+      setStatus({
+        message: "先绑定目标原片并导入 XML 后，才能生成匹配评分提案。",
+        tone: "warning"
+      });
       return;
     }
     previewAlignmentProposalData(projectMatchAssessment.proposal);
@@ -349,31 +423,20 @@ export function AssetPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="grid h-10 shrink-0 grid-cols-3 border-b border-panel-line text-xs">
-        <TabButton active={tab === "media"} onClick={() => setTab("media")}>
-          媒体
-        </TabButton>
-        <TabButton active={tab === "danmaku"} onClick={() => setTab("danmaku")}>
-          弹幕素材
-        </TabButton>
-        <TabButton active={tab === "project"} onClick={() => setTab("project")}>
-          导出检查
-        </TabButton>
-      </div>
       <div className="thin-scrollbar min-h-0 flex-1 overflow-auto p-3">
-        {tab === "media" ? (
+        {section === "materials" ? (
           <div className="grid gap-3">
+            <WorkspaceProgressBanner pageId="materials" />
             <MediaRoleGuidePanel
               targetCount={targetOriginalMedia.length}
               referenceCount={bilibiliReferenceMedia.length}
-              binding={project.mediaBinding}
             />
             <MediaLibrarySection
               title="原片素材"
               description="原片素材是弹幕最终要匹配到的标准时间轴，可导入一个或多个完整版或目标集视频。"
               role="targetOriginal"
               mediaItems={targetOriginalMedia}
-              onImport={() => targetMediaInputRef.current?.click()}
+              onImport={() => void openMediaImport("targetOriginal")}
               onReconnect={(mediaId) => {
                 setReconnectMediaId(mediaId);
                 reconnectMediaInputRef.current?.click();
@@ -385,28 +448,180 @@ export function AssetPanel() {
               description="B 站参考素材用于理解弹幕 XML 的原始时间轴，可以是单集、合集或存在删减的参考视频，但不是最终输出目标。"
               role="bilibiliReference"
               mediaItems={bilibiliReferenceMedia}
-              onImport={() => sourceMediaInputRef.current?.click()}
+              onImport={() => void openMediaImport("bilibiliReference")}
               onReconnect={(mediaId) => {
                 setReconnectMediaId(mediaId);
                 reconnectMediaInputRef.current?.click();
               }}
               onDelete={removeMediaReference}
             />
-            <TargetMediaBindingPanel
-              binding={project.mediaBinding}
-              media={project.media}
-              mediaLibrary={project.mediaLibrary}
-              validating={targetValidationLoading}
-              onBindLocalPath={() => void bindLocalPathAsTarget()}
-              onValidateEmby={() => void validateEmbyTargetBinding()}
-              onClear={clearMediaBinding}
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-sm font-medium text-slate-100">弹幕 XML</h3>
+                <TextButton tone="primary" onClick={() => xmlInputRef.current?.click()}>
+                  <ListPlus size={14} />
+                  导入 XML
+                </TextButton>
+              </div>
+              <p className="mt-2 leading-5 text-slate-500">
+                XML 是要被修正和导出的弹幕来源。导入后，请把每个 XML 关联到它来自的 B
+                站参考视频，后续匹配才可靠。
+              </p>
+              {importProgress !== null ? (
+                <div className="mt-2 rounded border border-panel-line bg-black/15 p-2 text-slate-300">
+                  正在导入 XML... {Math.round(importProgress * 100)}%
+                </div>
+              ) : null}
+              {project.assets.length === 0 ? (
+                <EmptyState
+                  title="尚未导入 XML"
+                  text="可一次选择多个 Bilibili XML 分 P 文件。"
+                />
+              ) : (
+                <div className="mt-3 grid gap-3">
+                  {project.assets.map((asset) => {
+                    const range = getAssetTimeRange(asset);
+                    const sourceBinding = findDanmakuSourceBinding(
+                      project.danmakuSourceBindings,
+                      asset.id
+                    );
+                    return (
+                      <article
+                        key={asset.id}
+                        className="rounded border border-panel-line bg-[#111318] p-3"
+                        data-testid="asset-card"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="h-3 w-3 rounded-sm"
+                            style={{ background: asset.color }}
+                          />
+                          <h4 className="min-w-0 flex-1 truncate text-sm font-medium text-slate-100">
+                            {asset.fileName}
+                          </h4>
+                        </div>
+                        <dl className="mt-3 grid gap-1 text-xs text-slate-400">
+                          <Row
+                            label="弹幕数量"
+                            value={asset.items.length.toLocaleString("zh-CN")}
+                          />
+                          <Row label="最早时间" value={formatTimecode(range.earliestMs)} />
+                          <Row label="最晚时间" value={formatTimecode(range.latestMs)} />
+                          <Row label="导入警告" value={asset.warnings.length.toString()} />
+                        </dl>
+                        <div className="mt-3 grid gap-2 rounded border border-panel-line/70 bg-black/15 p-2 text-xs">
+                          <label className="grid gap-1">
+                            <span className="text-slate-500">弹幕来源视频</span>
+                            <select
+                              aria-label={`${asset.fileName} 弹幕来源视频`}
+                              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+                              value={sourceBinding?.sourceMediaId ?? ""}
+                              onChange={(event) => {
+                                if (event.target.value.length > 0) {
+                                  bindXmlToSourceMedia(asset.id, event.target.value);
+                                } else {
+                                  clearXmlSourceBinding(asset.id);
+                                }
+                              }}
+                            >
+                              <option value="">未绑定</option>
+                              {bilibiliReferenceMedia.map((media) => (
+                                <option key={media.id} value={media.id}>
+                                  {media.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          {sourceBinding ? (
+                            <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                              <span className="min-w-0 truncate">
+                                已关联：
+                                {findProjectMedia(project, sourceBinding.sourceMediaId)
+                                  ?.fileName ?? sourceBinding.sourceMediaId}
+                              </span>
+                              <TextButton onClick={() => clearXmlSourceBinding(asset.id)}>
+                                解除绑定
+                              </TextButton>
+                            </div>
+                          ) : (
+                            <p className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
+                              该 XML 尚未关联弹幕来源视频，仍可编辑但无法进行可靠的来源段匹配。
+                            </p>
+                          )}
+                        </div>
+                        <div className="mt-3 flex flex-wrap justify-end gap-2">
+                          <TextButton
+                            tone="danger"
+                            title="删除资源及关联片段"
+                            onClick={() => removeAsset(asset.id)}
+                          >
+                            <Trash2 size={14} />
+                            删除
+                          </TextButton>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-3 text-left"
+                aria-expanded={legacyMaterialsOpen}
+                onClick={() => setLegacyMaterialsOpen((open) => !open)}
+              >
+                <span>
+                  <span className="block text-sm font-medium text-slate-100">
+                    高级：单目标绑定与匹配评分（兼容旧项目）
+                  </span>
+                  <span className="mt-1 block leading-5 text-slate-500">
+                    多集工作流请使用上方「原片素材」和「来源段」；此处仅供旧版单目标绑定项目兼容。
+                  </span>
+                </span>
+                <span className="shrink-0 rounded border border-panel-line px-2 py-1 text-[11px] text-slate-300">
+                  {legacyMaterialsOpen ? "收起" : "展开"}
+                </span>
+              </button>
+              {legacyMaterialsOpen ? (
+                <div className="mt-3 grid gap-3">
+                  <TargetMediaBindingPanel
+                    binding={project.mediaBinding}
+                    media={project.media}
+                    mediaLibrary={project.mediaLibrary}
+                    validating={targetValidationLoading}
+                    onBindLocalPath={() => void bindLocalPathAsTarget()}
+                    onValidateEmby={() => void validateEmbyTargetBinding()}
+                    onClear={clearMediaBinding}
+                  />
+                  <ProjectMatchAssessmentPanel
+                    assessment={projectMatchAssessment}
+                    onPreview={previewProjectMatchProposal}
+                  />
+                </div>
+              ) : null}
+            </section>
+            <input
+              ref={xmlInputRef}
+              className="hidden"
+              type="file"
+              accept=".xml,text/xml,application/xml"
+              multiple
+              data-testid="xml-input"
+              aria-label="导入弹幕 XML 文件"
+              onChange={(event) => {
+                if (event.target.files) {
+                  void importXmlFiles(event.target.files);
+                }
+                event.target.value = "";
+              }}
             />
-            <ProjectMatchAssessmentPanel assessment={projectMatchAssessment} onPreview={previewProjectMatchProposal} />
             <input
               ref={targetMediaInputRef}
               className="hidden"
               type="file"
-              accept="video/mp4,video/webm"
+              accept={VIDEO_FILE_EXTENSIONS.map((extension) => `.${extension}`).join(",")}
               multiple
               aria-label="导入原片素材文件"
               onChange={(event) => {
@@ -420,7 +635,7 @@ export function AssetPanel() {
               ref={sourceMediaInputRef}
               className="hidden"
               type="file"
-              accept="video/mp4,video/webm"
+              accept={VIDEO_FILE_EXTENSIONS.map((extension) => `.${extension}`).join(",")}
               multiple
               aria-label="导入 B 站参考素材文件"
               onChange={(event) => {
@@ -434,7 +649,7 @@ export function AssetPanel() {
               ref={reconnectMediaInputRef}
               className="hidden"
               type="file"
-              accept="video/mp4,video/webm"
+              accept={VIDEO_FILE_EXTENSIONS.map((extension) => `.${extension}`).join(",")}
               aria-label="重新连接媒体素材文件"
               onChange={(event) => {
                 const file = event.target.files?.[0];
@@ -447,45 +662,40 @@ export function AssetPanel() {
             />
           </div>
         ) : null}
-        {tab === "danmaku" ? (
+        {section === "editing" ? (
           <div className="grid gap-3">
             <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
               <h3 className="text-sm font-medium text-slate-100">下一步</h3>
               <p className="mt-2 leading-5 text-slate-500">
                 {project.assets.length === 0
-                  ? "先导入 B 站 XML 弹幕文件。导入后，它们会出现在下面的素材列表里。"
+                  ? "还没有弹幕 XML。请先到素材页导入。"
                   : project.clips.length === 0
                     ? "把弹幕素材放到时间轴。多分 P 文件可以直接按顺序排列。"
                     : "现在可以在时间轴预览和微调弹幕；遇到视频版本删减时，用“标记版本差异”。"}
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
-                <TextButton onClick={autoArrangeClips} disabled={project.assets.length === 0}>
-                  <Shuffle size={14} />
-                  按顺序放入时间轴
-                </TextButton>
-                <TextButton
-                  tone="primary"
-                  onClick={() => void exportBatchMergePlan(batchMergePlan, project.name)}
-                  disabled={batchMergePlan.episodes.length === 0}
-                  title="按当前批量规则导出多个分集 XML"
-                >
-                  <Download size={14} />
-                  导出分集 XML
-                </TextButton>
+                {project.assets.length === 0 ? (
+                  <TextButton tone="primary" onClick={() => setWorkspacePage("materials")}>
+                    <ListPlus size={14} />
+                    去素材页导入
+                  </TextButton>
+                ) : (
+                  <TextButton onClick={autoArrangeClips}>
+                    <Shuffle size={14} />
+                    按顺序放入时间轴
+                  </TextButton>
+                )}
               </div>
             </section>
-            {importProgress !== null ? (
-              <div className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
-                正在导入 XML... {Math.round(importProgress * 100)}%
-              </div>
-            ) : null}
             {project.assets.length === 0 ? (
-              <EmptyState title="尚未导入 XML" text="可一次选择多个 Bilibili XML 分 P 文件。" />
+              <EmptyState
+                title="尚未导入 XML"
+                text="到素材页导入 Bilibili XML 后，这里会显示可编辑的弹幕素材。"
+              />
             ) : (
               project.assets.map((asset) => {
                 const range = getAssetTimeRange(asset);
                 const inTimeline = project.clips.some((clip) => clip.assetId === asset.id);
-                const sourceBinding = findDanmakuSourceBinding(project.danmakuSourceBindings, asset.id);
                 return (
                   <article
                     key={asset.id}
@@ -493,52 +703,23 @@ export function AssetPanel() {
                     data-testid="asset-card"
                   >
                     <div className="flex items-center gap-2">
-                      <span className="h-3 w-3 rounded-sm" style={{ background: asset.color }} />
-                      <h3 className="min-w-0 flex-1 truncate text-sm font-medium text-slate-100">{asset.fileName}</h3>
+                      <span
+                        className="h-3 w-3 rounded-sm"
+                        style={{ background: asset.color }}
+                      />
+                      <h3 className="min-w-0 flex-1 truncate text-sm font-medium text-slate-100">
+                        {asset.fileName}
+                      </h3>
                     </div>
                     <dl className="mt-3 grid gap-1 text-xs text-slate-400">
-                      <Row label="弹幕数量" value={asset.items.length.toLocaleString("zh-CN")} />
+                      <Row
+                        label="弹幕数量"
+                        value={asset.items.length.toLocaleString("zh-CN")}
+                      />
                       <Row label="最早时间" value={formatTimecode(range.earliestMs)} />
                       <Row label="最晚时间" value={formatTimecode(range.latestMs)} />
                       <Row label="状态" value={inTimeline ? "已放入时间轴" : "未放入时间轴"} />
-                      <Row label="导入警告" value={asset.warnings.length.toString()} />
                     </dl>
-                    <div className="mt-3 grid gap-2 rounded border border-panel-line/70 bg-black/15 p-2 text-xs">
-                      <label className="grid gap-1">
-                        <span className="text-slate-500">弹幕来源视频</span>
-                        <select
-                          aria-label={`${asset.fileName} 弹幕来源视频`}
-                          className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-                          value={sourceBinding?.sourceMediaId ?? ""}
-                          onChange={(event) => {
-                            if (event.target.value.length > 0) {
-                              bindXmlToSourceMedia(asset.id, event.target.value);
-                            } else {
-                              clearXmlSourceBinding(asset.id);
-                            }
-                          }}
-                        >
-                          <option value="">未绑定</option>
-                          {bilibiliReferenceMedia.map((media) => (
-                            <option key={media.id} value={media.id}>
-                              {media.name}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      {sourceBinding ? (
-                        <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
-                          <span className="min-w-0 truncate">
-                            已关联：{findProjectMedia(project, sourceBinding.sourceMediaId)?.fileName ?? sourceBinding.sourceMediaId}
-                          </span>
-                          <TextButton onClick={() => clearXmlSourceBinding(asset.id)}>解除绑定</TextButton>
-                        </div>
-                      ) : (
-                        <p className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
-                          该 XML 尚未关联弹幕来源视频，仍可编辑但无法进行可靠的来源段匹配。
-                        </p>
-                      )}
-                    </div>
                     <div className="mt-3 flex flex-wrap gap-2">
                       <TextButton
                         onClick={() => addAssetToTimeline(asset.id)}
@@ -551,7 +732,9 @@ export function AssetPanel() {
                       {inTimeline ? (
                         <TextButton
                           onClick={() => {
-                            const clip = project.clips.find((candidate) => candidate.assetId === asset.id);
+                            const clip = project.clips.find(
+                              (candidate) => candidate.assetId === asset.id
+                            );
                             if (clip) {
                               select({ kind: "clip", ids: [clip.id] });
                             }
@@ -559,51 +742,266 @@ export function AssetPanel() {
                         >
                           <Layers size={14} />
                           选择片段
-                          </TextButton>
+                        </TextButton>
                       ) : null}
                       {inTimeline ? (
-                        <TextButton title="从时间轴移出，保留资源" onClick={() => removeAssetFromTimeline(asset.id)}>
+                        <TextButton
+                          title="从时间轴移出，保留资源"
+                          onClick={() => removeAssetFromTimeline(asset.id)}
+                        >
                           <ListX size={14} />
                           移出
                         </TextButton>
                       ) : null}
-                      <TextButton tone="danger" title="删除资源及关联片段" onClick={() => removeAsset(asset.id)}>
-                        <Trash2 size={14} />
-                        删除
-                      </TextButton>
                     </div>
                   </article>
                 );
               })
             )}
+            {project.assets.length > 0 ? (
+              <>
+                <CompensationMarkersPanel
+                  markers={project.cutMarkers}
+                  selectedIds={selection.kind === "cut" ? selection.ids : []}
+                  onFocus={(marker) => {
+                    select({ kind: "cut", ids: [marker.id] });
+                    setPlayhead(marker.sourceAtMs);
+                  }}
+                  onUpdate={updateCutMarker}
+                  onDelete={deleteCutMarker}
+                />
+                <SyncAnchorsPanel
+                  anchors={project.syncAnchors}
+                  onFocus={(anchor) => setPlayhead(anchor.sourceMs)}
+                  onUpdate={updateSyncAnchor}
+                  onDelete={deleteSyncAnchor}
+                />
+              </>
+            ) : null}
+          </div>
+        ) : null}
+        {section === "matching" ? (
+          <div className="grid gap-3">
+            <WorkspaceProgressBanner pageId="matching" />
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <h3 className="text-sm font-medium text-slate-100">匹配：参考视频 → 原片</h3>
+              <p className="mt-2 leading-5 text-slate-500">
+                这一页回答一个问题：B
+                站参考视频的哪一段对应哪个原片。产出是“来源内容段”和段内删减修正；
+                导出页会按这些结果把弹幕投影到每个原片。
+              </p>
+              {project.assets.length === 0 ||
+              bilibiliReferenceMedia.length === 0 ||
+              targetOriginalMedia.length === 0 ? (
+                <div className="mt-3 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 leading-5 text-accent-yellow">
+                  {project.assets.length === 0
+                    ? "还没有弹幕 XML。"
+                    : bilibiliReferenceMedia.length === 0
+                      ? "还没有 B 站参考素材。"
+                      : "还没有原片素材。"}
+                  请先到素材页补齐。
+                  <div className="mt-2">
+                    <TextButton tone="primary" onClick={() => setWorkspacePage("materials")}>
+                      去素材页
+                    </TextButton>
+                  </div>
+                </div>
+              ) : null}
+            </section>
+            {project.assets.length > 0 ? (
+              <>
+                <MediaMatchingPanel
+                  project={project}
+                  suspectedCutCandidates={suspectedCutCandidates}
+                />
+                <details className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+                  <summary className="cursor-pointer text-sm font-medium text-slate-100">
+                    手动补充或精修来源段
+                  </summary>
+                  <p className="mt-2 leading-5 text-slate-500">
+                    自动候选不足时再使用。所属 XML
+                    决定参考素材；这里可调整来源范围、目标起点和段内删减修正。
+                  </p>
+                  <div className="mt-3">
+                    <SourceTimelineSegmentsPanel
+                      segments={project.danmakuSourceSegments}
+                      assets={project.assets}
+                      sourceBindings={project.danmakuSourceBindings}
+                      sourceMediaOptions={bilibiliReferenceMedia}
+                      targetMediaOptions={targetOriginalMedia}
+                      plan={batchMergePlan}
+                      summary={sourceTimelineSummary}
+                      onAdd={addDanmakuSourceSegment}
+                      onUpdate={updateDanmakuSourceSegment}
+                      onDelete={deleteDanmakuSourceSegment}
+                      onFocus={(timeMs) => {
+                        setPlayhead(timeMs);
+                        setStatus({
+                          message: `已定位弹幕来源时间：${formatTimecode(timeMs)}。`,
+                          tone: "success"
+                        });
+                      }}
+                    />
+                  </div>
+                </details>
+                <details
+                  className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+                  data-testid="legacy-alignment-diagnostics"
+                >
+                  <summary className="cursor-pointer text-sm font-medium text-slate-100">
+                    高级诊断：旧单对单实验室与对齐 JSON
+                  </summary>
+                  <p className="mt-2 leading-5 text-slate-500">
+                    仅用于旧项目兼容、算法诊断和手工校准。普通多集工作流请使用上方项目素材批量匹配；这里的全局锚点与版本差异不会替代已确认的来源段。
+                  </p>
+                  <div className="mt-3 grid gap-3">
+                    <VideoAlignmentLabPanel
+                      enabled
+                      project={project}
+                      suspectedCutCandidates={suspectedCutCandidates}
+                      text={alignmentProposalText}
+                      proposal={alignmentProposal}
+                      preview={alignmentPreview}
+                      onTextChange={setAlignmentProposalText}
+                      onImportText={importAlignmentProposalText}
+                      onApply={applyAlignmentProposal}
+                      onApplyCutCandidate={(candidate) =>
+                        applyAlignmentProposalData(createSingleCutCandidateProposal(candidate))
+                      }
+                      onClear={() => {
+                        if (alignmentProposal) {
+                          clearAlignmentProposal();
+                        } else {
+                          setStatus({ message: "已清空对齐提案草稿。", tone: "neutral" });
+                        }
+                        setAlignmentProposalText("");
+                      }}
+                      onFocusQueueItem={(sourceAtMs, name) => {
+                        setPlayhead(sourceAtMs);
+                        setStatus({
+                          message: `已定位复核项：${name}（${formatTimecode(sourceAtMs)}）。`,
+                          tone: "success"
+                        });
+                      }}
+                    />
+                    <SuspectedCutPanel
+                      candidates={suspectedCutCandidates}
+                      cutMarkers={project.cutMarkers}
+                      keywordsText={cutHintSettings.keywordsText}
+                      windowSeconds={cutHintSettings.windowSeconds}
+                      minHitCount={cutHintSettings.minHitCount}
+                      warnings={cutHintSearch.warnings}
+                      onKeywordsTextChange={(keywordsText) =>
+                        setCutHintSettings({ keywordsText })
+                      }
+                      onWindowSecondsChange={(windowSeconds) =>
+                        setCutHintSettings({ windowSeconds })
+                      }
+                      onMinHitCountChange={(minHitCount) => setCutHintSettings({ minHitCount })}
+                      onApply={(candidate) => {
+                        addCutMarker(candidate.sourceAtMs, 45_000, {
+                          name: `待确认版本差异 ${formatTimecode(candidate.sourceAtMs)}`,
+                          note: `由弹幕文本扫描生成，需人工复核。来源：${candidate.assetFileName}；关键词：${candidate.keywords.join("、")}`
+                        });
+                      }}
+                    />
+                    <AnchorCalibrationPanel
+                      text={anchorCalibrationText}
+                      proposal={anchorCalibrationProposal}
+                      onTextChange={setAnchorCalibrationText}
+                      onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
+                      onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
+                    />
+                  </div>
+                </details>
+              </>
+            ) : (
+              <EmptyState
+                title="先导入素材"
+                text="匹配需要弹幕 XML、B 站参考素材和原片素材。"
+              />
+            )}
+          </div>
+        ) : null}
+        {section === "export" ? (
+          <div className="grid gap-3 text-xs text-slate-400">
+            <WorkspaceProgressBanner pageId="export" />
+            <ProjectionExportPanel
+              projection={sourceProjection}
+              projectName={project.name}
+              onGoMatching={() => setWorkspacePage("matching")}
+            />
+            <ExportReadinessPanel
+              projectName={project.name}
+              reportSummary={projectHealth}
+              readiness={projectReadiness}
+              onCleanupEditReferences={cleanupProjectEditReferences}
+              onCleanupMissingAssetClips={cleanupProjectMissingAssetClips}
+            />
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <h3 className="text-sm font-medium text-slate-100">其他导出方式</h3>
+              <p className="mt-2 leading-5 text-slate-500">
+                以下为单文件或传统分 P
+                合并导出，不依赖来源段投影。多集场景请优先使用上方「按原片分集导出」。
+              </p>
+            </section>
+            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <h3 className="text-sm font-medium text-slate-100">
+                导出当前编辑时间轴（单文件）
+              </h3>
+              <p className="mt-2 leading-5 text-slate-500">
+                把编辑页时间轴上的全部弹幕（含全局偏移、版本差异、单条调整）合并导出为一个
+                XML。适合单集修正场景。
+              </p>
+              <div className="mt-3">
+                <TextButton
+                  tone="primary"
+                  onClick={prepareExport}
+                  disabled={project.clips.length === 0}
+                  title={
+                    project.clips.length === 0
+                      ? "编辑页时间轴上还没有弹幕片段。"
+                      : "预览并导出单个 XML"
+                  }
+                >
+                  <Download size={14} />
+                  预览并导出单个 XML
+                </TextButton>
+              </div>
+            </section>
             <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
               <button
                 type="button"
                 className="flex w-full items-center justify-between gap-3 text-left"
-                aria-expanded={advancedOpen}
-                onClick={() => setAdvancedOpen((open) => !open)}
+                aria-expanded={legacyExportOpen}
+                onClick={() => setLegacyExportOpen((open) => !open)}
               >
                 <span>
-                  <span className="block text-sm font-medium text-slate-100">高级工具</span>
+                  <span className="block text-sm font-medium text-slate-100">
+                    按文件名分 P 合并导出（传统方式）
+                  </span>
                   <span className="mt-1 block leading-5 text-slate-500">
-                    Emby 时长、批量整理、弹幕来源内容段、版本差异列表、差异扫描和视频对齐都在这里。
+                    不依赖来源段，按 XML 文件名识别集数并切分合并。适合命名规范的分 P 弹幕。
                   </span>
                 </span>
                 <span className="shrink-0 rounded border border-panel-line px-2 py-1 text-[11px] text-slate-300">
-                  {advancedOpen ? "收起" : "展开"}
+                  {legacyExportOpen ? "收起" : "展开"}
                 </span>
               </button>
-              {advancedOpen ? (
+              {legacyExportOpen ? (
                 <div className="mt-3 grid gap-3">
-                  <EmbyMetadataPanel
-                    onImportDurationLines={(lines) => {
-                      setEpisodeDurationsText(lines);
-                      setLongSplitMode("durations");
-                      setStatus({ message: "已把 Emby 剧集时长导入批量整理规则。", tone: "success" });
-                    }}
-                  />
                   {project.assets.length > 0 ? (
                     <>
+                      <EmbyMetadataPanel
+                        onImportDurationLines={(lines) => {
+                          setEpisodeDurationsText(lines);
+                          setLongSplitMode("durations");
+                          setStatus({
+                            message: "已把 Emby 剧集时长导入批量整理规则。",
+                            tone: "success"
+                          });
+                        }}
+                      />
                       <ManualRulePanel
                         partWindowMode={partWindowMode}
                         partWindowMinutes={partWindowMinutes}
@@ -621,89 +1019,6 @@ export function AssetPanel() {
                         onEpisodeDurationsTextChange={setEpisodeDurationsText}
                         onCutPointsTextChange={setCutPointsText}
                       />
-                      <CompensationMarkersPanel
-                        markers={project.cutMarkers}
-                        selectedIds={selection.kind === "cut" ? selection.ids : []}
-                        onFocus={(marker) => {
-                          select({ kind: "cut", ids: [marker.id] });
-                          setPlayhead(marker.sourceAtMs);
-                        }}
-                        onUpdate={updateCutMarker}
-                        onDelete={deleteCutMarker}
-                      />
-                      <SuspectedCutPanel
-                        candidates={suspectedCutCandidates}
-                        cutMarkers={project.cutMarkers}
-                        keywordsText={cutHintSettings.keywordsText}
-                        windowSeconds={cutHintSettings.windowSeconds}
-                        minHitCount={cutHintSettings.minHitCount}
-                        warnings={cutHintSearch.warnings}
-                        onKeywordsTextChange={(keywordsText) => setCutHintSettings({ keywordsText })}
-                        onWindowSecondsChange={(windowSeconds) => setCutHintSettings({ windowSeconds })}
-                        onMinHitCountChange={(minHitCount) => setCutHintSettings({ minHitCount })}
-                        onApply={(candidate) => {
-                          addCutMarker(candidate.sourceAtMs, 45_000, {
-                            name: `待确认版本差异 ${formatTimecode(candidate.sourceAtMs)}`,
-                            note: `由弹幕文本扫描生成，需人工复核。来源：${candidate.assetFileName}；关键词：${candidate.keywords.join("、")}`
-                          });
-                        }}
-                      />
-                      <AnchorCalibrationPanel
-                        text={anchorCalibrationText}
-                        proposal={anchorCalibrationProposal}
-                        onTextChange={setAnchorCalibrationText}
-                        onPreview={() => previewAlignmentProposalData(anchorCalibrationProposal)}
-                        onApply={() => applyAlignmentProposalData(anchorCalibrationProposal)}
-                      />
-                      <SourceTimelineSegmentsPanel
-                        segments={project.danmakuSourceSegments}
-                        assets={project.assets}
-                        sourceMediaOptions={bilibiliReferenceMedia}
-                        targetMediaOptions={targetOriginalMedia}
-                        plan={batchMergePlan}
-                        summary={sourceTimelineSummary}
-                        onAdd={addDanmakuSourceSegment}
-                        onUpdate={updateDanmakuSourceSegment}
-                        onDelete={deleteDanmakuSourceSegment}
-                        onFocus={(timeMs) => {
-                          setPlayhead(timeMs);
-                          setStatus({ message: `已定位弹幕来源时间：${formatTimecode(timeMs)}。`, tone: "success" });
-                        }}
-                      />
-                      <SyncAnchorsPanel
-                        anchors={project.syncAnchors}
-                        onFocus={(anchor) => setPlayhead(anchor.sourceMs)}
-                        onUpdate={updateSyncAnchor}
-                        onDelete={deleteSyncAnchor}
-                      />
-                      <VideoAlignmentLabPanel
-                        project={project}
-                        suspectedCutCandidates={suspectedCutCandidates}
-                        text={alignmentProposalText}
-                        proposal={alignmentProposal}
-                        preview={alignmentPreview}
-                        onTextChange={setAlignmentProposalText}
-                        onImportText={importAlignmentProposalText}
-                        onApply={applyAlignmentProposal}
-                        onApplyCutCandidate={(candidate) =>
-                          applyAlignmentProposalData(createSingleCutCandidateProposal(candidate))
-                        }
-                        onClear={() => {
-                          if (alignmentProposal) {
-                            clearAlignmentProposal();
-                          } else {
-                            setStatus({ message: "已清空对齐提案草稿。", tone: "neutral" });
-                          }
-                          setAlignmentProposalText("");
-                        }}
-                        onFocusQueueItem={(sourceAtMs, name) => {
-                          setPlayhead(sourceAtMs);
-                          setStatus({
-                            message: `已定位复核项：${name}（${formatTimecode(sourceAtMs)}）。`,
-                            tone: "success"
-                          });
-                        }}
-                      />
                       <SeasonWorkbenchPanel summary={seasonWorkbench} />
                       <SeasonEpisodeBindingPanel
                         plan={batchMergePlan}
@@ -713,27 +1028,32 @@ export function AssetPanel() {
                           bindCurrentTargetToSeasonEpisode(episodeKey, episodeLabel)
                         }
                         onClear={clearSeasonEpisodeBinding}
-                        onOpenMediaTab={() => setTab("media")}
+                        onOpenMediaTab={() => setWorkspacePage("materials")}
                       />
-                      <BatchMergeSummary plan={batchMergePlan} warnings={manualRules.warnings} />
+                      <BatchMergeSummary
+                        plan={batchMergePlan}
+                        warnings={manualRules.warnings}
+                      />
+                      <div className="flex justify-end">
+                        <TextButton
+                          tone="primary"
+                          onClick={() =>
+                            void exportBatchMergePlan(batchMergePlan, project.name)
+                          }
+                          disabled={batchMergePlan.episodes.length === 0}
+                          title="按当前批量规则导出多个分集 XML"
+                        >
+                          <Download size={14} />
+                          导出分集 XML
+                        </TextButton>
+                      </div>
                     </>
                   ) : (
-                    <EmptyState title="先导入 XML" text="高级工具会基于已导入的弹幕素材生成规则和候选。" />
+                    <EmptyState title="先导入 XML" text="分 P 合并导出基于已导入的弹幕素材。" />
                   )}
                 </div>
               ) : null}
             </section>
-          </div>
-        ) : null}
-        {tab === "project" ? (
-          <div className="grid gap-3 text-xs text-slate-400">
-            <ExportReadinessPanel
-              projectName={project.name}
-              reportSummary={projectHealth}
-              readiness={projectReadiness}
-              onCleanupEditReferences={cleanupProjectEditReferences}
-              onCleanupMissingAssetClips={cleanupProjectMissingAssetClips}
-            />
             <div className="rounded border border-panel-line bg-panel-soft p-3">
               <h3 className="mb-2 text-sm font-medium text-slate-100">{project.name}</h3>
               <Row label="资源数" value={project.assets.length.toString()} />
@@ -743,8 +1063,14 @@ export function AssetPanel() {
               <Row label="禁用弹幕" value={project.disabledItemIds.length.toString()} />
               <Row label="目标原片" value={formatMediaBindingTitle(project.mediaBinding)} />
               <Row label="全局偏移" value={`${project.globalOffsetMs} ms`} />
-              <Row label="创建时间" value={new Date(project.createdAt).toLocaleString("zh-CN")} />
-              <Row label="更新时间" value={new Date(project.updatedAt).toLocaleString("zh-CN")} />
+              <Row
+                label="创建时间"
+                value={new Date(project.createdAt).toLocaleString("zh-CN")}
+              />
+              <Row
+                label="更新时间"
+                value={new Date(project.updatedAt).toLocaleString("zh-CN")}
+              />
             </div>
           </div>
         ) : null}
@@ -779,7 +1105,9 @@ function TargetMediaBindingPanel({
     (Boolean(binding.localPath) ||
       Boolean(bindingMedia?.objectUrl) ||
       (Boolean(media?.objectUrl) &&
-        (binding.mediaId ? media?.id === binding.mediaId : media?.fileName === binding.fileName)));
+        (binding.mediaId
+          ? media?.id === binding.mediaId
+          : media?.fileName === binding.fileName)));
   const statusText = !binding
     ? "未绑定"
     : binding.kind === "localFile"
@@ -806,16 +1134,26 @@ function TargetMediaBindingPanel({
           <Row label="名称" value={formatMediaBindingTitle(binding)} />
           <Row label="来源" value={formatMediaBindingSource(binding)} />
           <Row label="位置" value={formatMediaBindingEpisode(binding)} />
-          <Row label="时长" value={binding.runtimeMs === null ? "未知" : formatTimecode(binding.runtimeMs)} />
+          <Row
+            label="时长"
+            value={binding.runtimeMs === null ? "未知" : formatTimecode(binding.runtimeMs)}
+          />
           {binding.kind === "localFile" ? (
-            <Row label="本地路径" value={binding.localPath ? binding.localPath : "未保存路径"} />
+            <Row
+              label="本地路径"
+              value={binding.localPath ? binding.localPath : "未保存路径"}
+            />
           ) : null}
           {binding.kind === "embyItem" ? (
             <>
               <Row label="条目 ID" value={binding.itemId} />
               <Row
                 label="媒体源"
-                value={binding.mediaSources[0] ? formatMediaSourceSummary(binding.mediaSources[0]) : "暂未读取"}
+                value={
+                  binding.mediaSources[0]
+                    ? formatMediaSourceSummary(binding.mediaSources[0])
+                    : "暂未读取"
+                }
               />
             </>
           ) : null}
@@ -863,7 +1201,10 @@ function MediaLibrarySection({
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2">
-        <Video size={16} className={role === "targetOriginal" ? "text-accent-green" : "text-accent-cyan"} />
+        <Video
+          size={16}
+          className={role === "targetOriginal" ? "text-accent-green" : "text-accent-cyan"}
+        />
         <h3 className="text-sm font-medium text-slate-100">{title}</h3>
         <span className="ml-auto rounded border border-panel-line bg-black/20 px-2 py-0.5 text-[11px] text-slate-500">
           {mediaItems.length} 个
@@ -873,15 +1214,21 @@ function MediaLibrarySection({
       <div className="mt-3 flex flex-wrap gap-2">
         <TextButton tone="primary" onClick={onImport}>
           <FolderOpen size={14} />
-          {role === "targetOriginal" ? "导入原片素材" : "导入 B 站参考素材"}
+          {role === "targetOriginal" ? "批量导入原片素材" : "批量导入 B 站参考素材"}
         </TextButton>
       </div>
       {mediaItems.length > 0 ? (
         <div className="mt-3 grid gap-2">
           {mediaItems.map((media) => (
-            <article key={media.id} className="rounded border border-panel-line/80 bg-[#111318] p-2">
+            <article
+              key={media.id}
+              className="rounded border border-panel-line/80 bg-[#111318] p-2"
+            >
               <div className="flex items-center gap-2">
-                <span className="min-w-0 flex-1 truncate text-sm text-slate-100" title={media.name}>
+                <span
+                  className="min-w-0 flex-1 truncate text-sm text-slate-100"
+                  title={media.name}
+                >
                   {media.name}
                 </span>
                 <span className="shrink-0 rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
@@ -891,17 +1238,24 @@ function MediaLibrarySection({
               <dl className="mt-2 grid gap-1 text-slate-400">
                 <Row label="文件" value={media.fileName} />
                 <Row label="角色" value={formatMediaRole(media.role)} />
-                <Row label="时长" value={media.durationMs === null ? "时长未知" : formatTimecode(media.durationMs)} />
+                <Row
+                  label="时长"
+                  value={
+                    media.durationMs === null ? "时长未知" : formatTimecode(media.durationMs)
+                  }
+                />
                 <Row label="来源" value={media.sourceSummary} />
                 <Row label="引用" value={formatProjectMediaReferenceKind(media)} />
               </dl>
               {media.connectionState === "needsReconnect" ? (
                 <p className="mt-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
                   此素材使用的是临时浏览器引用，重新打开项目后需要重新选择原文件。项目中的绑定和时间段信息仍然保留。
+                  自动匹配需要桌面端持久本地路径；请删除此临时引用后，使用本区的批量导入按钮重新加入。
                 </p>
               ) : null}
               <div className="mt-2 flex flex-wrap justify-end gap-2">
-                {media.connectionState === "needsReconnect" || media.referenceKind === "browserFile" ? (
+                {media.connectionState === "needsReconnect" ||
+                media.referenceKind === "browserFile" ? (
                   <TextButton onClick={() => onReconnect(media.id)}>
                     <FolderOpen size={14} />
                     重新连接
@@ -918,7 +1272,11 @@ function MediaLibrarySection({
       ) : (
         <EmptyState
           title={role === "targetOriginal" ? "尚未导入原片素材" : "尚未导入 B 站参考素材"}
-          text={role === "targetOriginal" ? "可连续导入多个完整版或目标集视频。" : "可连续导入多个 B 站单集、合集或删减版参考视频。"}
+          text={
+            role === "targetOriginal"
+              ? "可连续导入多个完整版或目标集视频。"
+              : "可连续导入多个 B 站单集、合集或删减版参考视频。"
+          }
         />
       )}
     </section>
@@ -927,12 +1285,10 @@ function MediaLibrarySection({
 
 function MediaRoleGuidePanel({
   targetCount,
-  referenceCount,
-  binding
+  referenceCount
 }: {
   targetCount: number;
   referenceCount: number;
-  binding: MediaBinding | null;
 }) {
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
@@ -941,13 +1297,12 @@ function MediaRoleGuidePanel({
         <h3 className="text-sm font-medium text-slate-100">视频来源</h3>
       </div>
       <p className="mt-2 leading-5 text-slate-500">
-        视频只作为时间轴证据或目标标准时间轴，项目文件不会保存视频内容。最终输出为正常的 XML 弹幕文件，弹幕时间将匹配到原片标准时间轴。
+        按四页动线工作：先在素材页导入并绑定，再在匹配页标出来源段，最后在导出页按原片分集导出。视频不嵌入项目文件。
       </p>
       <dl className="mt-3 grid gap-2">
         <Row label="原片素材" value={`${targetCount} 个`} />
         <Row label="B 站参考" value={`${referenceCount} 个`} />
-        <Row label="目标原片" value={formatMediaBindingTitle(binding)} />
-        <Row label="关系" value="XML 绑定 B 站参考素材，来源段再指向具体原片素材" />
+        <Row label="关系" value="XML → 参考视频 → 来源段 → 原片" />
       </dl>
     </section>
   );
@@ -966,12 +1321,16 @@ function ProjectMatchAssessmentPanel({
       <div className="flex items-center gap-2">
         <WandSparkles size={16} className="text-accent-cyan" />
         <h3 className="text-sm font-medium text-slate-100">匹配评分</h3>
-        <span className={`ml-auto rounded border px-2 py-0.5 text-[11px] ${projectMatchBadgeClass(assessment.conclusion)}`}>
+        <span
+          className={`ml-auto rounded border px-2 py-0.5 text-[11px] ${projectMatchBadgeClass(assessment.conclusion)}`}
+        >
           {assessment.conclusionLabel}
         </span>
       </div>
       <div className="mt-3 grid grid-cols-[64px_minmax(0,1fr)] gap-3">
-        <div className={`flex h-14 items-center justify-center rounded border text-lg font-semibold ${projectMatchScoreClass(assessment.conclusion)}`}>
+        <div
+          className={`flex h-14 items-center justify-center rounded border text-lg font-semibold ${projectMatchScoreClass(assessment.conclusion)}`}
+        >
           {formatProjectMatchScore(assessment.score)}
         </div>
         <div className="min-w-0">
@@ -985,7 +1344,10 @@ function ProjectMatchAssessmentPanel({
       </dl>
       <div className="mt-3 grid gap-2">
         {assessment.criteria.map((criterion) => (
-          <div key={criterion.id} className="rounded border border-panel-line/70 bg-black/15 p-2">
+          <div
+            key={criterion.id}
+            className="rounded border border-panel-line/70 bg-black/15 p-2"
+          >
             <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
               <span className={`text-[11px] ${projectMatchCriterionClass(criterion.state)}`}>
                 {projectMatchCriterionStateText(criterion.state)}
@@ -997,7 +1359,10 @@ function ProjectMatchAssessmentPanel({
             </div>
             <p className="mt-1 leading-5 text-slate-500">{criterion.detail}</p>
             {criterion.evidence.length > 0 ? (
-              <p className="mt-1 truncate text-[11px] text-slate-400" title={criterion.evidence.join("；")}>
+              <p
+                className="mt-1 truncate text-[11px] text-slate-400"
+                title={criterion.evidence.join("；")}
+              >
                 {criterion.evidence.join("；")}
               </p>
             ) : null}
@@ -1008,7 +1373,11 @@ function ProjectMatchAssessmentPanel({
         <TextButton
           onClick={onPreview}
           disabled={!canPreview}
-          title={canPreview ? "把评分诊断和候选同步线索送入时间轴预览" : "绑定目标原片并导入 XML 后可生成提案"}
+          title={
+            canPreview
+              ? "把评分诊断和候选同步线索送入时间轴预览"
+              : "绑定目标原片并导入 XML 后可生成提案"
+          }
         >
           <Crosshair size={14} />
           预览评分提案
@@ -1021,7 +1390,11 @@ function ProjectMatchAssessmentPanel({
 const EMBY_INPUT_CLASS =
   "h-8 min-w-0 w-full rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100";
 
-function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (lines: string) => void }) {
+function EmbyMetadataPanel({
+  onImportDurationLines
+}: {
+  onImportDurationLines: (lines: string) => void;
+}) {
   const [itemId, setItemId] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
   const [sessionState, setSessionState] = useState<EmbySessionState | null>(null);
@@ -1034,7 +1407,10 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
   const selectedItemId = itemId.trim();
   const hasSelectedItem = selectedItemId.length > 0;
 
-  async function runAction<T>(kind: EmbyLoadingKind, action: () => Promise<T>): Promise<T | null> {
+  async function runAction<T>(
+    kind: EmbyLoadingKind,
+    action: () => Promise<T>
+  ): Promise<T | null> {
     setLoading(kind);
     try {
       return await action();
@@ -1058,12 +1434,18 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
       return { connection, session: sessionState.session };
     }
     const nextSession = await runAction("auth", () =>
-      authenticateEmby(connection.config, { username: connection.username, password: connection.password })
+      authenticateEmby(connection.config, {
+        username: connection.username,
+        password: connection.password
+      })
     );
     if (nextSession) {
       setSessionState({ key: connection.sessionKey, session: nextSession });
       setSearchResults([]);
-      setStatus({ message: `Emby 已登录：${nextSession.userName || nextSession.userId}`, tone: "success" });
+      setStatus({
+        message: `Emby 已登录：${nextSession.userName || nextSession.userId}`,
+        tone: "success"
+      });
       return { connection, session: nextSession };
     }
     return null;
@@ -1084,7 +1466,10 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
     if (items) {
       setSearchResults(items);
       setStatus({
-        message: items.length > 0 ? `已找到 ${items.length} 个 Emby 候选条目。` : "没有找到匹配的 Emby 条目。",
+        message:
+          items.length > 0
+            ? `已找到 ${items.length} 个 Emby 候选条目。`
+            : "没有找到匹配的 Emby 条目。",
         tone: items.length > 0 ? "success" : "warning"
       });
     }
@@ -1130,7 +1515,9 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
     if (!ready) {
       return;
     }
-    const item = await runAction("item", () => fetchEmbyItem(ready.connection.config, ready.session, selectedItemId));
+    const item = await runAction("item", () =>
+      fetchEmbyItem(ready.connection.config, ready.session, selectedItemId)
+    );
     if (item) {
       setLoadedItem(item);
       setStatus({ message: `已读取 Emby 条目：${item.name}`, tone: "success" });
@@ -1154,7 +1541,10 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
       setEpisodeItems(items);
       setDurationLines(lines);
       setStatus({
-        message: lines.length > 0 ? `已读取 ${items.length} 个 Emby 剧集条目。` : "未读到带时长的 Emby 剧集。",
+        message:
+          lines.length > 0
+            ? `已读取 ${items.length} 个 Emby 剧集条目。`
+            : "未读到带时长的 Emby 剧集。",
         tone: lines.length > 0 ? "success" : "warning"
       });
     }
@@ -1194,7 +1584,9 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
             disabled={loading !== null}
           >
             <Search size={14} />
-            <span className="truncate">{loading === "auth" ? "连接中" : loading === "search" ? "搜索中" : "搜索"}</span>
+            <span className="truncate">
+              {loading === "auth" ? "连接中" : loading === "search" ? "搜索中" : "搜索"}
+            </span>
           </TextButton>
         </div>
         {searchResults.length > 0 ? (
@@ -1210,7 +1602,9 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
                 onClick={() => selectSearchResult(item)}
               >
                 <span className="truncate">{item.name}</span>
-                <span className="truncate text-[11px] text-slate-500">{formatEmbySearchResultMeta(item)}</span>
+                <span className="truncate text-[11px] text-slate-500">
+                  {formatEmbySearchResultMeta(item)}
+                </span>
               </button>
             ))}
           </div>
@@ -1220,10 +1614,19 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
             <Row label="条目" value={loadedItem.name} />
             <Row label="类型" value={loadedItem.type} />
             {loadedItem.seriesName ? <Row label="剧名" value={loadedItem.seriesName} /> : null}
-            <Row label="时长" value={loadedItem.durationMs === null ? "未知" : formatTimecode(loadedItem.durationMs)} />
+            <Row
+              label="时长"
+              value={
+                loadedItem.durationMs === null ? "未知" : formatTimecode(loadedItem.durationMs)
+              }
+            />
             <Row
               label="媒体源"
-              value={loadedItem.mediaSources[0] ? formatMediaSourceSummary(loadedItem.mediaSources[0]) : "暂未读取"}
+              value={
+                loadedItem.mediaSources[0]
+                  ? formatMediaSourceSummary(loadedItem.mediaSources[0])
+                  : "暂未读取"
+              }
             />
             <div className="mt-2 grid min-w-0 gap-2">
               <TextButton
@@ -1238,14 +1641,20 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
                 onClick={() => void readEpisodes()}
                 disabled={loading !== null || !hasSelectedItem}
               >
-                <span className="truncate">{loading === "episodes" ? "读取中" : "读取下级剧集"}</span>
+                <span className="truncate">
+                  {loading === "episodes" ? "读取中" : "读取下级剧集"}
+                </span>
               </TextButton>
               {loadedItem.durationMs !== null ? (
                 <TextButton className="w-full min-w-0 px-2" onClick={importLoadedItemDuration}>
                   <span className="truncate">导入单条时长</span>
                 </TextButton>
               ) : null}
-              <TextButton tone="primary" className="w-full min-w-0 px-2" onClick={bindLoadedItemAsTarget}>
+              <TextButton
+                tone="primary"
+                className="w-full min-w-0 px-2"
+                onClick={bindLoadedItemAsTarget}
+              >
                 <span className="truncate">绑定为目标原片</span>
               </TextButton>
             </div>
@@ -1259,7 +1668,9 @@ function EmbyMetadataPanel({ onImportDurationLines }: { onImportDurationLines: (
               readOnly
             />
             <div className="grid min-w-0 gap-2">
-              <span className="min-w-0 truncate text-slate-500">{episodeItems.length} 个条目</span>
+              <span className="min-w-0 truncate text-slate-500">
+                {episodeItems.length} 个条目
+              </span>
               <TextButton
                 tone="primary"
                 className="w-full min-w-0 px-2"
@@ -1289,16 +1700,15 @@ function loadEmbyConnectionState(): EmbyConnectionState {
   };
 }
 
-function createEmbyBindingFromItem(item: EmbyItemMetadata, connection: EmbyConnectionState): MediaBinding {
-  return createEmbyItemMediaBinding(
-    createId("media_binding"),
-    item,
-    {
-      serverUrl: connection.config.serverUrl,
-      pathPrefix: connection.config.pathPrefix,
-      username: connection.username
-    }
-  );
+function createEmbyBindingFromItem(
+  item: EmbyItemMetadata,
+  connection: EmbyConnectionState
+): MediaBinding {
+  return createEmbyItemMediaBinding(createId("media_binding"), item, {
+    serverUrl: connection.config.serverUrl,
+    pathPrefix: connection.config.pathPrefix,
+    username: connection.username
+  });
 }
 
 function validateEmbyConnectionState(connection: EmbyConnectionState): boolean {
@@ -1311,7 +1721,10 @@ function validateEmbyConnectionState(connection: EmbyConnectionState): boolean {
     return false;
   }
   if (connection.password.length === 0) {
-    setStatus({ message: "请先在设置中心填写本次会话密码。密码不会写入本地设置。", tone: "warning" });
+    setStatus({
+      message: "请先在设置中心填写本次会话密码。密码不会写入本地设置。",
+      tone: "warning"
+    });
     return false;
   }
   return true;
@@ -1468,7 +1881,13 @@ function ManualRulePanel({
   );
 }
 
-function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBatchMergePlan>; warnings: string[] }) {
+function BatchMergeSummary({
+  plan,
+  warnings
+}: {
+  plan: ReturnType<typeof buildBatchMergePlan>;
+  warnings: string[];
+}) {
   const previewEpisodes = plan.episodes.slice(0, 4);
   const hiddenCount = Math.max(0, plan.episodes.length - previewEpisodes.length);
   return (
@@ -1491,13 +1910,20 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
         <div className="mt-3 grid gap-1">
           {previewEpisodes.map((episode) => (
             <div key={episode.id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-              <span className="truncate" title={`${episode.label}：${episode.sourceFileNames.join("、")}`}>
+              <span
+                className="truncate"
+                title={`${episode.label}：${episode.sourceFileNames.join("、")}`}
+              >
                 {episode.label}
               </span>
-              <span className="text-slate-500">{episode.itemCount.toLocaleString("zh-CN")} 条</span>
+              <span className="text-slate-500">
+                {episode.itemCount.toLocaleString("zh-CN")} 条
+              </span>
             </div>
           ))}
-          {hiddenCount > 0 ? <p className="text-slate-500">另有 {hiddenCount} 个输出。</p> : null}
+          {hiddenCount > 0 ? (
+            <p className="text-slate-500">另有 {hiddenCount} 个输出。</p>
+          ) : null}
         </div>
       ) : null}
       {plan.compensation.markerCount > 0 ? (
@@ -1513,7 +1939,8 @@ function BatchMergeSummary({ plan, warnings }: { plan: ReturnType<typeof buildBa
           <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
             <span className="text-slate-500">影响</span>
             <span>
-              {plan.compensation.affectedEpisodeCount} 个输出，{plan.compensation.affectedEntryCount.toLocaleString("zh-CN")} 条弹幕
+              {plan.compensation.affectedEpisodeCount} 个输出，
+              {plan.compensation.affectedEntryCount.toLocaleString("zh-CN")} 条弹幕
             </span>
           </div>
         </div>
@@ -1534,6 +1961,8 @@ interface SourceSegmentFormState {
   startText: string;
   endText: string;
   targetMediaId: string;
+  targetStartText: string;
+  timingRulesText: string;
   episodeKey: string;
   label: string;
   note: string;
@@ -1542,6 +1971,7 @@ interface SourceSegmentFormState {
 function SourceTimelineSegmentsPanel({
   segments,
   assets,
+  sourceBindings,
   sourceMediaOptions,
   targetMediaOptions,
   plan,
@@ -1553,6 +1983,7 @@ function SourceTimelineSegmentsPanel({
 }: {
   segments: DanmakuSourceSegment[];
   assets: EditorProject["assets"];
+  sourceBindings: EditorProject["danmakuSourceBindings"];
   sourceMediaOptions: ProjectMediaReference[];
   targetMediaOptions: ProjectMediaReference[];
   plan: ReturnType<typeof buildBatchMergePlan>;
@@ -1563,6 +1994,10 @@ function SourceTimelineSegmentsPanel({
   onFocus: (timeMs: Milliseconds) => void;
 }) {
   const episodeOptions = useMemo(() => createSourceSegmentEpisodeOptions(plan), [plan]);
+  const sourceSegmentGroups = useMemo(
+    () => createSourceSegmentGroups(segments, sourceMediaOptions),
+    [segments, sourceMediaOptions]
+  );
   const [form, setForm] = useState<SourceSegmentFormState>({
     kind: "content",
     assetId: "",
@@ -1570,6 +2005,8 @@ function SourceTimelineSegmentsPanel({
     startText: "00:00:00.000",
     endText: "00:24:00.000",
     targetMediaId: "",
+    targetStartText: "00:00:00.000",
+    timingRulesText: "",
     episodeKey: "",
     label: "",
     note: ""
@@ -1578,18 +2015,23 @@ function SourceTimelineSegmentsPanel({
   useEffect(() => {
     setForm((current) => ({
       ...current,
-      assetId: current.assetId.length === 0 && assets.length > 0 ? assets[0].id : current.assetId,
+      assetId:
+        current.assetId.length === 0 && assets.length > 0 ? assets[0].id : current.assetId,
       sourceMediaId:
-        current.sourceMediaId.length === 0 && sourceMediaOptions.length > 0
-          ? sourceMediaOptions[0].id
-          : current.sourceMediaId,
+        findDanmakuSourceBinding(
+          sourceBindings,
+          current.assetId.length === 0 && assets.length > 0 ? assets[0].id : current.assetId
+        )?.sourceMediaId ?? "",
       targetMediaId:
         current.targetMediaId.length === 0 && targetMediaOptions.length > 0
           ? targetMediaOptions[0].id
           : current.targetMediaId,
-      episodeKey: current.episodeKey.length === 0 && episodeOptions.length > 0 ? episodeOptions[0].key : current.episodeKey
+      episodeKey:
+        current.episodeKey.length === 0 && episodeOptions.length > 0
+          ? episodeOptions[0].key
+          : current.episodeKey
     }));
-  }, [assets, episodeOptions, sourceMediaOptions, targetMediaOptions]);
+  }, [assets, episodeOptions, sourceBindings, targetMediaOptions]);
 
   useEffect(() => {
     if (form.kind === "ignored" && form.targetMediaId.length > 0) {
@@ -1636,10 +2078,13 @@ function SourceTimelineSegmentsPanel({
           </div>
         ))}
       </div>
-      <SourceTimelineStrip segments={segments} />
+      <SourceTimelineLanes groups={sourceSegmentGroups} />
       <div className="mt-3 grid gap-1">
         {summary.findings.map((finding) => (
-          <div key={finding.id} className={`rounded border p-2 ${sourceTimelineFindingClass(finding.severity)}`}>
+          <div
+            key={finding.id}
+            className={`rounded border p-2 ${sourceTimelineFindingClass(finding.severity)}`}
+          >
             <div className="font-medium">{finding.title}</div>
             <div className="mt-1 leading-5">{finding.detail}</div>
           </div>
@@ -1653,7 +2098,15 @@ function SourceTimelineSegmentsPanel({
               aria-label="来源段所属 XML"
               className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={form.assetId}
-              onChange={(event) => setForm((current) => ({ ...current, assetId: event.target.value }))}
+              onChange={(event) => {
+                const assetId = event.target.value;
+                setForm((current) => ({
+                  ...current,
+                  assetId,
+                  sourceMediaId:
+                    findDanmakuSourceBinding(sourceBindings, assetId)?.sourceMediaId ?? ""
+                }));
+              }}
             >
               <option value="">请选择 XML</option>
               {assets.map((asset) => (
@@ -1664,14 +2117,14 @@ function SourceTimelineSegmentsPanel({
             </select>
           </label>
           <label className="grid gap-1">
-            <span className="text-slate-500">B 站参考素材</span>
+            <span className="text-slate-500">B 站参考素材（由 XML 绑定决定）</span>
             <select
               aria-label="来源段 B 站参考素材"
-              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
+              className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100 disabled:opacity-70"
               value={form.sourceMediaId}
-              onChange={(event) => setForm((current) => ({ ...current, sourceMediaId: event.target.value }))}
+              disabled
             >
-              <option value="">请选择参考素材</option>
+              <option value="">请先到素材页绑定 XML</option>
               {sourceMediaOptions.map((media) => (
                 <option key={media.id} value={media.id}>
                   {media.name}
@@ -1680,6 +2133,42 @@ function SourceTimelineSegmentsPanel({
             </select>
           </label>
         </div>
+        <details className="rounded border border-panel-line/70 bg-black/10 p-2">
+          <summary className="cursor-pointer text-[11px] text-slate-400">
+            目标起点与段内删减修正
+          </summary>
+          <div className="mt-2 grid gap-2">
+            <label className="grid gap-1">
+              <span className="text-slate-500">目标原片起点</span>
+              <input
+                aria-label="来源段目标原片起点"
+                className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100 disabled:opacity-50"
+                value={form.targetStartText}
+                disabled={form.kind === "ignored"}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, targetStartText: event.target.value }))
+                }
+              />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-slate-500">删减修正（每行：参考时间 -&gt; 毫秒差值）</span>
+              <textarea
+                aria-label="来源段删减修正"
+                className="min-h-20 rounded border border-panel-line bg-[#111318] p-2 text-xs text-slate-100 disabled:opacity-50"
+                value={form.timingRulesText}
+                disabled={form.kind === "ignored"}
+                placeholder="00:12:30.000 -> +45000"
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, timingRulesText: event.target.value }))
+                }
+              />
+            </label>
+            <p className="text-[11px] leading-5 text-slate-500">
+              目标起点影响这一段投影到原片的落点；删减修正只影响该来源段内后续弹幕，不修改原始
+              XML。
+            </p>
+          </div>
+        </details>
         <div className="grid grid-cols-2 gap-2">
           <label className="grid gap-1">
             <span className="text-slate-500">开始</span>
@@ -1687,7 +2176,9 @@ function SourceTimelineSegmentsPanel({
               aria-label="来源段开始"
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={form.startText}
-              onChange={(event) => setForm((current) => ({ ...current, startText: event.target.value }))}
+              onChange={(event) =>
+                setForm((current) => ({ ...current, startText: event.target.value }))
+              }
             />
           </label>
           <label className="grid gap-1">
@@ -1696,7 +2187,9 @@ function SourceTimelineSegmentsPanel({
               aria-label="来源段结束"
               className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
               value={form.endText}
-              onChange={(event) => setForm((current) => ({ ...current, endText: event.target.value }))}
+              onChange={(event) =>
+                setForm((current) => ({ ...current, endText: event.target.value }))
+              }
             />
           </label>
         </div>
@@ -1725,7 +2218,9 @@ function SourceTimelineSegmentsPanel({
               className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100 disabled:opacity-50"
               value={form.targetMediaId}
               disabled={form.kind === "ignored"}
-              onChange={(event) => setForm((current) => ({ ...current, targetMediaId: event.target.value }))}
+              onChange={(event) =>
+                setForm((current) => ({ ...current, targetMediaId: event.target.value }))
+              }
             >
               <option value="">暂不关联</option>
               {targetMediaOptions.map((media) => (
@@ -1743,7 +2238,9 @@ function SourceTimelineSegmentsPanel({
             className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100 disabled:opacity-50"
             value={form.episodeKey}
             disabled={form.kind === "ignored"}
-            onChange={(event) => setForm((current) => ({ ...current, episodeKey: event.target.value }))}
+            onChange={(event) =>
+              setForm((current) => ({ ...current, episodeKey: event.target.value }))
+            }
           >
             <option value="">暂不关联</option>
             {episodeOptions.map((option) => (
@@ -1760,7 +2257,9 @@ function SourceTimelineSegmentsPanel({
             className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
             value={form.label}
             placeholder="留空时自动命名"
-            onChange={(event) => setForm((current) => ({ ...current, label: event.target.value }))}
+            onChange={(event) =>
+              setForm((current) => ({ ...current, label: event.target.value }))
+            }
           />
         </label>
         <label className="grid gap-1">
@@ -1770,7 +2269,9 @@ function SourceTimelineSegmentsPanel({
             className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
             value={form.note}
             placeholder="例如：前两小时为无意义片段"
-            onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))}
+            onChange={(event) =>
+              setForm((current) => ({ ...current, note: event.target.value }))
+            }
           />
         </label>
         <div className="flex justify-end">
@@ -1782,24 +2283,35 @@ function SourceTimelineSegmentsPanel({
       </div>
       {segments.length > 0 ? (
         <div className="mt-3 grid gap-2">
-          {[...segments]
-            .sort((left, right) => left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs)
-            .map((segment) => (
-              <SourceTimelineSegmentRow
-                key={segment.id}
-                segment={segment}
-                assets={assets}
-                sourceMediaOptions={sourceMediaOptions}
-                targetMediaOptions={targetMediaOptions}
-                episodeOptions={episodeOptions}
-                onUpdate={onUpdate}
-                onDelete={onDelete}
-                onFocus={onFocus}
-              />
-            ))}
+          {sourceSegmentGroups.map((group) => (
+            <section
+              key={group.sourceMediaId}
+              className="grid gap-2 rounded border border-panel-line/70 bg-black/10 p-2"
+              aria-label={`${group.label} 来源段`}
+              data-testid="source-segment-lane"
+            >
+              <div className="text-[11px] font-medium text-slate-400">{group.label}</div>
+              {group.segments.map((segment) => (
+                <SourceTimelineSegmentRow
+                  key={segment.id}
+                  segment={segment}
+                  assets={assets}
+                  sourceBindings={sourceBindings}
+                  sourceMediaOptions={sourceMediaOptions}
+                  targetMediaOptions={targetMediaOptions}
+                  episodeOptions={episodeOptions}
+                  onUpdate={onUpdate}
+                  onDelete={onDelete}
+                  onFocus={onFocus}
+                />
+              ))}
+            </section>
+          ))}
         </div>
       ) : null}
-      <p className="mt-3 text-[11px] leading-5 text-slate-500">下一步：{summary.nextActionLabel}</p>
+      <p className="mt-3 text-[11px] leading-5 text-slate-500">
+        下一步：{summary.nextActionLabel}
+      </p>
     </section>
   );
 }
@@ -1807,6 +2319,7 @@ function SourceTimelineSegmentsPanel({
 function SourceTimelineSegmentRow({
   segment,
   assets,
+  sourceBindings,
   sourceMediaOptions,
   targetMediaOptions,
   episodeOptions,
@@ -1816,6 +2329,7 @@ function SourceTimelineSegmentRow({
 }: {
   segment: DanmakuSourceSegment;
   assets: EditorProject["assets"];
+  sourceBindings: EditorProject["danmakuSourceBindings"];
   sourceMediaOptions: ProjectMediaReference[];
   targetMediaOptions: ProjectMediaReference[];
   episodeOptions: SourceSegmentEpisodeOption[];
@@ -1823,7 +2337,9 @@ function SourceTimelineSegmentRow({
   onDelete: (id: string) => void;
   onFocus: (timeMs: Milliseconds) => void;
 }) {
-  const [form, setForm] = useState<SourceSegmentFormState>(() => createFormFromSegment(segment));
+  const [form, setForm] = useState<SourceSegmentFormState>(() =>
+    createFormFromSegment(segment)
+  );
 
   useEffect(() => {
     setForm(createFormFromSegment(segment));
@@ -1834,6 +2350,14 @@ function SourceTimelineSegmentRow({
       setForm((current) => ({ ...current, targetMediaId: "" }));
     }
   }, [form.kind, form.targetMediaId]);
+
+  useEffect(() => {
+    const boundSourceMediaId =
+      findDanmakuSourceBinding(sourceBindings, form.assetId)?.sourceMediaId ?? "";
+    if (boundSourceMediaId !== form.sourceMediaId) {
+      setForm((current) => ({ ...current, sourceMediaId: boundSourceMediaId }));
+    }
+  }, [form.assetId, form.sourceMediaId, sourceBindings]);
 
   const save = () => {
     const draft = createSourceSegmentDraftFromForm(form, episodeOptions);
@@ -1847,7 +2371,9 @@ function SourceTimelineSegmentRow({
   return (
     <article className="grid gap-2 rounded border border-panel-line bg-[#111318] p-2">
       <div className="flex items-center gap-2">
-        <span className={`h-2.5 w-2.5 rounded-sm ${segment.kind === "content" ? "bg-accent-cyan" : "bg-slate-600"}`} />
+        <span
+          className={`h-2.5 w-2.5 rounded-sm ${segment.kind === "content" ? "bg-accent-cyan" : "bg-slate-600"}`}
+        />
         <span className="min-w-0 flex-1 truncate text-slate-100" title={segment.label}>
           {segment.label}
         </span>
@@ -1860,10 +2386,16 @@ function SourceTimelineSegmentRow({
           XML：{assets.find((asset) => asset.id === segment.assetId)?.fileName ?? "未选择"}
         </div>
         <div className="truncate">
-          B 站参考：{sourceMediaOptions.find((media) => media.id === segment.sourceMediaId)?.name ?? "未选择"}
+          B 站参考：
+          {sourceMediaOptions.find((media) => media.id === segment.sourceMediaId)?.name ??
+            "未选择"}
         </div>
         <div className="truncate">
-          目标原片：{segment.kind === "ignored" ? "忽略范围无需目标" : targetMediaOptions.find((media) => media.id === segment.targetMediaId)?.name ?? "未选择"}
+          目标原片：
+          {segment.kind === "ignored"
+            ? "忽略范围无需目标"
+            : (targetMediaOptions.find((media) => media.id === segment.targetMediaId)?.name ??
+              "未选择")}
         </div>
       </div>
       <div className="grid grid-cols-2 gap-2">
@@ -1871,7 +2403,15 @@ function SourceTimelineSegmentRow({
           aria-label={`${segment.label} 所属 XML`}
           className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.assetId}
-          onChange={(event) => setForm((current) => ({ ...current, assetId: event.target.value }))}
+          onChange={(event) => {
+            const assetId = event.target.value;
+            setForm((current) => ({
+              ...current,
+              assetId,
+              sourceMediaId:
+                findDanmakuSourceBinding(sourceBindings, assetId)?.sourceMediaId ?? ""
+            }));
+          }}
         >
           <option value="">请选择 XML</option>
           {assets.map((asset) => (
@@ -1882,11 +2422,11 @@ function SourceTimelineSegmentRow({
         </select>
         <select
           aria-label={`${segment.label} B 站参考素材`}
-          className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
+          className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-70"
           value={form.sourceMediaId}
-          onChange={(event) => setForm((current) => ({ ...current, sourceMediaId: event.target.value }))}
+          disabled
         >
-          <option value="">请选择参考素材</option>
+          <option value="">请先到素材页绑定 XML</option>
           {sourceMediaOptions.map((media) => (
             <option key={media.id} value={media.id}>
               {media.name}
@@ -1894,18 +2434,48 @@ function SourceTimelineSegmentRow({
           ))}
         </select>
       </div>
+      <details className="rounded border border-panel-line/70 bg-black/10 p-2">
+        <summary className="cursor-pointer text-[11px] text-slate-400">
+          目标起点与段内删减修正
+        </summary>
+        <div className="mt-2 grid gap-2">
+          <input
+            aria-label={`${segment.label} 目标原片起点`}
+            className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-50"
+            value={form.targetStartText}
+            disabled={form.kind === "ignored"}
+            onChange={(event) =>
+              setForm((current) => ({ ...current, targetStartText: event.target.value }))
+            }
+          />
+          <textarea
+            aria-label={`${segment.label} 删减修正`}
+            className="min-h-20 rounded border border-panel-line bg-black/20 p-2 text-xs text-slate-100 disabled:opacity-50"
+            value={form.timingRulesText}
+            disabled={form.kind === "ignored"}
+            placeholder="00:12:30.000 -> +45000"
+            onChange={(event) =>
+              setForm((current) => ({ ...current, timingRulesText: event.target.value }))
+            }
+          />
+        </div>
+      </details>
       <div className="grid grid-cols-2 gap-2">
         <input
           aria-label={`${segment.label} 开始`}
           className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.startText}
-          onChange={(event) => setForm((current) => ({ ...current, startText: event.target.value }))}
+          onChange={(event) =>
+            setForm((current) => ({ ...current, startText: event.target.value }))
+          }
         />
         <input
           aria-label={`${segment.label} 结束`}
           className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.endText}
-          onChange={(event) => setForm((current) => ({ ...current, endText: event.target.value }))}
+          onChange={(event) =>
+            setForm((current) => ({ ...current, endText: event.target.value }))
+          }
         />
       </div>
       <div className="grid grid-cols-2 gap-2">
@@ -1914,7 +2484,10 @@ function SourceTimelineSegmentRow({
           className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.kind}
           onChange={(event) =>
-            setForm((current) => ({ ...current, kind: event.target.value as DanmakuSourceSegmentKind }))
+            setForm((current) => ({
+              ...current,
+              kind: event.target.value as DanmakuSourceSegmentKind
+            }))
           }
         >
           <option value="content">正片内容</option>
@@ -1925,7 +2498,9 @@ function SourceTimelineSegmentRow({
           className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-50"
           value={form.targetMediaId}
           disabled={form.kind === "ignored"}
-          onChange={(event) => setForm((current) => ({ ...current, targetMediaId: event.target.value }))}
+          onChange={(event) =>
+            setForm((current) => ({ ...current, targetMediaId: event.target.value }))
+          }
         >
           <option value="">暂不关联</option>
           {targetMediaOptions.map((media) => (
@@ -1940,7 +2515,9 @@ function SourceTimelineSegmentRow({
         className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-50"
         value={form.episodeKey}
         disabled={form.kind === "ignored"}
-        onChange={(event) => setForm((current) => ({ ...current, episodeKey: event.target.value }))}
+        onChange={(event) =>
+          setForm((current) => ({ ...current, episodeKey: event.target.value }))
+        }
       >
         <option value="">暂不关联</option>
         {episodeOptions.map((option) => (
@@ -1980,20 +2557,64 @@ function SourceTimelineSegmentRow({
   );
 }
 
-function SourceTimelineStrip({ segments }: { segments: DanmakuSourceSegment[] }) {
+interface SourceSegmentGroup {
+  sourceMediaId: string;
+  label: string;
+  segments: DanmakuSourceSegment[];
+}
+
+function SourceTimelineLanes({ groups }: { groups: SourceSegmentGroup[] }) {
+  if (groups.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-3 grid gap-2" data-testid="source-timeline-lanes">
+      {groups.map((group) => (
+        <section
+          key={group.sourceMediaId}
+          className="rounded border border-panel-line bg-black/15 p-2"
+          aria-label={`${group.label} 独立时间带`}
+        >
+          <div className="text-[11px] font-medium text-slate-400">{group.label}</div>
+          <SourceTimelineStrip
+            segments={group.segments}
+            ariaLabel={`${group.label} 弹幕来源时间带`}
+          />
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function SourceTimelineStrip({
+  segments,
+  ariaLabel
+}: {
+  segments: DanmakuSourceSegment[];
+  ariaLabel: string;
+}) {
   if (segments.length === 0) {
     return null;
   }
-  const sorted = [...segments].sort((left, right) => left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs);
+  const sorted = [...segments].sort(
+    (left, right) =>
+      left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs
+  );
   const startMs = sorted[0].sourceStartMs;
   const endMs = Math.max(...sorted.map((segment) => segment.sourceEndMs));
   const durationMs = Math.max(1, endMs - startMs);
   return (
-    <div className="mt-3 rounded border border-panel-line bg-black/20 p-2" aria-label="弹幕来源时间带">
+    <div
+      className="mt-2 rounded border border-panel-line bg-black/20 p-2"
+      aria-label={ariaLabel}
+    >
       <div className="relative h-7 overflow-hidden rounded bg-[#0b0d12]">
         {sorted.map((segment) => {
           const left = ((segment.sourceStartMs - startMs) / durationMs) * 100;
-          const width = Math.max(1, ((segment.sourceEndMs - segment.sourceStartMs) / durationMs) * 100);
+          const width = Math.max(
+            1,
+            ((segment.sourceEndMs - segment.sourceStartMs) / durationMs) * 100
+          );
           return (
             <div
               key={segment.id}
@@ -2014,7 +2635,41 @@ function SourceTimelineStrip({ segments }: { segments: DanmakuSourceSegment[] })
   );
 }
 
-function createSourceSegmentEpisodeOptions(plan: ReturnType<typeof buildBatchMergePlan>): SourceSegmentEpisodeOption[] {
+function createSourceSegmentGroups(
+  segments: DanmakuSourceSegment[],
+  sourceMediaOptions: ProjectMediaReference[]
+): SourceSegmentGroup[] {
+  const unboundSourceId = "__unbound_source__";
+  const labels = new Map(sourceMediaOptions.map((media) => [media.id, media.name]));
+  const order = new Map(sourceMediaOptions.map((media, index) => [media.id, index]));
+  const groups = new Map<string, DanmakuSourceSegment[]>();
+  segments.forEach((segment) => {
+    const sourceMediaId = segment.sourceMediaId ?? unboundSourceId;
+    groups.set(sourceMediaId, [...(groups.get(sourceMediaId) ?? []), segment]);
+  });
+  return [...groups.entries()]
+    .map(([sourceMediaId, groupedSegments]) => ({
+      sourceMediaId,
+      label:
+        sourceMediaId === unboundSourceId
+          ? "未绑定参考素材"
+          : (labels.get(sourceMediaId) ?? sourceMediaId),
+      segments: [...groupedSegments].sort(
+        (left, right) =>
+          left.sourceStartMs - right.sourceStartMs || left.sourceEndMs - right.sourceEndMs
+      )
+    }))
+    .sort(
+      (left, right) =>
+        (order.get(left.sourceMediaId) ?? Number.MAX_SAFE_INTEGER) -
+          (order.get(right.sourceMediaId) ?? Number.MAX_SAFE_INTEGER) ||
+        left.label.localeCompare(right.label, "zh-CN")
+    );
+}
+
+function createSourceSegmentEpisodeOptions(
+  plan: ReturnType<typeof buildBatchMergePlan>
+): SourceSegmentEpisodeOption[] {
   return plan.episodes.map((episode) => ({
     key: createSeasonEpisodeKey(episode),
     label: episode.label
@@ -2039,6 +2694,14 @@ function createSourceSegmentDraftFromForm(
   if (form.sourceMediaId.length === 0) {
     return { ok: false, message: "来源段必须选择 B 站参考素材。" };
   }
+  const targetStartMs = parseSourceTimecode(form.targetStartText);
+  if (form.kind === "content" && targetStartMs === null) {
+    return { ok: false, message: "目标原片起点格式无效，请使用 00:00:00.000。" };
+  }
+  const timingRules = parseSegmentTimingRulesText(form.timingRulesText);
+  if (!timingRules.ok) {
+    return timingRules;
+  }
   const episode = episodeOptions.find((option) => option.key === form.episodeKey);
   return {
     ok: true,
@@ -2049,8 +2712,10 @@ function createSourceSegmentDraftFromForm(
       sourceStartMs,
       sourceEndMs,
       targetMediaId: form.kind === "content" ? form.targetMediaId || null : null,
+      targetStartMs: form.kind === "content" ? targetStartMs : null,
+      timingRules: form.kind === "content" ? timingRules.value : [],
       episodeKey: form.kind === "content" ? form.episodeKey || null : null,
-      episodeLabel: form.kind === "content" ? episode?.label ?? null : null,
+      episodeLabel: form.kind === "content" ? (episode?.label ?? null) : null,
       label: form.label,
       note: form.note
     }
@@ -2065,10 +2730,43 @@ function createFormFromSegment(segment: DanmakuSourceSegment): SourceSegmentForm
     startText: formatTimecode(segment.sourceStartMs),
     endText: formatTimecode(segment.sourceEndMs),
     targetMediaId: segment.targetMediaId ?? "",
+    targetStartText: formatTimecode(segment.targetStartMs ?? 0),
+    timingRulesText: segment.timingRules
+      .map(
+        (rule) =>
+          `${formatTimecode(rule.sourceAtMs)} -> ${rule.gapMs >= 0 ? "+" : ""}${rule.gapMs}${rule.note ? ` ${rule.note}` : ""}`
+      )
+      .join("\n"),
     episodeKey: segment.episodeKey ?? "",
     label: segment.label,
     note: segment.note
   };
+}
+
+function parseSegmentTimingRulesText(
+  text: string
+): { ok: true; value: SegmentTimingRuleDraft[] } | { ok: false; message: string } {
+  const rules: SegmentTimingRuleDraft[] = [];
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(.*?)\s*(?:->|=>)\s*([+-]?\d+)(?:\s+(.*))?$/);
+    if (!match) {
+      return {
+        ok: false,
+        message: `第 ${index + 1} 行删减修正格式无效，请使用“00:12:30.000 -> +45000”。`
+      };
+    }
+    const sourceAtMs = parseSourceTimecode(match[1].trim());
+    const gapMs = Number(match[2]);
+    if (sourceAtMs === null || !Number.isSafeInteger(gapMs) || gapMs === 0) {
+      return { ok: false, message: `第 ${index + 1} 行删减修正的时间或差值无效。` };
+    }
+    rules.push({ sourceAtMs, gapMs, note: match[3]?.trim() ?? "手动段内删减修正" });
+  }
+  return { ok: true, value: rules };
 }
 
 function sourceTimelineFindingClass(severity: SourceTimelineFinding["severity"]): string {
@@ -2105,10 +2803,15 @@ function SeasonWorkbenchPanel({ summary }: { summary: SeasonWorkbenchSummary }) 
       </div>
       <div className="mt-3 grid gap-2">
         {summary.steps.map((step) => (
-          <div key={step.id} className="grid gap-1 rounded border border-panel-line bg-black/15 p-2">
+          <div
+            key={step.id}
+            className="grid gap-1 rounded border border-panel-line bg-black/15 p-2"
+          >
             <div className="flex items-center gap-2">
               <span className="min-w-0 flex-1 truncate text-slate-100">{step.label}</span>
-              <span className={`rounded border px-1.5 py-0.5 text-[11px] ${seasonWorkbenchStepClass(step.state)}`}>
+              <span
+                className={`rounded border px-1.5 py-0.5 text-[11px] ${seasonWorkbenchStepClass(step.state)}`}
+              >
                 {step.stateText}
               </span>
             </div>
@@ -2116,7 +2819,9 @@ function SeasonWorkbenchPanel({ summary }: { summary: SeasonWorkbenchSummary }) 
           </div>
         ))}
       </div>
-      <p className="mt-3 text-[11px] leading-5 text-slate-500">下一步：{summary.nextActionLabel}</p>
+      <p className="mt-3 text-[11px] leading-5 text-slate-500">
+        下一步：{summary.nextActionLabel}
+      </p>
     </section>
   );
 }
@@ -2160,14 +2865,21 @@ function SeasonEpisodeBindingPanel({
             const savedBinding = findSeasonEpisodeBinding(bindings, episodeKey);
             const canBindCurrent = Boolean(currentBinding);
             return (
-              <div key={episodeKey} className="grid gap-2 rounded border border-panel-line bg-black/15 p-2">
+              <div
+                key={episodeKey}
+                className="grid gap-2 rounded border border-panel-line bg-black/15 p-2"
+              >
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
                   <div className="min-w-0">
-                    <div className="truncate text-slate-100" title={`${episode.label}：${episode.sourceFileNames.join("、")}`}>
+                    <div
+                      className="truncate text-slate-100"
+                      title={`${episode.label}：${episode.sourceFileNames.join("、")}`}
+                    >
                       {episode.label}
                     </div>
                     <div className="mt-0.5 truncate text-[11px] text-slate-500">
-                      {episode.sourceFileNames.join("、")} / {episode.itemCount.toLocaleString("zh-CN")} 条
+                      {episode.sourceFileNames.join("、")} /{" "}
+                      {episode.itemCount.toLocaleString("zh-CN")} 条
                     </div>
                   </div>
                   <span
@@ -2197,12 +2909,18 @@ function SeasonEpisodeBindingPanel({
                   ) : (
                     <TextButton onClick={onOpenMediaTab}>去绑定目标</TextButton>
                   )}
-                  {savedBinding ? <TextButton onClick={() => onClear(episodeKey)}>清除</TextButton> : null}
+                  {savedBinding ? (
+                    <TextButton onClick={() => onClear(episodeKey)}>清除</TextButton>
+                  ) : null}
                 </div>
               </div>
             );
           })}
-          {hiddenCount > 0 ? <p className="text-[11px] text-slate-500">另有 {hiddenCount} 个输出，可继续调整规则后查看。</p> : null}
+          {hiddenCount > 0 ? (
+            <p className="text-[11px] text-slate-500">
+              另有 {hiddenCount} 个输出，可继续调整规则后查看。
+            </p>
+          ) : null}
         </div>
       ) : (
         <div className="mt-3 rounded border border-panel-line bg-black/15 p-2 text-slate-500">
@@ -2254,7 +2972,9 @@ function CompensationMarkersPanel({
             <span>{formatSignedDuration(totalGapMs)}</span>
           </div>
         ) : (
-          <div className="text-slate-500">暂无版本差异。可在时间轴标记，或从删减扫描、对齐线索生成。</div>
+          <div className="text-slate-500">
+            暂无版本差异。可在时间轴标记，或从删减扫描、对齐线索生成。
+          </div>
         )}
         {markers.map((marker) => {
           const selected = selectedIds.includes(marker.id);
@@ -2262,7 +2982,9 @@ function CompensationMarkersPanel({
             <article
               key={marker.id}
               className={`grid gap-2 rounded border p-2 ${
-                selected ? "border-accent-cyan bg-accent-cyan/10" : "border-panel-line bg-black/20"
+                selected
+                  ? "border-accent-cyan bg-accent-cyan/10"
+                  : "border-panel-line bg-black/20"
               }`}
             >
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
@@ -2276,10 +2998,15 @@ function CompensationMarkersPanel({
                     {marker.name}
                   </span>
                   <span className="mt-1 block font-mono text-[11px] text-slate-500">
-                    {formatTimecode(marker.sourceAtMs)} / {formatSignedDuration(marker.targetGapMs)}
+                    {formatTimecode(marker.sourceAtMs)} /{" "}
+                    {formatSignedDuration(marker.targetGapMs)}
                   </span>
                 </button>
-                <TextButton aria-label={`删除版本差异 ${marker.name}`} tone="danger" onClick={() => onDelete(marker.id)}>
+                <TextButton
+                  aria-label={`删除版本差异 ${marker.name}`}
+                  tone="danger"
+                  onClick={() => onDelete(marker.id)}
+                >
                   <Trash2 size={14} />
                   删除
                 </TextButton>
@@ -2292,7 +3019,9 @@ function CompensationMarkersPanel({
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={marker.sourceAtMs}
-                    onChange={(event) => onUpdate(marker.id, { sourceAtMs: Number(event.target.value) })}
+                    onChange={(event) =>
+                      onUpdate(marker.id, { sourceAtMs: Number(event.target.value) })
+                    }
                   />
                 </label>
                 <label className="grid gap-1">
@@ -2302,7 +3031,9 @@ function CompensationMarkersPanel({
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={marker.targetGapMs}
-                    onChange={(event) => onUpdate(marker.id, { targetGapMs: Number(event.target.value) })}
+                    onChange={(event) =>
+                      onUpdate(marker.id, { targetGapMs: Number(event.target.value) })
+                    }
                   />
                 </label>
               </div>
@@ -2389,14 +3120,21 @@ function SuspectedCutPanel({
         {previewCandidates.map((candidate) => {
           const applied = isSuspectedCutCandidateApplied(candidate, cutMarkers);
           return (
-            <div key={candidate.id} className="grid gap-2 border-t border-panel-line pt-2 first:border-t-0 first:pt-0">
+            <div
+              key={candidate.id}
+              className="grid gap-2 border-t border-panel-line pt-2 first:border-t-0 first:pt-0"
+            >
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
                 <div className="min-w-0">
                   <div className="truncate text-slate-100" title={candidate.assetFileName}>
                     {formatTimecode(candidate.sourceAtMs)} / {candidate.assetFileName}
                   </div>
-                  <div className="mt-1 truncate text-slate-500" title={candidate.sampleTexts.join(" / ")}>
-                    {candidate.hitCount} 条 / {candidate.keywords.join("、")} / {confidenceText(candidate.confidence)}
+                  <div
+                    className="mt-1 truncate text-slate-500"
+                    title={candidate.sampleTexts.join(" / ")}
+                  >
+                    {candidate.hitCount} 条 / {candidate.keywords.join("、")} /{" "}
+                    {confidenceText(candidate.confidence)}
                   </div>
                 </div>
                 <TextButton
@@ -2407,7 +3145,10 @@ function SuspectedCutPanel({
                   {applied ? "已存在" : "转为版本差异"}
                 </TextButton>
               </div>
-              <div className="truncate text-[11px] text-slate-500" title={candidate.sampleTexts.join(" / ")}>
+              <div
+                className="truncate text-[11px] text-slate-500"
+                title={candidate.sampleTexts.join(" / ")}
+              >
                 {candidate.sampleTexts[0]}
               </div>
             </div>
@@ -2467,10 +3208,7 @@ function AnchorCalibrationPanel({
               </div>
             ) : null}
             <div className="flex justify-end gap-2">
-              <TextButton
-                disabled={proposal.anchors.length === 0}
-                onClick={onPreview}
-              >
+              <TextButton disabled={proposal.anchors.length === 0} onClick={onPreview}>
                 预览到时间轴
               </TextButton>
               <TextButton
@@ -2499,7 +3237,9 @@ function SyncAnchorsPanel({
   onUpdate: (id: string, patch: Partial<Omit<SyncAnchor, "id">>) => void;
   onDelete: (id: string) => void;
 }) {
-  const sortedAnchors = [...anchors].sort((left, right) => left.sourceMs - right.sourceMs || left.id.localeCompare(right.id));
+  const sortedAnchors = [...anchors].sort(
+    (left, right) => left.sourceMs - right.sourceMs || left.id.localeCompare(right.id)
+  );
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
@@ -2514,7 +3254,10 @@ function SyncAnchorsPanel({
         {sortedAnchors.map((anchor, index) => {
           const label = `同步锚点 ${index + 1}`;
           return (
-            <article key={anchor.id} className="grid gap-2 rounded border border-panel-line bg-black/20 p-2">
+            <article
+              key={anchor.id}
+              className="grid gap-2 rounded border border-panel-line bg-black/20 p-2"
+            >
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
                 <button
                   type="button"
@@ -2530,7 +3273,11 @@ function SyncAnchorsPanel({
                     {formatSignedDuration(anchor.targetMs - anchor.sourceMs)}
                   </span>
                 </button>
-                <TextButton aria-label={`删除${label}`} tone="danger" onClick={() => onDelete(anchor.id)}>
+                <TextButton
+                  aria-label={`删除${label}`}
+                  tone="danger"
+                  onClick={() => onDelete(anchor.id)}
+                >
                   <Trash2 size={14} />
                   删除
                 </TextButton>
@@ -2543,7 +3290,9 @@ function SyncAnchorsPanel({
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={anchor.sourceMs}
-                    onChange={(event) => onUpdate(anchor.id, { sourceMs: Number(event.target.value) })}
+                    onChange={(event) =>
+                      onUpdate(anchor.id, { sourceMs: Number(event.target.value) })
+                    }
                   />
                 </label>
                 <label className="grid gap-1">
@@ -2553,7 +3302,9 @@ function SyncAnchorsPanel({
                     className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                     inputMode="numeric"
                     value={anchor.targetMs}
-                    onChange={(event) => onUpdate(anchor.id, { targetMs: Number(event.target.value) })}
+                    onChange={(event) =>
+                      onUpdate(anchor.id, { targetMs: Number(event.target.value) })
+                    }
                   />
                 </label>
               </div>
@@ -2566,6 +3317,7 @@ function SyncAnchorsPanel({
 }
 
 function VideoAlignmentLabPanel({
+  enabled,
   project,
   suspectedCutCandidates,
   text,
@@ -2578,6 +3330,7 @@ function VideoAlignmentLabPanel({
   onClear,
   onFocusQueueItem
 }: {
+  enabled: boolean;
   project: EditorProject;
   suspectedCutCandidates: SuspectedCutCandidate[];
   text: string;
@@ -2595,9 +3348,15 @@ function VideoAlignmentLabPanel({
   const [completePath, setCompletePath] = useState("");
   const [sourcePath, setSourcePath] = useState("");
   const [ffmpegPath, setFfmpegPath] = useState(initialSettingsRef.current.alignment.ffmpegPath);
-  const [windowMs, setWindowMs] = useState(String(initialSettingsRef.current.alignment.windowMs));
-  const [minGapMs, setMinGapMs] = useState(String(initialSettingsRef.current.alignment.minGapMs));
-  const [matchThreshold, setMatchThreshold] = useState(String(initialSettingsRef.current.alignment.matchThreshold));
+  const [windowMs, setWindowMs] = useState(
+    String(initialSettingsRef.current.alignment.windowMs)
+  );
+  const [minGapMs, setMinGapMs] = useState(
+    String(initialSettingsRef.current.alignment.minGapMs)
+  );
+  const [matchThreshold, setMatchThreshold] = useState(
+    String(initialSettingsRef.current.alignment.matchThreshold)
+  );
   const [enableVisualEvidence, setEnableVisualEvidence] = useState(false);
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -2606,11 +3365,14 @@ function VideoAlignmentLabPanel({
   const [jobSnapshot, setJobSnapshot] = useState<AudioAlignmentJobSnapshot | null>(null);
   const [embyCompleteInput, setEmbyCompleteInput] = useState<EmbyAlignmentInput | null>(null);
   const [skippedCutCandidateIds, setSkippedCutCandidateIds] = useState<string[]>([]);
-  const [cutCandidateDrafts, setCutCandidateDrafts] = useState<Record<string, CutCandidateDraft>>({});
+  const [cutCandidateDrafts, setCutCandidateDrafts] = useState<
+    Record<string, CutCandidateDraft>
+  >({});
   const runTokenRef = useRef(0);
   const proposalCandidateKeyRef = useRef("");
   const previewCuts = preview.proposalCuts.slice(0, 3);
-  const hasCompleteAlignmentInput = completePath.trim().length > 0 || embyCompleteInput !== null;
+  const hasCompleteAlignmentInput =
+    completePath.trim().length > 0 || embyCompleteInput !== null;
   const canRunAlignment = hasCompleteAlignmentInput && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const canClearProposal = Boolean(proposal) || text.trim().length > 0;
@@ -2619,22 +3381,33 @@ function VideoAlignmentLabPanel({
     existingAnchors: project.syncAnchors,
     existingCutMarkers: project.cutMarkers
   };
-  const applyBlockers = proposal ? createAlignmentApplyBlockers(proposal, applyBlockerContext) : [];
-  const reviewItemStatuses = proposal ? createAlignmentReviewItemStatuses(proposal, applyBlockerContext) : [];
+  const applyBlockers = proposal
+    ? createAlignmentApplyBlockers(proposal, applyBlockerContext)
+    : [];
+  const reviewItemStatuses = proposal
+    ? createAlignmentReviewItemStatuses(proposal, applyBlockerContext)
+    : [];
   const reviewStatusSummary = createAlignmentReviewStatusSummary(reviewItemStatuses);
   const reviewQueue = proposal ? createAlignmentReviewQueue(proposal, applyBlockerContext) : [];
   const noisyProposalMessage = proposal ? createNoisyAlignmentProposalMessage(proposal) : null;
   const visibleReviewQueue = reviewQueue.slice(0, 4);
   const hiddenReviewQueueCount = reviewQueue.length - visibleReviewQueue.length;
   const visibleReviewItemStatuses = reviewItemStatuses.slice(0, 5);
-  const hiddenReviewItemStatusCount = reviewItemStatuses.length - visibleReviewItemStatuses.length;
+  const hiddenReviewItemStatusCount =
+    reviewItemStatuses.length - visibleReviewItemStatuses.length;
   const targetLocalPath =
-    project.mediaBinding?.kind === "localFile" ? project.mediaBinding.localPath?.trim() ?? "" : "";
+    project.mediaBinding?.kind === "localFile"
+      ? (project.mediaBinding.localPath?.trim() ?? "")
+      : "";
   const embyTargetNeedsLocalAudioInput = project.mediaBinding?.kind === "embyItem";
   const reviewableCutCandidates = proposal
-    ? proposal.cutCandidates.filter((candidate) => !skippedCutCandidateIds.includes(candidate.id))
+    ? proposal.cutCandidates.filter(
+        (candidate) => !skippedCutCandidateIds.includes(candidate.id)
+      )
     : [];
-  const handledCutCandidateCount = proposal ? proposal.cutCandidates.length - reviewableCutCandidates.length : 0;
+  const handledCutCandidateCount = proposal
+    ? proposal.cutCandidates.length - reviewableCutCandidates.length
+    : 0;
   const alignmentStageItems = jobSnapshot ? createAudioAlignmentStageItems(jobSnapshot) : [];
 
   useEffect(() => {
@@ -2646,13 +3419,19 @@ function VideoAlignmentLabPanel({
           return;
         }
         setFfmpegPath((current) =>
-          current === initialSettings.alignment.ffmpegPath ? desktopSettings.alignment.ffmpegPath : current
+          current === initialSettings.alignment.ffmpegPath
+            ? desktopSettings.alignment.ffmpegPath
+            : current
         );
         setWindowMs((current) =>
-          current === String(initialSettings.alignment.windowMs) ? String(desktopSettings.alignment.windowMs) : current
+          current === String(initialSettings.alignment.windowMs)
+            ? String(desktopSettings.alignment.windowMs)
+            : current
         );
         setMinGapMs((current) =>
-          current === String(initialSettings.alignment.minGapMs) ? String(desktopSettings.alignment.minGapMs) : current
+          current === String(initialSettings.alignment.minGapMs)
+            ? String(desktopSettings.alignment.minGapMs)
+            : current
         );
         setMatchThreshold((current) =>
           current === String(initialSettings.alignment.matchThreshold)
@@ -2677,7 +3456,9 @@ function VideoAlignmentLabPanel({
   }, [project.mediaBinding?.id]);
 
   useEffect(() => {
-    const nextKey = proposal ? proposal.cutCandidates.map((candidate) => candidate.id).join("|") : "";
+    const nextKey = proposal
+      ? proposal.cutCandidates.map((candidate) => candidate.id).join("|")
+      : "";
     if (proposalCandidateKeyRef.current === nextKey) {
       return;
     }
@@ -2692,14 +3473,21 @@ function VideoAlignmentLabPanel({
     const parsedMatchThreshold = parsePositiveNumberInput(matchThreshold, "匹配阈值");
     if (parsedWindowMs.error || parsedMinGapMs.error || parsedMatchThreshold.error) {
       setStatus({
-        message: parsedWindowMs.error ?? parsedMinGapMs.error ?? parsedMatchThreshold.error ?? "对齐参数无效。",
+        message:
+          parsedWindowMs.error ??
+          parsedMinGapMs.error ??
+          parsedMatchThreshold.error ??
+          "对齐参数无效。",
         tone: "warning"
       });
       return;
     }
     const completeInputPath = embyCompleteInput?.url ?? completePath.trim();
     if (completeInputPath.length === 0) {
-      setStatus({ message: "请先选择完整版输入，或使用已绑定 Emby 原片生成授权输入。", tone: "warning" });
+      setStatus({
+        message: "请先选择完整版输入，或使用已绑定 Emby 原片生成授权输入。",
+        tone: "warning"
+      });
       return;
     }
     const request = {
@@ -2744,10 +3532,13 @@ function VideoAlignmentLabPanel({
       if (snapshot.status === "failed" || !snapshot.proposal) {
         throw new Error(snapshot.error ?? snapshot.message ?? "本地音频对齐失败。");
       }
-      const proposalWithDanmakuEvidence = augmentAlignmentProposalWithDanmakuEvidence(snapshot.proposal, {
-        assets: project.assets,
-        suspectedCutCandidates
-      });
+      const proposalWithDanmakuEvidence = augmentAlignmentProposalWithDanmakuEvidence(
+        snapshot.proposal,
+        {
+          assets: project.assets,
+          suspectedCutCandidates
+        }
+      );
       const content = `${JSON.stringify(proposalWithDanmakuEvidence, null, 2)}\n`;
       onTextChange(content);
       onImportText(content);
@@ -2895,7 +3686,10 @@ function VideoAlignmentLabPanel({
     }
   };
 
-  const updateCutCandidateDraft = (candidate: CutCandidate, patch: Partial<CutCandidateDraft>) => {
+  const updateCutCandidateDraft = (
+    candidate: CutCandidate,
+    patch: Partial<CutCandidateDraft>
+  ) => {
     setCutCandidateDrafts((current) => {
       const previous = current[candidate.id] ?? createCutCandidateDraft(candidate);
       return {
@@ -2917,7 +3711,10 @@ function VideoAlignmentLabPanel({
     const parsedSource = parseNonNegativeIntegerInput(draft.sourceAtMs, "候选时间");
     const parsedGap = parseSignedNonZeroIntegerInput(draft.targetGapMs, "差异时长");
     if (parsedSource.error || parsedGap.error) {
-      setStatus({ message: parsedSource.error ?? parsedGap.error ?? "候选修正无效。", tone: "warning" });
+      setStatus({
+        message: parsedSource.error ?? parsedGap.error ?? "候选修正无效。",
+        tone: "warning"
+      });
       return;
     }
     onApplyCutCandidate({
@@ -2934,6 +3731,10 @@ function VideoAlignmentLabPanel({
     setStatus({ message: `已跳过候选版本差异：${candidate.name}。`, tone: "neutral" });
   };
 
+  if (!enabled) {
+    return null;
+  }
+
   return (
     <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
@@ -2941,8 +3742,11 @@ function VideoAlignmentLabPanel({
         <span>视频对齐实验室</span>
         {proposal ? (
           <span className="ml-auto text-[11px] text-slate-500">
-            待应用 {reviewStatusSummary.pendingCount} / 已落点 {reviewStatusSummary.appliedCount}
-            {reviewStatusSummary.blockedCount > 0 ? ` / 阻断 ${reviewStatusSummary.blockedCount}` : ""}
+            待应用 {reviewStatusSummary.pendingCount} / 已落点{" "}
+            {reviewStatusSummary.appliedCount}
+            {reviewStatusSummary.blockedCount > 0
+              ? ` / 阻断 ${reviewStatusSummary.blockedCount}`
+              : ""}
           </span>
         ) : null}
       </div>
@@ -2980,7 +3784,8 @@ function VideoAlignmentLabPanel({
         ) : embyTargetNeedsLocalAudioInput ? (
           <div className="grid gap-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
             <div>
-              已绑定 Emby 目标原片。可以用本次会话密码生成临时授权输入交给 FFmpeg，也可以继续选择可读取的本地文件路径。
+              已绑定 Emby 目标原片。可以用本次会话密码生成临时授权输入交给
+              FFmpeg，也可以继续选择可读取的本地文件路径。
             </div>
             <div className="flex flex-wrap gap-2">
               <TextButton
@@ -2999,7 +3804,8 @@ function VideoAlignmentLabPanel({
         ) : null}
         {embyCompleteInput ? (
           <div className="rounded border border-accent-cyan/20 bg-accent-cyan/10 p-2 text-[11px] leading-5 text-slate-300">
-            已准备 Emby 授权输入：{embyCompleteInput.label}。本次运行会使用临时播放地址；项目文件不会保存密码、token 或播放 URL。
+            已准备 Emby 授权输入：{embyCompleteInput.label}
+            。本次运行会使用临时播放地址；项目文件不会保存密码、token 或播放 URL。
           </div>
         ) : null}
         <label className="grid gap-1">
@@ -3124,10 +3930,13 @@ function VideoAlignmentLabPanel({
               <div className="grid gap-1" aria-label="音频对齐阶段">
                 <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
                   <span className="min-w-0 truncate">
-                    阶段 {jobSnapshot.stageIndex ?? 0}/{jobSnapshot.stageCount ?? alignmentStageItems.length} ·{" "}
+                    阶段 {jobSnapshot.stageIndex ?? 0}/
+                    {jobSnapshot.stageCount ?? alignmentStageItems.length} ·{" "}
                     {jobSnapshot.stageLabel}
                   </span>
-                  <span className="shrink-0">{Math.round((jobSnapshot.stageProgress ?? 0) * 100)}%</span>
+                  <span className="shrink-0">
+                    {Math.round((jobSnapshot.stageProgress ?? 0) * 100)}%
+                  </span>
                 </div>
                 <div className="grid grid-cols-[repeat(auto-fit,minmax(54px,1fr))] gap-1">
                   {alignmentStageItems.map((item) => (
@@ -3161,7 +3970,8 @@ function VideoAlignmentLabPanel({
         ) : null}
         {noisyProposalMessage ? (
           <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
-            {noisyProposalMessage} 已阻断全量应用；请逐条接受可信候选，或提高窗口/匹配阈值后重新运行。
+            {noisyProposalMessage}{" "}
+            已阻断全量应用；请逐条接受可信候选，或提高窗口/匹配阈值后重新运行。
           </div>
         ) : null}
         <textarea
@@ -3172,36 +3982,26 @@ function VideoAlignmentLabPanel({
         />
         <div className="flex flex-wrap gap-2">
           <TextButton onClick={() => inputRef.current?.click()}>导入文件</TextButton>
-          <TextButton
-            onClick={() => onImportText(text)}
-            disabled={text.trim().length === 0}
-          >
+          <TextButton onClick={() => onImportText(text)} disabled={text.trim().length === 0}>
             导入提案
           </TextButton>
-          <TextButton
-            onClick={exportProposal}
-            disabled={!downloadContent}
-          >
+          <TextButton onClick={exportProposal} disabled={!downloadContent}>
             导出提案
           </TextButton>
-          <TextButton
-            onClick={exportReviewReport}
-            disabled={!proposal}
-          >
+          <TextButton onClick={exportReviewReport} disabled={!proposal}>
             <Download size={14} />
             导出报告
           </TextButton>
-          <TextButton
-            onClick={onClear}
-            disabled={!canClearProposal}
-          >
+          <TextButton onClick={onClear} disabled={!canClearProposal}>
             <Trash2 size={14} />
             清空提案
           </TextButton>
           <TextButton
             tone="primary"
             onClick={onApply}
-            disabled={!proposal || reviewStatusSummary.pendingCount === 0 || applyBlockers.length > 0}
+            disabled={
+              !proposal || reviewStatusSummary.pendingCount === 0 || applyBlockers.length > 0
+            }
             title={applyBlockers[0] ?? "应用候选"}
           >
             应用候选
@@ -3266,14 +4066,19 @@ function VideoAlignmentLabPanel({
                 </div>
                 <div className="grid gap-2">
                   {reviewableCutCandidates.map((candidate, index) => {
-                    const draft = cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
+                    const draft =
+                      cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
                     return (
-                      <div key={candidate.id} className="grid gap-2 rounded border border-panel-line/70 bg-[#111318] p-2">
+                      <div
+                        key={candidate.id}
+                        className="grid gap-2 rounded border border-panel-line/70 bg-[#111318] p-2"
+                      >
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
                             <div className="truncate text-slate-100">{candidate.name}</div>
                             <div className="mt-0.5 text-slate-500">
-                              {formatTimecode(candidate.sourceAtMs)} / {formatSignedDuration(candidate.targetGapMs)} / 置信度{" "}
+                              {formatTimecode(candidate.sourceAtMs)} /{" "}
+                              {formatSignedDuration(candidate.targetGapMs)} / 置信度{" "}
                               {formatPercent(candidate.confidence)}
                               {formatCandidateSourceRange(candidate)}
                             </div>
@@ -3296,7 +4101,11 @@ function VideoAlignmentLabPanel({
                               className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
                               inputMode="numeric"
                               value={draft.sourceAtMs}
-                              onChange={(event) => updateCutCandidateDraft(candidate, { sourceAtMs: event.target.value })}
+                              onChange={(event) =>
+                                updateCutCandidateDraft(candidate, {
+                                  sourceAtMs: event.target.value
+                                })
+                              }
                             />
                           </label>
                           <label className="grid gap-1">
@@ -3306,13 +4115,22 @@ function VideoAlignmentLabPanel({
                               className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
                               inputMode="numeric"
                               value={draft.targetGapMs}
-                              onChange={(event) => updateCutCandidateDraft(candidate, { targetGapMs: event.target.value })}
+                              onChange={(event) =>
+                                updateCutCandidateDraft(candidate, {
+                                  targetGapMs: event.target.value
+                                })
+                              }
                             />
                           </label>
                         </div>
                         <div className="flex flex-wrap justify-end gap-2">
-                          <TextButton onClick={() => skipCutCandidate(candidate)}>跳过</TextButton>
-                          <TextButton tone="primary" onClick={() => acceptCutCandidate(candidate)}>
+                          <TextButton onClick={() => skipCutCandidate(candidate)}>
+                            跳过
+                          </TextButton>
+                          <TextButton
+                            tone="primary"
+                            onClick={() => acceptCutCandidate(candidate)}
+                          >
                             接受
                           </TextButton>
                         </div>
@@ -3342,7 +4160,8 @@ function VideoAlignmentLabPanel({
                         <span className="text-slate-100">{item.name}</span>
                         <span className="text-slate-500">
                           {" "}
-                          / {item.kind === "anchor" ? "锚点" : "版本差异"} / {formatTimecode(item.sourceAtMs)}
+                          / {item.kind === "anchor" ? "锚点" : "版本差异"} /{" "}
+                          {formatTimecode(item.sourceAtMs)}
                         </span>
                         <span className="block text-slate-400">{item.reasons.join("；")}</span>
                       </span>
@@ -3359,7 +4178,9 @@ function VideoAlignmentLabPanel({
                   ))}
                 </ol>
                 {hiddenReviewQueueCount > 0 ? (
-                  <div className="mt-1 text-slate-500">另有 {hiddenReviewQueueCount} 条复核项已收起。</div>
+                  <div className="mt-1 text-slate-500">
+                    另有 {hiddenReviewQueueCount} 条复核项已收起。
+                  </div>
                 ) : null}
               </div>
             ) : null}
@@ -3372,17 +4193,26 @@ function VideoAlignmentLabPanel({
                       key={`${item.kind}-${item.id}-${index}`}
                       className="grid grid-cols-[44px_minmax(0,1fr)] gap-2"
                     >
-                      <span className="text-slate-500">{item.kind === "anchor" ? "锚点" : "版本差异"}</span>
+                      <span className="text-slate-500">
+                        {item.kind === "anchor" ? "锚点" : "版本差异"}
+                      </span>
                       <span className="min-w-0">
                         <span className="text-slate-100">{item.name}</span>
-                        <span className="text-slate-500"> / {formatTimecode(item.sourceAtMs)} / </span>
-                        <span className={getAlignmentReviewStatusClassName(item.state)}>{item.statusText}</span>
+                        <span className="text-slate-500">
+                          {" "}
+                          / {formatTimecode(item.sourceAtMs)} /{" "}
+                        </span>
+                        <span className={getAlignmentReviewStatusClassName(item.state)}>
+                          {item.statusText}
+                        </span>
                       </span>
                     </li>
                   ))}
                 </ul>
                 {hiddenReviewItemStatusCount > 0 ? (
-                  <div className="mt-1 text-slate-500">另有 {hiddenReviewItemStatusCount} 条状态已收起。</div>
+                  <div className="mt-1 text-slate-500">
+                    另有 {hiddenReviewItemStatusCount} 条状态已收起。
+                  </div>
                 ) : null}
               </div>
             ) : null}
@@ -3402,7 +4232,8 @@ function VideoAlignmentLabPanel({
               <div key={candidate.id} className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
                 <span className="text-slate-500">{formatTimecode(candidate.sourceAtMs)}</span>
                 <span>
-                  {formatSignedDuration(candidate.targetGapMs)} / {candidate.state === "applied" ? "已应用" : "候选"}
+                  {formatSignedDuration(candidate.targetGapMs)} /{" "}
+                  {candidate.state === "applied" ? "已应用" : "候选"}
                   {formatCandidateSourceRange(candidate)}
                 </span>
               </div>
@@ -3457,12 +4288,19 @@ function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
   const timelineMaxMs = createAlignmentEvidenceTimelineMaxMs(proposal);
   const anchorTicks = proposal.anchors.slice(0, 18).map((anchor) => ({
     id: anchor.id,
-    x: timelineMaxMs > 0 ? Math.min(96, Math.max(4, (anchor.sourceMs / timelineMaxMs) * 100)) : 4
+    x:
+      timelineMaxMs > 0 ? Math.min(96, Math.max(4, (anchor.sourceMs / timelineMaxMs) * 100)) : 4
   }));
   const cutBands = proposal.cutCandidates.slice(0, 12).map((candidate) => ({
     id: candidate.id,
-    x: timelineMaxMs > 0 ? Math.min(96, Math.max(4, (candidate.sourceAtMs / timelineMaxMs) * 100)) : 4,
-    width: timelineMaxMs > 0 ? Math.min(18, Math.max(3, (Math.abs(candidate.targetGapMs) / timelineMaxMs) * 100)) : 3
+    x:
+      timelineMaxMs > 0
+        ? Math.min(96, Math.max(4, (candidate.sourceAtMs / timelineMaxMs) * 100))
+        : 4,
+    width:
+      timelineMaxMs > 0
+        ? Math.min(18, Math.max(3, (Math.abs(candidate.targetGapMs) / timelineMaxMs) * 100))
+        : 3
   }));
   return (
     <div className="grid gap-2 rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
@@ -3473,9 +4311,18 @@ function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
         </span>
       </div>
       <div className="grid grid-cols-[repeat(auto-fit,minmax(92px,1fr))] gap-2">
-        <EvidenceMetric label="算法" value={formatAlignmentEvidenceAlgorithm(evidence.algorithm)} />
-        <EvidenceMetric label="稀疏锚点" value={`${evidence.monotonicMatchCount} / ${evidence.fingerprintMatchCount}`} />
-        <EvidenceMetric label="强/弱锚点" value={`${evidence.strongAnchorCount} / ${evidence.weakAnchorCount}`} />
+        <EvidenceMetric
+          label="算法"
+          value={formatAlignmentEvidenceAlgorithm(evidence.algorithm)}
+        />
+        <EvidenceMetric
+          label="稀疏锚点"
+          value={`${evidence.monotonicMatchCount} / ${evidence.fingerprintMatchCount}`}
+        />
+        <EvidenceMetric
+          label="强/弱锚点"
+          value={`${evidence.strongAnchorCount} / ${evidence.weakAnchorCount}`}
+        />
         <EvidenceMetric label="offset 簇" value={`${evidence.offsetClusterCount}`} />
         <EvidenceMetric label="低置信区" value={`${evidence.lowConfidenceRegionCount}`} />
         <EvidenceMetric label="精修候选" value={`${evidence.refinedCandidateCount}`} />
@@ -3510,13 +4357,20 @@ function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
           <circle key={tick.id} cx={tick.x} cy="10" r="1.6" fill="rgb(34 211 238)" />
         ))}
         {anchorTicks.map((tick) => (
-          <circle key={`${tick.id}-target`} cx={tick.x} cy="22" r="1.6" fill="rgb(16 185 129)" />
+          <circle
+            key={`${tick.id}-target`}
+            cx={tick.x}
+            cy="22"
+            r="1.6"
+            fill="rgb(16 185 129)"
+          />
         ))}
       </svg>
       <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 text-slate-400">
         <span className="text-slate-500">指纹数量</span>
         <span>
-          完整版 {evidence.completeFingerprintCount} / B 站删减版 {evidence.sourceFingerprintCount}
+          完整版 {evidence.completeFingerprintCount} / B 站删减版{" "}
+          {evidence.sourceFingerprintCount}
         </span>
         <span className="text-slate-500">offset 范围</span>
         <span>
@@ -3529,7 +4383,10 @@ function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
         <div className="grid gap-1 border-t border-panel-line pt-2">
           <div className="text-slate-500">证据信号</div>
           {evidence.signals.map((signal) => (
-            <div key={signal.kind} className="grid gap-0.5 rounded border border-panel-line/70 bg-[#111318] p-2">
+            <div
+              key={signal.kind}
+              className="grid gap-0.5 rounded border border-panel-line/70 bg-[#111318] p-2"
+            >
               <div className="flex items-center justify-between gap-2">
                 <span className="min-w-0 truncate text-slate-200">{signal.label}</span>
                 <span className={`shrink-0 ${getEvidenceSignalStatusClassName(signal.status)}`}>
@@ -3575,7 +4432,9 @@ interface EmbyAlignmentInput {
 }
 
 function formatEmbyAlignmentInputLabel(itemName: string, mediaSourceId: string | null): string {
-  return mediaSourceId && mediaSourceId.trim().length > 0 ? `${itemName} / 媒体源 ${mediaSourceId}` : itemName;
+  return mediaSourceId && mediaSourceId.trim().length > 0
+    ? `${itemName} / 媒体源 ${mediaSourceId}`
+    : itemName;
 }
 
 function createSingleCutCandidateProposal(candidate: CutCandidate): AlignmentProposal {
@@ -3653,7 +4512,10 @@ function parsePositiveNumberInput(value: string, label: string): ParsedNumericIn
   return { value: parsed, error: null };
 }
 
-function getAlignmentProposalDownloadText(text: string, proposal: AlignmentProposal | null): string {
+function getAlignmentProposalDownloadText(
+  text: string,
+  proposal: AlignmentProposal | null
+): string {
   const trimmed = text.trim();
   if (trimmed.length > 0) {
     return `${trimmed}\n`;
@@ -3691,7 +4553,9 @@ function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): st
   return "已取消";
 }
 
-function createAudioAlignmentStageItems(snapshot: AudioAlignmentJobSnapshot): AudioAlignmentStageItem[] {
+function createAudioAlignmentStageItems(
+  snapshot: AudioAlignmentJobSnapshot
+): AudioAlignmentStageItem[] {
   const activeIndex = Math.max(0, snapshot.stageIndex ?? 0);
   if (snapshot.status === "completed") {
     return AUDIO_ALIGNMENT_STAGE_ITEMS.map((item) => ({
@@ -3715,7 +4579,9 @@ function getAudioAlignmentStageClassName(state: AudioAlignmentStageState): strin
   return "truncate rounded border border-panel-line bg-[#111318] px-1.5 py-1 text-center text-slate-500";
 }
 
-function formatAlignmentEvidenceAlgorithm(algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]): string {
+function formatAlignmentEvidenceAlgorithm(
+  algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]
+): string {
   if (algorithm === "time-map-audio") {
     return "音频时间映射";
   }
@@ -3731,7 +4597,9 @@ function formatAlignmentEvidenceAlgorithm(algorithm: NonNullable<AlignmentPropos
   return "密集 DP";
 }
 
-function formatAlignmentEvidenceQuality(quality: NonNullable<AlignmentProposal["evidence"]>["quality"]): string {
+function formatAlignmentEvidenceQuality(
+  quality: NonNullable<AlignmentProposal["evidence"]>["quality"]
+): string {
   if (quality === "high") {
     return "高可信";
   }
@@ -3744,7 +4612,9 @@ function formatAlignmentEvidenceQuality(quality: NonNullable<AlignmentProposal["
   return "需重跑";
 }
 
-function getAlignmentEvidenceQualityClassName(quality: NonNullable<AlignmentProposal["evidence"]>["quality"]): string {
+function getAlignmentEvidenceQualityClassName(
+  quality: NonNullable<AlignmentProposal["evidence"]>["quality"]
+): string {
   if (quality === "high") {
     return "text-emerald-300";
   }
@@ -3781,7 +4651,9 @@ function getEvidenceSignalStatusClassName(
   return "text-slate-500";
 }
 
-function createAlignmentOffsetSummary(proposal: AlignmentProposal): AlignmentOffsetSummary | null {
+function createAlignmentOffsetSummary(
+  proposal: AlignmentProposal
+): AlignmentOffsetSummary | null {
   if (proposal.anchors.length === 0) {
     return null;
   }
@@ -3820,7 +4692,9 @@ function getAlignmentReviewStatusClassName(state: AlignmentReviewItemState): str
   return "text-amber-200";
 }
 
-function getAlignmentReviewQueueSeverityClassName(severity: AlignmentReviewQueueSeverity): string {
+function getAlignmentReviewQueueSeverityClassName(
+  severity: AlignmentReviewQueueSeverity
+): string {
   if (severity === "blocked") {
     return "text-red-200";
   }
@@ -3883,7 +4757,10 @@ function createBatchMergeOptions({
   return { options, warnings };
 }
 
-async function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>, projectName: string) {
+async function exportBatchMergePlan(
+  plan: ReturnType<typeof buildBatchMergePlan>,
+  projectName: string
+) {
   const files = plan.episodes.map((episode) => {
     const result = serializeBilibiliXml(episode.entries);
     const validation = validateExportedXml(result.xml);
@@ -3916,6 +4793,201 @@ async function exportBatchMergePlan(plan: ReturnType<typeof buildBatchMergePlan>
 
 function setStatus(status: EditorStatus) {
   useEditorStore.setState({ status });
+}
+
+async function exportProjectionGroups(projection: SourceProjectionResult, projectName: string) {
+  const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
+  if (exportableGroups.length === 0) {
+    setStatus({ message: "没有可导出的分集弹幕，请先在匹配页完成来源段。", tone: "warning" });
+    return;
+  }
+  const files = exportableGroups.map((group) => {
+    const result = serializeBilibiliXml(
+      group.entries.map((entry) => ({ item: entry.item, finalTimeMs: entry.finalTimeMs }))
+    );
+    const validation = validateExportedXml(result.xml);
+    return {
+      fileName: group.exportFileName,
+      content: result.xml,
+      valid: validation.ok,
+      message: validation.message
+    };
+  });
+  const invalid = files.find((file) => !file.valid);
+  if (invalid) {
+    setStatus({ message: `分集 XML 验证失败：${invalid.message}`, tone: "error" });
+    return;
+  }
+  try {
+    const exportResult = await saveTextExportFiles(
+      files.map((file) => ({ fileName: file.fileName, content: file.content })),
+      {
+        directoryPath: loadAppSettings().export.defaultDirectory,
+        type: "application/xml;charset=utf-8",
+        archiveFileName: createProjectDownloadFileName(projectName, "-target-danmaku.zip")
+      }
+    );
+    setStatus(createBatchExportStatus(exportResult));
+  } catch (error) {
+    setStatus({ message: `分集 XML 导出失败：${formatExportFileError(error)}`, tone: "error" });
+  }
+}
+
+function ProjectionExportPanel({
+  projection,
+  projectName,
+  onGoMatching
+}: {
+  projection: SourceProjectionResult;
+  projectName: string;
+  onGoMatching: () => void;
+}) {
+  const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
+  const exportDisabled = projection.status === "blocked" || exportableGroups.length === 0;
+  const exportDisabledReason =
+    projection.status === "blocked"
+      ? "先处理下面的阻断问题，再导出分集 XML。"
+      : exportableGroups.length === 0
+        ? "还没有可导出的分集弹幕。请先在匹配页标出来源段并关联原片。"
+        : "为每个原片导出一个精准同步的弹幕 XML";
+  return (
+    <section
+      className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+      aria-label="按原片分集导出"
+    >
+      <div className="flex items-center gap-2">
+        <h3 className="text-sm font-medium text-slate-100">按原片分集导出</h3>
+        <span className="ml-auto rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
+          {projectionStatusLabel(projection.status)}
+        </span>
+      </div>
+      <p className="mt-2 leading-5 text-slate-500">
+        按匹配页确认的来源段，把弹幕从 B 站参考时间轴投影到每个原片的时间轴，为每集导出一个
+        XML。
+      </p>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="rounded border border-panel-line bg-[#111318] p-2">
+          <div className="text-[11px] text-slate-500">可导出分集</div>
+          <div className="mt-1 text-sm font-medium text-slate-100">
+            {exportableGroups.length} 个
+          </div>
+        </div>
+        <div className="rounded border border-panel-line bg-[#111318] p-2">
+          <div className="text-[11px] text-slate-500">已投影弹幕</div>
+          <div className="mt-1 text-sm font-medium text-slate-100">
+            {projection.projectedItemCount.toLocaleString("zh-CN")} 条
+          </div>
+        </div>
+        <div className="rounded border border-panel-line bg-[#111318] p-2">
+          <div className="text-[11px] text-slate-500">忽略段弹幕</div>
+          <div className="mt-1 text-sm font-medium text-slate-100">
+            {projection.ignoredItemCount.toLocaleString("zh-CN")} 条
+          </div>
+        </div>
+        <div className="rounded border border-panel-line bg-[#111318] p-2">
+          <div className="text-[11px] text-slate-500">未覆盖弹幕</div>
+          <div className="mt-1 text-sm font-medium text-slate-100">
+            {projection.unmappedItemCount.toLocaleString("zh-CN")} 条
+          </div>
+        </div>
+      </div>
+      {projection.issues.length > 0 ? (
+        <div className="mt-3 grid gap-1">
+          {projection.issues.map((issue) => (
+            <div
+              key={issue.id}
+              className={`rounded border p-2 leading-5 ${
+                issue.severity === "error"
+                  ? "border-accent-red/30 bg-accent-red/10 text-accent-red"
+                  : "border-accent-yellow/30 bg-accent-yellow/10 text-accent-yellow"
+              }`}
+            >
+              {issue.message}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {projection.groups.length > 0 ? (
+        <div className="mt-3 grid gap-2">
+          {projection.groups.map((group) => (
+            <ProjectionGroupRow key={group.targetMediaId} group={group} />
+          ))}
+        </div>
+      ) : (
+        <div className="mt-3 rounded border border-panel-line bg-black/15 p-3 leading-5 text-slate-500">
+          这里会按目标原片列出每一集的导出预览。请先在匹配页把参考视频的正片段关联到原片。
+          <div className="mt-2">
+            <TextButton onClick={onGoMatching}>去匹配页</TextButton>
+          </div>
+        </div>
+      )}
+      <div className="mt-3 flex justify-end">
+        <TextButton
+          tone="primary"
+          disabled={exportDisabled}
+          title={exportDisabledReason}
+          onClick={() => void exportProjectionGroups(projection, projectName)}
+        >
+          <Download size={14} />
+          导出全部分集 XML
+        </TextButton>
+      </div>
+    </section>
+  );
+}
+
+function ProjectionGroupRow({ group }: { group: TargetProjectionGroup }) {
+  const totalGapMs = group.appliedRules.reduce((sum, rule) => sum + rule.gapMs, 0);
+  return (
+    <article
+      className="rounded border border-panel-line bg-[#111318] p-2"
+      data-testid="projection-group"
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className="min-w-0 flex-1 truncate text-sm text-slate-100"
+          title={group.targetName}
+        >
+          {group.episodeLabel
+            ? `${group.episodeLabel} · ${group.targetName}`
+            : group.targetName}
+        </span>
+        <span className="shrink-0 text-[11px] text-slate-500">{group.exportFileName}</span>
+      </div>
+      <div className="mt-2 grid gap-1 text-[11px] text-slate-500">
+        <div>
+          {group.entries.length.toLocaleString("zh-CN")} 条弹幕 · 来自 {group.segments.length}{" "}
+          个来源段
+          {group.disabledCount > 0 ? ` · ${group.disabledCount} 条已禁用不导出` : ""}
+        </div>
+        {group.appliedRules.length > 0 ? (
+          <div>
+            应用 {group.appliedRules.length} 处删减修正，共{" "}
+            {formatTimecode(Math.abs(totalGapMs))}
+            {totalGapMs < 0 ? "（提前）" : ""}
+          </div>
+        ) : null}
+        {group.warnings.map((warning) => (
+          <div key={warning} className="text-accent-yellow">
+            {warning}
+          </div>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function projectionStatusLabel(status: SourceProjectionResult["status"]): string {
+  if (status === "empty") {
+    return "等待匹配";
+  }
+  if (status === "blocked") {
+    return "有阻断";
+  }
+  if (status === "readyWithWarnings") {
+    return "可导出（有提示）";
+  }
+  return "可导出";
 }
 
 function createBatchExportStatus(result: SaveTextExportResult): EditorStatus {
@@ -3970,19 +5042,31 @@ function ExportReadinessPanel({
   onCleanupMissingAssetClips: () => void;
 }) {
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
-  const StatusIcon = readiness.status === "blocked" ? CircleAlert : readiness.status === "attention" ? TriangleAlert : CircleCheck;
+  const StatusIcon =
+    readiness.status === "blocked"
+      ? CircleAlert
+      : readiness.status === "attention"
+        ? TriangleAlert
+        : CircleCheck;
   return (
-    <section className="rounded border border-panel-line bg-panel-soft p-3" data-testid="project-health-panel">
+    <section
+      className="rounded border border-panel-line bg-panel-soft p-3"
+      data-testid="project-health-panel"
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
             <StatusIcon size={16} className={projectReadinessIconClass(readiness.status)} />
             <span>导出前检查</span>
           </div>
-          <p className="mt-1 text-xs font-medium leading-5 text-slate-300">{readiness.headline}</p>
+          <p className="mt-1 text-xs font-medium leading-5 text-slate-300">
+            {readiness.headline}
+          </p>
           <p className="mt-1 text-xs leading-5 text-slate-500">{readiness.detail}</p>
         </div>
-        <span className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectReadinessBadgeClass(readiness.status)}`}>
+        <span
+          className={`shrink-0 rounded border px-2 py-1 text-[11px] ${projectReadinessBadgeClass(readiness.status)}`}
+        >
           {readiness.statusLabel}
         </span>
       </div>
@@ -4030,7 +5114,11 @@ function ExportReadinessPanel({
       {diagnosticsOpen ? (
         <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-panel-line pt-3">
           {readiness.diagnostics.map((diagnostic) => (
-            <HealthMetric key={diagnostic.label} label={diagnostic.label} value={diagnostic.value} />
+            <HealthMetric
+              key={diagnostic.label}
+              label={diagnostic.label}
+              value={diagnostic.value}
+            />
           ))}
         </dl>
       ) : null}
@@ -4051,10 +5139,17 @@ function HealthMetric({ label, value }: { label: string; value: string }) {
 
 function ProjectReadinessItemRow({ item }: { item: ProjectReadinessItem }) {
   const FindingIcon =
-    item.severity === "error" ? CircleAlert : item.severity === "warning" ? TriangleAlert : CircleCheck;
+    item.severity === "error"
+      ? CircleAlert
+      : item.severity === "warning"
+        ? TriangleAlert
+        : CircleCheck;
   return (
     <li className="flex gap-2 py-2 first:pt-3 last:pb-0">
-      <FindingIcon size={14} className={`mt-0.5 shrink-0 ${projectReadinessItemIconClass(item.severity)}`} />
+      <FindingIcon
+        size={14}
+        className={`mt-0.5 shrink-0 ${projectReadinessItemIconClass(item.severity)}`}
+      />
       <div className="min-w-0">
         <p className="text-xs font-medium text-slate-200">{item.title}</p>
         <p className="mt-0.5 text-[11px] leading-5 text-slate-500">{item.detail}</p>
@@ -4106,7 +5201,10 @@ function formatMatchSourceSummary(assessment: ProjectMatchAssessment): string {
   if (assessment.source.itemCount === 0) {
     return `${assessment.source.assetCount} 个 XML / 暂无弹幕`;
   }
-  const endText = assessment.source.sourceEndMs === null ? "未知" : formatTimecode(assessment.source.sourceEndMs);
+  const endText =
+    assessment.source.sourceEndMs === null
+      ? "未知"
+      : formatTimecode(assessment.source.sourceEndMs);
   return `${assessment.source.assetCount} 个 XML / ${assessment.source.itemCount.toLocaleString("zh-CN")} 条 / 到 ${endText}`;
 }
 
@@ -4201,28 +5299,6 @@ function formatCandidateSourceRange(candidate: {
     return "";
   }
   return ` / 区间 ${formatTimecode(candidate.sourceRangeStartMs)}-${formatTimecode(candidate.sourceRangeEndMs)}`;
-}
-
-function TabButton({
-  active,
-  onClick,
-  children
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: string;
-}) {
-  return (
-    <button
-      type="button"
-      className={`border-r border-panel-line text-xs ${
-        active ? "bg-panel-soft text-accent-cyan" : "text-slate-400 hover:bg-panel-soft hover:text-slate-200"
-      }`}
-      onClick={onClick}
-    >
-      {children}
-    </button>
-  );
 }
 
 function Row({ label, value }: { label: string; value: string }) {

@@ -19,6 +19,7 @@ export function createEmptyProject(name = "未命名项目"): EditorProject {
     seasonEpisodeBindings: [],
     danmakuSourceBindings: [],
     danmakuSourceSegments: [],
+    mediaMatchCandidates: [],
     assets: [],
     clips: [],
     globalOffsetMs: 0,
