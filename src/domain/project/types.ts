@@ -7,7 +7,7 @@ import type {
 import type { AlignmentProposal } from "../alignment/types";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 export interface MediaReference {
   id: string;
@@ -115,6 +115,18 @@ export interface DanmakuSourceBinding {
   updatedAt: string;
 }
 
+/**
+ * 段内时间修正规则：参考时间轴（B 站/XML 时间）到达 sourceAtMs 之后，
+ * 目标原片相对参考版累计多出 gapMs 内容（参考版在此处被删减）。
+ * 投影时对该点之后的弹幕整体加上 gapMs。
+ */
+export interface SegmentTimingRule {
+  id: string;
+  sourceAtMs: Milliseconds;
+  gapMs: Milliseconds;
+  note: string;
+}
+
 export interface DanmakuSourceSegment {
   id: string;
   label: string;
@@ -124,6 +136,10 @@ export interface DanmakuSourceSegment {
   sourceStartMs: Milliseconds;
   sourceEndMs: Milliseconds;
   targetMediaId: string | null;
+  /** 该段开头对应目标原片时间轴上的时间；null 表示 0（段首对齐原片开头）。 */
+  targetStartMs: Milliseconds | null;
+  /** 段内删减修正规则，sourceAtMs 使用参考时间轴。 */
+  timingRules: SegmentTimingRule[];
   episodeKey: string | null;
   episodeLabel: string | null;
   note: string;

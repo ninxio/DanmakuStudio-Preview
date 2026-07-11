@@ -149,7 +149,7 @@ function migrateProjectToCurrentSchema(project: EditorProject, parsedVersion: nu
       danmakuSourceBindings: mediaMigration.danmakuSourceBindings,
       danmakuSourceSegments:
         parsedVersion >= 6
-          ? migrateLegacyDanmakuSourceSegments(project.danmakuSourceSegments, mediaMigration)
+          ? migrateLegacyDanmakuSourceSegments(project.danmakuSourceSegments, mediaMigration, parsedVersion)
           : []
     },
     migration: {
@@ -209,7 +209,8 @@ function migrateProjectMediaState(
 
 function migrateLegacyDanmakuSourceSegments(
   segments: EditorProject["danmakuSourceSegments"],
-  mediaMigration: MediaSchemaMigrationResult
+  mediaMigration: MediaSchemaMigrationResult,
+  parsedVersion: number
 ): EditorProject["danmakuSourceSegments"] {
   return segments.map((segment) => ({
     ...segment,
@@ -218,7 +219,9 @@ function migrateLegacyDanmakuSourceSegments(
     targetMediaId:
       segment.kind === "content"
         ? segment.targetMediaId ?? mediaMigration.defaultTargetMediaId
-        : null
+        : null,
+    targetStartMs: parsedVersion >= 8 && segment.kind === "content" ? segment.targetStartMs : null,
+    timingRules: parsedVersion >= 8 && segment.kind === "content" ? segment.timingRules : []
   }));
 }
 
@@ -464,6 +467,9 @@ function isDanmakuSourceSegment(value: unknown, version: number): boolean {
     !isNonNegativeIntegerMilliseconds(value.sourceEndMs) ||
     value.sourceEndMs <= value.sourceStartMs ||
     (version >= 7 && (typeof value.targetMediaId !== "string" && value.targetMediaId !== null)) ||
+    (version >= 8 &&
+      (!isNonNegativeIntegerMilliseconds(value.targetStartMs) && value.targetStartMs !== null)) ||
+    (version >= 8 && !isSegmentTimingRules(value.timingRules)) ||
     typeof value.note !== "string" ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string"
@@ -480,6 +486,20 @@ function isDanmakuSourceSegment(value: unknown, version: number): boolean {
     return value.episodeKey === null && value.episodeLabel === null && (version < 7 || value.targetMediaId === null);
   }
   return false;
+}
+
+function isSegmentTimingRules(value: unknown): boolean {
+  return Array.isArray(value) && value.every(isSegmentTimingRule);
+}
+
+function isSegmentTimingRule(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    isNonNegativeIntegerMilliseconds(value.sourceAtMs) &&
+    isIntegerMilliseconds(value.gapMs) &&
+    typeof value.note === "string"
+  );
 }
 
 function isDanmakuAsset(value: unknown): boolean {

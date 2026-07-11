@@ -1,7 +1,19 @@
 import type { BatchMergePlan } from "../danmaku/batchMerge";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { createSeasonEpisodeKey } from "./seasonEpisodeBinding";
-import type { DanmakuSourceSegment, DanmakuSourceSegmentKind, EditorProject } from "./types";
+import type {
+  DanmakuSourceSegment,
+  DanmakuSourceSegmentKind,
+  EditorProject,
+  SegmentTimingRule
+} from "./types";
+
+export interface SegmentTimingRuleDraft {
+  id?: string;
+  sourceAtMs: Milliseconds;
+  gapMs: Milliseconds;
+  note?: string;
+}
 
 export interface DanmakuSourceSegmentDraft {
   label?: string;
@@ -11,6 +23,8 @@ export interface DanmakuSourceSegmentDraft {
   sourceStartMs: Milliseconds;
   sourceEndMs: Milliseconds;
   targetMediaId: string | null;
+  targetStartMs?: Milliseconds | null;
+  timingRules?: SegmentTimingRuleDraft[];
   episodeKey: string | null;
   episodeLabel: string | null;
   note?: string;
@@ -68,6 +82,8 @@ export function updateDanmakuSourceSegment(
     sourceStartMs: patch.sourceStartMs ?? segment.sourceStartMs,
     sourceEndMs: patch.sourceEndMs ?? segment.sourceEndMs,
     targetMediaId: patch.targetMediaId !== undefined ? patch.targetMediaId : segment.targetMediaId,
+    targetStartMs: patch.targetStartMs !== undefined ? patch.targetStartMs : segment.targetStartMs,
+    timingRules: patch.timingRules !== undefined ? patch.timingRules : segment.timingRules,
     episodeKey: patch.episodeKey !== undefined ? patch.episodeKey : segment.episodeKey,
     episodeLabel: patch.episodeLabel !== undefined ? patch.episodeLabel : segment.episodeLabel,
     note: patch.note ?? segment.note
@@ -284,6 +300,9 @@ function normalizeSegmentDraft(draft: DanmakuSourceSegmentDraft): Omit<DanmakuSo
   const targetMediaId = kind === "content" ? normalizeOptionalText(draft.targetMediaId) : null;
   const episodeKey = kind === "content" ? normalizeOptionalText(draft.episodeKey) : null;
   const episodeLabel = kind === "content" ? normalizeOptionalText(draft.episodeLabel) : null;
+  const targetStartMs = kind === "content" ? normalizeTargetStart(draft.targetStartMs) : null;
+  const timingRules =
+    kind === "content" ? normalizeTimingRules(draft.timingRules ?? [], sourceStartMs, sourceEndMs) : [];
   return {
     label: normalizeLabel(draft.label, kind, episodeLabel, sourceStartMs, sourceEndMs),
     kind,
@@ -292,10 +311,45 @@ function normalizeSegmentDraft(draft: DanmakuSourceSegmentDraft): Omit<DanmakuSo
     sourceStartMs,
     sourceEndMs,
     targetMediaId,
+    targetStartMs,
+    timingRules,
     episodeKey,
     episodeLabel,
     note: draft.note?.trim() ?? ""
   };
+}
+
+function normalizeTargetStart(value: Milliseconds | null | undefined): Milliseconds | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  assertFiniteMilliseconds(value, "内容段的原片起始时间无效。");
+  return Math.max(0, Math.round(value));
+}
+
+function normalizeTimingRules(
+  rules: readonly SegmentTimingRuleDraft[],
+  sourceStartMs: Milliseconds,
+  sourceEndMs: Milliseconds
+): SegmentTimingRule[] {
+  return rules
+    .map((rule, index) => {
+      assertFiniteMilliseconds(rule.sourceAtMs, "删减修正点时间无效。");
+      if (typeof rule.gapMs !== "number" || !Number.isFinite(rule.gapMs) || !Number.isSafeInteger(Math.round(rule.gapMs))) {
+        throw new Error("删减修正时长无效。");
+      }
+      const sourceAtMs = Math.round(rule.sourceAtMs);
+      if (sourceAtMs < sourceStartMs || sourceAtMs > sourceEndMs) {
+        throw new Error("删减修正点必须位于内容段范围内。");
+      }
+      return {
+        id: rule.id && rule.id.trim().length > 0 ? rule.id.trim() : `timing_rule_${index}_${sourceAtMs}`,
+        sourceAtMs,
+        gapMs: Math.round(rule.gapMs),
+        note: rule.note?.trim() ?? ""
+      };
+    })
+    .sort((left, right) => left.sourceAtMs - right.sourceAtMs);
 }
 
 function assertFiniteMilliseconds(value: Milliseconds, message: string): void {

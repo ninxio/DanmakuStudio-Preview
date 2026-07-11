@@ -59,26 +59,31 @@ const assets = files.map((fileName, index) => {
 let cursor = 0;
 const clips = assets.map((asset, index) => {
   const latest = Math.max(...asset.items.map((item) => item.sourceTimeMs));
+  // 片段范围为半开区间 [sourceInMs, sourceOutMs)，因此末尾 +1 才能包含最后一条弹幕。
   const clip = {
     id: `demo_clip_${index + 1}`,
     assetId: asset.id,
     name: `${asset.name} 时间轴片段`,
     timelineStartMs: cursor,
     sourceInMs: 0,
-    sourceOutMs: latest,
+    sourceOutMs: latest + 1,
     localOffsetMs: 0,
     enabled: true
   };
-  cursor += latest;
+  cursor += latest + 1;
   return clip;
 });
 
 const project = {
-  schemaVersion: 4,
+  schemaVersion: 8,
   id: "demo_three_part_project",
   name: "三分P合并示例",
   media: null,
+  mediaLibrary: [],
   mediaBinding: null,
+  seasonEpisodeBindings: [],
+  danmakuSourceBindings: [],
+  danmakuSourceSegments: [],
   assets,
   clips,
   globalOffsetMs: 0,

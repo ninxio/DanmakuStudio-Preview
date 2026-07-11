@@ -154,6 +154,10 @@ describe("project schema", () => {
           sourceStartMs: 7_200_000,
           sourceEndMs: 7_260_000,
           targetMediaId: "target-media",
+          targetStartMs: 0,
+          timingRules: [
+            { id: "rule-1", sourceAtMs: 7_230_000, gapMs: 45_000, note: "审核删减补偿" }
+          ],
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "B 站长视频两小时后进入正片",
@@ -169,6 +173,8 @@ describe("project schema", () => {
           sourceStartMs: 0,
           sourceEndMs: 7_200_000,
           targetMediaId: null,
+          targetStartMs: null,
+          timingRules: [],
           episodeKey: null,
           episodeLabel: null,
           note: "",
@@ -440,6 +446,53 @@ describe("project schema", () => {
     expect(parsed.danmakuSourceSegments[0]).toMatchObject({
       sourceMediaId: "migrated_target_binding-local",
       targetMediaId: "migrated_target_binding-local_2"
+    });
+  });
+
+  it("打开 v7 项目时为来源段补齐投影字段", () => {
+    const v7Segment = {
+      id: "v7-segment",
+      label: "第 1 集来源段",
+      kind: "content" as const,
+      assetId: "asset",
+      sourceMediaId: "source-media",
+      sourceStartMs: 0,
+      sourceEndMs: 60_000,
+      targetMediaId: "target-media",
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集",
+      note: "",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      updatedAt: "2026-07-11T00:00:00.000Z"
+    };
+    const v7Project = {
+      ...JSON.parse(JSON.stringify(createEmptyProject("v7 项目"))),
+      schemaVersion: 7,
+      assets: [createValidAsset()],
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      danmakuSourceSegments: [v7Segment]
+    } as Record<string, unknown>;
+
+    const { project: parsed, migration } = parseProjectJsonWithMetadata(JSON.stringify(v7Project));
+
+    expect(migration).toEqual({
+      fromVersion: 7,
+      toVersion: CURRENT_SCHEMA_VERSION,
+      adjustedClipRangeCount: 0
+    });
+    expect(parsed.danmakuSourceSegments[0]).toMatchObject({
+      id: "v7-segment",
+      targetStartMs: null,
+      timingRules: []
+    });
+
+    const reopened = parseProjectJson(serializeProject(parsed));
+    expect(reopened.danmakuSourceSegments[0]).toMatchObject({
+      targetStartMs: null,
+      timingRules: []
     });
   });
 
