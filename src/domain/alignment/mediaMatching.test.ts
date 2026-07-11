@@ -13,6 +13,7 @@ import {
   reconcileMediaMatchCandidates,
   rejectMediaMatchCandidate,
   revokeMediaMatchCandidateAcceptance,
+  upsertMediaMatchCandidate,
   updateMediaMatchCandidateRange
 } from "./mediaMatching";
 
@@ -134,6 +135,48 @@ describe("media matching candidates", () => {
     expect(rejected.danmakuSourceSegments).toEqual([]);
     expect(() => acceptMediaMatchCandidate(rejected, "candidate-1", ["asset-1"])).toThrow(
       "已拒绝"
+    );
+  });
+
+  it("空 range patch 或与当前值相同的 patch 保持项目与候选时间图 revision 不变", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-noop-range",
+      "source-1",
+      "target-1"
+    );
+    const seeded = updateMediaMatchCandidateRange(
+      project,
+      "candidate-noop-range",
+      { sourceStartMs: 11_000, sourceEndMs: 71_000 },
+      "2026-07-11T00:01:00.000Z"
+    );
+    expect(seeded.mediaTimeMaps[0]?.revision).toBe(1);
+
+    const emptyPatch = updateMediaMatchCandidateRange(
+      seeded,
+      "candidate-noop-range",
+      {},
+      "2026-07-11T00:02:00.000Z"
+    );
+    expect(emptyPatch).toBe(seeded);
+    expect(emptyPatch.mediaTimeMaps[0]?.revision).toBe(1);
+
+    const sameValuePatch = updateMediaMatchCandidateRange(
+      seeded,
+      "candidate-noop-range",
+      {
+        sourceStartMs: 11_000,
+        sourceEndMs: 71_000,
+        targetStartMs: seeded.mediaMatchCandidates[0].targetStartMs,
+        targetEndMs: seeded.mediaMatchCandidates[0].targetEndMs
+      },
+      "2026-07-11T00:03:00.000Z"
+    );
+    expect(sameValuePatch).toBe(seeded);
+    expect(sameValuePatch.mediaTimeMaps[0]?.revision).toBe(1);
+    expect(sameValuePatch.mediaMatchCandidates[0].updatedAt).toBe(
+      "2026-07-11T00:01:00.000Z"
     );
   });
 
@@ -355,6 +398,11 @@ describe("media matching candidates", () => {
     expect(acceptedAgain.mediaMatchCandidates[0].appliedSegmentIds).toEqual([
       createAppliedSegmentId("candidate-1", "asset-1")
     ]);
+    expect(acceptedAgain.mediaTimeMaps).toHaveLength(2);
+    expect(acceptedAgain.mediaTimeMaps.map((map) => map.state).sort()).toEqual([
+      "candidate",
+      "confirmed"
+    ]);
     expect(acceptedAgain.syncAnchors).toEqual(project.syncAnchors);
     expect(acceptedAgain.cutMarkers).toEqual(project.cutMarkers);
   });
@@ -372,6 +420,12 @@ describe("media matching candidates", () => {
       ["asset-1"],
       TIMESTAMP
     );
+    const candidateMap = accepted.mediaTimeMaps.find((map) => map.state === "candidate");
+    const confirmedMap = accepted.mediaTimeMaps.find((map) => map.state === "confirmed");
+    expect(candidateMap).toMatchObject({ quality: { level: "legacy-unverified" } });
+    expect(confirmedMap?.id).not.toBe(candidateMap?.id);
+    expect(accepted.danmakuSourceSegments[0].timeMapId).toBe(confirmedMap?.id);
+    expect(accepted.mediaMatchCandidates[0].confirmedTimeMapId).toBe(confirmedMap?.id);
 
     const revoked = revokeMediaMatchCandidateAcceptance(
       accepted,
@@ -382,12 +436,87 @@ describe("media matching candidates", () => {
     expect(revoked.mediaMatchCandidates[0]).toMatchObject({
       state: "pending",
       appliedSegmentIds: [],
+      confirmedTimeMapId: null,
       updatedAt: "2026-07-11T00:03:00.000Z"
     });
+    expect(revoked.mediaTimeMaps.find((map) => map.id === confirmedMap?.id)?.state).toBe(
+      "superseded"
+    );
 
     const acceptedAgain = acceptMediaMatchCandidate(revoked, "candidate-revoke", ["asset-1"]);
     expect(acceptedAgain.mediaMatchCandidates[0].state).toBe("accepted");
     expect(acceptedAgain.danmakuSourceSegments).toHaveLength(1);
+    expect(acceptedAgain.mediaMatchCandidates[0].confirmedTimeMapId).toContain(
+      ":time-map:confirmed:2"
+    );
+  });
+
+  it("撤销按 confirmed map 清理未登记的同归属段，不留下可导出孤儿", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-revoke-all",
+      "source-1",
+      "target-1"
+    );
+    const accepted = acceptMediaMatchCandidate(
+      project,
+      "candidate-revoke-all",
+      ["asset-1"],
+      TIMESTAMP
+    );
+    const ownedSegment = accepted.danmakuSourceSegments[0];
+    const inconsistent = {
+      ...accepted,
+      danmakuSourceSegments: [
+        ownedSegment,
+        {
+          ...ownedSegment,
+          id: "candidate-revoke-all:segment:recovered-after-interruption",
+          label: "异常中断后未登记但仍指向确认图的段"
+        }
+      ]
+    };
+    expect(validateProjectSchema(inconsistent).ok).toBe(false);
+
+    const revoked = revokeMediaMatchCandidateAcceptance(
+      inconsistent,
+      "candidate-revoke-all",
+      "2026-07-11T00:03:00.000Z"
+    );
+    expect(revoked.danmakuSourceSegments).toEqual([]);
+    expect(revoked.mediaMatchCandidates[0]).toMatchObject({
+      state: "pending",
+      confirmedTimeMapId: null,
+      appliedSegmentIds: []
+    });
+    expect(validateProjectSchema(revoked).ok).toBe(true);
+  });
+
+  it("撤销遇到未知 appliedSegmentIds 时安全阻断且不删除任何来源段", () => {
+    const project = withCandidate(
+      createMatchingProject(),
+      "candidate-revoke-unknown",
+      "source-1",
+      "target-1"
+    );
+    const accepted = acceptMediaMatchCandidate(
+      project,
+      "candidate-revoke-unknown",
+      ["asset-1"],
+      TIMESTAMP
+    );
+    const corrupted = {
+      ...accepted,
+      mediaMatchCandidates: accepted.mediaMatchCandidates.map((candidate) => ({
+        ...candidate,
+        appliedSegmentIds: [...candidate.appliedSegmentIds, "unknown-segment"]
+      }))
+    };
+
+    expect(() =>
+      revokeMediaMatchCandidateAcceptance(corrupted, "candidate-revoke-unknown")
+    ).toThrow("已安全阻断撤销");
+    expect(corrupted.danmakuSourceSegments).toEqual(accepted.danmakuSourceSegments);
   });
 
   it("来源段、XML 或媒体删除后清理候选的已应用引用与状态", () => {
@@ -429,10 +558,10 @@ describe("media matching candidates", () => {
     expect(withoutTarget.mediaMatchCandidates).toEqual([]);
     expect(validateProjectSchema(withoutSegment).ok).toBe(true);
     expect(validateProjectSchema(withoutAsset).ok).toBe(true);
-    expect(validateProjectSchema(withoutTarget).ok).toBe(true);
+    expect(validateProjectSchema(withoutTarget).ok).toBe(false);
   });
 
-  it("接受候选后，targetStartMs 与 timingRules 会共同驱动最终弹幕投影时间", () => {
+  it("旧候选接受后生成显式时间图，但 legacy-unverified 默认阻断导出", () => {
     let project = createMatchingProject();
     project.assets[0].items = [
       createDanmakuItem("asset-1", 0, 20_000),
@@ -464,15 +593,153 @@ describe("media matching candidates", () => {
       targetStartMs: 30_000,
       timingRules: [{ sourceAtMs: 40_000, gapMs: 5_000 }]
     });
+    expect(typeof appliedSegment.timeMapId).toBe("string");
+    expect(project.mediaTimeMaps.find((map) => map.id === appliedSegment.timeMapId)).toMatchObject({
+      state: "confirmed",
+      quality: { level: "legacy-unverified" }
+    });
 
     const projection = projectDanmakuToTargets(project);
-    const targetGroup = projection.groups.find((group) => group.targetMediaId === "target-1");
+    expect(projection.status).toBe("blocked");
+    expect(projection.groups).toEqual([]);
+    expect(projection.issues.some((issue) => issue.message.includes("未经验证"))).toBe(true);
+  });
 
-    // 20s - 10s + 30s = 40s；50s - 10s + 30s + 5s（版本差异）= 75s。
-    expect(targetGroup?.entries.map((entry) => entry.finalTimeMs)).toEqual([40_000, 75_000]);
-    expect(targetGroup?.appliedRules).toMatchObject([
-      { sourceAtMs: 40_000, gapMs: 5_000, affectedCount: 1 }
-    ]);
+  it("Alignment V2 候选保留分段仿射图，但没有校准 record 时不能伪装 verified 导出", () => {
+    let project = createMatchingProject();
+    project.assets[0].items = [
+      createDanmakuItem("asset-1", 0, 20_000),
+      createDanmakuItem("asset-1", 1, 50_000)
+    ];
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    proposal.timeMap = createVerifiedTimeMapProposal();
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-v2",
+        batchId: "batch-v2",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal
+      })
+    ];
+
+    project = acceptMediaMatchCandidate(project, "candidate-v2", ["asset-1"], TIMESTAMP);
+    const candidateMap = project.mediaTimeMaps.find((map) => map.state === "candidate");
+    const confirmedMap = project.mediaTimeMaps.find((map) => map.state === "confirmed");
+    expect(candidateMap).toMatchObject({
+      engineVersion: "alignment-v2-test",
+      quality: { level: "review" },
+      spans: [
+        { kind: "matched" },
+        { kind: "targetOnly" },
+        { kind: "matched" }
+      ]
+    });
+    expect(confirmedMap?.id).not.toBe(candidateMap?.id);
+    expect(confirmedMap?.verification).toBeNull();
+
+    const projection = projectDanmakuToTargets(project);
+    expect(projection.status).toBe("blocked");
+    expect(projection.groups).toHaveLength(0);
+    expect(projection.issues.some((issue) => issue.message.includes("复核"))).toBe(true);
+  });
+
+  it("外部 V2 自报 verified 不满足中央概率门槛时降级并阻断导出", () => {
+    let project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    const overclaimed = createVerifiedTimeMapProposal();
+    overclaimed.quality.probability = 0.99;
+    proposal.timeMap = overclaimed;
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-v2-overclaimed",
+      batchId: "batch-v2",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      proposal
+    });
+
+    expect(candidate.proposal.timeMap?.quality).toMatchObject({ level: "review" });
+    project = upsertMediaMatchCandidate(project, candidate, TIMESTAMP);
+    expect(project.mediaTimeMaps[0]?.quality.level).toBe("review");
+    project = acceptMediaMatchCandidate(project, candidate.id, ["asset-1"], TIMESTAMP);
+
+    const projection = projectDanmakuToTargets(project);
+    expect(projection.status).toBe("blocked");
+    expect(projection.groups).toEqual([]);
+    expect(projection.issues.some((issue) => issue.message.includes("仍需人工复核"))).toBe(true);
+  });
+
+  it("证据不足或有歧义的 V2 时间图在领域层也不能被确认", () => {
+    const project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    const blockedTimeMap = createVerifiedTimeMapProposal();
+    blockedTimeMap.quality = {
+      ...blockedTimeMap.quality,
+      level: "blocked",
+      reasons: ["最佳路径与备选路径无法区分。"]
+    };
+    proposal.timeMap = blockedTimeMap;
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-blocked-v2",
+      batchId: "batch-v2",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      proposal
+    });
+    project.mediaMatchCandidates = [candidate];
+
+    expect(candidate.state).toBe("blocked");
+    expect(() => acceptMediaMatchCandidate(project, candidate.id, ["asset-1"])).toThrow(
+      "候选时间图已阻断"
+    );
+  });
+
+  it("只改 V2 候选边界时不会硬拉旧映射，而是明确降级为 ambiguous", () => {
+    const project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    proposal.timeMap = createVerifiedTimeMapProposal();
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-range-v2",
+        batchId: "batch-v2",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal
+      })
+    ];
+
+    const updated = updateMediaMatchCandidateRange(project, "candidate-range-v2", {
+      sourceStartMs: 12_000
+    });
+    expect(updated.mediaMatchCandidates[0]).toMatchObject({ state: "blocked" });
+    expect(updated.mediaMatchCandidates[0].proposal.timeMap).toMatchObject({
+      quality: { level: "blocked" },
+      spans: [{ kind: "ambiguous", sourceStartMs: 12_000 }]
+    });
+    expect(updated.mediaTimeMaps[0]).toMatchObject({
+      quality: { level: "blocked" },
+      spans: [{ kind: "ambiguous" }]
+    });
   });
 });
 
@@ -555,6 +822,83 @@ function createProposal(
   };
 }
 
+function createVerifiedTimeMapProposal(): NonNullable<AlignmentProposal["timeMap"]> {
+  return {
+    sourceStartMs: 10_000,
+    sourceEndMs: 70_000,
+    targetStartMs: 30_000,
+    targetEndMs: 95_000,
+    spans: [
+      {
+        kind: "matched",
+        sourceStartMs: 10_000,
+        sourceEndMs: 40_000,
+        targetStartMs: 30_000,
+        targetEndMs: 63_000
+      },
+      {
+        kind: "targetOnly",
+        sourceStartMs: 40_000,
+        sourceEndMs: 40_000,
+        targetStartMs: 63_000,
+        targetEndMs: 68_000
+      },
+      {
+        kind: "matched",
+        sourceStartMs: 40_000,
+        sourceEndMs: 70_000,
+        targetStartMs: 68_000,
+        targetEndMs: 95_000
+      }
+    ],
+    quality: {
+      level: "verified",
+      probability: 0.999,
+      metricSource: "measured",
+      coverage: 0.96,
+      p50ResidualMs: 25,
+      p95ResidualMs: 80,
+      maxResidualMs: 140,
+      boundaryUncertaintyMs: 180,
+      alternativeMargin: 0.4,
+      anchorCount: 40,
+      heldOutAnchorCount: 8,
+      reasons: ["测试中的独立音画证据已验证。"]
+    },
+    evidence: {
+      types: ["audio", "visual"],
+      audioAnchorCount: 32,
+      visualAnchorCount: 8,
+      heldOutAnchorCount: 8,
+      top1Top2Margin: 0.4,
+      notes: ["测试证据"]
+    },
+    sourceStream: createAlignmentAudioStreamIdentity(0),
+    targetStream: createAlignmentAudioStreamIdentity(0),
+    sourceIdentity: createTestMediaIdentity(),
+    targetIdentity: createTestMediaIdentity(),
+    engineVersion: "alignment-v2-test",
+    featureVersion: "landmark-edit-dp-test",
+    parametersHash: "test-v2-parameters"
+  };
+}
+
+function createAlignmentAudioStreamIdentity(index: number) {
+  return {
+    type: "audio" as const,
+    index,
+    codec: "aac",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/48000",
+    sampleRate: 48_000,
+    channels: 2,
+    frameRate: null,
+    language: "zh",
+    title: null
+  };
+}
+
 function createMedia(
   id: string,
   role: ProjectMediaRole,
@@ -576,7 +920,19 @@ function createMedia(
     episodeLabel: null,
     createdAt: TIMESTAMP,
     updatedAt: TIMESTAMP,
-    ...overrides
+    ...overrides,
+    contentIdentity: overrides.contentIdentity ?? createTestMediaIdentity()
+  };
+}
+
+function createTestMediaIdentity() {
+  return {
+    algorithm: "fnv1a64-first-middle-last-64k-v1",
+    sizeBytes: 1_000,
+    modifiedUnixMs: 1_700_000_000_000,
+    firstSampleDigest: "a".repeat(16),
+    middleSampleDigest: "b".repeat(16),
+    lastSampleDigest: "c".repeat(16)
   };
 }
 

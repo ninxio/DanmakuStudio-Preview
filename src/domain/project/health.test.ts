@@ -24,6 +24,133 @@ describe("project health", () => {
     );
   });
 
+  it("把未验证或含歧义的确认时间图列为导出阻断", () => {
+    const project = createEmptyProject("时间图健康检查");
+    project.danmakuSourceSegments = [
+      {
+        id: "segment-1",
+        label: "第 1 集来源段",
+        kind: "content",
+        assetId: null,
+        sourceMediaId: "source-1",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetMediaId: "target-1",
+        targetStartMs: 0,
+        timingRules: [],
+        timeMapId: "time-map-1",
+        episodeKey: null,
+        episodeLabel: null,
+        note: "",
+        createdAt: "2026-07-12T00:00:00.000Z",
+        updatedAt: "2026-07-12T00:00:00.000Z"
+      }
+    ];
+    project.mediaTimeMaps = [
+      {
+        id: "time-map-1",
+        revision: 1,
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        sourceStream: null,
+        targetStream: null,
+        sourceIdentity: null,
+        targetIdentity: null,
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000,
+        spans: [
+          {
+            kind: "ambiguous",
+            sourceStartMs: 0,
+            sourceEndMs: 10_000,
+            targetStartMs: 0,
+            targetEndMs: 10_000
+          }
+        ],
+        quality: {
+          level: "legacy-unverified",
+          probability: null,
+          metricSource: "missing",
+          coverage: null,
+          p50ResidualMs: null,
+          p95ResidualMs: null,
+          maxResidualMs: null,
+          boundaryUncertaintyMs: null,
+          alternativeMargin: null,
+          anchorCount: 0,
+          heldOutAnchorCount: 0,
+          reasons: ["旧算法没有真实媒体精度指标。"]
+        },
+        evidence: {
+          types: ["legacy"],
+          audioAnchorCount: 0,
+          visualAnchorCount: 0,
+          heldOutAnchorCount: 0,
+          notes: []
+        },
+        verification: null,
+        engineVersion: "legacy-v9",
+        featureVersion: "legacy-v9",
+        parametersHash: "legacy-test",
+        state: "confirmed",
+        createdAt: "2026-07-12T00:00:00.000Z",
+        updatedAt: "2026-07-12T00:00:00.000Z",
+        confirmedAt: "2026-07-12T00:00:00.000Z"
+      }
+    ];
+
+    const summary = createProjectHealthSummary(project);
+    expect(summary.status).toBe("blocked");
+    expect(summary.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "source-segment-time-map-quality-segment-1",
+          severity: "error",
+          title: "时间映射尚未验证"
+        }),
+        expect.objectContaining({
+          id: "source-segment-time-map-ambiguous-segment-1",
+          severity: "error",
+          title: "时间映射仍有歧义区间"
+        })
+      ])
+    );
+  });
+
+  it("没有时间图的 content 段直接列为导出阻断", () => {
+    const project = createEmptyProject("手工兼容段");
+    project.danmakuSourceSegments = [
+      {
+        id: "manual-segment",
+        label: "手工来源段",
+        kind: "content",
+        assetId: null,
+        sourceMediaId: null,
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetMediaId: null,
+        targetStartMs: 0,
+        timingRules: [],
+        timeMapId: null,
+        episodeKey: null,
+        episodeLabel: null,
+        note: "",
+        createdAt: "2026-07-12T00:00:00.000Z",
+        updatedAt: "2026-07-12T00:00:00.000Z"
+      }
+    ];
+
+    expect(createProjectHealthSummary(project).findings).toContainEqual(
+      expect.objectContaining({
+        id: "source-segment-time-map-missing-manual-segment",
+        severity: "error",
+        title: "来源段缺少确认时间图"
+      })
+    );
+  });
+
   it("统计可用弹幕、片段和版本差异规则", () => {
     const asset = createAsset("asset", [createItem("item-1"), { ...createItem("item-2"), enabled: false }]);
     const project = {

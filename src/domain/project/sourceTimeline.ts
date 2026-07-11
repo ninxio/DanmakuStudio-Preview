@@ -25,6 +25,7 @@ export interface DanmakuSourceSegmentDraft {
   targetMediaId: string | null;
   targetStartMs?: Milliseconds | null;
   timingRules?: SegmentTimingRuleDraft[];
+  timeMapId?: string | null;
   episodeKey: string | null;
   episodeLabel: string | null;
   note?: string;
@@ -87,15 +88,57 @@ export function updateDanmakuSourceSegment(
     targetStartMs:
       patch.targetStartMs !== undefined ? patch.targetStartMs : segment.targetStartMs,
     timingRules: patch.timingRules !== undefined ? patch.timingRules : segment.timingRules,
+    timeMapId: patch.timeMapId !== undefined ? patch.timeMapId : segment.timeMapId,
     episodeKey: patch.episodeKey !== undefined ? patch.episodeKey : segment.episodeKey,
     episodeLabel: patch.episodeLabel !== undefined ? patch.episodeLabel : segment.episodeLabel,
     note: patch.note ?? segment.note
   });
+  if (segment.timeMapId && hasTimeMapOwnedStructureChanged(segment, normalized)) {
+    throw new Error(
+      "该来源段由已确认时间图管理，不能在旧来源段表单中修改用途、素材、范围、目标起点或删减修正；请先在匹配页撤销确认，再重新分析。"
+    );
+  }
   return {
     ...segment,
     ...normalized,
     updatedAt: timestamp
   };
+}
+
+function hasTimeMapOwnedStructureChanged(
+  segment: DanmakuSourceSegment,
+  normalized: Omit<DanmakuSourceSegment, "id" | "createdAt" | "updatedAt">
+): boolean {
+  return (
+    normalized.kind !== segment.kind ||
+    normalized.assetId !== segment.assetId ||
+    normalized.sourceMediaId !== segment.sourceMediaId ||
+    normalized.sourceStartMs !== segment.sourceStartMs ||
+    normalized.sourceEndMs !== segment.sourceEndMs ||
+    normalized.targetMediaId !== segment.targetMediaId ||
+    normalized.targetStartMs !== segment.targetStartMs ||
+    normalized.timeMapId !== segment.timeMapId ||
+    !areTimingRulesEqual(normalized.timingRules, segment.timingRules)
+  );
+}
+
+function areTimingRulesEqual(
+  left: readonly SegmentTimingRule[],
+  right: readonly SegmentTimingRule[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((rule, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        rule.id === other.id &&
+        rule.sourceAtMs === other.sourceAtMs &&
+        rule.gapMs === other.gapMs &&
+        rule.note === other.note
+      );
+    })
+  );
 }
 
 export function createSourceTimelineSummary(
@@ -313,6 +356,7 @@ function normalizeSegmentDraft(
     kind === "content"
       ? normalizeTimingRules(draft.timingRules ?? [], sourceStartMs, sourceEndMs)
       : [];
+  const timeMapId = kind === "content" ? normalizeOptionalText(draft.timeMapId ?? null) : null;
   return {
     label: normalizeLabel(draft.label, kind, episodeLabel, sourceStartMs, sourceEndMs),
     kind,
@@ -323,6 +367,7 @@ function normalizeSegmentDraft(
     targetMediaId,
     targetStartMs,
     timingRules,
+    timeMapId,
     episodeKey,
     episodeLabel,
     note: draft.note?.trim() ?? ""

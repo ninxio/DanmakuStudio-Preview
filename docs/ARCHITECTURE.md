@@ -30,7 +30,7 @@ resolved = applyCutMapping(adjusted, cutMarkers)
 
 ## 目标原片绑定
 
-项目 schema v4 新增 `mediaBinding`，用于表达当前项目最终要对齐到哪一份目标原片。schema v5 新增 `seasonEpisodeBindings`，用于表达剧集批量工作台中每个输出集对应哪份目标原片。schema v6 新增 `danmakuSourceSegments`，用于表达 B 站/XML 弹幕来源时间轴上的虚拟内容段和忽略范围。schema v7 新增 `mediaLibrary` 和 `danmakuSourceBindings`，把多条媒体素材、XML 到 B 站参考素材的绑定、来源段到参考素材/目标原片的关系统一改为稳定 ID 引用。绑定与来源时间轴模型位于 `src/domain/project`，不依赖 React，后续匹配评分、预览、对齐和导出检查都应读取同一份项目状态。
+项目 schema v4 新增 `mediaBinding`，v5 新增 `seasonEpisodeBindings`，v6 新增 `danmakuSourceSegments`，v7 新增 `mediaLibrary` 和 `danmakuSourceBindings`，把多条媒体素材、XML 到 B 站参考素材的绑定、来源段到参考素材/目标原片的关系统一改为稳定 ID 引用。v9 新增批量 `mediaMatchCandidates`；v10 新增正式 `mediaTimeMaps`；v11 新增验证来源记录，防止项目 JSON 仅靠自报指标取得 `verified`。绑定、来源时间轴和时间图模型位于 `src/domain/project` 与 `src/domain/alignment`，不依赖 React。
 
 `mediaLibrary` 是项目级媒体素材库，每条素材都有稳定 ID、角色、名称、文件名或媒体名、时长、引用类型、连接状态和来源摘要。当前角色包括：
 
@@ -51,6 +51,10 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 `danmakuSourceBindings` 表达每个 XML 当前绑定的 B 站参考素材。XML 可以不绑定、绑定、更换或解除绑定；这些操作只修改项目关系，不修改原始 XML 或弹幕时间。未绑定 XML 仍可编辑，但来源段匹配会显示风险提示。
 
 `danmakuSourceSegments` 由 `src/domain/project/sourceTimeline.ts` 维护。schema v7 后，每段明确记录所属 XML、B 站参考素材、来源起止时间、正片/忽略类型、目标原片和可选输出集 key。正片内容段可以指向目标原片；忽略范围不要求目标原片。新增、更新和删除都进入编辑历史。它不剪切视频、不改变原始 XML，后续弹幕投影和分集复核应读取这些虚拟范围作为证据边界。
+
+schema v10/v11 下，自动候选先保存 candidate `MediaTimeMap`，接受后复制为独立 confirmed revision，来源段只通过 `timeMapId` 引用它。正式投影只读取 confirmed map：`matched` 使用整数端点有理插值，`sourceOnly` 明确舍弃参考独有弹幕，`targetOnly` 推动后续目标边界，`ambiguous` 阻断导出。旧 `targetStartMs + timingRules` 只用于迁移兼容，不能消费 V2 结果。
+
+`verified` 需要 v11 verification record 精确绑定规范化 map 摘要、revision、双端全文件 SHA-256 身份和校准来源；当前自动 calibration 白名单为空。媒体身份由 Rust 从同一文件句柄流式计算，并在分析前后、导出预检和 native 写盘前重复核验。任何缺失、替换、竞态或 provenance 不一致都会安全降级或阻断。
 
 ## 匹配评分
 

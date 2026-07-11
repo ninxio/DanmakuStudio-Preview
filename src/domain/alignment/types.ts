@@ -1,5 +1,7 @@
 import type { CutMarker, SyncAnchor } from "../danmaku/types";
+import type { MediaContentIdentity } from "../project/types";
 import { clampMilliseconds } from "../shared/time";
+import type { TimeMapSpan, TimeMapQualityLevel } from "./timeMap";
 
 export interface AlignmentInput {
   projectId: string;
@@ -21,6 +23,7 @@ export interface CutCandidate {
 export type AlignmentEvidenceQuality = "high" | "medium" | "low" | "blocked";
 
 export type AlignmentEvidenceAlgorithm =
+  | "alignment-v2-edit-map"
   | "time-map-audio"
   | "offset-path"
   | "sparse-fingerprint"
@@ -65,6 +68,74 @@ export interface AlignmentMatchRange {
   coverage: number;
 }
 
+export interface AlignmentTimeMapStreamIdentity {
+  type: "audio" | "video";
+  index: number;
+  codec: string | null;
+  startMs: number | null;
+  timelineOffsetMs: number | null;
+  timeBase: string | null;
+  sampleRate: number | null;
+  channels: number | null;
+  frameRate: number | null;
+  language: string | null;
+  title: string | null;
+}
+
+export interface AlignmentTimeMapQuality {
+  level: TimeMapQualityLevel;
+  probability: number | null;
+  metricSource: "measured" | "estimated" | "missing";
+  coverage: number | null;
+  p50ResidualMs: number | null;
+  p95ResidualMs: number | null;
+  maxResidualMs: number | null;
+  boundaryUncertaintyMs: number | null;
+  alternativeMargin: number | null;
+  anchorCount: number;
+  heldOutAnchorCount: number;
+  reasons: string[];
+}
+
+export interface AlignmentTrackAlternative {
+  sourceStreamIndex: number;
+  targetStreamIndex: number;
+  score: number;
+}
+
+export interface AlignmentTimeMapEvidence {
+  types: Array<"audio" | "visual" | "manual" | "danmaku" | "legacy">;
+  audioAnchorCount: number;
+  visualAnchorCount: number;
+  heldOutAnchorCount: number;
+  top1Top2Margin: number | null;
+  /** Source-axis support backed by content-unique observations, not just mapped duration. */
+  uniqueContentCoverage?: number | null;
+  /** True when another well-supported, temporally distinct occurrence competes with Top-1. */
+  repeatedContentOnly?: boolean;
+  selectedTrackReason?: string;
+  alternativeTrackScores?: AlignmentTrackAlternative[];
+  notes: string[];
+}
+
+/** Rust Alignment V2 返回的候选快照；持久化 ID、媒体 ID 和 revision 由项目层生成。 */
+export interface AlignmentTimeMapProposal {
+  sourceStartMs: number;
+  sourceEndMs: number;
+  targetStartMs: number;
+  targetEndMs: number;
+  spans: TimeMapSpan[];
+  quality: AlignmentTimeMapQuality;
+  evidence: AlignmentTimeMapEvidence;
+  sourceStream: AlignmentTimeMapStreamIdentity | null;
+  targetStream: AlignmentTimeMapStreamIdentity | null;
+  sourceIdentity: MediaContentIdentity | null;
+  targetIdentity: MediaContentIdentity | null;
+  engineVersion: string;
+  featureVersion: string;
+  parametersHash: string;
+}
+
 export interface AlignmentProposal {
   anchors: SyncAnchor[];
   cutCandidates: CutCandidate[];
@@ -72,6 +143,7 @@ export interface AlignmentProposal {
   diagnostics: string[];
   evidence?: AlignmentEvidenceSummary;
   matchRange?: AlignmentMatchRange;
+  timeMap?: AlignmentTimeMapProposal;
 }
 
 export interface AlignmentProvider {

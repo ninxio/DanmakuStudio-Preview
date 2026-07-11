@@ -1,12 +1,26 @@
-import type { AlignmentProposal, CutCandidate } from "./types";
+import type { AlignmentProposal, AlignmentTimeMapProposal, CutCandidate } from "./types";
+import {
+  isAlignmentTimeMapProposal,
+  reconcileAlignmentTimeMapProposalQuality
+} from "./timeMapProposal";
+import {
+  confirmCandidateTimeMap,
+  createCandidateTimeMapId,
+  createConfirmedTimeMapId,
+  createLegacyMediaTimeMap,
+  reconcileMediaTimeMapQuality,
+  supersedeMediaTimeMap
+} from "./mediaTimeMap";
 import { createDanmakuSourceSegment } from "../project/sourceTimeline";
 import type {
   EditorProject,
   MediaMatchCandidate,
+  MediaTimeMap,
   ProjectMediaReference,
   SegmentTimingRule
 } from "../project/types";
 import type { Milliseconds } from "../shared/time";
+import { cloneMediaContentIdentity } from "../project/mediaIdentity";
 
 export interface CreateMediaMatchCandidateInput {
   id: string;
@@ -55,6 +69,7 @@ export function createMediaMatchCandidate(
   }
   validateMediaMatchRange(range, source, target);
   validateProposalItemsInRange(input.proposal, range);
+  validateProposalTimeMapInRange(input.proposal, range);
 
   const proposal = namespaceProposal(input.proposal, id);
   const timingRules = createTimingRules(
@@ -80,7 +95,9 @@ export function createMediaMatchCandidate(
     timingRules,
     confidence: proposal.confidence,
     proposal,
-    state: hasBoundAsset ? "pending" : "blocked",
+    timeMapId: createCandidateTimeMapId(id),
+    confirmedTimeMapId: null,
+    state: hasBoundAsset && !isProposalBlocked(proposal) ? "pending" : "blocked",
     appliedSegmentIds: [],
     createdAt: timestamp,
     updatedAt: timestamp
@@ -102,16 +119,28 @@ export function updateMediaMatchCandidateRange(
         : "已拒绝的匹配候选不能修改区间。"
     );
   }
+  const nextSourceStartMs = patch.sourceStartMs ?? candidate.sourceStartMs;
+  const nextSourceEndMs = patch.sourceEndMs ?? candidate.sourceEndMs;
+  const nextTargetStartMs = patch.targetStartMs ?? candidate.targetStartMs;
+  const nextTargetEndMs = patch.targetEndMs ?? candidate.targetEndMs;
+  if (
+    nextSourceStartMs === candidate.sourceStartMs &&
+    nextSourceEndMs === candidate.sourceEndMs &&
+    nextTargetStartMs === candidate.targetStartMs &&
+    nextTargetEndMs === candidate.targetEndMs
+  ) {
+    return project;
+  }
   const { source, target } = requireMediaPair(
     project.mediaLibrary,
     candidate.sourceMediaId,
     candidate.targetMediaId
   );
   const range = {
-    sourceStartMs: patch.sourceStartMs ?? candidate.sourceStartMs,
-    sourceEndMs: patch.sourceEndMs ?? candidate.sourceEndMs,
-    targetStartMs: patch.targetStartMs ?? candidate.targetStartMs,
-    targetEndMs: patch.targetEndMs ?? candidate.targetEndMs,
+    sourceStartMs: nextSourceStartMs,
+    sourceEndMs: nextSourceEndMs,
+    targetStartMs: nextTargetStartMs,
+    targetEndMs: nextTargetEndMs,
     coverage: candidate.proposal.matchRange?.coverage ?? candidate.confidence
   };
   const sourceTranslationMs = getWholeRangeTranslation(
@@ -143,6 +172,7 @@ export function updateMediaMatchCandidateRange(
   validateMediaMatchRange(range, source, target);
   validateTimingRulesInRange(adjustedTimingRules, range.sourceStartMs, range.sourceEndMs);
   validateProposalItemsInRange(adjustedProposal, range);
+  validateProposalTimeMapInRange(adjustedProposal, range);
   const hasBoundAsset = project.danmakuSourceBindings.some(
     (binding) =>
       binding.sourceMediaId === candidate.sourceMediaId &&
@@ -159,10 +189,34 @@ export function updateMediaMatchCandidateRange(
       ...adjustedProposal,
       matchRange: range
     },
-    state: hasBoundAsset ? "pending" : "blocked",
+    state: hasBoundAsset && !isProposalBlocked(adjustedProposal) ? "pending" : "blocked",
     updatedAt: timestamp
   };
-  return replaceCandidate(project, updated);
+  return replaceCandidateAndCandidateMap(project, updated, timestamp);
+}
+
+/**
+ * 把候选与其 state=candidate 时间图作为一个原子项目变更写入。
+ * 旧引擎只能生成 legacy-unverified/blocked 图，不能借候选分数升级质量等级。
+ */
+export function upsertMediaMatchCandidate(
+  project: EditorProject,
+  candidate: MediaMatchCandidate,
+  timestamp = candidate.updatedAt
+): EditorProject {
+  const projectWithCurrentIdentities = synchronizeMediaIdentitySnapshots(project, candidate);
+  const existing = projectWithCurrentIdentities.mediaMatchCandidates.some(
+    (item) => item.id === candidate.id
+  );
+  const withCandidate: EditorProject = {
+    ...projectWithCurrentIdentities,
+    mediaMatchCandidates: existing
+      ? projectWithCurrentIdentities.mediaMatchCandidates.map((item) =>
+          item.id === candidate.id ? candidate : item
+        )
+      : [...projectWithCurrentIdentities.mediaMatchCandidates, candidate]
+  };
+  return replaceCandidateAndCandidateMap(withCandidate, candidate, timestamp);
 }
 
 /**
@@ -181,6 +235,7 @@ export function reconcileMediaMatchCandidates(
   const segmentsById = new Map(
     project.danmakuSourceSegments.map((segment) => [segment.id, segment])
   );
+  const supersededMapIds = new Set<string>();
   let changed = false;
   const mediaMatchCandidates = project.mediaMatchCandidates.flatMap((candidate) => {
     if (!mediaIds.has(candidate.sourceMediaId) || !mediaIds.has(candidate.targetMediaId)) {
@@ -198,7 +253,9 @@ export function reconcileMediaMatchCandidates(
         binding?.sourceMediaId === candidate.sourceMediaId &&
         segmentId === createAppliedSegmentId(candidate.id, segment.assetId) &&
         segment.sourceMediaId === candidate.sourceMediaId &&
-        segment.targetMediaId === candidate.targetMediaId
+        segment.targetMediaId === candidate.targetMediaId &&
+        candidate.confirmedTimeMapId !== null &&
+        segment.timeMapId === candidate.confirmedTimeMapId
       );
     });
     const hasBoundAsset = project.danmakuSourceBindings.some(
@@ -210,12 +267,17 @@ export function reconcileMediaMatchCandidates(
         ? "rejected"
         : appliedSegmentIds.length > 0
           ? "accepted"
-          : hasBoundAsset
+          : hasBoundAsset && !isProposalBlocked(candidate.proposal)
             ? "pending"
             : "blocked";
     const normalizedAppliedSegmentIds = state === "accepted" ? appliedSegmentIds : [];
+    const confirmedTimeMapId = state === "accepted" ? candidate.confirmedTimeMapId : null;
+    if (candidate.confirmedTimeMapId && confirmedTimeMapId === null) {
+      supersededMapIds.add(candidate.confirmedTimeMapId);
+    }
     if (
       state === candidate.state &&
+      confirmedTimeMapId === candidate.confirmedTimeMapId &&
       normalizedAppliedSegmentIds.length === candidate.appliedSegmentIds.length &&
       normalizedAppliedSegmentIds.every(
         (id, index) => id === candidate.appliedSegmentIds[index]
@@ -228,12 +290,37 @@ export function reconcileMediaMatchCandidates(
       {
         ...candidate,
         state,
+        confirmedTimeMapId,
         appliedSegmentIds: normalizedAppliedSegmentIds,
         updatedAt: timestamp
       }
     ];
   });
-  return changed ? { ...project, mediaMatchCandidates } : project;
+  const referencedTimeMapIds = new Set(
+    project.danmakuSourceSegments.flatMap((segment) =>
+      segment.timeMapId ? [segment.timeMapId] : []
+    )
+  );
+  let mediaTimeMaps = project.mediaTimeMaps
+    .filter((map) => mediaIds.has(map.sourceMediaId) && mediaIds.has(map.targetMediaId))
+    .map((map) =>
+      supersededMapIds.has(map.id) &&
+      !referencedTimeMapIds.has(map.id) &&
+      map.state === "confirmed"
+        ? supersedeMediaTimeMap(map, timestamp)
+        : map
+    );
+  if (mediaTimeMaps.length !== project.mediaTimeMaps.length || supersededMapIds.size > 0) {
+    changed = true;
+  }
+  for (const candidate of mediaMatchCandidates) {
+    if (mediaTimeMaps.some((map) => map.id === candidate.timeMapId)) {
+      continue;
+    }
+    mediaTimeMaps = [...mediaTimeMaps, createCandidateTimeMap(candidate, timestamp)];
+    changed = true;
+  }
+  return changed ? { ...project, mediaMatchCandidates, mediaTimeMaps } : project;
 }
 
 /** 拒绝待复核候选；不会修改任何已确认来源段。 */
@@ -249,12 +336,13 @@ export function rejectMediaMatchCandidate(
   if (candidate.state === "rejected") {
     return project;
   }
-  return replaceCandidate(project, {
+  return replaceCandidateAndCandidateMap(project, {
     ...candidate,
     state: "rejected",
+    confirmedTimeMapId: null,
     appliedSegmentIds: [],
     updatedAt: timestamp
-  });
+  }, timestamp, false);
 }
 
 /** 撤销已确认候选，只删除该候选生成的来源段，并把候选恢复为待复核或阻塞状态。 */
@@ -267,12 +355,46 @@ export function revokeMediaMatchCandidateAcceptance(
   if (candidate.state !== "accepted") {
     throw new Error("只有已确认的匹配候选可以撤销确认。");
   }
-  const appliedSegmentIds = new Set(candidate.appliedSegmentIds);
+  const confirmedTimeMapId = candidate.confirmedTimeMapId;
+  const confirmedMap = confirmedTimeMapId
+    ? project.mediaTimeMaps.find((map) => map.id === confirmedTimeMapId)
+    : undefined;
+  if (
+    !confirmedTimeMapId ||
+    confirmedMap?.state !== "confirmed" ||
+    !doesTimeMapMatchCandidate(confirmedMap, candidate)
+  ) {
+    throw new Error("候选的确认时间图引用未知或不一致，已安全阻断撤销。");
+  }
+  if (
+    project.mediaMatchCandidates.some(
+      (other) =>
+        other.id !== candidate.id &&
+        other.state === "accepted" &&
+        other.confirmedTimeMapId === confirmedTimeMapId
+    )
+  ) {
+    throw new Error("确认时间图被多个候选共同引用，已安全阻断撤销。");
+  }
+
+  const segmentsById = new Map(
+    project.danmakuSourceSegments.map((segment) => [segment.id, segment])
+  );
+  const hasUnknownAppliedReference = candidate.appliedSegmentIds.some((segmentId) => {
+    const segment = segmentsById.get(segmentId);
+    return segment?.kind !== "content" || segment.timeMapId !== confirmedTimeMapId;
+  });
+  if (hasUnknownAppliedReference) {
+    throw new Error("候选的已应用片段引用未知或不属于其确认时间图，已安全阻断撤销。");
+  }
+
+  // appliedSegmentIds 可能来自旧项目或异常中断而不完整；确认图才是归属的最终依据。
+  // 清理该图下的全部段，避免遗漏仍可进入导出链路的孤儿段。
   return reconcileMediaMatchCandidates(
     {
       ...project,
       danmakuSourceSegments: project.danmakuSourceSegments.filter(
-        (segment) => !appliedSegmentIds.has(segment.id)
+        (segment) => segment.timeMapId !== confirmedTimeMapId
       )
     },
     timestamp
@@ -320,13 +442,36 @@ export function acceptMediaMatchCandidate(
     return asset;
   });
 
+  const candidateMap = requireOrCreateCandidateTimeMap(project, candidate, timestamp);
+  if (candidateMap.quality.level === "blocked") {
+    throw new Error(`候选时间图已阻断：${candidateMap.quality.reasons.join("；")}`);
+  }
+  const existingConfirmedMap = candidate.confirmedTimeMapId
+    ? project.mediaTimeMaps.find((map) => map.id === candidate.confirmedTimeMapId)
+    : undefined;
+  if (candidate.state === "accepted" && existingConfirmedMap?.state !== "confirmed") {
+    throw new Error("已接受候选引用的确认时间图不存在或状态无效。");
+  }
+  const confirmedRevision = nextConfirmedRevision(project, candidate.id);
+  const confirmedMap =
+    existingConfirmedMap?.state === "confirmed"
+      ? existingConfirmedMap
+      : confirmCandidateTimeMap(
+          candidateMap,
+          createConfirmedTimeMapId(candidate.id, confirmedRevision),
+          confirmedRevision,
+          timestamp
+        );
+  let mediaTimeMaps = upsertTimeMap(project.mediaTimeMaps, candidateMap);
+  mediaTimeMaps = upsertTimeMap(mediaTimeMaps, confirmedMap);
+
   const segments = [...project.danmakuSourceSegments];
   const appliedSegmentIds = new Set(candidate.appliedSegmentIds);
   for (const asset of selectedAssets) {
     const segmentId = createAppliedSegmentId(candidate.id, asset.id);
     const existing = segments.find((segment) => segment.id === segmentId);
     if (existing) {
-      if (!isSegmentForCandidate(existing, candidate, asset.id)) {
+      if (!isSegmentForCandidate(existing, candidate, asset.id, confirmedMap.id)) {
         throw new Error(`来源段 ID 冲突：${segmentId}`);
       }
       appliedSegmentIds.add(segmentId);
@@ -358,6 +503,7 @@ export function acceptMediaMatchCandidate(
           targetMediaId: candidate.targetMediaId,
           targetStartMs: candidate.targetStartMs,
           timingRules: candidate.timingRules,
+          timeMapId: confirmedMap.id,
           episodeKey: target.episodeKey,
           episodeLabel: target.episodeLabel,
           note: `由媒体匹配候选 ${candidate.id} 确认`
@@ -371,6 +517,7 @@ export function acceptMediaMatchCandidate(
   const updatedCandidate: MediaMatchCandidate = {
     ...candidate,
     state: "accepted",
+    confirmedTimeMapId: confirmedMap.id,
     appliedSegmentIds: [...appliedSegmentIds],
     updatedAt:
       candidate.state === "accepted" &&
@@ -381,12 +528,17 @@ export function acceptMediaMatchCandidate(
         : timestamp
   };
   const nextProject = replaceCandidate(project, updatedCandidate);
-  if (segments.length === project.danmakuSourceSegments.length && nextProject === project) {
+  if (
+    segments.length === project.danmakuSourceSegments.length &&
+    nextProject === project &&
+    mediaTimeMaps === project.mediaTimeMaps
+  ) {
     return project;
   }
   return {
     ...nextProject,
-    danmakuSourceSegments: segments
+    danmakuSourceSegments: segments,
+    mediaTimeMaps
   };
 }
 
@@ -431,7 +583,10 @@ function translateProposalCoordinates(
           : cut.sourceRangeStartMs + sourceDeltaMs,
       sourceRangeEndMs:
         cut.sourceRangeEndMs === undefined ? undefined : cut.sourceRangeEndMs + sourceDeltaMs
-    }))
+    })),
+    timeMap: proposal.timeMap
+      ? translateTimeMapProposal(proposal.timeMap, sourceDeltaMs, targetDeltaMs)
+      : undefined
   };
 }
 
@@ -471,14 +626,97 @@ function clipProposalToRange(
     anchors.length +
     proposal.cutCandidates.length -
     cutCandidates.length;
+  const timeMap = proposal.timeMap
+    ? doesProposalTimeMapMatchRange(proposal.timeMap, range)
+      ? proposal.timeMap
+      : blockTimeMapAfterManualRangeChange(proposal.timeMap, range)
+    : undefined;
   return {
     ...proposal,
     anchors,
     cutCandidates,
+    timeMap,
     diagnostics:
       removedCount > 0
         ? [...proposal.diagnostics, `人工调整范围后排除了 ${removedCount} 条范围外匹配证据。`]
         : proposal.diagnostics
+  };
+}
+
+function translateTimeMapProposal(
+  timeMap: AlignmentTimeMapProposal,
+  sourceDeltaMs: Milliseconds,
+  targetDeltaMs: Milliseconds
+): AlignmentTimeMapProposal {
+  return {
+    ...timeMap,
+    sourceStartMs: timeMap.sourceStartMs + sourceDeltaMs,
+    sourceEndMs: timeMap.sourceEndMs + sourceDeltaMs,
+    targetStartMs: timeMap.targetStartMs + targetDeltaMs,
+    targetEndMs: timeMap.targetEndMs + targetDeltaMs,
+    spans: timeMap.spans.map((span) => ({
+      ...span,
+      sourceStartMs: span.sourceStartMs + sourceDeltaMs,
+      sourceEndMs: span.sourceEndMs + sourceDeltaMs,
+      targetStartMs: span.targetStartMs + targetDeltaMs,
+      targetEndMs: span.targetEndMs + targetDeltaMs
+    })),
+    parametersHash: `${timeMap.parametersHash}:translated:${sourceDeltaMs}:${targetDeltaMs}`
+  };
+}
+
+function doesProposalTimeMapMatchRange(
+  timeMap: AlignmentTimeMapProposal,
+  range: {
+    sourceStartMs: Milliseconds;
+    sourceEndMs: Milliseconds;
+    targetStartMs: Milliseconds;
+    targetEndMs: Milliseconds;
+  }
+): boolean {
+  return (
+    timeMap.sourceStartMs === range.sourceStartMs &&
+    timeMap.sourceEndMs === range.sourceEndMs &&
+    timeMap.targetStartMs === range.targetStartMs &&
+    timeMap.targetEndMs === range.targetEndMs
+  );
+}
+
+function blockTimeMapAfterManualRangeChange(
+  timeMap: AlignmentTimeMapProposal,
+  range: {
+    sourceStartMs: Milliseconds;
+    sourceEndMs: Milliseconds;
+    targetStartMs: Milliseconds;
+    targetEndMs: Milliseconds;
+  }
+): AlignmentTimeMapProposal {
+  const reason = "人工只调整了候选边界，原有分段时间图已失效；请重新分析或重新标注映射。";
+  return {
+    ...timeMap,
+    sourceStartMs: range.sourceStartMs,
+    sourceEndMs: range.sourceEndMs,
+    targetStartMs: range.targetStartMs,
+    targetEndMs: range.targetEndMs,
+    spans: [
+      {
+        kind: "ambiguous",
+        sourceStartMs: range.sourceStartMs,
+        sourceEndMs: range.sourceEndMs,
+        targetStartMs: range.targetStartMs,
+        targetEndMs: range.targetEndMs
+      }
+    ],
+    quality: {
+      ...timeMap.quality,
+      level: "blocked",
+      reasons: [...timeMap.quality.reasons, reason]
+    },
+    evidence: {
+      ...timeMap.evidence,
+      notes: [...timeMap.evidence.notes, reason]
+    },
+    parametersHash: `${timeMap.parametersHash}:manual-range-blocked`
   };
 }
 
@@ -489,6 +727,9 @@ function namespaceProposal(
   const cloned = structuredClone(proposal);
   return {
     ...cloned,
+    timeMap: cloned.timeMap
+      ? reconcileAlignmentTimeMapProposalQuality(cloned.timeMap)
+      : undefined,
     anchors: cloned.anchors.map((anchor, index) => ({
       ...anchor,
       id: createNamespacedId(candidateId, "anchor", anchor.id, index)
@@ -542,6 +783,26 @@ function validateCandidateRange(
     candidate.sourceStartMs,
     candidate.sourceEndMs
   );
+}
+
+function validateProposalTimeMapInRange(
+  proposal: AlignmentProposal,
+  range: {
+    sourceStartMs: Milliseconds;
+    sourceEndMs: Milliseconds;
+    targetStartMs: Milliseconds;
+    targetEndMs: Milliseconds;
+  }
+): void {
+  if (proposal.timeMap === undefined) {
+    return;
+  }
+  if (!isAlignmentTimeMapProposal(proposal.timeMap)) {
+    throw new Error("Alignment V2 时间图结构无效。");
+  }
+  if (!doesProposalTimeMapMatchRange(proposal.timeMap, range)) {
+    throw new Error("Alignment V2 时间图范围与 matchRange 不一致。");
+  }
 }
 
 function validateMediaMatchRange(
@@ -692,6 +953,186 @@ function requireCandidate(project: EditorProject, candidateId: string): MediaMat
   return candidate;
 }
 
+function createCandidateTimeMap(
+  candidate: MediaMatchCandidate,
+  timestamp: string
+): MediaTimeMap {
+  const proposal = candidate.proposal.timeMap;
+  if (proposal !== undefined) {
+    if (!isAlignmentTimeMapProposal(proposal)) {
+      throw new Error("候选携带的 Alignment V2 时间图结构无效。");
+    }
+    if (
+      proposal.sourceStartMs !== candidate.sourceStartMs ||
+      proposal.sourceEndMs !== candidate.sourceEndMs ||
+      proposal.targetStartMs !== candidate.targetStartMs ||
+      proposal.targetEndMs !== candidate.targetEndMs
+    ) {
+      throw new Error("候选时间图范围与 matchRange 不一致。");
+    }
+    const reconciledProposal = reconcileAlignmentTimeMapProposalQuality(proposal);
+    return reconcileMediaTimeMapQuality({
+      id: candidate.timeMapId,
+      revision: 1,
+      sourceMediaId: candidate.sourceMediaId,
+      targetMediaId: candidate.targetMediaId,
+      sourceStream: structuredClone(reconciledProposal.sourceStream),
+      targetStream: structuredClone(reconciledProposal.targetStream),
+      sourceIdentity: cloneMediaContentIdentity(reconciledProposal.sourceIdentity),
+      targetIdentity: cloneMediaContentIdentity(reconciledProposal.targetIdentity),
+      sourceStartMs: reconciledProposal.sourceStartMs,
+      sourceEndMs: reconciledProposal.sourceEndMs,
+      targetStartMs: reconciledProposal.targetStartMs,
+      targetEndMs: reconciledProposal.targetEndMs,
+      spans: structuredClone(reconciledProposal.spans),
+      quality: structuredClone(reconciledProposal.quality),
+      evidence: {
+        types: [...reconciledProposal.evidence.types],
+        audioAnchorCount: reconciledProposal.evidence.audioAnchorCount,
+        visualAnchorCount: reconciledProposal.evidence.visualAnchorCount,
+        heldOutAnchorCount: reconciledProposal.evidence.heldOutAnchorCount,
+        notes: [
+          ...reconciledProposal.evidence.notes,
+          ...(reconciledProposal.evidence.selectedTrackReason
+            ? [reconciledProposal.evidence.selectedTrackReason]
+            : [])
+        ]
+      },
+      verification: null,
+      engineVersion: reconciledProposal.engineVersion,
+      featureVersion: reconciledProposal.featureVersion,
+      parametersHash: reconciledProposal.parametersHash,
+      state: "candidate",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      confirmedAt: null
+    });
+  }
+  return createLegacyMediaTimeMap({
+    id: candidate.timeMapId,
+    sourceMediaId: candidate.sourceMediaId,
+    targetMediaId: candidate.targetMediaId,
+    sourceStartMs: candidate.sourceStartMs,
+    sourceEndMs: candidate.sourceEndMs,
+    targetStartMs: candidate.targetStartMs,
+    expectedTargetEndMs: candidate.targetEndMs,
+    timingRules: candidate.timingRules,
+    state: "candidate",
+    timestamp,
+    coverage: candidate.proposal.matchRange?.coverage ?? null,
+    anchorCount: candidate.proposal.anchors.length
+  });
+}
+
+function synchronizeMediaIdentitySnapshots(
+  project: EditorProject,
+  candidate: MediaMatchCandidate
+): EditorProject {
+  const proposal = candidate.proposal.timeMap;
+  if (!proposal?.sourceIdentity && !proposal?.targetIdentity) {
+    return project;
+  }
+  return {
+    ...project,
+    mediaLibrary: project.mediaLibrary.map((media) => {
+      if (media.id === candidate.sourceMediaId && proposal.sourceIdentity) {
+        return {
+          ...media,
+          contentIdentity: cloneMediaContentIdentity(proposal.sourceIdentity),
+          updatedAt: candidate.updatedAt
+        };
+      }
+      if (media.id === candidate.targetMediaId && proposal.targetIdentity) {
+        return {
+          ...media,
+          contentIdentity: cloneMediaContentIdentity(proposal.targetIdentity),
+          updatedAt: candidate.updatedAt
+        };
+      }
+      return media;
+    })
+  };
+}
+
+function replaceCandidateAndCandidateMap(
+  project: EditorProject,
+  candidate: MediaMatchCandidate,
+  timestamp: string,
+  rebuild = true
+): EditorProject {
+  const existingMap = project.mediaTimeMaps.find((map) => map.id === candidate.timeMapId);
+  let candidateMap: MediaTimeMap;
+  if (!rebuild && existingMap) {
+    if (existingMap.state !== "candidate" || !doesTimeMapMatchCandidate(existingMap, candidate)) {
+      throw new Error("候选时间图与匹配范围不一致。");
+    }
+    candidateMap = existingMap;
+  } else {
+    const created = createCandidateTimeMap(candidate, timestamp);
+    candidateMap = existingMap
+      ? {
+          ...created,
+          revision: existingMap.revision + 1,
+          createdAt: existingMap.createdAt
+        }
+      : created;
+  }
+  const nextProject = replaceCandidate(project, candidate);
+  return {
+    ...nextProject,
+    mediaTimeMaps: upsertTimeMap(nextProject.mediaTimeMaps, candidateMap)
+  };
+}
+
+function requireOrCreateCandidateTimeMap(
+  project: EditorProject,
+  candidate: MediaMatchCandidate,
+  timestamp: string
+): MediaTimeMap {
+  const existing = project.mediaTimeMaps.find((map) => map.id === candidate.timeMapId);
+  if (!existing) {
+    return createCandidateTimeMap(candidate, timestamp);
+  }
+  if (existing.state !== "candidate" || !doesTimeMapMatchCandidate(existing, candidate)) {
+    throw new Error("候选时间图不存在、状态无效或与候选范围不一致。");
+  }
+  return existing;
+}
+
+function doesTimeMapMatchCandidate(map: MediaTimeMap, candidate: MediaMatchCandidate): boolean {
+  return (
+    map.sourceMediaId === candidate.sourceMediaId &&
+    map.targetMediaId === candidate.targetMediaId &&
+    map.sourceStartMs === candidate.sourceStartMs &&
+    map.sourceEndMs === candidate.sourceEndMs &&
+    map.targetStartMs === candidate.targetStartMs &&
+    map.targetEndMs === candidate.targetEndMs
+  );
+}
+
+function nextConfirmedRevision(project: EditorProject, candidateId: string): number {
+  const prefix = `${candidateId}:time-map:confirmed:`;
+  return (
+    project.mediaTimeMaps
+      .filter((map) => map.id.startsWith(prefix))
+      .reduce((maximum, map) => Math.max(maximum, map.revision), 0) + 1
+  );
+}
+
+function upsertTimeMap(
+  maps: MediaTimeMap[],
+  timeMap: MediaTimeMap
+): MediaTimeMap[] {
+  const existingIndex = maps.findIndex((map) => map.id === timeMap.id);
+  if (existingIndex < 0) {
+    return [...maps, timeMap];
+  }
+  if (maps[existingIndex] === timeMap) {
+    return maps;
+  }
+  return maps.map((map, index) => (index === existingIndex ? timeMap : map));
+}
+
 function replaceCandidate(
   project: EditorProject,
   candidate: MediaMatchCandidate
@@ -711,7 +1152,8 @@ function replaceCandidate(
 function isSegmentForCandidate(
   segment: EditorProject["danmakuSourceSegments"][number],
   candidate: MediaMatchCandidate,
-  assetId: string
+  assetId: string,
+  confirmedTimeMapId: string
 ): boolean {
   return (
     segment.kind === "content" &&
@@ -721,6 +1163,7 @@ function isSegmentForCandidate(
     segment.sourceEndMs === candidate.sourceEndMs &&
     segment.targetMediaId === candidate.targetMediaId &&
     (segment.targetStartMs ?? 0) === candidate.targetStartMs &&
+    segment.timeMapId === confirmedTimeMapId &&
     areTimingRulesEqual(segment.timingRules, candidate.timingRules)
   );
 }
@@ -747,6 +1190,10 @@ function createAppliedSegmentLabel(
 ): string {
   const targetLabel = target.episodeLabel?.trim() || target.name.trim() || target.fileName;
   return `${targetLabel} · ${assetFileName}`;
+}
+
+function isProposalBlocked(proposal: AlignmentProposal): boolean {
+  return proposal.timeMap?.quality.level === "blocked";
 }
 
 function requireIdentifier(value: string, label: string): string {

@@ -1,9 +1,8 @@
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
 const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
-const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
 
 interface MockDialogCall {
   title: string;
@@ -12,7 +11,6 @@ interface MockDialogCall {
 
 test.beforeAll(() => {
   mkdirSync(screenshotDir, { recursive: true });
-  mkdirSync(downloadDir, { recursive: true });
 });
 
 test.beforeEach(async ({ page }) => {
@@ -74,7 +72,7 @@ test.beforeEach(async ({ page }) => {
                 anchors: [
                   {
                     id: `anchor-${currentIndex + 1}`,
-                    sourceMs: 5_000,
+                    sourceMs: currentIndex * 60_000 + 5_000,
                     targetMs: 5_000,
                     confidence: 0.94,
                     origin: "automatic"
@@ -84,8 +82,8 @@ test.beforeEach(async ({ page }) => {
                 confidence: 0.9,
                 diagnostics: ["E2E 使用确定性桌面桥接结果；真实定位由 Rust 测试覆盖。"],
                 matchRange: {
-                  sourceStartMs: 0,
-                  sourceEndMs: 60_000,
+                  sourceStartMs: currentIndex * 60_000,
+                  sourceEndMs: (currentIndex + 1) * 60_000,
                   targetStartMs: 0,
                   targetEndMs: 60_000,
                   coverage: 1
@@ -116,7 +114,7 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
-test("北极星多素材流程可批量导入、生成五组候选并按五个原片导出", async ({ page }) => {
+test("北极星多素材流程可批量导入、生成五组候选并安全阻断未验证导出", async ({ page }) => {
   await page.goto("/");
 
   await page.getByRole("button", { name: "批量导入原片素材" }).click();
@@ -148,7 +146,7 @@ test("北极星多素材流程可批量导入、生成五组候选并按五个�
   await expect(page.getByTestId("status-bar")).toContainText("已绑定 XML 来源");
   await page.getByRole("heading", { name: "原片素材", exact: true }).scrollIntoViewIfNeeded();
   await page.screenshot({
-    path: resolve(screenshotDir, "c136-materials-batch.png"),
+    path: resolve(screenshotDir, "c137-materials-batch.png"),
     fullPage: true
   });
 
@@ -157,14 +155,25 @@ test("北极星多素材流程可批量导入、生成五组候选并按五个�
   await expect(matchingPanel).toContainText("将分析 1 个参考 × 5 个原片，共 5 组");
   await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
   await expect(page.getByTestId("media-match-candidate")).toHaveCount(5);
-  await expect(page.getByTestId("status-bar")).toContainText("5 组中新找到 5 个候选");
+  await expect(page.getByTestId("status-bar")).toContainText(
+    "pairwise 找到 5、全局采用 5、阻断备选 0"
+  );
+  const firstCandidate = page.getByTestId("media-match-candidate").nth(0);
+  await firstCandidate.getByText("来源↔原片时间图复核").click();
+  await expect(firstCandidate.getByRole("img", { name: "来源与原片双时间轴分段图" })).toBeVisible();
   await matchingPanel.getByRole("heading", { name: "候选复核" }).scrollIntoViewIfNeeded();
   await page.screenshot({
-    path: resolve(screenshotDir, "c136-matching-candidates.png"),
+    path: resolve(screenshotDir, "c137-matching-time-map-review.png"),
     fullPage: true
   });
 
-  await matchingPanel.getByRole("button", { name: "按各卡勾选确认高可信候选（5）" }).click();
+  const candidateCards = page.getByTestId("media-match-candidate");
+  for (let index = 0; index < 5; index += 1) {
+    await candidateCards
+      .nth(index)
+      .getByRole("button", { name: "保存关系供试听复核" })
+      .click();
+  }
   await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E01");
   await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E05");
   await expect(matchingPanel).toContainText("5 / 5 个原片已确认");
@@ -172,20 +181,14 @@ test("北极星多素材流程可批量导入、生成五组候选并按五个�
   await page.getByTestId("workspace-nav-export").click();
   const projectionExport = page.getByRole("region", { name: "按原片分集导出" });
   await expect(projectionExport).toContainText("可导出分集");
-  await expect(projectionExport).toContainText("5 个");
-  await expect(projectionExport).toContainText("15 条");
+  await expect(projectionExport).toContainText("0 个");
+  await expect(projectionExport).toContainText("旧规则迁移且未经验证，不能导出");
+  await expect(
+    projectionExport.getByRole("button", { name: "导出全部分集 XML" })
+  ).toBeDisabled();
   await projectionExport.scrollIntoViewIfNeeded();
   await page.screenshot({
-    path: resolve(screenshotDir, "c136-export-multi-target.png"),
+    path: resolve(screenshotDir, "c137-export-gate-blocked.png"),
     fullPage: true
   });
-
-  const downloadPromise = page.waitForEvent("download");
-  await projectionExport.getByRole("button", { name: "导出全部分集 XML" }).click();
-  const download = await downloadPromise;
-  const archivePath = resolve(downloadDir, download.suggestedFilename());
-  await download.saveAs(archivePath);
-  expect(download.suggestedFilename()).toMatch(/-target-danmaku\.zip$/);
-  expect(readFileSync(archivePath).byteLength).toBeGreaterThan(0);
-  await expect(page.getByTestId("status-bar")).toContainText("已触发下载 5 个分集 XML");
 });

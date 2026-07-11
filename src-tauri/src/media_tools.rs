@@ -348,7 +348,10 @@ fn read_mpv_number_property_ms(ipc_path: &str, property: &str) -> Result<u64, St
 }
 
 fn read_mpv_tracks(ipc_path: &str) -> Result<Vec<MpvTrackSummary>, String> {
-    let response = send_mpv_ipc_command(ipc_path, json!({ "command": ["get_property", "track-list"] }))?;
+    let response = send_mpv_ipc_command(
+        ipc_path,
+        json!({ "command": ["get_property", "track-list"] }),
+    )?;
     ensure_mpv_success(response.clone())?;
     let tracks = response
         .get("data")
@@ -385,7 +388,12 @@ fn parse_mpv_track_list(tracks: &[Value]) -> Vec<MpvTrackSummary> {
 }
 
 fn normalize_mpv_track_type(track_type: Option<&str>) -> String {
-    match track_type.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+    match track_type
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "video" => "video".to_string(),
         "audio" => "audio".to_string(),
         "sub" | "subtitle" => "subtitle".to_string(),
@@ -491,12 +499,17 @@ fn read_child_stderr(child: &mut Child) -> Option<String> {
     let mut stderr = child.stderr.take()?;
     let mut text = String::new();
     stderr.read_to_string(&mut text).ok()?;
-    Some(truncate_text(&redact_sensitive_media_text(text.trim()), 600))
+    Some(truncate_text(
+        &redact_sensitive_media_text(text.trim()),
+        600,
+    ))
 }
 
 fn validate_mpv_media_path(media_path: &str) -> Result<(), String> {
     if media_path.is_empty() {
-        return Err("mpv 播放需要真实本地视频路径，或本次会话生成的 Emby 授权播放地址。".to_string());
+        return Err(
+            "mpv 播放需要真实本地视频路径，或本次会话生成的 Emby 授权播放地址。".to_string(),
+        );
     }
     if is_remote_media_url(media_path) {
         return Ok(());
@@ -540,7 +553,7 @@ fn redact_query_value(text: &str, key: &str) -> String {
         let value_start = key.len();
         let value_tail = &tail[value_start..];
         let value_end = value_tail
-            .find(|character| matches!(character, '&' | ' ' | '\n' | '\r' | '\t'))
+            .find(['&', ' ', '\n', '\r', '\t'])
             .unwrap_or(value_tail.len());
         rest = &value_tail[value_end..];
     }

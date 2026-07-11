@@ -20,6 +20,7 @@ import {
   type ProjectReadinessSummary
 } from "../../domain/project/readiness";
 import { formatTimecode } from "../../domain/shared/time";
+import { requiresProjectionOnlyExport } from "../../domain/timeline/sourceProjection";
 import {
   formatExportFileError,
   saveTextExportFile,
@@ -55,6 +56,7 @@ export function ExportDialog() {
   const previewNegativeClamps = summary.negativeClampDetails.slice(0, 3);
   const hiddenNegativeClampCount = Math.max(0, summary.negativeClampDetails.length - previewNegativeClamps.length);
   const hasExportReviewReport = summary.compensationDetails.length > 0 || summary.negativeClampDetails.length > 0;
+  const projectionOnlyExport = requiresProjectionOnlyExport(project);
 
   const chooseExportDirectory = async () => {
     try {
@@ -100,6 +102,13 @@ export function ExportDialog() {
   };
 
   const downloadXml = async () => {
+    if (projectionOnlyExport) {
+      setExportStatus({
+        message: "导出已阻断：当前项目必须通过已确认时间图按原片分集导出。",
+        tone: "error"
+      });
+      return;
+    }
     try {
       const result = await saveTextExportFile(
         {
@@ -137,6 +146,11 @@ export function ExportDialog() {
           {exportDirectory.trim().length === 0 ? (
             <div className="rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs leading-5 text-amber-100">
               未设置默认导出目录，本次会使用浏览器下载。你也可以先选择本次导出目录。
+            </div>
+          ) : null}
+          {projectionOnlyExport ? (
+            <div className="rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 text-xs leading-5 text-accent-red">
+              项目已进入原片时间映射流程；此单文件草稿不消费时间图，已禁止导出。请关闭后使用导出页上方的「按原片分集导出」。
             </div>
           ) : null}
           <ProjectReadinessPreflight summary={readinessSummary} />
@@ -195,7 +209,11 @@ export function ExportDialog() {
             </TextButton>
           ) : null}
           <TextButton onClick={clearExport}>取消</TextButton>
-          <TextButton tone="primary" disabled={!validation.ok} onClick={() => void downloadXml()}>
+          <TextButton
+            tone="primary"
+            disabled={!validation.ok || projectionOnlyExport}
+            onClick={() => void downloadXml()}
+          >
             <Download size={14} />
             导出 XML
           </TextButton>

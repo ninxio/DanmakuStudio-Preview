@@ -20,19 +20,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import {
   createAlignmentApplyBlockers,
-  createAlignmentReviewFocus,
   createAlignmentReviewItemStatuses,
-  createAlignmentReviewQueue,
   createAlignmentReviewReport,
-  createAlignmentReviewStatusSummary,
-  type AlignmentReviewItemState,
-  type AlignmentReviewQueueSeverity
+  createAlignmentReviewStatusSummary
 } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
-import { augmentAlignmentProposalWithDanmakuEvidence } from "../../domain/alignment/danmakuEvidence";
 import { serializeAlignmentProposal } from "../../domain/alignment/manualProvider";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
-import type { AlignmentProposal, CutCandidate } from "../../domain/alignment/types";
+import type { AlignmentProposal } from "../../domain/alignment/types";
 import { buildBatchMergePlan, type BatchMergeOptions } from "../../domain/danmaku/batchMerge";
 import {
   createCutHintSearchPlan,
@@ -100,6 +95,7 @@ import type {
   DanmakuSourceSegment,
   DanmakuSourceSegmentKind,
   EditorProject,
+  MediaContentIdentity,
   MediaBinding,
   MediaReference,
   ProjectMediaReference,
@@ -110,31 +106,27 @@ import { formatTimecode, type Milliseconds } from "../../domain/shared/time";
 import { getAssetTimeRange } from "../../domain/timeline/mapping";
 import {
   projectDanmakuToTargets,
+  requiresProjectionOnlyExport,
   type SourceProjectionResult,
   type TargetProjectionGroup
 } from "../../domain/timeline/sourceProjection";
-import {
-  cancelTauriAudioAlignmentJob,
-  getTauriAudioAlignmentJob,
-  isAudioAlignmentJobFinished,
-  startTauriAudioAlignmentJob,
-  type AudioAlignmentJobSnapshot
-} from "../../infrastructure/alignment/tauriAudioAlignment";
+import { preflightProjectMediaIdentities } from "../../infrastructure/media/mediaIdentityPreflight";
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import {
   formatExportFileError,
+  getVerifiedExportUnavailableReason,
   saveTextExportFiles,
-  type SaveTextExportResult
+  type SaveTextExportResult,
+  type VerifiedExportVerification,
+  type VerifiedMediaDependency
 } from "../../infrastructure/file-system/exportFiles";
 import {
   pickAlignmentMediaPath,
-  pickFfmpegExecutablePath,
   pickMediaPaths,
   VIDEO_FILE_EXTENSIONS
 } from "../../infrastructure/file-system/nativeDialogs";
 import {
   authenticateEmby,
-  createEmbyAuthorizedStreamUrl,
   fetchEmbyEpisodeChildren,
   fetchEmbyItem,
   formatEmbyEpisodeDurationLines,
@@ -144,7 +136,6 @@ import {
   type EmbyItemMetadata
 } from "../../infrastructure/metadata/embyClient";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
-import { hydrateDesktopAppSettings } from "../../infrastructure/settings/desktopAppSettings";
 import { loadVolatileEmbyPassword } from "../../infrastructure/settings/volatileEmbyCredentials";
 import {
   serializeBilibiliXml,
@@ -234,7 +225,6 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
   const importAlignmentProposalText = useEditorStore(
     (state) => state.importAlignmentProposalText
   );
-  const applyAlignmentProposal = useEditorStore((state) => state.applyAlignmentProposal);
   const clearAlignmentProposal = useEditorStore((state) => state.clearAlignmentProposal);
   const previewAlignmentProposalData = useEditorStore(
     (state) => state.previewAlignmentProposalData
@@ -335,6 +325,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
     [project]
   );
   const sourceProjection = useMemo(() => projectDanmakuToTargets(project), [project]);
+  const projectionOnlyExport = requiresProjectionOnlyExport(project);
   const targetOriginalMedia = useMemo(
     () => project.mediaLibrary.filter((media) => media.role === "targetOriginal"),
     [project.mediaLibrary]
@@ -820,7 +811,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                   </summary>
                   <p className="mt-2 leading-5 text-slate-500">
                     自动候选不足时再使用。所属 XML
-                    决定参考素材；这里可调整来源范围、目标起点和段内删减修正。
+                    决定参考素材；未绑定时间图的手工段可调整范围。已确认时间图生成的来源段只允许改输出标签和备注，结构修改必须先撤销确认。
                   </p>
                   <div className="mt-3">
                     <SourceTimelineSegmentsPanel
@@ -846,28 +837,22 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 </details>
                 <details
                   className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
-                  data-testid="legacy-alignment-diagnostics"
+                  data-testid="manual-alignment-diagnostics"
                 >
                   <summary className="cursor-pointer text-sm font-medium text-slate-100">
-                    高级诊断：旧单对单实验室与对齐 JSON
+                    手工导入诊断（JSON，只读）
                   </summary>
                   <p className="mt-2 leading-5 text-slate-500">
-                    仅用于旧项目兼容、算法诊断和手工校准。普通多集工作流请使用上方项目素材批量匹配；这里的全局锚点与版本差异不会替代已确认的来源段。
+                    仅用于检查外部或旧项目生成的对齐提案。这里不会选择视频、不会运行自动匹配，也不会把诊断结果直接写入来源段；普通多集工作流请使用上方项目素材批量匹配。
                   </p>
                   <div className="mt-3 grid gap-3">
-                    <VideoAlignmentLabPanel
-                      enabled
+                    <AlignmentProposalDiagnosticsPanel
                       project={project}
-                      suspectedCutCandidates={suspectedCutCandidates}
                       text={alignmentProposalText}
                       proposal={alignmentProposal}
                       preview={alignmentPreview}
                       onTextChange={setAlignmentProposalText}
                       onImportText={importAlignmentProposalText}
-                      onApply={applyAlignmentProposal}
-                      onApplyCutCandidate={(candidate) =>
-                        applyAlignmentProposalData(createSingleCutCandidateProposal(candidate))
-                      }
                       onClear={() => {
                         if (alignmentProposal) {
                           clearAlignmentProposal();
@@ -875,13 +860,6 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                           setStatus({ message: "已清空对齐提案草稿。", tone: "neutral" });
                         }
                         setAlignmentProposalText("");
-                      }}
-                      onFocusQueueItem={(sourceAtMs, name) => {
-                        setPlayhead(sourceAtMs);
-                        setStatus({
-                          message: `已定位复核项：${name}（${formatTimecode(sourceAtMs)}）。`,
-                          tone: "success"
-                        });
                       }}
                     />
                     <SuspectedCutPanel
@@ -928,7 +906,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
             <WorkspaceProgressBanner pageId="export" />
             <ProjectionExportPanel
               projection={sourceProjection}
-              projectName={project.name}
+              project={project}
               onGoMatching={() => setWorkspacePage("matching")}
             />
             <ExportReadinessPanel
@@ -944,6 +922,11 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 以下为单文件或传统分 P
                 合并导出，不依赖来源段投影。多集场景请优先使用上方「按原片分集导出」。
               </p>
+              {projectionOnlyExport ? (
+                <p className="mt-2 rounded border border-accent-red/30 bg-accent-red/10 p-2 leading-5 text-accent-red">
+                  当前项目已包含目标原片或时间映射。为避免导出错位 XML，只可使用上方「按原片分集导出」。
+                </p>
+              ) : null}
             </section>
             <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
               <h3 className="text-sm font-medium text-slate-100">
@@ -957,9 +940,11 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 <TextButton
                   tone="primary"
                   onClick={prepareExport}
-                  disabled={project.clips.length === 0}
+                  disabled={projectionOnlyExport || project.clips.length === 0}
                   title={
-                    project.clips.length === 0
+                    projectionOnlyExport
+                      ? "当前项目必须通过已确认时间图按原片分集导出。"
+                      : project.clips.length === 0
                       ? "编辑页时间轴上还没有弹幕片段。"
                       : "预览并导出单个 XML"
                   }
@@ -974,7 +959,12 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 type="button"
                 className="flex w-full items-center justify-between gap-3 text-left"
                 aria-expanded={legacyExportOpen}
-                onClick={() => setLegacyExportOpen((open) => !open)}
+                disabled={projectionOnlyExport}
+                onClick={() => {
+                  if (!projectionOnlyExport) {
+                    setLegacyExportOpen((open) => !open);
+                  }
+                }}
               >
                 <span>
                   <span className="block text-sm font-medium text-slate-100">
@@ -988,7 +978,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                   {legacyExportOpen ? "收起" : "展开"}
                 </span>
               </button>
-              {legacyExportOpen ? (
+              {legacyExportOpen && !projectionOnlyExport ? (
                 <div className="mt-3 grid gap-3">
                   {project.assets.length > 0 ? (
                     <>
@@ -1038,7 +1028,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                         <TextButton
                           tone="primary"
                           onClick={() =>
-                            void exportBatchMergePlan(batchMergePlan, project.name)
+                            void exportBatchMergePlan(batchMergePlan, project)
                           }
                           disabled={batchMergePlan.episodes.length === 0}
                           title="按当前批量规则导出多个分集 XML"
@@ -2337,6 +2327,7 @@ function SourceTimelineSegmentRow({
   onDelete: (id: string) => void;
   onFocus: (timeMs: Milliseconds) => void;
 }) {
+  const timeMapOwned = Boolean(segment.timeMapId);
   const [form, setForm] = useState<SourceSegmentFormState>(() =>
     createFormFromSegment(segment)
   );
@@ -2360,6 +2351,16 @@ function SourceTimelineSegmentRow({
   }, [form.assetId, form.sourceMediaId, sourceBindings]);
 
   const save = () => {
+    if (timeMapOwned) {
+      const episode = episodeOptions.find((option) => option.key === form.episodeKey);
+      onUpdate(segment.id, {
+        episodeKey: form.episodeKey || null,
+        episodeLabel: episode?.label ?? null,
+        label: form.label,
+        note: form.note
+      });
+      return;
+    }
     const draft = createSourceSegmentDraftFromForm(form, episodeOptions);
     if (!draft.ok) {
       setStatus({ message: draft.message, tone: "warning" });
@@ -2398,11 +2399,17 @@ function SourceTimelineSegmentRow({
               "未选择")}
         </div>
       </div>
+      {timeMapOwned ? (
+        <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
+          这条来源段由已确认时间图管理。素材、用途、双方范围和删减修正已锁定；这里只能修改输出标签与备注。若映射有误，请回到上方候选卡撤销确认后重新分析。
+        </div>
+      ) : null}
       <div className="grid grid-cols-2 gap-2">
         <select
           aria-label={`${segment.label} 所属 XML`}
           className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.assetId}
+          disabled={timeMapOwned}
           onChange={(event) => {
             const assetId = event.target.value;
             setForm((current) => ({
@@ -2443,7 +2450,7 @@ function SourceTimelineSegmentRow({
             aria-label={`${segment.label} 目标原片起点`}
             className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-50"
             value={form.targetStartText}
-            disabled={form.kind === "ignored"}
+            disabled={timeMapOwned || form.kind === "ignored"}
             onChange={(event) =>
               setForm((current) => ({ ...current, targetStartText: event.target.value }))
             }
@@ -2452,7 +2459,7 @@ function SourceTimelineSegmentRow({
             aria-label={`${segment.label} 删减修正`}
             className="min-h-20 rounded border border-panel-line bg-black/20 p-2 text-xs text-slate-100 disabled:opacity-50"
             value={form.timingRulesText}
-            disabled={form.kind === "ignored"}
+            disabled={timeMapOwned || form.kind === "ignored"}
             placeholder="00:12:30.000 -> +45000"
             onChange={(event) =>
               setForm((current) => ({ ...current, timingRulesText: event.target.value }))
@@ -2465,6 +2472,7 @@ function SourceTimelineSegmentRow({
           aria-label={`${segment.label} 开始`}
           className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.startText}
+          disabled={timeMapOwned}
           onChange={(event) =>
             setForm((current) => ({ ...current, startText: event.target.value }))
           }
@@ -2473,6 +2481,7 @@ function SourceTimelineSegmentRow({
           aria-label={`${segment.label} 结束`}
           className="h-8 min-w-0 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.endText}
+          disabled={timeMapOwned}
           onChange={(event) =>
             setForm((current) => ({ ...current, endText: event.target.value }))
           }
@@ -2483,6 +2492,7 @@ function SourceTimelineSegmentRow({
           aria-label={`${segment.label} 用途`}
           className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
           value={form.kind}
+          disabled={timeMapOwned}
           onChange={(event) =>
             setForm((current) => ({
               ...current,
@@ -2497,7 +2507,7 @@ function SourceTimelineSegmentRow({
           aria-label={`${segment.label} 目标原片`}
           className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100 disabled:opacity-50"
           value={form.targetMediaId}
-          disabled={form.kind === "ignored"}
+          disabled={timeMapOwned || form.kind === "ignored"}
           onChange={(event) =>
             setForm((current) => ({ ...current, targetMediaId: event.target.value }))
           }
@@ -2548,7 +2558,12 @@ function SourceTimelineSegmentRow({
           <CircleCheck size={14} />
           更新
         </TextButton>
-        <TextButton tone="danger" onClick={() => onDelete(segment.id)}>
+        <TextButton
+          tone="danger"
+          disabled={timeMapOwned}
+          title={timeMapOwned ? "请在匹配候选卡中撤销已确认关系。" : undefined}
+          onClick={() => onDelete(segment.id)}
+        >
           <Trash2 size={14} />
           删除
         </TextButton>
@@ -3316,67 +3331,26 @@ function SyncAnchorsPanel({
   );
 }
 
-function VideoAlignmentLabPanel({
-  enabled,
+function AlignmentProposalDiagnosticsPanel({
   project,
-  suspectedCutCandidates,
   text,
   proposal,
   preview,
   onTextChange,
   onImportText,
-  onApply,
-  onApplyCutCandidate,
-  onClear,
-  onFocusQueueItem
+  onClear
 }: {
-  enabled: boolean;
   project: EditorProject;
-  suspectedCutCandidates: SuspectedCutCandidate[];
   text: string;
   proposal: AlignmentProposal | null;
   preview: ReturnType<typeof buildAlignmentPreview>;
   onTextChange: (value: string) => void;
   onImportText: (value: string, sourceFileName?: string) => void;
-  onApply: () => void;
-  onApplyCutCandidate: (candidate: CutCandidate) => void;
   onClear: () => void;
-  onFocusQueueItem: (sourceAtMs: number, name: string) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const initialSettingsRef = useRef(loadAppSettings());
-  const [completePath, setCompletePath] = useState("");
-  const [sourcePath, setSourcePath] = useState("");
-  const [ffmpegPath, setFfmpegPath] = useState(initialSettingsRef.current.alignment.ffmpegPath);
-  const [windowMs, setWindowMs] = useState(
-    String(initialSettingsRef.current.alignment.windowMs)
-  );
-  const [minGapMs, setMinGapMs] = useState(
-    String(initialSettingsRef.current.alignment.minGapMs)
-  );
-  const [matchThreshold, setMatchThreshold] = useState(
-    String(initialSettingsRef.current.alignment.matchThreshold)
-  );
-  const [enableVisualEvidence, setEnableVisualEvidence] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
-  const [preparingEmbyInput, setPreparingEmbyInput] = useState(false);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [jobSnapshot, setJobSnapshot] = useState<AudioAlignmentJobSnapshot | null>(null);
-  const [embyCompleteInput, setEmbyCompleteInput] = useState<EmbyAlignmentInput | null>(null);
-  const [skippedCutCandidateIds, setSkippedCutCandidateIds] = useState<string[]>([]);
-  const [cutCandidateDrafts, setCutCandidateDrafts] = useState<
-    Record<string, CutCandidateDraft>
-  >({});
-  const runTokenRef = useRef(0);
-  const proposalCandidateKeyRef = useRef("");
-  const previewCuts = preview.proposalCuts.slice(0, 3);
-  const hasCompleteAlignmentInput =
-    completePath.trim().length > 0 || embyCompleteInput !== null;
-  const canRunAlignment = hasCompleteAlignmentInput && sourcePath.trim().length > 0 && !running;
   const downloadContent = getAlignmentProposalDownloadText(text, proposal);
   const canClearProposal = Boolean(proposal) || text.trim().length > 0;
-  const reviewFocus = proposal ? createAlignmentReviewFocus(proposal) : [];
   const applyBlockerContext = {
     existingAnchors: project.syncAnchors,
     existingCutMarkers: project.cutMarkers
@@ -3388,191 +3362,7 @@ function VideoAlignmentLabPanel({
     ? createAlignmentReviewItemStatuses(proposal, applyBlockerContext)
     : [];
   const reviewStatusSummary = createAlignmentReviewStatusSummary(reviewItemStatuses);
-  const reviewQueue = proposal ? createAlignmentReviewQueue(proposal, applyBlockerContext) : [];
-  const noisyProposalMessage = proposal ? createNoisyAlignmentProposalMessage(proposal) : null;
-  const visibleReviewQueue = reviewQueue.slice(0, 4);
-  const hiddenReviewQueueCount = reviewQueue.length - visibleReviewQueue.length;
-  const visibleReviewItemStatuses = reviewItemStatuses.slice(0, 5);
-  const hiddenReviewItemStatusCount =
-    reviewItemStatuses.length - visibleReviewItemStatuses.length;
-  const targetLocalPath =
-    project.mediaBinding?.kind === "localFile"
-      ? (project.mediaBinding.localPath?.trim() ?? "")
-      : "";
-  const embyTargetNeedsLocalAudioInput = project.mediaBinding?.kind === "embyItem";
-  const reviewableCutCandidates = proposal
-    ? proposal.cutCandidates.filter(
-        (candidate) => !skippedCutCandidateIds.includes(candidate.id)
-      )
-    : [];
-  const handledCutCandidateCount = proposal
-    ? proposal.cutCandidates.length - reviewableCutCandidates.length
-    : 0;
-  const alignmentStageItems = jobSnapshot ? createAudioAlignmentStageItems(jobSnapshot) : [];
-
-  useEffect(() => {
-    let mounted = true;
-    const initialSettings = initialSettingsRef.current;
-    void hydrateDesktopAppSettings()
-      .then((desktopSettings) => {
-        if (!mounted || !desktopSettings) {
-          return;
-        }
-        setFfmpegPath((current) =>
-          current === initialSettings.alignment.ffmpegPath
-            ? desktopSettings.alignment.ffmpegPath
-            : current
-        );
-        setWindowMs((current) =>
-          current === String(initialSettings.alignment.windowMs)
-            ? String(desktopSettings.alignment.windowMs)
-            : current
-        );
-        setMinGapMs((current) =>
-          current === String(initialSettings.alignment.minGapMs)
-            ? String(desktopSettings.alignment.minGapMs)
-            : current
-        );
-        setMatchThreshold((current) =>
-          current === String(initialSettings.alignment.matchThreshold)
-            ? String(desktopSettings.alignment.matchThreshold)
-            : current
-        );
-      })
-      .catch(() => undefined);
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (completePath.trim().length === 0 && targetLocalPath.length > 0) {
-      setCompletePath(targetLocalPath);
-    }
-  }, [completePath, targetLocalPath]);
-
-  useEffect(() => {
-    setEmbyCompleteInput(null);
-  }, [project.mediaBinding?.id]);
-
-  useEffect(() => {
-    const nextKey = proposal
-      ? proposal.cutCandidates.map((candidate) => candidate.id).join("|")
-      : "";
-    if (proposalCandidateKeyRef.current === nextKey) {
-      return;
-    }
-    proposalCandidateKeyRef.current = nextKey;
-    setSkippedCutCandidateIds([]);
-    setCutCandidateDrafts({});
-  }, [proposal]);
-
-  const runDesktopAlignment = async () => {
-    const parsedWindowMs = parsePositiveIntegerInput(windowMs, "窗口");
-    const parsedMinGapMs = parseNonNegativeIntegerInput(minGapMs, "最小缺失");
-    const parsedMatchThreshold = parsePositiveNumberInput(matchThreshold, "匹配阈值");
-    if (parsedWindowMs.error || parsedMinGapMs.error || parsedMatchThreshold.error) {
-      setStatus({
-        message:
-          parsedWindowMs.error ??
-          parsedMinGapMs.error ??
-          parsedMatchThreshold.error ??
-          "对齐参数无效。",
-        tone: "warning"
-      });
-      return;
-    }
-    const completeInputPath = embyCompleteInput?.url ?? completePath.trim();
-    if (completeInputPath.length === 0) {
-      setStatus({
-        message: "请先选择完整版输入，或使用已绑定 Emby 原片生成授权输入。",
-        tone: "warning"
-      });
-      return;
-    }
-    const request = {
-      completePath: completeInputPath,
-      sourcePath: sourcePath.trim(),
-      ffmpegPath: ffmpegPath.trim().length > 0 ? ffmpegPath.trim() : null,
-      windowMs: parsedWindowMs.value,
-      minGapMs: parsedMinGapMs.value,
-      matchThreshold: parsedMatchThreshold.value,
-      enableVisualEvidence,
-      visualSampleIntervalMs: 5000
-    };
-    const runToken = runTokenRef.current + 1;
-    runTokenRef.current = runToken;
-    setRunning(true);
-    setCancelling(false);
-    setJobSnapshot(null);
-    setActiveJobId(null);
-    try {
-      let snapshot = await startTauriAudioAlignmentJob(request);
-      if (runTokenRef.current !== runToken) {
-        return;
-      }
-      setActiveJobId(snapshot.jobId);
-      setJobSnapshot(snapshot);
-      setStatus({ message: snapshot.message, tone: "success" });
-      while (!isAudioAlignmentJobFinished(snapshot.status)) {
-        await waitForAudioAlignmentPoll();
-        if (runTokenRef.current !== runToken) {
-          return;
-        }
-        snapshot = await getTauriAudioAlignmentJob(snapshot.jobId);
-        if (runTokenRef.current !== runToken) {
-          return;
-        }
-        setJobSnapshot(snapshot);
-      }
-      if (snapshot.status === "cancelled") {
-        setStatus({ message: snapshot.message || "本地音频对齐已取消。", tone: "warning" });
-        return;
-      }
-      if (snapshot.status === "failed" || !snapshot.proposal) {
-        throw new Error(snapshot.error ?? snapshot.message ?? "本地音频对齐失败。");
-      }
-      const proposalWithDanmakuEvidence = augmentAlignmentProposalWithDanmakuEvidence(
-        snapshot.proposal,
-        {
-          assets: project.assets,
-          suspectedCutCandidates
-        }
-      );
-      const content = `${JSON.stringify(proposalWithDanmakuEvidence, null, 2)}\n`;
-      onTextChange(content);
-      onImportText(content);
-      setStatus({ message: "本地音频对齐完成，已导入候选提案。", tone: "success" });
-    } catch (error) {
-      setStatus({
-        message: error instanceof Error ? error.message : "本地音频对齐失败。",
-        tone: "error"
-      });
-    } finally {
-      if (runTokenRef.current === runToken) {
-        setRunning(false);
-        setCancelling(false);
-        setActiveJobId(null);
-      }
-    }
-  };
-
-  const cancelDesktopAlignment = async () => {
-    if (!activeJobId || cancelling) {
-      return;
-    }
-    setCancelling(true);
-    try {
-      const snapshot = await cancelTauriAudioAlignmentJob(activeJobId);
-      setJobSnapshot(snapshot);
-      setStatus({ message: snapshot.message, tone: "warning" });
-    } catch (error) {
-      setStatus({
-        message: error instanceof Error ? error.message : "取消音频对齐任务失败。",
-        tone: "error"
-      });
-    }
-  };
+  const previewCuts = preview.proposalCuts.slice(0, 3);
 
   const exportProposal = () => {
     if (!downloadContent) {
@@ -3589,7 +3379,7 @@ function VideoAlignmentLabPanel({
 
   const exportReviewReport = () => {
     if (!proposal) {
-      setStatus({ message: "暂无可导出的对齐报告。", tone: "warning" });
+      setStatus({ message: "暂无可导出的对齐诊断报告。", tone: "warning" });
       return;
     }
     const fileName = downloadTextFile(
@@ -3597,414 +3387,54 @@ function VideoAlignmentLabPanel({
       createAlignmentReviewReport(proposal, new Date(), applyBlockerContext),
       "text/plain;charset=utf-8"
     );
-    setStatus({ message: `已导出对齐复核报告：${fileName}。`, tone: "success" });
+    setStatus({ message: `已导出对齐诊断报告：${fileName}。`, tone: "success" });
   };
-
-  const prepareEmbyCompleteInput = async () => {
-    const binding = project.mediaBinding;
-    if (!binding || binding.kind !== "embyItem") {
-      setStatus({ message: "当前项目没有绑定 Emby 目标原片。", tone: "warning" });
-      return;
-    }
-    const password = loadVolatileEmbyPassword().trim();
-    if (password.length === 0) {
-      setStatus({ message: "请先在设置中心填写 Emby 密码并保存本次会话。", tone: "warning" });
-      return;
-    }
-    setPreparingEmbyInput(true);
-    try {
-      const config = {
-        serverUrl: binding.server.serverUrl,
-        pathPrefix: binding.server.pathPrefix
-      };
-      const session = await authenticateEmby(config, {
-        username: binding.server.username,
-        password
-      });
-      const item = await fetchEmbyItem(config, session, binding.itemId);
-      const mediaSourceId = item.mediaSources[0]?.id ?? binding.mediaSources[0]?.id ?? null;
-      const url = createEmbyAuthorizedStreamUrl(config, session, binding.itemId, mediaSourceId);
-      setCompletePath("");
-      setEmbyCompleteInput({
-        url,
-        label: formatEmbyAlignmentInputLabel(item.name, mediaSourceId)
-      });
-      setStatus({ message: `已准备 Emby 授权输入：${item.name}。`, tone: "success" });
-    } catch (error) {
-      setStatus({
-        message: `Emby 授权输入准备失败：${error instanceof Error ? error.message : "Emby 请求失败。"}`,
-        tone: "error"
-      });
-    } finally {
-      setPreparingEmbyInput(false);
-    }
-  };
-
-  const chooseCompletePath = async () => {
-    try {
-      const path = await pickAlignmentMediaPath(completePath);
-      if (path) {
-        setEmbyCompleteInput(null);
-        setCompletePath(path);
-        setStatus({ message: "已选择完整版输入。", tone: "success" });
-      }
-    } catch (error) {
-      setStatus({
-        message: error instanceof Error ? error.message : "完整版输入选择失败。",
-        tone: "error"
-      });
-    }
-  };
-
-  const chooseSourcePath = async () => {
-    try {
-      const path = await pickAlignmentMediaPath(sourcePath);
-      if (path) {
-        setSourcePath(path);
-        setStatus({ message: "已选择 B 站删减版输入。", tone: "success" });
-      }
-    } catch (error) {
-      setStatus({
-        message: error instanceof Error ? error.message : "B 站删减版输入选择失败。",
-        tone: "error"
-      });
-    }
-  };
-
-  const chooseFfmpegPath = async () => {
-    try {
-      const path = await pickFfmpegExecutablePath(ffmpegPath);
-      if (path) {
-        setFfmpegPath(path);
-        setStatus({ message: "已选择 FFmpeg 路径。", tone: "success" });
-      }
-    } catch (error) {
-      setStatus({
-        message: error instanceof Error ? error.message : "FFmpeg 路径选择失败。",
-        tone: "error"
-      });
-    }
-  };
-
-  const updateCutCandidateDraft = (
-    candidate: CutCandidate,
-    patch: Partial<CutCandidateDraft>
-  ) => {
-    setCutCandidateDrafts((current) => {
-      const previous = current[candidate.id] ?? createCutCandidateDraft(candidate);
-      return {
-        ...current,
-        [candidate.id]: { ...previous, ...patch }
-      };
-    });
-  };
-
-  const previewCutCandidate = (candidate: CutCandidate) => {
-    const draft = cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
-    const parsedSource = parseNonNegativeIntegerInput(draft.sourceAtMs, "候选时间");
-    const sourceAtMs = parsedSource.error ? candidate.sourceAtMs : parsedSource.value;
-    onFocusQueueItem(sourceAtMs, candidate.name);
-  };
-
-  const acceptCutCandidate = (candidate: CutCandidate) => {
-    const draft = cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
-    const parsedSource = parseNonNegativeIntegerInput(draft.sourceAtMs, "候选时间");
-    const parsedGap = parseSignedNonZeroIntegerInput(draft.targetGapMs, "差异时长");
-    if (parsedSource.error || parsedGap.error) {
-      setStatus({
-        message: parsedSource.error ?? parsedGap.error ?? "候选修正无效。",
-        tone: "warning"
-      });
-      return;
-    }
-    onApplyCutCandidate({
-      ...candidate,
-      sourceAtMs: parsedSource.value,
-      targetGapMs: parsedGap.value,
-      note: appendManualReviewNote(candidate.note, parsedSource.value, parsedGap.value)
-    });
-    setSkippedCutCandidateIds((current) => [...new Set([...current, candidate.id])]);
-  };
-
-  const skipCutCandidate = (candidate: CutCandidate) => {
-    setSkippedCutCandidateIds((current) => [...new Set([...current, candidate.id])]);
-    setStatus({ message: `已跳过候选版本差异：${candidate.name}。`, tone: "neutral" });
-  };
-
-  if (!enabled) {
-    return null;
-  }
 
   return (
-    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+    <section
+      aria-label="手工 JSON 对齐诊断"
+      className="rounded border border-panel-line bg-black/10 p-3 text-xs text-slate-300"
+    >
       <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
-        <Video size={15} className="text-accent-cyan" />
-        <span>视频对齐实验室</span>
+        <Search size={15} className="text-accent-cyan" />
+        <span>手工 JSON 与只读结果</span>
         {proposal ? (
           <span className="ml-auto text-[11px] text-slate-500">
-            待应用 {reviewStatusSummary.pendingCount} / 已落点{" "}
+            待检查 {reviewStatusSummary.pendingCount} / 已存在{" "}
             {reviewStatusSummary.appliedCount}
             {reviewStatusSummary.blockedCount > 0
-              ? ` / 阻断 ${reviewStatusSummary.blockedCount}`
+              ? ` / 冲突 ${reviewStatusSummary.blockedCount}`
               : ""}
           </span>
         ) : null}
       </div>
+      <p className="mt-2 leading-5 text-slate-500">
+        可粘贴或导入 AlignmentProposal JSON，结果只用于证据检查和时间轴候选预览。
+        本区不读取视频、不启动 FFmpeg，也不提供旧单对单自动对齐。
+      </p>
       <div className="mt-3 grid gap-2">
-        <label className="grid gap-1">
-          <span className="text-slate-500">完整版输入（目标原片）</span>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-            <input
-              aria-label="完整版输入"
-              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              value={completePath}
-              placeholder="D:\\media\\full.mkv"
-              onChange={(event) => {
-                setEmbyCompleteInput(null);
-                setCompletePath(event.target.value);
-              }}
-            />
-            <TextButton
-              aria-label="选择完整版"
-              title="选择完整版"
-              onClick={() => {
-                void chooseCompletePath();
-              }}
-              className="px-2"
-            >
-              <FolderOpen size={14} />
-              选择
-            </TextButton>
-          </div>
-        </label>
-        {targetLocalPath ? (
-          <div className="rounded border border-accent-cyan/20 bg-accent-cyan/10 p-2 text-[11px] leading-5 text-slate-300">
-            已使用目标原片绑定中的本地路径作为完整版输入。
-          </div>
-        ) : embyTargetNeedsLocalAudioInput ? (
-          <div className="grid gap-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
-            <div>
-              已绑定 Emby 目标原片。可以用本次会话密码生成临时授权输入交给
-              FFmpeg，也可以继续选择可读取的本地文件路径。
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <TextButton
-                onClick={() => {
-                  void prepareEmbyCompleteInput();
-                }}
-                disabled={preparingEmbyInput || running}
-              >
-                {preparingEmbyInput ? "准备中" : "使用 Emby 授权输入"}
-              </TextButton>
-              {embyCompleteInput ? (
-                <TextButton onClick={() => setEmbyCompleteInput(null)}>改用本地路径</TextButton>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
-        {embyCompleteInput ? (
-          <div className="rounded border border-accent-cyan/20 bg-accent-cyan/10 p-2 text-[11px] leading-5 text-slate-300">
-            已准备 Emby 授权输入：{embyCompleteInput.label}
-            。本次运行会使用临时播放地址；项目文件不会保存密码、token 或播放 URL。
-          </div>
-        ) : null}
-        <label className="grid gap-1">
-          <span className="text-slate-500">B 站删减版输入（参考视频）</span>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-            <input
-              aria-label="B 站删减版输入"
-              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              value={sourcePath}
-              placeholder="D:\\media\\bilibili-cut.mp4"
-              onChange={(event) => setSourcePath(event.target.value)}
-            />
-            <TextButton
-              aria-label="选择当前视频"
-              title="选择当前视频"
-              onClick={() => {
-                void chooseSourcePath();
-              }}
-              className="px-2"
-            >
-              <FolderOpen size={14} />
-              选择
-            </TextButton>
-          </div>
-        </label>
-        <label className="grid gap-1">
-          <span className="text-slate-500">FFmpeg 路径</span>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-            <input
-              aria-label="FFmpeg 路径"
-              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              value={ffmpegPath}
-              placeholder="留空使用 PATH 中的 ffmpeg"
-              onChange={(event) => setFfmpegPath(event.target.value)}
-            />
-            <TextButton
-              aria-label="选择 FFmpeg"
-              title="选择 FFmpeg"
-              onClick={() => {
-                void chooseFfmpegPath();
-              }}
-              className="px-2"
-            >
-              <FolderOpen size={14} />
-              选择
-            </TextButton>
-          </div>
-        </label>
-        <div className="grid grid-cols-[repeat(auto-fit,minmax(112px,1fr))] gap-2">
-          <label className="grid min-w-0 gap-1">
-            <span className="text-slate-500">窗口 ms</span>
-            <input
-              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              inputMode="numeric"
-              value={windowMs}
-              onChange={(event) => setWindowMs(event.target.value)}
-            />
-          </label>
-          <label className="grid min-w-0 gap-1">
-            <span className="text-slate-500">最小缺失 ms</span>
-            <input
-              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              inputMode="numeric"
-              value={minGapMs}
-              onChange={(event) => setMinGapMs(event.target.value)}
-            />
-          </label>
-          <label className="grid min-w-0 gap-1">
-            <span className="text-slate-500">匹配阈值</span>
-            <input
-              className="h-8 min-w-0 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
-              inputMode="decimal"
-              value={matchThreshold}
-              onChange={(event) => setMatchThreshold(event.target.value)}
-            />
-          </label>
-        </div>
-        <label className="flex items-center gap-2 rounded border border-panel-line bg-[#111318] px-2 py-2 text-[11px] text-slate-300">
-          <input
-            type="checkbox"
-            className="h-3.5 w-3.5 accent-cyan-400"
-            checked={enableVisualEvidence}
-            onChange={(event) => setEnableVisualEvidence(event.target.checked)}
-          />
-          <span className="min-w-0 flex-1">鲁棒视觉辅助</span>
-          <span className="shrink-0 text-slate-500">可选</span>
-        </label>
-        <div className="flex flex-wrap gap-2">
-          <TextButton
-            tone="primary"
-            onClick={() => {
-              void runDesktopAlignment();
-            }}
-            disabled={!canRunAlignment}
-          >
-            {running ? "对齐中" : "运行本地对齐"}
-          </TextButton>
-          <TextButton
-            onClick={() => {
-              void cancelDesktopAlignment();
-            }}
-            disabled={!activeJobId || cancelling || !running}
-          >
-            {cancelling ? "取消中" : "取消任务"}
-          </TextButton>
-        </div>
-        {jobSnapshot ? (
-          <div className="grid gap-1 rounded border border-panel-line bg-black/20 p-2 text-slate-400">
-            <div className="flex items-center justify-between gap-2">
-              <span className="min-w-0 truncate">{jobSnapshot.message}</span>
-              <span className="shrink-0 text-slate-500">
-                {Math.round(jobSnapshot.progress * 100)}%
-              </span>
-            </div>
-            <div className="h-1.5 overflow-hidden rounded bg-[#111318]">
-              <div
-                className="h-full rounded bg-accent-cyan"
-                style={{ width: `${Math.round(jobSnapshot.progress * 100)}%` }}
-              />
-            </div>
-            {jobSnapshot.stageLabel ? (
-              <div className="grid gap-1" aria-label="音频对齐阶段">
-                <div className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
-                  <span className="min-w-0 truncate">
-                    阶段 {jobSnapshot.stageIndex ?? 0}/
-                    {jobSnapshot.stageCount ?? alignmentStageItems.length} ·{" "}
-                    {jobSnapshot.stageLabel}
-                  </span>
-                  <span className="shrink-0">
-                    {Math.round((jobSnapshot.stageProgress ?? 0) * 100)}%
-                  </span>
-                </div>
-                <div className="grid grid-cols-[repeat(auto-fit,minmax(54px,1fr))] gap-1">
-                  {alignmentStageItems.map((item) => (
-                    <span
-                      key={item.key}
-                      className={getAudioAlignmentStageClassName(item.state)}
-                      title={item.label}
-                    >
-                      {item.shortLabel}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-            <div className="text-[11px] text-slate-500">
-              任务 {jobSnapshot.jobId} / {alignmentJobStatusText(jobSnapshot.status)}
-            </div>
-            {jobSnapshot.logs.length > 0 ? (
-              <details className="rounded border border-panel-line bg-[#111318] p-2 text-[11px] text-slate-400">
-                <summary className="cursor-pointer text-slate-300">任务日志</summary>
-                <ol className="mt-2 grid gap-1">
-                  {jobSnapshot.logs.slice(-8).map((item, index) => (
-                    <li key={`${item}-${index}`} className="break-words">
-                      {item}
-                    </li>
-                  ))}
-                </ol>
-              </details>
-            ) : null}
-          </div>
-        ) : null}
-        {noisyProposalMessage ? (
-          <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
-            {noisyProposalMessage}{" "}
-            已阻断全量应用；请逐条接受可信候选，或提高窗口/匹配阈值后重新运行。
-          </div>
-        ) : null}
         <textarea
+          aria-label="对齐提案 JSON"
           className="min-h-24 resize-y rounded border border-panel-line bg-[#111318] p-2 font-mono text-xs leading-5 text-slate-100"
           value={text}
-          placeholder="AlignmentProposal JSON"
+          placeholder="粘贴 AlignmentProposal JSON"
           onChange={(event) => onTextChange(event.target.value)}
         />
         <div className="flex flex-wrap gap-2">
-          <TextButton onClick={() => inputRef.current?.click()}>导入文件</TextButton>
+          <TextButton onClick={() => inputRef.current?.click()}>选择 JSON 文件</TextButton>
           <TextButton onClick={() => onImportText(text)} disabled={text.trim().length === 0}>
-            导入提案
+            解析为只读诊断
           </TextButton>
           <TextButton onClick={exportProposal} disabled={!downloadContent}>
-            导出提案
+            导出 JSON
           </TextButton>
           <TextButton onClick={exportReviewReport} disabled={!proposal}>
             <Download size={14} />
-            导出报告
+            导出诊断报告
           </TextButton>
           <TextButton onClick={onClear} disabled={!canClearProposal}>
             <Trash2 size={14} />
-            清空提案
-          </TextButton>
-          <TextButton
-            tone="primary"
-            onClick={onApply}
-            disabled={
-              !proposal || reviewStatusSummary.pendingCount === 0 || applyBlockers.length > 0
-            }
-            title={applyBlockers[0] ?? "应用候选"}
-          >
-            应用候选
+            清空诊断
           </TextButton>
         </div>
         <input
@@ -4034,21 +3464,11 @@ function VideoAlignmentLabPanel({
           }}
         />
         {proposal ? (
-          <div className="grid gap-1 text-slate-400">
+          <div className="grid gap-2 text-slate-400">
             <AlignmentEvidencePanel proposal={proposal} />
-            {reviewFocus.length > 0 ? (
-              <div className="rounded border border-amber-400/30 bg-amber-400/10 p-2 text-[11px] text-amber-100">
-                <div className="mb-1 font-medium">复核提示</div>
-                <ul className="grid list-disc gap-1 pl-4">
-                  {reviewFocus.slice(0, 3).map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
             {applyBlockers.length > 0 ? (
-              <div className="rounded border border-accent-red/30 bg-accent-red/10 p-2 text-[11px] text-red-100">
-                <div className="mb-1 font-medium">应用已暂停</div>
+              <div className="rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] text-accent-yellow">
+                <div className="mb-1 font-medium">诊断警告</div>
                 <ul className="grid list-disc gap-1 pl-4">
                   {applyBlockers.slice(0, 3).map((item) => (
                     <li key={item}>{item}</li>
@@ -4056,229 +3476,48 @@ function VideoAlignmentLabPanel({
                 </ul>
               </div>
             ) : null}
-            {reviewableCutCandidates.length > 0 ? (
-              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <span className="font-medium text-slate-200">候选版本差异复核</span>
-                  {handledCutCandidateCount > 0 ? (
-                    <span className="text-slate-500">已处理 {handledCutCandidateCount} 条</span>
-                  ) : null}
-                </div>
-                <div className="grid gap-2">
-                  {reviewableCutCandidates.map((candidate, index) => {
-                    const draft =
-                      cutCandidateDrafts[candidate.id] ?? createCutCandidateDraft(candidate);
-                    return (
-                      <div
-                        key={candidate.id}
-                        className="grid gap-2 rounded border border-panel-line/70 bg-[#111318] p-2"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <div className="truncate text-slate-100">{candidate.name}</div>
-                            <div className="mt-0.5 text-slate-500">
-                              {formatTimecode(candidate.sourceAtMs)} /{" "}
-                              {formatSignedDuration(candidate.targetGapMs)} / 置信度{" "}
-                              {formatPercent(candidate.confidence)}
-                              {formatCandidateSourceRange(candidate)}
-                            </div>
-                          </div>
-                          <TextButton
-                            aria-label={`预览候选 ${index + 1}`}
-                            title="定位到候选点，用当前预览后端试听或查看"
-                            onClick={() => previewCutCandidate(candidate)}
-                            className="px-2"
-                          >
-                            <Crosshair size={13} />
-                            预览
-                          </TextButton>
-                        </div>
-                        <div className="grid grid-cols-2 gap-2">
-                          <label className="grid gap-1">
-                            <span className="text-slate-500">候选时间 ms</span>
-                            <input
-                              aria-label={`候选时间 ${candidate.name}`}
-                              className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
-                              inputMode="numeric"
-                              value={draft.sourceAtMs}
-                              onChange={(event) =>
-                                updateCutCandidateDraft(candidate, {
-                                  sourceAtMs: event.target.value
-                                })
-                              }
-                            />
-                          </label>
-                          <label className="grid gap-1">
-                            <span className="text-slate-500">差异时长 ms</span>
-                            <input
-                              aria-label={`差异时长 ${candidate.name}`}
-                              className="h-8 rounded border border-panel-line bg-black/20 px-2 text-xs text-slate-100"
-                              inputMode="numeric"
-                              value={draft.targetGapMs}
-                              onChange={(event) =>
-                                updateCutCandidateDraft(candidate, {
-                                  targetGapMs: event.target.value
-                                })
-                              }
-                            />
-                          </label>
-                        </div>
-                        <div className="flex flex-wrap justify-end gap-2">
-                          <TextButton onClick={() => skipCutCandidate(candidate)}>
-                            跳过
-                          </TextButton>
-                          <TextButton
-                            tone="primary"
-                            onClick={() => acceptCutCandidate(candidate)}
-                          >
-                            接受
-                          </TextButton>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : handledCutCandidateCount > 0 ? (
-              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-500">
-                候选版本差异已全部处理：已处理 {handledCutCandidateCount} 条。
-              </div>
-            ) : null}
-            {reviewQueue.length > 0 ? (
-              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
-                <div className="mb-1 font-medium text-slate-200">复核队列</div>
-                <ol className="grid gap-1" aria-label="对齐复核队列">
-                  {visibleReviewQueue.map((item, index) => (
-                    <li
-                      key={`${item.kind}-${item.id}-${index}`}
-                      className="grid grid-cols-[64px_minmax(0,1fr)_auto] items-start gap-2"
-                    >
-                      <span className={getAlignmentReviewQueueSeverityClassName(item.severity)}>
-                        {item.severityText}
-                      </span>
-                      <span className="min-w-0">
-                        <span className="text-slate-100">{item.name}</span>
-                        <span className="text-slate-500">
-                          {" "}
-                          / {item.kind === "anchor" ? "锚点" : "版本差异"} /{" "}
-                          {formatTimecode(item.sourceAtMs)}
-                        </span>
-                        <span className="block text-slate-400">{item.reasons.join("；")}</span>
-                      </span>
-                      <TextButton
-                        aria-label={`定位复核项 ${index + 1}`}
-                        title={`定位到 ${formatTimecode(item.sourceAtMs)}`}
-                        onClick={() => onFocusQueueItem(item.sourceAtMs, item.name)}
-                        className="px-2"
-                      >
-                        <Crosshair size={13} />
-                        定位
-                      </TextButton>
-                    </li>
-                  ))}
-                </ol>
-                {hiddenReviewQueueCount > 0 ? (
-                  <div className="mt-1 text-slate-500">
-                    另有 {hiddenReviewQueueCount} 条复核项已收起。
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-            {reviewItemStatuses.length > 0 ? (
-              <div className="rounded border border-panel-line bg-black/20 p-2 text-[11px] text-slate-300">
-                <div className="mb-1 font-medium text-slate-200">落点状态</div>
-                <ul className="grid gap-1" aria-label="对齐落点状态">
-                  {visibleReviewItemStatuses.map((item, index) => (
-                    <li
-                      key={`${item.kind}-${item.id}-${index}`}
-                      className="grid grid-cols-[44px_minmax(0,1fr)] gap-2"
-                    >
-                      <span className="text-slate-500">
-                        {item.kind === "anchor" ? "锚点" : "版本差异"}
-                      </span>
-                      <span className="min-w-0">
-                        <span className="text-slate-100">{item.name}</span>
-                        <span className="text-slate-500">
-                          {" "}
-                          / {formatTimecode(item.sourceAtMs)} /{" "}
-                        </span>
-                        <span className={getAlignmentReviewStatusClassName(item.state)}>
-                          {item.statusText}
-                        </span>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-                {hiddenReviewItemStatusCount > 0 ? (
-                  <div className="mt-1 text-slate-500">
-                    另有 {hiddenReviewItemStatusCount} 条状态已收起。
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
             <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
-              <span className="text-slate-500">锚点</span>
+              <span className="text-slate-500">同步锚点</span>
               <span>
                 {proposal.anchors.length} 个，候选 {preview.summary.candidateAnchorCount}
               </span>
-            </div>
-            <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
               <span className="text-slate-500">版本差异</span>
               <span>
                 {proposal.cutCandidates.length} 个，候选 {preview.summary.candidateCutCount}
               </span>
             </div>
             {previewCuts.map((candidate) => (
-              <div key={candidate.id} className="grid grid-cols-[88px_minmax(0,1fr)] gap-2">
+              <div
+                key={candidate.id}
+                className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 rounded border border-panel-line/70 bg-[#111318] p-2"
+              >
                 <span className="text-slate-500">{formatTimecode(candidate.sourceAtMs)}</span>
                 <span>
                   {formatSignedDuration(candidate.targetGapMs)} /{" "}
-                  {candidate.state === "applied" ? "已应用" : "候选"}
+                  {candidate.state === "applied" ? "项目中已存在" : "只读候选"}
                   {formatCandidateSourceRange(candidate)}
                 </span>
               </div>
             ))}
-            {proposal.diagnostics.slice(0, 2).map((diagnostic, index) => (
+            {proposal.diagnostics.slice(0, 4).map((diagnostic, index) => (
               <div
                 key={`${diagnostic}-${index}`}
-                className="rounded border border-panel-line bg-black/20 p-2 text-slate-400"
+                className="rounded border border-panel-line bg-[#111318] p-2 leading-5 text-slate-400"
               >
                 {diagnostic}
               </div>
             ))}
           </div>
-        ) : null}
+        ) : (
+          <div className="rounded border border-panel-line bg-[#111318] p-2 leading-5 text-slate-500">
+            暂无已解析的对齐提案。普通匹配无需使用本区；仅在收到外部 JSON
+            或排查旧项目时导入。
+          </div>
+        )}
       </div>
     </section>
   );
 }
-
-type AudioAlignmentStageState = "done" | "active" | "pending";
-
-interface AudioAlignmentStageItem {
-  key: string;
-  label: string;
-  shortLabel: string;
-  state: AudioAlignmentStageState;
-}
-
-interface AlignmentOffsetSummary {
-  minOffsetMs: number;
-  maxOffsetMs: number;
-}
-
-const AUDIO_ALIGNMENT_STAGE_ITEMS: Array<Omit<AudioAlignmentStageItem, "state">> = [
-  { key: "validating", label: "校验输入", shortLabel: "校验" },
-  { key: "extracting-complete", label: "提取完整版特征", shortLabel: "原片" },
-  { key: "extracting-source", label: "提取删减版特征", shortLabel: "参考" },
-  { key: "extracting-visual", label: "提取视觉证据", shortLabel: "视觉" },
-  { key: "fingerprinting", label: "生成稀疏指纹", shortLabel: "指纹" },
-  { key: "matching", label: "建立候选观测", shortLabel: "观测" },
-  { key: "fitting", label: "拟合时间映射", shortLabel: "映射" },
-  { key: "refining", label: "确认持续变点", shortLabel: "变点" },
-  { key: "reporting", label: "生成复核数据", shortLabel: "报告" }
-];
-
 function AlignmentEvidencePanel({ proposal }: { proposal: AlignmentProposal }) {
   if (!proposal.evidence) {
     return null;
@@ -4416,102 +3655,6 @@ function EvidenceMetric({ label, value }: { label: string; value: string }) {
   );
 }
 
-interface ParsedNumericInput {
-  value: number;
-  error: string | null;
-}
-
-interface CutCandidateDraft {
-  sourceAtMs: string;
-  targetGapMs: string;
-}
-
-interface EmbyAlignmentInput {
-  url: string;
-  label: string;
-}
-
-function formatEmbyAlignmentInputLabel(itemName: string, mediaSourceId: string | null): string {
-  return mediaSourceId && mediaSourceId.trim().length > 0
-    ? `${itemName} / 媒体源 ${mediaSourceId}`
-    : itemName;
-}
-
-function createSingleCutCandidateProposal(candidate: CutCandidate): AlignmentProposal {
-  return {
-    anchors: [],
-    cutCandidates: [candidate],
-    confidence: candidate.confidence,
-    diagnostics: [`已从候选复核接受：${candidate.name}。`]
-  };
-}
-
-function createCutCandidateDraft(candidate: CutCandidate): CutCandidateDraft {
-  return {
-    sourceAtMs: String(Math.round(candidate.sourceAtMs)),
-    targetGapMs: String(Math.round(candidate.targetGapMs))
-  };
-}
-
-function createNoisyAlignmentProposalMessage(proposal: AlignmentProposal): string | null {
-  if (proposal.cutCandidates.length > 30) {
-    return `本次音频对齐生成 ${proposal.cutCandidates.length} 个候选版本差异，疑似噪声过多。`;
-  }
-  const pendingCount = proposal.anchors.length + proposal.cutCandidates.length;
-  if (pendingCount > 80) {
-    return `本次音频对齐生成 ${pendingCount} 个待复核项，疑似噪声过多。`;
-  }
-  return null;
-}
-
-function parsePositiveIntegerInput(value: string, label: string): ParsedNumericInput {
-  const trimmed = value.trim();
-  const parsed = Number(trimmed);
-  if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed <= 0) {
-    return {
-      value: 0,
-      error: `${label}必须是大于 0 的整数。`
-    };
-  }
-  return { value: parsed, error: null };
-}
-
-function parseNonNegativeIntegerInput(value: string, label: string): ParsedNumericInput {
-  const trimmed = value.trim();
-  const parsed = Number(trimmed);
-  if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed < 0) {
-    return {
-      value: 0,
-      error: `${label}必须是大于或等于 0 的整数毫秒。`
-    };
-  }
-  return { value: parsed, error: null };
-}
-
-function parseSignedNonZeroIntegerInput(value: string, label: string): ParsedNumericInput {
-  const trimmed = value.trim();
-  const parsed = Number(trimmed);
-  if (trimmed.length === 0 || !Number.isInteger(parsed) || parsed === 0) {
-    return {
-      value: 0,
-      error: `${label}必须是非 0 的整数毫秒。`
-    };
-  }
-  return { value: parsed, error: null };
-}
-
-function parsePositiveNumberInput(value: string, label: string): ParsedNumericInput {
-  const trimmed = value.trim();
-  const parsed = Number(trimmed);
-  if (trimmed.length === 0 || !Number.isFinite(parsed) || parsed <= 0) {
-    return {
-      value: 0,
-      error: `${label}必须是大于 0 的数字。`
-    };
-  }
-  return { value: parsed, error: null };
-}
-
 function getAlignmentProposalDownloadText(
   text: string,
   proposal: AlignmentProposal | null
@@ -4526,62 +3669,12 @@ function getAlignmentProposalDownloadText(
   return "";
 }
 
-function appendManualReviewNote(note: string, sourceAtMs: number, targetGapMs: number): string {
-  const reviewNote = `人工复核接受：候选时间 ${formatTimecode(sourceAtMs)}，差异 ${formatSignedDuration(targetGapMs)}。`;
-  return note.trim().length > 0 ? `${note}\n${reviewNote}` : reviewNote;
-}
-
-function waitForAudioAlignmentPoll(): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, 700);
-  });
-}
-
-function alignmentJobStatusText(status: AudioAlignmentJobSnapshot["status"]): string {
-  if (status === "queued") {
-    return "排队中";
-  }
-  if (status === "running") {
-    return "运行中";
-  }
-  if (status === "completed") {
-    return "已完成";
-  }
-  if (status === "failed") {
-    return "失败";
-  }
-  return "已取消";
-}
-
-function createAudioAlignmentStageItems(
-  snapshot: AudioAlignmentJobSnapshot
-): AudioAlignmentStageItem[] {
-  const activeIndex = Math.max(0, snapshot.stageIndex ?? 0);
-  if (snapshot.status === "completed") {
-    return AUDIO_ALIGNMENT_STAGE_ITEMS.map((item) => ({
-      ...item,
-      state: "done"
-    }));
-  }
-  return AUDIO_ALIGNMENT_STAGE_ITEMS.map((item, index) => ({
-    ...item,
-    state: index + 1 < activeIndex ? "done" : index + 1 === activeIndex ? "active" : "pending"
-  }));
-}
-
-function getAudioAlignmentStageClassName(state: AudioAlignmentStageState): string {
-  if (state === "done") {
-    return "truncate rounded border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-1 text-center text-emerald-200";
-  }
-  if (state === "active") {
-    return "truncate rounded border border-accent-cyan/50 bg-accent-cyan/15 px-1.5 py-1 text-center text-accent-cyan";
-  }
-  return "truncate rounded border border-panel-line bg-[#111318] px-1.5 py-1 text-center text-slate-500";
-}
-
 function formatAlignmentEvidenceAlgorithm(
   algorithm: NonNullable<AlignmentProposal["evidence"]>["algorithm"]
 ): string {
+  if (algorithm === "alignment-v2-edit-map") {
+    return "C137 分段时间映射";
+  }
   if (algorithm === "time-map-audio") {
     return "音频时间映射";
   }
@@ -4653,7 +3746,7 @@ function getEvidenceSignalStatusClassName(
 
 function createAlignmentOffsetSummary(
   proposal: AlignmentProposal
-): AlignmentOffsetSummary | null {
+): { minOffsetMs: number; maxOffsetMs: number } | null {
   if (proposal.anchors.length === 0) {
     return null;
   }
@@ -4680,28 +3773,6 @@ function createAlignmentEvidenceTimelineMaxMs(proposal: AlignmentProposal): numb
     0
   );
   return Math.max(anchorMax, cutMax, 1);
-}
-
-function getAlignmentReviewStatusClassName(state: AlignmentReviewItemState): string {
-  if (state === "applied") {
-    return "text-emerald-300";
-  }
-  if (state === "blocked") {
-    return "text-red-200";
-  }
-  return "text-amber-200";
-}
-
-function getAlignmentReviewQueueSeverityClassName(
-  severity: AlignmentReviewQueueSeverity
-): string {
-  if (severity === "blocked") {
-    return "text-red-200";
-  }
-  if (severity === "attention") {
-    return "text-amber-200";
-  }
-  return "text-slate-400";
 }
 
 function createBatchMergeOptions({
@@ -4759,8 +3830,15 @@ function createBatchMergeOptions({
 
 async function exportBatchMergePlan(
   plan: ReturnType<typeof buildBatchMergePlan>,
-  projectName: string
+  project: EditorProject
 ) {
+  if (requiresProjectionOnlyExport(project)) {
+    setStatus({
+      message: "导出已阻断：当前项目必须通过已确认时间图按原片分集导出。",
+      tone: "error"
+    });
+    return;
+  }
   const files = plan.episodes.map((episode) => {
     const result = serializeBilibiliXml(episode.entries);
     const validation = validateExportedXml(result.xml);
@@ -4782,7 +3860,7 @@ async function exportBatchMergePlan(
       {
         directoryPath: loadAppSettings().export.defaultDirectory,
         type: "application/xml;charset=utf-8",
-        archiveFileName: createProjectDownloadFileName(projectName, "-danmaku-exports.zip")
+        archiveFileName: createProjectDownloadFileName(project.name, "-danmaku-exports.zip")
       }
     );
     setStatus(createBatchExportStatus(exportResult));
@@ -4795,10 +3873,30 @@ function setStatus(status: EditorStatus) {
   useEditorStore.setState({ status });
 }
 
-async function exportProjectionGroups(projection: SourceProjectionResult, projectName: string) {
+async function exportProjectionGroups(projection: SourceProjectionResult, project: EditorProject) {
+  const projectSnapshot = project;
   const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
   if (exportableGroups.length === 0) {
     setStatus({ message: "没有可导出的分集弹幕，请先在匹配页完成来源段。", tone: "warning" });
+    return;
+  }
+  setStatus({ message: "正在重新核验参考视频与原片的文件身份……", tone: "neutral" });
+  const settings = loadAppSettings();
+  const identityPreflight = await preflightProjectMediaIdentities(project, {
+    ffmpegPath: settings.alignment.ffmpegPath.trim() || null
+  });
+  if (!identityPreflight.ok) {
+    setStatus({
+      message: `导出已阻断：${identityPreflight.issues.map((issue) => issue.message).join("；")}`,
+      tone: "error"
+    });
+    return;
+  }
+  if (!isProjectExportSnapshotCurrent(projectSnapshot)) {
+    setStatus({
+      message: "导出已取消：项目在媒体身份核验期间发生变化，请检查最新结果后重新导出。",
+      tone: "warning"
+    });
     return;
   }
   const files = exportableGroups.map((group) => {
@@ -4819,12 +3917,20 @@ async function exportProjectionGroups(projection: SourceProjectionResult, projec
     return;
   }
   try {
+    const snapshotDigest = createProjectionExportSnapshotDigest(projectSnapshot, files);
+    const verification = createVerifiedExportVerification(
+      projectSnapshot,
+      identityPreflight.currentIdentities,
+      snapshotDigest
+    );
     const exportResult = await saveTextExportFiles(
       files.map((file) => ({ fileName: file.fileName, content: file.content })),
       {
-        directoryPath: loadAppSettings().export.defaultDirectory,
+        directoryPath: settings.export.defaultDirectory,
         type: "application/xml;charset=utf-8",
-        archiveFileName: createProjectDownloadFileName(projectName, "-target-danmaku.zip")
+        archiveFileName: createProjectDownloadFileName(project.name, "-target-danmaku.zip"),
+        verification,
+        isSnapshotCurrent: () => isProjectExportSnapshotCurrent(projectSnapshot)
       }
     );
     setStatus(createBatchExportStatus(exportResult));
@@ -4835,21 +3941,32 @@ async function exportProjectionGroups(projection: SourceProjectionResult, projec
 
 function ProjectionExportPanel({
   projection,
-  projectName,
+  project,
   onGoMatching
 }: {
   projection: SourceProjectionResult;
-  projectName: string;
+  project: EditorProject;
   onGoMatching: () => void;
 }) {
+  const [isExporting, setIsExporting] = useState(false);
+  const exportInFlightRef = useRef(false);
   const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
-  const exportDisabled = projection.status === "blocked" || exportableGroups.length === 0;
+  const verifiedExportUnavailableReason = getVerifiedExportUnavailableReason(
+    loadAppSettings().export.defaultDirectory
+  );
+  const exportDisabled =
+    isExporting ||
+    projection.status === "blocked" ||
+    exportableGroups.length === 0 ||
+    verifiedExportUnavailableReason !== null;
   const exportDisabledReason =
-    projection.status === "blocked"
+    isExporting
+      ? "正在核验媒体身份并导出，请稍候。"
+      : projection.status === "blocked"
       ? "先处理下面的阻断问题，再导出分集 XML。"
       : exportableGroups.length === 0
         ? "还没有可导出的分集弹幕。请先在匹配页标出来源段并关联原片。"
-        : "为每个原片导出一个精准同步的弹幕 XML";
+        : verifiedExportUnavailableReason ?? "为每个原片导出一个精准同步的弹幕 XML";
   return (
     <section
       className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
@@ -4865,6 +3982,11 @@ function ProjectionExportPanel({
         按匹配页确认的来源段，把弹幕从 B 站参考时间轴投影到每个原片的时间轴，为每集导出一个
         XML。
       </p>
+      {verifiedExportUnavailableReason ? (
+        <p className="mt-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 leading-5 text-accent-yellow">
+          {verifiedExportUnavailableReason} 本导出不会降级为普通浏览器下载。
+        </p>
+      ) : null}
       <div className="mt-3 grid grid-cols-2 gap-2">
         <div className="rounded border border-panel-line bg-[#111318] p-2">
           <div className="text-[11px] text-slate-500">可导出分集</div>
@@ -4885,9 +4007,15 @@ function ProjectionExportPanel({
           </div>
         </div>
         <div className="rounded border border-panel-line bg-[#111318] p-2">
-          <div className="text-[11px] text-slate-500">未覆盖弹幕</div>
+          <div className="text-[11px] text-slate-500">参考独有段弹幕</div>
           <div className="mt-1 text-sm font-medium text-slate-100">
-            {projection.unmappedItemCount.toLocaleString("zh-CN")} 条
+            {projection.sourceOnlyItemCount.toLocaleString("zh-CN")} 条
+          </div>
+        </div>
+        <div className="rounded border border-panel-line bg-[#111318] p-2">
+          <div className="text-[11px] text-slate-500">意外未覆盖弹幕</div>
+          <div className="mt-1 text-sm font-medium text-slate-100">
+            {projection.unexpectedUnmappedItemCount.toLocaleString("zh-CN")} 条
           </div>
         </div>
       </div>
@@ -4926,14 +4054,120 @@ function ProjectionExportPanel({
           tone="primary"
           disabled={exportDisabled}
           title={exportDisabledReason}
-          onClick={() => void exportProjectionGroups(projection, projectName)}
+          onClick={() => {
+            if (exportInFlightRef.current) {
+              return;
+            }
+            exportInFlightRef.current = true;
+            setIsExporting(true);
+            void exportProjectionGroups(projection, project).finally(() => {
+              exportInFlightRef.current = false;
+              setIsExporting(false);
+            });
+          }}
         >
           <Download size={14} />
-          导出全部分集 XML
+          {isExporting ? "正在核验并导出…" : "导出全部分集 XML"}
         </TextButton>
       </div>
     </section>
   );
+}
+
+function isProjectExportSnapshotCurrent(projectSnapshot: EditorProject): boolean {
+  const current = useEditorStore.getState().project;
+  return (
+    current === projectSnapshot &&
+    current.id === projectSnapshot.id &&
+    current.updatedAt === projectSnapshot.updatedAt
+  );
+}
+
+function createProjectionExportSnapshotDigest(
+  project: EditorProject,
+  files: readonly { fileName: string; content: string }[]
+): string {
+  let hash = 0x811c9dc5;
+  const append = (value: string | number) => {
+    const text = String(value);
+    for (let index = 0; index < text.length; index += 1) {
+      hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+    }
+    hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
+  };
+  append(project.id);
+  append(project.updatedAt);
+  for (const segment of project.danmakuSourceSegments) {
+    if (segment.kind !== "content" || !segment.timeMapId) {
+      continue;
+    }
+    append(segment.id);
+    append(segment.updatedAt);
+    append(segment.timeMapId);
+  }
+  for (const timeMap of project.mediaTimeMaps) {
+    append(timeMap.id);
+    append(timeMap.revision);
+    append(timeMap.updatedAt);
+    append(timeMap.state);
+  }
+  for (const file of files) {
+    append(file.fileName);
+    append(file.content);
+  }
+  return `fnv1a32:${hash.toString(16).padStart(8, "0")}`;
+}
+
+function createVerifiedExportVerification(
+  project: EditorProject,
+  currentIdentities: Readonly<Record<string, MediaContentIdentity>>,
+  snapshotDigest: string
+): VerifiedExportVerification {
+  const referencedMapIds = new Set(
+    project.danmakuSourceSegments.flatMap((segment) =>
+      segment.kind === "content" && segment.timeMapId ? [segment.timeMapId] : []
+    )
+  );
+  const mediaById = new Map(project.mediaLibrary.map((media) => [media.id, media]));
+  const dependencyByMediaId = new Map<string, VerifiedMediaDependency>();
+  const appendDependency = (mediaId: string, mapId: string) => {
+    const existing = dependencyByMediaId.get(mediaId);
+    if (existing) {
+      if (!existing.mapIds.includes(mapId)) {
+        existing.mapIds.push(mapId);
+      }
+      return;
+    }
+    const media = mediaById.get(mediaId);
+    const identity = currentIdentities[mediaId];
+    if (!media?.localPath?.trim() || !identity) {
+      throw new Error(`媒体 ${media?.name ?? mediaId} 缺少可原子复核的本地路径或内容身份。`);
+    }
+    dependencyByMediaId.set(mediaId, {
+      mediaId,
+      path: media.localPath.trim(),
+      expectedIdentity: { ...identity },
+      mapIds: [mapId]
+    });
+  };
+
+  for (const timeMap of project.mediaTimeMaps) {
+    if (timeMap.state !== "confirmed" || !referencedMapIds.has(timeMap.id)) {
+      continue;
+    }
+    appendDependency(timeMap.sourceMediaId, timeMap.id);
+    appendDependency(timeMap.targetMediaId, timeMap.id);
+  }
+  const dependencies = [...dependencyByMediaId.values()];
+  if (dependencies.length === 0) {
+    throw new Error("导出结果没有可复核的已确认时间图媒体依赖。");
+  }
+  return {
+    projectId: project.id,
+    projectUpdatedAt: project.updatedAt,
+    snapshotDigest,
+    dependencies
+  };
 }
 
 function ProjectionGroupRow({ group }: { group: TargetProjectionGroup }) {
@@ -5281,10 +4515,6 @@ function anchorOriginText(origin: SyncAnchor["origin"]): string {
 function formatSignedDuration(milliseconds: number): string {
   const sign = milliseconds < 0 ? "-" : "+";
   return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
-}
-
-function formatPercent(value: number): string {
-  return `${Math.round(value * 1000) / 10}%`;
 }
 
 function formatCandidateSourceRange(candidate: {

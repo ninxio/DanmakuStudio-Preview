@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
+import { migrateLegacyTimeMap, type TimeMapSpan } from "../alignment/timeMap";
+import { applyManualMediaTimeMapVerification } from "../alignment/mediaTimeMap";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "../project/factory";
 import { createDanmakuSourceBinding } from "../project/mediaLibrary";
 import { createDanmakuSourceSegment } from "../project/sourceTimeline";
-import type { EditorProject, ProjectMediaReference } from "../project/types";
-import { projectDanmakuToTargets } from "./sourceProjection";
+import type {
+  EditorProject,
+  MediaTimeMap,
+  MediaTimeMapQualityLevel,
+  ProjectMediaReference
+} from "../project/types";
+import {
+  projectDanmakuToTargets,
+  requiresProjectionOnlyExport
+} from "./sourceProjection";
 
 function createItem(
   assetId: string,
@@ -72,11 +82,154 @@ function createMedia(
     episodeLabel: null,
     createdAt: "2026-07-11T00:00:00.000Z",
     updatedAt: "2026-07-11T00:00:00.000Z",
-    ...overrides
+    ...overrides,
+    contentIdentity: overrides.contentIdentity ?? createTestMediaIdentity()
   };
 }
 
-function createProjectWithLongReference(): EditorProject {
+function createSingleSegmentProject(times: number[], sourceEndMs = 40_000): EditorProject {
+  const project = createEmptyProject("可验证时间图投影测试");
+  const asset = createAsset("asset_verified", times);
+  project.assets = [asset];
+  project.mediaLibrary = [
+    createMedia("ref_verified", "bilibiliReference"),
+    createMedia("target_verified", "targetOriginal")
+  ];
+  project.danmakuSourceBindings = [
+    createDanmakuSourceBinding("binding_verified", asset.id, "ref_verified")
+  ];
+  project.danmakuSourceSegments = [
+    createDanmakuSourceSegment("segment_verified", {
+      kind: "content",
+      assetId: asset.id,
+      sourceMediaId: "ref_verified",
+      sourceStartMs: 0,
+      sourceEndMs,
+      targetMediaId: "target_verified",
+      targetStartMs: 0,
+      episodeKey: null,
+      episodeLabel: null
+    })
+  ];
+  return project;
+}
+
+function attachTimeMap(
+  project: EditorProject,
+  segmentId: string,
+  spans: TimeMapSpan[],
+  qualityLevel: MediaTimeMapQualityLevel = "verified"
+): MediaTimeMap {
+  const segment = project.danmakuSourceSegments.find((candidate) => candidate.id === segmentId);
+  if (!segment?.sourceMediaId || !segment.targetMediaId || spans.length === 0) {
+    throw new Error("测试时间图缺少有效来源段或 spans。");
+  }
+  const lastSpan = spans[spans.length - 1];
+  const timestamp = "2026-07-12T00:00:00.000Z";
+  const timeMap: MediaTimeMap = {
+    id: `time_map_${segment.id}`,
+    revision: 1,
+    sourceMediaId: segment.sourceMediaId,
+    targetMediaId: segment.targetMediaId,
+    sourceStream: createAudioStreamIdentity(0),
+    targetStream: createAudioStreamIdentity(0),
+    sourceIdentity: createTestMediaIdentity(),
+    targetIdentity: createTestMediaIdentity(),
+    sourceStartMs: segment.sourceStartMs,
+    sourceEndMs: segment.sourceEndMs,
+    targetStartMs: segment.targetStartMs ?? 0,
+    targetEndMs: lastSpan.targetEndMs,
+    spans,
+    quality: {
+      level: qualityLevel,
+      probability: qualityLevel === "verified" ? 0.999 : null,
+      metricSource: "measured",
+      coverage: 0.98,
+      p50ResidualMs: 20,
+      p95ResidualMs: 50,
+      maxResidualMs: 90,
+      boundaryUncertaintyMs: 100,
+      alternativeMargin: 0.5,
+      anchorCount: 20,
+      heldOutAnchorCount: 5,
+      reasons: []
+    },
+    evidence: {
+      types: qualityLevel === "verified" ? ["audio", "visual", "manual"] : ["audio", "visual"],
+      audioAnchorCount: 20,
+      visualAnchorCount: 20,
+      heldOutAnchorCount: 5,
+      notes: []
+    },
+    verification: null,
+    engineVersion: "test-engine",
+    featureVersion: "test-feature",
+    parametersHash: "test-parameters",
+    state: "confirmed",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    confirmedAt: timestamp
+  };
+  const signedTimeMap =
+    qualityLevel === "verified"
+      ? applyManualMediaTimeMapVerification(timeMap, {
+          calibrationArtifactId: "test-manual-review-protocol",
+          calibrationArtifactVersion: "1",
+          verifier: "vitest",
+          verifiedAt: timestamp
+        })
+      : timeMap;
+  segment.timeMapId = signedTimeMap.id;
+  project.mediaTimeMaps.push(signedTimeMap);
+  return signedTimeMap;
+}
+
+function createAudioStreamIdentity(index: number): MediaTimeMap["sourceStream"] {
+  return {
+    type: "audio",
+    index,
+    codec: "aac",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/48000",
+    sampleRate: 48_000,
+    channels: 2,
+    frameRate: null,
+    language: "zh",
+    title: null
+  };
+}
+
+function createTestMediaIdentity() {
+  return {
+    algorithm: "fnv1a64-first-middle-last-64k-v1",
+    sizeBytes: 1_000,
+    modifiedUnixMs: 1_700_000_000_000,
+    firstSampleDigest: "a".repeat(16),
+    middleSampleDigest: "b".repeat(16),
+    lastSampleDigest: "c".repeat(16)
+  };
+}
+
+function attachVerifiedMapsToContentSegments(project: EditorProject): void {
+  for (const segment of project.danmakuSourceSegments) {
+    if (segment.kind !== "content") {
+      continue;
+    }
+    const migration = migrateLegacyTimeMap({
+      sourceStartMs: segment.sourceStartMs,
+      sourceEndMs: segment.sourceEndMs,
+      targetStartMs: segment.targetStartMs ?? 0,
+      timingRules: segment.timingRules
+    });
+    if (migration.status !== "migrated") {
+      throw new Error("测试来源段无法生成显式时间图。");
+    }
+    attachTimeMap(project, segment.id, [...migration.spans]);
+  }
+}
+
+function createProjectWithLongReference(withTimeMaps = true): EditorProject {
   const project = createEmptyProject("投影测试");
   const asset = createAsset("asset_long", [
     10_000, // 集1 开头
@@ -140,37 +293,67 @@ function createProjectWithLongReference(): EditorProject {
       targetStartMs: 90_000
     })
   ];
+  if (withTimeMaps) {
+    attachVerifiedMapsToContentSegments(project);
+  }
   return project;
 }
 
 describe("projectDanmakuToTargets", () => {
-  it("把长参考视频的弹幕按来源段投影到多个原片", () => {
-    const project = createProjectWithLongReference();
+  it("目标原片、内容段或时间图任一出现后都要求只走投影导出", () => {
+    const legacyProject = createEmptyProject("传统项目");
+    expect(requiresProjectionOnlyExport(legacyProject)).toBe(false);
+
+    expect(
+      requiresProjectionOnlyExport({
+        ...legacyProject,
+        mediaLibrary: [createMedia("target-only", "targetOriginal")]
+      })
+    ).toBe(true);
+    expect(
+      requiresProjectionOnlyExport({
+        ...legacyProject,
+        danmakuSourceSegments: [
+          createDanmakuSourceSegment("content-only", {
+            kind: "content",
+            assetId: "asset",
+            sourceMediaId: "source",
+            sourceStartMs: 0,
+            sourceEndMs: 1000,
+            targetMediaId: "target",
+            targetStartMs: 0,
+            episodeKey: null,
+            episodeLabel: null
+          })
+        ]
+      })
+    ).toBe(true);
+    const mappedProject = createSingleSegmentProject([100], 1000);
+    attachTimeMap(mappedProject, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 1000,
+        targetStartMs: 0,
+        targetEndMs: 1000
+      }
+    ]);
+    mappedProject.danmakuSourceSegments = [];
+    mappedProject.mediaLibrary = [];
+    expect(requiresProjectionOnlyExport(mappedProject)).toBe(true);
+  });
+  it("content 段没有 timeMapId 时阻断且不进入 usableSegments", () => {
+    const project = createProjectWithLongReference(false);
     const result = projectDanmakuToTargets(project);
 
-    expect(result.status).toBe("readyWithWarnings");
-    expect(result.groups).toHaveLength(3);
+    expect(result.status).toBe("blocked");
+    expect(result.issues.filter((issue) => issue.id.includes("missing-time-map"))).toHaveLength(3);
+    expect(result.issues.every((issue) => issue.severity === "error" || issue.id === "unmapped-items")).toBe(true);
+    expect(result.groups).toHaveLength(0);
     expect(result.contentSegmentCount).toBe(3);
     expect(result.ignoredSegmentCount).toBe(1);
-
-    const ep1 = result.groups.find((group) => group.targetMediaId === "ep1");
-    expect(ep1).toBeDefined();
-    expect(ep1?.entries.map((entry) => entry.finalTimeMs)).toEqual([10_000, 600_000]);
-
-    const ep2 = result.groups.find((group) => group.targetMediaId === "ep2");
-    // 1_310_000 - 1_290_000 = 20_000（删减点之前，不加 gap）
-    // 1_500_000 - 1_290_000 + 45_000 = 255_000（删减点之后加 gap）
-    expect(ep2?.entries.map((entry) => entry.finalTimeMs)).toEqual([20_000, 255_000]);
-    expect(ep2?.appliedRules).toHaveLength(1);
-    expect(ep2?.appliedRules[0].affectedCount).toBe(1);
-
-    const ep3 = result.groups.find((group) => group.targetMediaId === "ep3");
-    // 2_650_000 - 2_400_000 + 90_000（targetStartMs） = 340_000
-    expect(ep3?.entries.map((entry) => entry.finalTimeMs)).toEqual([340_000]);
-
-    expect(result.projectedItemCount).toBe(5);
-    expect(result.unmappedItemCount).toBe(1);
-    expect(result.issues.some((issue) => issue.id === "unmapped-items")).toBe(true);
+    expect(result.projectedItemCount).toBe(0);
+    expect(result.unmappedItemCount).toBe(6);
   });
 
   it("忽略段内的弹幕不投影", () => {
@@ -359,6 +542,7 @@ describe("projectDanmakuToTargets", () => {
         targetStartMs: 480_000
       })
     ];
+    attachVerifiedMapsToContentSegments(project);
     const result = projectDanmakuToTargets(project);
     const ep1 = result.groups.find((group) => group.targetMediaId === "ep1");
     expect(ep1?.segments).toHaveLength(2);
@@ -488,7 +672,7 @@ describe("projectDanmakuToTargets", () => {
     expect(result.groups[0]?.exportFileName).toBe("episode.xml");
   });
 
-  it("投影时间超出目标原片已知时长时给出警告", () => {
+  it("投影时间超出目标原片已知时长时阻断导出", () => {
     const project = createProjectWithLongReference();
     project.mediaLibrary = project.mediaLibrary.map((media) =>
       media.id === "ep1" ? { ...media, durationMs: 100_000 } : media
@@ -502,15 +686,427 @@ describe("projectDanmakuToTargets", () => {
     expect(
       ep1?.warnings.some((warning) => warning.includes("1 条弹幕投影后超出原片时长"))
     ).toBe(true);
-    expect(overflowIssue?.severity).toBe("warning");
+    expect(overflowIssue?.severity).toBe("error");
+    expect(result.status).toBe("blocked");
     expect(overflowIssue?.message).toContain("1 条弹幕投影后超出原片时长");
   });
 
-  it("负时间投影会给出警告", () => {
+  it("投影时间恰好等于半开目标时长边界时也阻断", () => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    project.mediaLibrary = project.mediaLibrary.map((media) =>
+      media.role === "targetOriginal" ? { ...media, durationMs: 5_000 } : media
+    );
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.groups[0]?.entries[0]?.finalTimeMs).toBe(5_000);
+    expect(result.issues.some((issue) => issue.id.startsWith("target-overflow-"))).toBe(true);
+    expect(result.status).toBe("blocked");
+  });
+
+  it("负时间投影会阻断导出而不是静默压到零", () => {
     const project = createProjectWithLongReference();
     project.itemTimeAdjustments = { [`${project.assets[0].id}_item_0`]: -60_000 };
     const result = projectDanmakuToTargets(project);
     const ep1 = result.groups.find((group) => group.targetMediaId === "ep1");
     expect(ep1?.warnings.some((warning) => warning.includes("时间为负"))).toBe(true);
+    expect(result.issues.find((issue) => issue.id === "target-negative-ep1")?.severity).toBe(
+      "error"
+    );
+    expect(result.status).toBe("blocked");
+  });
+
+  it("未覆盖非忽略弹幕超过五条或总量百分之一时阻断导出", () => {
+    const project = createSingleSegmentProject(
+      [1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 11_000, 12_000, 13_000, 14_000, 15_000, 16_000],
+      10_000
+    );
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.unmappedItemCount).toBe(6);
+    expect(result.issues.find((issue) => issue.id === "unmapped-items")?.severity).toBe("error");
+    expect(result.status).toBe("blocked");
+  });
+
+  it("已验证时间图在媒体身份快照变化后立即失效", () => {
+    const project = createSingleSegmentProject([1_000], 10_000);
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+    project.mediaLibrary[0].contentIdentity = {
+      ...createTestMediaIdentity(),
+      firstSampleDigest: "d".repeat(16)
+    };
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("blocked");
+    expect(result.issues.some((issue) => issue.message.includes("已被替换或修改"))).toBe(true);
+    expect(result.projectedItemCount).toBe(0);
+  });
+
+  it("已验证时间图按整数分段仿射投影并在最后叠加单条调整", () => {
+    const project = createSingleSegmentProject([1_000, 5_000], 10_000);
+    project.danmakuSourceSegments[0].timingRules = [
+      { id: "legacy_rule", sourceAtMs: 2_000, gapMs: 99_000, note: "不得参与正式投影" }
+    ];
+    project.itemTimeAdjustments = { asset_verified_item_0: 125 };
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 11_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("ready");
+    expect(result.groups[0]?.entries.map((entry) => entry.finalTimeMs)).toEqual([1_225, 5_500]);
+    expect(result.groups[0]?.appliedRules).toEqual([]);
+    expect(result.unmappedItemCount).toBe(0);
+  });
+
+  it("targetOnly 让后续 matched 正确跳变，sourceOnly 内弹幕单独计为有意舍弃", () => {
+    const project = createSingleSegmentProject([5_000, 10_000, 15_000, 25_000, 35_000]);
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      },
+      {
+        kind: "targetOnly",
+        sourceStartMs: 10_000,
+        sourceEndMs: 10_000,
+        targetStartMs: 10_000,
+        targetEndMs: 20_000
+      },
+      {
+        kind: "matched",
+        sourceStartMs: 10_000,
+        sourceEndMs: 20_000,
+        targetStartMs: 20_000,
+        targetEndMs: 30_000
+      },
+      {
+        kind: "sourceOnly",
+        sourceStartMs: 20_000,
+        sourceEndMs: 30_000,
+        targetStartMs: 30_000,
+        targetEndMs: 30_000
+      },
+      {
+        kind: "matched",
+        sourceStartMs: 30_000,
+        sourceEndMs: 40_000,
+        targetStartMs: 30_000,
+        targetEndMs: 40_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("readyWithWarnings");
+    expect(result.groups[0]?.entries.map((entry) => entry.finalTimeMs)).toEqual([
+      5_000, 20_000, 25_000, 35_000
+    ]);
+    expect(result.unmappedItemCount).toBe(1);
+    expect(result.sourceOnlyItemCount).toBe(1);
+    expect(result.unexpectedUnmappedItemCount).toBe(0);
+    expect(result.groups[0]?.entries.some((entry) => entry.item.sourceTimeMs === 25_000)).toBe(
+      false
+    );
+  });
+
+  it("大量 sourceOnly 弹幕不会被误判为来源段未覆盖并阻断导出", () => {
+    const project = createSingleSegmentProject([
+      1_000,
+      11_000,
+      12_000,
+      13_000,
+      14_000,
+      15_000,
+      16_000,
+      25_000
+    ], 30_000);
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      },
+      {
+        kind: "sourceOnly",
+        sourceStartMs: 10_000,
+        sourceEndMs: 20_000,
+        targetStartMs: 10_000,
+        targetEndMs: 10_000
+      },
+      {
+        kind: "matched",
+        sourceStartMs: 20_000,
+        sourceEndMs: 30_000,
+        targetStartMs: 10_000,
+        targetEndMs: 20_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("readyWithWarnings");
+    expect(result.projectedItemCount).toBe(2);
+    expect(result.sourceOnlyItemCount).toBe(6);
+    expect(result.unexpectedUnmappedItemCount).toBe(0);
+    expect(result.issues.find((issue) => issue.id === "unmapped-items")).toBeUndefined();
+  });
+
+  it("即使质量标记为 verified，包含 ambiguous 区间也会阻断导出", () => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "ambiguous",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("blocked");
+    expect(result.groups).toHaveLength(0);
+    expect(result.unmappedItemCount).toBe(1);
+    expect(result.issues.some((issue) => issue.message.includes("歧义（ambiguous）"))).toBe(
+      true
+    );
+  });
+
+  it.each<{
+    level: MediaTimeMapQualityLevel;
+    expectedStatus: "ready" | "blocked";
+    expectedMessage: string | null;
+  }>([
+    { level: "verified", expectedStatus: "ready", expectedMessage: null },
+    { level: "review", expectedStatus: "blocked", expectedMessage: "仍需人工复核" },
+    { level: "blocked", expectedStatus: "blocked", expectedMessage: "质量评估已阻断" },
+    {
+      level: "legacy-unverified",
+      expectedStatus: "blocked",
+      expectedMessage: "旧规则迁移且未经验证"
+    }
+  ])("质量等级 $level 的导出闸门符合预期", ({ level, expectedStatus, expectedMessage }) => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    attachTimeMap(
+      project,
+      "segment_verified",
+      [
+        {
+          kind: "matched",
+          sourceStartMs: 0,
+          sourceEndMs: 10_000,
+          targetStartMs: 0,
+          targetEndMs: 10_000
+        }
+      ],
+      level
+    );
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe(expectedStatus);
+    expect(result.groups).toHaveLength(level === "verified" ? 1 : 0);
+    if (expectedMessage) {
+      expect(result.issues.some((issue) => issue.message.includes(expectedMessage))).toBe(true);
+    }
+  });
+
+  it("导出链路会重算自报 verified，低于校准概率门槛时不加入导出组", () => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    const timeMap = attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+    timeMap.quality.probability = 0.99;
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("blocked");
+    expect(result.groups).toEqual([]);
+    expect(result.issues.some((issue) => issue.message.includes("仍需人工复核"))).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "候选状态",
+      mutate: (project: EditorProject, timeMap: MediaTimeMap) => {
+        timeMap.state = "candidate";
+      },
+      expected: "尚未确认"
+    },
+    {
+      name: "错误来源",
+      mutate: (project: EditorProject, timeMap: MediaTimeMap) => {
+        timeMap.sourceMediaId = "other_source";
+      },
+      expected: "与来源素材、目标原片或分段范围不一致"
+    },
+    {
+      name: "错误目标",
+      mutate: (project: EditorProject, timeMap: MediaTimeMap) => {
+        timeMap.targetMediaId = "other_target";
+      },
+      expected: "与来源素材、目标原片或分段范围不一致"
+    },
+    {
+      name: "错误来源范围",
+      mutate: (project: EditorProject, timeMap: MediaTimeMap) => {
+        timeMap.sourceEndMs = 9_000;
+      },
+      expected: "与来源素材、目标原片或分段范围不一致"
+    },
+    {
+      name: "错误目标起点",
+      mutate: (project: EditorProject, timeMap: MediaTimeMap) => {
+        timeMap.targetStartMs = 1_000;
+      },
+      expected: "与来源素材、目标原片或分段范围不一致"
+    },
+    {
+      name: "引用不存在",
+      mutate: (project: EditorProject) => {
+        project.danmakuSourceSegments[0].timeMapId = "missing_time_map";
+      },
+      expected: "时间图不存在"
+    }
+  ])("$name 的时间图不会被错用", ({ mutate, expected }) => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    const timeMap = attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+    mutate(project, timeMap);
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("blocked");
+    expect(result.groups).toHaveLength(0);
+    expect(result.issues.some((issue) => issue.message.includes(expected))).toBe(true);
+  });
+
+  it("多段可汇入同一目标，同一来源也可分别投影到多个目标", () => {
+    const project = createProjectWithLongReference();
+    project.danmakuSourceSegments = [
+      createDanmakuSourceSegment("seg_multi_a", {
+        kind: "content",
+        assetId: project.assets[0].id,
+        sourceMediaId: "ref_long",
+        sourceStartMs: 0,
+        sourceEndMs: 500_000,
+        targetMediaId: "ep1",
+        targetStartMs: 0,
+        episodeKey: null,
+        episodeLabel: "第 1 集"
+      }),
+      createDanmakuSourceSegment("seg_multi_b", {
+        kind: "content",
+        assetId: project.assets[0].id,
+        sourceMediaId: "ref_long",
+        sourceStartMs: 500_000,
+        sourceEndMs: 700_000,
+        targetMediaId: "ep1",
+        targetStartMs: 500_000,
+        episodeKey: null,
+        episodeLabel: "第 1 集"
+      }),
+      createDanmakuSourceSegment("seg_multi_target", {
+        kind: "content",
+        assetId: project.assets[0].id,
+        sourceMediaId: "ref_long",
+        sourceStartMs: 0,
+        sourceEndMs: 700_000,
+        targetMediaId: "ep2",
+        targetStartMs: 100_000,
+        episodeKey: null,
+        episodeLabel: "第 2 集"
+      })
+    ];
+    attachTimeMap(project, "seg_multi_a", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 500_000,
+        targetStartMs: 0,
+        targetEndMs: 500_000
+      }
+    ]);
+    attachTimeMap(project, "seg_multi_b", [
+      {
+        kind: "matched",
+        sourceStartMs: 500_000,
+        sourceEndMs: 700_000,
+        targetStartMs: 500_000,
+        targetEndMs: 700_000
+      }
+    ]);
+    attachTimeMap(project, "seg_multi_target", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 700_000,
+        targetStartMs: 100_000,
+        targetEndMs: 800_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+    const ep1 = result.groups.find((group) => group.targetMediaId === "ep1");
+    const ep2 = result.groups.find((group) => group.targetMediaId === "ep2");
+
+    expect(ep1?.segments).toHaveLength(2);
+    expect(ep1?.entries.map((entry) => entry.finalTimeMs)).toEqual([10_000, 600_000]);
+    expect(ep2?.entries.map((entry) => entry.finalTimeMs)).toEqual([110_000, 700_000]);
   });
 });

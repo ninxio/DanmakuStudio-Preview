@@ -6,6 +6,8 @@ import type {
   ResolvedDanmakuEvent,
   SyncAnchor
 } from "../danmaku/types";
+import { reconcileMediaTimeMapQuality } from "../alignment/mediaTimeMap";
+import { areMediaContentIdentitiesEqual } from "./mediaIdentity";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { isItemInsideClip, resolveProjectDanmakuEvents } from "../timeline/mapping";
 import {
@@ -312,6 +314,75 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
       });
     });
   });
+  const timeMapsById = new Map(project.mediaTimeMaps.map((timeMap) => [timeMap.id, timeMap]));
+  const mediaById = new Map(project.mediaLibrary.map((media) => [media.id, media]));
+  project.danmakuSourceSegments
+    .filter((segment) => segment.kind === "content")
+    .forEach((segment) => {
+      if (!segment.timeMapId) {
+        findings.push({
+          id: `source-segment-time-map-missing-${segment.id}`,
+          severity: "error",
+          title: "来源段缺少确认时间图",
+          detail: `${segment.label} 未关联已确认时间图；旧兼容投影已停用，不能导出。`
+        });
+        return;
+      }
+      const timeMap = timeMapsById.get(segment.timeMapId);
+      if (!timeMap || timeMap.state !== "confirmed") {
+        findings.push({
+          id: `source-segment-time-map-invalid-${segment.id}`,
+          severity: "error",
+          title: "来源段时间图无效",
+          detail: `${segment.label} 引用的确认时间图不存在或状态不正确，不能导出。`
+        });
+        return;
+      }
+      const effectiveQuality = reconcileMediaTimeMapQuality(timeMap).quality;
+      if (effectiveQuality.level !== "verified") {
+        findings.push({
+          id: `source-segment-time-map-quality-${segment.id}`,
+          severity: "error",
+          title: "时间映射尚未验证",
+          detail: `${segment.label} 的时间图质量为${formatTimeMapQualityLevel(effectiveQuality.level)}，默认阻断导出。`,
+          evidence: effectiveQuality.reasons.slice(0, EVIDENCE_PREVIEW_LIMIT)
+        });
+      } else {
+        const sourceMedia = mediaById.get(timeMap.sourceMediaId);
+        const targetMedia = mediaById.get(timeMap.targetMediaId);
+        const missingIdentity =
+          !sourceMedia?.contentIdentity ||
+          !targetMedia?.contentIdentity ||
+          !timeMap.sourceIdentity ||
+          !timeMap.targetIdentity;
+        const sourceChanged =
+          sourceMedia?.contentIdentity && timeMap.sourceIdentity
+            ? !areMediaContentIdentitiesEqual(sourceMedia.contentIdentity, timeMap.sourceIdentity)
+            : false;
+        const targetChanged =
+          targetMedia?.contentIdentity && timeMap.targetIdentity
+            ? !areMediaContentIdentitiesEqual(targetMedia.contentIdentity, timeMap.targetIdentity)
+            : false;
+        if (missingIdentity || sourceChanged || targetChanged) {
+          findings.push({
+            id: `source-segment-time-map-media-identity-${segment.id}`,
+            severity: "error",
+            title: "时间映射对应的媒体文件已失效",
+            detail: missingIdentity
+              ? `${segment.label} 缺少当前媒体或分析时的内容身份快照，必须重新分析。`
+              : `${segment.label} 对应的${sourceChanged ? " B 站参考文件" : "目标原片"}已被替换或修改，必须重新分析。`
+          });
+        }
+      }
+      if (timeMap.spans.some((span) => span.kind === "ambiguous")) {
+        findings.push({
+          id: `source-segment-time-map-ambiguous-${segment.id}`,
+          severity: "error",
+          title: "时间映射仍有歧义区间",
+          detail: `${segment.label} 包含 ambiguous 区间，必须先确定对应关系或标为双边版本差异。`
+        });
+      }
+    });
   if (mediaBindingNeedsReconnect && project.mediaBinding) {
     findings.push({
       id: "target-local-needs-reconnect",
@@ -787,4 +858,13 @@ function severityLabel(severity: ProjectHealthFindingSeverity): string {
 function formatSignedDuration(milliseconds: Milliseconds): string {
   const sign = milliseconds < 0 ? "-" : "+";
   return `${sign}${formatTimecode(Math.abs(milliseconds))}`;
+}
+
+function formatTimeMapQualityLevel(
+  level: EditorProject["mediaTimeMaps"][number]["quality"]["level"]
+): string {
+  if (level === "review") return "“需复核”";
+  if (level === "blocked") return "“已阻断”";
+  if (level === "legacy-unverified") return "“旧版未验证”";
+  return "“已验证”";
 }

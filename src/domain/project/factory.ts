@@ -20,6 +20,7 @@ export function createEmptyProject(name = "未命名项目"): EditorProject {
     danmakuSourceBindings: [],
     danmakuSourceSegments: [],
     mediaMatchCandidates: [],
+    mediaTimeMaps: [],
     assets: [],
     clips: [],
     globalOffsetMs: 0,

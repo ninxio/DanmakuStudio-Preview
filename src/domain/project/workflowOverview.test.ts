@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { applyManualMediaTimeMapVerification } from "../alignment/mediaTimeMap";
 import type { AlignmentProposal } from "../alignment/types";
 import type { DanmakuClip } from "../danmaku/types";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { createEmptyProject } from "./factory";
 import { createDanmakuSourceSegment } from "./sourceTimeline";
-import type { ProjectMediaReference } from "./types";
+import type { EditorProject, MediaTimeMap, ProjectMediaReference } from "./types";
 import { createWorkflowOverview } from "./workflowOverview";
 
 describe("workflow overview", () => {
@@ -116,8 +117,7 @@ describe("workflow overview", () => {
       confidence: 0.9,
       diagnostics: ["测试提案"]
     };
-    const overview = createWorkflowOverview(
-      {
+    const project: EditorProject = {
         ...createEmptyProject(),
         assets: [asset],
         clips: [clip],
@@ -147,9 +147,9 @@ describe("workflow overview", () => {
           })
         ],
         alignmentProposal: proposal
-      },
-      proposal
-    );
+      };
+    attachVerifiedTimeMap(project, "seg-1", "map-workflow");
+    const overview = createWorkflowOverview(project, proposal);
 
     expect(overview.actions.find((action) => action.id === "review-matches")?.enabled).toBe(
       true
@@ -185,9 +185,109 @@ function createMedia(
     episodeLabel: null,
     createdAt: "2026-07-10T00:00:00.000Z",
     updatedAt: "2026-07-10T00:00:00.000Z",
-    ...overrides
+    ...overrides,
+    contentIdentity:
+      overrides.contentIdentity ?? testContentIdentity(role === "bilibiliReference" ? "1" : "2")
   };
 }
+
+function attachVerifiedTimeMap(project: EditorProject, segmentId: string, mapId: string): void {
+  const segment = project.danmakuSourceSegments.find((item) => item.id === segmentId);
+  if (!segment?.sourceMediaId || !segment.targetMediaId) {
+    throw new Error("测试来源段缺少媒体引用。");
+  }
+  segment.timeMapId = mapId;
+  const targetStartMs = segment.targetStartMs ?? 0;
+  const targetEndMs = targetStartMs + segment.sourceEndMs - segment.sourceStartMs;
+  const map: MediaTimeMap = {
+    id: mapId,
+    revision: 1,
+    sourceMediaId: segment.sourceMediaId,
+    targetMediaId: segment.targetMediaId,
+    sourceStream: testAudioStream(1),
+    targetStream: testAudioStream(2),
+    sourceIdentity: { ...project.mediaLibrary.find((media) => media.id === segment.sourceMediaId)!.contentIdentity! },
+    targetIdentity: { ...project.mediaLibrary.find((media) => media.id === segment.targetMediaId)!.contentIdentity! },
+    sourceStartMs: segment.sourceStartMs,
+    sourceEndMs: segment.sourceEndMs,
+    targetStartMs,
+    targetEndMs,
+    spans: [
+      {
+        kind: "matched",
+        sourceStartMs: segment.sourceStartMs,
+        sourceEndMs: segment.sourceEndMs,
+        targetStartMs,
+        targetEndMs
+      }
+    ],
+    quality: {
+      level: "verified",
+      probability: 0.999,
+      metricSource: "measured",
+      coverage: 1,
+      p50ResidualMs: 0,
+      p95ResidualMs: 0,
+      maxResidualMs: 0,
+      boundaryUncertaintyMs: 0,
+      alternativeMargin: 1,
+      anchorCount: 10,
+      heldOutAnchorCount: 2,
+      reasons: ["测试已验证时间图。"]
+    },
+    evidence: {
+      types: ["audio", "visual", "manual"],
+      audioAnchorCount: 10,
+      visualAnchorCount: 5,
+      heldOutAnchorCount: 2,
+      notes: ["测试证据。"]
+    },
+    verification: null,
+    engineVersion: "test-v2",
+    featureVersion: "test-v2",
+    parametersHash: mapId,
+    state: "confirmed",
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+    confirmedAt: project.updatedAt
+  };
+  project.mediaTimeMaps.push(
+    applyManualMediaTimeMapVerification(map, {
+      calibrationArtifactId: "test-manual-review-protocol",
+      calibrationArtifactVersion: "1",
+      verifier: "vitest",
+      verifiedAt: project.updatedAt
+    })
+  );
+}
+
+function testContentIdentity(digit: string) {
+  return {
+    algorithm: "fnv1a64-first-middle-last-64k-v1",
+    sizeBytes: Number(digit) * 1_000_000,
+    modifiedUnixMs: Number(digit) * 1_000,
+    firstSampleDigest: digit.repeat(16),
+    middleSampleDigest: ((Number(digit) + 2) % 10).toString().repeat(16),
+    lastSampleDigest: ((Number(digit) + 4) % 10).toString().repeat(16)
+  };
+}
+
+function testAudioStream(index: number) {
+  return {
+    type: "audio" as const,
+    index,
+    codec: "pcm_s16le",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/16000",
+    sampleRate: 16_000,
+    channels: 1,
+    frameRate: null,
+    language: "und",
+    title: null
+  };
+}
+
 
 function createTimedXml(count: number, intervalSeconds: number): string {
   const lines = Array.from(

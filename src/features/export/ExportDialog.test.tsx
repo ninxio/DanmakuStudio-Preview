@@ -64,6 +64,41 @@ describe("导出摘要", () => {
       expect(screen.getByText("导出 XML 可重新导入。 验证条数：1")).toBeInTheDocument();
   });
 
+  it("草稿生成后项目进入原片映射流程时也会禁用单文件写出", () => {
+    useEditorStore.getState().prepareExport();
+    const project = useEditorStore.getState().project;
+    useEditorStore.setState({
+      project: {
+        ...project,
+        mediaLibrary: [
+          {
+            id: "target-after-draft",
+            role: "targetOriginal",
+            name: "目标原片",
+            fileName: "target.mkv",
+            objectUrl: null,
+            durationMs: 10_000,
+            contentIdentity: null,
+            referenceKind: "localPath",
+            connectionState: "connected",
+            sourceSummary: "本地文件",
+            localPath: "D:\\media\\target.mkv",
+            emby: null,
+            episodeKey: null,
+            episodeLabel: null,
+            createdAt: "2026-07-12T00:00:00.000Z",
+            updatedAt: "2026-07-12T00:00:00.000Z"
+          }
+        ]
+      }
+    });
+
+    render(<ExportDialog />);
+
+    expect(screen.getByText(/此单文件草稿不消费时间图，已禁止导出/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "导出 XML" })).toBeDisabled();
+  });
+
   it("显示导出前检查项并可下载检查报告", async () => {
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");

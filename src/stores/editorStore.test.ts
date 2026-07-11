@@ -490,6 +490,7 @@ describe("editor store", () => {
           targetMediaId: "target-media",
           targetStartMs: null,
           timingRules: [],
+          timeMapId: null,
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "",
@@ -567,6 +568,7 @@ describe("editor store", () => {
           targetMediaId: "target-media",
           targetStartMs: null,
           timingRules: [],
+          timeMapId: null,
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "",
@@ -715,6 +717,14 @@ describe("editor store", () => {
     expect(generatedSegmentId).toBeTruthy();
     useEditorStore.getState().deleteDanmakuSourceSegment(generatedSegmentId ?? "");
     expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
+      state: "accepted",
+      appliedSegmentIds: [generatedSegmentId]
+    });
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
+    expect(useEditorStore.getState().status.message).toContain("不能单独删除");
+
+    useEditorStore.getState().revokeMediaMatchCandidateAcceptance(candidate.id);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
       state: "pending",
       appliedSegmentIds: []
     });
@@ -737,6 +747,63 @@ describe("editor store", () => {
       state: "pending",
       appliedSegmentIds: []
     });
+  });
+
+  it("同一候选绑定多个 XML 时删除其中一个不会留下 confirmed 时间图孤儿段", () => {
+    const project = createEmptyProject();
+    const firstAsset = createAsset("asset-multi-a", "multi-a.xml");
+    const secondAsset = createAsset("asset-multi-b", "multi-b.xml");
+    project.assets = [firstAsset, secondAsset];
+    project.mediaLibrary = [
+      createProjectMediaReference("source-multi", "bilibiliReference"),
+      createProjectMediaReference("target-multi", "targetOriginal")
+    ];
+    project.danmakuSourceBindings = [firstAsset, secondAsset].map((asset, index) => ({
+      id: `binding-multi-${index}`,
+      assetId: asset.id,
+      sourceMediaId: "source-multi",
+      linkedAt: "2026-07-12T00:00:00.000Z",
+      updatedAt: "2026-07-12T00:00:00.000Z"
+    }));
+    resetStore(project);
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-multi-xml",
+      batchId: "batch-multi-xml",
+      sourceMediaId: "source-multi",
+      targetMediaId: "target-multi",
+      proposal: {
+        anchors: [],
+        cutCandidates: [],
+        confidence: 0.9,
+        diagnostics: [],
+        matchRange: {
+          sourceStartMs: 0,
+          sourceEndMs: 2_000,
+          targetStartMs: 0,
+          targetEndMs: 2_000,
+          coverage: 1
+        }
+      }
+    });
+
+    useEditorStore.getState().addMediaMatchCandidate(candidate);
+    useEditorStore
+      .getState()
+      .acceptMediaMatchCandidate(candidate.id, [firstAsset.id, secondAsset.id]);
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(2);
+
+    useEditorStore.getState().removeAsset(firstAsset.id);
+
+    const afterRemoval = useEditorStore.getState().project;
+    expect(afterRemoval.danmakuSourceSegments).toHaveLength(1);
+    expect(afterRemoval.danmakuSourceSegments[0]?.assetId).toBe(secondAsset.id);
+    expect(afterRemoval.mediaMatchCandidates[0]).toMatchObject({
+      state: "accepted",
+      appliedSegmentIds: [expect.stringContaining(secondAsset.id)]
+    });
+    const serialized = serializeProject(afterRemoval);
+    expect(() => useEditorStore.getState().openProjectFromText(serialized, "multi.json")).not.toThrow();
+    expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
   });
 
   it("批量导入本地路径会保留全部素材、跳过重复项并只产生一次历史记录", () => {
@@ -994,6 +1061,35 @@ describe("editor store", () => {
     expect(useEditorStore.getState().exportDraft).toBeNull();
     expect(useEditorStore.getState().status).toEqual({
       message: "当前没有可导出的弹幕，请先把 XML 放入时间轴。",
+      tone: "warning"
+    });
+  });
+
+  it("存在目标原片时单文件导出入口在状态层严格阻断", () => {
+    const asset = createAsset("asset-projection-only", "projection-only.xml");
+    resetStore({
+      ...createEmptyProject(),
+      assets: [asset],
+      clips: [
+        {
+          id: "clip-projection-only",
+          assetId: asset.id,
+          name: "旧时间轴片段",
+          timelineStartMs: 0,
+          sourceInMs: 0,
+          sourceOutMs: 1001,
+          localOffsetMs: 0,
+          enabled: true
+        }
+      ],
+      mediaLibrary: [createProjectMediaReference("target-export", "targetOriginal")]
+    });
+
+    useEditorStore.getState().prepareExport();
+
+    expect(useEditorStore.getState().exportDraft).toBeNull();
+    expect(useEditorStore.getState().status).toEqual({
+      message: "导出已阻断：当前项目必须在导出页通过已确认时间图按原片分集导出。",
       tone: "warning"
     });
   });
@@ -1467,6 +1563,7 @@ function createProjectMediaReference(
       overrides.fileName ?? (role === "bilibiliReference" ? "reference.mp4" : "target.mp4"),
     objectUrl: "objectUrl" in overrides ? (overrides.objectUrl ?? null) : "blob:test",
     durationMs: "durationMs" in overrides ? (overrides.durationMs ?? null) : 120_000,
+    contentIdentity: overrides.contentIdentity ?? null,
     referenceKind: overrides.referenceKind ?? "browserFile",
     connectionState: overrides.connectionState ?? "connected",
     sourceSummary: overrides.sourceSummary ?? "测试媒体",

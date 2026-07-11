@@ -24,8 +24,7 @@ import { AssetPanel } from "./AssetPanel";
 vi.mock("../../infrastructure/file-system/nativeDialogs", () => ({
   VIDEO_FILE_EXTENSIONS: ["mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "m2ts"],
   pickMediaPaths: vi.fn(),
-  pickAlignmentMediaPath: vi.fn(),
-  pickFfmpegExecutablePath: vi.fn()
+  pickAlignmentMediaPath: vi.fn()
 }));
 
 describe("资源面板", () => {
@@ -419,6 +418,41 @@ describe("资源面板", () => {
     expect(screen.queryByRole("button", { name: "登录" })).not.toBeInTheDocument();
   });
 
+  it("存在目标原片时禁用所有不消费时间图的导出旁路", () => {
+    const project = useEditorStore.getState().project;
+    const asset = project.assets[0];
+    useEditorStore.setState({
+      project: {
+        ...project,
+        clips: [
+          {
+            id: "legacy-export-clip",
+            assetId: asset.id,
+            name: "旧时间轴片段",
+            timelineStartMs: 0,
+            sourceInMs: 0,
+            sourceOutMs: 1,
+            localOffsetMs: 0,
+            enabled: true
+          }
+        ],
+        mediaLibrary: [
+          createProjectMediaReference("target-export", "targetOriginal", {
+            referenceKind: "localPath",
+            localPath: "D:\\media\\target.mkv"
+          })
+        ]
+      }
+    });
+
+    render(<AssetPanel section="export" />);
+
+    expect(screen.getByText(/只可使用上方「按原片分集导出」/)).toBeInTheDocument();
+    expect(screen.getByText(/高精度分集导出必须先在设置中选择桌面导出文件夹/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "预览并导出单个 XML" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /按文件名分 P 合并导出/ })).toBeDisabled();
+  });
+
   it("高级工具展示剧集工作台状态摘要", async () => {
     const user = userEvent.setup();
     const asset = parseBilibiliXml(
@@ -665,6 +699,7 @@ describe("资源面板", () => {
             targetMediaId: "target-a",
             targetStartMs: 0,
             timingRules: [],
+            timeMapId: null,
             episodeKey: "S01E01",
             episodeLabel: "第 1 集",
             note: "",
@@ -682,6 +717,7 @@ describe("资源面板", () => {
             targetMediaId: "target-b",
             targetStartMs: 0,
             timingRules: [],
+            timeMapId: null,
             episodeKey: "S01E02",
             episodeLabel: "第 2 集",
             note: "",
@@ -699,6 +735,7 @@ describe("资源面板", () => {
             targetMediaId: "target-a",
             targetStartMs: 0,
             timingRules: [],
+            timeMapId: null,
             episodeKey: "S01E01",
             episodeLabel: "第 1 集",
             note: "",
@@ -716,6 +753,7 @@ describe("资源面板", () => {
             targetMediaId: "target-b",
             targetStartMs: 0,
             timingRules: [],
+            timeMapId: null,
             episodeKey: "S01E02",
             episodeLabel: "第 2 集",
             note: "",
@@ -1038,6 +1076,52 @@ describe("资源面板", () => {
     expect(useEditorStore.getState().project.cutMarkers[0].note).toContain("广告");
   });
 
+  it("匹配页退役旧单对单路径实验室，仅保留手工 JSON 只读诊断", async () => {
+    const user = userEvent.setup();
+    render(<AssetPanel section="matching" />);
+
+    expect(screen.queryByTestId("legacy-alignment-diagnostics")).not.toBeInTheDocument();
+    expect(screen.queryByText("视频对齐实验室")).not.toBeInTheDocument();
+
+    const diagnostics = screen.getByTestId("manual-alignment-diagnostics");
+    await user.click(
+      within(diagnostics).getByText("手工导入诊断（JSON，只读）")
+    );
+
+    expect(
+      within(diagnostics).getByText(/不会选择视频、不会运行自动匹配/)
+    ).toBeInTheDocument();
+    expect(within(diagnostics).queryByLabelText("完整版输入")).not.toBeInTheDocument();
+    expect(
+      within(diagnostics).queryByLabelText("B 站删减版输入")
+    ).not.toBeInTheDocument();
+    expect(within(diagnostics).queryByLabelText("FFmpeg 路径")).not.toBeInTheDocument();
+    expect(
+      within(diagnostics).queryByRole("button", { name: "运行本地对齐" })
+    ).not.toBeInTheDocument();
+
+    const proposalText = JSON.stringify({
+      anchors: [],
+      cutCandidates: [],
+      confidence: 0.5,
+      diagnostics: ["外部诊断样例"]
+    });
+    fireEvent.change(within(diagnostics).getByLabelText("对齐提案 JSON"), {
+      target: { value: proposalText }
+    });
+    await user.click(
+      within(diagnostics).getByRole("button", { name: "解析为只读诊断" })
+    );
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().alignmentProposal?.diagnostics).toEqual([
+        "外部诊断样例"
+      ])
+    );
+    expect(within(diagnostics).getByText("外部诊断样例")).toBeInTheDocument();
+    expect(within(diagnostics).queryByRole("button", { name: "应用候选" })).not.toBeInTheDocument();
+  });
+
   it("导出多分集时使用项目名生成 ZIP 文件名", async () => {
     const user = userEvent.setup();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
@@ -1291,6 +1375,7 @@ function createProjectMediaReference(
     fileName,
     objectUrl: "objectUrl" in overrides ? (overrides.objectUrl ?? null) : `blob:${fileName}`,
     durationMs: "durationMs" in overrides ? (overrides.durationMs ?? null) : 10_000_000,
+    contentIdentity: overrides.contentIdentity ?? null,
     referenceKind: overrides.referenceKind ?? "browserFile",
     connectionState: overrides.connectionState ?? "connected",
     sourceSummary: overrides.sourceSummary ?? "测试媒体",

@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod alignment_v2;
 mod app_settings;
 mod audio_alignment;
 mod export_files;
+mod media_probe;
 mod media_tools;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,12 +23,15 @@ pub fn run() {
             app_settings::save_app_settings_file,
             app_settings::clear_app_settings_file,
             export_files::save_export_file,
+            export_files::save_verified_export_file,
             export_files::open_export_directory,
             emby_http_request,
             audio_alignment::align_audio_files,
             audio_alignment::start_audio_alignment_job,
             audio_alignment::get_audio_alignment_job,
             audio_alignment::cancel_audio_alignment_job,
+            media_probe::probe_media_timeline,
+            media_probe::probe_media_identity,
             media_tools::detect_media_tool,
             media_tools::start_mpv_sidecar,
             media_tools::stop_mpv_sidecar,

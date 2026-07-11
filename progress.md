@@ -1,3 +1,22 @@
+- 2026-07-12：C137“真实媒体高精度时间映射引擎”完成第一阶段工程主链并进入安全预览；目标仍保持进行中，真实冻结集样本数为 **0**，不得宣称高精度、准确率通过或自动 `verified`。
+  - 目标与门槛：新增 `docs/goals/C137-high-precision-time-map.md`，明确 PTS、多音轨、速度漂移、双向增删、重复内容、独立视觉、边界不确定度、真实金标准、校准和性能门槛；真实样本、双人标注、1000 个冻结关系判断和 20 套北极星合集尚未建立，因此 C137 不能标记完成。
+  - P0 安全降级：旧引擎不再显示高可信或“没有删减”，不能批量确认；旧单对单“视频对齐实验室”和重复路径选择入口已退役，只保留手工 JSON 只读诊断。自动分析唯一入口为匹配页项目素材批量匹配。
+  - schema 升级到 v11：v10 引入 `mediaTimeMaps`，v11 新增 verification provenance。时间图支持 `matched/sourceOnly/targetOnly/ambiguous`、独立 candidate/confirmed/superseded revision、双端流身份、全文件身份、质量和证据；v9/v10 迁移幂等，旧 `verified` 无可信来源会降为 `review`。
+  - 投影主链：候选接受后复制为不可变 confirmed revision，来源段通过 `timeMapId` 引用；分集导出只消费 confirmed+verified map。整数端点有理插值避免长片浮点累计漂移；`sourceOnly` 与意外未覆盖分开统计，`targetOnly` 正确推动后续目标边界，`ambiguous`、负时间、半开时长越界或大段意外未覆盖均阻断。
+  - Rust Alignment V2：媒体探测保存容器/流 presentation origin、全局流索引、time base、逐帧/packet PTS、skip/discard 与时间戳空洞；PCM 使用 `copyts + start_at_zero + aresample async:first_pts=0`，真实 FFmpeg 回归确认 5 秒 PTS 空洞不会被压扁。
+  - 音频路径：16 kHz 声谱 landmark Top-K、0.94–1.06 仿射 offset/scale、重复位置竞争、多音轨软先验、50ms 细特征、edit-aware 分块 DP、120 秒目标独有段后递推重锚和局部相关边界精修；显式输出双向 span，不再把未精修边界伪报为 0ms。
+  - 视觉路径：无共同音轨/landmark/affine 时自动进入绑定视频流 PTS 的独立视觉回退，使用遮蔽水印/字幕后的低频 DCT 与多块梯度、Top-K affine 和重复位置 margin；音频成功时视觉只可确认、否决或报告冲突，不能提高质量。视觉粗定位最高为 `review`，不宣称局部删减边界。
+  - 资源与取消：音轨候选超过 12 条明确资源阻断；PCM 单路约 60 分钟/110MiB 硬上限，视觉 6 小时/10000 帧和 stdout/stderr 硬上限；landmark、仿射、特征、DP、回溯和边界搜索均检查取消。
+  - 媒体身份：新增无依赖的 `sha256-full-file-v2` 流式全文件 SHA-256；同一文件句柄前后检查元数据，FFprobe 前后再次核验。导出预检改为 identity-only Tauri command 和 2–4 路有界并发，不再依赖 FFprobe 可用性；相同内容副本的 mtime 不参与 v2 等值。
+  - 导出事务：正式分集导出在前端预检、项目快照检查和 XML 回读验证后，只走 `save_verified_export_file`；Rust 在同一写盘命令再次核验所有依赖媒体身份，并用 `create_new + write_all + sync_all` 原子占用文件名。浏览器、缺目录、缺 bridge 或项目中途变化均 fail-closed。
+  - 旁路封堵：只要项目存在目标原片、content 来源段或 TimeMap，旧单文件导出和按文件名分 P 在 AssetPanel、store 与旧 ExportDialog 三层阻断。已确认时间图拥有的来源段锁定素材、用途、双方范围和旧 timingRules，只允许改标签/备注；删除 XML 会同步移除其派生段，避免保存后无法重开。
+  - 多对多与复核：项目级全局 assignment 支持 1×N、N×1、N×M、硬重叠、软顺序、重复内容惩罚、精确/beam 搜索和真正的关系 runner-up；修复 19+ 候选零增益尾项误阻断及重复 ID。候选卡新增来源/原片双时间轴分段图和结果语言列表，键盘可达；点击只暂停并定位，明确没有执行 A/B 播放。
+  - 基准设施：新增严格真实媒体 manifest/result、关系/锚点/边界/事件最大匹配、覆盖与歧义指标、150 关系/30 长参考/500 事件基础规模闸门及 1000 关系上线门槛；仓库只有 manifest 示例和程序生成/FFmpeg 回归，不含受版权限制媒体，当前报告必须为 insufficient-data。
+  - 自动验证：Rust 单元/集成测试 82/82；Vitest 全量 64 文件/485 项通过；Chromium E2E 4/4 通过，并生成 `c137-materials-batch.png`、`c137-matching-time-map-review.png`、`c137-export-gate-blocked.png`。`audit:source`、ESLint、production build、`cargo check --all-targets`、`cargo fmt --check`、严格 Clippy 和 `git diff --check` 均通过。
+  - UX 走查边界：已按北极星 E2E 从空项目走到 5 组候选、双时间轴复核、5 个关系保存及未验证导出阻断；尝试使用应用内浏览器做额外人工走查时，本地 Vite 服务因 Windows `spawn EPERM` 且权限额度暂不可用而未启动，不能宣称应用内浏览器人工走查通过。
+  - 安全预览 release：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3326980` 字节，SHA256 `5BDE68C1212A6390DEC6875EA7B915F69464EB736B873167755D0777A86FBDF0`；portable exe 为 `src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `13236736` 字节，SHA256 `75A1C70AF511616CD86464829F55B930FD67E9CA806C84D250391289C7600C5C`。本阶段 checkpoint 标签为 `checkpoint/c137-alignment-v2-safe-preview-20260712`。
+  - 尚未完成：真实冻结集与校准、可持久的人工验证签发、真正的双源 A/B 同步播放、视觉局部删减边界和规定硬件性能报告；以上任一缺失都不允许把 C137 标记完成。
+
 - 2026-07-11：成熟度提升阶段 C136 的实现、自动验收和 release 打包已完成：多视频批量导入、多对一/多对多匹配与项目素材对齐工作台进入投影导出主链；原生系统文件选择器的 5+1 人工点击烟测待补。
   - 素材页新增桌面原生批量多选入口，原片与 B 站参考素材分别导入；统一支持 mp4/mkv/webm/mov/m4v/avi/flv/ts/m2ts，批量路径以一次历史事务写入，取消不改项目，同角色重复路径会跳过并显示摘要。浏览器多选回退明确标记重开后需要重连，不再把批次第一项写成旧版唯一媒体。
   - 项目 schema 升级到 v9，新增持久化 `mediaMatchCandidates`；候选保存来源/目标素材、绝对来源范围、目标起点、段内修正规则、证据、状态和已生成来源段 ID，支持接受、拒绝、撤销、重做、保存重开以及删除引用后的状态协调。

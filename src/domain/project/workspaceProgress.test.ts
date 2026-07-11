@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { applyManualMediaTimeMapVerification } from "../alignment/mediaTimeMap";
 import { createDanmakuSourceSegment } from "./sourceTimeline";
 import { createEmptyProject } from "./factory";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
-import type { ProjectMediaReference } from "./types";
+import type { EditorProject, MediaTimeMap, ProjectMediaReference } from "./types";
 import { createWorkspaceProgress } from "./workspaceProgress";
 
 function createItem(assetId: string, index: number, sourceTimeMs: number): DanmakuItem {
@@ -57,7 +58,9 @@ function createMedia(
     episodeLabel: role === "targetOriginal" ? id : null,
     createdAt: "2026-07-11T00:00:00.000Z",
     updatedAt: "2026-07-11T00:00:00.000Z",
-    ...overrides
+    ...overrides,
+    contentIdentity:
+      overrides.contentIdentity ?? testContentIdentity(role === "bilibiliReference" ? "1" : "2")
   };
 }
 
@@ -111,6 +114,8 @@ describe("createWorkspaceProgress", () => {
       })
     ];
     project.assets[0].items.push(createItem(project.assets[0].id, 2, 1_310_000));
+    attachVerifiedTimeMap(project, "seg_ep1", "map-ep1");
+    attachVerifiedTimeMap(project, "seg_ep2", "map-ep2");
 
     const progress = createWorkspaceProgress(project);
     expect(progress.steps.find((step) => step.id === "materials")?.state).toBe("complete");
@@ -164,6 +169,7 @@ describe("createWorkspaceProgress", () => {
         episodeLabel: "第 1 集"
       })
     ];
+    attachVerifiedTimeMap(project, "seg-1", "map-partial");
 
     const progress = createWorkspaceProgress(project);
     const matching = progress.steps.find((step) => step.id === "matching");
@@ -174,3 +180,100 @@ describe("createWorkspaceProgress", () => {
     expect(matching?.blockers).toContain("还有 1 个原片未确认匹配关系。");
   });
 });
+
+function attachVerifiedTimeMap(project: EditorProject, segmentId: string, mapId: string): void {
+  const segment = project.danmakuSourceSegments.find((item) => item.id === segmentId);
+  if (!segment?.sourceMediaId || !segment.targetMediaId) {
+    throw new Error("测试来源段缺少媒体引用。");
+  }
+  segment.timeMapId = mapId;
+  const targetStartMs = segment.targetStartMs ?? 0;
+  const targetEndMs = targetStartMs + segment.sourceEndMs - segment.sourceStartMs;
+  const map: MediaTimeMap = {
+    id: mapId,
+    revision: 1,
+    sourceMediaId: segment.sourceMediaId,
+    targetMediaId: segment.targetMediaId,
+    sourceStream: testAudioStream(1),
+    targetStream: testAudioStream(2),
+    sourceIdentity: { ...project.mediaLibrary.find((media) => media.id === segment.sourceMediaId)!.contentIdentity! },
+    targetIdentity: { ...project.mediaLibrary.find((media) => media.id === segment.targetMediaId)!.contentIdentity! },
+    sourceStartMs: segment.sourceStartMs,
+    sourceEndMs: segment.sourceEndMs,
+    targetStartMs,
+    targetEndMs,
+    spans: [
+      {
+        kind: "matched",
+        sourceStartMs: segment.sourceStartMs,
+        sourceEndMs: segment.sourceEndMs,
+        targetStartMs,
+        targetEndMs
+      }
+    ],
+    quality: {
+      level: "verified",
+      probability: 0.999,
+      metricSource: "measured",
+      coverage: 1,
+      p50ResidualMs: 0,
+      p95ResidualMs: 0,
+      maxResidualMs: 0,
+      boundaryUncertaintyMs: 0,
+      alternativeMargin: 1,
+      anchorCount: 10,
+      heldOutAnchorCount: 2,
+      reasons: ["测试已验证时间图。"]
+    },
+    evidence: {
+      types: ["audio", "visual", "manual"],
+      audioAnchorCount: 10,
+      visualAnchorCount: 5,
+      heldOutAnchorCount: 2,
+      notes: ["测试证据。"]
+    },
+    verification: null,
+    engineVersion: "test-v2",
+    featureVersion: "test-v2",
+    parametersHash: mapId,
+    state: "confirmed",
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+    confirmedAt: project.updatedAt
+  };
+  project.mediaTimeMaps.push(
+    applyManualMediaTimeMapVerification(map, {
+      calibrationArtifactId: "test-manual-review-protocol",
+      calibrationArtifactVersion: "1",
+      verifier: "vitest",
+      verifiedAt: project.updatedAt
+    })
+  );
+}
+
+function testContentIdentity(digit: string) {
+  return {
+    algorithm: "fnv1a64-first-middle-last-64k-v1",
+    sizeBytes: Number(digit) * 1_000_000,
+    modifiedUnixMs: Number(digit) * 1_000,
+    firstSampleDigest: digit.repeat(16),
+    middleSampleDigest: ((Number(digit) + 2) % 10).toString().repeat(16),
+    lastSampleDigest: ((Number(digit) + 4) % 10).toString().repeat(16)
+  };
+}
+
+function testAudioStream(index: number) {
+  return {
+    type: "audio" as const,
+    index,
+    codec: "pcm_s16le",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/16000",
+    sampleRate: 16_000,
+    channels: 1,
+    frameRate: null,
+    language: "und",
+    title: null
+  };
+}

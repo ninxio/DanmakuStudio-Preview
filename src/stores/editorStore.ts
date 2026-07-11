@@ -49,6 +49,7 @@ import {
   type DanmakuSourceSegmentDraft,
   type DanmakuSourceSegmentPatch
 } from "../domain/project/sourceTimeline";
+import { requiresProjectionOnlyExport } from "../domain/timeline/sourceProjection";
 import type {
   EditorProject,
   EditorSelection,
@@ -90,6 +91,7 @@ import {
   reconcileMediaMatchCandidates,
   rejectMediaMatchCandidate as rejectProjectMediaMatchCandidate,
   revokeMediaMatchCandidateAcceptance as revokeProjectMediaMatchCandidateAcceptance,
+  upsertMediaMatchCandidate as upsertProjectMediaMatchCandidate,
   updateMediaMatchCandidateRange as updateProjectMediaMatchCandidateRange,
   type MediaMatchRangePatch
 } from "../domain/alignment/mediaMatching";
@@ -403,19 +405,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     const existing = get().project.mediaMatchCandidates.some(
       (item) => item.id === candidate.id
     );
-    commitProject(set, get, existing ? "更新媒体匹配候选" : "新增媒体匹配候选", (project) => ({
-      ...project,
-      mediaMatchCandidates: existing
-        ? project.mediaMatchCandidates.map((item) =>
-            item.id === candidate.id ? candidate : item
-          )
-        : [...project.mediaMatchCandidates, candidate]
-    }));
+    commitProject(set, get, existing ? "更新媒体匹配候选" : "新增媒体匹配候选", (project) =>
+      upsertProjectMediaMatchCandidate(project, candidate)
+    );
     set({
       status: {
         message:
           candidate.state === "blocked"
-            ? "匹配候选已保存，但需要先为参考素材绑定 XML。"
+            ? candidate.proposal.timeMap?.quality.level === "blocked"
+              ? "匹配候选已保存，但时间图存在歧义或证据不足，不能确认或导出。"
+              : "匹配候选已保存，但需要先为参考素材绑定 XML。"
             : "匹配候选已加入复核队列。",
         tone: candidate.state === "blocked" ? "warning" : "success"
       }
@@ -800,6 +799,15 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({ status: { message: "弹幕来源内容段不存在。", tone: "warning" } });
       return;
     }
+    if (segment.timeMapId) {
+      set({
+        status: {
+          message: "该来源段属于已确认时间图，不能单独删除；请在匹配页撤销对应关系。",
+          tone: "warning"
+        }
+      });
+      return;
+    }
     commitProject(set, get, "删除弹幕来源内容段", (project) =>
       reconcileMediaMatchCandidates({
         ...project,
@@ -930,8 +938,10 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
           danmakuSourceBindings: currentProject.danmakuSourceBindings.filter(
             (binding) => binding.assetId !== assetId
           ),
-          danmakuSourceSegments: currentProject.danmakuSourceSegments.map((segment) =>
-            segment.assetId === assetId ? { ...segment, assetId: null } : segment
+          // XML 是来源段的内容所有者；删除 XML 时必须连同这些派生段一起移除。
+          // 仅把 assetId 置空会留下仍引用 confirmed TimeMap 的孤儿段，使项目可保存却无法重开。
+          danmakuSourceSegments: currentProject.danmakuSourceSegments.filter(
+            (segment) => segment.assetId !== assetId
           ),
           disabledItemIds: currentProject.disabledItemIds.filter(
             (itemId) => !itemIds.has(itemId)
@@ -1565,6 +1575,16 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   prepareExport: () => {
     const project = get().project;
+    if (requiresProjectionOnlyExport(project)) {
+      set({
+        exportDraft: null,
+        status: {
+          message: "导出已阻断：当前项目必须在导出页通过已确认时间图按原片分集导出。",
+          tone: "warning"
+        }
+      });
+      return;
+    }
     const health = createProjectHealthSummary(project);
     const blockingFinding = health.findings.find((finding) => finding.severity === "error");
     if (blockingFinding) {

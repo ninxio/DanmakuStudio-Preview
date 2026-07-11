@@ -1,9 +1,16 @@
+import {
+  compileTimeMap,
+  validateTimeMap,
+  type CompiledTimeMap
+} from "../alignment/timeMap";
+import { reconcileMediaTimeMapQuality } from "../alignment/mediaTimeMap";
+import { areMediaContentIdentitiesEqual } from "../project/mediaIdentity";
 import type { DanmakuItem } from "../danmaku/types";
 import type {
   DanmakuSourceSegment,
   EditorProject,
-  ProjectMediaReference,
-  SegmentTimingRule
+  MediaTimeMap,
+  ProjectMediaReference
 } from "../project/types";
 import type { Milliseconds } from "../shared/time";
 
@@ -14,13 +21,11 @@ import type { Milliseconds } from "../shared/time";
  * - 输入时间：弹幕 XML 原始时间（即 B 站参考素材时间轴，二者强关联）。
  * - 输出时间：目标原片时间轴。
  *
- * 投影规则（针对每个 content 来源段）：
- *   targetTime = (itemSourceTime - segment.sourceStartMs)
- *              + (segment.targetStartMs ?? 0)
- *              + Σ gapMs（所有 sourceAtMs <= itemSourceTime 的段内删减修正规则）
- *              + itemTimeAdjustment（单条弹幕非破坏性调整）
+ * 已验证时间图是正式投影路径：matched 段执行整数毫秒分段仿射插值，sourceOnly 不投影，
+ * targetOnly 通过后续 matched 段的目标边界产生跳变，ambiguous 会阻断导出。单条调整最后叠加。
  *
- * ignored 段内的弹幕不投影；未被任何段覆盖的弹幕计入 unmappedItemCount。
+ * ignored 段内的弹幕不投影；sourceOnly 内弹幕属于时间图明确舍弃的内容，单独计数且不触发
+ * “来源段未覆盖”闸门。未被任何有效映射覆盖的弹幕计入 unexpectedUnmappedItemCount。
  * 本模块不修改原始 XML 数据，仅产出投影结果。
  */
 
@@ -72,7 +77,28 @@ export interface SourceProjectionResult {
   ignoredSegmentCount: number;
   projectedItemCount: number;
   ignoredItemCount: number;
+  sourceOnlyItemCount: number;
+  unexpectedUnmappedItemCount: number;
+  /** sourceOnly 与意外未覆盖的合计，供兼容摘要使用。 */
   unmappedItemCount: number;
+}
+
+/**
+ * Once a project has entered the source-to-original workflow, legacy timeline/file-name exports
+ * are unsafe because they do not consume the confirmed MediaTimeMap.
+ */
+export function requiresProjectionOnlyExport(project: EditorProject): boolean {
+  return (
+    project.danmakuSourceSegments.some((segment) => segment.kind === "content") ||
+    project.mediaTimeMaps.length > 0 ||
+    project.mediaLibrary.some((media) => media.role === "targetOriginal")
+  );
+}
+
+interface UsableProjectionSegment {
+  segment: DanmakuSourceSegment;
+  timeMap: MediaTimeMap;
+  compiledTimeMap: CompiledTimeMap;
 }
 
 export function projectDanmakuToTargets(project: EditorProject): SourceProjectionResult {
@@ -82,6 +108,7 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   const sourceBindingByAssetId = new Map(
     project.danmakuSourceBindings.map((binding) => [binding.assetId, binding.sourceMediaId])
   );
+  const timeMapById = new Map(project.mediaTimeMaps.map((timeMap) => [timeMap.id, timeMap]));
   const disabled = new Set(project.disabledItemIds);
 
   const contentSegments = project.danmakuSourceSegments.filter(
@@ -107,6 +134,11 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       ignoredSegmentCount: ignoredSegments.length,
       projectedItemCount: 0,
       ignoredItemCount: 0,
+      sourceOnlyItemCount: 0,
+      unexpectedUnmappedItemCount: project.assets.reduce(
+        (count, asset) => count + asset.items.length,
+        0
+      ),
       unmappedItemCount: project.assets.reduce((count, asset) => count + asset.items.length, 0)
     };
   }
@@ -125,7 +157,7 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     }
   );
 
-  const usableSegments: DanmakuSourceSegment[] = [];
+  const usableSegments: UsableProjectionSegment[] = [];
   for (const segment of contentSegments) {
     if (overlappingSegmentIds.has(segment.id)) {
       continue;
@@ -140,7 +172,32 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       });
       continue;
     }
-    usableSegments.push(segment);
+    if (!segment.timeMapId) {
+      issues.push({
+        id: `segment-missing-time-map-${segment.id}`,
+        severity: "error",
+        segmentId: segment.id,
+        message: `${segment.label} 未关联已确认时间图；旧的段首与删减规则不再允许进入导出链路。`
+      });
+      continue;
+    }
+
+    const timeMap = timeMapById.get(segment.timeMapId);
+    const timeMapProblem = findTimeMapBlocker(segment, timeMap, mediaById);
+    if (timeMapProblem || !timeMap) {
+      issues.push({
+        id: `segment-time-map-blocked-${segment.id}`,
+        severity: "error",
+        segmentId: segment.id,
+        message: timeMapProblem ?? `${segment.label} 引用的可验证时间图不存在，无法导出。`
+      });
+      continue;
+    }
+    usableSegments.push({
+      segment,
+      timeMap,
+      compiledTimeMap: compileTimeMap(timeMap.spans)
+    });
   }
 
   const usableIgnoredSegments: DanmakuSourceSegment[] = [];
@@ -166,10 +223,12 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   }
 
   const groupsByTarget = new Map<string, TargetProjectionGroup>();
+  const coveredItemKeys = new Set<string>();
+  const sourceOnlyItemKeys = new Set<string>();
   let projectedItemCount = 0;
   let disabledTotal = 0;
 
-  for (const segment of usableSegments) {
+  for (const { segment, compiledTimeMap } of usableSegments) {
     const asset = assetsById.get(segment.assetId as string);
     const target = mediaById.get(segment.targetMediaId as string);
     if (!asset || !target) {
@@ -178,10 +237,6 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     const group = ensureGroup(groupsByTarget, target);
     group.segments.push(segment);
 
-    const sortedRules = [...segment.timingRules].sort(
-      (left, right) => left.sourceAtMs - right.sourceAtMs
-    );
-    const ruleHits = new Map<string, number>();
     let disabledCount = 0;
 
     for (const item of asset.items) {
@@ -191,35 +246,33 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       ) {
         continue;
       }
+
+      const mapping = compiledTimeMap.mapSourceTime(item.sourceTimeMs);
+      if (mapping.status === "unmapped") {
+        const itemKey = createItemKey(asset.id, item.id);
+        coveredItemKeys.add(itemKey);
+        sourceOnlyItemKeys.add(itemKey);
+        continue;
+      }
+      if (mapping.status === "ambiguous") {
+        // 正常情况下 ambiguous 会在时间图校验阶段阻断；保留防御性检查，避免未来改动静默投影。
+        continue;
+      }
+      const mappedTimeMs = mapping.targetTimeMs;
+
+      coveredItemKeys.add(createItemKey(asset.id, item.id));
       if (!item.enabled || disabled.has(item.id)) {
         disabledCount += 1;
         continue;
       }
-      const gapMs = accumulateGap(sortedRules, item.sourceTimeMs, ruleHits);
       const adjustmentMs = project.itemTimeAdjustments[item.id] ?? 0;
-      const finalTimeMs =
-        item.sourceTimeMs -
-        segment.sourceStartMs +
-        (segment.targetStartMs ?? 0) +
-        gapMs +
-        adjustmentMs;
+      const finalTimeMs = mappedTimeMs + adjustmentMs;
       group.entries.push({ item, finalTimeMs, segmentId: segment.id });
       projectedItemCount += 1;
     }
 
     group.disabledCount += disabledCount;
     disabledTotal += disabledCount;
-    for (const rule of sortedRules) {
-      group.appliedRules.push({
-        segmentId: segment.id,
-        segmentLabel: segment.label,
-        ruleId: rule.id,
-        sourceAtMs: rule.sourceAtMs,
-        gapMs: rule.gapMs,
-        affectedCount: ruleHits.get(rule.id) ?? 0,
-        note: rule.note
-      });
-    }
   }
 
   const groups = Array.from(groupsByTarget.values());
@@ -241,19 +294,26 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     }
     const negativeCount = group.entries.filter((entry) => entry.finalTimeMs < 0).length;
     if (negativeCount > 0) {
-      group.warnings.push(`${negativeCount} 条弹幕投影后时间为负，导出时会被限制为 0。`);
+      const message = `${group.targetName} 有 ${negativeCount} 条弹幕投影后时间为负；静默限制为 0 会破坏同步，已阻断导出。`;
+      group.warnings.push(message);
+      issues.push({
+        id: `target-negative-${group.targetMediaId}`,
+        severity: "error",
+        segmentId: null,
+        message
+      });
     }
     const targetDurationMs = mediaById.get(group.targetMediaId)?.durationMs ?? null;
     if (targetDurationMs !== null) {
       const overflowCount = group.entries.filter(
-        (entry) => entry.finalTimeMs > targetDurationMs
+        (entry) => entry.finalTimeMs >= targetDurationMs
       ).length;
       if (overflowCount > 0) {
         const message = `${group.targetName} 有 ${overflowCount} 条弹幕投影后超出原片时长，请复核来源范围或目标起点。`;
         group.warnings.push(message);
         issues.push({
           id: `target-overflow-${group.targetMediaId}`,
-          severity: "warning",
+          severity: "error",
           segmentId: null,
           message
         });
@@ -263,18 +323,39 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   groups.sort((left, right) => compareGroupOrder(left, right));
 
   const ignoredItemCount = countItemsInSegments(usableIgnoredSegments, assetsById);
-  const unmappedItemCount = countUnmappedItems(
-    project,
-    usableSegments,
-    usableIgnoredSegments,
-    assetsById
+  const unexpectedUnmappedItemCount = countUnmappedItems(
+    assetsById,
+    coveredItemKeys,
+    usableIgnoredSegments
   );
-  if (unmappedItemCount > 0) {
+  const sourceOnlyItemCount = sourceOnlyItemKeys.size;
+  const unmappedItemCount = unexpectedUnmappedItemCount + sourceOnlyItemCount;
+  const nonIgnoredItemCount = Math.max(
+    0,
+    project.assets.reduce((count, asset) => count + asset.items.length, 0) -
+      ignoredItemCount -
+      sourceOnlyItemCount
+  );
+  const unmappedErrorThreshold = Math.max(5, nonIgnoredItemCount * 0.01);
+  if (sourceOnlyItemCount > 0) {
     issues.push({
-      id: "unmapped-items",
+      id: "source-only-items",
       severity: "warning",
       segmentId: null,
-      message: `${unmappedItemCount} 条弹幕不在任何来源段内，不会被导出。如需保留，请补充正片来源段。`
+      message: `${sourceOnlyItemCount} 条弹幕位于参考视频独有内容中，已按确认时间图明确舍弃，不会触发来源段覆盖错误。`
+    });
+  }
+  if (unexpectedUnmappedItemCount > 0) {
+    const exceedsThreshold = unexpectedUnmappedItemCount > unmappedErrorThreshold;
+    issues.push({
+      id: "unmapped-items",
+      severity: exceedsThreshold ? "error" : "warning",
+      segmentId: null,
+      message: `${unexpectedUnmappedItemCount} 条弹幕不在任何来源段内，不会被导出。${
+        exceedsThreshold
+          ? `已超过非忽略弹幕的安全阈值 ${formatCoverageThreshold(unmappedErrorThreshold)} 条，导出已阻断。`
+          : "如需保留，请补充正片来源段。"
+      }`
     });
   }
 
@@ -293,8 +374,14 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     ignoredSegmentCount: ignoredSegments.length,
     projectedItemCount,
     ignoredItemCount,
+    sourceOnlyItemCount,
+    unexpectedUnmappedItemCount,
     unmappedItemCount
   };
+}
+
+function formatCoverageThreshold(value: number): string {
+  return Number.isInteger(value) ? value.toString() : value.toFixed(2);
 }
 
 function findOverlappingProjectionSegments(
@@ -356,6 +443,78 @@ function findSegmentBlocker(
   }
   if (mediaById.get(segment.targetMediaId)?.role !== "targetOriginal") {
     return `${segment.label} 的目标素材不是原片角色，无法投影。`;
+  }
+  return null;
+}
+
+function findTimeMapBlocker(
+  segment: DanmakuSourceSegment,
+  timeMap: MediaTimeMap | undefined,
+  mediaById: Map<string, ProjectMediaReference>
+): string | null {
+  if (!timeMap) {
+    return `${segment.label} 引用的可验证时间图不存在，无法导出。`;
+  }
+  if (timeMap.state !== "confirmed") {
+    return `${segment.label} 引用的时间图尚未确认（当前状态：${timeMap.state}），无法导出。`;
+  }
+  if (
+    timeMap.sourceMediaId !== segment.sourceMediaId ||
+    timeMap.targetMediaId !== segment.targetMediaId ||
+    timeMap.sourceStartMs !== segment.sourceStartMs ||
+    timeMap.sourceEndMs !== segment.sourceEndMs ||
+    timeMap.targetStartMs !== (segment.targetStartMs ?? 0)
+  ) {
+    return `${segment.label} 引用的时间图与来源素材、目标原片或分段范围不一致，无法导出。`;
+  }
+
+  const validation = validateTimeMap(timeMap.spans);
+  if (!validation.valid || timeMap.spans.length === 0) {
+    const detail = validation.valid
+      ? "时间图没有任何分段"
+      : validation.issues.map((issue) => issue.message).join("；");
+    return `${segment.label} 的时间图结构无效：${detail}。`;
+  }
+
+  const firstSpan = timeMap.spans[0];
+  const lastSpan = timeMap.spans[timeMap.spans.length - 1];
+  if (
+    firstSpan.sourceStartMs !== timeMap.sourceStartMs ||
+    lastSpan.sourceEndMs !== timeMap.sourceEndMs ||
+    firstSpan.targetStartMs !== timeMap.targetStartMs ||
+    lastSpan.targetEndMs !== timeMap.targetEndMs
+  ) {
+    return `${segment.label} 的时间图边界与其声明范围不一致，无法导出。`;
+  }
+  if (timeMap.spans.some((span) => span.kind === "ambiguous")) {
+    return `${segment.label} 的时间图包含歧义（ambiguous）区间，必须先人工消除歧义才能导出。`;
+  }
+
+  const effectiveQuality = reconcileMediaTimeMapQuality(timeMap).quality;
+  if (effectiveQuality.level === "review") {
+    return `${segment.label} 的时间图仍需人工复核，不能导出。`;
+  }
+  if (effectiveQuality.level === "blocked") {
+    return `${segment.label} 的时间图质量评估已阻断，不能导出。`;
+  }
+  if (effectiveQuality.level === "legacy-unverified") {
+    return `${segment.label} 的时间图由旧规则迁移且未经验证，不能导出。`;
+  }
+  const sourceMedia = mediaById.get(timeMap.sourceMediaId);
+  const targetMedia = mediaById.get(timeMap.targetMediaId);
+  if (
+    !sourceMedia?.contentIdentity ||
+    !targetMedia?.contentIdentity ||
+    !timeMap.sourceIdentity ||
+    !timeMap.targetIdentity
+  ) {
+    return `${segment.label} 的已验证时间图缺少当前媒体或分析时的内容身份快照，必须重新分析后才能导出。`;
+  }
+  if (!areMediaContentIdentitiesEqual(sourceMedia.contentIdentity, timeMap.sourceIdentity)) {
+    return `${segment.label} 的 B 站参考文件已被替换或修改，原时间图已经失效，必须重新分析。`;
+  }
+  if (!areMediaContentIdentitiesEqual(targetMedia.contentIdentity, timeMap.targetIdentity)) {
+    return `${segment.label} 的目标原片已被替换或修改，原时间图已经失效，必须重新分析。`;
   }
   return null;
 }
@@ -451,21 +610,6 @@ function stripVideoExtension(fileName: string): string {
   return fileName.replace(/\.(mp4|webm|mkv|avi|mov|m4v|ts|flv|m2ts)$/i, "");
 }
 
-function accumulateGap(
-  sortedRules: readonly SegmentTimingRule[],
-  itemSourceTimeMs: Milliseconds,
-  ruleHits: Map<string, number>
-): Milliseconds {
-  let total = 0;
-  for (const rule of sortedRules) {
-    if (itemSourceTimeMs >= rule.sourceAtMs) {
-      total += rule.gapMs;
-      ruleHits.set(rule.id, (ruleHits.get(rule.id) ?? 0) + 1);
-    }
-  }
-  return total;
-}
-
 function countItemsInSegments(
   segments: readonly DanmakuSourceSegment[],
   assetsById: Map<string, EditorProject["assets"][number]>
@@ -488,28 +632,31 @@ function countItemsInSegments(
 }
 
 function countUnmappedItems(
-  project: EditorProject,
-  contentSegments: readonly DanmakuSourceSegment[],
-  ignoredSegments: readonly DanmakuSourceSegment[],
-  assetsById: Map<string, EditorProject["assets"][number]>
+  assetsById: Map<string, EditorProject["assets"][number]>,
+  coveredItemKeys: ReadonlySet<string>,
+  ignoredSegments: readonly DanmakuSourceSegment[]
 ): number {
   let unmapped = 0;
   for (const asset of assetsById.values()) {
     const assetId = asset.id;
-    const assetSegments = [...contentSegments, ...ignoredSegments].filter(
+    const assetIgnoredSegments = ignoredSegments.filter(
       (segment) => segment.assetId === assetId
     );
     for (const item of asset.items) {
-      const covered = assetSegments.some(
+      const coveredByIgnoredSegment = assetIgnoredSegments.some(
         (segment) =>
           item.sourceTimeMs >= segment.sourceStartMs && item.sourceTimeMs < segment.sourceEndMs
       );
-      if (!covered) {
+      if (!coveredItemKeys.has(createItemKey(asset.id, item.id)) && !coveredByIgnoredSegment) {
         unmapped += 1;
       }
     }
   }
   return unmapped;
+}
+
+function createItemKey(assetId: string, itemId: string): string {
+  return `${assetId}\u0000${itemId}`;
 }
 
 function compareGroupOrder(left: TargetProjectionGroup, right: TargetProjectionGroup): number {

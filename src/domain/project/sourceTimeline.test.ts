@@ -73,6 +73,44 @@ describe("danmaku source timeline", () => {
     expect(parseSourceTimecode("bad")).toBeNull();
   });
 
+  it("已确认时间图拥有的来源段只允许修改标签类元数据", () => {
+    const segment = createDanmakuSourceSegment("mapped", {
+      kind: "content",
+      assetId: "asset",
+      sourceMediaId: "source-media",
+      sourceStartMs: 0,
+      sourceEndMs: 60_000,
+      targetMediaId: "target-media",
+      targetStartMs: 5_000,
+      timingRules: [],
+      timeMapId: "confirmed-map",
+      episodeKey: "S01E01",
+      episodeLabel: "第 1 集"
+    });
+
+    expect(
+      updateDanmakuSourceSegment(segment, {
+        label: "人工备注后的标签",
+        note: "仅改说明",
+        episodeKey: "S01E02",
+        episodeLabel: "第 2 集"
+      })
+    ).toMatchObject({
+      label: "人工备注后的标签",
+      note: "仅改说明",
+      episodeKey: "S01E02",
+      timeMapId: "confirmed-map"
+    });
+    expect(() =>
+      updateDanmakuSourceSegment(segment, { sourceStartMs: 1_000 })
+    ).toThrow("由已确认时间图管理");
+    expect(() =>
+      updateDanmakuSourceSegment(segment, {
+        timingRules: [{ sourceAtMs: 20_000, gapMs: 5_000 }]
+      })
+    ).toThrow("由已确认时间图管理");
+  });
+
   it("摘要提示未标注、重叠和就绪状态", () => {
     const plan = createPlan();
     const emptyProject = {
@@ -211,6 +249,7 @@ function createMedia(id: string, role: ProjectMediaRole): ProjectMediaReference 
     fileName: role === "bilibiliReference" ? "reference.mp4" : "target.mp4",
     objectUrl: "blob:test",
     durationMs: 120_000,
+    contentIdentity: null,
     referenceKind: "browserFile",
     connectionState: "connected",
     sourceSummary: "浏览器文件",

@@ -164,8 +164,8 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.screenshot({ path: screenshotPath("project-health.png"), fullPage: true });
   await page.getByTestId("workspace-nav-matching").click();
   await page
-    .getByTestId("legacy-alignment-diagnostics")
-    .getByText("高级诊断：旧单对单实验室与对齐 JSON")
+    .getByTestId("manual-alignment-diagnostics")
+    .getByText("手工导入诊断（JSON，只读）")
     .click();
 
   const blockedAudioAlignmentProposal = {
@@ -194,12 +194,12 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
     diagnostics: ["音频特征匹配 4 / 4 帧。"]
   };
   await page
-    .getByPlaceholder("AlignmentProposal JSON")
+    .getByLabel("对齐提案 JSON")
     .fill(JSON.stringify(blockedAudioAlignmentProposal, null, 2));
-  await page.getByRole("button", { name: "导入提案" }).click();
-  await expect(page.getByText("应用已暂停")).toBeVisible();
+  await page.getByRole("button", { name: "解析为只读诊断" }).click();
+  await expect(page.getByText("诊断警告")).toBeVisible();
   await expect(page.getByText(/不确定区间起止顺序异常/).last()).toBeVisible();
-  await expect(page.getByRole("button", { name: "应用候选" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "应用候选" })).toHaveCount(0);
 
   const audioAlignmentProposal = {
     anchors: [
@@ -227,14 +227,13 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
     diagnostics: ["音频特征匹配 4 / 4 帧。"]
   };
   await page
-    .getByPlaceholder("AlignmentProposal JSON")
+    .getByLabel("对齐提案 JSON")
     .fill(JSON.stringify(audioAlignmentProposal, null, 2));
-  await page.getByRole("button", { name: "导入提案" }).click();
+  await page.getByRole("button", { name: "解析为只读诊断" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已发送到时间轴预览");
-  await expect(page.getByText("应用已暂停")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "应用候选" })).toBeEnabled();
+  await expect(page.getByText("诊断警告")).toHaveCount(0);
   const alignmentReportDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "导出报告" }).click();
+  await page.getByRole("button", { name: "导出诊断报告" }).click();
   const alignmentReportDownload = await alignmentReportDownloadPromise;
   const alignmentReportPath = resolve(downloadDir, alignmentReportDownload.suggestedFilename());
   await alignmentReportDownload.saveAs(alignmentReportPath);

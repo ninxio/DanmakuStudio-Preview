@@ -69,4 +69,100 @@ describe("manual alignment provider", () => {
       )
     ).toThrow("对齐提案 JSON 格式不正确。");
   });
+
+  it("严格校验 Alignment V2 的分段时间图快照", () => {
+    const proposal = createTimeMapProposal();
+    expect(parseAlignmentProposal(JSON.stringify(proposal)).timeMap).toMatchObject({
+      engineVersion: "alignment-v2-test",
+      evidence: {
+        uniqueContentCoverage: 0.82,
+        repeatedContentOnly: true
+      },
+      quality: { level: "review" },
+      spans: [{ kind: "matched" }, { kind: "targetOnly" }, { kind: "matched" }]
+    });
+
+    const invalid = createTimeMapProposal();
+    if (!invalid.timeMap) {
+      throw new Error("测试提案缺少时间图。");
+    }
+    invalid.timeMap.spans[2].targetStartMs = 11_000;
+    expect(() => parseAlignmentProposal(JSON.stringify(invalid))).toThrow(
+      "对齐提案 JSON 格式不正确。"
+    );
+  });
 });
+
+function createTimeMapProposal() {
+  return {
+    anchors: [],
+    cutCandidates: [],
+    confidence: 0.7,
+    diagnostics: ["候选时间图"],
+    matchRange: {
+      sourceStartMs: 0,
+      sourceEndMs: 20_000,
+      targetStartMs: 0,
+      targetEndMs: 25_000,
+      coverage: 0.9
+    },
+    timeMap: {
+      sourceStartMs: 0,
+      sourceEndMs: 20_000,
+      targetStartMs: 0,
+      targetEndMs: 25_000,
+      spans: [
+        {
+          kind: "matched" as const,
+          sourceStartMs: 0,
+          sourceEndMs: 10_000,
+          targetStartMs: 0,
+          targetEndMs: 10_000
+        },
+        {
+          kind: "targetOnly" as const,
+          sourceStartMs: 10_000,
+          sourceEndMs: 10_000,
+          targetStartMs: 10_000,
+          targetEndMs: 15_000
+        },
+        {
+          kind: "matched" as const,
+          sourceStartMs: 10_000,
+          sourceEndMs: 20_000,
+          targetStartMs: 15_000,
+          targetEndMs: 25_000
+        }
+      ],
+      quality: {
+        level: "review" as const,
+        probability: null,
+        metricSource: "measured" as const,
+        coverage: 0.9,
+        p50ResidualMs: 30,
+        p95ResidualMs: 80,
+        maxResidualMs: 120,
+        boundaryUncertaintyMs: 200,
+        alternativeMargin: 0.2,
+        anchorCount: 20,
+        heldOutAnchorCount: 4,
+        reasons: ["尚未通过真实冻结基准。"]
+      },
+      evidence: {
+        types: ["audio" as const],
+        audioAnchorCount: 20,
+        visualAnchorCount: 0,
+        heldOutAnchorCount: 4,
+        top1Top2Margin: 0.2,
+        uniqueContentCoverage: 0.82,
+        repeatedContentOnly: true,
+        notes: []
+      },
+      sourceStream: null,
+      targetStream: null,
+      engineVersion: "alignment-v2-test",
+      featureVersion: "landmark-v1",
+      parametersHash: "test-parameters"
+    }
+  };
+}

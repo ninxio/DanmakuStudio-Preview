@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { mapSourceTime } from "../alignment/timeMap";
+import { computeMediaTimeMapCoreDigest } from "../alignment/mediaTimeMap";
 import { createEmptyProject } from "./factory";
 import {
   parseProjectJson,
@@ -10,6 +12,7 @@ import {
 } from "./schema";
 import {
   CURRENT_SCHEMA_VERSION,
+  type MediaTimeMap,
   type ProjectMediaReference,
   type ProjectMediaRole
 } from "./types";
@@ -221,6 +224,7 @@ describe("project schema", () => {
           timingRules: [
             { id: "rule-1", sourceAtMs: 7_230_000, gapMs: 45_000, note: "审核删减补偿" }
           ],
+          timeMapId: null,
           episodeKey: "S01E01",
           episodeLabel: "第 1 集",
           note: "B 站长视频两小时后进入正片",
@@ -238,6 +242,7 @@ describe("project schema", () => {
           targetMediaId: null,
           targetStartMs: null,
           timingRules: [],
+          timeMapId: null,
           episodeKey: null,
           episodeLabel: null,
           note: "",
@@ -268,6 +273,7 @@ describe("project schema", () => {
         createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
         createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
       ],
+      mediaTimeMaps: [createValidMediaTimeMap()],
       mediaMatchCandidates: [createValidMediaMatchCandidate()]
     };
 
@@ -290,17 +296,143 @@ describe("project schema", () => {
         }
       }
     });
+    expect(parsed.mediaTimeMaps[0]).toMatchObject({
+      id: "candidate-map-1",
+      sourceStream: { type: "audio", index: 1, sampleRate: 48_000 },
+      quality: { level: "review", p95ResidualMs: 120 },
+      state: "candidate"
+    });
+  });
+
+  it("打开 v10 项目时重算时间图质量，只降级外部声明而不自动升级", () => {
+    const overclaimed = createValidMediaTimeMap({ id: "map-overclaimed" });
+    overclaimed.quality = {
+      ...overclaimed.quality,
+      level: "verified",
+      probability: 0.999,
+      p95ResidualMs: 80,
+      reasons: ["外部声称已验证。"]
+    };
+    overclaimed.evidence = {
+      ...overclaimed.evidence,
+      types: ["audio", "visual"],
+      visualAnchorCount: 10
+    };
+    const conservative = createValidMediaTimeMap({ id: "map-conservative" });
+    conservative.quality = {
+      ...conservative.quality,
+      level: "review",
+      probability: 0.999,
+      p95ResidualMs: 80,
+      reasons: ["保守地请求人工复核。"]
+    };
+    conservative.evidence = {
+      ...conservative.evidence,
+      types: ["audio", "visual"],
+      visualAnchorCount: 10
+    };
+    const project = {
+      ...createEmptyProject("外部时间图质量声明"),
+      schemaVersion: 10,
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [overclaimed, conservative]
+    };
+
+    expect(validateProjectSchema(project).ok).toBe(true);
+    const result = parseProjectJsonWithMetadata(JSON.stringify(project));
+    const parsed = result.project;
+    expect(result.migration).toMatchObject({ fromVersion: 10, toVersion: 11 });
+    expect(parsed.mediaTimeMaps[0].quality.level).toBe("review");
+    expect(parsed.mediaTimeMaps[0].quality.reasons.join(" ")).toContain("v10 没有可绑定时间图核心");
+    expect(parsed.mediaTimeMaps[0].verification).toBeNull();
+    expect(parsed.mediaTimeMaps[1].quality.level).toBe("review");
+
+    const reopened = parseProjectJson(serializeProject(parsed));
+    expect(reopened.mediaTimeMaps[0].quality.level).toBe("review");
+    expect(
+      reopened.mediaTimeMaps[0].quality.reasons.filter((reason) =>
+        reason.includes("v10 没有可绑定时间图核心")
+      )
+    ).toHaveLength(1);
+  });
+
+  it("v11 导入的自报 manual record 即使摘要正确也不会自动成为 trusted", () => {
+    const map = createValidMediaTimeMap({
+      id: "forged-manual-map",
+      state: "confirmed",
+      confirmedAt: "2026-07-12T00:00:00.000Z"
+    });
+    map.quality = {
+      ...map.quality,
+      level: "verified",
+      probability: 0.999,
+      p95ResidualMs: 80
+    };
+    map.evidence = {
+      ...map.evidence,
+      types: ["manual"],
+      audioAnchorCount: 0
+    };
+    map.verification = {
+      recordVersion: 1,
+      method: "manual-review",
+      mapCoreDigest: computeMediaTimeMapCoreDigest(map),
+      mapRevision: map.revision,
+      sourceIdentity: structuredClone(map.sourceIdentity!),
+      targetIdentity: structuredClone(map.targetIdentity!),
+      calibrationArtifactId: "manual-review-protocol",
+      calibrationArtifactVersion: "1",
+      verifier: "forged-json",
+      verifiedAt: "2026-07-12T00:00:00.000Z"
+    };
+    const project = {
+      ...createEmptyProject("伪造人工验证记录"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [map]
+    };
+
+    expect(validateProjectSchema(project).ok).toBe(true);
+    const reopened = parseProjectJson(JSON.stringify(project));
+    expect(reopened.mediaTimeMaps[0].quality.level).toBe("review");
+    expect(reopened.mediaTimeMaps[0].quality.reasons.join(" ")).toContain(
+      "导入 JSON 不能自动取得可信状态"
+    );
+  });
+
+  it("v11 时间图必须显式携带 verification=null 或合法 record", () => {
+    const project = {
+      ...createEmptyProject("缺少验证字段"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [createValidMediaTimeMap()]
+    };
+    const withoutVerification = structuredClone(project) as unknown as {
+      mediaTimeMaps: Array<Record<string, unknown>>;
+    };
+    delete withoutVerification.mediaTimeMaps[0].verification;
+
+    expect(validateProjectSchema(withoutVerification).ok).toBe(false);
   });
 
   it("已接受和已拒绝的媒体匹配候选连同应用片段 ID 完整往返", () => {
     const acceptedCandidate = {
       ...createValidMediaMatchCandidate(),
       state: "accepted" as const,
-      appliedSegmentIds: ["candidate-1:segment:asset-1"]
+      appliedSegmentIds: ["candidate-1:segment:asset-1"],
+      confirmedTimeMapId: "confirmed-map-1"
     };
     const rejectedCandidate = {
       ...createValidMediaMatchCandidate(),
       id: "candidate-rejected",
+      timeMapId: "candidate-map-rejected",
       state: "rejected" as const,
       appliedSegmentIds: []
     };
@@ -309,6 +441,37 @@ describe("project schema", () => {
       mediaLibrary: [
         createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
         createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      danmakuSourceSegments: [
+        {
+          id: "candidate-1:segment:asset-1",
+          label: "已接受来源段",
+          kind: "content" as const,
+          assetId: "asset-1",
+          sourceMediaId: "source-media",
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetMediaId: "target-media",
+          targetStartMs: 0,
+          timingRules: [
+            { id: "candidate-1:rule:0", sourceAtMs: 40_000, gapMs: 5_000, note: "测试" }
+          ],
+          timeMapId: "confirmed-map-1",
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      mediaTimeMaps: [
+        createValidMediaTimeMap(),
+        createValidMediaTimeMap({
+          id: "confirmed-map-1",
+          state: "confirmed",
+          confirmedAt: "2026-07-11T00:00:00.000Z"
+        }),
+        createValidMediaTimeMap({ id: "candidate-map-rejected" })
       ],
       mediaMatchCandidates: [acceptedCandidate, rejectedCandidate]
     };
@@ -635,6 +798,12 @@ describe("project schema", () => {
       targetStartMs: null,
       timingRules: []
     });
+    expect(parsed.danmakuSourceSegments[0].timeMapId).toContain(
+      "migrated_v10_confirmed-segment"
+    );
+    expect(parsed.mediaTimeMaps).toMatchObject([
+      { state: "confirmed", quality: { level: "legacy-unverified" } }
+    ]);
 
     const reopened = parseProjectJson(serializeProject(parsed));
     expect(reopened.danmakuSourceSegments[0]).toMatchObject({
@@ -663,6 +832,321 @@ describe("project schema", () => {
       adjustedClipRangeCount: 0
     });
     expect(parseProjectJson(serializeProject(parsed)).mediaMatchCandidates).toEqual([]);
+  });
+
+  it("打开 v9 项目时为候选和内容段生成相互独立的 legacy-unverified 时间图", () => {
+    const segmentId = "candidate-1:segment:asset-1";
+    const legacyProject = {
+      ...createEmptyProject("v9 时间图迁移"),
+      schemaVersion: 9,
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      danmakuSourceSegments: [
+        {
+          id: segmentId,
+          label: "已接受来源段",
+          kind: "content",
+          assetId: "asset-1",
+          sourceMediaId: "source-media",
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetMediaId: "target-media",
+          targetStartMs: 0,
+          timingRules: [
+            { id: "candidate-1:rule:0", sourceAtMs: 40_000, gapMs: 5_000, note: "旧规则" }
+          ],
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        },
+        {
+          id: "ignored",
+          label: "片头",
+          kind: "ignored",
+          assetId: "asset-1",
+          sourceMediaId: "source-media",
+          sourceStartMs: 0,
+          sourceEndMs: 10_000,
+          targetMediaId: null,
+          targetStartMs: null,
+          timingRules: [],
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      mediaMatchCandidates: [
+        {
+          ...createValidMediaMatchCandidate(),
+          state: "accepted",
+          appliedSegmentIds: [segmentId]
+        }
+      ]
+    } as Record<string, unknown>;
+    delete legacyProject.mediaTimeMaps;
+    const legacyCandidate = (
+      legacyProject.mediaMatchCandidates as Array<Record<string, unknown>>
+    )[0];
+    delete legacyCandidate.timeMapId;
+    delete legacyCandidate.confirmedTimeMapId;
+
+    const parsed = parseProjectJson(JSON.stringify(legacyProject));
+
+    expect(parsed.mediaTimeMaps).toHaveLength(2);
+    const candidateMap = parsed.mediaTimeMaps.find((map) => map.state === "candidate");
+    const confirmedMap = parsed.mediaTimeMaps.find((map) => map.state === "confirmed");
+    expect(candidateMap).toMatchObject({
+      quality: { level: "legacy-unverified", metricSource: "estimated" },
+      sourceStream: null,
+      targetStream: null,
+      spans: [{ kind: "matched" }, { kind: "targetOnly" }, { kind: "matched" }]
+    });
+    expect(confirmedMap?.id).not.toBe(candidateMap?.id);
+    expect(parsed.mediaMatchCandidates[0]).toMatchObject({
+      timeMapId: candidateMap?.id,
+      confirmedTimeMapId: confirmedMap?.id,
+      state: "accepted"
+    });
+    expect(parsed.danmakuSourceSegments[0].timeMapId).toBe(confirmedMap?.id);
+    expect(parsed.danmakuSourceSegments[1].timeMapId).toBeNull();
+    expect(validateProjectSchema(parsed).ok).toBe(true);
+    expect(parseProjectJson(serializeProject(parsed))).toEqual(parsed);
+  });
+
+  it("v9 已应用段规则与候选不一致时保留段自身投影语义并阻断候选复用", () => {
+    const segmentId = "candidate-1:segment:asset-1";
+    const legacyProject = {
+      ...createEmptyProject("v9 不一致时间规则迁移"),
+      schemaVersion: 9,
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      danmakuSourceSegments: [
+        {
+          id: segmentId,
+          label: "实际采用七秒间隔的来源段",
+          kind: "content",
+          assetId: "asset-1",
+          sourceMediaId: "source-media",
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetMediaId: "target-media",
+          targetStartMs: 0,
+          timingRules: [
+            { id: "segment-rule", sourceAtMs: 40_000, gapMs: 7_000, note: "段自身规则" }
+          ],
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ],
+      mediaMatchCandidates: [
+        {
+          ...createValidMediaMatchCandidate(),
+          state: "accepted",
+          appliedSegmentIds: [segmentId]
+        }
+      ]
+    } as Record<string, unknown>;
+    delete legacyProject.mediaTimeMaps;
+    const legacyCandidate = (
+      legacyProject.mediaMatchCandidates as Array<Record<string, unknown>>
+    )[0];
+    delete legacyCandidate.timeMapId;
+    delete legacyCandidate.confirmedTimeMapId;
+
+    const parsed = parseProjectJson(JSON.stringify(legacyProject));
+    const candidate = parsed.mediaMatchCandidates[0];
+    const segment = parsed.danmakuSourceSegments[0];
+    const candidateMap = parsed.mediaTimeMaps.find((map) => map.id === candidate.timeMapId);
+    const segmentMap = parsed.mediaTimeMaps.find((map) => map.id === segment.timeMapId);
+
+    expect(candidate).toMatchObject({
+      state: "blocked",
+      confirmedTimeMapId: null,
+      appliedSegmentIds: []
+    });
+    expect(candidateMap).toMatchObject({ state: "candidate", quality: { level: "blocked" } });
+    expect(segmentMap).toMatchObject({
+      state: "confirmed",
+      targetEndMs: 67_000,
+      quality: { level: "legacy-unverified" }
+    });
+    expect(segment.timeMapId).not.toBe(candidate.timeMapId);
+    expect(mapSourceTime(segmentMap?.spans ?? [], 50_000)).toEqual({
+      status: "mapped",
+      sourceTimeMs: 50_000,
+      targetTimeMs: 47_000,
+      spanIndex: 2
+    });
+    expect(validateProjectSchema(parsed).ok).toBe(true);
+    expect(parseProjectJson(serializeProject(parsed))).toEqual(parsed);
+  });
+
+  it("迁移 v9 负 gap 时不猜测 sourceOnly，而是生成 blocked ambiguous 候选图", () => {
+    const candidate = {
+      ...createValidMediaMatchCandidate(),
+      targetEndMs: 55_000,
+      timingRules: [
+        { id: "candidate-1:rule:negative", sourceAtMs: 40_000, gapMs: -5_000, note: "旧负值" }
+      ],
+      proposal: {
+        ...createValidMediaMatchCandidate().proposal,
+        matchRange: {
+          ...createValidMediaMatchCandidate().proposal.matchRange,
+          targetEndMs: 55_000
+        }
+      }
+    };
+    const legacyProject = {
+      ...createEmptyProject("v9 负 gap"),
+      schemaVersion: 9,
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [candidate]
+    } as Record<string, unknown>;
+    delete legacyProject.mediaTimeMaps;
+    const legacyCandidate = (
+      legacyProject.mediaMatchCandidates as Array<Record<string, unknown>>
+    )[0];
+    delete legacyCandidate.timeMapId;
+    delete legacyCandidate.confirmedTimeMapId;
+
+    const parsed = parseProjectJson(JSON.stringify(legacyProject));
+
+    expect(parsed.mediaTimeMaps).toHaveLength(1);
+    expect(parsed.mediaTimeMaps[0]).toMatchObject({
+      state: "candidate",
+      quality: { level: "blocked" },
+      spans: [{ kind: "ambiguous", sourceStartMs: 10_000, sourceEndMs: 70_000 }]
+    });
+    expect(
+      parsed.mediaTimeMaps[0].quality.reasons.some((reason) => reason.includes("负 gap"))
+    ).toBe(true);
+    expect(validateProjectSchema(parsed).ok).toBe(true);
+  });
+
+  it("拒绝 validateTimeMap 不通过或外层范围不一致的 v10 时间图", () => {
+    const project = {
+      ...createEmptyProject(),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [
+        createValidMediaTimeMap({
+          spans: [
+            {
+              kind: "matched",
+              sourceStartMs: 10_000,
+              sourceEndMs: 50_000,
+              targetStartMs: 0,
+              targetEndMs: 40_000
+            },
+            {
+              kind: "matched",
+              sourceStartMs: 49_000,
+              sourceEndMs: 70_000,
+              targetStartMs: 40_000,
+              targetEndMs: 65_000
+            }
+          ]
+        })
+      ]
+    };
+
+    const validation = validateProjectSchema(project);
+    expect(validation.ok).toBe(false);
+    expect(validation.message).toContain("必要字段");
+  });
+
+  it("拒绝候选、确认段与错误 state 或错误范围的时间图引用", () => {
+    const candidate = createValidMediaMatchCandidate();
+    const missingCandidateMapProject = {
+      ...createEmptyProject(),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [candidate]
+    };
+    const missingReferenceValidation = validateProjectSchema(missingCandidateMapProject);
+    expect(missingReferenceValidation.ok).toBe(false);
+    expect(missingReferenceValidation.message).toContain("引用或范围");
+
+    const wrongRangeMapProject = {
+      ...missingCandidateMapProject,
+      mediaTimeMaps: [createValidMediaTimeMap({ sourceEndMs: 69_000 })]
+    };
+    expect(validateProjectSchema(wrongRangeMapProject).ok).toBe(false);
+  });
+
+  it("拒绝 confirmedTimeMapId 下未登记到候选 appliedSegmentIds 的反向孤儿段", () => {
+    const acceptedCandidate = {
+      ...createValidMediaMatchCandidate(),
+      state: "accepted" as const,
+      confirmedTimeMapId: "confirmed-map-1",
+      appliedSegmentIds: ["owned-segment"]
+    };
+    const ownedSegment = {
+      id: "owned-segment",
+      label: "候选已登记段",
+      kind: "content" as const,
+      assetId: "asset-1",
+      sourceMediaId: "source-media",
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetMediaId: "target-media",
+      targetStartMs: 0,
+      timingRules: [],
+      timeMapId: "confirmed-map-1",
+      episodeKey: null,
+      episodeLabel: null,
+      note: "",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      updatedAt: "2026-07-11T00:00:00.000Z"
+    };
+    const project = {
+      ...createEmptyProject("反向时间图所有权"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [acceptedCandidate],
+      mediaTimeMaps: [
+        createValidMediaTimeMap(),
+        createValidMediaTimeMap({
+          id: "confirmed-map-1",
+          state: "confirmed",
+          confirmedAt: "2026-07-11T00:00:00.000Z"
+        })
+      ],
+      danmakuSourceSegments: [ownedSegment]
+    };
+    expect(validateProjectSchema(project).ok).toBe(true);
+
+    const withOrphan = {
+      ...project,
+      danmakuSourceSegments: [
+        ownedSegment,
+        { ...ownedSegment, id: "unregistered-orphan", label: "未登记孤儿段" }
+      ]
+    };
+    expect(validateProjectSchema(withOrphan)).toMatchObject({
+      ok: false,
+      message: "项目文件中的时间映射引用或范围不一致。"
+    });
   });
 
   it("打开当前版本项目时保留半开 sourceOutMs", () => {
@@ -1029,10 +1513,115 @@ function createValidMediaMatchCandidate() {
     timingRules: [{ id: "candidate-1:rule:0", sourceAtMs: 40_000, gapMs: 5_000, note: "测试" }],
     confidence: 0.85,
     proposal,
+    timeMapId: "candidate-map-1",
+    confirmedTimeMapId: null,
     state: "pending" as const,
     appliedSegmentIds: [],
     createdAt: "2026-07-11T00:00:00.000Z",
     updatedAt: "2026-07-11T00:00:00.000Z"
+  };
+}
+
+function createValidMediaTimeMap(overrides: Partial<MediaTimeMap> = {}): MediaTimeMap {
+  const state = overrides.state ?? "candidate";
+  return {
+    id: "candidate-map-1",
+    revision: 1,
+    sourceMediaId: "source-media",
+    targetMediaId: "target-media",
+    sourceStream: {
+      type: "audio",
+      index: 1,
+      codec: "aac",
+      startMs: 0,
+      timelineOffsetMs: 0,
+      timeBase: "1/48000",
+      sampleRate: 48_000,
+      channels: 2,
+      frameRate: null,
+      language: "jpn",
+      title: "Original"
+    },
+    targetStream: {
+      type: "audio",
+      index: 1,
+      codec: "flac",
+      startMs: 0,
+      timelineOffsetMs: 0,
+      timeBase: "1/48000",
+      sampleRate: 48_000,
+      channels: 2,
+      frameRate: null,
+      language: "jpn",
+      title: "Original"
+    },
+    sourceStartMs: 10_000,
+    sourceEndMs: 70_000,
+    targetStartMs: 0,
+    targetEndMs: 65_000,
+    spans: [
+      {
+        kind: "matched",
+        sourceStartMs: 10_000,
+        sourceEndMs: 40_000,
+        targetStartMs: 0,
+        targetEndMs: 30_000
+      },
+      {
+        kind: "targetOnly",
+        sourceStartMs: 40_000,
+        sourceEndMs: 40_000,
+        targetStartMs: 30_000,
+        targetEndMs: 35_000
+      },
+      {
+        kind: "matched",
+        sourceStartMs: 40_000,
+        sourceEndMs: 70_000,
+        targetStartMs: 35_000,
+        targetEndMs: 65_000
+      }
+    ],
+    quality: {
+      level: "review",
+      probability: null,
+      metricSource: "measured",
+      coverage: 0.95,
+      p50ResidualMs: 40,
+      p95ResidualMs: 120,
+      maxResidualMs: 240,
+      boundaryUncertaintyMs: 200,
+      alternativeMargin: 0.3,
+      anchorCount: 50,
+      heldOutAnchorCount: 10,
+      reasons: ["测试映射仍需人工复核。"]
+    },
+    evidence: {
+      types: ["audio"],
+      audioAnchorCount: 50,
+      visualAnchorCount: 0,
+      heldOutAnchorCount: 10,
+      notes: ["测试音频证据。"]
+    },
+    engineVersion: "alignment-v2-test",
+    featureVersion: "feature-v2-test",
+    parametersHash: "sha256:test",
+    state,
+    createdAt: "2026-07-11T00:00:00.000Z",
+    updatedAt: "2026-07-11T00:00:00.000Z",
+    confirmedAt:
+      overrides.confirmedAt !== undefined
+        ? overrides.confirmedAt
+        : state === "candidate"
+          ? null
+          : "2026-07-11T00:00:00.000Z",
+    ...overrides,
+    sourceIdentity:
+      "sourceIdentity" in overrides ? (overrides.sourceIdentity ?? null) : createValidMediaIdentity(),
+    targetIdentity:
+      "targetIdentity" in overrides ? (overrides.targetIdentity ?? null) : createValidMediaIdentity(),
+    verification:
+      "verification" in overrides ? (overrides.verification ?? null) : null
   };
 }
 
@@ -1098,6 +1687,10 @@ function createValidProjectMediaReference(
     fileName: overrides.fileName ?? roleDefaults.fileName,
     objectUrl: overrides.objectUrl ?? null,
     durationMs: overrides.durationMs ?? 120_000,
+    contentIdentity:
+      "contentIdentity" in overrides
+        ? (overrides.contentIdentity ?? null)
+        : createValidMediaIdentity(),
     referenceKind: overrides.referenceKind ?? "browserFile",
     connectionState: overrides.connectionState ?? "needsReconnect",
     sourceSummary: overrides.sourceSummary ?? "测试媒体",
@@ -1107,5 +1700,16 @@ function createValidProjectMediaReference(
     episodeLabel: overrides.episodeLabel ?? null,
     createdAt: overrides.createdAt ?? "2026-07-11T00:00:00.000Z",
     updatedAt: overrides.updatedAt ?? "2026-07-11T00:00:00.000Z"
+  };
+}
+
+function createValidMediaIdentity() {
+  return {
+    algorithm: "fnv1a64-first-middle-last-64k-v1",
+    sizeBytes: 1_000,
+    modifiedUnixMs: 1_700_000_000_000,
+    firstSampleDigest: "a".repeat(16),
+    middleSampleDigest: "b".repeat(16),
+    lastSampleDigest: "c".repeat(16)
   };
 }

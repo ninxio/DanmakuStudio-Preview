@@ -271,6 +271,7 @@ function createToolbarMedia(id: string, role: ProjectMediaRole): ProjectMediaRef
     fileName,
     objectUrl: null,
     durationMs: 60_000,
+    contentIdentity: null,
     referenceKind: "localPath",
     connectionState: "connected",
     sourceSummary: "本地文件路径",

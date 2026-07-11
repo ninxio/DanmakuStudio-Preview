@@ -11,7 +11,17 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import { augmentAlignmentProposalWithDanmakuEvidence } from "../../domain/alignment/danmakuEvidence";
+import {
+  assignGlobalMediaMatches,
+  type GlobalAssignmentRejectionReason,
+  type GlobalMatchHypothesis
+} from "../../domain/alignment/globalAssignment";
 import { createMediaMatchCandidate } from "../../domain/alignment/mediaMatching";
+import {
+  validateTimeMap,
+  type TimeMapSpan,
+  type TimeMapSpanKind
+} from "../../domain/alignment/timeMap";
 import type { SuspectedCutCandidate } from "../../domain/danmaku/cutHints";
 import { createId } from "../../domain/project/factory";
 import { findProjectMedia } from "../../domain/project/mediaLibrary";
@@ -19,6 +29,9 @@ import { parseSourceTimecode } from "../../domain/project/sourceTimeline";
 import type {
   EditorProject,
   MediaMatchCandidate,
+  MediaTimeMap,
+  MediaTimeMapState,
+  MediaTimeMapStreamIdentity,
   ProjectMediaReference
 } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
@@ -50,6 +63,24 @@ interface CandidateAssetSelection {
   touched: boolean;
 }
 
+interface StagedPairwiseCandidate {
+  pairId: string;
+  candidate: MediaMatchCandidate;
+  sourceOrderHint: number;
+  targetOrderHint: number;
+}
+
+interface ResolvedGlobalCandidate extends StagedPairwiseCandidate {
+  adopted: boolean;
+  globalMessage: string;
+}
+
+interface GlobalBatchResolution {
+  candidates: ResolvedGlobalCandidate[];
+  adoptedCount: number;
+  blockedCount: number;
+}
+
 export function MediaMatchingPanel({
   project,
   suspectedCutCandidates
@@ -78,7 +109,6 @@ export function MediaMatchingPanel({
   const sourceSelectionTouchedRef = useRef(false);
   const targetSelectionTouchedRef = useRef(false);
   const addCandidate = useEditorStore((state) => state.addMediaMatchCandidate);
-  const acceptCandidate = useEditorStore((state) => state.acceptMediaMatchCandidate);
   const projectEpoch = useEditorStore((state) => state.projectEpoch);
   const projectEpochRef = useRef(projectEpoch);
   const batchTokenRef = useRef(0);
@@ -151,6 +181,7 @@ export function MediaMatchingPanel({
 
   useEffect(
     () => () => {
+      batchTokenRef.current += 1;
       cancelRequestedRef.current = true;
       const activeJob = activeJobRef.current;
       if (activeJob) {
@@ -163,9 +194,6 @@ export function MediaMatchingPanel({
   const pairCount = selectedSourceIds.length * selectedTargetIds.length;
   const pendingCandidates = project.mediaMatchCandidates.filter(
     (candidate) => candidate.state === "pending" || candidate.state === "blocked"
-  );
-  const highConfidenceCandidates = pendingCandidates.filter(
-    (candidate) => candidate.state === "pending" && candidate.confidence >= 0.75
   );
   const hasCancelledTasks = tasks.some((task) => task.state === "cancelled");
 
@@ -203,6 +231,12 @@ export function MediaMatchingPanel({
     const pendingPairs = pairs.filter(
       (pair) => !existingPairKeys.has(createMediaPairKey(pair.source.id, pair.target.id))
     );
+    const sourceOrderById = new Map(
+      selectedSources.map((media, index) => [media.id, index] as const)
+    );
+    const targetOrderById = new Map(
+      selectedTargets.map((media, index) => [media.id, index] as const)
+    );
     const batchId = createId("media_match_batch");
     const initialTasks: BatchTask[] = pairs.map(({ source, target, id }) => ({
       id,
@@ -235,8 +269,9 @@ export function MediaMatchingPanel({
     setRunning(true);
     cancelRequestedRef.current = false;
     const settings = loadAppSettings().alignment;
-    let foundCount = 0;
+    const stagedCandidates: StagedPairwiseCandidate[] = [];
     let contextInvalidated = false;
+    let failedCount = 0;
 
     for (const pair of pendingPairs) {
       if (cancelRequestedRef.current || !isRunCurrent()) {
@@ -288,16 +323,14 @@ export function MediaMatchingPanel({
           break;
         }
         updateTaskFromSnapshot(pair.id, snapshot);
-        if (cancelRequestedRef.current) {
-          if (!isAudioAlignmentJobFinished(snapshot.status)) {
-            try {
-              snapshot = await cancelTauriAudioAlignmentJob(snapshot.jobId);
-              if (isRunCurrent()) {
-                updateTaskFromSnapshot(pair.id, snapshot);
-              }
-            } catch {
-              // 后端任务可能已结束；前端仍按已取消处理，并且不会创建候选。
+        if (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status)) {
+          try {
+            snapshot = await cancelTauriAudioAlignmentJob(snapshot.jobId);
+            if (isRunCurrent()) {
+              updateTaskFromSnapshot(pair.id, snapshot);
             }
+          } catch {
+            // 后端任务可能已结束；前端仍按已取消处理，并且不会创建候选。
           }
           if (isRunCurrent()) {
             updateTask(pair.id, { state: "cancelled", message: "已取消" });
@@ -326,7 +359,7 @@ export function MediaMatchingPanel({
           }
           break;
         }
-        if (cancelRequestedRef.current) {
+        if (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status)) {
           updateTask(pair.id, { state: "cancelled", message: "已取消" });
           break;
         }
@@ -357,15 +390,20 @@ export function MediaMatchingPanel({
           targetMediaId: pair.target.id,
           proposal
         });
-        addCandidate(candidate);
-        foundCount += 1;
+        stagedCandidates.push({
+          pairId: pair.id,
+          candidate,
+          sourceOrderHint: sourceOrderById.get(pair.source.id) ?? 0,
+          targetOrderHint: targetOrderById.get(pair.target.id) ?? 0
+        });
         updateTask(pair.id, {
           state: "found",
           progress: 1,
-          message: `已找到 ${formatTimecode(candidate.sourceStartMs)}–${formatTimecode(candidate.sourceEndMs)}`
+          message: `Pairwise 已找到 ${formatTimecode(candidate.sourceStartMs)}–${formatTimecode(candidate.sourceEndMs)}，等待全局分配`
         });
       } catch (error) {
         if (isRunCurrent()) {
+          failedCount += 1;
           updateTask(pair.id, {
             state: "failed",
             message: error instanceof Error ? error.message : "分析失败"
@@ -392,6 +430,16 @@ export function MediaMatchingPanel({
       setRunning(false);
       return;
     }
+    const globalResolution = resolveGlobalBatch(stagedCandidates);
+    globalResolution.candidates.forEach((resolved) => {
+      addCandidate(resolved.candidate);
+      updateTask(resolved.pairId, {
+        state: "found",
+        progress: 1,
+        message: resolved.globalMessage
+      });
+    });
+    const batchSummary = `pairwise 找到 ${stagedCandidates.length}、全局采用 ${globalResolution.adoptedCount}、阻断备选 ${globalResolution.blockedCount}`;
     if (cancelRequestedRef.current) {
       setTasks((current) =>
         current.map((task) =>
@@ -400,14 +448,17 @@ export function MediaMatchingPanel({
             : task
         )
       );
-      setEditorStatus("批量匹配已取消，已经完成的候选仍保留。", "warning");
+      setEditorStatus(
+        `批量匹配已取消：已完成结果中 ${batchSummary}；未完成任务已取消。`,
+        "warning"
+      );
     } else {
       const skippedCount = pairs.length - pendingPairs.length;
       setEditorStatus(
-        `批量匹配完成：${pendingPairs.length} 组中新找到 ${foundCount} 个候选${
+        `批量匹配完成：${batchSummary}${
           skippedCount > 0 ? `，跳过 ${skippedCount} 组已有结果` : ""
-        }。`,
-        "success"
+        }${failedCount > 0 ? `，${failedCount} 组失败` : ""}。`,
+        failedCount > 0 || globalResolution.blockedCount > 0 ? "warning" : "success"
       );
     }
     setRunning(false);
@@ -423,34 +474,6 @@ export function MediaMatchingPanel({
         // 任务可能恰好结束；循环会在下一次状态检查时停止。
       }
     }
-  };
-
-  const acceptAllHighConfidence = () => {
-    let acceptedCount = 0;
-    let skippedCount = 0;
-    let failedCount = 0;
-    highConfidenceCandidates.forEach((candidate) => {
-      const assetIds = selectedAssetIdsForCandidate(candidate);
-      if (assetIds.length === 0) {
-        skippedCount += 1;
-        return;
-      }
-      acceptCandidate(candidate.id, assetIds);
-      const updated = useEditorStore
-        .getState()
-        .project.mediaMatchCandidates.find((item) => item.id === candidate.id);
-      if (updated?.state === "accepted") {
-        acceptedCount += 1;
-      } else {
-        failedCount += 1;
-      }
-    });
-    setEditorStatus(
-      `已按各卡 XML 勾选确认 ${acceptedCount} 个高可信候选${
-        skippedCount > 0 ? `，跳过 ${skippedCount} 个未勾选 XML 的候选` : ""
-      }${failedCount > 0 ? `，${failedCount} 个因已有重叠关系或校验失败而未确认` : ""}；请继续复核其余结果。`,
-      acceptedCount > 0 && failedCount === 0 ? "success" : "warning"
-    );
   };
 
   const selectedAssetIdsForCandidate = (candidate: MediaMatchCandidate): string[] =>
@@ -493,8 +516,19 @@ export function MediaMatchingPanel({
         </span>
       </div>
       <p className="mt-2 leading-5 text-slate-500">
-        直接使用素材页导入的视频定位对应片段。自动结果只进入候选队列，确认后才会生成来源段并影响分集导出。
+        直接使用素材页导入的视频寻找可能对应的片段。自动结果只进入候选队列，请逐项检查参考范围、原片起点和删减修正后再决定是否确认。
       </p>
+      <div
+        role="alert"
+        data-testid="legacy-alignment-warning"
+        className="mt-3 rounded border border-amber-400/40 bg-amber-400/10 p-3 leading-5 text-amber-100"
+      >
+        <div className="font-medium">实验性定位线索</div>
+        <p className="mt-1">
+          当前旧对齐引擎尚未通过真实媒体精度基准，旧引擎分数未经校准；Alignment V2
+          请以每张卡片的质量等级、实测指标和导出闸门为准。范围、起点和删减修正仍必须逐项试听或预览复核，自动结果不能直接作为导出依据。
+        </p>
+      </div>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <MediaChoiceList
@@ -539,12 +573,6 @@ export function MediaMatchingPanel({
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <h4 className="text-sm font-medium text-slate-100">候选复核</h4>
-        {highConfidenceCandidates.length > 0 ? (
-          <TextButton className="ml-auto" onClick={acceptAllHighConfidence}>
-            <CircleCheck size={13} />
-            按各卡勾选确认高可信候选（{highConfidenceCandidates.length}）
-          </TextButton>
-        ) : null}
       </div>
       {project.mediaMatchCandidates.length === 0 ? (
         <div className="mt-2 rounded border border-dashed border-panel-line p-3 leading-5 text-slate-500">
@@ -571,6 +599,223 @@ export function MediaMatchingPanel({
       <ConfirmedRelations project={project} />
     </section>
   );
+}
+
+function resolveGlobalBatch(
+  stagedCandidates: readonly StagedPairwiseCandidate[]
+): GlobalBatchResolution {
+  if (stagedCandidates.length === 0) {
+    return { candidates: [], adoptedCount: 0, blockedCount: 0 };
+  }
+  const assignment = assignGlobalMediaMatches(
+    stagedCandidates.map(createGlobalMatchHypothesis)
+  );
+  const selectedIds = new Set(assignment.selectedIds);
+  const rejectionById = new Map(
+    assignment.rejected.map((rejection) => [rejection.id, rejection] as const)
+  );
+  const runnerUpIds = new Set(assignment.runnerUpIds ?? []);
+  const ambiguityCandidateIds = new Set<string>();
+  if (assignment.ambiguous) {
+    if (assignment.runnerUpIds === null) {
+      stagedCandidates.forEach((staged) => ambiguityCandidateIds.add(staged.candidate.id));
+    } else {
+      stagedCandidates.forEach((staged) => {
+        const id = staged.candidate.id;
+        if (selectedIds.has(id) !== runnerUpIds.has(id)) {
+          ambiguityCandidateIds.add(id);
+        }
+      });
+    }
+  }
+  const ambiguityReason = assignment.ambiguous
+    ? `全局 Top1/Top2 组合差距仅 ${formatQualityRatio(assignment.normalizedMargin)}，这些互斥关系无法唯一确定，需人工复核。`
+    : null;
+  let adoptedCount = 0;
+  const candidates = stagedCandidates.map((staged): ResolvedGlobalCandidate => {
+    const isAmbiguousAlternative = ambiguityCandidateIds.has(staged.candidate.id);
+    const adopted = selectedIds.has(staged.candidate.id) && !isAmbiguousAlternative;
+    const rangeText = `${formatTimecode(staged.candidate.sourceStartMs)}–${formatTimecode(staged.candidate.sourceEndMs)}`;
+    if (adopted) {
+      adoptedCount += 1;
+      return {
+        ...staged,
+        adopted: true,
+        candidate: appendCandidateDiagnostic(
+          staged.candidate,
+          "全局分配：进入本批次最佳无冲突组合。"
+        ),
+        globalMessage: `Pairwise 已找到 ${rangeText}；全局采用`
+      };
+    }
+
+    const rejection = rejectionById.get(staged.candidate.id);
+    const reason =
+      (isAmbiguousAlternative ? ambiguityReason : null) ??
+      describeGlobalRejection(
+        rejection?.reason ?? "notInBestCombination",
+        rejection?.conflictsWith.length ?? 0
+      );
+    return {
+      ...staged,
+      adopted: false,
+      candidate: blockCandidateForGlobalReview(staged.candidate, reason),
+      globalMessage: `Pairwise 已找到 ${rangeText}；全局阻断备选：${reason}`
+    };
+  });
+  return {
+    candidates,
+    adoptedCount,
+    blockedCount: candidates.length - adoptedCount
+  };
+}
+
+function createGlobalMatchHypothesis(staged: StagedPairwiseCandidate): GlobalMatchHypothesis {
+  const { candidate } = staged;
+  const timeMap = candidate.proposal.timeMap;
+  const quality = timeMap?.quality;
+  return {
+    id: candidate.id,
+    sourceMediaId: candidate.sourceMediaId,
+    targetMediaId: candidate.targetMediaId,
+    sourceStartMs: timeMap?.sourceStartMs ?? candidate.sourceStartMs,
+    sourceEndMs: timeMap?.sourceEndMs ?? candidate.sourceEndMs,
+    targetStartMs: timeMap?.targetStartMs ?? candidate.targetStartMs,
+    targetEndMs: timeMap?.targetEndMs ?? candidate.targetEndMs,
+    score: clampUnitScore(quality?.probability ?? quality?.coverage ?? candidate.confidence),
+    uniqueCoverage: clampUnitScore(
+      timeMap?.evidence.uniqueContentCoverage ??
+        quality?.coverage ??
+        candidate.proposal.matchRange?.coverage ??
+        0
+    ),
+    alternativeMargin: clampUnitScore(quality?.alternativeMargin ?? 0),
+    repeatedContentOnly: timeMap?.evidence.repeatedContentOnly ?? false,
+    blocked:
+      quality?.level === "blocked" ||
+      Boolean(timeMap?.spans.some((span) => span.kind === "ambiguous")),
+    sourceOrderHint: staged.sourceOrderHint,
+    targetOrderHint: staged.targetOrderHint
+  };
+}
+
+function describeGlobalRejection(
+  reason: GlobalAssignmentRejectionReason,
+  conflictCount: number
+): string {
+  if (reason === "sourceOverlap") {
+    return `全局分配发现同一参考时间范围冲突（与 ${conflictCount} 个已采用结果冲突），未采用此备选。`;
+  }
+  if (reason === "targetOverlap") {
+    return `全局分配发现同一原片时间范围冲突（与 ${conflictCount} 个已采用结果冲突），未采用此备选。`;
+  }
+  if (reason === "blocked") {
+    return "Pairwise 时间图已被质量闸门阻断，未进入全局组合。";
+  }
+  return "此结果未进入全局最佳组合，已作为阻断备选保留。";
+}
+
+function appendCandidateDiagnostic(
+  candidate: MediaMatchCandidate,
+  diagnostic: string
+): MediaMatchCandidate {
+  return {
+    ...candidate,
+    proposal: {
+      ...candidate.proposal,
+      diagnostics: appendUniqueText(candidate.proposal.diagnostics, diagnostic)
+    }
+  };
+}
+
+function blockCandidateForGlobalReview(
+  candidate: MediaMatchCandidate,
+  reason: string
+): MediaMatchCandidate {
+  const existingTimeMap = candidate.proposal.timeMap;
+  const timeMap: NonNullable<MediaMatchCandidate["proposal"]["timeMap"]> = existingTimeMap
+    ? {
+        ...existingTimeMap,
+        quality: {
+          ...existingTimeMap.quality,
+          level: "blocked",
+          probability: null,
+          reasons: appendUniqueText(existingTimeMap.quality.reasons, reason)
+        },
+        evidence: {
+          ...existingTimeMap.evidence,
+          notes: appendUniqueText(existingTimeMap.evidence.notes, reason)
+        }
+      }
+    : createLegacyGlobalBlockTimeMap(candidate, reason);
+  return {
+    ...candidate,
+    state: "blocked",
+    proposal: {
+      ...candidate.proposal,
+      diagnostics: appendUniqueText(candidate.proposal.diagnostics, `全局分配阻断：${reason}`),
+      timeMap
+    }
+  };
+}
+
+function createLegacyGlobalBlockTimeMap(
+  candidate: MediaMatchCandidate,
+  reason: string
+): NonNullable<MediaMatchCandidate["proposal"]["timeMap"]> {
+  const coverage = candidate.proposal.matchRange?.coverage ?? null;
+  return {
+    sourceStartMs: candidate.sourceStartMs,
+    sourceEndMs: candidate.sourceEndMs,
+    targetStartMs: candidate.targetStartMs,
+    targetEndMs: candidate.targetEndMs,
+    spans: [
+      {
+        kind: "ambiguous",
+        sourceStartMs: candidate.sourceStartMs,
+        sourceEndMs: candidate.sourceEndMs,
+        targetStartMs: candidate.targetStartMs,
+        targetEndMs: candidate.targetEndMs
+      }
+    ],
+    quality: {
+      level: "blocked",
+      probability: null,
+      metricSource: coverage === null ? "missing" : "estimated",
+      coverage,
+      p50ResidualMs: null,
+      p95ResidualMs: null,
+      maxResidualMs: null,
+      boundaryUncertaintyMs: null,
+      alternativeMargin: null,
+      anchorCount: candidate.proposal.anchors.length,
+      heldOutAnchorCount: 0,
+      reasons: [reason]
+    },
+    evidence: {
+      types: ["legacy"],
+      audioAnchorCount: 0,
+      visualAnchorCount: 0,
+      heldOutAnchorCount: 0,
+      top1Top2Margin: null,
+      notes: [reason]
+    },
+    sourceStream: null,
+    targetStream: null,
+    sourceIdentity: null,
+    targetIdentity: null,
+    engineVersion: "legacy-global-guard-v1",
+    featureVersion: "legacy-global-guard-v1",
+    parametersHash: `legacy-global-guard:${candidate.id}`
+  };
+}
+
+function appendUniqueText(lines: readonly string[], line: string): string[] {
+  return lines.includes(line) ? [...lines] : [...lines, line];
+}
+
+function clampUnitScore(value: number): number {
+  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
 }
 
 function MediaChoiceList({
@@ -683,6 +928,20 @@ function MediaMatchCandidateCard({
 }) {
   const source = findProjectMedia(project, candidate.sourceMediaId);
   const target = findProjectMedia(project, candidate.targetMediaId);
+  const candidateTimeMap = project.mediaTimeMaps.find(
+    (item) => item.id === candidate.timeMapId
+  );
+  const confirmedTimeMap = candidate.confirmedTimeMapId
+    ? project.mediaTimeMaps.find((item) => item.id === candidate.confirmedTimeMapId)
+    : undefined;
+  const displayedTimeMap = candidate.state === "accepted" ? confirmedTimeMap : candidateTimeMap;
+  const displayedTimeMapState = candidate.state === "accepted" ? "confirmed" : "candidate";
+  const timeMapGate = describeTimeMapGate(candidateTimeMap, "candidate");
+  const acceptLabel = timeMapGate.exportReady
+    ? "确认关系并用于导出"
+    : timeMapGate.canSaveRelationship
+      ? "保存关系供试听复核"
+      : "此候选不能确认";
   const boundAssets = useMemo(() => {
     const boundIds = new Set(
       project.danmakuSourceBindings
@@ -750,7 +1009,23 @@ function MediaMatchCandidateCard({
   };
 
   const accept = () => {
+    if (!timeMapGate.canSaveRelationship) {
+      setEditorStatus(timeMapGate.message, "warning");
+      return;
+    }
     if (!saveRange()) {
+      return;
+    }
+    const currentProject = useEditorStore.getState().project;
+    const currentCandidate = currentProject.mediaMatchCandidates.find(
+      (item) => item.id === candidate.id
+    );
+    const currentTimeMap = currentCandidate
+      ? currentProject.mediaTimeMaps.find((item) => item.id === currentCandidate.timeMapId)
+      : undefined;
+    const currentGate = describeTimeMapGate(currentTimeMap, "candidate");
+    if (!currentGate.canSaveRelationship) {
+      setEditorStatus(currentGate.message, "warning");
       return;
     }
     acceptCandidate(candidate.id, selectedAssetIds);
@@ -776,12 +1051,25 @@ function MediaMatchCandidateCard({
         <span
           className={`rounded border px-2 py-0.5 text-[11px] ${candidateStateClass(candidate.state)}`}
         >
-          {candidateStateText(candidate.state)}
+          {candidateStateText(candidate)}
         </span>
         <span className="rounded border border-panel-line px-2 py-0.5 text-[11px] text-slate-400">
-          可信度 {Math.round(candidate.confidence * 100)}%
+          {candidate.proposal.timeMap
+            ? `定位线索分数 ${Math.round(candidate.confidence * 100)}% · 不是校准概率`
+            : `旧引擎分数 ${Math.round(candidate.confidence * 100)}% · 未校准`}
         </span>
       </div>
+
+      <TimeMapQualitySummary
+        timeMap={displayedTimeMap}
+        expectedState={displayedTimeMapState}
+        testId="candidate-time-map-quality"
+      />
+
+      <TimeMapReview
+        timeMap={displayedTimeMap}
+        relationState={candidate.state === "accepted" ? "accepted" : "candidate"}
+      />
 
       {candidate.state === "pending" || candidate.state === "blocked" ? (
         <>
@@ -827,11 +1115,15 @@ function MediaMatchCandidateCard({
             </TextButton>
             <TextButton
               tone="primary"
-              disabled={selectedAssetIds.length === 0 || candidate.state === "blocked"}
+              disabled={
+                selectedAssetIds.length === 0 ||
+                candidate.state === "blocked" ||
+                !timeMapGate.canSaveRelationship
+              }
               onClick={accept}
             >
               <CircleCheck size={13} />
-              确认并生成来源段
+              {acceptLabel}
             </TextButton>
           </div>
         </>
@@ -861,6 +1153,574 @@ function MediaMatchCandidateCard({
       </details>
     </article>
   );
+}
+
+type TimeMapGateKind =
+  "verified" | "review" | "blocked" | "legacy-unverified" | "missing" | "state-error";
+
+interface TimeMapGateDescription {
+  kind: TimeMapGateKind;
+  label: string;
+  message: string;
+  canSaveRelationship: boolean;
+  exportReady: boolean;
+}
+
+function TimeMapQualitySummary({
+  timeMap,
+  expectedState,
+  testId
+}: {
+  timeMap: MediaTimeMap | undefined;
+  expectedState: Extract<MediaTimeMapState, "candidate" | "confirmed">;
+  testId: string;
+}) {
+  const gate = describeTimeMapGate(timeMap, expectedState);
+  const panelClass = gate.exportReady
+    ? "border-emerald-400/35 bg-emerald-400/10 text-emerald-100"
+    : gate.canSaveRelationship
+      ? "border-amber-400/35 bg-amber-400/10 text-amber-100"
+      : "border-red-400/35 bg-red-400/10 text-red-100";
+  const badgeClass = gate.exportReady
+    ? "border-emerald-300/50 bg-emerald-300/10 text-emerald-100"
+    : gate.canSaveRelationship
+      ? "border-amber-300/50 bg-amber-300/10 text-amber-100"
+      : "border-red-300/50 bg-red-300/10 text-red-100";
+  const spanCounts = { matched: 0, sourceOnly: 0, targetOnly: 0, ambiguous: 0 };
+  timeMap?.spans.forEach((span) => {
+    spanCounts[span.kind] += 1;
+  });
+
+  return (
+    <section
+      className={`mt-3 rounded border p-2.5 ${panelClass}`}
+      data-testid={testId}
+      role={
+        gate.kind === "blocked" || gate.kind === "missing" || gate.kind === "state-error"
+          ? "alert"
+          : undefined
+      }
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={`rounded border px-2 py-0.5 text-[11px] font-medium ${badgeClass}`}
+          data-testid="time-map-quality-label"
+        >
+          {gate.label}
+        </span>
+        <span className="text-[11px] font-medium">
+          导出闸门：{gate.exportReady ? "通过" : "未通过"}
+        </span>
+      </div>
+      <p className="mt-1 leading-5">{gate.message}</p>
+
+      {timeMap ? (
+        <details className="mt-2 rounded border border-current/20 bg-black/10 p-2 text-[11px]">
+          <summary className="cursor-pointer rounded font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan">
+            时间图证据详情
+          </summary>
+          <div className="mt-2 grid gap-1.5 text-slate-300">
+            <div>
+              引擎 / 特征：{timeMap.engineVersion || "未记录"} /{" "}
+              {timeMap.featureVersion || "未记录"}
+            </div>
+            <div>
+              校准概率：
+              {timeMap.quality.probability === null
+                ? "尚未完成真实基准校准"
+                : formatQualityRatio(timeMap.quality.probability)}
+            </div>
+            <div>
+              覆盖率：{formatQualityRatio(timeMap.quality.coverage)} · P95 残差：
+              {formatQualityMilliseconds(timeMap.quality.p95ResidualMs)} · 边界不确定度：
+              {formatQualityMilliseconds(timeMap.quality.boundaryUncertaintyMs)} · Top1/Top2
+              差距：{formatQualityRatio(timeMap.quality.alternativeMargin)}
+            </div>
+            <div>
+              时间图片段：matched {spanCounts.matched} · sourceOnly {spanCounts.sourceOnly} ·
+              targetOnly {spanCounts.targetOnly} · ambiguous {spanCounts.ambiguous}
+            </div>
+            <div>
+              选中音轨：{formatSelectedStream(timeMap.sourceStream, "参考")}；
+              {formatSelectedStream(timeMap.targetStream, "原片")}
+            </div>
+            <div className="pt-1 font-medium text-slate-200">主要质量原因</div>
+            {timeMap.quality.reasons.length > 0 ? (
+              <ul className="list-disc space-y-1 pl-4">
+                {timeMap.quality.reasons.slice(0, 4).map((reason, index) => (
+                  <li key={`${timeMap.id}-quality-reason-${index}`}>{reason}</li>
+                ))}
+              </ul>
+            ) : (
+              <p>没有补充原因；请结合实测指标和试听结果判断。</p>
+            )}
+          </div>
+        </details>
+      ) : null}
+    </section>
+  );
+}
+
+const TIME_MAP_SPAN_LABELS: Record<TimeMapSpanKind, string> = {
+  matched: "共同内容",
+  sourceOnly: "参考独有",
+  targetOnly: "原片独有",
+  ambiguous: "无法判断"
+};
+
+interface TimeMapReviewValidation {
+  valid: boolean;
+  message: string | null;
+}
+
+/**
+ * 匹配页只负责解释和定位时间图，不在这里签发人工验证，也不伪装成 A/B 播放器。
+ * 两条轨道分别按自己的完整范围归一化，因此同一屏幕宽度不代表双方真实时长相同。
+ */
+function TimeMapReview({
+  timeMap,
+  relationState
+}: {
+  timeMap: MediaTimeMap | undefined;
+  relationState: "candidate" | "accepted";
+}) {
+  const setPlayhead = useEditorStore((state) => state.setPlayhead);
+  const setPlaying = useEditorStore((state) => state.setPlaying);
+
+  if (!timeMap) {
+    return (
+      <section
+        className="mt-3 rounded border border-red-400/35 bg-red-400/10 p-2.5 text-red-100"
+        data-testid="time-map-review"
+        role="alert"
+      >
+        <div className="font-medium">来源↔原片时间图复核</div>
+        <p className="mt-1 leading-5">
+          {relationState === "accepted" ? "已确认" : "候选"}
+          时间图缺失，无法安全绘制或定位分段。请重新分析这组素材。
+        </p>
+      </section>
+    );
+  }
+
+  const validation = validateTimeMapForReview(timeMap);
+  if (!validation.valid) {
+    return (
+      <section
+        className="mt-3 rounded border border-red-400/35 bg-red-400/10 p-2.5 text-red-100"
+        data-testid="time-map-review"
+        role="alert"
+      >
+        <div className="font-medium">来源↔原片时间图复核</div>
+        <p className="mt-1 leading-5">
+          时间图结构无效，已停止绘制和定位，避免按错误范围复核。
+          {validation.message ? ` ${validation.message}` : ""}
+        </p>
+      </section>
+    );
+  }
+
+  const spanCounts = countTimeMapSpans(timeMap.spans);
+  const blockingReason =
+    timeMap.quality.level === "blocked" ||
+    timeMap.spans.some((span) => span.kind === "ambiguous")
+      ? timeMap.quality.reasons.slice(0, 3).join("；") ||
+        "存在无法唯一判断的内容，当前时间图不能用于导出。"
+      : null;
+
+  const locateSpan = (span: TimeMapSpan, spanIndex: number) => {
+    setPlaying(false);
+    setPlayhead(span.sourceStartMs);
+    const positionedMs = useEditorStore.getState().project.timeline.playheadMs;
+    const label = TIME_MAP_SPAN_LABELS[span.kind];
+    if (positionedMs !== span.sourceStartMs) {
+      setEditorStatus(
+        `当前编辑时间轴只能定位到参考 ${formatTimecode(positionedMs)}；第 ${spanIndex + 1} 段“${label}”起点为 ${formatTimecode(span.sourceStartMs)}。仅完成时间定位，未执行 A/B 播放。`,
+        "warning"
+      );
+      return;
+    }
+    setEditorStatus(
+      `已将编辑页时间指针定位到参考 ${formatTimecode(span.sourceStartMs)}（第 ${spanIndex + 1} 段“${label}”起点）。仅完成时间定位，未执行 A/B 播放。`,
+      "neutral"
+    );
+  };
+
+  return (
+    <details
+      className="mt-3 rounded border border-panel-line/70 bg-black/10 p-2.5 text-[11px] text-slate-400"
+      data-testid="time-map-review"
+    >
+      <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan">
+        <span className="font-medium text-slate-200">来源↔原片时间图复核</span>
+        <span className="ml-2 text-slate-500">
+          {relationState === "accepted" ? "已确认图 · " : "候选图 · "}
+          共同内容 {spanCounts.matched} · 参考独有 {spanCounts.sourceOnly} · 原片独有{" "}
+          {spanCounts.targetOnly} · 无法判断 {spanCounts.ambiguous}
+        </span>
+      </summary>
+
+      <div className="mt-3 grid gap-3">
+        <p className="leading-5 text-slate-400">
+          两条轨道按各自完整范围铺满，宽度只表示内容在本方时间轴中的位置。选择分段只会暂停并定位编辑页时间指针，不会自动播放或声称已完成
+          A/B 复核。
+        </p>
+
+        <div
+          className="grid gap-2 rounded border border-panel-line/70 bg-black/20 p-2"
+          role="img"
+          aria-label="来源与原片双时间轴分段图"
+        >
+          <TimeMapTrack
+            label="参考轨道"
+            rangeStartMs={timeMap.sourceStartMs}
+            rangeEndMs={timeMap.sourceEndMs}
+            spans={timeMap.spans}
+            axis="source"
+          />
+          <TimeMapTrack
+            label="原片轨道"
+            rangeStartMs={timeMap.targetStartMs}
+            rangeEndMs={timeMap.targetEndMs}
+            spans={timeMap.spans}
+            axis="target"
+          />
+        </div>
+
+        <div className="flex flex-wrap gap-x-3 gap-y-1" aria-label="时间图图例">
+          {(Object.keys(TIME_MAP_SPAN_LABELS) as TimeMapSpanKind[]).map((kind) => (
+            <span key={kind} className="inline-flex items-center gap-1.5">
+              <span
+                className={`h-2.5 w-2.5 rounded-sm border ${timeMapSpanColor(kind)}`}
+                aria-hidden="true"
+              />
+              {TIME_MAP_SPAN_LABELS[kind]}
+            </span>
+          ))}
+        </div>
+
+        {blockingReason ? (
+          <p
+            className="rounded border border-red-400/30 bg-red-400/10 p-2 leading-5 text-red-100"
+            role="alert"
+          >
+            导出阻断原因：{blockingReason}
+          </p>
+        ) : null}
+
+        <ol className="grid gap-1.5" aria-label="时间图分段复核列表">
+          {timeMap.spans.map((span, spanIndex) => (
+            <li key={`${timeMap.id}-review-span-${spanIndex}`}>
+              <button
+                type="button"
+                className="grid w-full gap-1 rounded border border-panel-line/70 bg-black/15 px-2.5 py-2 text-left text-slate-300 transition-colors hover:border-slate-500 hover:bg-white/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan"
+                aria-label={createTimeMapSpanAccessibleName(span, spanIndex)}
+                onClick={() => locateSpan(span, spanIndex)}
+              >
+                <span className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`rounded border px-1.5 py-0.5 font-medium ${timeMapSpanBadgeColor(span.kind)}`}
+                  >
+                    第 {spanIndex + 1} 段 · {TIME_MAP_SPAN_LABELS[span.kind]}
+                  </span>
+                  <span>伸缩比例：{formatTimeMapStretchRatio(span)}</span>
+                </span>
+                <span>
+                  参考 {formatTimeMapRange(span.sourceStartMs, span.sourceEndMs)} ↔ 原片{" "}
+                  {formatTimeMapRange(span.targetStartMs, span.targetEndMs)}
+                </span>
+                <span className="text-slate-500">
+                  边界不确定度：
+                  {formatQualityMilliseconds(timeMap.quality.boundaryUncertaintyMs)} · P95
+                  残差：{formatQualityMilliseconds(timeMap.quality.p95ResidualMs)}
+                </span>
+                {span.kind === "ambiguous" ? (
+                  <span className="text-red-200">
+                    阻断原因：{blockingReason ?? "这一段无法唯一判断，不能安全投影弹幕。"}
+                  </span>
+                ) : null}
+              </button>
+            </li>
+          ))}
+        </ol>
+      </div>
+    </details>
+  );
+}
+
+function TimeMapTrack({
+  label,
+  rangeStartMs,
+  rangeEndMs,
+  spans,
+  axis
+}: {
+  label: "参考轨道" | "原片轨道";
+  rangeStartMs: number;
+  rangeEndMs: number;
+  spans: readonly TimeMapSpan[];
+  axis: "source" | "target";
+}) {
+  return (
+    <div className="grid grid-cols-[5rem_minmax(0,1fr)] items-center gap-2">
+      <div>
+        <div className="font-medium text-slate-300">{label}</div>
+        <div className="mt-0.5 text-[10px] text-slate-500">
+          {formatTimecode(rangeStartMs)}–{formatTimecode(rangeEndMs)}
+        </div>
+      </div>
+      <div className="relative h-7 overflow-hidden rounded border border-panel-line bg-slate-950">
+        {spans.map((span, spanIndex) => {
+          const startMs = axis === "source" ? span.sourceStartMs : span.targetStartMs;
+          const endMs = axis === "source" ? span.sourceEndMs : span.targetEndMs;
+          const style = createNormalizedTrackStyle(startMs, endMs, rangeStartMs, rangeEndMs);
+          return (
+            <span
+              key={`${label}-${spanIndex}`}
+              className={`absolute inset-y-1 rounded-sm border ${timeMapSpanColor(span.kind)}`}
+              style={style}
+              title={`第 ${spanIndex + 1} 段 · ${TIME_MAP_SPAN_LABELS[span.kind]}`}
+              aria-hidden="true"
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function validateTimeMapForReview(timeMap: MediaTimeMap): TimeMapReviewValidation {
+  if (
+    !isValidReviewRange(timeMap.sourceStartMs, timeMap.sourceEndMs) ||
+    !isValidReviewRange(timeMap.targetStartMs, timeMap.targetEndMs)
+  ) {
+    return { valid: false, message: "时间图总范围不是有效的非负整数毫秒区间。" };
+  }
+  if (timeMap.spans.length === 0) {
+    return { valid: false, message: "时间图没有任何内容分段。" };
+  }
+  const spanValidation = validateTimeMap(timeMap.spans);
+  if (!spanValidation.valid) {
+    return { valid: false, message: spanValidation.issues[0]?.message ?? null };
+  }
+  const first = timeMap.spans[0];
+  const last = timeMap.spans[timeMap.spans.length - 1];
+  const spansStayInsideRange = timeMap.spans.every(
+    (span) =>
+      span.sourceStartMs >= timeMap.sourceStartMs &&
+      span.sourceEndMs <= timeMap.sourceEndMs &&
+      span.targetStartMs >= timeMap.targetStartMs &&
+      span.targetEndMs <= timeMap.targetEndMs
+  );
+  if (
+    !spansStayInsideRange ||
+    first.sourceStartMs !== timeMap.sourceStartMs ||
+    first.targetStartMs !== timeMap.targetStartMs ||
+    last.sourceEndMs !== timeMap.sourceEndMs ||
+    last.targetEndMs !== timeMap.targetEndMs
+  ) {
+    return { valid: false, message: "分段没有完整覆盖时间图声明的双方范围。" };
+  }
+  return { valid: true, message: null };
+}
+
+function isValidReviewRange(startMs: number, endMs: number): boolean {
+  return (
+    Number.isSafeInteger(startMs) &&
+    startMs >= 0 &&
+    Number.isSafeInteger(endMs) &&
+    endMs > startMs
+  );
+}
+
+function countTimeMapSpans(spans: readonly TimeMapSpan[]): Record<TimeMapSpanKind, number> {
+  const counts: Record<TimeMapSpanKind, number> = {
+    matched: 0,
+    sourceOnly: 0,
+    targetOnly: 0,
+    ambiguous: 0
+  };
+  spans.forEach((span) => {
+    counts[span.kind] += 1;
+  });
+  return counts;
+}
+
+function createNormalizedTrackStyle(
+  startMs: number,
+  endMs: number,
+  rangeStartMs: number,
+  rangeEndMs: number
+): { left: string; width: string; transform?: string } {
+  const durationMs = rangeEndMs - rangeStartMs;
+  const leftPercentage = ((startMs - rangeStartMs) / durationMs) * 100;
+  const widthPercentage = ((endMs - startMs) / durationMs) * 100;
+  if (endMs === startMs) {
+    return {
+      left: `${leftPercentage}%`,
+      width: "3px",
+      transform: leftPercentage >= 100 ? "translateX(-100%)" : "translateX(-1px)"
+    };
+  }
+  return {
+    left: `${leftPercentage}%`,
+    width: `${Math.max(widthPercentage, 0.5)}%`
+  };
+}
+
+function timeMapSpanColor(kind: TimeMapSpanKind): string {
+  if (kind === "matched") return "border-emerald-300/60 bg-emerald-400/65";
+  if (kind === "sourceOnly") return "border-amber-300/60 bg-amber-400/65";
+  if (kind === "targetOnly") return "border-cyan-300/60 bg-cyan-400/65";
+  return "border-red-300/60 bg-red-400/65";
+}
+
+function timeMapSpanBadgeColor(kind: TimeMapSpanKind): string {
+  if (kind === "matched") return "border-emerald-400/40 bg-emerald-400/10 text-emerald-100";
+  if (kind === "sourceOnly") return "border-amber-400/40 bg-amber-400/10 text-amber-100";
+  if (kind === "targetOnly") return "border-cyan-400/40 bg-cyan-400/10 text-cyan-100";
+  return "border-red-400/40 bg-red-400/10 text-red-100";
+}
+
+function formatTimeMapRange(startMs: number, endMs: number): string {
+  if (startMs === endMs) {
+    return `${formatTimecode(startMs)}（边界点）`;
+  }
+  return `${formatTimecode(startMs)}–${formatTimecode(endMs)}`;
+}
+
+function formatTimeMapStretchRatio(span: TimeMapSpan): string {
+  const sourceDurationMs = span.sourceEndMs - span.sourceStartMs;
+  const targetDurationMs = span.targetEndMs - span.targetStartMs;
+  if (span.kind !== "matched" || sourceDurationMs <= 0 || targetDurationMs <= 0) {
+    return "不适用";
+  }
+  return `${(targetDurationMs / sourceDurationMs).toFixed(3)}×`;
+}
+
+function createTimeMapSpanAccessibleName(span: TimeMapSpan, spanIndex: number): string {
+  return `第 ${spanIndex + 1} 段 ${TIME_MAP_SPAN_LABELS[span.kind]}，参考 ${formatTimeMapRange(span.sourceStartMs, span.sourceEndMs)}，原片 ${formatTimeMapRange(span.targetStartMs, span.targetEndMs)}；定位到参考起点 ${formatTimecode(span.sourceStartMs)}`;
+}
+
+function UnlinkedLegacyTimeMapWarning() {
+  return (
+    <section
+      className="mt-3 rounded border border-accent-red/35 bg-accent-red/10 p-2.5 text-accent-red"
+      data-testid="confirmed-time-map-quality"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded border border-accent-red/50 bg-accent-red/10 px-2 py-0.5 text-[11px] font-medium">
+          确认时间图缺失
+        </span>
+        <span className="text-[11px] font-medium">导出闸门：已阻断</span>
+      </div>
+      <p className="mt-1 leading-5">
+        这是只保留供查看的旧关系；正式导出已停用旧规则兼容投影。请用 V2
+        重新分析并确认一张可验证时间图。
+      </p>
+    </section>
+  );
+}
+
+function describeTimeMapGate(
+  timeMap: MediaTimeMap | undefined,
+  expectedState: Extract<MediaTimeMapState, "candidate" | "confirmed">
+): TimeMapGateDescription {
+  const isConfirmedRelation = expectedState === "confirmed";
+  if (!timeMap) {
+    return {
+      kind: "missing",
+      label: "时间图缺失",
+      message: isConfirmedRelation
+        ? "确认时间图缺失，这条关系数据异常，不能导出；请重新分析或人工建立可验证映射。"
+        : "候选时间图缺失，这个候选数据异常，不能确认或导出；请重新运行匹配。",
+      canSaveRelationship: false,
+      exportReady: false
+    };
+  }
+  if (timeMap.state !== expectedState) {
+    return {
+      kind: "state-error",
+      label: "时间图异常",
+      message: `${isConfirmedRelation ? "确认关系" : "候选"}引用的时间图状态为 ${timeMap.state}，预期为 ${expectedState}，不能继续确认或导出。`,
+      canSaveRelationship: false,
+      exportReady: false
+    };
+  }
+
+  if (timeMap.quality.level === "verified") {
+    return {
+      kind: "verified",
+      label: "已验证",
+      message: isConfirmedRelation
+        ? "确认图已达到导出质量门槛，可用于导出。"
+        : "质量指标已达到导出门槛；确认关系后可用于导出。",
+      canSaveRelationship: true,
+      exportReady: true
+    };
+  }
+  if (timeMap.quality.level === "review") {
+    return {
+      kind: "review",
+      label: "需复核",
+      message: isConfirmedRelation
+        ? "关系已保存供试听复核，但仍不能导出；当前引擎尚未完成真实基准校准，本版本不会把试听结果伪装成已验证。"
+        : "可以保存关系供试听复核，但仍不能导出；当前引擎尚未完成真实基准校准，本版本不会把试听结果伪装成已验证。",
+      canSaveRelationship: true,
+      exportReady: false
+    };
+  }
+  if (timeMap.quality.level === "legacy-unverified") {
+    return {
+      kind: "legacy-unverified",
+      label: "旧版未验证",
+      message: isConfirmedRelation
+        ? "旧版关系仅保留供试听复核，仍不能导出；需要用完成真实媒体校准的 V2 重新分析。"
+        : "可以保存旧版关系供试听复核，但仍不能导出；需要用完成真实媒体校准的 V2 重新分析。",
+      canSaveRelationship: true,
+      exportReady: false
+    };
+  }
+  return {
+    kind: "blocked",
+    label: "已阻断",
+    message: isConfirmedRelation
+      ? "确认图不满足质量门槛，仍不能导出；请先处理歧义或证据不足问题。"
+      : "证据不足或存在歧义，不能确认，也不能导出；请查看原因并重新分析。",
+    canSaveRelationship: false,
+    exportReady: false
+  };
+}
+
+function formatQualityRatio(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return "未提供";
+  }
+  const percentage = value * 100;
+  return `${percentage.toFixed(Number.isInteger(percentage) ? 0 : 1)}%`;
+}
+
+function formatQualityMilliseconds(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? "未提供" : `${Math.round(value)} 毫秒`;
+}
+
+function formatSelectedStream(
+  stream: MediaTimeMapStreamIdentity | null,
+  role: "参考" | "原片"
+): string {
+  if (!stream) {
+    return `${role}音轨未记录`;
+  }
+  const details = [
+    stream.codec?.toUpperCase() ?? null,
+    stream.sampleRate === null ? null : `${stream.sampleRate} Hz`,
+    stream.channels === null ? null : `${stream.channels} 声道`,
+    stream.language,
+    stream.title
+  ].filter((value): value is string => Boolean(value));
+  return `${role}${stream.type === "audio" ? "音轨" : "视频流"} #${stream.index}${
+    details.length > 0 ? ` · ${details.join(" · ")}` : ""
+  }`;
 }
 
 function TimeField({
@@ -922,6 +1782,11 @@ function ConfirmedRelations({ project }: { project: EditorProject }) {
                     const asset = project.assets.find(
                       (candidate) => candidate.id === segment.assetId
                     );
+                    const confirmedTimeMap = segment.timeMapId
+                      ? project.mediaTimeMaps.find(
+                          (timeMap) => timeMap.id === segment.timeMapId
+                        )
+                      : undefined;
                     return (
                       <div
                         key={segment.id}
@@ -937,6 +1802,15 @@ function ConfirmedRelations({ project }: { project: EditorProject }) {
                           {formatTimecode(segment.targetStartMs ?? 0)} 起 ·{" "}
                           {segment.timingRules.length} 处删减修正
                         </div>
+                        {segment.timeMapId === null ? (
+                          <UnlinkedLegacyTimeMapWarning />
+                        ) : (
+                          <TimeMapQualitySummary
+                            timeMap={confirmedTimeMap}
+                            expectedState="confirmed"
+                            testId="confirmed-time-map-quality"
+                          />
+                        )}
                       </div>
                     );
                   })}
@@ -1054,10 +1928,11 @@ function batchTaskStateText(state: BatchTaskState): string {
   return "失败";
 }
 
-function candidateStateText(state: MediaMatchCandidate["state"]): string {
-  if (state === "pending") return "待复核";
-  if (state === "accepted") return "已确认";
-  if (state === "rejected") return "已忽略";
+function candidateStateText(candidate: MediaMatchCandidate): string {
+  if (candidate.state === "pending") return "待复核";
+  if (candidate.state === "accepted") return "已确认";
+  if (candidate.state === "rejected") return "已忽略";
+  if (candidate.proposal.timeMap?.quality.level === "blocked") return "已阻断";
   return "缺少 XML 绑定";
 }
 

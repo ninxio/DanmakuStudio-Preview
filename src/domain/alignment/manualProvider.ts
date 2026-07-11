@@ -1,5 +1,6 @@
 import type { SyncAnchor } from "../danmaku/types";
 import type { AlignmentInput, AlignmentProposal, AlignmentProvider, CutCandidate } from "./types";
+import { isAlignmentTimeMapProposal } from "./timeMapProposal";
 
 export class ManualAlignmentProvider implements AlignmentProvider {
   private proposal: AlignmentProposal;
@@ -41,7 +42,8 @@ function isProposal(value: unknown): value is AlignmentProposal {
     Array.isArray(record.diagnostics) &&
     record.diagnostics.every((diagnostic) => typeof diagnostic === "string") &&
     (record.evidence === undefined || isAlignmentEvidence(record.evidence)) &&
-    (record.matchRange === undefined || isAlignmentMatchRange(record.matchRange))
+    (record.matchRange === undefined || isAlignmentMatchRange(record.matchRange)) &&
+    (record.timeMap === undefined || isAlignmentTimeMapProposal(record.timeMap))
   );
 }
 
@@ -70,7 +72,8 @@ function isAlignmentEvidence(value: unknown): boolean {
   }
   const record = value as Record<string, unknown>;
   return (
-    (record.algorithm === "time-map-audio" ||
+    (record.algorithm === "alignment-v2-edit-map" ||
+      record.algorithm === "time-map-audio" ||
       record.algorithm === "sparse-fingerprint" ||
       record.algorithm === "offset-path" ||
       record.algorithm === "sparse-fingerprint-fallback" ||
