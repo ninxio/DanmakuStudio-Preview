@@ -1,13 +1,16 @@
+use crate::process_supervision::{
+    SupervisedCommand, SupervisedOutput, SupervisedOutputLimits, SupervisedProcessError,
+    SupervisedProcessErrorKind,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::Write as _,
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::UNIX_EPOCH,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, UNIX_EPOCH},
 };
 
 const MEDIA_IDENTITY_ALGORITHM: &str = "sha256-full-file-v2";
@@ -27,7 +30,16 @@ const SHA256_ROUND_CONSTANTS: [u32; 64] = [
 ];
 const AUDIO_TIMELINE_PROBE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const AUDIO_TIMELINE_PROBE_MAX_STDERR_BYTES: usize = 1024 * 1024;
+const AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES: usize = 1024 * 1024;
+const AUDIO_TIMELINE_PROBE_MAX_STREAMS: usize = 256;
 const AUDIO_PTS_DISCONTINUITY_TOLERANCE_MS: i64 = 5;
+const MEDIA_TIMELINE_PROBE_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MEDIA_TIMELINE_PROBE_MAX_STDERR_BYTES: usize = 256 * 1024;
+const MEDIA_TIMELINE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const AUDIO_TIMELINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const PROBE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,109 +233,178 @@ pub(crate) fn probe_media_timeline_with_ffprobe(
     path: &str,
     ffprobe_path: &Path,
 ) -> Result<MediaProbeSnapshot, String> {
-    let content_identity_before = probe_media_content_identity(Path::new(path))?;
-    let output = Command::new(ffprobe_path)
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=start_time,duration:stream=index,codec_type,codec_name,start_time,duration,time_base,avg_frame_rate,sample_rate,channels,channel_layout:stream_tags=language,title:stream_disposition=default,comment",
-            "-of",
-            "json",
-            path,
-        ])
-        .output()
-        .map_err(|error| format!("FFprobe 启动失败：{error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("FFprobe 媒体探测失败：{}", detail.trim()));
-    }
+    probe_media_timeline_with_ffprobe_cancellable(path, ffprobe_path, None)
+}
+
+pub(crate) fn probe_media_timeline_with_ffprobe_cancellable(
+    path: &str,
+    ffprobe_path: &Path,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<MediaProbeSnapshot, String> {
+    ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 媒体时间线探测")?;
+    let content_identity_before =
+        probe_media_content_identity_cancellable(Path::new(path), cancel_flag)?;
+    let mut command = SupervisedCommand::new(ffprobe_path);
+    command.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=start_time,duration:stream=index,codec_type,codec_name,start_time,duration,time_base,avg_frame_rate,sample_rate,channels,channel_layout:stream_tags=language,title:stream_disposition=default,comment",
+        "-of",
+        "json",
+        path,
+    ]);
+    let output = run_supervised_ffprobe(
+        &command,
+        media_timeline_probe_limits(),
+        || alignment_probe_cancelled(cancel_flag),
+        "FFprobe 媒体时间线探测",
+    )?;
     // FFprobe re-opens the path independently. Re-hash after it exits so a path replacement or
     // in-place rewrite during analysis can never be paired with stale stream metadata.
-    let content_identity_after = probe_media_content_identity(Path::new(path))?;
+    let content_identity_after =
+        probe_media_content_identity_cancellable(Path::new(path), cancel_flag)?;
     if !are_media_content_identities_equal(&content_identity_before, &content_identity_after) {
         return Err(
             "媒体文件在 FFprobe 分析期间被替换或修改，请等待文件稳定后重新分析。".to_string(),
         );
     }
-    let mut snapshot = parse_media_probe_json(path, &String::from_utf8_lossy(&output.stdout))?;
+    ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 媒体时间线结果解析")?;
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    let mut snapshot = parse_media_probe_json_cancellable(path, &output_text, cancel_flag)?;
     snapshot.content_identity = Some(content_identity_after);
     Ok(snapshot)
 }
 
-/// Scans decoded audio frame PTS and packet skip-sample metadata without retaining FFprobe's
-/// potentially very large output. The compact stream is consumed line-by-line and killed once
-/// the hard metadata byte limit is exceeded.
+/// Scans decoded audio frame PTS and packet skip-sample metadata under a bounded process owner.
+///
+/// The supervisor retains at most 128 MiB of compact stdout so it can enforce timeout,
+/// cancellation and whole-process-tree cleanup without an unbounded reader join. Parsing happens
+/// only after the Job has exited and additionally rejects any compact record over 1 MiB.
+#[cfg(test)]
 pub(crate) fn probe_audio_decode_timelines_with_ffprobe(
     path: &str,
     ffprobe_path: &Path,
 ) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
-    let mut child = Command::new(ffprobe_path)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_frames",
-            "-show_packets",
-            "-show_entries",
-            "frame=stream_index,best_effort_timestamp_time,pts_time,pkt_duration_time,nb_samples:frame_side_data=side_data_type,skip_samples,discard_padding:packet=stream_index,pts_time,duration_time:packet_side_data=side_data_type,skip_samples,discard_padding",
-            "-of",
-            "compact=p=1:nk=0",
-            path,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("FFprobe 音频逐帧时间戳探测启动失败：{error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "FFprobe 音频逐帧时间戳标准输出不可用。".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "FFprobe 音频逐帧时间戳错误输出不可用。".to_string())?;
-    let stderr_reader = thread::spawn(move || {
-        read_stream_prefix_while_draining(stderr, AUDIO_TIMELINE_PROBE_MAX_STDERR_BYTES)
-    });
-    let mut reader = BufReader::new(stdout);
-    let mut total_bytes = 0usize;
-    let mut line = Vec::new();
-    let mut accumulators = HashMap::<u32, AudioTimelineAccumulator>::new();
-    loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| format!("FFprobe 音频逐帧时间戳输出读取失败：{error}"))?;
-        if read == 0 {
-            break;
+    let expected_identity = probe_media_content_identity(Path::new(path))?;
+    probe_audio_decode_timelines_with_ffprobe_cancellable(
+        path,
+        ffprobe_path,
+        &expected_identity,
+        None,
+    )
+}
+
+pub(crate) fn probe_audio_decode_timelines_with_ffprobe_cancellable(
+    path: &str,
+    ffprobe_path: &Path,
+    expected_identity: &MediaContentIdentity,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
+    ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳探测")?;
+    let content_identity_before = probe_audio_timeline_guard_identity(path, cancel_flag)?;
+    ensure_strict_audio_timeline_identity_match(expected_identity, &content_identity_before)?;
+    let mut command = SupervisedCommand::new(ffprobe_path);
+    command.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_frames",
+        "-show_packets",
+        "-show_entries",
+        "frame=stream_index,best_effort_timestamp_time,pts_time,pkt_duration_time,nb_samples:frame_side_data=side_data_type,skip_samples,discard_padding:packet=stream_index,pts_time,duration_time:packet_side_data=side_data_type,skip_samples,discard_padding",
+        "-of",
+        "compact=p=1:nk=0",
+        path,
+    ]);
+    let output = run_supervised_ffprobe(
+        &command,
+        audio_timeline_probe_limits(),
+        || alignment_probe_cancelled(cancel_flag),
+        "FFprobe 音频逐帧时间戳探测",
+    )?;
+    // Frame/packet stdout stays unparsed until the path has been re-hashed after every process in
+    // the supervised Job exits. This binds the compact PTS evidence to the same full-file
+    // identity as the stream snapshot consumed by Alignment V2.
+    let content_identity_after = probe_audio_timeline_guard_identity(path, cancel_flag)?;
+    ensure_strict_audio_timeline_identity_match(&content_identity_before, &content_identity_after)?;
+    ensure_strict_audio_timeline_identity_match(expected_identity, &content_identity_after)?;
+    parse_audio_timeline_compact_output_cancellable(
+        &output.stdout,
+        AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES,
+        cancel_flag,
+    )
+}
+
+fn probe_audio_timeline_guard_identity(
+    path: &str,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<MediaContentIdentity, String> {
+    probe_media_content_identity_cancellable(Path::new(path), cancel_flag).map_err(|error| {
+        if error.starts_with("cancelled：") {
+            "cancelled：FFprobe 音频逐帧时间戳身份复核已取消。".to_string()
+        } else {
+            "blocked:media-identity-recheck：FFprobe 音频逐帧时间戳探测无法复核全文件媒体身份；未解析工具输出。"
+                .to_string()
         }
-        total_bytes = total_bytes.saturating_add(read);
-        if total_bytes > AUDIO_TIMELINE_PROBE_MAX_BYTES {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stderr_reader.join();
+    })
+}
+
+fn ensure_strict_audio_timeline_identity_match(
+    expected: &MediaContentIdentity,
+    observed: &MediaContentIdentity,
+) -> Result<(), String> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(
+            "blocked:media-identity-changed：媒体文件在逐帧/packet PTS 探测期间发生变化；未解析工具输出。"
+                .to_string(),
+        )
+    }
+}
+
+fn alignment_probe_cancelled(cancel_flag: Option<&AtomicBool>) -> bool {
+    cancel_flag.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
+fn ensure_alignment_probe_not_cancelled(
+    cancel_flag: Option<&AtomicBool>,
+    context: &str,
+) -> Result<(), String> {
+    if alignment_probe_cancelled(cancel_flag) {
+        Err(format!("cancelled：{context}已取消。"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn parse_audio_timeline_compact_output(
+    output: &[u8],
+    record_hard_limit: usize,
+) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
+    parse_audio_timeline_compact_output_cancellable(output, record_hard_limit, None)
+}
+
+fn parse_audio_timeline_compact_output_cancellable(
+    output: &[u8],
+    record_hard_limit: usize,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
+    let mut accumulators = HashMap::<u32, AudioTimelineAccumulator>::new();
+    for line in output.split(|byte| *byte == b'\n') {
+        ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
+        let record = line.strip_suffix(b"\r").unwrap_or(line);
+        if record.len() > record_hard_limit {
             return Err(format!(
-                "blocked:resource-limit：FFprobe 音频逐帧时间戳元数据超过 {} MiB 硬上限。",
-                AUDIO_TIMELINE_PROBE_MAX_BYTES / (1024 * 1024)
+                "blocked:resource-limit：FFprobe 音频逐帧时间戳单条记录超过 {} KiB 硬上限。",
+                record_hard_limit / 1024
             ));
         }
-        let record = String::from_utf8_lossy(&line);
+        let record = String::from_utf8_lossy(record);
         apply_audio_timeline_compact_record(record.trim(), &mut accumulators)?;
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("FFprobe 音频逐帧时间戳进程等待失败：{error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "FFprobe 音频逐帧时间戳错误输出线程异常。".to_string())?
-        .map_err(|error| format!("FFprobe 音频逐帧时间戳错误输出读取失败：{error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "FFprobe 音频逐帧时间戳探测失败：{}",
-            String::from_utf8_lossy(&stderr).trim()
-        ));
     }
     Ok(accumulators
         .into_iter()
@@ -334,21 +415,93 @@ pub(crate) fn probe_audio_decode_timelines_with_ffprobe(
         .collect())
 }
 
-fn read_stream_prefix_while_draining<R: Read>(
-    mut reader: R,
-    retained_limit: usize,
-) -> Result<Vec<u8>, std::io::Error> {
-    let mut retained = Vec::new();
-    let mut buffer = [0u8; 8 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let remaining = retained_limit.saturating_sub(retained.len());
-        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+fn media_timeline_probe_limits() -> SupervisedOutputLimits {
+    SupervisedOutputLimits {
+        execution_timeout: MEDIA_TIMELINE_PROBE_TIMEOUT,
+        output_drain_timeout: PROBE_OUTPUT_DRAIN_TIMEOUT,
+        termination_timeout: PROBE_TERMINATION_TIMEOUT,
+        poll_interval: PROBE_POLL_INTERVAL,
+        stdout_hard_limit: MEDIA_TIMELINE_PROBE_MAX_STDOUT_BYTES,
+        stderr_hard_limit: MEDIA_TIMELINE_PROBE_MAX_STDERR_BYTES,
     }
-    Ok(retained)
+}
+
+fn audio_timeline_probe_limits() -> SupervisedOutputLimits {
+    SupervisedOutputLimits {
+        execution_timeout: AUDIO_TIMELINE_PROBE_TIMEOUT,
+        output_drain_timeout: PROBE_OUTPUT_DRAIN_TIMEOUT,
+        termination_timeout: PROBE_TERMINATION_TIMEOUT,
+        poll_interval: PROBE_POLL_INTERVAL,
+        stdout_hard_limit: AUDIO_TIMELINE_PROBE_MAX_BYTES,
+        stderr_hard_limit: AUDIO_TIMELINE_PROBE_MAX_STDERR_BYTES,
+    }
+}
+
+fn run_supervised_ffprobe<F>(
+    command: &SupervisedCommand,
+    limits: SupervisedOutputLimits,
+    is_cancelled: F,
+    context: &str,
+) -> Result<SupervisedOutput, String>
+where
+    F: Fn() -> bool,
+{
+    let output = command.output(limits, is_cancelled).map_err(|error| {
+        format_supervised_ffprobe_error(
+            context,
+            error,
+            limits.stdout_hard_limit,
+            limits.stderr_hard_limit,
+        )
+    })?;
+    if !output.status.success() {
+        let exit = output
+            .status
+            .code()
+            .map(|code| format!("退出码 {code}"))
+            .unwrap_or_else(|| "无退出码".to_string());
+        return Err(format!(
+            "{context}失败（{exit}）；为保护本地路径与访问凭据，未回显媒体工具错误输出。"
+        ));
+    }
+    Ok(output)
+}
+
+fn format_supervised_ffprobe_error(
+    context: &str,
+    error: SupervisedProcessError,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> String {
+    match error.kind() {
+        SupervisedProcessErrorKind::Spawn => format!("{context}无法在受监督进程中启动。"),
+        SupervisedProcessErrorKind::Timeout => {
+            format!("blocked:process-timeout：{context}超过最长执行或有界收尾时间。")
+        }
+        SupervisedProcessErrorKind::Cancelled => format!("cancelled：{context}已取消。"),
+        SupervisedProcessErrorKind::StdoutOverflow => format!(
+            "blocked:resource-limit：{context}标准输出超过 {} MiB 硬上限。",
+            stdout_limit.div_ceil(1024 * 1024)
+        ),
+        SupervisedProcessErrorKind::StderrOverflow => format!(
+            "blocked:resource-limit：{context}错误输出超过 {} KiB 硬上限。",
+            stderr_limit.div_ceil(1024)
+        ),
+        SupervisedProcessErrorKind::Reader => {
+            #[cfg(test)]
+            {
+                format!("{context}的有界输出读取失败（test-safe-detail: {error}）。")
+            }
+            #[cfg(not(test))]
+            {
+                format!("{context}的有界输出读取失败。")
+            }
+        }
+        SupervisedProcessErrorKind::Wait => format!("{context}的受监督进程状态读取失败。"),
+        SupervisedProcessErrorKind::Cleanup => {
+            format!("blocked:cleanup-failed：{context}的受监督进程树未完成有界清理。")
+        }
+    }
 }
 
 fn apply_audio_timeline_compact_record(
@@ -369,7 +522,18 @@ fn apply_audio_timeline_compact_record(
     else {
         return Ok(());
     };
-    let accumulator = accumulators.entry(stream_index).or_default();
+    let stream_capacity_reached = accumulators.len() >= AUDIO_TIMELINE_PROBE_MAX_STREAMS;
+    let accumulator = match accumulators.entry(stream_index) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) if !stream_capacity_reached => {
+            entry.insert(AudioTimelineAccumulator::default())
+        }
+        std::collections::hash_map::Entry::Vacant(_) => {
+            return Err(format!(
+                "blocked:resource-limit：FFprobe 音频逐帧时间戳输出超过 {AUDIO_TIMELINE_PROBE_MAX_STREAMS} 条音频流硬上限。"
+            ));
+        }
+    };
     match record_type {
         "frame" => {
             let pts_ms = values
@@ -437,6 +601,14 @@ fn apply_audio_timeline_compact_record(
 /// legacy three digest fields are intentionally all populated with the same complete-file digest
 /// to keep schema v10 projects readable without a migration.
 pub(crate) fn probe_media_content_identity(path: &Path) -> Result<MediaContentIdentity, String> {
+    probe_media_content_identity_cancellable(path, None)
+}
+
+pub(crate) fn probe_media_content_identity_cancellable(
+    path: &Path,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<MediaContentIdentity, String> {
+    ensure_alignment_probe_not_cancelled(cancel_flag, "媒体身份读取")?;
     let mut file =
         File::open(path).map_err(|error| format!("无法打开媒体文件以生成身份：{error}"))?;
     let metadata_before = file
@@ -451,6 +623,7 @@ pub(crate) fn probe_media_content_identity(path: &Path) -> Result<MediaContentId
     let mut buffer = vec![0_u8; MEDIA_IDENTITY_READ_BUFFER_BYTES];
     let mut bytes_read = 0_u64;
     loop {
+        ensure_alignment_probe_not_cancelled(cancel_flag, "媒体身份读取")?;
         let read = file
             .read(&mut buffer)
             .map_err(|error| format!("媒体身份全文件读取失败：{error}"))?;
@@ -460,6 +633,8 @@ pub(crate) fn probe_media_content_identity(path: &Path) -> Result<MediaContentId
         hasher.update(&buffer[..read]);
         bytes_read = bytes_read.saturating_add(read as u64);
     }
+
+    ensure_alignment_probe_not_cancelled(cancel_flag, "媒体身份读取")?;
 
     let metadata_after = file
         .metadata()
@@ -667,9 +842,53 @@ fn resolve_requested_ffprobe_path(
         .unwrap_or_else(|| resolve_ffprobe_path(ffmpeg_path.unwrap_or("ffmpeg")))
 }
 
-pub fn parse_media_probe_json(path: &str, text: &str) -> Result<MediaProbeSnapshot, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaProbeJsonParseCheckpoint {
+    BeforeDeserialize,
+    AfterDeserialize,
+    NormalizeStream,
+    AfterNormalize,
+}
+
+#[cfg(test)]
+fn parse_media_probe_json(path: &str, text: &str) -> Result<MediaProbeSnapshot, String> {
+    parse_media_probe_json_with_cancel_check(path, text, |_| false)
+}
+
+fn parse_media_probe_json_cancellable(
+    path: &str,
+    text: &str,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<MediaProbeSnapshot, String> {
+    parse_media_probe_json_with_cancel_check(path, text, |_| alignment_probe_cancelled(cancel_flag))
+}
+
+fn parse_media_probe_json_with_cancel_check<F>(
+    path: &str,
+    text: &str,
+    mut is_cancelled: F,
+) -> Result<MediaProbeSnapshot, String>
+where
+    F: FnMut(MediaProbeJsonParseCheckpoint) -> bool,
+{
+    let ensure_not_cancelled = |cancelled: bool| {
+        if cancelled {
+            Err("cancelled：FFprobe 媒体时间线结果解析已取消。".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    // Production stdout is already capped at 8 MiB by the process supervisor. Checking on both
+    // sides of serde's bounded in-memory deserialize avoids returning a snapshot after a cancel;
+    // normalization additionally checks once per stream so a metadata-heavy result is interruptible.
+    ensure_not_cancelled(is_cancelled(
+        MediaProbeJsonParseCheckpoint::BeforeDeserialize,
+    ))?;
     let raw: RawProbeOutput =
         serde_json::from_str(text).map_err(|error| format!("FFprobe JSON 无法解析：{error}"))?;
+    ensure_not_cancelled(is_cancelled(
+        MediaProbeJsonParseCheckpoint::AfterDeserialize,
+    ))?;
     let format_start_ms = raw
         .format
         .as_ref()
@@ -694,6 +913,7 @@ pub fn parse_media_probe_json(path: &str, text: &str) -> Result<MediaProbeSnapsh
     let mut video_streams = Vec::new();
     let mut audio_streams = Vec::new();
     for stream in raw.streams {
+        ensure_not_cancelled(is_cancelled(MediaProbeJsonParseCheckpoint::NormalizeStream))?;
         let start_time_ms =
             parse_signed_seconds_ms(stream.start_time.as_deref()).unwrap_or(presentation_origin_ms);
         let timeline_offset_ms = start_time_ms.saturating_sub(presentation_origin_ms);
@@ -742,6 +962,7 @@ pub fn parse_media_probe_json(path: &str, text: &str) -> Result<MediaProbeSnapsh
     video_streams.sort_by_key(|stream| stream.stream_index);
     audio_streams.sort_by_key(|stream| stream.stream_index);
     let preferred_audio_stream_index = choose_preferred_audio_stream(&audio_streams);
+    ensure_not_cancelled(is_cancelled(MediaProbeJsonParseCheckpoint::AfterNormalize))?;
 
     Ok(MediaProbeSnapshot {
         path: path.to_string(),
@@ -898,6 +1119,25 @@ mod tests {
         assert_eq!(snapshot.audio_streams[0].language.as_deref(), Some("jpn"));
         assert_eq!(snapshot.preferred_audio_stream_index, Some(1));
         assert!(snapshot.audio_streams[1].is_commentary);
+    }
+
+    #[test]
+    fn media_timeline_json_parse_honors_every_bounded_cancel_checkpoint() {
+        for cancel_at in [
+            MediaProbeJsonParseCheckpoint::BeforeDeserialize,
+            MediaProbeJsonParseCheckpoint::AfterDeserialize,
+            MediaProbeJsonParseCheckpoint::NormalizeStream,
+            MediaProbeJsonParseCheckpoint::AfterNormalize,
+        ] {
+            let error =
+                parse_media_probe_json_with_cancel_check("episode.mkv", PROBE_JSON, |checkpoint| {
+                    checkpoint == cancel_at
+                })
+                .expect_err("a cancelled parse checkpoint must not return a snapshot");
+
+            assert!(error.starts_with("cancelled："));
+            assert!(error.contains("结果解析"));
+        }
     }
 
     #[test]
@@ -1060,6 +1300,254 @@ mod tests {
     }
 
     #[test]
+    fn compact_audio_timeline_output_has_a_per_record_hard_limit() {
+        let valid =
+            b"frame|stream_index=2|best_effort_timestamp_time=1.250|pkt_duration_time=0.020\n";
+        let parsed = parse_audio_timeline_compact_output(valid, valid.len()).unwrap();
+        assert_eq!(parsed[&2].first_decoded_pts_ms, Some(1_250));
+
+        let oversized = vec![b'x'; 1_025];
+        let error = parse_audio_timeline_compact_output(&oversized, 1_024).unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("单条记录"));
+    }
+
+    #[test]
+    fn compact_audio_timeline_output_caps_distinct_stream_accumulators() {
+        use std::fmt::Write as _;
+
+        let mut output = String::new();
+        for stream_index in 0..=AUDIO_TIMELINE_PROBE_MAX_STREAMS {
+            writeln!(
+                output,
+                "frame|stream_index={stream_index}|best_effort_timestamp_time=0.000"
+            )
+            .unwrap();
+        }
+
+        let error = parse_audio_timeline_compact_output(
+            output.as_bytes(),
+            AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("音频流硬上限"));
+    }
+
+    #[cfg(windows)]
+    fn supervised_probe_helper_command(test_name: &str) -> SupervisedCommand {
+        let mut command = SupervisedCommand::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+        command
+    }
+
+    #[cfg(windows)]
+    fn supervised_probe_test_limits(
+        timeout: Duration,
+        stdout_hard_limit: usize,
+        stderr_hard_limit: usize,
+    ) -> SupervisedOutputLimits {
+        SupervisedOutputLimits {
+            execution_timeout: timeout,
+            output_drain_timeout: Duration::from_millis(200),
+            termination_timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(5),
+            stdout_hard_limit,
+            stderr_hard_limit,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-probe supervised stdout overflow helper"]
+    fn supervised_probe_stdout_overflow_helper() {
+        use std::io::Write as _;
+
+        let mut stdout = std::io::stdout();
+        for _ in 0..16 {
+            stdout.write_all(&[b'x'; 4 * 1024]).unwrap();
+        }
+        stdout.flush().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-probe supervised stderr overflow helper"]
+    fn supervised_probe_stderr_overflow_helper() {
+        use std::io::Write as _;
+
+        let mut stderr = std::io::stderr();
+        for _ in 0..16 {
+            stderr.write_all(&[b'e'; 4 * 1024]).unwrap();
+        }
+        stderr.flush().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-probe supervised nonzero helper"]
+    fn supervised_probe_sensitive_stderr_helper() {
+        use std::io::Write as _;
+
+        std::io::stderr()
+            .write_all(br#"C:\Users\alice\private\episode.mkv?api_key=secret-token&token=other"#)
+            .unwrap();
+        std::io::stderr().flush().unwrap();
+        std::process::exit(23);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-probe supervised cancellation helper"]
+    #[allow(clippy::zombie_processes)]
+    fn supervised_probe_cancellation_helper() {
+        use std::io::Write as _;
+        use std::process::Command;
+
+        let descendant = Command::new("ping.exe")
+            .args(["-t", "127.0.0.1"])
+            .spawn()
+            .unwrap();
+        writeln!(std::io::stdout(), "descendant={}", descendant.id()).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::mem::forget(descendant);
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervised_probe_wrapper_stdout_overflow_is_bounded() {
+        let command = supervised_probe_helper_command(
+            "media_probe::tests::supervised_probe_stdout_overflow_helper",
+        );
+        let started = std::time::Instant::now();
+        let error = run_supervised_ffprobe(
+            &command,
+            supervised_probe_test_limits(Duration::from_secs(3), 1_024, 64 * 1024),
+            || false,
+            "wrapper probe",
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("标准输出"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervised_probe_wrapper_stderr_overflow_is_bounded() {
+        let command = supervised_probe_helper_command(
+            "media_probe::tests::supervised_probe_stderr_overflow_helper",
+        );
+        let started = std::time::Instant::now();
+        let error = run_supervised_ffprobe(
+            &command,
+            supervised_probe_test_limits(Duration::from_secs(3), 64 * 1024, 1_024),
+            || false,
+            "wrapper probe",
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("错误输出"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervised_probe_nonzero_error_never_echoes_stderr_or_local_paths() {
+        let command = supervised_probe_helper_command(
+            "media_probe::tests::supervised_probe_sensitive_stderr_helper",
+        );
+        let error = run_supervised_ffprobe(
+            &command,
+            supervised_probe_test_limits(Duration::from_secs(3), 64 * 1024, 64 * 1024),
+            || false,
+            "wrapper probe",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("退出码 23"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("episode.mkv"));
+        assert!(!error.contains("secret-token"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervised_probe_cancel_and_watchdog_are_bounded_for_wrapper_descendants() {
+        let cancelled_command = supervised_probe_helper_command(
+            "media_probe::tests::supervised_probe_cancellation_helper",
+        );
+        let cancel_flag = std::sync::Arc::new(AtomicBool::new(false));
+        let setter_flag = cancel_flag.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            setter_flag.store(true, Ordering::Release);
+        });
+        let cancel_started = std::time::Instant::now();
+        let cancelled = run_supervised_ffprobe(
+            &cancelled_command,
+            supervised_probe_test_limits(Duration::from_secs(3), 64 * 1024, 64 * 1024),
+            || alignment_probe_cancelled(Some(cancel_flag.as_ref())),
+            "wrapper probe",
+        )
+        .unwrap_err();
+        setter.join().unwrap();
+        assert!(cancelled.starts_with("cancelled"));
+        assert!(cancel_started.elapsed() < Duration::from_secs(4));
+
+        let timeout_command = supervised_probe_helper_command(
+            "media_probe::tests::supervised_probe_cancellation_helper",
+        );
+        let timeout_started = std::time::Instant::now();
+        let timed_out = run_supervised_ffprobe(
+            &timeout_command,
+            supervised_probe_test_limits(Duration::from_millis(150), 64 * 1024, 64 * 1024),
+            || false,
+            "wrapper probe",
+        )
+        .unwrap_err();
+        assert!(timed_out.starts_with("blocked:process-timeout"));
+        assert!(timeout_started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_probe_variants_observe_an_already_cancelled_atomic_flag() {
+        let media_path = std::env::temp_dir().join(format!(
+            "media-probe-cancel-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&media_path, b"cancel-probe-fixture").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let cancelled = AtomicBool::new(true);
+        let path = media_path.to_string_lossy();
+        let expected_identity = probe_media_content_identity(&media_path).unwrap();
+
+        let timeline_error =
+            probe_media_timeline_with_ffprobe_cancellable(&path, &executable, Some(&cancelled))
+                .unwrap_err();
+        assert!(timeline_error.starts_with("cancelled"));
+
+        let frames_error = probe_audio_decode_timelines_with_ffprobe_cancellable(
+            &path,
+            &executable,
+            &expected_identity,
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert!(frames_error.starts_with("cancelled"));
+
+        std::fs::remove_file(media_path).unwrap();
+    }
+
+    #[test]
     fn media_content_identity_is_stable_and_binds_every_byte_and_size() {
         let path = std::env::temp_dir().join(format!(
             "media-identity-{}-{}.bin",
@@ -1094,6 +1582,34 @@ mod tests {
         assert_ne!(previous, resized);
         assert_eq!(resized.size_bytes, bytes.len() as u64);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn audio_timeline_identity_guard_is_strict_and_redacts_probe_failures() {
+        let digest = "a".repeat(64);
+        let expected = MediaContentIdentity {
+            algorithm: MEDIA_IDENTITY_ALGORITHM,
+            size_bytes: 42,
+            modified_unix_ms: 100,
+            first_sample_digest: digest.clone(),
+            middle_sample_digest: digest.clone(),
+            last_sample_digest: digest,
+        };
+        let mut changed = expected.clone();
+        changed.modified_unix_ms = 101;
+        let changed_error =
+            ensure_strict_audio_timeline_identity_match(&expected, &changed).unwrap_err();
+        assert!(changed_error.starts_with("blocked:media-identity-changed"));
+        assert!(!changed_error.contains(&expected.first_sample_digest));
+
+        let probe_error = probe_audio_timeline_guard_identity(
+            r"C:\Users\alice\private\episode.mkv?token=secret",
+            None,
+        )
+        .unwrap_err();
+        assert!(probe_error.starts_with("blocked:media-identity-recheck"));
+        assert!(!probe_error.contains("alice"));
+        assert!(!probe_error.contains("secret"));
     }
 
     #[test]

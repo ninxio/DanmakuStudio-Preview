@@ -33,17 +33,31 @@ corepack pnpm tauri:build
 
 当前威胁边界是“项目 JSON 单独被修改或移机”：它不能伪造 HMAC，也不能在原安装上删除权威撤销状态。secret 目前依赖应用数据目录和系统账户权限，并非 Windows Credential Manager/TPM 密钥；具有同账户应用数据读写能力的恶意本地进程不在这一保证范围内。
 
+## Windows 媒体工具进程边界
+
+安装包内的 Windows 后端用共同 lifecycle Job Object 执行一次性 FFmpeg/FFprobe 与受控系统探测。每个子进程先以挂起状态创建，加入私有 kill-on-close Job 后才恢复；只允许显式标准流句柄继承，stdout/stderr、执行时间和收尾时间均有硬上限。取消、超时、输出溢出、读取/等待异常会终止整个 Job 并等待后代退出。若 Job 或 reader 不能在期限内可信清理，应用设置粘性 `blocked:process-cleanup`，作废当前结果并阻止后续媒体分析；benchmark session 会停留在 `cleanup-blocked`，不会把 lease 误报为已释放。
+
+输出 reader 只在 root exit、Job empty、stdout/stderr 全部就绪后消费结果；先完成的流会保留到另一条流收尾，不会在轮询中被提前取走并误报 disconnected。普通 FFprobe 时间线探测最多运行 30 秒并保留 8 MiB stdout / 256 KiB stderr；音频逐帧/packet PTS 探测最多运行 5 分钟并保留 128 MiB 紧凑 stdout / 1 MiB stderr，只在 Job 全部退出且 expected/before/after 全文件身份严格一致后解析，单条记录和不同音频流分别受 1 MiB、256 条硬限制。安装包不会执行 Chocolatey `ShimGen` 作为媒体工具：只有规范 Chocolatey 路径、version resource、拒绝 reparse/symlink 的有界候选遍历全部通过，且恰好得到一个真实 exe 时，才对该真实二进制计算指纹并执行。路径、reparse、版本资源或唯一性存在异常时会 fail-closed，并提示配置真实工具路径。
+
+每次本地对齐会在 run 开始前为参考/目标媒体各取得 `FILE_SHARE_READ` 只读 lease，并持有到 proposal 返回或失败。lease 期间文件不能被覆盖、删除、rename 或替换；run-start/run-final SHA-256、TimeMap 双端 identity、frame/packet PTS identity、音频/landmark/视觉 cache key 与 FFmpeg 后复核必须形成同一内容身份闭环。视觉验证必须与音频 TimeMap 属于同一 source/target 媒体世代，不能把不同文件的音画证据拼接。所有本地路径、token、工具 stderr 和身份摘要都不会进入用户可见错误或可下载 raw。
+
+取消不仅终止受监督进程，也贯穿后续解析：FFprobe JSON 在反序列化前后和逐流归一化时检查，compact PTS 逐记录检查，V2 PCM 分块、legacy PCM/频谱分块、视觉特征逐帧检查。取消或身份变化发生后不会写缓存、返回部分 TimeMap 或继续生成性能结论。
+
+这里的 Job 只负责进程树生命周期和有界清理，不是 C137 正式性能协议要求的 RSS sampler。当前 strict raw v1 仍声明 `windows-toolhelp-working-set-v1` 与 `system-volume`；安装包并未因此获得 `windows-job-object-working-set-v1` 或 `workload-media-volumes` 正式证据能力。
+
 ## C137 benchmark 与完整验收边界
 
-桌面包包含匹配页折叠的“高级：C137 精度基准”入口，但它只运行 TimeMap 组件级开发验收。用户导入本机 manifest v2 后，应用把完整清单投影成不含 gold、split、场景、复核者或仲裁答案的 blind `RunManifest`，并重新核验真实媒体的全文件身份及显式音视频流。`RunManifest` 使用 canonical JSON SHA-256 与通过的 preflight receipt 绑定；blind runner 随后调用与产品匹配相同的 Tauri `start/get/cancel_audio_alignment_job` 和 Rust Alignment V2，不使用测试预测或前端伪结果。
+桌面包包含匹配页折叠的“高级：C137 精度基准”入口，其中 TimeMap 组件报告子区运行组件级开发验收，原生性能子区运行性能工程采集。用户导入本机 manifest v2 后，应用把完整清单投影成不含 gold、split、场景、复核者或仲裁答案的 blind `RunManifest`，并重新核验真实媒体的全文件身份及显式音视频流。`RunManifest` 使用 canonical JSON SHA-256 与通过的 preflight receipt 绑定；blind runner 随后调用与产品匹配相同的 Tauri `start/get/cancel_audio_alignment_job` 和 Rust Alignment V2，不使用测试预测或前端伪结果。
 
 生产请求会显式传递参考/原片音轨和视频流。Rust 结果还会回报视觉 fallback/校验实际消费的视频流，runner 必须复核这些流，且视觉缓存按实际流索引隔离。每个 case 的 sealed receipt 记录成功、失败或取消、单调时钟 wall elapsed、engine/feature、实际视觉流和去敏参数摘要。只有所有真实 case 成功并与 blind SHA-256 一致时才揭示 gold 进行组件评估；失败、取消或未确认安全退出都会令 `evaluation=null`，超时任务未退出时也不会继续启动下一 case。
 
 从高级入口下载的 JSON 采用独立 schema 和 validator，固定标记 `scope: "time-map-component"`、`releaseEligible: false`。报告不包含本地媒体路径、媒体 SHA-256、生产参数 hash 或原始诊断。组件子闸门即使通过，也不等于 release 通过，不会改变项目的人工签发状态或授予 `verified`。
 
-完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部 `trustContext`。外部信任根必须对受信 protocol、数据审批/preflight/prediction receipts 及每类 raw report evidence 提供 canonical SHA-256；内嵌 evidence digest 不能自我批准。安装包默认不携带任何审批白名单或 trust context，因此缺少外部受信摘要时必定返回 `incomplete-evidence`，保持 fail-closed。
+同一高级区内的性能工程采集复用已导入 manifest 中的媒体引用，不会再要求选择第二组路径。它先取得 native exclusive session，原子清空应用特征缓存，然后严格按 cold → warmup → hot → cancel 计划运行与产品相同的对齐核心。导出的 strict raw v1 记录 Rust 原生单调时钟、阶段边界、缓存计数、进程树 RSS 和取消退出终态，并固定标记 `releaseEligible: false`、`trustStatus: "untrusted-raw-evidence"`。组件报告里的“协调器观测耗时”不属于性能证据。
 
-release 不携带真实媒体、gold、许可材料或 raw 性能记录。当前仓库也没有用于采集和冻结真实关系的生成器，亦没有在规定硬件上生成冷/热缓存耗时、进程树峰值 RSS、取消延迟等性能 evidence 的生成器；安装包中的 UI 与 evaluator 不能替代这些外部数据生产和审批步骤。
+完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部 `trustContext`。acceptance protocol v2 必须绑定性能 plan 摘要、cold/hot/cancel 次数、最大采样间隔和原生单调时钟，并要求 Job Object 进程归属及实际媒体卷环境收据；performance report v2 直接携带 strict raw v1，不接受手写耗时汇总。外部信任根必须对受信 protocol、数据审批/preflight/prediction receipts 及每类 raw report evidence 提供 canonical SHA-256；内嵌 evidence digest 不能自我批准。安装包默认不携带任何审批白名单或 trust context，因此缺少外部受信摘要时必定返回 `incomplete-evidence`，保持 fail-closed。
+
+release 不携带真实媒体、gold、许可材料或 raw 性能记录。当前仓库已能生成冷/热缓存耗时、进程树峰值 RSS 和取消延迟的性能工程 raw，但仍没有采集和冻结合法真实关系的生成器。生命周期 Job 已解决一次性媒体工具的进程树接管与失败清理，却没有替换性能报告中的 ToolHelp/PID RSS 采样；存储回执也仍只探测 Windows 系统卷的 seek-penalty，而不是实际媒体卷。这些限制使当前 raw 不得晋升为正式发布性能证据；正式证据必须另行实现 `windows-job-object-working-set-v1`、探测 `workload-media-volumes`，再用真实授权数据按受信协议重新采集并由独立 trust root 审批。
 
 ## Web 生产构建
 
@@ -64,4 +78,4 @@ corepack pnpm build
 - C137 的正式分集导出只在桌面端可用：写盘命令会再次计算所有依赖媒体的全文件 SHA-256，并拒绝浏览器下载降级。未经真实校准的 `review/blocked/legacy-unverified` 时间图不会进入该写盘路径。
 - Web 构建没有安装级 secret、签发命令或权威撤销注册表，因此只能展示/编辑复核状态，不能签发、恢复或撤销人工 `verified`。
 - release 不打包真实媒体 benchmark。仓库中的 manifest v2 文件是 `isExample=true` 的 placeholder；实际数据集路径、全文件身份和授权说明由评测者保留在本机，运行前通过 Tauri preflight 重新核对媒体身份和显式流索引。
-- 当前真实媒体关系数仍为 0，尚未完成统计校准、规定硬件性能报告、20 套北极星长合集验收；A/B token 也尚无最小播放时长门槛。因此现阶段安装包是 fail-closed 的工程预览，不能作为准确率、性能或人工观看充分性的验收证明。
+- 当前真实媒体关系数仍为 0，尚未完成统计校准、规定硬件性能报告、20 套北极星长合集验收。A/B v2 token 已要求共同内容和单侧差异达到 2000/1500 ms 有效/覆盖时长、边界达到 1500/1000 ms，但这些门槛也尚未在授权真实冻结集上完成充分性校准。因此现阶段安装包是 fail-closed 的工程预览，不能作为准确率、性能或人工观看充分性的验收证明。

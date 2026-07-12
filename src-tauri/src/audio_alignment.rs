@@ -9,25 +9,37 @@ use crate::{
         SpectralLandmark,
     },
     media_probe::{
-        probe_audio_decode_timelines_with_ffprobe, probe_media_content_identity,
-        probe_media_timeline_with_ffprobe, resolve_ffprobe_path, select_audio_stream,
-        AudioDecodeTimelineProbe, AudioStreamProbe, MediaContentIdentity, MediaProbeSnapshot,
-        VideoStreamProbe,
+        probe_audio_decode_timelines_with_ffprobe_cancellable,
+        probe_media_content_identity_cancellable, probe_media_timeline_with_ffprobe_cancellable,
+        resolve_ffprobe_path, select_audio_stream, AudioDecodeTimelineProbe, AudioStreamProbe,
+        MediaContentIdentity, MediaProbeSnapshot, VideoStreamProbe,
+    },
+    process_supervision::{
+        process_supervision_cleanup_faulted, resolve_supervised_executable, SupervisedCommand,
+        SupervisedOutput, SupervisedOutputLimits, SupervisedProcessErrorKind,
     },
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
-    process::{ChildStderr, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(windows)]
+use std::{
+    fs::OpenOptions,
+    io::{Seek, SeekFrom},
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
 };
 
 const DEFAULT_SAMPLE_RATE: u32 = 8_000;
@@ -97,6 +109,22 @@ const ALIGNMENT_V2_MIN_TRACK_MARGIN: f64 = 0.10;
 const ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE: f64 = 0.20;
 const ALIGNMENT_V2_MAX_UNSELECTED_STREAMS: usize = 12;
 const MAX_V2_LANDMARK_CACHE_ENTRIES: usize = 16;
+const DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 20;
+const MIN_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 10;
+const MAX_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 1_000;
+const BENCHMARK_RESIDUAL_GRACE_MS: u64 = 2_000;
+const BENCHMARK_TELEMETRY_VERSION: &str = "alignment-benchmark-native-v1";
+const BENCHMARK_PROCESS_CLEANUP_REASON: &str =
+    "受监督媒体进程未能可信收尾；lease 与工具 pin 按 fail-closed 保持占用。";
+const BENCHMARK_TOOL_VERSION_TIMEOUT_MS: u64 = 10_000;
+const BENCHMARK_TOOL_VERSION_MAX_BYTES: usize = 64 * 1024;
+const CHILD_OUTPUT_DRAIN_TIMEOUT_MS: u64 = 2_000;
+const CHILD_PROCESS_TREE_TERMINATION_TIMEOUT_MS: u64 = 2_000;
+const MEDIA_TOOL_EXECUTION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+const LEGACY_MAX_PCM_BYTES: usize =
+    DEFAULT_SAMPLE_RATE as usize * (ALIGNMENT_V2_MAX_DURATION_MS as usize / 1_000) * 4;
+const V2_PCM_PARSE_CANCEL_CHECK_SAMPLES: usize = 64 * 1024;
+const LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES: usize = 4 * 1024;
 
 const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
@@ -324,7 +352,7 @@ pub struct AudioAlignmentTimeMapDto {
     parameters_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AudioAlignmentJobStatus {
     Queued,
@@ -352,6 +380,192 @@ pub struct AudioAlignmentJobSnapshot {
     updated_at_ms: u64,
 }
 
+const ALIGNMENT_BENCHMARK_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlignmentBenchmarkSessionStatus {
+    Active,
+    CleanupBlocked,
+    Released,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginAlignmentBenchmarkSessionRequest {
+    ffmpeg_path: Option<String>,
+    ffprobe_path: Option<String>,
+    memory_sample_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkToolFingerprint {
+    version: String,
+    binary_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkEnvironmentReceipt {
+    schema_version: u8,
+    collector_version: &'static str,
+    measurement_status: &'static str,
+    issues: Vec<String>,
+    operating_system: String,
+    operating_system_version: String,
+    architecture: String,
+    cpu_model: String,
+    physical_core_count: u32,
+    logical_core_count: u32,
+    total_memory_bytes: u64,
+    storage_scope: &'static str,
+    storage_kind: String,
+    power_profile: String,
+    ffmpeg: AlignmentBenchmarkToolFingerprint,
+    ffprobe: AlignmentBenchmarkToolFingerprint,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkSessionSnapshot {
+    schema_version: u8,
+    session_id: String,
+    status: AlignmentBenchmarkSessionStatus,
+    session_origin_tick_ns: String,
+    cache_generation: u64,
+    memory_scope: &'static str,
+    memory_sample_interval_ms: u64,
+    environment: AlignmentBenchmarkEnvironmentReceipt,
+    active_job_id: Option<String>,
+    cleanup_issue: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkCacheCounts {
+    audio_feature_entries: usize,
+    landmark_entries: usize,
+    visual_feature_entries: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkCacheCounters {
+    hits: u64,
+    misses: u64,
+    writes: u64,
+    evictions: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkCacheTelemetry {
+    generation: u64,
+    before: AlignmentBenchmarkCacheCounts,
+    after: AlignmentBenchmarkCacheCounts,
+    audio_features: AlignmentBenchmarkCacheCounters,
+    landmarks: AlignmentBenchmarkCacheCounters,
+    visual_features: AlignmentBenchmarkCacheCounters,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkStageTiming {
+    stage_key: String,
+    occurrence: u32,
+    start_tick_ns: String,
+    end_tick_ns: String,
+    elapsed_ms: f64,
+    status: AudioAlignmentJobStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkMemoryTelemetry {
+    scope: &'static str,
+    sampler: &'static str,
+    sample_interval_ms: u64,
+    sample_count: u64,
+    failed_sample_count: u64,
+    maximum_sample_gap_ms: f64,
+    peak_process_tree_rss_bytes: Option<u64>,
+    coverage_complete: bool,
+    process_tree_empty_at_terminal: bool,
+    residual_process_count: usize,
+}
+
+impl AlignmentBenchmarkMemoryTelemetry {
+    fn new(sample_interval_ms: u64) -> Self {
+        Self {
+            scope: "application-process-tree",
+            sampler: if cfg!(windows) {
+                "windows-toolhelp-working-set-v1"
+            } else {
+                "unsupported"
+            },
+            sample_interval_ms,
+            sample_count: 0,
+            failed_sample_count: 0,
+            maximum_sample_gap_ms: 0.0,
+            peak_process_tree_rss_bytes: None,
+            coverage_complete: cfg!(windows),
+            process_tree_empty_at_terminal: false,
+            residual_process_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkCancellationTelemetry {
+    request_tick_ns: String,
+    terminal_tick_ns: String,
+    latency_ms: f64,
+    command_accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkJobTelemetry {
+    schema_version: u8,
+    clock: &'static str,
+    start_tick_ns: String,
+    end_tick_ns: Option<String>,
+    elapsed_ms: f64,
+    stages: Vec<AlignmentBenchmarkStageTiming>,
+    cache: AlignmentBenchmarkCacheTelemetry,
+    memory: AlignmentBenchmarkMemoryTelemetry,
+    cancellation: Option<AlignmentBenchmarkCancellationTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkJobSnapshot {
+    schema_version: u8,
+    session_id: String,
+    job_id: String,
+    status: AudioAlignmentJobStatus,
+    stage_key: String,
+    stage_label: String,
+    proposal: Option<AudioAlignmentProposal>,
+    error_code: Option<String>,
+    telemetry: AlignmentBenchmarkJobTelemetry,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkCacheResetReceipt {
+    schema_version: u8,
+    session_id: String,
+    reset_tick_ns: String,
+    previous_generation: u64,
+    cache_generation: u64,
+    before: AlignmentBenchmarkCacheCounts,
+    after: AlignmentBenchmarkCacheCounts,
+    all_caches_empty: bool,
+}
+
 struct AudioAlignmentOptions {
     sample_rate: u32,
     window_ms: u64,
@@ -374,6 +588,11 @@ struct AlignmentAudioInput {
     audio_stream_count: usize,
     explicit_stream_selection: bool,
     stream: AudioStreamProbe,
+}
+
+struct AlignmentMediaReadLease {
+    _source: File,
+    _target: File,
 }
 
 #[derive(Debug, Clone)]
@@ -564,6 +783,130 @@ struct AudioAlignmentJobEntry {
     cancel_flag: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BenchmarkCacheKind {
+    AudioFeatures,
+    V2Landmarks,
+    VisualFeatures,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BenchmarkCacheEvent {
+    Hit,
+    Miss,
+    Write,
+    Eviction,
+}
+
+struct AlignmentBenchmarkRunTelemetry {
+    session_origin: Instant,
+    state: Mutex<AlignmentBenchmarkRunTelemetryState>,
+}
+
+struct AlignmentBenchmarkRunTelemetryState {
+    stages: Vec<AlignmentBenchmarkStageTiming>,
+    current_stage: Option<AlignmentBenchmarkActiveStage>,
+    cache: AlignmentBenchmarkCacheTelemetry,
+    memory: AlignmentBenchmarkMemoryTelemetry,
+    started_tick_ns: u128,
+    cancel_requested_tick_ns: Option<u128>,
+    terminal_tick_ns: Option<u128>,
+    last_memory_sample_at: Option<Instant>,
+    memory_last_error: Option<String>,
+}
+
+struct AlignmentBenchmarkActiveStage {
+    key: String,
+    label: String,
+    occurrence: u32,
+    started_tick_ns: u128,
+}
+
+#[derive(Debug, Clone)]
+struct AlignmentBenchmarkOutstandingReceipt {
+    generation: u64,
+    reset_tick_ns: u128,
+    used: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlignmentBenchmarkWindowsFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+    file_size: u64,
+    last_write_time: u64,
+}
+
+struct AlignmentBenchmarkPinnedTool {
+    path: PathBuf,
+    expected_digest: String,
+    #[cfg(windows)]
+    file: File,
+    #[cfg(windows)]
+    identity: AlignmentBenchmarkWindowsFileIdentity,
+}
+
+struct AlignmentBenchmarkSessionEntry {
+    session_id: String,
+    status: AlignmentBenchmarkSessionStatus,
+    origin: Instant,
+    sample_interval_ms: u64,
+    cache_generation: u64,
+    environment: AlignmentBenchmarkEnvironmentReceipt,
+    ffmpeg_tool: AlignmentBenchmarkPinnedTool,
+    ffprobe_tool: AlignmentBenchmarkPinnedTool,
+    toolchain_integrity_failed: bool,
+    baseline_descendants: HashSet<u32>,
+    active_job_id: Option<String>,
+    cleanup_reason: Option<String>,
+    outstanding_receipt: Option<AlignmentBenchmarkOutstandingReceipt>,
+    jobs: HashMap<String, AlignmentBenchmarkJobEntry>,
+}
+
+struct AlignmentBenchmarkJobEntry {
+    snapshot: AlignmentBenchmarkJobSnapshot,
+    cancel_flag: Arc<AtomicBool>,
+    telemetry: Arc<AlignmentBenchmarkRunTelemetry>,
+    pending_terminal: Option<AlignmentBenchmarkPendingTerminal>,
+}
+
+struct AlignmentBenchmarkPendingTerminal {
+    status: AudioAlignmentJobStatus,
+    proposal: Option<AudioAlignmentProposal>,
+    error_code: Option<String>,
+}
+
+struct PreparedAlignmentBenchmarkJob {
+    session_id: String,
+    job_id: String,
+    request: AudioAlignmentRequest,
+    cancel_flag: Arc<AtomicBool>,
+    telemetry: Arc<AlignmentBenchmarkRunTelemetry>,
+    sample_interval_ms: u64,
+    baseline_descendants: HashSet<u32>,
+    initial_snapshot: AlignmentBenchmarkJobSnapshot,
+}
+
+#[derive(Default)]
+struct AlignmentBenchmarkCoordinator {
+    session: Option<AlignmentBenchmarkSessionEntry>,
+    initializing: bool,
+    ordinary_active_runs: usize,
+    sequence: u64,
+    cache_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessTreeMemorySample {
+    working_set_bytes: u64,
+    descendants: HashSet<u32>,
+}
+
+thread_local! {
+    static ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY: RefCell<Option<Arc<AlignmentBenchmarkRunTelemetry>>> = const { RefCell::new(None) };
+}
+
 static AUDIO_ALIGNMENT_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentJobEntry>>> =
     OnceLock::new();
 static AUDIO_ALIGNMENT_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -573,25 +916,33 @@ static V2_LANDMARK_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<SpectralLandmar
     OnceLock::new();
 static VISUAL_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<VisualFeatureFrame>>>> =
     OnceLock::new();
+static ALIGNMENT_BENCHMARK_COORDINATOR: OnceLock<Mutex<AlignmentBenchmarkCoordinator>> =
+    OnceLock::new();
 
 #[tauri::command]
 pub async fn align_audio_files(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentProposal, String> {
-    tauri::async_runtime::spawn_blocking(move || align_audio_files_inner(request))
-        .await
-        .map_err(|error| format!("本地音频对齐任务启动失败：{error}"))?
+    let permit = acquire_ordinary_alignment_run()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        align_audio_files_inner(request)
+    })
+    .await
+    .map_err(|error| format!("本地音频对齐任务启动失败：{error}"))?
 }
 
 #[tauri::command]
 pub async fn start_audio_alignment_job(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentJobSnapshot, String> {
+    let permit = acquire_ordinary_alignment_run()?;
     let job_id = next_audio_alignment_job_id();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     insert_audio_alignment_job(job_id.clone(), cancel_flag.clone())?;
     let worker_job_id = job_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
         run_audio_alignment_job(worker_job_id, cancel_flag, request);
     });
     get_audio_alignment_job(job_id)
@@ -629,6 +980,2064 @@ pub fn cancel_audio_alignment_job(job_id: String) -> Result<AudioAlignmentJobSna
     Ok(entry.snapshot.clone())
 }
 
+#[tauri::command]
+pub async fn begin_alignment_benchmark_session(
+    request: BeginAlignmentBenchmarkSessionRequest,
+) -> Result<AlignmentBenchmarkSessionSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || begin_alignment_benchmark_session_inner(request))
+        .await
+        .map_err(|error| format!("原生对齐基准会话初始化失败：{error}"))?
+}
+
+#[tauri::command]
+pub fn get_active_alignment_benchmark_session(
+) -> Result<Option<AlignmentBenchmarkSessionSnapshot>, String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    if process_supervision_cleanup_faulted() {
+        if let Some(session) = coordinator.session.as_mut() {
+            mark_alignment_benchmark_process_cleanup_blocked(session);
+        }
+    }
+    Ok(coordinator
+        .session
+        .as_ref()
+        .map(create_alignment_benchmark_session_snapshot))
+}
+
+#[tauri::command]
+pub fn reset_alignment_benchmark_caches(
+    session_id: String,
+) -> Result<AlignmentBenchmarkCacheResetReceipt, String> {
+    reset_alignment_benchmark_caches_inner(&session_id)
+}
+
+#[tauri::command]
+pub async fn start_alignment_benchmark_job(
+    session_id: String,
+    request: AudioAlignmentRequest,
+) -> Result<AlignmentBenchmarkJobSnapshot, String> {
+    let prepared = prepare_alignment_benchmark_job(&session_id, request)?;
+    let initial = prepared.initial_snapshot.clone();
+    tauri::async_runtime::spawn_blocking(move || run_alignment_benchmark_job(prepared));
+    Ok(initial)
+}
+
+#[tauri::command]
+pub fn get_alignment_benchmark_job(
+    session_id: String,
+    job_id: String,
+) -> Result<AlignmentBenchmarkJobSnapshot, String> {
+    refresh_alignment_benchmark_cleanup(&session_id, &job_id)?;
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, &session_id)?;
+    if let Some(entry) = session.jobs.get_mut(&job_id) {
+        refresh_alignment_benchmark_job_snapshot(entry)?;
+    }
+    session
+        .jobs
+        .get(&job_id)
+        .map(|entry| entry.snapshot.clone())
+        .ok_or_else(|| format!("基准会话中不存在任务：{job_id}"))
+}
+
+#[tauri::command]
+pub fn cancel_alignment_benchmark_job(
+    session_id: String,
+    job_id: String,
+) -> Result<AlignmentBenchmarkJobSnapshot, String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, &session_id)?;
+    let entry = session
+        .jobs
+        .get_mut(&job_id)
+        .ok_or_else(|| format!("基准会话中不存在任务：{job_id}"))?;
+    if matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) && entry.pending_terminal.is_none()
+    {
+        let cancel_tick = entry.telemetry.record_cancel_request()?;
+        entry.cancel_flag.store(true, Ordering::Release);
+        entry.snapshot.telemetry.cancellation = Some(AlignmentBenchmarkCancellationTelemetry {
+            request_tick_ns: cancel_tick.to_string(),
+            terminal_tick_ns: String::new(),
+            latency_ms: 0.0,
+            command_accepted: true,
+        });
+    }
+    refresh_alignment_benchmark_job_snapshot(entry)?;
+    Ok(entry.snapshot.clone())
+}
+
+#[tauri::command]
+pub fn finish_alignment_benchmark_session(
+    session_id: String,
+) -> Result<AlignmentBenchmarkSessionSnapshot, String> {
+    finish_alignment_benchmark_session_inner(&session_id)
+}
+
+struct OrdinaryAlignmentRunPermit;
+
+impl Drop for OrdinaryAlignmentRunPermit {
+    fn drop(&mut self) {
+        if let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() {
+            coordinator.ordinary_active_runs = coordinator.ordinary_active_runs.saturating_sub(1);
+        }
+    }
+}
+
+struct AlignmentBenchmarkInitializationLease {
+    armed: bool,
+}
+
+impl Drop for AlignmentBenchmarkInitializationLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() {
+            coordinator.initializing = false;
+        }
+    }
+}
+
+fn alignment_benchmark_coordinator() -> &'static Mutex<AlignmentBenchmarkCoordinator> {
+    ALIGNMENT_BENCHMARK_COORDINATOR
+        .get_or_init(|| Mutex::new(AlignmentBenchmarkCoordinator::default()))
+}
+
+fn acquire_ordinary_alignment_run() -> Result<OrdinaryAlignmentRunPermit, String> {
+    ensure_alignment_process_supervision_clean()?;
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    if coordinator.initializing || coordinator.session.is_some() {
+        return Err("原生性能独占会话正在运行；结束该会话后才能启动普通音频对齐任务。".to_string());
+    }
+    coordinator.ordinary_active_runs = coordinator.ordinary_active_runs.saturating_add(1);
+    Ok(OrdinaryAlignmentRunPermit)
+}
+
+fn acquire_alignment_benchmark_initialization_lease(
+) -> Result<AlignmentBenchmarkInitializationLease, String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    validate_alignment_benchmark_lease_availability(
+        coordinator.session.is_some(),
+        coordinator.initializing,
+        coordinator.ordinary_active_runs,
+        has_active_audio_alignment_jobs()?,
+    )?;
+    coordinator.initializing = true;
+    Ok(AlignmentBenchmarkInitializationLease { armed: true })
+}
+
+fn begin_alignment_benchmark_session_inner(
+    request: BeginAlignmentBenchmarkSessionRequest,
+) -> Result<AlignmentBenchmarkSessionSnapshot, String> {
+    if process_supervision_cleanup_faulted() {
+        return Err(
+            "blocked:process-cleanup：先前的受监督媒体进程未能可信收尾，不能创建基准会话。"
+                .to_string(),
+        );
+    }
+    let sample_interval_ms = request
+        .memory_sample_interval_ms
+        .unwrap_or(DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS);
+    if !(MIN_BENCHMARK_SAMPLE_INTERVAL_MS..=MAX_BENCHMARK_SAMPLE_INTERVAL_MS)
+        .contains(&sample_interval_ms)
+    {
+        return Err(format!(
+            "内存采样间隔必须在 {MIN_BENCHMARK_SAMPLE_INTERVAL_MS}–{MAX_BENCHMARK_SAMPLE_INTERVAL_MS} ms 之间。"
+        ));
+    }
+    let ffmpeg_request = request.ffmpeg_path.as_deref().unwrap_or("ffmpeg");
+    let ffprobe_request = request
+        .ffprobe_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_ffprobe_path(ffmpeg_request));
+    let mut initialization_lease = acquire_alignment_benchmark_initialization_lease()?;
+    let (baseline_descendants, (environment, ffmpeg_tool, ffprobe_tool)) =
+        collect_alignment_benchmark_baseline_before_probe(
+            || sample_process_tree_memory(std::process::id()).map(|sample| sample.descendants),
+            || collect_alignment_benchmark_environment(ffmpeg_request, &ffprobe_request),
+        )?;
+
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    if !coordinator.initializing || coordinator.session.is_some() {
+        return Err("原生性能 initializing lease 在环境采集期间失效。".to_string());
+    }
+    coordinator.sequence = coordinator.sequence.saturating_add(1);
+    let session_id =
+        create_alignment_benchmark_id("alignment-benchmark-session", coordinator.sequence)?;
+    let (status, cleanup_reason) =
+        alignment_benchmark_initial_lifecycle_state(process_supervision_cleanup_faulted());
+    let session = AlignmentBenchmarkSessionEntry {
+        session_id,
+        status,
+        origin: Instant::now(),
+        sample_interval_ms,
+        cache_generation: coordinator.cache_generation,
+        environment,
+        ffmpeg_tool,
+        ffprobe_tool,
+        toolchain_integrity_failed: false,
+        baseline_descendants,
+        active_job_id: None,
+        cleanup_reason,
+        outstanding_receipt: None,
+        jobs: HashMap::new(),
+    };
+    let snapshot = create_alignment_benchmark_session_snapshot(&session);
+    coordinator.initializing = false;
+    coordinator.session = Some(session);
+    initialization_lease.armed = false;
+    Ok(snapshot)
+}
+
+fn collect_alignment_benchmark_baseline_before_probe<T>(
+    capture_baseline: impl FnOnce() -> Result<HashSet<u32>, String>,
+    probe_environment: impl FnOnce() -> Result<T, String>,
+) -> Result<(HashSet<u32>, T), String> {
+    // The process baseline must predate every executable probe. Otherwise a wrapper can spawn a
+    // persistent helper during `-version` and have that helper incorrectly grandfathered into the
+    // session baseline, bypassing residual-process cleanup for the rest of the lease.
+    let baseline = capture_baseline()?;
+    let environment = probe_environment()?;
+    Ok((baseline, environment))
+}
+
+fn validate_alignment_benchmark_lease_availability(
+    has_session: bool,
+    initializing: bool,
+    ordinary_active_runs: usize,
+    has_active_job_snapshot: bool,
+) -> Result<(), String> {
+    if has_session || initializing {
+        return Err("已有原生性能独占会话；不能重复取得 lease。".to_string());
+    }
+    if ordinary_active_runs != 0 || has_active_job_snapshot {
+        return Err("仍有普通音频对齐任务在运行；基准会话未取得 lease。".to_string());
+    }
+    Ok(())
+}
+
+fn has_active_audio_alignment_jobs() -> Result<bool, String> {
+    let jobs = audio_alignment_jobs()
+        .lock()
+        .map_err(|_| "音频对齐任务状态锁已损坏。".to_string())?;
+    Ok(jobs.values().any(|entry| {
+        matches!(
+            entry.snapshot.status,
+            AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+        )
+    }))
+}
+
+fn create_alignment_benchmark_session_snapshot(
+    session: &AlignmentBenchmarkSessionEntry,
+) -> AlignmentBenchmarkSessionSnapshot {
+    AlignmentBenchmarkSessionSnapshot {
+        schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+        session_id: session.session_id.clone(),
+        status: session.status,
+        session_origin_tick_ns: "0".to_string(),
+        cache_generation: session.cache_generation,
+        memory_scope: "application-process-tree",
+        memory_sample_interval_ms: session.sample_interval_ms,
+        environment: session.environment.clone(),
+        active_job_id: session.active_job_id.clone(),
+        cleanup_issue: session.cleanup_reason.clone(),
+    }
+}
+
+fn require_alignment_benchmark_session<'a>(
+    coordinator: &'a AlignmentBenchmarkCoordinator,
+    session_id: &str,
+) -> Result<&'a AlignmentBenchmarkSessionEntry, String> {
+    let session = coordinator
+        .session
+        .as_ref()
+        .ok_or_else(|| "没有活动的原生性能会话。".to_string())?;
+    if session.session_id != session_id {
+        return Err("性能任务与当前独占会话不匹配。".to_string());
+    }
+    Ok(session)
+}
+
+fn require_alignment_benchmark_session_mut<'a>(
+    coordinator: &'a mut AlignmentBenchmarkCoordinator,
+    session_id: &str,
+) -> Result<&'a mut AlignmentBenchmarkSessionEntry, String> {
+    let session = coordinator
+        .session
+        .as_mut()
+        .ok_or_else(|| "没有活动的原生性能会话。".to_string())?;
+    if session.session_id != session_id {
+        return Err("性能任务与当前独占会话不匹配。".to_string());
+    }
+    Ok(session)
+}
+
+fn reset_alignment_benchmark_caches_inner(
+    session_id: &str,
+) -> Result<AlignmentBenchmarkCacheResetReceipt, String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    {
+        let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+        ensure_alignment_benchmark_supervision_clean(session)?;
+        if session.status != AlignmentBenchmarkSessionStatus::Active {
+            return Err("基准会话处于 cleanup-blocked，不能重置缓存。".to_string());
+        }
+        if session.active_job_id.is_some() {
+            return Err("基准任务运行期间不能重置缓存。".to_string());
+        }
+    }
+
+    let mut audio = audio_feature_cache()
+        .lock()
+        .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
+    let mut landmarks = v2_landmark_cache()
+        .lock()
+        .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+    let mut visual = visual_feature_cache()
+        .lock()
+        .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
+    let before = AlignmentBenchmarkCacheCounts {
+        audio_feature_entries: audio.len(),
+        landmark_entries: landmarks.len(),
+        visual_feature_entries: visual.len(),
+    };
+    audio.clear();
+    landmarks.clear();
+    visual.clear();
+    let after = AlignmentBenchmarkCacheCounts::default();
+    let previous_generation = coordinator.cache_generation;
+    coordinator.cache_generation = coordinator.cache_generation.saturating_add(1);
+    let generation = coordinator.cache_generation;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+    session.cache_generation = generation;
+    let reset_tick_ns = session.origin.elapsed().as_nanos().max(1);
+    session.outstanding_receipt = Some(AlignmentBenchmarkOutstandingReceipt {
+        generation,
+        reset_tick_ns,
+        used: false,
+    });
+    Ok(AlignmentBenchmarkCacheResetReceipt {
+        schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        reset_tick_ns: reset_tick_ns.to_string(),
+        previous_generation,
+        cache_generation: generation,
+        before,
+        after,
+        all_caches_empty: true,
+    })
+}
+
+fn prepare_alignment_benchmark_job(
+    session_id: &str,
+    mut request: AudioAlignmentRequest,
+) -> Result<PreparedAlignmentBenchmarkJob, String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    coordinator.sequence = coordinator.sequence.saturating_add(1);
+    let sequence = coordinator.sequence;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+    if session.status != AlignmentBenchmarkSessionStatus::Active {
+        return Err("基准会话处于 cleanup-blocked，不能启动新任务。".to_string());
+    }
+    ensure_alignment_benchmark_supervision_clean(session)?;
+    if session.active_job_id.is_some() {
+        return Err("同一基准会话一次只能运行一个任务。".to_string());
+    }
+    if verify_alignment_benchmark_session_toolchain(session).is_err() {
+        block_alignment_benchmark_session_for_toolchain(session);
+        return Err("基准媒体工具在任务启动前未通过固定身份复核。".to_string());
+    }
+    let receipt_generation = consume_alignment_benchmark_reset_receipt(
+        session.outstanding_receipt.as_mut(),
+        session.cache_generation,
+    )?;
+    request.ffmpeg_path = Some(session.ffmpeg_tool.path.to_string_lossy().into_owned());
+    request.ffprobe_path = Some(session.ffprobe_tool.path.to_string_lossy().into_owned());
+    let job_id = create_alignment_benchmark_id("alignment-benchmark-job", sequence)?;
+    let before = read_alignment_benchmark_cache_counts()?;
+    let telemetry = Arc::new(AlignmentBenchmarkRunTelemetry::new(
+        session.origin,
+        session.sample_interval_ms,
+        session.cache_generation,
+        before,
+    ));
+    if receipt_generation.is_some() {
+        telemetry.verify_reset_generation(receipt_generation, session.cache_generation)?;
+    }
+    let initial_snapshot =
+        create_initial_alignment_benchmark_job_snapshot(session_id, &job_id, &telemetry)?;
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    session.active_job_id = Some(job_id.clone());
+    session.jobs.insert(
+        job_id.clone(),
+        AlignmentBenchmarkJobEntry {
+            snapshot: initial_snapshot.clone(),
+            cancel_flag: cancel_flag.clone(),
+            telemetry: telemetry.clone(),
+            pending_terminal: None,
+        },
+    );
+    Ok(PreparedAlignmentBenchmarkJob {
+        session_id: session_id.to_string(),
+        job_id,
+        request,
+        cancel_flag,
+        telemetry,
+        sample_interval_ms: session.sample_interval_ms,
+        baseline_descendants: session.baseline_descendants.clone(),
+        initial_snapshot,
+    })
+}
+
+fn verify_alignment_benchmark_session_toolchain(
+    session: &AlignmentBenchmarkSessionEntry,
+) -> Result<(), String> {
+    if session.toolchain_integrity_failed {
+        return Err("基准媒体工具此前已发生身份漂移。".to_string());
+    }
+    verify_alignment_benchmark_pinned_tool("ffmpeg", &session.ffmpeg_tool)?;
+    verify_alignment_benchmark_pinned_tool("ffprobe", &session.ffprobe_tool)
+}
+
+fn ensure_alignment_benchmark_supervision_clean(
+    session: &mut AlignmentBenchmarkSessionEntry,
+) -> Result<(), String> {
+    if !process_supervision_cleanup_faulted() {
+        return Ok(());
+    }
+    mark_alignment_benchmark_process_cleanup_blocked(session);
+    Err("blocked:process-cleanup：受监督媒体进程存在粘性清理故障。".to_string())
+}
+
+fn alignment_benchmark_initial_lifecycle_state(
+    cleanup_faulted: bool,
+) -> (AlignmentBenchmarkSessionStatus, Option<String>) {
+    if cleanup_faulted {
+        (
+            AlignmentBenchmarkSessionStatus::CleanupBlocked,
+            Some(BENCHMARK_PROCESS_CLEANUP_REASON.to_string()),
+        )
+    } else {
+        (AlignmentBenchmarkSessionStatus::Active, None)
+    }
+}
+
+fn mark_alignment_benchmark_process_cleanup_blocked(session: &mut AlignmentBenchmarkSessionEntry) {
+    session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+    session.cleanup_reason = Some(BENCHMARK_PROCESS_CLEANUP_REASON.to_string());
+}
+
+fn block_alignment_benchmark_session_for_toolchain(session: &mut AlignmentBenchmarkSessionEntry) {
+    session.toolchain_integrity_failed = true;
+    session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+    session.cleanup_reason =
+        Some("固定媒体工具身份复核失败；lease 与只读 pin 保持占用。".to_string());
+}
+
+fn verify_alignment_benchmark_session_toolchain_by_id(session_id: &str) -> Result<(), String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+    ensure_alignment_benchmark_supervision_clean(session)?;
+    if verify_alignment_benchmark_session_toolchain(session).is_err() {
+        block_alignment_benchmark_session_for_toolchain(session);
+        return Err("固定媒体工具身份复核失败。".to_string());
+    }
+    Ok(())
+}
+
+fn consume_alignment_benchmark_reset_receipt(
+    receipt: Option<&mut AlignmentBenchmarkOutstandingReceipt>,
+    current_generation: u64,
+) -> Result<Option<u64>, String> {
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if receipt.used {
+        return Ok(None);
+    }
+    if receipt.generation != current_generation {
+        return Err("缓存 reset receipt 与当前 generation 不匹配。".to_string());
+    }
+    if receipt.reset_tick_ns == 0 {
+        return Err("缓存 reset receipt 缺少单调时钟签发点。".to_string());
+    }
+    receipt.used = true;
+    Ok(Some(receipt.generation))
+}
+
+impl AlignmentBenchmarkRunTelemetry {
+    fn new(
+        session_origin: Instant,
+        sample_interval_ms: u64,
+        generation: u64,
+        before: AlignmentBenchmarkCacheCounts,
+    ) -> Self {
+        Self {
+            session_origin,
+            state: Mutex::new(AlignmentBenchmarkRunTelemetryState {
+                stages: Vec::new(),
+                current_stage: None,
+                cache: AlignmentBenchmarkCacheTelemetry {
+                    generation,
+                    before: before.clone(),
+                    after: before,
+                    audio_features: AlignmentBenchmarkCacheCounters::default(),
+                    landmarks: AlignmentBenchmarkCacheCounters::default(),
+                    visual_features: AlignmentBenchmarkCacheCounters::default(),
+                },
+                memory: AlignmentBenchmarkMemoryTelemetry::new(sample_interval_ms),
+                started_tick_ns: 0,
+                cancel_requested_tick_ns: None,
+                terminal_tick_ns: None,
+                last_memory_sample_at: None,
+                memory_last_error: None,
+            }),
+        }
+    }
+
+    fn verify_reset_generation(
+        &self,
+        receipt_generation: Option<u64>,
+        current_generation: u64,
+    ) -> Result<(), String> {
+        if receipt_generation != Some(current_generation) {
+            return Err("cold cache reset receipt 未被严格绑定到当前任务。".to_string());
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        if state.cache.generation != current_generation
+            || state.cache.before != AlignmentBenchmarkCacheCounts::default()
+        {
+            return Err("cold cache receipt 已签发，但任务开始时三类缓存并非全空。".to_string());
+        }
+        Ok(())
+    }
+
+    fn mark_started(&self) -> Result<u128, String> {
+        let tick = self.session_origin.elapsed().as_nanos();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        if state.started_tick_ns == 0 {
+            state.started_tick_ns = tick.max(1);
+        }
+        Ok(state.started_tick_ns)
+    }
+
+    fn transition_stage(&self, key: &str, label: &str) -> Result<(), String> {
+        let tick = self.session_origin.elapsed().as_nanos();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        if state
+            .current_stage
+            .as_ref()
+            .is_some_and(|stage| stage.key == key)
+        {
+            return Ok(());
+        }
+        close_alignment_benchmark_stage(&mut state, tick, AudioAlignmentJobStatus::Completed);
+        let occurrence = state
+            .stages
+            .iter()
+            .filter(|stage| stage.stage_key == key)
+            .count()
+            .saturating_add(1) as u32;
+        state.current_stage = Some(AlignmentBenchmarkActiveStage {
+            key: key.to_string(),
+            label: label.to_string(),
+            occurrence,
+            started_tick_ns: tick,
+        });
+        Ok(())
+    }
+
+    fn record_cache_event(
+        &self,
+        kind: BenchmarkCacheKind,
+        event: BenchmarkCacheEvent,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        let counters = match kind {
+            BenchmarkCacheKind::AudioFeatures => &mut state.cache.audio_features,
+            BenchmarkCacheKind::V2Landmarks => &mut state.cache.landmarks,
+            BenchmarkCacheKind::VisualFeatures => &mut state.cache.visual_features,
+        };
+        match event {
+            BenchmarkCacheEvent::Hit => counters.hits = counters.hits.saturating_add(1),
+            BenchmarkCacheEvent::Miss => counters.misses = counters.misses.saturating_add(1),
+            BenchmarkCacheEvent::Write => counters.writes = counters.writes.saturating_add(1),
+            BenchmarkCacheEvent::Eviction => {
+                counters.evictions = counters.evictions.saturating_add(1)
+            }
+        }
+        Ok(())
+    }
+
+    fn record_cancel_request(&self) -> Result<u128, String> {
+        let tick = self.session_origin.elapsed().as_nanos();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        Ok(*state.cancel_requested_tick_ns.get_or_insert(tick))
+    }
+
+    fn record_memory_sample(
+        &self,
+        sampled_at: Instant,
+        result: Result<ProcessTreeMemorySample, String>,
+        baseline_descendants: &HashSet<u32>,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(previous) = state.last_memory_sample_at {
+            let gap_ms = sampled_at.duration_since(previous).as_secs_f64() * 1_000.0;
+            state.memory.maximum_sample_gap_ms = state.memory.maximum_sample_gap_ms.max(gap_ms);
+            if gap_ms > state.memory.sample_interval_ms as f64 * 4.0 {
+                state.memory.coverage_complete = false;
+                state.memory_last_error =
+                    Some("内存采样间隔出现超过配置值四倍的缺口。".to_string());
+            }
+        }
+        state.last_memory_sample_at = Some(sampled_at);
+        match result {
+            Ok(sample) => {
+                state.memory.sample_count = state.memory.sample_count.saturating_add(1);
+                state.memory.peak_process_tree_rss_bytes = Some(
+                    state
+                        .memory
+                        .peak_process_tree_rss_bytes
+                        .unwrap_or(0)
+                        .max(sample.working_set_bytes),
+                );
+                state.memory.residual_process_count =
+                    sample.descendants.difference(baseline_descendants).count();
+            }
+            Err(error) => {
+                state.memory.failed_sample_count =
+                    state.memory.failed_sample_count.saturating_add(1);
+                state.memory.coverage_complete = false;
+                state.memory_last_error = Some(error);
+            }
+        }
+    }
+
+    fn set_cache_after(&self, after: AlignmentBenchmarkCacheCounts) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        state.cache.after = after;
+        Ok(())
+    }
+
+    fn set_residual_process_count(&self, residual_count: usize) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        state.memory.residual_process_count = residual_count;
+        state.memory.process_tree_empty_at_terminal = residual_count == 0;
+        Ok(())
+    }
+
+    fn finish(&self, status: AudioAlignmentJobStatus) -> Result<u128, String> {
+        let tick = self.session_origin.elapsed().as_nanos();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        close_alignment_benchmark_stage(&mut state, tick, status);
+        state.terminal_tick_ns = Some(tick);
+        state.memory.process_tree_empty_at_terminal = state.memory.residual_process_count == 0;
+        Ok(tick)
+    }
+
+    fn current_stage(&self) -> Result<(String, String), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        Ok(state
+            .current_stage
+            .as_ref()
+            .map(|stage| (stage.key.clone(), stage.label.clone()))
+            .unwrap_or_else(|| ("queued".to_string(), "排队".to_string())))
+    }
+
+    fn snapshot(&self) -> Result<AlignmentBenchmarkJobTelemetry, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "基准任务 telemetry 锁已损坏。".to_string())?;
+        let now = self.session_origin.elapsed().as_nanos();
+        let end = state.terminal_tick_ns;
+        let elapsed_end = end.unwrap_or(now);
+        let elapsed_ms = elapsed_end.saturating_sub(state.started_tick_ns) as f64 / 1_000_000.0;
+        let cancellation = state.cancel_requested_tick_ns.map(|request_tick| {
+            let terminal_tick = end.unwrap_or(0);
+            AlignmentBenchmarkCancellationTelemetry {
+                request_tick_ns: request_tick.to_string(),
+                terminal_tick_ns: end.map(|tick| tick.to_string()).unwrap_or_default(),
+                latency_ms: if terminal_tick == 0 {
+                    0.0
+                } else {
+                    terminal_tick.saturating_sub(request_tick) as f64 / 1_000_000.0
+                },
+                command_accepted: true,
+            }
+        });
+        Ok(AlignmentBenchmarkJobTelemetry {
+            schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+            clock: "rust-std-instant-session-relative-v1",
+            start_tick_ns: state.started_tick_ns.to_string(),
+            end_tick_ns: end.map(|tick| tick.to_string()),
+            elapsed_ms,
+            stages: state.stages.clone(),
+            cache: state.cache.clone(),
+            memory: state.memory.clone(),
+            cancellation,
+        })
+    }
+}
+
+fn close_alignment_benchmark_stage(
+    state: &mut AlignmentBenchmarkRunTelemetryState,
+    end_tick_ns: u128,
+    status: AudioAlignmentJobStatus,
+) {
+    let Some(stage) = state.current_stage.take() else {
+        return;
+    };
+    state.stages.push(AlignmentBenchmarkStageTiming {
+        stage_key: stage.key,
+        occurrence: stage.occurrence,
+        start_tick_ns: stage.started_tick_ns.to_string(),
+        end_tick_ns: end_tick_ns.to_string(),
+        elapsed_ms: end_tick_ns.saturating_sub(stage.started_tick_ns) as f64 / 1_000_000.0,
+        status,
+    });
+}
+
+fn create_initial_alignment_benchmark_job_snapshot(
+    session_id: &str,
+    job_id: &str,
+    telemetry: &AlignmentBenchmarkRunTelemetry,
+) -> Result<AlignmentBenchmarkJobSnapshot, String> {
+    Ok(AlignmentBenchmarkJobSnapshot {
+        schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        job_id: job_id.to_string(),
+        status: AudioAlignmentJobStatus::Queued,
+        stage_key: "queued".to_string(),
+        stage_label: "排队".to_string(),
+        proposal: None,
+        error_code: None,
+        telemetry: telemetry.snapshot()?,
+    })
+}
+
+fn benchmark_stage(key: &str, label: &str) {
+    ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY.with(|slot| {
+        if let Some(telemetry) = slot.borrow().as_ref() {
+            let _ = telemetry.transition_stage(key, label);
+        }
+    });
+}
+
+fn benchmark_cache_event(kind: BenchmarkCacheKind, event: BenchmarkCacheEvent) {
+    ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY.with(|slot| {
+        if let Some(telemetry) = slot.borrow().as_ref() {
+            let _ = telemetry.record_cache_event(kind, event);
+        }
+    });
+}
+
+fn with_alignment_benchmark_telemetry<T>(
+    telemetry: Arc<AlignmentBenchmarkRunTelemetry>,
+    action: impl FnOnce() -> T,
+) -> T {
+    let previous = ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY.with(|slot| slot.replace(Some(telemetry)));
+    let _guard = ActiveAlignmentBenchmarkTelemetryGuard { previous };
+    action()
+}
+
+struct ActiveAlignmentBenchmarkTelemetryGuard {
+    previous: Option<Arc<AlignmentBenchmarkRunTelemetry>>,
+}
+
+impl Drop for ActiveAlignmentBenchmarkTelemetryGuard {
+    fn drop(&mut self) {
+        ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+fn run_alignment_benchmark_job(prepared: PreparedAlignmentBenchmarkJob) {
+    let _ = prepared.telemetry.mark_started();
+    benchmark_update_job_snapshot(
+        &prepared.session_id,
+        &prepared.job_id,
+        AudioAlignmentJobStatus::Running,
+        None,
+        None,
+    );
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    prepared.telemetry.record_memory_sample(
+        Instant::now(),
+        sample_process_tree_memory(std::process::id()),
+        &prepared.baseline_descendants,
+    );
+    let sampler = match spawn_alignment_benchmark_memory_sampler(
+        prepared.telemetry.clone(),
+        sampler_stop.clone(),
+        prepared.sample_interval_ms,
+        prepared.baseline_descendants.clone(),
+    ) {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            prepared.telemetry.record_memory_sample(
+                Instant::now(),
+                Err(error),
+                &prepared.baseline_descendants,
+            );
+            let _ = verify_alignment_benchmark_session_toolchain_by_id(&prepared.session_id);
+            complete_or_block_alignment_benchmark_job(
+                &prepared.session_id,
+                &prepared.job_id,
+                AlignmentBenchmarkPendingTerminal {
+                    status: AudioAlignmentJobStatus::Failed,
+                    proposal: None,
+                    error_code: Some("memory-sampler-start-failed".to_string()),
+                },
+                &prepared.baseline_descendants,
+            );
+            return;
+        }
+    };
+    let cancel_flag = prepared.cancel_flag.clone();
+    let mut update = |_progress: f64, _message: &str| Ok(());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_alignment_benchmark_telemetry(prepared.telemetry.clone(), || {
+            align_audio_files_with_progress(
+                prepared.request,
+                &mut update,
+                Some(cancel_flag.as_ref()),
+            )
+        })
+    }))
+    .unwrap_or_else(|_| Err("原生对齐基准 worker 异常退出。".to_string()));
+    sampler_stop.store(true, Ordering::Release);
+    if sampler.join().is_err() {
+        prepared.telemetry.record_memory_sample(
+            Instant::now(),
+            Err("内存采样线程异常退出。".to_string()),
+            &prepared.baseline_descendants,
+        );
+    }
+    prepared.telemetry.record_memory_sample(
+        Instant::now(),
+        sample_process_tree_memory(std::process::id()),
+        &prepared.baseline_descendants,
+    );
+    let cache_telemetry_complete = read_alignment_benchmark_cache_counts()
+        .and_then(|after| prepared.telemetry.set_cache_after(after))
+        .is_ok();
+    let toolchain_telemetry_complete =
+        verify_alignment_benchmark_session_toolchain_by_id(&prepared.session_id).is_ok();
+
+    let pending = if !toolchain_telemetry_complete {
+        AlignmentBenchmarkPendingTerminal {
+            status: AudioAlignmentJobStatus::Failed,
+            proposal: None,
+            error_code: Some("toolchain-integrity-failed".to_string()),
+        }
+    } else if !cache_telemetry_complete {
+        AlignmentBenchmarkPendingTerminal {
+            status: AudioAlignmentJobStatus::Failed,
+            proposal: None,
+            error_code: Some("cache-telemetry-incomplete".to_string()),
+        }
+    } else {
+        match result {
+            Ok(proposal) => AlignmentBenchmarkPendingTerminal {
+                status: AudioAlignmentJobStatus::Completed,
+                proposal: Some(proposal),
+                error_code: None,
+            },
+            Err(error)
+                if prepared.cancel_flag.load(Ordering::Acquire)
+                    || error == AUDIO_ALIGNMENT_CANCELLED =>
+            {
+                AlignmentBenchmarkPendingTerminal {
+                    status: AudioAlignmentJobStatus::Cancelled,
+                    proposal: None,
+                    error_code: None,
+                }
+            }
+            Err(_) => AlignmentBenchmarkPendingTerminal {
+                status: AudioAlignmentJobStatus::Failed,
+                proposal: None,
+                error_code: Some("alignment-failed".to_string()),
+            },
+        }
+    };
+    complete_or_block_alignment_benchmark_job(
+        &prepared.session_id,
+        &prepared.job_id,
+        pending,
+        &prepared.baseline_descendants,
+    );
+}
+
+fn spawn_alignment_benchmark_memory_sampler(
+    telemetry: Arc<AlignmentBenchmarkRunTelemetry>,
+    stop: Arc<AtomicBool>,
+    sample_interval_ms: u64,
+    baseline_descendants: HashSet<u32>,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("alignment-benchmark-memory".to_string())
+        .spawn(move || loop {
+            let sampled_at = Instant::now();
+            telemetry.record_memory_sample(
+                sampled_at,
+                sample_process_tree_memory(std::process::id()),
+                &baseline_descendants,
+            );
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(sample_interval_ms));
+        })
+        .map_err(|error| format!("内存采样线程启动失败：{error}"))
+}
+
+fn benchmark_update_job_snapshot(
+    session_id: &str,
+    job_id: &str,
+    status: AudioAlignmentJobStatus,
+    proposal: Option<AudioAlignmentProposal>,
+    error_code: Option<String>,
+) {
+    let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() else {
+        return;
+    };
+    let Ok(session) = require_alignment_benchmark_session_mut(&mut coordinator, session_id) else {
+        return;
+    };
+    let Some(entry) = session.jobs.get_mut(job_id) else {
+        return;
+    };
+    let Ok((stage_key, stage_label)) = entry.telemetry.current_stage() else {
+        return;
+    };
+    let Ok(telemetry) = entry.telemetry.snapshot() else {
+        return;
+    };
+    entry.snapshot.status = status;
+    entry.snapshot.stage_key = stage_key;
+    entry.snapshot.stage_label = stage_label;
+    entry.snapshot.proposal = proposal;
+    entry.snapshot.error_code = error_code;
+    entry.snapshot.telemetry = telemetry;
+}
+
+fn refresh_alignment_benchmark_job_snapshot(
+    entry: &mut AlignmentBenchmarkJobEntry,
+) -> Result<(), String> {
+    if matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) {
+        let (stage_key, stage_label) = entry.telemetry.current_stage()?;
+        entry.snapshot.stage_key = stage_key;
+        entry.snapshot.stage_label = stage_label;
+    }
+    entry.snapshot.telemetry = entry.telemetry.snapshot()?;
+    Ok(())
+}
+
+fn complete_or_block_alignment_benchmark_job(
+    session_id: &str,
+    job_id: &str,
+    pending: AlignmentBenchmarkPendingTerminal,
+    baseline_descendants: &HashSet<u32>,
+) {
+    let deadline = Instant::now() + Duration::from_millis(BENCHMARK_RESIDUAL_GRACE_MS);
+    loop {
+        match sample_process_tree_memory(std::process::id()) {
+            Ok(sample) => {
+                let residual = sample.descendants.difference(baseline_descendants).count();
+                if let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() {
+                    if let Ok(session) =
+                        require_alignment_benchmark_session_mut(&mut coordinator, session_id)
+                    {
+                        if let Some(entry) = session.jobs.get_mut(job_id) {
+                            entry.telemetry.record_memory_sample(
+                                Instant::now(),
+                                Ok(sample),
+                                baseline_descendants,
+                            );
+                            let _ = entry.telemetry.set_residual_process_count(residual);
+                        }
+                    }
+                }
+                if residual == 0 {
+                    finalize_alignment_benchmark_job(session_id, job_id, pending);
+                    return;
+                }
+            }
+            Err(error) => {
+                if let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() {
+                    if let Ok(session) =
+                        require_alignment_benchmark_session_mut(&mut coordinator, session_id)
+                    {
+                        if let Some(entry) = session.jobs.get_mut(job_id) {
+                            entry.telemetry.record_memory_sample(
+                                Instant::now(),
+                                Err(error),
+                                baseline_descendants,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS));
+    }
+    if let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() {
+        if let Ok(session) = require_alignment_benchmark_session_mut(&mut coordinator, session_id) {
+            session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+            session.cleanup_reason = Some(
+                "基准算法已退出，但仍检测到会话开始后出现的后代进程；lease 保持占用。".to_string(),
+            );
+            if let Some(entry) = session.jobs.get_mut(job_id) {
+                entry.pending_terminal = Some(pending);
+                entry.snapshot.status = AudioAlignmentJobStatus::Running;
+                entry.snapshot.error_code = Some("cleanup-blocked".to_string());
+                if let Ok(telemetry) = entry.telemetry.snapshot() {
+                    entry.snapshot.telemetry = telemetry;
+                }
+            }
+        }
+    }
+}
+
+fn finalize_alignment_benchmark_job(
+    session_id: &str,
+    job_id: &str,
+    pending: AlignmentBenchmarkPendingTerminal,
+) {
+    let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() else {
+        return;
+    };
+    let Ok(session) = require_alignment_benchmark_session_mut(&mut coordinator, session_id) else {
+        return;
+    };
+    let Some(entry) = session.jobs.get_mut(job_id) else {
+        return;
+    };
+    let _ = entry.telemetry.set_residual_process_count(0);
+    let _ = entry.telemetry.finish(pending.status);
+    let (stage_key, stage_label) = match pending.status {
+        AudioAlignmentJobStatus::Completed => ("completed", "已完成"),
+        AudioAlignmentJobStatus::Failed => ("failed", "失败"),
+        AudioAlignmentJobStatus::Cancelled => ("cancelled", "已取消"),
+        _ => ("reporting", "生成复核数据"),
+    };
+    entry.snapshot.status = pending.status;
+    entry.snapshot.stage_key = stage_key.to_string();
+    entry.snapshot.stage_label = stage_label.to_string();
+    entry.snapshot.proposal = pending.proposal;
+    entry.snapshot.error_code = pending.error_code;
+    if let Ok(telemetry) = entry.telemetry.snapshot() {
+        entry.snapshot.telemetry = telemetry;
+    }
+    session.active_job_id = None;
+    if process_supervision_cleanup_faulted() {
+        mark_alignment_benchmark_process_cleanup_blocked(session);
+    } else if session.toolchain_integrity_failed {
+        session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+        session.cleanup_reason =
+            Some("固定媒体工具身份复核失败；lease 与只读 pin 保持占用。".to_string());
+    } else {
+        session.status = AlignmentBenchmarkSessionStatus::Active;
+        session.cleanup_reason = None;
+    }
+}
+
+fn refresh_alignment_benchmark_cleanup(session_id: &str, job_id: &str) -> Result<(), String> {
+    let (baseline, has_pending) = {
+        let coordinator = alignment_benchmark_coordinator()
+            .lock()
+            .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+        let session = require_alignment_benchmark_session(&coordinator, session_id)?;
+        let entry = session
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| format!("基准会话中不存在任务：{job_id}"))?;
+        (
+            session.baseline_descendants.clone(),
+            entry.pending_terminal.is_some(),
+        )
+    };
+    if !has_pending {
+        return Ok(());
+    }
+    let sample = match sample_process_tree_memory(std::process::id()) {
+        Ok(sample) => sample,
+        Err(error) => {
+            let mut coordinator = alignment_benchmark_coordinator()
+                .lock()
+                .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+            let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+            if let Some(entry) = session.jobs.get_mut(job_id) {
+                entry
+                    .telemetry
+                    .record_memory_sample(Instant::now(), Err(error), &baseline);
+            }
+            return Ok(());
+        }
+    };
+    {
+        let mut coordinator = alignment_benchmark_coordinator()
+            .lock()
+            .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+        let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+        if let Some(entry) = session.jobs.get_mut(job_id) {
+            entry
+                .telemetry
+                .record_memory_sample(Instant::now(), Ok(sample.clone()), &baseline);
+        }
+    }
+    if sample.descendants.difference(&baseline).next().is_some() {
+        return Ok(());
+    }
+    let pending = {
+        let mut coordinator = alignment_benchmark_coordinator()
+            .lock()
+            .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+        let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+        session
+            .jobs
+            .get_mut(job_id)
+            .and_then(|entry| entry.pending_terminal.take())
+    };
+    if let Some(pending) = pending {
+        finalize_alignment_benchmark_job(session_id, job_id, pending);
+    }
+    Ok(())
+}
+
+fn finish_alignment_benchmark_session_inner(
+    session_id: &str,
+) -> Result<AlignmentBenchmarkSessionSnapshot, String> {
+    let pending_jobs = {
+        let coordinator = alignment_benchmark_coordinator()
+            .lock()
+            .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+        let session = require_alignment_benchmark_session(&coordinator, session_id)?;
+        session
+            .jobs
+            .iter()
+            .filter(|(_, entry)| entry.pending_terminal.is_some())
+            .map(|(job_id, _)| job_id.clone())
+            .collect::<Vec<_>>()
+    };
+    for job_id in pending_jobs {
+        let _ = refresh_alignment_benchmark_cleanup(session_id, &job_id);
+    }
+
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+    let has_non_terminal = session.jobs.values().any(|entry| {
+        matches!(
+            entry.snapshot.status,
+            AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+        )
+    });
+    if session.active_job_id.is_some() || has_non_terminal {
+        session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+        session.cleanup_reason =
+            Some("仍有基准任务或后代进程未进入可信终态；lease 未释放。".to_string());
+        return Ok(create_alignment_benchmark_session_snapshot(session));
+    }
+    if ensure_alignment_benchmark_supervision_clean(session).is_err() {
+        return Ok(create_alignment_benchmark_session_snapshot(session));
+    }
+    if verify_alignment_benchmark_session_toolchain(session).is_err() {
+        block_alignment_benchmark_session_for_toolchain(session);
+        return Ok(create_alignment_benchmark_session_snapshot(session));
+    }
+    let sample = match sample_process_tree_memory(std::process::id()) {
+        Ok(sample) => sample,
+        Err(_) => {
+            session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+            session.cleanup_reason =
+                Some("无法确认进程树已清空；lease 按 fail-closed 保持占用。".to_string());
+            return Ok(create_alignment_benchmark_session_snapshot(session));
+        }
+    };
+    if sample
+        .descendants
+        .difference(&session.baseline_descendants)
+        .next()
+        .is_some()
+    {
+        session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+        session.cleanup_reason =
+            Some("会话开始后出现的后代进程仍未退出；lease 未释放。".to_string());
+        return Ok(create_alignment_benchmark_session_snapshot(session));
+    }
+
+    let cache_cleanup = (|| -> Result<(), String> {
+        let mut audio = audio_feature_cache()
+            .lock()
+            .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
+        let mut landmarks = v2_landmark_cache()
+            .lock()
+            .map_err(|_| "landmark 缓存锁已损坏。".to_string())?;
+        let mut visual = visual_feature_cache()
+            .lock()
+            .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
+        audio.clear();
+        landmarks.clear();
+        visual.clear();
+        Ok(())
+    })();
+    if cache_cleanup.is_err() {
+        let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+        session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+        session.cleanup_reason =
+            Some("三类应用特征缓存未能全部清理；lease 按 fail-closed 保持占用。".to_string());
+        return Ok(create_alignment_benchmark_session_snapshot(session));
+    }
+    coordinator.cache_generation = coordinator.cache_generation.saturating_add(1);
+    let released_generation = coordinator.cache_generation;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+    session.cache_generation = released_generation;
+    session.jobs.clear();
+    session.outstanding_receipt = None;
+    session.active_job_id = None;
+    session.status = AlignmentBenchmarkSessionStatus::Released;
+    session.cleanup_reason = None;
+    let snapshot = create_alignment_benchmark_session_snapshot(session);
+    coordinator.session = None;
+    Ok(snapshot)
+}
+
+fn read_alignment_benchmark_cache_counts() -> Result<AlignmentBenchmarkCacheCounts, String> {
+    let audio = audio_feature_cache()
+        .lock()
+        .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
+    let landmarks = v2_landmark_cache()
+        .lock()
+        .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+    let visual = visual_feature_cache()
+        .lock()
+        .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
+    Ok(AlignmentBenchmarkCacheCounts {
+        audio_feature_entries: audio.len(),
+        landmark_entries: landmarks.len(),
+        visual_feature_entries: visual.len(),
+    })
+}
+
+fn create_alignment_benchmark_id(prefix: &str, sequence: u64) -> Result<String, String> {
+    let mut random = [0_u8; 12];
+    getrandom::fill(&mut random).map_err(|error| format!("无法生成基准会话随机标识：{error}"))?;
+    Ok(format!(
+        "{prefix}-{sequence}-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+#[cfg(not(windows))]
+fn collect_alignment_benchmark_environment(
+    _ffmpeg_path: &str,
+    _ffprobe_path: &Path,
+) -> Result<
+    (
+        AlignmentBenchmarkEnvironmentReceipt,
+        AlignmentBenchmarkPinnedTool,
+        AlignmentBenchmarkPinnedTool,
+    ),
+    String,
+> {
+    Err("unsupported：原生进程树 RSS 与物理核拓扑采集当前只支持 Windows。".to_string())
+}
+
+#[cfg(windows)]
+fn collect_alignment_benchmark_environment(
+    ffmpeg_path: &str,
+    ffprobe_path: &Path,
+) -> Result<
+    (
+        AlignmentBenchmarkEnvironmentReceipt,
+        AlignmentBenchmarkPinnedTool,
+        AlignmentBenchmarkPinnedTool,
+    ),
+    String,
+> {
+    let ffmpeg_path = resolve_windows_benchmark_executable(Path::new(ffmpeg_path))?;
+    let ffprobe_path = resolve_windows_benchmark_executable(ffprobe_path)?;
+    let ffmpeg_tool = pin_alignment_benchmark_tool(ffmpeg_path)?;
+    let ffprobe_tool = pin_alignment_benchmark_tool(ffprobe_path)?;
+    let physical_core_count = windows_physical_core_count()?;
+    let logical_core_count = windows_logical_core_count()?;
+    let total_memory_bytes = windows_total_memory_bytes()?;
+    let cpu_model = windows_registry_string(
+        r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        "ProcessorNameString",
+    )?;
+    let operating_system = windows_registry_string(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        "ProductName",
+    )?;
+    let display_version = windows_registry_string(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        "DisplayVersion",
+    )
+    .or_else(|_| {
+        windows_registry_string(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "ReleaseId")
+    })?;
+    let build = windows_registry_string(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+        "CurrentBuildNumber",
+    )?;
+    let operating_system_version = format!("{display_version} build {build}");
+    let ffmpeg = collect_alignment_benchmark_tool_fingerprint("ffmpeg", &ffmpeg_tool)?;
+    let ffprobe = collect_alignment_benchmark_tool_fingerprint("ffprobe", &ffprobe_tool)?;
+    let mut issues = Vec::new();
+    let power_profile = match windows_active_power_profile() {
+        Ok(profile) => profile,
+        Err(_) if process_supervision_cleanup_faulted() => {
+            // Keep enough environment state to commit the already-owned lease and tool pins as a
+            // cleanup-blocked session. The post-collection sticky check must never publish Active.
+            issues.push("process-cleanup-fault".to_string());
+            "cleanup-blocked".to_string()
+        }
+        Err(_) => "unknown".to_string(),
+    };
+    let storage_kind = match windows_system_storage_kind() {
+        Ok(kind) => kind,
+        Err(_) => {
+            issues.push("storage-kind-unavailable".to_string());
+            "unknown".to_string()
+        }
+    };
+    if power_profile == "unknown" {
+        issues.push("power-profile-unavailable".to_string());
+    }
+    let measurement_status = if issues.is_empty() {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    Ok((
+        AlignmentBenchmarkEnvironmentReceipt {
+            schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+            collector_version: BENCHMARK_TELEMETRY_VERSION,
+            measurement_status,
+            issues,
+            operating_system,
+            operating_system_version,
+            architecture: std::env::consts::ARCH.to_string(),
+            cpu_model: cpu_model.trim().to_string(),
+            physical_core_count,
+            logical_core_count,
+            total_memory_bytes,
+            storage_scope: "system-volume",
+            storage_kind,
+            power_profile,
+            ffmpeg,
+            ffprobe,
+        },
+        ffmpeg_tool,
+        ffprobe_tool,
+    ))
+}
+
+#[cfg(windows)]
+fn collect_alignment_benchmark_tool_fingerprint(
+    tool: &'static str,
+    pinned: &AlignmentBenchmarkPinnedTool,
+) -> Result<AlignmentBenchmarkToolFingerprint, String> {
+    verify_alignment_benchmark_pinned_tool(tool, pinned)?;
+    let (stdout, stderr) = run_alignment_benchmark_tool_version_probe(tool, &pinned.path)?;
+    let version = parse_alignment_benchmark_tool_semantic_version(tool, &stdout, &stderr)?;
+    verify_alignment_benchmark_pinned_tool(tool, pinned)?;
+    Ok(AlignmentBenchmarkToolFingerprint {
+        version,
+        binary_digest: format!("sha256:{}", pinned.expected_digest),
+    })
+}
+
+#[cfg(windows)]
+fn pin_alignment_benchmark_tool(path: PathBuf) -> Result<AlignmentBenchmarkPinnedTool, String> {
+    let file = open_alignment_benchmark_tool_read_pin(&path)?;
+    let identity = windows_alignment_benchmark_file_identity(&file)?;
+    let expected_digest = sha256_alignment_benchmark_pinned_file(&file)?;
+    let pinned = AlignmentBenchmarkPinnedTool {
+        path,
+        expected_digest,
+        file,
+        identity,
+    };
+    verify_alignment_benchmark_pinned_tool("media-tool", &pinned)?;
+    Ok(pinned)
+}
+
+#[cfg(windows)]
+fn open_alignment_benchmark_tool_read_pin(path: &Path) -> Result<File, String> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|_| "媒体工具无法取得禁止写入、删除和替换的只读 pin。".to_string())
+}
+
+#[cfg(windows)]
+fn windows_alignment_benchmark_file_identity(
+    file: &File,
+) -> Result<AlignmentBenchmarkWindowsFileIdentity, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file owns a valid Windows handle and information is a writable structure of the
+    // exact type required by GetFileInformationByHandle.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+    if ok == 0 {
+        return Err("媒体工具固定句柄身份读取失败。".to_string());
+    }
+    Ok(AlignmentBenchmarkWindowsFileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        file_size: (u64::from(information.nFileSizeHigh) << 32)
+            | u64::from(information.nFileSizeLow),
+        last_write_time: (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(information.ftLastWriteTime.dwLowDateTime),
+    })
+}
+
+#[cfg(windows)]
+fn sha256_alignment_benchmark_pinned_file(file: &File) -> Result<String, String> {
+    let mut reader = file
+        .try_clone()
+        .map_err(|_| "媒体工具固定句柄无法复制以计算摘要。".to_string())?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "媒体工具固定句柄无法定位摘要起点。".to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| "媒体工具固定句柄摘要读取失败。".to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(windows)]
+fn verify_alignment_benchmark_pinned_tool(
+    tool: &str,
+    pinned: &AlignmentBenchmarkPinnedTool,
+) -> Result<(), String> {
+    let handle_identity = windows_alignment_benchmark_file_identity(&pinned.file)?;
+    let current_path_file = open_alignment_benchmark_tool_read_pin(&pinned.path)?;
+    let current_path_identity = windows_alignment_benchmark_file_identity(&current_path_file)?;
+    let current_digest = sha256_alignment_benchmark_pinned_file(&pinned.file)?;
+    if handle_identity != pinned.identity
+        || current_path_identity != pinned.identity
+        || current_digest != pinned.expected_digest
+    {
+        return Err(format!("{tool} 固定文件身份或完整摘要发生变化。"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_alignment_benchmark_pinned_tool(
+    _tool: &str,
+    _pinned: &AlignmentBenchmarkPinnedTool,
+) -> Result<(), String> {
+    Err("unsupported：媒体工具固定句柄当前只支持 Windows。".to_string())
+}
+
+#[cfg(windows)]
+fn run_alignment_benchmark_tool_version_probe(
+    tool: &str,
+    executable: &Path,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    run_alignment_benchmark_tool_version_probe_with_timeouts(
+        tool,
+        executable,
+        Duration::from_millis(BENCHMARK_TOOL_VERSION_TIMEOUT_MS),
+        Duration::from_millis(CHILD_OUTPUT_DRAIN_TIMEOUT_MS),
+    )
+}
+
+#[cfg(windows)]
+fn run_alignment_benchmark_tool_version_probe_with_timeouts(
+    tool: &str,
+    executable: &Path,
+    process_timeout: Duration,
+    output_drain_timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut command = SupervisedCommand::new(executable);
+    command.arg("-version");
+    let output = command
+        .output(
+            SupervisedOutputLimits {
+                execution_timeout: process_timeout,
+                output_drain_timeout,
+                termination_timeout: Duration::from_millis(
+                    CHILD_PROCESS_TREE_TERMINATION_TIMEOUT_MS,
+                ),
+                poll_interval: Duration::from_millis(10),
+                stdout_hard_limit: BENCHMARK_TOOL_VERSION_MAX_BYTES,
+                stderr_hard_limit: BENCHMARK_TOOL_VERSION_MAX_BYTES,
+            },
+            || false,
+        )
+        .map_err(|error| format!("{tool} 版本探测失败：{error}"))?;
+    if !output.status.success() {
+        return Err(format!("{tool} 版本探测未成功退出。"));
+    }
+    Ok((output.stdout, output.stderr))
+}
+
+fn parse_alignment_benchmark_tool_semantic_version(
+    tool: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<String, String> {
+    for bytes in [stdout, stderr] {
+        for line in String::from_utf8_lossy(bytes).lines() {
+            let mut fields = line.split_ascii_whitespace();
+            let Some(name) = fields.next() else {
+                continue;
+            };
+            let Some(marker) = fields.next() else {
+                continue;
+            };
+            let Some(raw_version) = fields.next() else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case(tool) || !marker.eq_ignore_ascii_case("version") {
+                continue;
+            }
+            let numeric_prefix = raw_version
+                .chars()
+                .take_while(|character| character.is_ascii_digit() || *character == '.')
+                .collect::<String>();
+            let numeric_prefix = numeric_prefix.trim_end_matches('.');
+            let components = numeric_prefix.split('.').collect::<Vec<_>>();
+            if components.is_empty()
+                || components.len() > 3
+                || components.iter().any(|component| component.is_empty())
+            {
+                continue;
+            }
+            let parsed = components
+                .iter()
+                .map(|component| component.parse::<u32>())
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(mut parsed) = parsed else {
+                continue;
+            };
+            while parsed.len() < 3 {
+                parsed.push(0);
+            }
+            return Ok(format!("{}.{}.{}", parsed[0], parsed[1], parsed[2]));
+        }
+    }
+    Err(format!("{tool} 未返回可去敏的数字版本标识。"))
+}
+
+fn first_nonempty_output_line(primary: &[u8], secondary: &[u8]) -> Option<String> {
+    [primary, secondary].into_iter().find_map(|bytes| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    })
+}
+
+#[cfg(windows)]
+fn resolve_windows_benchmark_executable(path: &Path) -> Result<PathBuf, String> {
+    resolve_supervised_executable(path).map_err(|error| format!("无法安全解析媒体工具：{error}"))
+}
+
+#[cfg(windows)]
+fn windows_registry_string(subkey: &str, value_name: &str) -> Result<String, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::ERROR_SUCCESS,
+        System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
+    };
+
+    let subkey = std::ffi::OsStr::new(subkey)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let value_name = std::ffi::OsStr::new(value_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut bytes = 0_u32;
+    // SAFETY: pointers reference NUL-terminated UTF-16 buffers and the size query has no output
+    // buffer by contract.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS || bytes < 2 {
+        return Err("Windows 注册表环境字段不可用。".to_string());
+    }
+    let mut output = vec![0_u16; bytes as usize / 2];
+    // SAFETY: the allocated buffer is at least the byte count returned by the size query.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            output.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err("Windows 注册表环境字段读取失败。".to_string());
+    }
+    let length = output
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(output.len());
+    let value = String::from_utf16_lossy(&output[..length])
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        return Err("Windows 注册表环境字段为空。".to_string());
+    }
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn windows_physical_core_count() -> Result<u32, String> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    let mut bytes = 0_u32;
+    // SAFETY: the first call is the documented size query and writes only `bytes`.
+    unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut bytes);
+    }
+    if bytes == 0 {
+        return Err("Windows 未返回物理核拓扑缓冲区大小。".to_string());
+    }
+    let word_count = (bytes as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; word_count];
+    // SAFETY: the usize buffer is suitably aligned and has at least `bytes` writable bytes.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buffer
+                .as_mut_ptr()
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return Err("Windows 物理核拓扑读取失败。".to_string());
+    }
+    let mut offset = 0_usize;
+    let mut cores = 0_u32;
+    while offset < bytes as usize {
+        // SAFETY: offset is advanced only by validated record sizes within the returned buffer.
+        let record = unsafe {
+            &*(buffer.as_ptr().cast::<u8>().add(offset)
+                as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        let size = record.Size as usize;
+        if size < std::mem::size_of::<i32>() + std::mem::size_of::<u32>()
+            || offset.saturating_add(size) > bytes as usize
+        {
+            return Err("Windows 物理核拓扑记录大小无效。".to_string());
+        }
+        if record.Relationship == RelationProcessorCore {
+            cores = cores.saturating_add(1);
+        }
+        offset += size;
+    }
+    if cores == 0 {
+        return Err("Windows 物理核拓扑为空。".to_string());
+    }
+    Ok(cores)
+}
+
+#[cfg(windows)]
+fn windows_logical_core_count() -> Result<u32, String> {
+    use windows_sys::Win32::System::Threading::{GetActiveProcessorCount, ALL_PROCESSOR_GROUPS};
+    // SAFETY: ALL_PROCESSOR_GROUPS requests a scalar count and has no pointer arguments.
+    let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    if count == 0 {
+        return Err("Windows 逻辑处理器拓扑为空。".to_string());
+    }
+    Ok(count)
+}
+
+#[cfg(windows)]
+fn windows_total_memory_bytes() -> Result<u64, String> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..MEMORYSTATUSEX::default()
+    };
+    // SAFETY: `status` is initialized and its length field matches the structure size.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err("Windows 总内存读取失败。".to_string());
+    }
+    Ok(status.ullTotalPhys)
+}
+
+#[cfg(windows)]
+fn windows_active_power_profile() -> Result<String, String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut system_directory = vec![0_u16; 32_768];
+    // SAFETY: the UTF-16 output buffer is writable and its capacity is passed exactly.
+    let length = unsafe {
+        GetSystemDirectoryW(system_directory.as_mut_ptr(), system_directory.len() as u32)
+    } as usize;
+    if length == 0 || length >= system_directory.len() {
+        return Err("Windows System32 路径读取失败。".to_string());
+    }
+    system_directory.truncate(length);
+    let powercfg_path =
+        PathBuf::from(std::ffi::OsString::from_wide(&system_directory)).join("powercfg.exe");
+    let mut command = SupervisedCommand::new(powercfg_path);
+    command.arg("/getactivescheme");
+    let output = command
+        .output(
+            SupervisedOutputLimits {
+                execution_timeout: Duration::from_secs(10),
+                output_drain_timeout: Duration::from_millis(CHILD_OUTPUT_DRAIN_TIMEOUT_MS),
+                termination_timeout: Duration::from_millis(
+                    CHILD_PROCESS_TREE_TERMINATION_TIMEOUT_MS,
+                ),
+                poll_interval: Duration::from_millis(10),
+                stdout_hard_limit: 64 * 1024,
+                stderr_hard_limit: 64 * 1024,
+            },
+            || false,
+        )
+        .map_err(|error| format!("电源方案探测启动失败：{error}"))?;
+    if !output.status.success() {
+        return Err("电源方案探测未成功退出。".to_string());
+    }
+    let line = first_nonempty_output_line(&output.stdout, &output.stderr)
+        .ok_or_else(|| "电源方案探测没有输出。".to_string())?;
+    let lower = line.to_ascii_lowercase();
+    for (guid, label) in [
+        ("381b4222-f694-41f0-9685-ff5bb260df2e", "balanced"),
+        ("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c", "high-performance"),
+        ("a1841308-3541-4fab-bc81-f71556f20b4a", "power-saver"),
+        (
+            "e9a42b02-d5df-448d-aa00-03f14749eb61",
+            "ultimate-performance",
+        ),
+    ] {
+        if lower.contains(guid) {
+            return Ok(label.to_string());
+        }
+    }
+    Ok("custom".to_string())
+}
+
+#[cfg(windows)]
+fn windows_system_storage_kind() -> Result<String, String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+        System::{
+            Ioctl::{
+                PropertyStandardQuery, StorageDeviceSeekPenaltyProperty,
+                DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
+                STORAGE_PROPERTY_QUERY,
+            },
+            SystemInformation::GetWindowsDirectoryW,
+            IO::DeviceIoControl,
+        },
+    };
+
+    let mut windows_directory = vec![0_u16; 32_768];
+    // SAFETY: buffer is writable and its length is passed to the API.
+    let length = unsafe {
+        GetWindowsDirectoryW(
+            windows_directory.as_mut_ptr(),
+            windows_directory.len() as u32,
+        )
+    };
+    if length < 2 || length as usize >= windows_directory.len() {
+        return Err("无法定位 Windows 系统卷。".to_string());
+    }
+    let drive = String::from_utf16_lossy(&windows_directory[..length as usize]);
+    let prefix = drive
+        .get(..2)
+        .filter(|value| value.ends_with(':'))
+        .ok_or_else(|| "Windows 系统目录没有可识别的卷前缀。".to_string())?;
+    let device_path = format!(r"\\.\{prefix}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: device_path is NUL-terminated and other pointer arguments are null by contract.
+    let handle = unsafe {
+        CreateFileW(
+            device_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err("Windows 系统卷无法打开以读取 seek-penalty 属性。".to_string());
+    }
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+    let mut returned = 0_u32;
+    // SAFETY: the handle is valid; query/descriptor point to initialized buffers of the sizes
+    // supplied, and the call is synchronous because OVERLAPPED is null.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            (&mut descriptor as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR).cast(),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: handle is owned by this function and closed exactly once.
+    unsafe { CloseHandle(handle) };
+    let descriptor_size = std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32;
+    if ok == 0
+        || returned < descriptor_size
+        || descriptor.Size < descriptor_size
+        || descriptor.Version < descriptor_size
+    {
+        return Err("Windows 系统卷 seek-penalty 属性不可用。".to_string());
+    }
+    Ok(if descriptor.IncursSeekPenalty {
+        "system-volume-rotational-seek-penalty"
+    } else {
+        "system-volume-nonrotational-no-seek-penalty"
+    }
+    .to_string())
+}
+
+#[cfg(not(windows))]
+fn sample_process_tree_memory(_root_pid: u32) -> Result<ProcessTreeMemorySample, String> {
+    Err("unsupported：进程树 working-set 采样当前只支持 Windows。".to_string())
+}
+
+#[cfg(windows)]
+fn sample_process_tree_memory(root_pid: u32) -> Result<ProcessTreeMemorySample, String> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
+    };
+
+    // ToolHelp is intentionally used for the first native implementation because it does not
+    // require replacing every std::process::Command call. It cannot provide race-free spawn
+    // attribution like a Job Object, so *any* snapshot/open/read failure marks coverage
+    // incomplete and no RSS value is emitted for that pass. The session keeps a baseline PID set
+    // for persistent WebView children; ToolHelp cannot rule out PID reuse against that baseline,
+    // which is why the sampler/method identity remains explicit for a later Job Object upgrade.
+    let pairs = windows_process_parent_pairs()?;
+    let descendants = collect_process_descendants(root_pid, &pairs);
+    let mut pids = Vec::with_capacity(descendants.len().saturating_add(1));
+    pids.push(root_pid);
+    pids.extend(descendants.iter().copied());
+    let mut working_set_bytes = 0_u64;
+    for pid in pids {
+        // SAFETY: pid comes from the current ToolHelp snapshot; no handle is inherited.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err("Windows 进程树中至少一个进程无法打开，覆盖不完整。".to_string());
+        }
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..PROCESS_MEMORY_COUNTERS::default()
+        };
+        // SAFETY: process is open and counters points to a writable structure of the given size.
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                process,
+                &mut counters,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        };
+        // SAFETY: process is an owned handle returned by OpenProcess.
+        unsafe { CloseHandle(process) };
+        if ok == 0 {
+            return Err("Windows 进程树 working set 读取失败，覆盖不完整。".to_string());
+        }
+        working_set_bytes = working_set_bytes
+            .checked_add(counters.WorkingSetSize as u64)
+            .ok_or_else(|| "进程树 working set 求和溢出。".to_string())?;
+    }
+    Ok(ProcessTreeMemorySample {
+        working_set_bytes,
+        descendants,
+    })
+}
+
+#[cfg(windows)]
+fn windows_process_parent_pairs() -> Result<Vec<(u32, u32)>, String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    // SAFETY: CreateToolhelp32Snapshot has no borrowed pointer arguments.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err("Windows ToolHelp 进程快照创建失败。".to_string());
+    }
+    let mut pairs = Vec::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
+    // SAFETY: snapshot is valid and entry has the documented size.
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        // SAFETY: snapshot is a valid owned handle.
+        unsafe { CloseHandle(snapshot) };
+        return Err("Windows ToolHelp 进程快照为空或不可读。".to_string());
+    }
+    loop {
+        pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: snapshot and entry remain valid for enumeration.
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            // SAFETY: GetLastError is read immediately after Process32NextW failed.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_NO_MORE_FILES {
+                // SAFETY: snapshot is a valid owned handle.
+                unsafe { CloseHandle(snapshot) };
+                return Err("Windows ToolHelp 进程枚举中途失败，覆盖不完整。".to_string());
+            }
+            break;
+        }
+    }
+    // SAFETY: snapshot is a valid owned handle and is closed exactly once.
+    unsafe { CloseHandle(snapshot) };
+    Ok(pairs)
+}
+
+fn collect_process_descendants(root_pid: u32, pairs: &[(u32, u32)]) -> HashSet<u32> {
+    let mut descendants = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (pid, parent_pid) in pairs {
+            if *pid == root_pid || descendants.contains(pid) {
+                continue;
+            }
+            if *parent_pid == root_pid || descendants.contains(parent_pid) {
+                descendants.insert(*pid);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    descendants
+}
+
 fn align_audio_files_inner(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentProposal, String> {
@@ -644,7 +3053,54 @@ fn align_audio_files_with_progress<F>(
 where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
+    ensure_alignment_process_supervision_clean()?;
+    validate_media_input(&request.complete_path, "目标原片")?;
+    validate_media_input(&request.source_path, "B 站参考")?;
+    let _media_read_lease =
+        acquire_alignment_media_read_lease(&request.source_path, &request.complete_path)?;
+    let target_run_identity =
+        probe_alignment_run_expected_identity(&request.complete_path, cancel_flag, "目标原片")?;
+    let source_run_identity =
+        probe_alignment_run_expected_identity(&request.source_path, cancel_flag, "B 站参考")?;
+    let target_path = request.complete_path.clone();
+    let source_path = request.source_path.clone();
+    let result = align_audio_files_with_progress_impl(request, update_progress, cancel_flag);
+    // A lower layer may deliberately downgrade ordinary evidence failures, but a process-tree
+    // cleanup failure is never evidence. It invalidates the current run even if a fallback later
+    // managed to construct a proposal.
+    ensure_alignment_process_supervision_clean()?;
+    if let Ok(proposal) = &result {
+        verify_media_content_identity_after_tool_output(
+            &source_path,
+            Some(&source_run_identity),
+            cancel_flag,
+            "对齐结果最终复核",
+        )?;
+        verify_media_content_identity_after_tool_output(
+            &target_path,
+            Some(&target_run_identity),
+            cancel_flag,
+            "对齐结果最终复核",
+        )?;
+        verify_proposal_time_map_identities_match_run(
+            proposal,
+            &source_run_identity,
+            &target_run_identity,
+        )?;
+    }
+    result
+}
+
+fn align_audio_files_with_progress_impl<F>(
+    request: AudioAlignmentRequest,
+    update_progress: &mut F,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AudioAlignmentProposal, String>
+where
+    F: FnMut(f64, &str) -> Result<(), String>,
+{
     check_cancelled(cancel_flag)?;
+    benchmark_stage("validating", "校验输入与媒体时间线");
     update_progress(0.05, "正在校验本地媒体路径。")?;
     validate_media_input(&request.complete_path, "完整版")?;
     validate_media_input(&request.source_path, "当前视频")?;
@@ -663,6 +3119,7 @@ where
         "完整版",
         request.complete_audio_stream_index,
         &options,
+        cancel_flag,
     )?;
     check_cancelled(cancel_flag)?;
     let source_audio_input = probe_alignment_audio_input(
@@ -670,9 +3127,11 @@ where
         "当前视频",
         request.source_audio_stream_index,
         &options,
+        cancel_flag,
     )?;
     update_progress(0.10, "已确认媒体展示时间线、音轨和对齐参数。")?;
     check_cancelled(cancel_flag)?;
+    benchmark_stage("extracting-complete", "提取目标原片音频特征");
     update_progress(0.12, "正在检查或提取完整版音频特征。")?;
     let complete_features = get_audio_features(
         &request.complete_path,
@@ -686,6 +3145,7 @@ where
         &format_audio_feature_cache_message("完整版", &complete_features),
     )?;
     check_cancelled(cancel_flag)?;
+    benchmark_stage("extracting-source", "提取参考视频音频特征");
     update_progress(0.40, "正在检查或提取当前视频音频特征。")?;
     let source_features = get_audio_features(
         &request.source_path,
@@ -702,16 +3162,33 @@ where
     let mut visual_features: Option<(CachedVisualFeatures, CachedVisualFeatures)> = None;
     let mut visual_error: Option<String> = None;
     if options.enable_visual_evidence {
+        benchmark_stage("extracting-visual", "提取独立视觉证据");
         update_progress(0.68, "正在提取鲁棒视觉证据。")?;
         match (
-            get_visual_features(&request.complete_path, "完整版", &options, cancel_flag),
-            get_visual_features(&request.source_path, "当前视频", &options, cancel_flag),
+            get_visual_features(
+                &request.complete_path,
+                "完整版",
+                &options,
+                complete_audio_input.content_identity.as_ref(),
+                cancel_flag,
+            ),
+            get_visual_features(
+                &request.source_path,
+                "当前视频",
+                &options,
+                source_audio_input.content_identity.as_ref(),
+                cancel_flag,
+            ),
         ) {
             (Ok(complete_visual), Ok(source_visual)) => {
                 update_progress(0.74, "鲁棒视觉证据提取完成。")?;
                 visual_features = Some((complete_visual, source_visual));
             }
             (Err(error), _) | (_, Err(error)) => {
+                propagate_alignment_process_cleanup(&error)?;
+                if is_media_identity_guard_error(&error) || error == AUDIO_ALIGNMENT_CANCELLED {
+                    return Err(error);
+                }
                 update_progress(0.74, "视觉证据不可用，继续音频时间映射。")?;
                 visual_error = Some(error);
             }
@@ -774,6 +3251,7 @@ where
             }
         ));
     }
+    benchmark_stage("reporting", "生成对齐复核数据");
     update_progress(0.97, "正在生成对齐复核数据。")?;
     Ok(proposal)
 }
@@ -787,12 +3265,14 @@ fn align_audio_files_v2_with_progress<F>(
 where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
+    benchmark_stage("validating", "探测候选音轨与展示时间线");
     update_progress(0.08, "Alignment V2 正在探测展示时间线和候选音轨。")?;
     let target_inputs = match probe_alignment_audio_candidates(
         &request.complete_path,
         "目标原片",
         request.complete_audio_stream_index,
         options,
+        cancel_flag,
     ) {
         Ok(inputs) => inputs,
         Err(error) => {
@@ -811,6 +3291,7 @@ where
         "B 站参考",
         request.source_audio_stream_index,
         options,
+        cancel_flag,
     ) {
         Ok(inputs) => inputs,
         Err(error) => {
@@ -837,6 +3318,7 @@ where
     }
     check_cancelled(cancel_flag)?;
 
+    benchmark_stage("extracting-source", "提取参考音轨 landmark");
     update_progress(0.12, "正在为 B 站参考候选音轨提取 16 kHz landmark。")?;
     let mut extraction_notes = Vec::new();
     let source_landmarks = extract_v2_landmark_candidates(
@@ -846,7 +3328,8 @@ where
         &source_inputs,
         cancel_flag,
         &mut extraction_notes,
-    );
+    )?;
+    benchmark_stage("extracting-complete", "提取目标原片 landmark");
     update_progress(0.40, "正在为目标原片候选音轨提取 16 kHz landmark。")?;
     let target_landmarks = extract_v2_landmark_candidates(
         &request.complete_path,
@@ -855,7 +3338,7 @@ where
         &target_inputs,
         cancel_flag,
         &mut extraction_notes,
-    );
+    )?;
     check_cancelled(cancel_flag)?;
     if source_landmarks.is_empty() || target_landmarks.is_empty() {
         let reason = "候选音轨未产生可用 landmark，不能据此断言存在或不存在内容段。";
@@ -863,6 +3346,7 @@ where
         return try_v2_visual_fallback(request, options, reason, extraction_notes, cancel_flag);
     }
 
+    benchmark_stage("matching", "比较音轨组合与 Top-K 仿射假设");
     update_progress(0.78, "正在比较合理音轨组合的 Top-K 仿射假设。")?;
     let affine_config = AffineMatchConfig {
         residual_tolerance_ms: 140,
@@ -1063,6 +3547,7 @@ where
         ));
     }
 
+    benchmark_stage("extracting-source", "解码参考音轨细粒度特征");
     update_progress(0.84, "已选择音轨，正在保留 PCM 并生成 50 ms 细特征。")?;
     let source_audio = match decode_v2_audio(
         &request.source_path,
@@ -1073,6 +3558,10 @@ where
     ) {
         Ok(audio) => audio,
         Err(error) => {
+            propagate_alignment_process_cleanup(&error)?;
+            if is_media_identity_guard_error(&error) || error == AUDIO_ALIGNMENT_CANCELLED {
+                return Err(error);
+            }
             extraction_notes.push(error);
             return Ok(create_blocked_v2_affine_proposal(
                 "所选 B 站参考音轨无法进入细粒度对齐。",
@@ -1083,6 +3572,7 @@ where
             ));
         }
     };
+    benchmark_stage("extracting-complete", "解码目标原片细粒度特征");
     let target_audio = match decode_v2_audio(
         &request.complete_path,
         "目标原片",
@@ -1092,6 +3582,10 @@ where
     ) {
         Ok(audio) => audio,
         Err(error) => {
+            propagate_alignment_process_cleanup(&error)?;
+            if is_media_identity_guard_error(&error) || error == AUDIO_ALIGNMENT_CANCELLED {
+                return Err(error);
+            }
             extraction_notes.push(error);
             return Ok(create_blocked_v2_affine_proposal(
                 "所选目标原片音轨无法进入细粒度对齐。",
@@ -1103,6 +3597,7 @@ where
         }
     };
 
+    benchmark_stage("fitting", "执行分块 edit-aware DP");
     update_progress(0.89, "正在沿最佳 affine 走廊执行分块 edit-aware DP。")?;
     let mut chunk_alignment = match align_v2_feature_chunks(
         &source_audio.fine_features,
@@ -1124,6 +3619,7 @@ where
         }
     };
 
+    benchmark_stage("refining", "精修可识别版本差异边界");
     update_progress(0.94, "正在用局部相关峰精修可识别边界。")?;
     let boundary_summary = refine_v2_span_boundaries(
         &mut chunk_alignment.spans,
@@ -1134,6 +3630,7 @@ where
         cancel_flag,
     );
     check_cancelled(cancel_flag)?;
+    benchmark_stage("reporting", "生成 Alignment V2 时间图与证据");
     update_progress(0.97, "正在生成 Alignment V2 时间图和复核证据。")?;
     extraction_notes.push(format!(
         "细对齐按 {} ms 块、±{} ms affine 走廊执行；边界相关尝试 {} 次，可靠精修 {} 次，歧义 {} 次。",
@@ -1154,8 +3651,10 @@ where
         extraction_notes,
     );
     if options.enable_visual_evidence {
+        benchmark_stage("extracting-visual", "独立视觉校验时间图");
         update_progress(0.98, "正在用独立视觉采样校验音频时间图。")?;
         apply_v2_visual_validation(request, options, &mut proposal, cancel_flag)?;
+        benchmark_stage("reporting", "汇总音频与视觉复核证据");
     }
     Ok(proposal)
 }
@@ -1165,14 +3664,14 @@ fn probe_alignment_audio_candidates(
     label: &str,
     requested_stream_index: Option<u32>,
     options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<AlignmentAudioInput>, String> {
-    let snapshot =
-        probe_media_timeline_with_ffprobe(media_path, &options.ffprobe_path).map_err(|error| {
-            format!(
-                "{label}媒体时间线探测失败：{}",
-                redact_sensitive_media_text(&error)
-            )
-        })?;
+    let snapshot = probe_media_timeline_with_ffprobe_cancellable(
+        media_path,
+        &options.ffprobe_path,
+        cancel_flag,
+    )
+    .map_err(|error| format_alignment_probe_error(&format!("{label}媒体时间线探测失败"), error))?;
     if snapshot
         .duration_ms
         .is_some_and(|duration| duration > ALIGNMENT_V2_MAX_DURATION_MS)
@@ -1182,15 +3681,19 @@ fn probe_alignment_audio_candidates(
             ALIGNMENT_V2_MAX_DURATION_MS / 60_000
         ));
     }
-    let decode_timelines =
-        probe_audio_decode_timelines_with_ffprobe(media_path, &options.ffprobe_path).map_err(
-            |error| {
-                format!(
-                    "{label}逐帧 PTS/skip-sample 探测失败：{}",
-                    redact_sensitive_media_text(&error)
-                )
-            },
-        )?;
+    let decode_timelines = probe_audio_decode_timelines_with_ffprobe_cancellable(
+        media_path,
+        &options.ffprobe_path,
+        snapshot.content_identity.as_ref().ok_or_else(|| {
+            format!(
+                "blocked:media-identity-missing：{label}媒体时间线缺少全文件身份，Alignment V2 已阻断。"
+            )
+        })?,
+        cancel_flag,
+    )
+    .map_err(|error| {
+        format_alignment_probe_error(&format!("{label}逐帧 PTS/skip-sample 探测失败"), error)
+    })?;
     if let Some(stream_index) = requested_stream_index {
         let stream = select_audio_stream(&snapshot, Some(stream_index), label)?;
         let decode_timeline = decode_timelines
@@ -1347,7 +3850,7 @@ fn extract_v2_landmark_candidates(
     inputs: &[AlignmentAudioInput],
     cancel_flag: Option<&AtomicBool>,
     notes: &mut Vec<String>,
-) -> HashMap<u32, CachedV2Landmarks> {
+) -> Result<HashMap<u32, CachedV2Landmarks>, String> {
     let mut output = HashMap::new();
     for input in inputs {
         if let Err(error) = check_v2_duration_limit(input, label) {
@@ -1372,13 +3875,19 @@ fn extract_v2_landmark_candidates(
                 "{label}音轨 #{} 只有静音或重复性过高，未得到可用 landmark。",
                 input.stream.stream_index
             )),
-            Err(error) => notes.push(format!(
-                "{label}音轨 #{} landmark 提取失败：{error}",
-                input.stream.stream_index
-            )),
+            Err(error) => {
+                propagate_alignment_process_cleanup(&error)?;
+                if is_media_identity_guard_error(&error) || error == AUDIO_ALIGNMENT_CANCELLED {
+                    return Err(error);
+                }
+                notes.push(format!(
+                    "{label}音轨 #{} landmark 提取失败：{error}",
+                    input.stream.stream_index
+                ));
+            }
         }
     }
-    output
+    Ok(output)
 }
 
 fn check_v2_duration_limit(input: &AlignmentAudioInput, label: &str) -> Result<(), String> {
@@ -1413,11 +3922,13 @@ fn get_v2_landmarks(
         .get(&cache_key)
         .cloned()
     {
+        benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
         return Ok(CachedV2Landmarks {
             landmarks,
             cache_hit: true,
         });
     }
+    benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
     let pcm = decode_v2_pcm(media_path, label, options, input, cancel_flag)?;
     let landmarks = Arc::new(extract_landmarks_with_cancel(
         &pcm,
@@ -1440,8 +3951,13 @@ fn get_v2_landmarks(
         .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
     if !cache.contains_key(&cache_key) && cache.len() >= MAX_V2_LANDMARK_CACHE_ENTRIES {
         cache.clear();
+        benchmark_cache_event(
+            BenchmarkCacheKind::V2Landmarks,
+            BenchmarkCacheEvent::Eviction,
+        );
     }
     cache.insert(cache_key, landmarks.clone());
+    benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write);
     Ok(CachedV2Landmarks {
         landmarks,
         cache_hit: false,
@@ -1509,70 +4025,50 @@ fn decode_v2_pcm(
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<i16>, String> {
     check_cancelled(cancel_flag)?;
-    let mut child = Command::new(&options.ffmpeg_path)
-        .args(create_v2_audio_decode_args(media_path, input))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("FFmpeg 启动 Alignment V2 解码失败：{error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "FFmpeg V2 标准输出管道不可用。".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "FFmpeg V2 错误输出管道不可用。".to_string())?;
-    let stdout_overflow = Arc::new(AtomicBool::new(false));
-    let reader_overflow = stdout_overflow.clone();
-    let stdout_reader = thread::spawn(move || {
-        read_stream_bounded(stdout, ALIGNMENT_V2_MAX_PCM_BYTES, reader_overflow)
-    });
-    let stderr_reader =
-        thread::spawn(move || read_child_stderr_bounded(stderr, ALIGNMENT_V2_MAX_STDERR_BYTES));
-    let status = loop {
-        if let Err(error) = check_cancelled(cancel_flag) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_child_output(stdout_reader, "stdout");
-            let _ = join_child_output(stderr_reader, "stderr");
-            return Err(error);
-        }
-        if stdout_overflow.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_child_output(stdout_reader, "stdout");
-            let _ = join_child_output(stderr_reader, "stderr");
-            return Err(format!(
-                "blocked:resource-limit：{label} V2 PCM 超过 {} MiB 硬字节上限，FFmpeg 已终止。",
-                ALIGNMENT_V2_MAX_PCM_BYTES / (1024 * 1024)
-            ));
-        }
-        match child
-            .try_wait()
-            .map_err(|error| format!("FFmpeg V2 状态读取失败：{error}"))?
-        {
-            Some(status) => break status,
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    };
-    let stdout = join_child_output(stdout_reader, "stdout")?;
-    let stderr = join_child_output(stderr_reader, "stderr")?;
-    if !status.success() {
-        return Err(format!(
-            "FFmpeg 提取 {label} V2 PCM 失败：{}",
-            redact_sensitive_media_text(&String::from_utf8_lossy(&stderr))
+    let output = run_supervised_ffmpeg_output(
+        &options.ffmpeg_path,
+        create_v2_audio_decode_args(media_path, input),
+        "FFmpeg V2 音频解码",
+        ALIGNMENT_V2_MAX_PCM_BYTES,
+        cancel_flag,
+    )?;
+    if !output.status.success() {
+        return Err(format_media_tool_nonzero_exit(
+            &format!("FFmpeg 提取 {label} V2 PCM"),
+            output.status.code(),
+            &output.stderr,
         ));
     }
-    if stdout.len() % 2 != 0 {
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 音频解码",
+    )?;
+    parse_v2_pcm_output(&output.stdout, label, cancel_flag)
+}
+
+fn parse_v2_pcm_output(
+    stdout: &[u8],
+    label: &str,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<i16>, String> {
+    check_cancelled(cancel_flag)?;
+    if !stdout.len().is_multiple_of(2) {
         return Err(format!("{label} V2 PCM 字节数不是 i16 对齐。"));
     }
     let sample_count = stdout.len() / 2;
     debug_assert!(sample_count <= ALIGNMENT_V2_MAX_PCM_BYTES / 2);
-    let pcm = stdout
-        .chunks_exact(2)
-        .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
-        .collect::<Vec<_>>();
+    let mut pcm = Vec::with_capacity(sample_count);
+    for bytes in stdout.chunks(V2_PCM_PARSE_CANCEL_CHECK_SAMPLES * 2) {
+        pcm.extend(
+            bytes
+                .chunks_exact(2)
+                .map(|sample| i16::from_le_bytes([sample[0], sample[1]])),
+        );
+        check_cancelled(cancel_flag)?;
+    }
+    check_cancelled(cancel_flag)?;
     if pcm.is_empty() {
         return Err(format!("{label}没有可用 PCM。"));
     }
@@ -2555,6 +5051,7 @@ fn create_blocked_v2_proposal(
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     mut notes: Vec<String>,
 ) -> AudioAlignmentProposal {
+    benchmark_stage("reporting", "生成阻断型 Alignment V2 复核证据");
     notes.push(reason.to_string());
     let selected_track_reason = match (source_input, target_input) {
         (Some(source), Some(target)) => format!(
@@ -2613,6 +5110,7 @@ fn create_blocked_v2_affine_proposal(
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     notes: Vec<String>,
 ) -> AudioAlignmentProposal {
+    benchmark_stage("reporting", "生成仿射阻断型复核证据");
     let mut proposal = create_blocked_v2_proposal(
         reason,
         Some(&pair.source_input),
@@ -2762,17 +5260,21 @@ fn try_v2_visual_fallback(
     mut notes: Vec<String>,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<AudioAlignmentProposal, String> {
+    benchmark_stage("extracting-visual", "执行独立视觉定位回退");
     check_cancelled(cancel_flag)?;
+    ensure_alignment_process_supervision_clean()?;
     notes.push(format!("音频主路径已阻断：{audio_reason}"));
     let source_input = match probe_alignment_visual_input(
         &request.source_path,
         "B 站参考",
         request.source_video_stream_index,
         options,
+        cancel_flag,
     ) {
         Ok(input) => input,
         Err(error) => {
-            if error == AUDIO_ALIGNMENT_CANCELLED {
+            propagate_alignment_process_cleanup(&error)?;
+            if error == AUDIO_ALIGNMENT_CANCELLED || is_media_identity_guard_error(&error) {
                 return Err(error);
             }
             return Ok(create_blocked_visual_fallback_without_map(
@@ -2787,10 +5289,12 @@ fn try_v2_visual_fallback(
         "目标原片",
         request.complete_video_stream_index,
         options,
+        cancel_flag,
     ) {
         Ok(input) => input,
         Err(error) => {
-            if error == AUDIO_ALIGNMENT_CANCELLED {
+            propagate_alignment_process_cleanup(&error)?;
+            if error == AUDIO_ALIGNMENT_CANCELLED || is_media_identity_guard_error(&error) {
                 return Err(error);
             }
             return Ok(create_blocked_visual_fallback_without_map(
@@ -2809,7 +5313,8 @@ fn try_v2_visual_fallback(
     ) {
         Ok(features) => features,
         Err(error) => {
-            if error == AUDIO_ALIGNMENT_CANCELLED {
+            propagate_alignment_process_cleanup(&error)?;
+            if error == AUDIO_ALIGNMENT_CANCELLED || is_media_identity_guard_error(&error) {
                 return Err(error);
             }
             return Ok(create_blocked_visual_fallback_without_map(
@@ -2828,7 +5333,8 @@ fn try_v2_visual_fallback(
     ) {
         Ok(features) => features,
         Err(error) => {
-            if error == AUDIO_ALIGNMENT_CANCELLED {
+            propagate_alignment_process_cleanup(&error)?;
+            if error == AUDIO_ALIGNMENT_CANCELLED || is_media_identity_guard_error(&error) {
                 return Err(error);
             }
             return Ok(create_blocked_visual_fallback_without_map(
@@ -2876,6 +5382,7 @@ fn create_blocked_visual_fallback_without_map(
     visual_reason: &str,
     mut notes: Vec<String>,
 ) -> AudioAlignmentProposal {
+    benchmark_stage("reporting", "生成视觉回退阻断证据");
     notes.push(visual_reason.to_string());
     let mut proposal =
         create_blocked_v2_proposal(audio_reason, None, None, None, Vec::new(), notes);
@@ -2907,6 +5414,7 @@ fn create_visual_affine_fallback_proposal(
     mut diagnostics: Vec<String>,
     options: &AudioAlignmentOptions,
 ) -> AudioAlignmentProposal {
+    benchmark_stage("reporting", "生成独立视觉定位复核证据");
     let Some(best) = result.hypotheses.first() else {
         let reason = if result.informative_source_count < ALIGNMENT_V2_VISUAL_MIN_INLIERS
             || result.informative_target_count < ALIGNMENT_V2_VISUAL_MIN_INLIERS
@@ -3239,14 +5747,19 @@ fn apply_v2_visual_validation(
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<(), String> {
     check_cancelled(cancel_flag)?;
+    let (expected_source_identity, expected_target_identity) =
+        v2_time_map_media_identities_for_visual_validation(proposal)?;
     let source_input = match probe_alignment_visual_input(
         &request.source_path,
         "B 站参考",
         request.source_video_stream_index,
         options,
+        cancel_flag,
     ) {
         Ok(input) => input,
+        Err(error) if is_media_identity_guard_error(&error) => return Err(error),
         Err(error) => {
+            propagate_alignment_process_cleanup(&error)?;
             append_v2_visual_validation_unavailable(
                 proposal,
                 format!("参考视频视觉校验不可用：{}", truncate_visual_note(&error)),
@@ -3259,9 +5772,12 @@ fn apply_v2_visual_validation(
         "目标原片",
         request.complete_video_stream_index,
         options,
+        cancel_flag,
     ) {
         Ok(input) => input,
+        Err(error) if is_media_identity_guard_error(&error) => return Err(error),
         Err(error) => {
+            propagate_alignment_process_cleanup(&error)?;
             append_v2_visual_validation_unavailable(
                 proposal,
                 format!("目标视频视觉校验不可用：{}", truncate_visual_note(&error)),
@@ -3269,6 +5785,16 @@ fn apply_v2_visual_validation(
             return Ok(());
         }
     };
+    ensure_visual_input_matches_time_map_identity(
+        &expected_source_identity,
+        source_input.content_identity.as_ref(),
+        "参考视频",
+    )?;
+    ensure_visual_input_matches_time_map_identity(
+        &expected_target_identity,
+        target_input.content_identity.as_ref(),
+        "目标视频",
+    )?;
     let source_features = match get_v2_visual_features(
         &request.source_path,
         "B 站参考",
@@ -3278,7 +5804,9 @@ fn apply_v2_visual_validation(
     ) {
         Ok(features) => features,
         Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => return Err(error),
+        Err(error) if is_media_identity_guard_error(&error) => return Err(error),
         Err(error) => {
+            propagate_alignment_process_cleanup(&error)?;
             append_v2_visual_validation_unavailable(
                 proposal,
                 format!("参考视频视觉校验提取失败：{}", truncate_visual_note(&error)),
@@ -3295,7 +5823,9 @@ fn apply_v2_visual_validation(
     ) {
         Ok(features) => features,
         Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => return Err(error),
+        Err(error) if is_media_identity_guard_error(&error) => return Err(error),
         Err(error) => {
+            propagate_alignment_process_cleanup(&error)?;
             append_v2_visual_validation_unavailable(
                 proposal,
                 format!("目标视频视觉校验提取失败：{}", truncate_visual_note(&error)),
@@ -3303,6 +5833,21 @@ fn apply_v2_visual_validation(
             return Ok(());
         }
     };
+    // Cache hits do not run FFmpeg and therefore need their own full-file recheck. Compare to the
+    // audio timeMap identities, not merely the newly probed visual inputs, before attaching any
+    // visual stream or evidence.
+    verify_media_content_identity_after_tool_output(
+        &request.source_path,
+        Some(&expected_source_identity),
+        cancel_flag,
+        "视觉证据绑定复核",
+    )?;
+    verify_media_content_identity_after_tool_output(
+        &request.complete_path,
+        Some(&expected_target_identity),
+        cancel_flag,
+        "视觉证据绑定复核",
+    )?;
     if let Some(time_map) = &mut proposal.time_map {
         time_map.source_visual_stream = Some(v2_video_stream_identity(&source_input.stream));
         time_map.target_visual_stream = Some(v2_video_stream_identity(&target_input.stream));
@@ -3361,6 +5906,35 @@ fn apply_v2_visual_validation(
         block_proposal_for_v2_visual_conflict(proposal);
     }
     Ok(())
+}
+
+fn v2_time_map_media_identities_for_visual_validation(
+    proposal: &AudioAlignmentProposal,
+) -> Result<(MediaContentIdentity, MediaContentIdentity), String> {
+    let time_map = proposal.time_map.as_ref().ok_or_else(|| {
+        "blocked:media-identity-missing：音频路径没有可绑定视觉证据的 timeMap。".to_string()
+    })?;
+    let source = require_full_file_media_content_identity(time_map.source_identity.as_ref())?;
+    let target = require_full_file_media_content_identity(time_map.target_identity.as_ref())?;
+    Ok((source.clone(), target.clone()))
+}
+
+fn ensure_visual_input_matches_time_map_identity(
+    expected: &MediaContentIdentity,
+    observed: Option<&MediaContentIdentity>,
+    role: &str,
+) -> Result<(), String> {
+    let observed = require_full_file_media_content_identity(observed)?;
+    if observed != expected {
+        return Err(format!(
+            "blocked:media-identity-changed：{role}视觉证据与音频 timeMap 的全文件身份不一致；拒绝混合证据。"
+        ));
+    }
+    Ok(())
+}
+
+fn is_media_identity_guard_error(error: &str) -> bool {
+    error.starts_with("blocked:media-identity-")
 }
 
 fn block_proposal_for_v2_visual_conflict(proposal: &mut AudioAlignmentProposal) {
@@ -3853,12 +6427,44 @@ fn validate_media_input(path: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label}路径不能为空。"));
     }
     if is_remote_media_input(trimmed) {
-        return Ok(());
+        return Err("音频对齐仅支持已导入的本地媒体文件；远程地址不会被读取。".to_string());
     }
     if !Path::new(trimmed).is_file() {
-        return Err(format!("{label}不是可读取的本地文件：{path}"));
+        return Err(format!(
+            "{label}不是可读取的本地媒体文件；请重新选择或连接素材。"
+        ));
     }
     Ok(())
+}
+
+fn acquire_alignment_media_read_lease(
+    source_path: &str,
+    target_path: &str,
+) -> Result<AlignmentMediaReadLease, String> {
+    Ok(AlignmentMediaReadLease {
+        _source: open_alignment_media_read_lease(Path::new(source_path))?,
+        _target: open_alignment_media_read_lease(Path::new(target_path))?,
+    })
+}
+
+#[cfg(windows)]
+fn open_alignment_media_read_lease(path: &Path) -> Result<File, String> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|_| {
+            "blocked:media-lease：无法取得禁止写入、删除和替换的媒体只读 lease；路径已隐藏。"
+                .to_string()
+        })
+}
+
+#[cfg(not(windows))]
+fn open_alignment_media_read_lease(path: &Path) -> Result<File, String> {
+    File::open(path)
+        .map_err(|_| "blocked:media-lease：无法取得媒体只读 lease；路径已隐藏。".to_string())
 }
 
 fn probe_alignment_audio_input(
@@ -3866,14 +6472,14 @@ fn probe_alignment_audio_input(
     label: &str,
     requested_stream_index: Option<u32>,
     options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<AlignmentAudioInput, String> {
-    let snapshot =
-        probe_media_timeline_with_ffprobe(media_path, &options.ffprobe_path).map_err(|error| {
-            format!(
-                "{label}媒体时间线探测失败：{}",
-                redact_sensitive_media_text(&error)
-            )
-        })?;
+    let snapshot = probe_media_timeline_with_ffprobe_cancellable(
+        media_path,
+        &options.ffprobe_path,
+        cancel_flag,
+    )
+    .map_err(|error| format_alignment_probe_error(&format!("{label}媒体时间线探测失败"), error))?;
     let stream = select_audio_stream(&snapshot, requested_stream_index, label)?;
     if stream.timeline_offset_ms < 0 {
         return Err(format!(
@@ -3950,7 +6556,17 @@ fn read_audio_feature_cache(cache_key: &str) -> Result<Option<Vec<AudioFeatureFr
     let cache = audio_feature_cache()
         .lock()
         .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
-    Ok(cache.get(cache_key).cloned())
+    let result = cache.get(cache_key).cloned();
+    drop(cache);
+    benchmark_cache_event(
+        BenchmarkCacheKind::AudioFeatures,
+        if result.is_some() {
+            BenchmarkCacheEvent::Hit
+        } else {
+            BenchmarkCacheEvent::Miss
+        },
+    );
+    Ok(result)
 }
 
 fn write_audio_feature_cache(
@@ -3962,8 +6578,16 @@ fn write_audio_feature_cache(
         .map_err(|_| "音频特征缓存锁已损坏。".to_string())?;
     if !cache.contains_key(&cache_key) && cache.len() >= MAX_AUDIO_FEATURE_CACHE_ENTRIES {
         cache.clear();
+        benchmark_cache_event(
+            BenchmarkCacheKind::AudioFeatures,
+            BenchmarkCacheEvent::Eviction,
+        );
     }
     cache.insert(cache_key, frames.to_vec());
+    benchmark_cache_event(
+        BenchmarkCacheKind::AudioFeatures,
+        BenchmarkCacheEvent::Write,
+    );
     Ok(())
 }
 
@@ -3972,23 +6596,13 @@ fn create_audio_feature_cache_key(
     options: &AudioAlignmentOptions,
     audio_input: &AlignmentAudioInput,
 ) -> Result<String, String> {
+    let content_identity = alignment_audio_content_identity_cache_fragment(audio_input)?;
     let stream_identity = format!(
         "{}|channelLayout={}",
         serde_json::to_string(&audio_input.stream)
             .map_err(|error| format!("无法序列化音轨缓存身份：{error}"))?,
         audio_input.stream.channel_layout.as_deref().unwrap_or("")
     );
-    if is_remote_media_input(media_path) {
-        return Ok(format!(
-            "remote:{}|presentationOriginMs={}|audioStream={}|sampleRate={}|windowMs={}|ffmpeg={}",
-            redact_sensitive_media_text(media_path),
-            audio_input.presentation_origin_ms,
-            stream_identity,
-            options.sample_rate,
-            options.window_ms,
-            options.ffmpeg_path
-        ));
-    }
     let metadata = fs::metadata(media_path)
         .map_err(|error| format!("无法读取音频特征缓存文件信息：{error}"))?;
     let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
@@ -3999,7 +6613,7 @@ fn create_audio_feature_cache_key(
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     Ok(format!(
-        "{}|len={}|modified={modified_ms}|presentationOriginMs={}|audioStream={}|sampleRate={}|windowMs={}|ffmpeg={}",
+        "{}|len={}|modified={modified_ms}|{content_identity}|presentationOriginMs={}|audioStream={}|sampleRate={}|windowMs={}|ffmpeg={}",
         canonical_path.to_string_lossy(),
         metadata.len(),
         audio_input.presentation_origin_ms,
@@ -4007,6 +6621,21 @@ fn create_audio_feature_cache_key(
         options.sample_rate,
         options.window_ms,
         options.ffmpeg_path
+    ))
+}
+
+fn alignment_audio_content_identity_cache_fragment(
+    audio_input: &AlignmentAudioInput,
+) -> Result<String, String> {
+    let identity = require_full_file_media_content_identity(audio_input.content_identity.as_ref())?;
+    Ok(format!(
+        "contentIdentity={}:{}:{}:{}:{}:{}",
+        identity.algorithm,
+        identity.size_bytes,
+        identity.modified_unix_ms,
+        identity.first_sample_digest,
+        identity.middle_sample_digest,
+        identity.last_sample_digest,
     ))
 }
 
@@ -4023,10 +6652,11 @@ fn get_visual_features(
     media_path: &str,
     label: &str,
     options: &AudioAlignmentOptions,
+    expected_identity: Option<&MediaContentIdentity>,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<CachedVisualFeatures, String> {
     check_cancelled(cancel_flag)?;
-    let cache_key = create_visual_feature_cache_key(media_path, options)?;
+    let cache_key = create_visual_feature_cache_key(media_path, options, expected_identity)?;
     if let Some(frames) = read_visual_feature_cache(&cache_key)? {
         return Ok(CachedVisualFeatures {
             frames,
@@ -4034,7 +6664,8 @@ fn get_visual_features(
         });
     }
 
-    let frames = extract_visual_features(media_path, label, options, cancel_flag)?;
+    let frames =
+        extract_visual_features(media_path, label, options, expected_identity, cancel_flag)?;
     write_visual_feature_cache(cache_key, &frames)?;
     Ok(CachedVisualFeatures {
         frames,
@@ -4047,14 +6678,16 @@ fn probe_alignment_visual_input(
     label: &str,
     requested_stream_index: Option<u32>,
     options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<AlignmentVisualInput, String> {
-    let snapshot =
-        probe_media_timeline_with_ffprobe(media_path, &options.ffprobe_path).map_err(|error| {
-            format!(
-                "{label}视频展示时间线探测失败：{}",
-                redact_sensitive_media_text(&error)
-            )
-        })?;
+    let snapshot = probe_media_timeline_with_ffprobe_cancellable(
+        media_path,
+        &options.ffprobe_path,
+        cancel_flag,
+    )
+    .map_err(|error| {
+        format_alignment_probe_error(&format!("{label}视频展示时间线探测失败"), error)
+    })?;
     if snapshot
         .duration_ms
         .is_some_and(|duration| duration > ALIGNMENT_V2_VISUAL_MAX_DURATION_MS)
@@ -4151,10 +6784,7 @@ fn create_v2_visual_feature_cache_key(
     interval_ms: u64,
 ) -> Result<String, String> {
     let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
-    let identity = input
-        .content_identity
-        .as_ref()
-        .ok_or_else(|| "视觉回退缺少媒体内容身份，拒绝建立可复用缓存。".to_string())?;
+    let identity = require_full_file_media_content_identity(input.content_identity.as_ref())?;
     Ok(format!(
         "feature={ALIGNMENT_V2_VISUAL_FEATURE_VERSION}|path={}|identity={}:{}:{}:{}:{}:{}|presentationOrigin={}|stream={}:{}:{}:{:?}|interval={interval_ms}|ffmpeg={}",
         canonical_path.to_string_lossy(),
@@ -4187,8 +6817,10 @@ fn extract_v2_visual_features(
     let filter = format!(
         "fps=fps={fps:.9}:start_time={presentation_start_seconds:.6},scale={VISUAL_SAMPLE_WIDTH}:{VISUAL_SAMPLE_HEIGHT}:flags=area,format=gray"
     );
-    let mut child = Command::new(&options.ffmpeg_path)
-        .args([
+    let stream_map = format!("0:{}", input.stream.stream_index);
+    let output = run_supervised_ffmpeg_output(
+        &options.ffmpeg_path,
+        [
             "-nostdin",
             "-v",
             "error",
@@ -4197,9 +6829,9 @@ fn extract_v2_visual_features(
             "-i",
             media_path,
             "-map",
-            &format!("0:{}", input.stream.stream_index),
+            stream_map.as_str(),
             "-vf",
-            &filter,
+            filter.as_str(),
             "-an",
             "-sn",
             "-dn",
@@ -4208,72 +6840,31 @@ fn extract_v2_visual_features(
             "-pix_fmt",
             "gray",
             "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("FFmpeg 启动 {label} V2 视觉采样失败：{error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "FFmpeg V2 视觉采样标准输出管道不可用。".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "FFmpeg V2 视觉采样错误输出管道不可用。".to_string())?;
-    let stdout_overflow = Arc::new(AtomicBool::new(false));
-    let reader_overflow = stdout_overflow.clone();
-    let stdout_reader = thread::spawn(move || {
-        read_stream_bounded(stdout, ALIGNMENT_V2_VISUAL_MAX_RAW_BYTES, reader_overflow)
-    });
-    let stderr_reader =
-        thread::spawn(move || read_child_stderr_bounded(stderr, ALIGNMENT_V2_MAX_STDERR_BYTES));
-    let status = loop {
-        if let Err(error) = check_cancelled(cancel_flag) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_child_output(stdout_reader, "stdout");
-            let _ = join_child_output(stderr_reader, "stderr");
-            return Err(error);
-        }
-        if stdout_overflow.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_child_output(stdout_reader, "stdout");
-            let _ = join_child_output(stderr_reader, "stderr");
-            return Err(format!(
-                "blocked:resource-limit：{label}视觉原始帧超过 {} MiB 上限。",
-                ALIGNMENT_V2_VISUAL_MAX_RAW_BYTES / (1024 * 1024)
-            ));
-        }
-        match child
-            .try_wait()
-            .map_err(|error| format!("FFmpeg V2 视觉采样状态读取失败：{error}"))?
-        {
-            Some(status) => break status,
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    };
-    let stdout = join_child_output(stdout_reader, "stdout")?;
-    let stderr = join_child_output(stderr_reader, "stderr")?;
-    if !status.success() {
-        return Err(format!(
-            "FFmpeg 提取 {label} V2 视觉特征失败：{}",
-            redact_sensitive_media_text(&String::from_utf8_lossy(&stderr))
+        ],
+        "FFmpeg V2 视觉采样",
+        ALIGNMENT_V2_VISUAL_MAX_RAW_BYTES,
+        cancel_flag,
+    )?;
+    if !output.status.success() {
+        return Err(format_media_tool_nonzero_exit(
+            &format!("FFmpeg 提取 {label} V2 视觉特征"),
+            output.status.code(),
+            &output.stderr,
         ));
     }
-    if input.content_identity.as_ref()
-        != Some(
-            &probe_media_content_identity(Path::new(media_path))
-                .map_err(|error| format!("{label}视觉采样后媒体身份复核失败：{error}"))?,
-        )
-    {
-        return Err(format!(
-            "{label}文件在视觉采样期间发生变化，已丢弃视觉缓存与结论。"
-        ));
-    }
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 视觉采样",
+    )?;
     let start_ms = input.stream.timeline_offset_ms.max(0) as u64;
-    let frames = raw_visual_frames_to_features_with_origin(&stdout, interval_ms, start_ms)?;
+    let frames = raw_visual_frames_to_features_with_origin(
+        &output.stdout,
+        interval_ms,
+        start_ms,
+        cancel_flag,
+    )?;
     if frames.is_empty() {
         return Err(format!("{label}未能提取到可用 V2 视觉特征。"));
     }
@@ -4288,7 +6879,17 @@ fn read_visual_feature_cache(cache_key: &str) -> Result<Option<Vec<VisualFeature
     let cache = visual_feature_cache()
         .lock()
         .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
-    Ok(cache.get(cache_key).cloned())
+    let result = cache.get(cache_key).cloned();
+    drop(cache);
+    benchmark_cache_event(
+        BenchmarkCacheKind::VisualFeatures,
+        if result.is_some() {
+            BenchmarkCacheEvent::Hit
+        } else {
+            BenchmarkCacheEvent::Miss
+        },
+    );
+    Ok(result)
 }
 
 fn write_visual_feature_cache(
@@ -4300,23 +6901,34 @@ fn write_visual_feature_cache(
         .map_err(|_| "视觉特征缓存锁已损坏。".to_string())?;
     if !cache.contains_key(&cache_key) && cache.len() >= MAX_VISUAL_FEATURE_CACHE_ENTRIES {
         cache.clear();
+        benchmark_cache_event(
+            BenchmarkCacheKind::VisualFeatures,
+            BenchmarkCacheEvent::Eviction,
+        );
     }
     cache.insert(cache_key, frames.to_vec());
+    benchmark_cache_event(
+        BenchmarkCacheKind::VisualFeatures,
+        BenchmarkCacheEvent::Write,
+    );
     Ok(())
 }
 
 fn create_visual_feature_cache_key(
     media_path: &str,
     options: &AudioAlignmentOptions,
+    expected_identity: Option<&MediaContentIdentity>,
 ) -> Result<String, String> {
-    if is_remote_media_input(media_path) {
-        return Ok(format!(
-            "remote:{}|visualInterval={}|ffmpeg={}",
-            redact_sensitive_media_text(media_path),
-            options.visual_sample_interval_ms,
-            options.ffmpeg_path
-        ));
-    }
+    let identity = require_full_file_media_content_identity(expected_identity)?;
+    let content_identity = format!(
+        "contentIdentity={}:{}:{}:{}:{}:{}",
+        identity.algorithm,
+        identity.size_bytes,
+        identity.modified_unix_ms,
+        identity.first_sample_digest,
+        identity.middle_sample_digest,
+        identity.last_sample_digest,
+    );
     let metadata = fs::metadata(media_path)
         .map_err(|error| format!("无法读取视觉特征缓存文件信息：{error}"))?;
     let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
@@ -4327,7 +6939,7 @@ fn create_visual_feature_cache_key(
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     Ok(format!(
-        "{}|len={}|modified={modified_ms}|visualInterval={}|ffmpeg={}",
+        "{}|len={}|modified={modified_ms}|{content_identity}|visualInterval={}|ffmpeg={}",
         canonical_path.to_string_lossy(),
         metadata.len(),
         options.visual_sample_interval_ms,
@@ -4339,6 +6951,7 @@ fn extract_visual_features(
     media_path: &str,
     label: &str,
     options: &AudioAlignmentOptions,
+    expected_identity: Option<&MediaContentIdentity>,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<VisualFeatureFrame>, String> {
     check_cancelled(cancel_flag)?;
@@ -4346,50 +6959,43 @@ fn extract_visual_features(
     let filter = format!(
         "fps={fps:.6},scale={VISUAL_SAMPLE_WIDTH}:{VISUAL_SAMPLE_HEIGHT}:flags=bilinear,format=gray"
     );
-    let mut child = Command::new(&options.ffmpeg_path)
-        .args([
-            "-v", "error", "-i", media_path, "-vf", &filter, "-an", "-f", "rawvideo", "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("FFmpeg 启动视觉采样失败：{error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "FFmpeg 视觉采样标准输出管道不可用。".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "FFmpeg 视觉采样错误输出管道不可用。".to_string())?;
-    let stdout_reader = thread::spawn(move || read_child_stdout(stdout));
-    let stderr_reader = thread::spawn(move || read_child_stderr(stderr));
-
-    let status = loop {
-        if let Err(error) = check_cancelled(cancel_flag) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_child_output(stdout_reader, "stdout");
-            let _ = join_child_output(stderr_reader, "stderr");
-            return Err(error);
-        }
-        match child
-            .try_wait()
-            .map_err(|error| format!("FFmpeg 视觉采样状态读取失败：{error}"))?
-        {
-            Some(status) => break status,
-            None => thread::sleep(Duration::from_millis(100)),
-        }
-    };
-
-    let stdout = join_child_output(stdout_reader, "stdout")?;
-    let stderr = join_child_output(stderr_reader, "stderr")?;
-    if !status.success() {
-        let detail = redact_sensitive_media_text(&String::from_utf8_lossy(&stderr));
-        return Err(format!("FFmpeg 提取视觉证据失败：{detail}"));
+    let output = run_supervised_ffmpeg_output(
+        &options.ffmpeg_path,
+        [
+            "-nostdin",
+            "-v",
+            "error",
+            "-i",
+            media_path,
+            "-vf",
+            filter.as_str(),
+            "-an",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        "FFmpeg 视觉采样",
+        ALIGNMENT_V2_VISUAL_MAX_RAW_BYTES,
+        cancel_flag,
+    )?;
+    if !output.status.success() {
+        return Err(format_media_tool_nonzero_exit(
+            "FFmpeg 提取视觉证据",
+            output.status.code(),
+            &output.stderr,
+        ));
     }
-    let frames = raw_visual_frames_to_features(&stdout, options.visual_sample_interval_ms)?;
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        expected_identity,
+        cancel_flag,
+        "视觉特征采样",
+    )?;
+    let frames = raw_visual_frames_to_features(
+        &output.stdout,
+        options.visual_sample_interval_ms,
+        cancel_flag,
+    )?;
     if frames.is_empty() {
         return Err(format!("{label}未能提取到可用视觉证据。"));
     }
@@ -4399,17 +7005,21 @@ fn extract_visual_features(
 fn raw_visual_frames_to_features(
     raw: &[u8],
     sample_interval_ms: u64,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<VisualFeatureFrame>, String> {
-    raw_visual_frames_to_features_with_origin(raw, sample_interval_ms, 0)
+    raw_visual_frames_to_features_with_origin(raw, sample_interval_ms, 0, cancel_flag)
 }
 
 fn raw_visual_frames_to_features_with_origin(
     raw: &[u8],
     sample_interval_ms: u64,
     presentation_start_ms: u64,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<VisualFeatureFrame>, String> {
+    check_cancelled(cancel_flag)?;
     let frame_size = VISUAL_SAMPLE_WIDTH * VISUAL_SAMPLE_HEIGHT;
     if raw.len() < frame_size {
+        check_cancelled(cancel_flag)?;
         return Ok(Vec::new());
     }
     if raw.len() / frame_size > ALIGNMENT_V2_VISUAL_MAX_FRAMES {
@@ -4421,7 +7031,9 @@ fn raw_visual_frames_to_features_with_origin(
             time_ms: presentation_start_ms.saturating_add(index as u64 * sample_interval_ms),
             values: create_robust_visual_values(chunk),
         });
+        check_cancelled(cancel_flag)?;
     }
+    check_cancelled(cancel_flag)?;
     Ok(frames)
 }
 
@@ -4537,48 +7149,32 @@ fn extract_audio_features(
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<AudioFeatureFrame>, String> {
     check_cancelled(cancel_flag)?;
-    let mut child = Command::new(&options.ffmpeg_path)
-        .args(create_audio_decode_args(media_path, options, audio_input))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("FFmpeg 启动失败：{error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "FFmpeg 标准输出管道不可用。".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "FFmpeg 错误输出管道不可用。".to_string())?;
-    let stdout_reader = thread::spawn(move || read_child_stdout(stdout));
-    let stderr_reader = thread::spawn(move || read_child_stderr(stderr));
-
-    let status = loop {
-        if let Err(error) = check_cancelled(cancel_flag) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = join_child_output(stdout_reader, "stdout");
-            let _ = join_child_output(stderr_reader, "stderr");
-            return Err(error);
-        }
-        match child
-            .try_wait()
-            .map_err(|error| format!("FFmpeg 状态读取失败：{error}"))?
-        {
-            Some(status) => break status,
-            None => thread::sleep(Duration::from_millis(100)),
-        }
-    };
-
-    let stdout = join_child_output(stdout_reader, "stdout")?;
-    let stderr = join_child_output(stderr_reader, "stderr")?;
-    if !status.success() {
-        let detail = redact_sensitive_media_text(&String::from_utf8_lossy(&stderr));
-        return Err(format!("FFmpeg 提取音频失败：{detail}"));
+    let output = run_supervised_ffmpeg_output(
+        &options.ffmpeg_path,
+        create_audio_decode_args(media_path, options, audio_input),
+        "FFmpeg 音频解码",
+        LEGACY_MAX_PCM_BYTES,
+        cancel_flag,
+    )?;
+    if !output.status.success() {
+        return Err(format_media_tool_nonzero_exit(
+            "FFmpeg 提取音频",
+            output.status.code(),
+            &output.stderr,
+        ));
     }
-    let frames = pcm_to_feature_frames(&stdout, options, audio_input.stream.timeline_offset_ms)?;
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        audio_input.content_identity.as_ref(),
+        cancel_flag,
+        "音频特征解码",
+    )?;
+    let frames = pcm_to_feature_frames(
+        &output.stdout,
+        options,
+        audio_input.stream.timeline_offset_ms,
+        cancel_flag,
+    )?;
     if frames.is_empty() {
         return Err(format!("{label}未能提取到可用音频特征。"));
     }
@@ -4606,6 +7202,17 @@ fn create_audio_decode_args(
         "f32le".to_string(),
         "pipe:1".to_string(),
     ]
+}
+
+fn format_media_tool_nonzero_exit(
+    action: &str,
+    status_code: Option<i32>,
+    _untrusted_tool_output: &[u8],
+) -> String {
+    format!(
+        "{action}失败（退出码 {}）；为保护本地路径，未回显工具输出。",
+        status_code.unwrap_or(-1)
+    )
 }
 
 fn redact_sensitive_media_text(text: &str) -> String {
@@ -4647,83 +7254,196 @@ fn check_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
     Ok(())
 }
 
-fn read_child_stdout(mut stdout: ChildStdout) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    stdout
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("FFmpeg stdout 读取失败：{error}"))?;
-    Ok(bytes)
-}
-
-fn read_stream_bounded<R: Read>(
-    mut stdout: R,
-    byte_limit: usize,
-    overflow: Arc<AtomicBool>,
-) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::with_capacity(byte_limit.min(1024 * 1024));
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = stdout
-            .read(&mut buffer)
-            .map_err(|error| format!("FFmpeg V2 stdout 读取失败：{error}"))?;
-        if read == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(read) > byte_limit {
-            overflow.store(true, Ordering::Release);
-            return Err("blocked:resource-limit：FFmpeg V2 stdout 超过硬字节上限。".to_string());
-        }
-        bytes.extend_from_slice(&buffer[..read]);
+fn ensure_alignment_process_supervision_clean() -> Result<(), String> {
+    if process_supervision_cleanup_faulted() {
+        return Err(
+            "blocked:process-cleanup：受监督媒体进程未能可信收尾；当前对齐结果已作废。".to_string(),
+        );
     }
-    Ok(bytes)
+    Ok(())
 }
 
-fn read_child_stderr(mut stderr: ChildStderr) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    stderr
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("FFmpeg stderr 读取失败：{error}"))?;
-    Ok(bytes)
-}
-
-fn read_child_stderr_bounded(
-    mut stderr: ChildStderr,
-    retained_limit: usize,
-) -> Result<Vec<u8>, String> {
-    let mut retained = Vec::new();
-    let mut buffer = [0u8; 8 * 1024];
-    loop {
-        let read = stderr
-            .read(&mut buffer)
-            .map_err(|error| format!("FFmpeg stderr 读取失败：{error}"))?;
-        if read == 0 {
-            break;
-        }
-        let remaining = retained_limit.saturating_sub(retained.len());
-        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+fn propagate_alignment_process_cleanup(error: &str) -> Result<(), String> {
+    if process_supervision_cleanup_faulted() || error.starts_with("blocked:process-cleanup") {
+        return Err(
+            "blocked:process-cleanup：受监督媒体进程未能可信收尾；禁止降级或回退。".to_string(),
+        );
     }
-    Ok(retained)
+    Ok(())
 }
 
-fn join_child_output(
-    handle: thread::JoinHandle<Result<Vec<u8>, String>>,
-    stream_name: &str,
-) -> Result<Vec<u8>, String> {
-    handle
-        .join()
-        .map_err(|_| format!("FFmpeg {stream_name} 读取线程异常。"))?
+fn format_alignment_probe_error(context: &str, error: String) -> String {
+    if process_supervision_cleanup_faulted()
+        || error.starts_with("blocked:process-cleanup")
+        || error.starts_with("blocked:cleanup-failed")
+    {
+        return "blocked:process-cleanup：受监督媒体探测未能可信收尾。".to_string();
+    }
+    if error.starts_with("cancelled：") {
+        return AUDIO_ALIGNMENT_CANCELLED.to_string();
+    }
+    if is_media_identity_guard_error(&error) {
+        return error;
+    }
+    format!("{context}：{}", redact_sensitive_media_text(&error))
+}
+
+fn require_full_file_media_content_identity(
+    identity: Option<&MediaContentIdentity>,
+) -> Result<&MediaContentIdentity, String> {
+    let identity = identity.ok_or_else(|| {
+        "blocked:media-identity-missing：媒体输入缺少全文件身份，拒绝使用缓存或分析结果。"
+            .to_string()
+    })?;
+    let digest_is_valid =
+        |digest: &str| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if identity.algorithm != "sha256-full-file-v2"
+        || !digest_is_valid(&identity.first_sample_digest)
+        || identity.first_sample_digest != identity.middle_sample_digest
+        || identity.middle_sample_digest != identity.last_sample_digest
+    {
+        return Err(
+            "blocked:media-identity-invalid：媒体输入没有有效的 sha256-full-file-v2 全文件摘要，拒绝使用缓存或分析结果。"
+                .to_string(),
+        );
+    }
+    Ok(identity)
+}
+
+fn probe_alignment_run_expected_identity(
+    media_path: &str,
+    cancel_flag: Option<&AtomicBool>,
+    role: &str,
+) -> Result<MediaContentIdentity, String> {
+    check_cancelled(cancel_flag)?;
+    let identity = probe_media_content_identity_cancellable(Path::new(media_path), cancel_flag)
+        .map_err(|error| {
+            if error.starts_with("cancelled：") {
+                AUDIO_ALIGNMENT_CANCELLED.to_string()
+            } else {
+                format!(
+                    "blocked:media-identity-recheck：无法建立{role}的全文件媒体身份；路径与探测错误已隐藏。"
+                )
+            }
+        })?;
+    require_full_file_media_content_identity(Some(&identity)).map_err(|_| {
+        format!("blocked:media-identity-invalid：{role}没有有效的 sha256-full-file-v2 全文件摘要。")
+    })?;
+    Ok(identity)
+}
+
+fn verify_media_content_identity_after_tool_output(
+    media_path: &str,
+    expected_identity: Option<&MediaContentIdentity>,
+    cancel_flag: Option<&AtomicBool>,
+    operation: &str,
+) -> Result<(), String> {
+    check_cancelled(cancel_flag)?;
+    ensure_alignment_process_supervision_clean()?;
+    let expected_identity = require_full_file_media_content_identity(expected_identity)?;
+    let current_identity = probe_media_content_identity_cancellable(Path::new(media_path), cancel_flag)
+        .map_err(|error| {
+            if error.starts_with("cancelled：") {
+                AUDIO_ALIGNMENT_CANCELLED.to_string()
+            } else {
+                format!(
+                    "blocked:media-identity-recheck：{operation}后无法重新核验媒体身份；已丢弃工具输出。"
+                )
+            }
+        })?;
+    check_cancelled(cancel_flag)?;
+    require_full_file_media_content_identity(Some(&current_identity)).map_err(|_| {
+        format!("blocked:media-identity-recheck：{operation}后的媒体身份格式无效；已丢弃工具输出。")
+    })?;
+    if &current_identity != expected_identity {
+        return Err(format!(
+            "blocked:media-identity-changed：媒体文件在{operation}期间发生变化；已丢弃工具输出、缓存与结论。"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_proposal_time_map_identities_match_run(
+    proposal: &AudioAlignmentProposal,
+    source_run_identity: &MediaContentIdentity,
+    target_run_identity: &MediaContentIdentity,
+) -> Result<(), String> {
+    let Some(time_map) = proposal.time_map.as_ref() else {
+        return Ok(());
+    };
+    let source_identity =
+        require_full_file_media_content_identity(time_map.source_identity.as_ref())?;
+    let target_identity =
+        require_full_file_media_content_identity(time_map.target_identity.as_ref())?;
+    if source_identity != source_run_identity || target_identity != target_run_identity {
+        return Err(
+            "blocked:media-identity-changed：TimeMap 媒体身份与本次只读运行 lease 不一致；已丢弃 proposal。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_supervised_ffmpeg_output<I, S>(
+    executable: &str,
+    args: I,
+    context: &str,
+    stdout_hard_limit: usize,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<SupervisedOutput, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut command = SupervisedCommand::new(executable);
+    command.args(args);
+    if let Ok(current_dir) = std::env::current_dir() {
+        command.current_dir(current_dir);
+    }
+    command
+        .output(
+            SupervisedOutputLimits {
+                execution_timeout: Duration::from_millis(MEDIA_TOOL_EXECUTION_TIMEOUT_MS),
+                output_drain_timeout: Duration::from_millis(CHILD_OUTPUT_DRAIN_TIMEOUT_MS),
+                termination_timeout: Duration::from_millis(
+                    CHILD_PROCESS_TREE_TERMINATION_TIMEOUT_MS,
+                ),
+                poll_interval: Duration::from_millis(20),
+                stdout_hard_limit,
+                stderr_hard_limit: ALIGNMENT_V2_MAX_STDERR_BYTES,
+            },
+            || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)),
+        )
+        .map_err(|error| match error.kind() {
+            SupervisedProcessErrorKind::Cancelled => AUDIO_ALIGNMENT_CANCELLED.to_string(),
+            SupervisedProcessErrorKind::StdoutOverflow => format!(
+                "blocked:resource-limit：{context} stdout 超过 {} MiB 硬上限。",
+                stdout_hard_limit.div_ceil(1024 * 1024)
+            ),
+            SupervisedProcessErrorKind::StderrOverflow => {
+                format!("blocked:resource-limit：{context} stderr 超过硬上限。")
+            }
+            SupervisedProcessErrorKind::Timeout => {
+                format!("blocked:tool-timeout：{context} 超过执行时限。")
+            }
+            SupervisedProcessErrorKind::Cleanup => error.to_string(),
+            _ => format!("{context} 失败：{error}"),
+        })
 }
 
 fn pcm_to_feature_frames(
     bytes: &[u8],
     options: &AudioAlignmentOptions,
     timeline_offset_ms: i64,
+    cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<AudioFeatureFrame>, String> {
+    check_cancelled(cancel_flag)?;
     let frame_samples = ((options.sample_rate as u64 * options.window_ms) / 1000).max(1) as usize;
     let sample_count = bytes.len() / 4;
     let mut frames = Vec::new();
     let mut offset = 0usize;
     while offset + frame_samples <= sample_count {
+        check_cancelled(cancel_flag)?;
         let mut frame_samples_values = Vec::with_capacity(frame_samples);
         let mut square_sum = 0.0;
         let mut crossing_count = 0usize;
@@ -4742,6 +7462,9 @@ fn pcm_to_feature_frames(
             }
             previous = sample;
             frame_samples_values.push(f64::from(sample));
+            if should_check_parse_cancellation(index + 1, LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES) {
+                check_cancelled(cancel_flag)?;
+            }
         }
         let rms = (square_sum / frame_samples as f64).sqrt();
         let zero_crossing_rate = crossing_count as f64 / frame_samples as f64;
@@ -4749,7 +7472,8 @@ fn pcm_to_feature_frames(
         values.extend(calculate_spectral_features(
             &frame_samples_values,
             options.sample_rate,
-        ));
+            cancel_flag,
+        )?);
         frames.push(AudioFeatureFrame {
             time_ms: presentation_time_from_sample_offset(
                 offset,
@@ -4760,6 +7484,7 @@ fn pcm_to_feature_frames(
         });
         offset += frame_samples;
     }
+    check_cancelled(cancel_flag)?;
     if frames.is_empty() {
         return Err("未能提取到可用音频特征。".to_string());
     }
@@ -4776,32 +7501,58 @@ fn presentation_time_from_sample_offset(
         .clamp(0, u64::MAX as i128) as u64
 }
 
-fn calculate_spectral_features(samples: &[f64], sample_rate: u32) -> Vec<f64> {
-    let powers: Vec<f64> = SPECTRAL_FREQUENCIES_HZ
-        .iter()
-        .map(|frequency| calculate_goertzel_power(samples, f64::from(sample_rate), *frequency))
-        .collect();
+fn calculate_spectral_features(
+    samples: &[f64],
+    sample_rate: u32,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<f64>, String> {
+    check_cancelled(cancel_flag)?;
+    let mut powers = Vec::with_capacity(SPECTRAL_FREQUENCIES_HZ.len());
+    for frequency in SPECTRAL_FREQUENCIES_HZ {
+        powers.push(calculate_goertzel_power(
+            samples,
+            f64::from(sample_rate),
+            frequency,
+            cancel_flag,
+        )?);
+    }
     let total_power = powers.iter().sum::<f64>().max(0.000_001);
-    powers
+    let normalized = powers
         .into_iter()
         .map(|power| (power / total_power).sqrt().min(1.0))
-        .collect()
+        .collect();
+    check_cancelled(cancel_flag)?;
+    Ok(normalized)
 }
 
-fn calculate_goertzel_power(samples: &[f64], sample_rate: f64, frequency: f64) -> f64 {
+fn calculate_goertzel_power(
+    samples: &[f64],
+    sample_rate: f64,
+    frequency: f64,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<f64, String> {
+    check_cancelled(cancel_flag)?;
     if samples.is_empty() || sample_rate <= 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let normalized_frequency = frequency / sample_rate;
     let coefficient = 2.0 * (2.0 * std::f64::consts::PI * normalized_frequency).cos();
     let mut previous = 0.0;
     let mut previous2 = 0.0;
-    for sample in samples {
+    for (index, sample) in samples.iter().enumerate() {
         let current = sample + coefficient * previous - previous2;
         previous2 = previous;
         previous = current;
+        if should_check_parse_cancellation(index + 1, LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES) {
+            check_cancelled(cancel_flag)?;
+        }
     }
-    previous2 * previous2 + previous * previous - coefficient * previous * previous2
+    check_cancelled(cancel_flag)?;
+    Ok(previous2 * previous2 + previous * previous - coefficient * previous * previous2)
+}
+
+fn should_check_parse_cancellation(processed_items: usize, interval: usize) -> bool {
+    interval != 0 && processed_items != 0 && processed_items.is_multiple_of(interval)
 }
 
 fn create_audio_alignment_proposal(
@@ -4840,6 +7591,7 @@ fn create_audio_alignment_proposal(
     } else {
         create_multistage_audio_alignment(complete_frames, source_frames, options)?
     };
+    benchmark_stage("refining", "推断并精修候选版本差异");
     let cut_candidates = if let Some(change_points) = &alignment.change_points {
         refine_cut_candidates(create_cut_candidates_from_time_mapping_changes(
             change_points,
@@ -4930,6 +7682,7 @@ fn create_multistage_audio_alignment(
     options: &AudioAlignmentOptions,
 ) -> Result<MultistageAudioAlignmentResult, String> {
     if source_frames.len() >= OFFSET_PATH_MIN_SOURCE_FRAMES {
+        benchmark_stage("fitting", "拟合分块偏移路径");
         let offset_path =
             create_offset_path_audio_alignment(complete_frames, source_frames, options);
         let offset_path_coverage =
@@ -4990,6 +7743,7 @@ fn create_multistage_audio_alignment(
         });
     }
 
+    benchmark_stage("fitting", "执行密集时间序列回退");
     let dense_matches = align_audio_feature_sequences(complete_frames, source_frames, options)?;
     let low_confidence_region_count =
         sparse
@@ -5022,8 +7776,10 @@ fn create_localization_audio_alignment(
     reference_frames: &[AudioFeatureFrame],
     options: &AudioAlignmentOptions,
 ) -> MultistageAudioAlignmentResult {
+    benchmark_stage("fingerprinting", "生成定位音频指纹");
     let reference_fingerprints = create_audio_fingerprints(reference_frames);
     let target_fingerprints = create_audio_fingerprints(target_frames);
+    benchmark_stage("matching", "建立定位候选观测");
     let candidates = create_sparse_audio_candidates(
         reference_frames,
         target_frames,
@@ -5615,8 +8371,10 @@ fn create_sparse_audio_alignment(
     source_frames: &[AudioFeatureFrame],
     options: &AudioAlignmentOptions,
 ) -> SparseAudioAlignmentResult {
+    benchmark_stage("fingerprinting", "生成稀疏音频指纹");
     let complete_fingerprints = create_audio_fingerprints(complete_frames);
     let source_fingerprints = create_audio_fingerprints(source_frames);
+    benchmark_stage("matching", "建立稀疏候选观测");
     let candidates = create_sparse_audio_candidates(
         complete_frames,
         source_frames,
@@ -6695,6 +9453,50 @@ fn format_duration(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_probe::{
+        probe_audio_decode_timelines_with_ffprobe, probe_media_timeline_with_ffprobe,
+    };
+    use std::process::{Command, Stdio};
+
+    #[test]
+    #[ignore = "process-supervision sticky cleanup helper"]
+    fn sticky_cleanup_abort_helper() {
+        crate::process_supervision::mark_process_supervision_cleanup_fault_for_test();
+        let request = AudioAlignmentRequest {
+            complete_path: "must-not-be-opened-complete.mkv".to_string(),
+            source_path: "must-not-be-opened-source.mkv".to_string(),
+            ffmpeg_path: Some("must-not-be-spawned.exe".to_string()),
+            ffprobe_path: Some("must-not-be-spawned.exe".to_string()),
+            complete_audio_stream_index: None,
+            source_audio_stream_index: None,
+            complete_video_stream_index: None,
+            source_video_stream_index: None,
+            sample_rate: None,
+            window_ms: None,
+            match_threshold: None,
+            min_gap_ms: None,
+            max_cells: None,
+            enable_visual_evidence: None,
+            visual_sample_interval_ms: None,
+            localization_mode: None,
+        };
+        let error = align_audio_files_inner(request).expect_err("sticky cleanup must abort");
+        assert!(error.starts_with("blocked:process-cleanup"));
+    }
+
+    #[test]
+    fn sticky_cleanup_aborts_before_media_validation_or_spawn() {
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "audio_alignment::tests::sticky_cleanup_abort_helper",
+                "--nocapture",
+            ])
+            .status()
+            .expect("run isolated sticky-cleanup test");
+        assert!(status.success());
+    }
 
     fn test_options() -> AudioAlignmentOptions {
         AudioAlignmentOptions {
@@ -6711,11 +9513,27 @@ mod tests {
         }
     }
 
+    fn test_media_content_identity(
+        digest_character: char,
+        size_bytes: u64,
+        modified_unix_ms: u64,
+    ) -> MediaContentIdentity {
+        let digest = digest_character.to_string().repeat(64);
+        MediaContentIdentity {
+            algorithm: "sha256-full-file-v2",
+            size_bytes,
+            modified_unix_ms,
+            first_sample_digest: digest.clone(),
+            middle_sample_digest: digest.clone(),
+            last_sample_digest: digest,
+        }
+    }
+
     fn test_audio_input(stream_index: u32, timeline_offset_ms: i64) -> AlignmentAudioInput {
         AlignmentAudioInput {
             presentation_origin_ms: -80,
             media_duration_ms: Some(120_000),
-            content_identity: None,
+            content_identity: Some(test_media_content_identity('a', 1_024, 1)),
             decode_timeline: Some(AudioDecodeTimelineProbe {
                 first_decoded_pts_ms: Some(-80 + timeline_offset_ms),
                 decoded_frame_count: 1,
@@ -6761,14 +9579,7 @@ mod tests {
         AlignmentVisualInput {
             presentation_origin_ms: 0,
             media_duration_ms: Some(120_000),
-            content_identity: Some(MediaContentIdentity {
-                algorithm: "sha256-full-file-v2",
-                size_bytes: 1_024,
-                modified_unix_ms: 1,
-                first_sample_digest: "a".repeat(64),
-                middle_sample_digest: "a".repeat(64),
-                last_sample_digest: "a".repeat(64),
-            }),
+            content_identity: Some(test_media_content_identity('a', 1_024, 1)),
             stream: test_video_stream(stream_index, stream_index == 1),
         }
     }
@@ -7218,6 +10029,13 @@ mod tests {
         audio_feature_cache().lock().unwrap().clear();
     }
 
+    fn lock_audio_feature_cache_test_fixture() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("audio feature cache test fixture lock")
+    }
+
     fn temp_audio_cache_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "{name}-{}-{}.media",
@@ -7445,11 +10263,48 @@ mod tests {
         for sample in [0.5f32, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5] {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
-        let extracted = pcm_to_feature_frames(&bytes, &options, 80).unwrap();
+        let extracted = pcm_to_feature_frames(&bytes, &options, 80, None).unwrap();
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].time_ms, 80);
         assert!(extracted[0].values[0] > 0.9);
         assert!(extracted[0].values[1] > 0.9);
+    }
+
+    #[test]
+    fn bounded_cpu_parsers_fail_closed_when_cancelled_before_work() {
+        let cancelled = AtomicBool::new(true);
+        let v2_error = parse_v2_pcm_output(&[0, 0], "测试", Some(&cancelled)).unwrap_err();
+        assert_eq!(v2_error, AUDIO_ALIGNMENT_CANCELLED);
+
+        let options = test_options();
+        let legacy_bytes = vec![0_u8; options.sample_rate as usize * 4];
+        let legacy_error =
+            pcm_to_feature_frames(&legacy_bytes, &options, 0, Some(&cancelled)).unwrap_err();
+        assert_eq!(legacy_error, AUDIO_ALIGNMENT_CANCELLED);
+
+        let visual_bytes = vec![0_u8; VISUAL_SAMPLE_WIDTH * VISUAL_SAMPLE_HEIGHT];
+        let visual_error =
+            raw_visual_frames_to_features(&visual_bytes, 1_000, Some(&cancelled)).unwrap_err();
+        assert_eq!(visual_error, AUDIO_ALIGNMENT_CANCELLED);
+    }
+
+    #[test]
+    fn legacy_cpu_parse_cancel_schedule_has_a_fixed_work_bound() {
+        let processed = (1..=LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES * 3 + 17)
+            .filter(|processed| {
+                should_check_parse_cancellation(*processed, LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            processed,
+            vec![
+                LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES,
+                LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES * 2,
+                LEGACY_PCM_PARSE_CANCEL_CHECK_SAMPLES * 3,
+            ]
+        );
+        assert!(!should_check_parse_cancellation(1, 0));
     }
 
     #[test]
@@ -7492,16 +10347,6 @@ mod tests {
         assert!(args.iter().any(|value| value == "-start_at_zero"));
         assert!(args.iter().any(|value| value == "-t"));
         assert!(args.iter().any(|value| value == "s16le"));
-    }
-
-    #[test]
-    fn v2_stdout_reader_stops_at_hard_byte_limit() {
-        let overflow = Arc::new(AtomicBool::new(false));
-        let error = read_stream_bounded(std::io::Cursor::new(vec![1u8; 17]), 16, overflow.clone())
-            .unwrap_err();
-
-        assert!(error.contains("resource-limit"));
-        assert!(overflow.load(Ordering::Acquire));
     }
 
     #[test]
@@ -7850,7 +10695,12 @@ mod tests {
             localization_mode: Some(true),
         })
         .unwrap();
-        let time_map = proposal.time_map.as_ref().expect("V2 应输出合法时间图");
+        let time_map = proposal.time_map.as_ref().unwrap_or_else(|| {
+            panic!(
+                "V2 应输出合法时间图；diagnostics={:?}",
+                proposal.diagnostics
+            )
+        });
 
         assert_eq!(time_map.engine_version, ALIGNMENT_V2_ENGINE_VERSION);
         assert_eq!(time_map.feature_version, ALIGNMENT_V2_FEATURE_VERSION);
@@ -8064,7 +10914,12 @@ mod tests {
             localization_mode: Some(true),
         })
         .unwrap();
-        let time_map = proposal.time_map.as_ref().expect("视觉回退应输出 timeMap");
+        let time_map = proposal.time_map.as_ref().unwrap_or_else(|| {
+            panic!(
+                "视觉回退应输出 timeMap；diagnostics={:?}",
+                proposal.diagnostics
+            )
+        });
         assert_eq!(time_map.quality.level, "review");
         assert_eq!(
             time_map.feature_version,
@@ -8319,6 +11174,43 @@ mod tests {
     }
 
     #[test]
+    fn proposal_time_map_identities_must_match_run_lease_identities() {
+        let mut proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![AudioTimeMapSpanDto {
+                    kind: AudioTimeMapSpanKind::Matched,
+                    source_start_ms: 0,
+                    source_end_ms: 120_000,
+                    target_start_ms: 0,
+                    target_end_ms: 120_000,
+                }],
+                matched_step_count: 20,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            v2_test_pair_candidate(),
+            0.5,
+            "test audio".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let source_run = test_media_content_identity('a', 1_024, 1);
+        let target_run = test_media_content_identity('a', 1_024, 1);
+        assert!(
+            verify_proposal_time_map_identities_match_run(&proposal, &source_run, &target_run,)
+                .is_ok()
+        );
+
+        proposal.time_map.as_mut().unwrap().target_identity =
+            Some(test_media_content_identity('b', 1_024, 1));
+        let error =
+            verify_proposal_time_map_identities_match_run(&proposal, &source_run, &target_run)
+                .unwrap_err();
+        assert!(error.starts_with("blocked:media-identity-changed"));
+        assert!(!error.contains(&source_run.first_sample_digest));
+    }
+
+    #[test]
     fn visual_evidence_updates_proposal_as_auxiliary_signal() {
         let mut proposal = AudioAlignmentProposal {
             anchors: vec![
@@ -8396,6 +11288,7 @@ mod tests {
 
     #[test]
     fn audio_feature_cache_reuses_frames_for_same_file_and_options() {
+        let _fixture_guard = lock_audio_feature_cache_test_fixture();
         clear_audio_feature_cache_for_tests();
         let path = temp_audio_cache_path("audio-cache-hit");
         std::fs::write(&path, b"not-a-real-media-file").unwrap();
@@ -8417,6 +11310,7 @@ mod tests {
 
     #[test]
     fn audio_feature_cache_key_changes_with_feature_window() {
+        let _fixture_guard = lock_audio_feature_cache_test_fixture();
         clear_audio_feature_cache_for_tests();
         let path = temp_audio_cache_path("audio-cache-key");
         std::fs::write(&path, b"media").unwrap();
@@ -8458,27 +11352,222 @@ mod tests {
     }
 
     #[test]
-    fn remote_media_input_is_accepted_for_emby_streams() {
-        assert!(validate_media_input(
-            "https://emby.example.test/Videos/item/stream?api_key=secret",
-            "完整版"
+    fn audio_cache_keys_bind_full_digest_even_when_size_and_mtime_match() {
+        let path = temp_audio_cache_path("audio-cache-full-digest");
+        std::fs::write(&path, b"media").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let options = test_options();
+        let mut first = test_audio_input(1, 80);
+        first.content_identity = Some(test_media_content_identity('a', 5, 42));
+        let mut different_bytes = first.clone();
+        different_bytes.content_identity = Some(test_media_content_identity('b', 5, 42));
+
+        let first_legacy_key =
+            create_audio_feature_cache_key(&path_text, &options, &first).unwrap();
+        let changed_legacy_key =
+            create_audio_feature_cache_key(&path_text, &options, &different_bytes).unwrap();
+        let first_v2_key =
+            create_v2_audio_cache_key(&path_text, &options, &first, "landmark").unwrap();
+        let changed_v2_key =
+            create_v2_audio_cache_key(&path_text, &options, &different_bytes, "landmark").unwrap();
+        let first_visual_key =
+            create_visual_feature_cache_key(&path_text, &options, first.content_identity.as_ref())
+                .unwrap();
+        let changed_visual_key = create_visual_feature_cache_key(
+            &path_text,
+            &options,
+            different_bytes.content_identity.as_ref(),
+        )
+        .unwrap();
+
+        assert_ne!(first_legacy_key, changed_legacy_key);
+        assert_ne!(first_v2_key, changed_v2_key);
+        assert_ne!(first_visual_key, changed_visual_key);
+        assert!(first_legacy_key.contains(&"a".repeat(64)));
+        assert!(changed_legacy_key.contains(&"b".repeat(64)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn audio_cache_keys_reject_missing_or_non_full_file_identity() {
+        let path = temp_audio_cache_path("audio-cache-identity-missing");
+        std::fs::write(&path, b"media").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let options = test_options();
+        let mut missing = test_audio_input(1, 80);
+        missing.content_identity = None;
+
+        let legacy_error =
+            create_audio_feature_cache_key(&path_text, &options, &missing).unwrap_err();
+        let v2_error =
+            create_v2_audio_cache_key(&path_text, &options, &missing, "landmark").unwrap_err();
+        let visual_error = create_visual_feature_cache_key(&path_text, &options, None).unwrap_err();
+        assert!(legacy_error.starts_with("blocked:media-identity-missing"));
+        assert!(v2_error.starts_with("blocked:media-identity-missing"));
+        assert!(visual_error.starts_with("blocked:media-identity-missing"));
+
+        let mut legacy = test_audio_input(1, 80);
+        legacy.content_identity = Some(MediaContentIdentity {
+            algorithm: "fnv1a64-first-middle-last-64k-v1",
+            size_bytes: 5,
+            modified_unix_ms: 42,
+            first_sample_digest: "1".repeat(16),
+            middle_sample_digest: "2".repeat(16),
+            last_sample_digest: "3".repeat(16),
+        });
+        let invalid = create_audio_feature_cache_key(&path_text, &options, &legacy).unwrap_err();
+        assert!(invalid.starts_with("blocked:media-identity-invalid"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn post_decode_identity_recheck_rejects_missing_and_changed_identity() {
+        let missing = verify_media_content_identity_after_tool_output(
+            r"C:\private\must-not-be-opened.mkv",
+            None,
+            None,
+            "测试音频解码",
+        )
+        .unwrap_err();
+        assert!(missing.starts_with("blocked:media-identity-missing"));
+        assert!(!missing.contains("private"));
+
+        let path = temp_audio_cache_path("post-decode-identity-change");
+        std::fs::write(&path, b"decoded-media-source").unwrap();
+        let actual = probe_media_content_identity_cancellable(&path, None).unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        verify_media_content_identity_after_tool_output(
+            &path_text,
+            Some(&actual),
+            None,
+            "测试音频解码",
+        )
+        .unwrap();
+        let mut stale = actual.clone();
+        stale.first_sample_digest = "b".repeat(64);
+        stale.middle_sample_digest = stale.first_sample_digest.clone();
+        stale.last_sample_digest = stale.first_sample_digest.clone();
+        let changed = verify_media_content_identity_after_tool_output(
+            &path_text,
+            Some(&stale),
+            None,
+            "测试音频解码",
+        )
+        .unwrap_err();
+        assert!(changed.starts_with("blocked:media-identity-changed"));
+        assert!(!changed.contains(&path_text));
+        assert!(!changed.contains(&actual.first_sample_digest));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn final_identity_gate_rejects_a_cached_artifact_after_file_replacement() {
+        let _fixture_guard = lock_audio_feature_cache_test_fixture();
+        clear_audio_feature_cache_for_tests();
+        let path = temp_audio_cache_path("cache-hit-final-identity-gate");
+        std::fs::write(&path, b"version-a-media").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let expected = probe_media_content_identity_cancellable(&path, None).unwrap();
+        let mut input = test_audio_input(1, 80);
+        input.content_identity = Some(expected.clone());
+        let cache_key =
+            create_audio_feature_cache_key(&path_text, &test_options(), &input).unwrap();
+        write_audio_feature_cache(cache_key.clone(), &frames(&[0.1, 0.2])).unwrap();
+        assert!(read_audio_feature_cache(&cache_key).unwrap().is_some());
+
+        std::fs::write(&path, b"version-b-media").unwrap();
+        let error = verify_media_content_identity_after_tool_output(
+            &path_text,
+            Some(&expected),
+            None,
+            "对齐结果最终复核",
+        )
+        .unwrap_err();
+        assert!(error.starts_with("blocked:media-identity-changed"));
+        assert!(!error.contains(&path_text));
+        std::fs::remove_file(path).unwrap();
+        clear_audio_feature_cache_for_tests();
+    }
+
+    #[test]
+    fn visual_validation_rejects_cross_media_identity_binding() {
+        let expected = test_media_content_identity('a', 42, 7);
+        let other_media = test_media_content_identity('b', 42, 7);
+
+        assert!(ensure_visual_input_matches_time_map_identity(
+            &expected,
+            Some(&expected),
+            "参考视频"
         )
         .is_ok());
+        let mismatch = ensure_visual_input_matches_time_map_identity(
+            &expected,
+            Some(&other_media),
+            "参考视频",
+        )
+        .unwrap_err();
+        assert!(mismatch.starts_with("blocked:media-identity-changed"));
+        assert!(!mismatch.contains(&expected.first_sample_digest));
+        assert!(!mismatch.contains(&other_media.first_sample_digest));
+    }
+
+    #[test]
+    fn post_decode_identity_recheck_preserves_cancel_and_redacts_probe_errors() {
+        let expected = test_media_content_identity('a', 1, 1);
+        let cancelled = AtomicBool::new(true);
+        let cancel_error = verify_media_content_identity_after_tool_output(
+            "must-not-be-opened.mkv",
+            Some(&expected),
+            Some(&cancelled),
+            "测试音频解码",
+        )
+        .unwrap_err();
+        assert_eq!(cancel_error, AUDIO_ALIGNMENT_CANCELLED);
+
+        let missing_path = r"C:\Users\alice\private\missing.mkv";
+        let probe_error = verify_media_content_identity_after_tool_output(
+            missing_path,
+            Some(&expected),
+            None,
+            "测试音频解码",
+        )
+        .unwrap_err();
+        assert!(probe_error.starts_with("blocked:media-identity-recheck"));
+        assert!(!probe_error.contains("alice"));
+        assert!(!probe_error.contains("missing.mkv"));
+    }
+
+    #[test]
+    fn remote_media_input_is_rejected_before_alignment_without_echoing_secrets() {
+        let remote = "https://emby.example.test/Videos/private-item/stream?api_key=secret-token";
+        let error = validate_media_input(remote, "完整版").unwrap_err();
+
+        assert_eq!(
+            error,
+            "音频对齐仅支持已导入的本地媒体文件；远程地址不会被读取。"
+        );
+        assert!(!error.contains("emby.example.test"));
+        assert!(!error.contains("private-item"));
+        assert!(!error.contains("secret-token"));
+        assert!(!error.contains(remote));
+        assert!(
+            validate_media_input("HTTP://example.test/other?token=hidden", "完整版")
+                .unwrap_err()
+                .starts_with("音频对齐仅支持已导入的本地媒体文件")
+        );
         assert!(validate_media_input("ftp://example.test/item.mkv", "完整版").is_err());
     }
 
     #[test]
-    fn remote_audio_feature_cache_key_redacts_tokens() {
-        let key = create_audio_feature_cache_key(
-            "https://emby.example.test/Videos/item/stream?api_key=secret-token&MediaSourceId=source-1",
-            &test_options(),
-            &test_audio_input(1, 80),
-        )
-        .unwrap();
+    fn invalid_local_media_path_is_never_echoed_to_errors_or_job_logs() {
+        let private_path = r"C:\Users\alice\private\episode.mkv?token=secret-value";
+        let error = validate_media_input(private_path, "目标原片").unwrap_err();
 
-        assert!(key.contains("api_key=<已隐藏>"));
-        assert!(key.contains("MediaSourceId=source-1"));
-        assert!(!key.contains("secret-token"));
+        assert!(error.contains("目标原片不是可读取的本地媒体文件"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("episode.mkv"));
+        assert!(!error.contains("secret-value"));
+        assert!(!error.contains(private_path));
     }
 
     #[test]
@@ -8491,6 +11580,34 @@ mod tests {
             redacted,
             "https://emby.example.test/Videos/item/stream?api_key=<已隐藏>&token=<已隐藏> failed"
         );
+    }
+
+    #[test]
+    fn supervised_media_tool_nonzero_error_never_echoes_untrusted_paths() {
+        let raw = br#"C:\Users\alice\private\episode.mkv: api_key=secret-token"#;
+        let error = format_media_tool_nonzero_exit("FFmpeg 提取音频", Some(7), raw);
+
+        assert!(error.contains("退出码 7"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("episode.mkv"));
+        assert!(!error.contains("secret-token"));
+    }
+
+    #[test]
+    fn cancellable_probe_error_is_normalized_to_alignment_cancellation() {
+        let error = format_alignment_probe_error(
+            "目标原片媒体时间线探测失败",
+            "cancelled：FFprobe 媒体时间线探测已取消。".to_string(),
+        );
+        assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);
+    }
+
+    #[test]
+    fn cleanup_marker_cannot_be_downgraded_to_optional_evidence() {
+        let error =
+            propagate_alignment_process_cleanup("blocked:process-cleanup：reader cleanup failed")
+                .expect_err("cleanup failure must propagate");
+        assert!(error.starts_with("blocked:process-cleanup"));
     }
 
     #[test]
@@ -8601,5 +11718,330 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);
+    }
+
+    #[test]
+    fn benchmark_lease_rejects_existing_session_and_ordinary_work() {
+        assert!(validate_alignment_benchmark_lease_availability(false, false, 0, false).is_ok());
+        assert!(validate_alignment_benchmark_lease_availability(true, false, 0, false).is_err());
+        assert!(validate_alignment_benchmark_lease_availability(false, true, 0, false).is_err());
+        assert!(validate_alignment_benchmark_lease_availability(false, false, 1, false).is_err());
+        assert!(validate_alignment_benchmark_lease_availability(false, false, 0, true).is_err());
+    }
+
+    #[test]
+    fn benchmark_never_commits_active_after_environment_cleanup_fault() {
+        let (healthy_status, healthy_reason) = alignment_benchmark_initial_lifecycle_state(false);
+        assert_eq!(healthy_status, AlignmentBenchmarkSessionStatus::Active);
+        assert!(healthy_reason.is_none());
+
+        let (faulted_status, faulted_reason) = alignment_benchmark_initial_lifecycle_state(true);
+        assert_eq!(
+            faulted_status,
+            AlignmentBenchmarkSessionStatus::CleanupBlocked
+        );
+        assert_eq!(
+            faulted_reason.as_deref(),
+            Some(BENCHMARK_PROCESS_CLEANUP_REASON)
+        );
+    }
+
+    #[test]
+    fn benchmark_captures_process_baseline_before_probing_tools() {
+        let order = RefCell::new(Vec::new());
+        let (baseline, value) = collect_alignment_benchmark_baseline_before_probe(
+            || {
+                order.borrow_mut().push("baseline");
+                Ok(HashSet::from([17_u32]))
+            },
+            || {
+                assert_eq!(order.borrow().as_slice(), &["baseline"]);
+                order.borrow_mut().push("probe");
+                Ok(23_u32)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(baseline, HashSet::from([17_u32]));
+        assert_eq!(value, 23);
+        assert_eq!(order.into_inner(), vec!["baseline", "probe"]);
+    }
+
+    #[test]
+    fn benchmark_tool_version_parser_emits_only_numeric_semver() {
+        let stdout = br#"ffmpeg version 7.1.2-C:\Users\alice\private-build host=secret
+configuration: --extra-cflags=C:\Users\alice\sdk"#;
+        let version =
+            parse_alignment_benchmark_tool_semantic_version("ffmpeg", stdout, b"").unwrap();
+
+        assert_eq!(version, "7.1.2");
+        assert!(version
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.'));
+        assert!(!version.contains("alice"));
+        assert!(!version.contains("private-build"));
+        assert!(parse_alignment_benchmark_tool_semantic_version(
+            "ffmpeg",
+            br#"wrapper C:\Users\alice\ffmpeg.exe host=secret"#,
+            b""
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn benchmark_cache_reset_receipt_is_generation_bound_and_single_use() {
+        let mut receipt = AlignmentBenchmarkOutstandingReceipt {
+            generation: 7,
+            reset_tick_ns: 42,
+            used: false,
+        };
+        assert_eq!(
+            consume_alignment_benchmark_reset_receipt(Some(&mut receipt), 7).unwrap(),
+            Some(7)
+        );
+        assert!(receipt.used);
+        assert_eq!(
+            consume_alignment_benchmark_reset_receipt(Some(&mut receipt), 7).unwrap(),
+            None
+        );
+
+        let mut stale = AlignmentBenchmarkOutstandingReceipt {
+            generation: 8,
+            reset_tick_ns: 43,
+            used: false,
+        };
+        assert!(consume_alignment_benchmark_reset_receipt(Some(&mut stale), 9).is_err());
+        assert!(!stale.used);
+    }
+
+    #[test]
+    fn benchmark_telemetry_uses_explicit_stages_and_first_cancel_tick() {
+        let telemetry = AlignmentBenchmarkRunTelemetry::new(
+            Instant::now(),
+            DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS,
+            3,
+            AlignmentBenchmarkCacheCounts::default(),
+        );
+        telemetry.mark_started().unwrap();
+        telemetry
+            .transition_stage("validating", "校验输入与媒体时间线")
+            .unwrap();
+        telemetry
+            .transition_stage("matching", "建立候选观测")
+            .unwrap();
+        telemetry
+            .transition_stage("validating", "复核输入")
+            .unwrap();
+        telemetry
+            .record_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss)
+            .unwrap();
+        telemetry
+            .record_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write)
+            .unwrap();
+        telemetry
+            .record_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit)
+            .unwrap();
+        telemetry
+            .record_cache_event(
+                BenchmarkCacheKind::V2Landmarks,
+                BenchmarkCacheEvent::Eviction,
+            )
+            .unwrap();
+        let first_cancel = telemetry.record_cancel_request().unwrap();
+        let repeated_cancel = telemetry.record_cancel_request().unwrap();
+        assert_eq!(first_cancel, repeated_cancel);
+        telemetry.set_residual_process_count(0).unwrap();
+        telemetry
+            .finish(AudioAlignmentJobStatus::Cancelled)
+            .unwrap();
+
+        let snapshot = telemetry.snapshot().unwrap();
+        assert_eq!(snapshot.stages.len(), 3);
+        assert_eq!(snapshot.stages[0].stage_key, "validating");
+        assert_eq!(snapshot.stages[1].stage_key, "matching");
+        assert_eq!(snapshot.stages[2].occurrence, 2);
+        assert_eq!(
+            snapshot.stages[2].status,
+            AudioAlignmentJobStatus::Cancelled
+        );
+        assert_eq!(snapshot.cache.landmarks.misses, 1);
+        assert_eq!(snapshot.cache.landmarks.writes, 1);
+        assert_eq!(snapshot.cache.landmarks.hits, 1);
+        assert_eq!(snapshot.cache.landmarks.evictions, 1);
+        assert!(snapshot.memory.process_tree_empty_at_terminal);
+        assert!(snapshot.cancellation.unwrap().latency_ms >= 0.0);
+        assert!(snapshot.end_tick_ns.is_some());
+    }
+
+    #[test]
+    fn benchmark_job_snapshot_serializes_bridge_contract() {
+        let telemetry = AlignmentBenchmarkRunTelemetry::new(
+            Instant::now(),
+            DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS,
+            0,
+            AlignmentBenchmarkCacheCounts::default(),
+        );
+        let snapshot =
+            create_initial_alignment_benchmark_job_snapshot("session-123", "job-12345", &telemetry)
+                .unwrap();
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["schemaVersion"], ALIGNMENT_BENCHMARK_SCHEMA_VERSION);
+        assert_eq!(value["status"], "queued");
+        assert_eq!(value["stageKey"], "queued");
+        assert_eq!(
+            value["telemetry"]["clock"],
+            "rust-std-instant-session-relative-v1"
+        );
+        assert_eq!(
+            value["telemetry"]["memory"]["scope"],
+            "application-process-tree"
+        );
+    }
+
+    #[test]
+    fn benchmark_memory_telemetry_fails_closed_on_gap_or_sample_error() {
+        let telemetry = AlignmentBenchmarkRunTelemetry::new(
+            Instant::now(),
+            DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS,
+            0,
+            AlignmentBenchmarkCacheCounts::default(),
+        );
+        let baseline = HashSet::new();
+        let first = Instant::now();
+        telemetry.record_memory_sample(
+            first,
+            Ok(ProcessTreeMemorySample {
+                working_set_bytes: 123,
+                descendants: HashSet::new(),
+            }),
+            &baseline,
+        );
+        telemetry.record_memory_sample(
+            first + Duration::from_millis(DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS * 5),
+            Err("sample failed".to_string()),
+            &baseline,
+        );
+        let memory = telemetry.snapshot().unwrap().memory;
+        assert_eq!(memory.sample_count, 1);
+        assert_eq!(memory.failed_sample_count, 1);
+        assert_eq!(memory.peak_process_tree_rss_bytes, Some(123));
+        assert!(!memory.coverage_complete);
+        assert!(memory.maximum_sample_gap_ms >= 100.0);
+    }
+
+    #[test]
+    fn process_descendant_collection_is_transitive_and_excludes_unrelated_processes() {
+        let pairs = vec![(10, 1), (11, 10), (12, 11), (20, 1), (21, 20)];
+        let descendants = collect_process_descendants(10, &pairs);
+        assert_eq!(descendants, HashSet::from([11, 12]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_benchmark_topology_and_working_set_primitives_are_available() {
+        let physical = windows_physical_core_count().unwrap();
+        let logical = windows_logical_core_count().unwrap();
+        assert!(physical > 0);
+        assert!(logical >= physical);
+        assert!(windows_total_memory_bytes().unwrap() > 0);
+
+        // Parallel integration tests intentionally create and reap many short-lived FFmpeg
+        // processes. ToolHelp sampling is fail-closed for each pass, so retry until one complete
+        // snapshot proves the primitive works instead of weakening production coverage rules.
+        let sample = (0..50)
+            .find_map(|_| {
+                let sample = sample_process_tree_memory(std::process::id()).ok();
+                if sample.is_none() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                sample
+            })
+            .expect("working-set primitive never produced a complete snapshot");
+        assert!(sample.working_set_bytes > 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_benchmark_tool_pin_denies_write_and_delete_until_drop() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "danmaku-alignment-benchmark-tool-pin-{}-{unique}.bin",
+            std::process::id()
+        ));
+        fs::write(&path, b"pinned-tool-fixture").unwrap();
+        let canonical_path = fs::canonicalize(&path).unwrap();
+        let pinned = pin_alignment_benchmark_tool(canonical_path.clone()).unwrap();
+
+        assert!(verify_alignment_benchmark_pinned_tool("fixture", &pinned).is_ok());
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .open(&canonical_path)
+            .is_err());
+        assert!(fs::remove_file(&canonical_path).is_err());
+
+        drop(pinned);
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .open(&canonical_path)
+            .is_ok());
+        fs::remove_file(canonical_path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alignment_media_read_lease_blocks_overwrite_and_rename_until_drop() {
+        let source = temp_audio_cache_path("alignment-media-lease-source");
+        let target = temp_audio_cache_path("alignment-media-lease-target");
+        let renamed = source.with_extension("renamed");
+        fs::write(&source, b"source-version-a").unwrap();
+        fs::write(&target, b"target-version-a").unwrap();
+        let lease = acquire_alignment_media_read_lease(
+            &source.to_string_lossy(),
+            &target.to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(fs::write(&source, b"source-version-b").is_err());
+        assert!(fs::rename(&source, &renamed).is_err());
+
+        drop(lease);
+        fs::write(&source, b"source-version-b").unwrap();
+        fs::rename(&source, &renamed).unwrap();
+        fs::remove_file(renamed).unwrap();
+        fs::remove_file(target).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_benchmark_environment_hashes_resolved_media_tools_without_paths() {
+        if !ffmpeg_test_tools_available() {
+            eprintln!("跳过原生 benchmark 环境收据测试：ffmpeg/ffprobe 不可用。");
+            return;
+        }
+        let (environment, ffmpeg_tool, ffprobe_tool) =
+            collect_alignment_benchmark_environment("ffmpeg", Path::new("ffprobe")).unwrap();
+        assert!(environment.physical_core_count > 0);
+        assert!(environment.logical_core_count >= environment.physical_core_count);
+        assert!(environment.total_memory_bytes > 0);
+        assert_eq!(environment.storage_scope, "system-volume");
+        assert!(environment.ffmpeg.binary_digest.starts_with("sha256:"));
+        assert!(environment.ffprobe.binary_digest.starts_with("sha256:"));
+        for version in [&environment.ffmpeg.version, &environment.ffprobe.version] {
+            let components = version.split('.').collect::<Vec<_>>();
+            assert_eq!(components.len(), 3);
+            assert!(components
+                .iter()
+                .all(|component| component.parse::<u32>().is_ok()));
+        }
+        assert!(verify_alignment_benchmark_pinned_tool("ffmpeg", &ffmpeg_tool).is_ok());
+        assert!(verify_alignment_benchmark_pinned_tool("ffprobe", &ffprobe_tool).is_ok());
+        let serialized = serde_json::to_string(&environment).unwrap();
+        assert!(!serialized.to_ascii_lowercase().contains("hostname"));
+        assert!(!serialized.to_ascii_lowercase().contains("executable_path"));
+        assert!(!serialized.contains(&ffmpeg_tool.path.to_string_lossy().to_string()));
+        assert!(!serialized.contains(&ffprobe_tool.path.to_string_lossy().to_string()));
     }
 }

@@ -11,7 +11,9 @@
 1. 在真实媒体冻结测试集达到本目标门槛之前，不得对外宣称自动匹配或删减检测“精度通过”。
 2. 算法的任何结论都先是候选；即使达到高质量门槛，也只能进入可批量人工确认状态，不能静默写入已确认映射。
 
-当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、完整 C137 acceptance bundle 的 fail-closed 聚合器，以及 A/B 播放复核证据 v2。这些能力解决的是“怎样盲跑生产算法、怎样防止局部指标或自报 JSON 冒充完整验收”，不代表真实准确率已经通过。仓库仍缺少达到规模的授权真实冻结集、正式批准的验收协议和外部信任根、规定硬件上的完整性能原始测量、20 套北极星长合集结果与真实媒体回归。
+当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、完整 C137 acceptance bundle 的 fail-closed 聚合器、A/B 播放复核证据 v2，以及第四阶段原生性能工程证据链。性能链现已具备原生独占 session、严格 performance raw evidence v1、acceptance protocol v2 / performance report v2、匹配页工程采集入口与 manifest 工作负载绑定；它能从生产调用链记录 session-relative 单调时钟、真实阶段边界、冷/热缓存、取消终态和应用进程树 working set，并固定、摘要和去敏 FFmpeg/FFprobe 工具信息。Windows 一次性媒体工具同时已迁移到独立 lifecycle Job Object：挂起创建、入 Job 后恢复、kill-on-close、有界输出与有界清理，无法可信收尾时触发全局粘性 `blocked:process-cleanup`。本地 source/target 又由贯穿整个对齐 run 的 `FILE_SHARE_READ` media lease 固定，run-start/run-final SHA、TimeMap identity、frame/packet PTS、缓存和音画证据都绑定同一全文件身份。
+
+这些能力解决的是“怎样盲跑生产算法、怎样安全拥有和清理媒体进程树、怎样生成不可自行放行的性能原始记录、怎样防止局部指标或自报 JSON 冒充完整验收”，不代表真实准确率或正式性能验收已经通过。lifecycle Job 只负责执行与清理，不是性能协议的 RSS sampler；当前 native raw 仍声明 `windows-toolhelp-working-set-v1`，并只生成 `system-volume` 存储属性，没有以 Job membership 汇总 working set，也没有逐一覆盖实际 workload media volumes。故该产物只能标记为 `releaseEligible=false` 的 engineering raw，不能晋级为正式 acceptance evidence。正式协议仍要求 `windows-job-object-working-set-v1` 与 `workload-media-volumes`。当前获授权且完成运行的真实冻结关系数仍为 0；实测校准、批准的验收协议与外部信任根、规定目标机上的正式性能测量、20 套北极星长合集和真实媒体回归均未完成。
 
 ## 产品目标
 
@@ -400,11 +402,24 @@ production blind benchmark runner 已能执行以下闭环：
 
 现有 `evaluateRealMediaBenchmark` 只评估“已知正确媒体 pair 的 TimeMap 组件”，其 gate 明确为 `time-map-component`。即使 150 个已知 pair 的组件指标全部通过，`verifiedEligible` 仍恒为 `false`，也不能替代 Top-1/Top-K、全局 N×M 分配、校准、性能、北极星、UI 或 release 验收。
 
-完整 C137 acceptance bundle 已定义 versioned protocol、数据审批/preflight/prediction receipts，以及 dataset、关系排名、TimeMap、校准、视觉回退、安全降级、北极星、性能、UI 和 release 原始报告。最终 gate 只使用 frozen-test 原始 evidence 重算门槛；缺报告、digest 不一致、synthetic、real-development 或未批准阈值均只能得到 `incomplete-evidence`。
+完整 C137 acceptance bundle 已定义 versioned protocol、数据审批/preflight/prediction receipts，以及 dataset、关系排名、TimeMap、校准、视觉回退、安全降级、北极星、性能、UI 和 release 原始报告。acceptance protocol 已升级到 v2，性能报告已升级到 v2：性能报告不再接受手写汇总耗时，而是绑定严格 performance raw evidence v1、固定性能计划摘要、session-relative 原生单调时钟、最大内存采样间隔和规定取消次数。最终 gate 只使用 frozen-test 原始 evidence 重算门槛；缺报告、digest 不一致、synthetic、real-development、未批准阈值或性能采集器/存储范围不符合协议，均只能得到 `incomplete-evidence`。
 
 acceptance 不内置可自行放行的非空白名单。调用方必须从独立信任根提供受信 protocol、三类 receipt 和每份 raw report 的 canonical SHA-256；报告摘要从原始内容重算并排除自身 `evidenceDigest`。默认没有外部 trust context 时，即使 bundle 字段齐全也必须保持 `incomplete-evidence`。当前 release 尚无正式批准的协议摘要、数据审批 receipt 和外部信任根，因此不存在可用于真实发布放行的 production trust context。
 
-尚未完成的是性能原始测量生成器：需要在规定 4 核目标机上结构化记录硬件/工具链指纹、真实阶段耗时、冷/热缓存控制与命中统计、应用及 FFmpeg 子进程树峰值内存、取消响应和输出一致性。blind runner 当前记录的 wall time 不能替代这些证据。
+第四阶段已完成原生性能**工程**原始测量生成器：
+
+1. 原生独占 benchmark session 会阻止普通对齐任务并串行执行预注册的冷缓存、warmup、热缓存和取消试验；缓存重置带 generation 与单次 receipt，session 只有在任务终止且未残留新子进程时才释放。
+2. Windows 一次性 FFmpeg/FFprobe、版本探测和受控系统探测以挂起状态创建，先加入私有 kill-on-close Job Object 后才恢复；显式继承列表只含标准流。取消、超时、输出溢出、I/O/等待异常会终止整个 Job 并有界等待；reader drain 超时会针对精确线程句柄取消同步 I/O 后再次等待。任何清理失败都会把当前结果作废、把 benchmark session 固定为 `cleanup-blocked` 并保持 lease。
+3. FFprobe 普通时间线探测限制为 30 秒、8 MiB stdout / 256 KiB stderr；逐帧/packet 音频 PTS 探测限制为 5 分钟、128 MiB 紧凑 stdout / 1 MiB stderr，并只在整个 Job 退出后解析，另限制单条 compact record 为 1 MiB、不同音频流为 256 条。
+4. 性能计划绑定由治理 manifest 投影得到的 workload digest 与真实 case 数；匹配页复核 runner 返回结果时再次校验 manifest binding，示例清单或空真实清单不能启动。
+5. raw evidence v1 严格拒绝未知字段、试验删改、tick/elapsed 不一致、错误缓存命中、输出不一致、内存覆盖缺口和残留进程；报告恒为 `releaseEligible=false` / `untrusted-raw-evidence`。
+6. 耗时由 Rust `Instant` 的 session-relative 纳秒 tick 和真实阶段边界生成；缓存记录 hits/misses/writes/evictions；取消记录请求 tick 到真实终态；内存按默认 20ms 采样应用及发现的 FFmpeg 子进程树 working set，并保存覆盖率、失败样本、最大间隔和残留进程数。
+7. 环境 receipt 记录物理/逻辑核心、内存、OS/架构、电源方案、存储 seek-penalty，以及 FFmpeg/FFprobe 的版本和完整二进制 SHA；本地路径、主机名和原始工具错误不进入可下载 raw。若 PATH 命中 Chocolatey `ShimGen`，只有规范路径、version resource、拒绝 reparse/symlink 的有界候选遍历都通过且恰好找到一个真实 exe 时才固定、哈希并执行该真二进制；任一验证失败都要求显式真实路径。
+8. 每个 Windows 本地对齐 run 在任何媒体探测前取得 source/target `FILE_SHARE_READ` lease，持有到最终 proposal gate；写入、删除、rename 和路径替换在 lease 期间被拒绝。run-start 与 run-final 全文件 SHA 必须一致，TimeMap 的双端 identity 还必须严格等于本次 run identity，关闭 A→B→A 替换窗口。
+9. frame/packet PTS 探测同时绑定 stream snapshot expected identity、FFprobe 前 identity 与 Job 退出后 identity；音频、landmark、legacy/V2 视觉 cache key 都强制绑定 `sha256-full-file-v2`。FFmpeg 成功后、PCM/视觉帧解析前再次核验；视觉证据必须在 cache/decode 前后均与音频 TimeMap 属于同一双端媒体世代，之后才允许附加 visual stream/evidence。
+10. reader 状态机只在 root exit、Job empty、stdout/stderr 全就绪时消费缓冲，修复先完成流在轮询中被提前丢弃的竞态。取消检查延伸到工具退出后的 JSON deserialize 前后、逐 stream/record 归一化、V2 PCM 分块、legacy PCM/频谱分块和视觉逐帧解析；取消后不返回部分 snapshot、缓存或 proposal。
+
+但 lifecycle Job 不会自动把采样器升级为正式性能证据。native v1 的采样器身份仍是 `windows-toolhelp-working-set-v1`，存储范围仍是 `system-volume`；ToolHelp raw 没有按 Job membership 汇总进程 working set，也不能彻底规避 session baseline 的 PID 复用，系统卷 seek-penalty 更不能证明 manifest 引用的所有媒体卷具有同一存储特征。正式 acceptance protocol v2 因此仍固定要求 `windows-job-object-working-set-v1` 与 `workload-media-volumes`。在这两个采集能力升级、正式协议/环境获批并于规定 4 核目标机重复运行前，当前 raw 只能用于工程诊断，不能计入上线门槛。blind runner 和组件面板的协调器 wall time 同样不能替代正式性能证据。
 
 ### 指标
 
@@ -481,14 +496,24 @@ acceptance 不内置可自行放行的非空白名单。调用方必须从独立
 - [x] 已知 pair 的 TimeMap component gate 不再授予 `verifiedEligible`，组件通过不能冒充完整 C137 通过。
 - [x] 完整 acceptance bundle 能从 frozen 原始 evidence 重算固定门槛；缺证据、非 real-frozen、digest 不一致或无外部 trust 时 fail closed。
 - [x] A/B 播放复核证据 v2 按轴记录有效时长和覆盖范围，并执行 span、边界两级最小时长要求。
+- [x] 原生独占性能 session 复用生产对齐核心，并记录 session-relative tick、真实阶段、缓存 generation/命中、取消终态和 ToolHelp 进程树 RSS；清理失败时保留 lease 并 fail closed。
+- [x] Windows 一次性媒体工具使用挂起创建 → Job 归属 → 恢复执行的 lifecycle supervisor；取消、超时、输出异常和 reader 收尾均有界，无法可信清理时设置粘性故障并禁止结果降级。
+- [x] FFprobe 时间线/逐帧 PTS 输出与解析均有硬上限；Chocolatey ShimGen 只允许解析到唯一、规范、非 reparse 的真实二进制，并把工具指纹绑定该真实文件。
+- [x] Windows source/target media lease 贯穿完整 run；run-start/run-final SHA、TimeMap 双端 identity 与 frame/packet expected/before/after 身份严格闭环，缓存命中不能绕过最终复核。
+- [x] 音频/landmark/视觉缓存全部绑定完整 SHA-256；视觉验证在消费前后都与音频 TimeMap 绑定同一媒体世代，身份缺失、变化或探测失败不产生混合证据。
+- [x] reader 就绪状态不再过早消费单侧输出；JSON、compact PTS、V2/legacy PCM 与视觉 CPU 解析均有可测试的取消检查粒度。
+- [x] strict performance raw evidence v1 绑定不可删改的冷/热/取消计划、manifest workload、工具链摘要、输出一致性与内存采样覆盖，且恒为 `releaseEligible=false`。
+- [x] acceptance protocol v2 与 performance report v2 完整消费 raw v1；手写耗时、旧 v1 性能报告、环境或工具摘要篡改均不能通过。
+- [x] 匹配页高级诊断提供工程性能采集与取消入口，复用同一 manifest、二次校验 workload/case binding，并在下载前执行路径与媒体秘密扫描。
 
-当前剩余限制：双侧证据、不确定范围、A/B 人工复核、blind runner 和 fail-closed acceptance 虽已落地，但尚未通过真实冻结媒体、实测校准、批准的 production trust、规定硬件性能和 20 套北极星长合集验证，不能据此宣称准确率达标。
+当前剩余限制：双侧证据、不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程性能 raw 和 fail-closed acceptance 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；实测校准、批准的 production protocol / trust root、独立 Job Object RSS sampler + workload-media-volumes 正式性能证据和 20 套北极星长合集均未完成，不能据此宣称准确率或性能达标。
 
 ### 真实准确率与发布
 
 - [ ] 真实媒体基准规模、双人标注和冻结集达到要求。
 - [ ] 正式批准 versioned 验收协议、校准/取消阈值、数据审批 receipts 与独立 production trust root。
-- [ ] 性能原始测量生成器在规定 4 核目标机输出硬件/工具链、阶段耗时、冷/热缓存、进程树峰值内存、取消响应和一致性证据。
+- [x] 工程性能 raw v1 可在原生独占 session 中输出硬件/工具链、阶段耗时、冷/热缓存、ToolHelp 进程树峰值内存、取消响应和一致性证据，并保持不可晋级状态。
+- [ ] 正式性能采集在现有 lifecycle Job 之上实现 `windows-job-object-working-set-v1`，按 Job membership 汇总 RSS 并逐一探测 workload media volumes；在规定 4 核目标机按获批协议重复运行并形成受信原始报告。
 - [ ] 所有上线准确率、校准和性能门槛通过并有可重复报告。
 - [ ] 北极星 20 套长合集 5/5 定位和完整导出通过。
 - [ ] 源码审计、lint、前端/Rust 单测、真实媒体回归、E2E、构建和 Tauri release 通过。

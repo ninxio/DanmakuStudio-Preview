@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { createCompleteC137PerformanceEvidenceFixture } from "../../test/c137PerformanceEvidence";
+import {
+  computeC137PerformanceEnvironmentDigest,
+  computeC137PerformanceEvidenceDigest
+} from "./c137PerformanceEvidence";
 import {
   computeC137CanonicalDigest,
+  computeC137EnvironmentDigest,
   computeC137ReportEvidenceDigest,
   evaluateC137AcceptanceBundle,
   validateC137AcceptanceBundle,
@@ -11,6 +17,7 @@ import {
   type C137Digest,
   type C137EditKind,
   type C137EvidenceBinding,
+  type C137EnvironmentFingerprint,
   type C137RelationshipDecisionEvidence
 } from "./c137Acceptance";
 
@@ -57,6 +64,19 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(gate.status).toBe("pass");
     expect(gate.verifiedEligible).toBe(true);
     expect(gate.checks.every((check) => check.status === "pass")).toBe(true);
+  });
+
+  it("修改硬件或工具链字段但保留旧环境摘要时严格拒绝", () => {
+    const bundle = createCompleteBundle();
+    bundle.environment.cpuModel = "tampered cpu";
+
+    const validation = validateC137AcceptanceBundle(bundle);
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("规范摘要不一致");
+    expect(evaluateC137AcceptanceBundle(bundle, createTrustContext(createCompleteBundle()))).toMatchObject({
+      status: "incomplete-evidence",
+      verifiedEligible: false
+    });
   });
 
   it("完整 bundle 默认没有外部信任根，仍必须 incomplete", () => {
@@ -209,6 +229,53 @@ describe("C137 fail-closed acceptance gate", () => {
     });
   });
 
+  it("旧版手写 runs/cancellation 数组不能升级为 performance v2", () => {
+    const bundle = createCompleteBundle();
+    bundle.reports.performance = {
+      schemaVersion: 1,
+      binding: bundle.reports.performance!.binding,
+      runs: [],
+      cancellationLatenciesMs: []
+    } as unknown as C137AcceptanceBundle["reports"]["performance"];
+
+    const validation = validateC137AcceptanceBundle(bundle);
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("rawEvidence");
+  });
+
+  it("raw performance plan 未命中受信 protocol 时保持 incomplete", () => {
+    const bundle = createCompleteBundle();
+    bundle.protocol.performancePlanDigest = digest("e");
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(gate.status).toBe("incomplete-evidence");
+    expect(gate.checks.find((check) => check.id === "performance-measurements")).toMatchObject({
+      status: "incomplete"
+    });
+  });
+
+  it("ToolHelp engineering raw 不能晋升为正式性能通过", () => {
+    const bundle = createCompleteBundle();
+    const raw = bundle.reports.performance!.rawEvidence;
+    raw.collector.sampler = "windows-toolhelp-working-set-v1";
+    for (const trial of raw.trials) {
+      if (trial.trialType === "run") {
+        for (const item of trial.cases) {
+          item.telemetry.memory.sampler = "windows-toolhelp-working-set-v1";
+        }
+      } else {
+        trial.telemetry.memory.sampler = "windows-toolhelp-working-set-v1";
+      }
+    }
+    raw.evidenceDigest = computeC137PerformanceEvidenceDigest(raw);
+    refreshReportEvidenceDigests(bundle);
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(gate.status).toBe("incomplete-evidence");
+    expect(gate.checks.find((check) => check.id === "performance-measurements"))
+      .toMatchObject({ status: "incomplete", actual: false });
+  });
+
   it("bundle 自带任意 approval ID 不能替代外部受信 receipt digest", () => {
     const bundle = createCompleteBundle();
     const trustContext = createTrustContext(bundle);
@@ -242,16 +309,51 @@ function createCompleteBundle(): C137AcceptanceBundle {
   const manifestDigest = digest("1");
   const goldDigest = digest("2");
   const predictionsDigest = digest("3");
-  const environmentDigest = digest("4");
   const buildDigest = digest("5");
   const parametersDigest = digest("6");
-  const outputDigest = digest("7");
+  const performanceEvidence = createCompleteC137PerformanceEvidenceFixture();
+  performanceEvidence.collector.sampler = "windows-job-object-working-set-v1";
+  performanceEvidence.environment.storageScope = "workload-media-volumes";
+  const { digest: ignoredEnvironmentDigest, ...performanceEnvironmentFields } =
+    performanceEvidence.environment;
+  void ignoredEnvironmentDigest;
+  performanceEvidence.environment.digest =
+    computeC137PerformanceEnvironmentDigest(performanceEnvironmentFields);
+  for (const trial of performanceEvidence.trials) {
+    if (trial.trialType === "run") {
+      for (const item of trial.cases) {
+        item.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+      }
+    } else {
+      trial.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+    }
+  }
+  performanceEvidence.evidenceDigest = computeC137PerformanceEvidenceDigest(performanceEvidence);
+  const performanceEnvironment = performanceEvidence.environment;
+  const environmentWithoutDigest: Omit<C137EnvironmentFingerprint, "digest"> = {
+    schemaVersion: 2,
+    operatingSystem: performanceEnvironment.operatingSystem,
+    operatingSystemVersion: performanceEnvironment.operatingSystemVersion,
+    architecture: performanceEnvironment.architecture,
+    cpuModel: performanceEnvironment.cpuModel,
+    physicalCoreCount: performanceEnvironment.physicalCoreCount,
+    logicalCoreCount: performanceEnvironment.logicalCoreCount,
+    totalMemoryBytes: performanceEnvironment.totalMemoryBytes,
+    storageScope: performanceEnvironment.storageScope,
+    storageKind: performanceEnvironment.storageKind,
+    powerProfile: performanceEnvironment.powerProfile,
+    ffmpegVersion: performanceEnvironment.ffmpeg.version,
+    ffmpegBinaryDigest: performanceEnvironment.ffmpeg.binaryDigest,
+    ffprobeVersion: performanceEnvironment.ffprobe.version,
+    ffprobeBinaryDigest: performanceEnvironment.ffprobe.binaryDigest
+  };
+  const environmentDigest = computeC137EnvironmentDigest(environmentWithoutDigest);
   const binding: C137EvidenceBinding = {
     manifestDigest,
     goldDigest,
     datasetVersion: "real-frozen-1",
     predictionsDigest,
-    protocolId: "c137-acceptance@1",
+    protocolId: "c137-acceptance@2",
     environmentDigest,
     buildDigest,
     engineVersion: "alignment-v2",
@@ -301,13 +403,19 @@ function createCompleteBundle(): C137AcceptanceBundle {
     datasetVersion: "real-frozen-1",
     certificationClass: "real-frozen",
     protocol: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: "c137-acceptance",
-      version: "1",
+      version: "2",
       topK: 5,
       calibrationBinCount: 10,
       requiredColdRuns: 1,
       requiredHotRuns: 1,
+      requiredCancellationRuns: 1,
+      performancePlanDigest: performanceEvidence.planDigest,
+      maximumMemorySampleIntervalMs: 100,
+      requiredMonotonicClock: "rust-std-instant-session-relative-v1",
+      requiredMemorySampler: "windows-job-object-working-set-v1",
+      requiredStorageScope: "workload-media-volumes",
       performanceAggregation: "maximum",
       memoryScope: "application-process-tree",
       coldCacheDefinition: "empty-application-feature-cache",
@@ -326,21 +434,8 @@ function createCompleteBundle(): C137AcceptanceBundle {
       }
     },
     environment: {
-      schemaVersion: 1,
+      ...environmentWithoutDigest,
       digest: environmentDigest,
-      operatingSystem: "Windows",
-      operatingSystemVersion: "test",
-      architecture: "x86_64",
-      cpuModel: "4-core reference",
-      physicalCoreCount: 4,
-      logicalCoreCount: 8,
-      totalMemoryBytes: 16 * 1_073_741_824,
-      storageKind: "SSD",
-      powerProfile: "reference",
-      ffmpegVersion: "ffmpeg-test",
-      ffmpegBinaryDigest: digest("9"),
-      ffprobeVersion: "ffprobe-test",
-      ffprobeBinaryDigest: digest("a")
     },
     runner: {
       schemaVersion: 1,
@@ -382,7 +477,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
         manifestDigest,
         datasetVersion: "real-frozen-1",
         predictionsDigest,
-        protocolId: "c137-acceptance@1",
+        protocolId: "c137-acceptance@2",
         environmentDigest,
         buildDigest,
         engineVersion: "alignment-v2",
@@ -450,29 +545,9 @@ function createCompleteBundle(): C137AcceptanceBundle {
         }))
       },
       performance: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         binding: { ...binding },
-        runs: [
-          {
-            runId: "cold-1",
-            cacheCondition: "cold",
-            repetition: 1,
-            elapsedMs: 600_000,
-            peakProcessTreeRssBytes: 1_073_741_824,
-            outputDigest,
-            stages: [{ stageKey: "complete", elapsedMs: 600_000 }]
-          },
-          {
-            runId: "hot-1",
-            cacheCondition: "hot",
-            repetition: 1,
-            elapsedMs: 120_000,
-            peakProcessTreeRssBytes: 1_000_000_000,
-            outputDigest,
-            stages: [{ stageKey: "complete", elapsedMs: 120_000 }]
-          }
-        ],
-        cancellationLatenciesMs: [100]
+        rawEvidence: structuredClone(performanceEvidence)
       },
       uiWalkthrough: {
         schemaVersion: 1,

@@ -491,7 +491,7 @@ async function executeBlindCase(
 ): Promise<CaseExecutionResult> {
   const { options, now, wait } = dependencies;
   const startedAt = now();
-  const request = createAlignmentRequest(benchmarkCase, options);
+  const request = createRealMediaBenchmarkAlignmentRequest(benchmarkCase, options);
   let snapshot: AudioAlignmentJobSnapshot;
   try {
     snapshot = await startTauriAudioAlignmentJob(request, options.alignmentInvoker);
@@ -670,7 +670,7 @@ function finalizeTerminalSnapshot(
       dependencies.options
     );
   }
-  const validationFailure = validateProposalBinding(
+  const validationFailure = validateRealMediaBenchmarkProposalBinding(
     benchmarkCase,
     snapshot.proposal,
     dependencies.options
@@ -711,7 +711,7 @@ function finalizeTerminalSnapshot(
   };
 }
 
-function validateProposalBinding(
+export function validateRealMediaBenchmarkProposalBinding(
   benchmarkCase: RealMediaBenchmarkBlindCase,
   proposal: AlignmentProposal,
   options: RealMediaBenchmarkRunnerOptions
@@ -800,7 +800,7 @@ function matchesExpectedVisualStream(
   );
 }
 
-function createAlignmentRequest(
+export function createRealMediaBenchmarkAlignmentRequest(
   benchmarkCase: RealMediaBenchmarkBlindCase,
   options: RealMediaBenchmarkRunnerOptions
 ): TauriAudioAlignmentRequest {

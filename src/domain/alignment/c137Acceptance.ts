@@ -2,12 +2,19 @@ import type {
   RealMediaBenchmarkMediaKind,
   RealMediaBenchmarkScenario
 } from "./realMediaBenchmark";
+import {
+  getC137PerformanceMeasuredRuns,
+  getC137PerformancePeakRss,
+  validateC137PerformanceEvidence,
+  type C137PerformanceRawEvidenceV1
+} from "./c137PerformanceEvidence";
 import { sha256Hex } from "../shared/sha256";
 
 export const C137_ACCEPTANCE_SCHEMA_VERSION = 1 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 1 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 2 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
+export const C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION = 2 as const;
 
 export const C137_FIXED_ACCEPTANCE_THRESHOLDS = {
   targetPhysicalCoreCount: 4,
@@ -67,6 +74,12 @@ export interface C137AcceptanceProtocol {
   calibrationBinCount: number;
   requiredColdRuns: number;
   requiredHotRuns: number;
+  requiredCancellationRuns: number;
+  performancePlanDigest: C137Digest;
+  maximumMemorySampleIntervalMs: number;
+  requiredMonotonicClock: "rust-std-instant-session-relative-v1";
+  requiredMemorySampler: "windows-job-object-working-set-v1";
+  requiredStorageScope: "workload-media-volumes";
   performanceAggregation: "maximum";
   memoryScope: "application-process-tree";
   coldCacheDefinition: "empty-application-feature-cache";
@@ -77,7 +90,7 @@ export interface C137AcceptanceProtocol {
 }
 
 export interface C137EnvironmentFingerprint {
-  schemaVersion: 1;
+  schemaVersion: 2;
   digest: C137Digest;
   operatingSystem: string;
   operatingSystemVersion: string;
@@ -86,6 +99,7 @@ export interface C137EnvironmentFingerprint {
   physicalCoreCount: number;
   logicalCoreCount: number;
   totalMemoryBytes: number;
+  storageScope: "system-volume" | "workload-media-volumes";
   storageKind: string;
   powerProfile: string;
   ffmpegVersion: string;
@@ -279,26 +293,10 @@ export interface C137NorthStarReport {
   suites: C137NorthStarSuiteEvidence[];
 }
 
-export interface C137StagePerformanceEvidence {
-  stageKey: string;
-  elapsedMs: number;
-}
-
-export interface C137PerformanceRunEvidence {
-  runId: string;
-  cacheCondition: "cold" | "hot";
-  repetition: number;
-  elapsedMs: number;
-  peakProcessTreeRssBytes: number;
-  outputDigest: C137Digest;
-  stages: C137StagePerformanceEvidence[];
-}
-
 export interface C137PerformanceReport {
-  schemaVersion: typeof C137_ACCEPTANCE_REPORT_SCHEMA_VERSION;
+  schemaVersion: typeof C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION;
   binding: C137EvidenceBinding;
-  runs: C137PerformanceRunEvidence[];
-  cancellationLatenciesMs: number[];
+  rawEvidence: C137PerformanceRawEvidenceV1;
 }
 
 export interface C137UiWalkthroughReceipt {
@@ -409,6 +407,34 @@ const REQUIRED_REPORT_KEYS: readonly (keyof C137AcceptanceReports)[] = [
 /** Deterministic SHA-256 for externally approved C137 protocols, receipts, and evidence. */
 export function computeC137CanonicalDigest(value: unknown): C137Digest {
   return `sha256:${sha256Hex(canonicalJson(value))}`;
+}
+
+/**
+ * Environment identity is derived from every allowlisted hardware and toolchain field. Keeping
+ * the claimed digest out of the payload prevents a caller from editing CPU/tool data while
+ * retaining an unrelated, externally approved digest string.
+ */
+export function computeC137EnvironmentDigest(
+  environment: Omit<C137EnvironmentFingerprint, "digest"> | C137EnvironmentFingerprint
+): C137Digest {
+  return computeC137CanonicalDigest({
+    domain: "c137-environment-fingerprint-v2",
+    schemaVersion: environment.schemaVersion,
+    operatingSystem: environment.operatingSystem,
+    operatingSystemVersion: environment.operatingSystemVersion,
+    architecture: environment.architecture,
+    cpuModel: environment.cpuModel,
+    physicalCoreCount: environment.physicalCoreCount,
+    logicalCoreCount: environment.logicalCoreCount,
+    totalMemoryBytes: environment.totalMemoryBytes,
+    storageScope: environment.storageScope,
+    storageKind: environment.storageKind,
+    powerProfile: environment.powerProfile,
+    ffmpegVersion: environment.ffmpegVersion,
+    ffmpegBinaryDigest: environment.ffmpegBinaryDigest,
+    ffprobeVersion: environment.ffprobeVersion,
+    ffprobeBinaryDigest: environment.ffprobeBinaryDigest
+  });
 }
 
 /**
@@ -784,10 +810,23 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
   const degradationComplete =
     reports.degradation.cases.length > 0 &&
     reports.degradation.cases.every(isFrozenRealEvidence);
+  const performanceValidation = validateC137PerformanceEvidence(
+    reports.performance.rawEvidence
+  );
   const performanceComplete =
-    reports.performance.runs.length > 0 &&
-    reports.performance.runs.every((run) => run.stages.length > 0) &&
-    reports.performance.cancellationLatenciesMs.length > 0;
+    performanceValidation.valid &&
+    performanceValidation.complete &&
+    matchesC137PerformanceEnvironment(bundle.environment, reports.performance.rawEvidence) &&
+    reports.performance.rawEvidence.planDigest === bundle.protocol.performancePlanDigest &&
+    reports.performance.rawEvidence.collector.clock === bundle.protocol.requiredMonotonicClock &&
+    reports.performance.rawEvidence.collector.sampler === bundle.protocol.requiredMemorySampler &&
+    reports.performance.rawEvidence.environment.storageScope ===
+      bundle.protocol.requiredStorageScope &&
+    reports.performance.rawEvidence.plan.memorySampleIntervalMs <=
+      bundle.protocol.maximumMemorySampleIntervalMs &&
+    reports.performance.rawEvidence.trials.filter(
+      (trial) => trial.trialType === "cancellation"
+    ).length >= bundle.protocol.requiredCancellationRuns;
 
   return [
     createCheck(
@@ -833,6 +872,29 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
       "性能报告必须包含阶段耗时和取消响应原始测量"
     )
   ];
+}
+
+function matchesC137PerformanceEnvironment(
+  environment: C137EnvironmentFingerprint,
+  rawEvidence: C137PerformanceRawEvidenceV1
+): boolean {
+  const measured = rawEvidence.environment;
+  return (
+    environment.operatingSystem === measured.operatingSystem &&
+    environment.operatingSystemVersion === measured.operatingSystemVersion &&
+    environment.architecture === measured.architecture &&
+    environment.cpuModel === measured.cpuModel &&
+    environment.physicalCoreCount === measured.physicalCoreCount &&
+    environment.logicalCoreCount === measured.logicalCoreCount &&
+    environment.totalMemoryBytes === measured.totalMemoryBytes &&
+    environment.storageScope === measured.storageScope &&
+    environment.storageKind === measured.storageKind &&
+    environment.powerProfile === measured.powerProfile &&
+    environment.ffmpegVersion === measured.ffmpeg.version &&
+    environment.ffmpegBinaryDigest === measured.ffmpeg.binaryDigest &&
+    environment.ffprobeVersion === measured.ffprobe.version &&
+    environment.ffprobeBinaryDigest === measured.ffprobe.binaryDigest
+  );
 }
 
 function evaluateDatasetThresholds(report: C137DatasetReport): C137AcceptanceCheck[] {
@@ -1141,16 +1203,51 @@ function evaluatePerformanceThresholds(
   report: C137PerformanceReport,
   protocol: C137AcceptanceProtocol
 ): C137AcceptanceCheck[] {
-  const coldRuns = report.runs.filter((item) => item.cacheCondition === "cold");
-  const hotRuns = report.runs.filter((item) => item.cacheCondition === "hot");
+  const validation = validateC137PerformanceEvidence(report.rawEvidence);
+  const measuredRuns = getC137PerformanceMeasuredRuns(report.rawEvidence);
+  const coldRuns = measuredRuns.filter((item) => item.runKind === "cold");
+  const hotRuns = measuredRuns.filter((item) => item.runKind === "hot");
   const coldElapsed = maximum(coldRuns.map((item) => item.elapsedMs));
   const hotElapsed = maximum(hotRuns.map((item) => item.elapsedMs));
-  const peakRss = maximum(report.runs.map((item) => item.peakProcessTreeRssBytes));
-  const resultDigestCount = new Set(report.runs.map((item) => item.outputDigest)).size;
-  const cancellationP95 = percentile(report.cancellationLatenciesMs, 0.95);
+  const peakValues = measuredRuns.map(getC137PerformancePeakRss);
+  const peakRss = peakValues.every((item) => item !== null)
+    ? maximum(peakValues)
+    : null;
+  const resultDigestCount = new Set(measuredRuns.map((item) => item.outputDigest)).size;
+  const cancellations = report.rawEvidence.trials.filter(
+    (trial) => trial.trialType === "cancellation"
+  );
+  const cancellationP95 = percentile(
+    cancellations.map((trial) => trial.latencyMs),
+    0.95
+  );
   const maximumCancellationP95 =
     protocol.cancellationThreshold.maximumP95Ms ?? Number.NEGATIVE_INFINITY;
   return [
+    thresholdCheck(
+      "performance-raw-evidence",
+      validation.valid && validation.complete,
+      validation.complete,
+      "性能报告必须来自完整、严格校验的 raw evidence v1"
+    ),
+    thresholdCheck(
+      "performance-plan-binding",
+      report.rawEvidence.planDigest === protocol.performancePlanDigest,
+      report.rawEvidence.planDigest,
+      "性能 raw evidence 必须命中受信协议预注册的 plan digest"
+    ),
+    thresholdCheck(
+      "performance-sampler-binding",
+      report.rawEvidence.collector.sampler === protocol.requiredMemorySampler,
+      report.rawEvidence.collector.sampler,
+      `正式性能证据必须使用 ${protocol.requiredMemorySampler}`
+    ),
+    thresholdCheck(
+      "performance-storage-scope-binding",
+      report.rawEvidence.environment.storageScope === protocol.requiredStorageScope,
+      report.rawEvidence.environment.storageScope,
+      `正式性能环境必须测量 ${protocol.requiredStorageScope}`
+    ),
     thresholdCheck(
       "performance-cold-run-count",
       coldRuns.length >= protocol.requiredColdRuns,
@@ -1162,6 +1259,12 @@ function evaluatePerformanceThresholds(
       hotRuns.length >= protocol.requiredHotRuns,
       hotRuns.length,
       `热缓存重复次数 ≥ ${protocol.requiredHotRuns}`
+    ),
+    thresholdCheck(
+      "performance-cancellation-run-count",
+      cancellations.length >= protocol.requiredCancellationRuns,
+      cancellations.length,
+      `取消探针次数 ≥ ${protocol.requiredCancellationRuns}`
     ),
     thresholdCheck(
       "performance-cold-elapsed",
@@ -1186,7 +1289,7 @@ function evaluatePerformanceThresholds(
     ),
     thresholdCheck(
       "performance-cache-consistency",
-      report.runs.length > 0 && resultDigestCount === 1,
+      measuredRuns.length > 0 && resultDigestCount === 1,
       resultDigestCount,
       "冷/热缓存输出 digest 必须完全一致"
     ),
@@ -1554,6 +1657,12 @@ function validateProtocol(value: unknown, issues: string[]): void {
       "calibrationBinCount",
       "requiredColdRuns",
       "requiredHotRuns",
+      "requiredCancellationRuns",
+      "performancePlanDigest",
+      "maximumMemorySampleIntervalMs",
+      "requiredMonotonicClock",
+      "requiredMemorySampler",
+      "requiredStorageScope",
       "performanceAggregation",
       "memoryScope",
       "coldCacheDefinition",
@@ -1583,6 +1692,35 @@ function validateProtocol(value: unknown, issues: string[]): void {
   );
   requirePositiveInteger(record.requiredColdRuns, "bundle.protocol.requiredColdRuns", issues);
   requirePositiveInteger(record.requiredHotRuns, "bundle.protocol.requiredHotRuns", issues);
+  requirePositiveInteger(
+    record.requiredCancellationRuns,
+    "bundle.protocol.requiredCancellationRuns",
+    issues
+  );
+  requireDigest(record.performancePlanDigest, "bundle.protocol.performancePlanDigest", issues);
+  requirePositiveInteger(
+    record.maximumMemorySampleIntervalMs,
+    "bundle.protocol.maximumMemorySampleIntervalMs",
+    issues
+  );
+  requireLiteral(
+    record.requiredMonotonicClock,
+    "rust-std-instant-session-relative-v1",
+    "bundle.protocol.requiredMonotonicClock",
+    issues
+  );
+  requireLiteral(
+    record.requiredMemorySampler,
+    "windows-job-object-working-set-v1",
+    "bundle.protocol.requiredMemorySampler",
+    issues
+  );
+  requireLiteral(
+    record.requiredStorageScope,
+    "workload-media-volumes",
+    "bundle.protocol.requiredStorageScope",
+    issues
+  );
   requireLiteral(
     record.performanceAggregation,
     "maximum",
@@ -1669,6 +1807,7 @@ function validateCancellationThresholdApproval(value: unknown, issues: string[])
 
 function validateEnvironment(value: unknown, issues: string[]): void {
   const path = "bundle.environment";
+  const issueCountBefore = issues.length;
   const record = strictRecord(
     value,
     path,
@@ -1682,6 +1821,7 @@ function validateEnvironment(value: unknown, issues: string[]): void {
       "physicalCoreCount",
       "logicalCoreCount",
       "totalMemoryBytes",
+      "storageScope",
       "storageKind",
       "powerProfile",
       "ffmpegVersion",
@@ -1694,7 +1834,7 @@ function validateEnvironment(value: unknown, issues: string[]): void {
   if (record === null) {
     return;
   }
-  requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
+  requireLiteral(record.schemaVersion, 2, `${path}.schemaVersion`, issues);
   requireDigest(record.digest, `${path}.digest`, issues);
   for (const key of [
     "operatingSystem",
@@ -1711,8 +1851,20 @@ function validateEnvironment(value: unknown, issues: string[]): void {
   requirePositiveInteger(record.physicalCoreCount, `${path}.physicalCoreCount`, issues);
   requirePositiveInteger(record.logicalCoreCount, `${path}.logicalCoreCount`, issues);
   requirePositiveInteger(record.totalMemoryBytes, `${path}.totalMemoryBytes`, issues);
+  requireOneOf(
+    record.storageScope,
+    ["system-volume", "workload-media-volumes"],
+    `${path}.storageScope`,
+    issues
+  );
   requireDigest(record.ffmpegBinaryDigest, `${path}.ffmpegBinaryDigest`, issues);
   requireDigest(record.ffprobeBinaryDigest, `${path}.ffprobeBinaryDigest`, issues);
+  if (issues.length === issueCountBefore) {
+    const environment = record as unknown as C137EnvironmentFingerprint;
+    if (environment.digest !== computeC137EnvironmentDigest(environment)) {
+      issues.push(`${path}.digest 与硬件及工具链字段的规范摘要不一致。`);
+    }
+  }
 }
 
 function validateRunner(value: unknown, issues: string[]): void {
@@ -2008,27 +2160,21 @@ function validateNorthStarReport(value: unknown, issues: string[]): void {
 
 function validatePerformanceReport(value: unknown, issues: string[]): void {
   const path = "bundle.reports.performance";
-  const record = validateReportHeader(value, path, ["runs", "cancellationLatenciesMs"], issues);
+  const record = strictRecord(value, path, ["schemaVersion", "binding", "rawEvidence"], issues);
   if (record === null) return;
-  validateArray(record.runs, `${path}.runs`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["runId", "cacheCondition", "repetition", "elapsedMs", "peakProcessTreeRssBytes", "outputDigest", "stages"], issues);
-    if (entry === null) return;
-    requireString(entry.runId, `${itemPath}.runId`, issues);
-    requireOneOf(entry.cacheCondition, ["cold", "hot"], `${itemPath}.cacheCondition`, issues);
-    requirePositiveInteger(entry.repetition, `${itemPath}.repetition`, issues);
-    requireNonNegativeInteger(entry.elapsedMs, `${itemPath}.elapsedMs`, issues);
-    requireNonNegativeInteger(entry.peakProcessTreeRssBytes, `${itemPath}.peakProcessTreeRssBytes`, issues);
-    requireDigest(entry.outputDigest, `${itemPath}.outputDigest`, issues);
-    validateArray(entry.stages, `${itemPath}.stages`, issues, (stage, stagePath) => {
-      const stageRecord = strictRecord(stage, stagePath, ["stageKey", "elapsedMs"], issues);
-      if (stageRecord === null) return;
-      requireString(stageRecord.stageKey, `${stagePath}.stageKey`, issues);
-      requireNonNegativeInteger(stageRecord.elapsedMs, `${stagePath}.elapsedMs`, issues);
-    });
-    validateUniqueStringField(entry.stages, "stageKey", `${itemPath}.stages`, issues);
-  });
-  validateUniqueStringField(record.runs, "runId", `${path}.runs`, issues);
-  validateNumberArray(record.cancellationLatenciesMs, `${path}.cancellationLatenciesMs`, issues);
+  requireLiteral(
+    record.schemaVersion,
+    C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION,
+    `${path}.schemaVersion`,
+    issues
+  );
+  validateEvidenceBinding(record.binding, `${path}.binding`, issues);
+  const validation = validateC137PerformanceEvidence(record.rawEvidence);
+  if (!validation.valid) {
+    for (const issue of validation.issues) {
+      issues.push(`${path}.rawEvidence：${issue}`);
+    }
+  }
 }
 
 function validateUiWalkthroughReceipt(value: unknown, issues: string[]): void {

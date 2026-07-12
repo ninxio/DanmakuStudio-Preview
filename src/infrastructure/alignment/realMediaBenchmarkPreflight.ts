@@ -39,6 +39,7 @@ export interface RealMediaBenchmarkPreflightOptions {
   ffmpegPath?: string | null;
   probe?: MediaTimelineProbeInvoker;
   concurrency?: number;
+  signal?: AbortSignal;
 }
 
 interface BenchmarkMediaBinding {
@@ -55,6 +56,7 @@ export async function preflightRealMediaBenchmark(
   manifest: RealMediaBenchmarkManifest,
   options: RealMediaBenchmarkPreflightOptions = {}
 ): Promise<RealMediaBenchmarkPreflightResult> {
+  throwIfPreflightAborted(options.signal);
   const validation = validateRealMediaBenchmarkManifest(manifest);
   if (!validation.valid) {
     return {
@@ -90,6 +92,7 @@ export async function preflightRealMediaBenchmark(
   await Promise.all(
     Array.from({ length: Math.min(concurrency, entries.length) }, async () => {
       while (cursor < entries.length) {
+        throwIfPreflightAborted(options.signal);
         const index = cursor;
         cursor += 1;
         const entry = entries[index];
@@ -103,7 +106,9 @@ export async function preflightRealMediaBenchmark(
             { path, ffprobePath: options.ffprobePath, ffmpegPath: options.ffmpegPath },
             options.probe
           );
+          throwIfPreflightAborted(options.signal);
         } catch {
+          throwIfPreflightAborted(options.signal);
           for (const binding of pathBindings) {
             issues.push(
               createIssue(
@@ -134,6 +139,12 @@ export async function preflightRealMediaBenchmark(
     checkedFileCount: entries.length,
     issues
   };
+}
+
+function throwIfPreflightAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new Error("真实媒体基准预检已取消。");
+  }
 }
 
 function validateBindingAgainstProbe(

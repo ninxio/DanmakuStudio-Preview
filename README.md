@@ -19,7 +19,12 @@ Danmaku Studio 是一个把 B 站 XML 弹幕对齐到本地视频、处理不同
 - 匹配页双源 A/B 复核：按 TimeMap 切换参考 A/原片 B、循环共同内容或差异边界，并把累计有效试听写成 `manual-playback-review:v2` 证据。共同内容要求 A/B 各有效推进 2.0 秒且唯一覆盖至少 1.5 秒；单侧差异的存在侧要求 2.0/1.5 秒，段首和段尾的 A/B 边界各要求 1.5/1.0 秒。短区间要求累计完整区间时长并唯一覆盖至少 80%。只有页面可见、1 倍速且媒体时间连续向前推进才计入；暂停、后台、停滞、seek、切轴和循环跳回均不计时。token 绑定策略版本、媒体、span、有效时长和覆盖摘要；旧 v1 token 只保留审计文本并 fail-closed。
 - 可持久人工验证：只有用户显式点击“完成复核并签发”且每个 span 都有当前播放证据、所有单侧差异已分类、没有 `ambiguous`、实测质量达到中央门槛时，桌面端才用安装级 HMAC-SHA256 密钥签发 v11 verification record。签发、撤销和项目打开后的复核都查询本机不可变事件注册表；自动匹配、接受关系和保存项目不会自动签发。
 - 真实媒体基准治理：benchmark manifest v2 区分 `development/frozen-test` 和 `real/synthetic/placeholder`，真实关系必须绑定全文件 SHA-256、显式音视频流、许可/版本说明、两份独立标注和必要的第三人仲裁。本地 preflight 会重新探测唯一媒体文件并核对身份与流索引；可分享结果不带本地路径和实测哈希。
-- 匹配页底部默认收起“高级：C137 精度基准（开发与验收）”，这是唯一真实 benchmark 执行入口：只选择 manifest JSON，不重复选择媒体路径；桌面端可运行、取消并下载去敏稳定报告。浏览器、example manifest 或 0 个 `mediaKind=real` 关系都会明确阻断。报告固定为 `scope=time-map-component`、`releaseEligible=false`，组件子闸门通过也绝不代表 release 通过。
+- 匹配页底部默认收起“高级：C137 精度基准（开发与验收）”，这是唯一真实 benchmark 执行入口：只选择 manifest JSON，不重复选择媒体路径；桌面端可运行、取消并下载去敏稳定报告。浏览器、example manifest 或 0 个 `mediaKind=real` 关系都会明确阻断。报告固定为 `scope=time-map-component`、`releaseEligible=false`，组件子闸门通过也绝不代表 release 通过；界面中的“协调器观测耗时”只是流程诊断，不是性能证据。
+- 同一高级区复用已导入 manifest 和其媒体引用，不增加第二个文件或路径选择器；它可取得 native exclusive session，按预注册的 cold → warmup → hot → cancel 计划运行生产对齐核心，并导出 strict raw v1 性能工程证据。raw 包含原生单调时钟、显式阶段、缓存重置/命中、进程树 RSS 和取消终态，但始终是 `releaseEligible=false` 的 `untrusted-raw-evidence`，不内置受信协议或 trust root。
+- Windows 一次性媒体工具进程已统一进入 lifecycle Job Object：子进程以挂起状态创建，先加入私有 Job 再恢复执行，Job 启用 kill-on-close，且只继承显式标准流句柄。FFmpeg/FFprobe 的输出、执行、收尾均有硬上限；取消、超时、输出溢出、读取异常或后代未退出会终止并等待整个 Job 清空，无法可信清理时设置粘性 `blocked:process-cleanup`，使当前结果及后续媒体分析 fail-closed。该 Job 只负责生命周期安全，不是下述正式 RSS 采样器。
+- FFprobe 普通媒体时间线探测限制为 30 秒、8 MiB stdout / 256 KiB stderr；音频逐帧/packet PTS 探测限制为 5 分钟、128 MiB 紧凑 stdout / 1 MiB stderr，并且只在 Job 全部退出后解析，单条记录上限 1 MiB、不同音频流上限 256。Chocolatey `ShimGen` 不会被当作 FFmpeg/FFprobe 真二进制执行或指纹化：只有规范 Chocolatey 路径、版本资源和候选树检查全部通过且恰好找到一个真实 exe 时才继续，并对该真实 exe 固定、哈希和执行；路径、reparse/symlink、版本资源或唯一性验证失败均关闭执行并要求显式配置真实路径。
+- Windows 本地对齐还会为参考视频和目标原片各持有贯穿整个 run 的 `FILE_SHARE_READ` 只读 media lease，运行期间拒绝覆盖、删除、rename 和路径替换。lease 内先计算 run-start 全文件 SHA-256；FFprobe frame/packet PTS 的 expected / before / after 三份身份必须完全一致；音频、landmark 和视觉缓存键全部绑定 `sha256-full-file-v2`；FFmpeg 成功后会在解析 PCM/帧前复核身份；命中缓存也必须通过 run-final SHA 与 TimeMap 双端身份复核。视觉证据在读取缓存或解码前后都必须与音频 TimeMap 同一媒体世代，避免把音频 A 与视觉 B 混为一条结论。
+- 有界输出 reader 状态机只在根进程已退出、Job 已空且 stdout/stderr 两份结果都就绪后消费缓冲，不再因轮询时过早 `take()` 丢失先完成的流。取消也覆盖工具退出后的 CPU 解析：媒体 JSON 在反序列化前后、逐流归一化时检查，frame/packet compact 输出逐记录检查，V2 PCM 每 64 Ki samples、legacy PCM/频谱每 4 Ki samples、视觉帧逐帧检查；取消后不会返回部分 snapshot、缓存或 proposal。
 - Emby 时长辅助与目标绑定：通过设置中心保存非敏感连接项，桌面端优先写入 Tauri 应用配置目录，网页模式使用 localStorage fallback；资源栏搜索用户授权的 Emby 媒体条目、导入真实集时长规则，并可把条目绑定为当前项目目标原片，本次会话密码只保存在内存。
 - 设置中心：支持保存、恢复默认、清除本地设置，管理默认导出目录、FFmpeg/mpv 路径、播放器后端偏好，以及导出/导入不含密码或 token 的版本化应用设置备份。
 - 默认导出目录：设置中心可保存本机默认导出文件夹；导出弹窗可为本次导出临时选择其他目录。桌面端会把单集 XML、分集 ZIP 和报告写入指定目录，网页模式保留浏览器下载。
@@ -122,6 +127,7 @@ corepack prepare pnpm@9.15.4 --activate
 - 视觉回退目前只建立粗粒度全局仿射关系，不负责宣称局部删减边界；大幅裁切、极端调色、长静态或黑场会保守阻断。
 - A/B 播放证据 v2 已累计最小时长与唯一覆盖，但它只证明完成了规定的有效试听过程，不能单独证明人工判断正确。签发仍同时要求逐段分类、无 ambiguous、媒体身份和中央质量门槛。
 - 完整 C137 acceptance 还要求 `real-frozen` 证据包、固定协议、全部原始报告、UI/性能/release 回执及独立信任根。release 默认不内置审批白名单；未提供严格的外部 `trustContext` 时结果必为 `incomplete-evidence`、`verifiedEligible=false`，永远不会通过完整验收。
+- C137 acceptance protocol v2 会绑定性能 plan 摘要、原生单调时钟、最大内存采样间隔和取消探针数量，并明确要求 `windows-job-object-working-set-v1` 与 `workload-media-volumes`。虽然一次性媒体工具已由 lifecycle Job Object 安全监管，当前性能 raw 的 RSS 采样器身份仍是 `windows-toolhelp-working-set-v1`，仍按 ToolHelp/PID 快照计数；环境存储范围也仍是只探测系统卷的 `system-volume`。因此当前 raw 会被正式门禁拒绝，不得晋升为发布性能证据；后续还需实现独立的 Job Object working-set 正式采样器、探测实际 workload 媒体卷，再结合受信协议和真实授权数据重新采集。
 - 人工签名的信任根是本机应用数据目录中的安装级 secret 与撤销注册表。仅篡改 `.danmaku-project.json` 不能伪造签名或恢复已撤销凭据；项目换机、secret 丢失、注册表损坏或签发来源不匹配时会 fail-closed 为 `review`。该设计不宣称抵抗能够读取并篡改同一系统账户应用数据目录的恶意本地进程。
 - Emby 集成只处理用户配置且有权限访问的媒体库元数据，不实现视频下载、DRM 绕过、账号绕过、私有接口爬取或未授权媒体访问。
 - Emby 密码和 token 不写入项目文件、Tauri 配置文件或 localStorage；本次会话密码关闭应用后失效。
@@ -152,6 +158,7 @@ corepack pnpm tauri:build
 - 扩展播放器化能力：把当前会话级缓存状态升级为可管理的持久缓存，并补充更多剧集批量工作台自动化。
 - 建立双人标注的真实冻结媒体集，完成关系、投影误差、删减边界、视觉回退、校准与性能门槛；门槛通过前不开放自动 `verified`。
 - 用真实媒体继续审计 A/B 播放证据 v2 的时长/覆盖门槛与签发误用率，并根据审计结果版本化调整策略。
+- 在现有 lifecycle Job Object 之上实现独立的 `windows-job-object-working-set-v1` 正式 RSS 采样器，替换性能 raw 中的 ToolHelp/PID 快照；同时探测所有实际 workload 媒体卷，并在受信协议下使用真实授权数据生成可审批的正式性能证据。
 - 完成 20 套北极星长合集的 5/5 定位、跨集零错配和完整导出验收，并发布规定硬件上的可重复性能报告。
 - 扩展 Playwright E2E 覆盖导出 XML 后重新导入、复杂编辑撤销恢复和更多窄窗口截图。
 - 评估系统凭证库保存敏感凭证，并在后续设置 schema 升级时补充迁移界面和冲突提示。

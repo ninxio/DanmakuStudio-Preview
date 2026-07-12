@@ -21,6 +21,7 @@ test.beforeEach(async ({ page }) => {
         isTauri: boolean;
         __C136_DIALOG_CALLS__: MockDialogCall[];
         __C137_VERIFICATION_CALLS__: string[];
+        __C137_PERFORMANCE_CALLS__: string[];
         __TAURI_INTERNALS__: {
           invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
         };
@@ -156,9 +157,13 @@ test.beforeEach(async ({ page }) => {
       mockWindow.isTauri = true;
       mockWindow.__C136_DIALOG_CALLS__ = [];
       mockWindow.__C137_VERIFICATION_CALLS__ = [];
+      mockWindow.__C137_PERFORMANCE_CALLS__ = [];
       mockWindow.__TAURI_INTERNALS__ = {
         invoke: async (command, args = {}) => {
           await Promise.resolve();
+          if (command.includes("alignment_benchmark")) {
+            mockWindow.__C137_PERFORMANCE_CALLS__.push(command);
+          }
           if (command === "load_app_settings_file") {
             return JSON.stringify({
               export: { defaultDirectory: "" },
@@ -312,6 +317,35 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await expect(
     benchmarkPanel.getByRole("button", { name: "运行真实媒体精度基准" })
   ).toBeDisabled();
+  await expect(
+    benchmarkPanel.getByRole("heading", { name: "原生性能 raw evidence（工程采集）" })
+  ).toBeVisible();
+  await expect(benchmarkPanel).toContainText(
+    "当前没有批准的 production protocol 或 trust root"
+  );
+  const performanceButton = benchmarkPanel.getByRole("button", {
+    name: "采集工程性能原始证据"
+  });
+  await expect(performanceButton).toBeDisabled();
+  await expect(performanceButton).toHaveAttribute(
+    "title",
+    "示例 manifest 只用于理解格式，禁止执行或作为精度证据。"
+  );
+  await expect(
+    benchmarkPanel.getByRole("region", { name: "性能 raw evidence 摘要" })
+  ).toHaveCount(0);
+  await expect(
+    benchmarkPanel.getByRole("button", { name: "下载未审批 raw evidence" })
+  ).toHaveCount(0);
+  const examplePerformanceCalls = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __C137_PERFORMANCE_CALLS__: string[];
+        }
+      ).__C137_PERFORMANCE_CALLS__
+  );
+  expect(examplePerformanceCalls).toEqual([]);
   await benchmarkPanel.scrollIntoViewIfNeeded();
   await page.screenshot({
     path: resolve(screenshotDir, "c137-benchmark-governance-blocked.png"),
@@ -424,4 +458,48 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
     path: resolve(screenshotDir, "c137-export-gate-blocked.png"),
     fullPage: true
   });
+});
+
+test("浏览器预览中的原生性能证据入口失败关闭", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    Reflect.set(window, "isTauri", false);
+    Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  });
+
+  await page.getByTestId("workspace-nav-matching").click();
+  const benchmarkPanel = page.getByTestId("real-media-benchmark-panel");
+  await benchmarkPanel
+    .getByRole("button", { name: /高级：C137 精度基准（开发与验收）/ })
+    .click();
+
+  await expect(
+    benchmarkPanel.getByRole("heading", { name: "原生性能 raw evidence（工程采集）" })
+  ).toBeVisible();
+  await expect(benchmarkPanel).toContainText(
+    "浏览器预览不能运行真实媒体基准；请在 Tauri 桌面端打开同一份清单。"
+  );
+  const performanceButton = benchmarkPanel.getByRole("button", {
+    name: "采集工程性能原始证据"
+  });
+  await expect(performanceButton).toBeDisabled();
+  await expect(performanceButton).toHaveAttribute(
+    "title",
+    "浏览器预览不能运行真实媒体基准；请在 Tauri 桌面端打开同一份清单。"
+  );
+  await expect(
+    benchmarkPanel.getByRole("region", { name: "性能 raw evidence 摘要" })
+  ).toHaveCount(0);
+  await expect(
+    benchmarkPanel.getByRole("button", { name: "下载未审批 raw evidence" })
+  ).toHaveCount(0);
+  const browserPerformanceCalls = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __C137_PERFORMANCE_CALLS__: string[];
+        }
+      ).__C137_PERFORMANCE_CALLS__
+  );
+  expect(browserPerformanceCalls).toEqual([]);
 });

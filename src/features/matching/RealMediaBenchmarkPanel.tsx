@@ -1,5 +1,5 @@
 import { isTauri } from "@tauri-apps/api/core";
-import { Download, FileJson, Gauge, Play, Square } from "lucide-react";
+import { Cpu, Download, FileJson, Gauge, Play, Square } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import {
@@ -7,14 +7,30 @@ import {
   type C137BenchmarkGateCheck,
   type RealMediaBenchmarkManifest
 } from "../../domain/alignment/realMediaBenchmark";
+import {
+  getC137PerformanceMeasuredRuns,
+  getC137PerformancePeakRss,
+  serializeC137PerformanceEvidence,
+  validateC137PerformanceEvidence,
+  type C137PerformanceRawEvidenceV1
+} from "../../domain/alignment/c137PerformanceEvidence";
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import {
+  createRealMediaBenchmarkRunManifestDigest,
+  projectRealMediaBenchmarkRunManifest,
   runRealMediaBenchmarkManifest,
   serializeRealMediaBenchmarkRunReport,
   validateRealMediaBenchmarkRunReport,
   type RealMediaBenchmarkRunReport,
   type RealMediaBenchmarkRunnerOptions
 } from "../../infrastructure/alignment/realMediaBenchmarkRunner";
+import {
+  collectRealMediaPerformanceEvidence,
+  createC137PerformanceRawEvidenceFromJournal,
+  createEngineeringRealMediaPerformancePlan,
+  createRealMediaPerformanceWorkloadDigest,
+  type RealMediaPerformancePhase
+} from "../../infrastructure/alignment/realMediaPerformanceRunner";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
 
 export type RealMediaBenchmarkPanelRunner = (
@@ -22,8 +38,20 @@ export type RealMediaBenchmarkPanelRunner = (
   options: RealMediaBenchmarkRunnerOptions
 ) => Promise<RealMediaBenchmarkRunReport>;
 
+export interface RealMediaPerformancePanelRunOptions {
+  signal: AbortSignal;
+  ffmpegPath: string | null;
+  onProgress: (phase: RealMediaPerformancePhase) => void;
+}
+
+export type RealMediaPerformancePanelRunner = (
+  manifest: RealMediaBenchmarkManifest,
+  options: RealMediaPerformancePanelRunOptions
+) => Promise<C137PerformanceRawEvidenceV1>;
+
 interface RealMediaBenchmarkPanelProps {
   runner?: RealMediaBenchmarkPanelRunner;
+  performanceRunner?: RealMediaPerformancePanelRunner;
   desktopAvailable?: boolean;
 }
 
@@ -31,6 +59,7 @@ type RunPhase = "idle" | "running" | "cancelling";
 
 export function RealMediaBenchmarkPanel({
   runner = runRealMediaBenchmarkManifest,
+  performanceRunner = defaultPerformancePanelRunner,
   desktopAvailable: desktopAvailableOverride
 }: RealMediaBenchmarkPanelProps) {
   const desktopAvailable = desktopAvailableOverride ?? isTauri();
@@ -40,6 +69,7 @@ export function RealMediaBenchmarkPanel({
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [report, setReport] = useState<RealMediaBenchmarkRunReport | null>(null);
   const [runPhase, setRunPhase] = useState<RunPhase>("idle");
+  const [performanceBusy, setPerformanceBusy] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [downloadStatus, setDownloadStatus] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -49,7 +79,8 @@ export function RealMediaBenchmarkPanel({
     [manifest]
   );
   const blockers = createRunBlockers(desktopAvailable, manifest, realCases.length);
-  const running = runPhase !== "idle";
+  const precisionRunning = runPhase !== "idle";
+  const running = precisionRunning || performanceBusy;
 
   useEffect(
     () => () => {
@@ -103,12 +134,7 @@ export function RealMediaBenchmarkPanel({
       if (!validation.valid) {
         throw new Error(`runner 返回的报告无效：${validation.issues.join("；")}`);
       }
-      if (
-        nextReport.manifestId !== manifest.id ||
-        nextReport.datasetVersion !== manifest.datasetVersion
-      ) {
-        throw new Error("runner 返回的报告与当前 manifest 身份不一致。");
-      }
+      assertBenchmarkReportMatchesManifest(nextReport, manifest);
       assertReportContainsNoManifestSecrets(
         serializeRealMediaBenchmarkRunReport(nextReport),
         manifest
@@ -153,6 +179,7 @@ export function RealMediaBenchmarkPanel({
   const downloadReport = (): void => {
     if (!manifest || !report) return;
     try {
+      assertBenchmarkReportMatchesManifest(report, manifest);
       const text = serializeRealMediaBenchmarkRunReport(report);
       assertReportContainsNoManifestSecrets(text, manifest);
       const fileName = downloadTextFile(
@@ -174,9 +201,13 @@ export function RealMediaBenchmarkPanel({
     >
       <button
         type="button"
+        disabled={running}
         className="flex w-full items-center justify-between gap-3 rounded text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan"
         aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
+        title={running ? "基准运行期间请先取消并等待原生清理完成。" : undefined}
+        onClick={() => {
+          if (!running) setOpen((current) => !current);
+        }}
       >
         <span className="flex items-center gap-2 text-sm font-medium text-slate-100">
           <Gauge size={15} className="text-accent-cyan" aria-hidden="true" />
@@ -251,7 +282,7 @@ export function RealMediaBenchmarkPanel({
           ) : null}
 
           <div className="flex flex-wrap gap-2">
-            {running ? (
+            {precisionRunning ? (
               <TextButton
                 tone="danger"
                 disabled={runPhase === "cancelling"}
@@ -263,7 +294,7 @@ export function RealMediaBenchmarkPanel({
             ) : (
               <TextButton
                 tone="primary"
-                disabled={!manifest || blockers.length > 0}
+                disabled={!manifest || blockers.length > 0 || performanceBusy}
                 title={blockers[0] ?? (!manifest ? "请先选择有效 manifest JSON。" : undefined)}
                 onClick={() => void runBenchmark()}
               >
@@ -278,7 +309,7 @@ export function RealMediaBenchmarkPanel({
             ) : null}
           </div>
 
-          {running ? (
+          {precisionRunning ? (
             <p className="leading-5 text-slate-400" role="status" aria-live="polite">
               {runPhase === "cancelling"
                 ? "已请求取消；正在等待活动分析任务安全退出并生成可审计的取消报告。"
@@ -309,8 +340,281 @@ export function RealMediaBenchmarkPanel({
               ) : null}
             </div>
           ) : null}
+
+          <PerformanceEvidencePanel
+            manifest={manifest}
+            blockers={blockers}
+            disabled={precisionRunning}
+            runner={performanceRunner}
+            onBusyChange={setPerformanceBusy}
+          />
         </div>
       ) : null}
+    </section>
+  );
+}
+
+function PerformanceEvidencePanel({
+  manifest,
+  blockers,
+  disabled,
+  runner,
+  onBusyChange
+}: {
+  manifest: RealMediaBenchmarkManifest | null;
+  blockers: string[];
+  disabled: boolean;
+  runner: RealMediaPerformancePanelRunner;
+  onBusyChange: (busy: boolean) => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [phase, setPhase] = useState<RealMediaPerformancePhase | null>(null);
+  const [evidence, setEvidence] = useState<C137PerformanceRawEvidenceV1 | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [downloadStatus, setDownloadStatus] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const operationRef = useRef(0);
+
+  useEffect(
+    () => () => {
+      operationRef.current += 1;
+      abortRef.current?.abort();
+      onBusyChange(false);
+    },
+    [onBusyChange]
+  );
+
+  useEffect(() => {
+    setEvidence(null);
+    setError(null);
+    setDownloadStatus(null);
+    setPhase(null);
+  }, [manifest]);
+
+  const runPerformance = async (): Promise<void> => {
+    if (!manifest || blockers.length > 0 || disabled || running) return;
+    const operation = operationRef.current + 1;
+    operationRef.current = operation;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setRunning(true);
+    setCancelling(false);
+    setError(null);
+    setDownloadStatus(null);
+    onBusyChange(true);
+    const settings = loadAppSettings().alignment;
+    try {
+      const rawEvidence = await runner(manifest, {
+        signal: controller.signal,
+        ffmpegPath: settings.ffmpegPath.trim() || null,
+        onProgress: (nextPhase) => {
+          if (operationRef.current === operation) setPhase(nextPhase);
+        }
+      });
+      if (operationRef.current !== operation) return;
+      const validation = validateC137PerformanceEvidence(rawEvidence);
+      if (!validation.valid) {
+        throw new Error(`raw evidence 严格校验失败：${validation.issues.join("；")}`);
+      }
+      assertPerformanceEvidenceMatchesManifest(rawEvidence, manifest);
+      const serialized = serializeC137PerformanceEvidence(rawEvidence);
+      assertReportContainsNoManifestSecrets(serialized, manifest);
+      setEvidence(rawEvidence);
+      if (!validation.complete) {
+        setError(
+          `采集已结束，但不具备正式性能证据条件：${validation.completenessIssues.join("；")}`
+        );
+      }
+    } catch (reason: unknown) {
+      if (operationRef.current !== operation) return;
+      setError(
+        sanitizeManifestSecrets(
+          controller.signal.aborted
+            ? "性能采集已请求取消；尚未取得可分享的安全终态。"
+            : `性能采集失败：${formatError(reason)}`,
+          manifest
+        )
+      );
+    } finally {
+      if (operationRef.current === operation) {
+        abortRef.current = null;
+        setRunning(false);
+        setCancelling(false);
+        onBusyChange(false);
+      }
+    }
+  };
+
+  const cancelPerformance = (): void => {
+    const controller = abortRef.current;
+    if (!controller || controller.signal.aborted) return;
+    controller.abort();
+    setCancelling(true);
+  };
+
+  const downloadEvidence = (): void => {
+    if (!manifest || !evidence) return;
+    try {
+      assertPerformanceEvidenceMatchesManifest(evidence, manifest);
+      const serialized = serializeC137PerformanceEvidence(evidence);
+      assertReportContainsNoManifestSecrets(serialized, manifest);
+      const fileName = downloadTextFile(
+        `c137-performance-${evidence.plan.planId}.json`,
+        serialized,
+        "application/json;charset=utf-8"
+      );
+      setDownloadStatus(`已下载未审批 raw evidence：${fileName}。`);
+    } catch (reason: unknown) {
+      setError(`无法下载性能 evidence：${formatError(reason)}`);
+    }
+  };
+
+  return (
+    <section
+      className="grid gap-3 rounded border border-cyan-400/25 bg-cyan-400/5 p-3"
+      aria-label="C137 原生性能证据采集"
+    >
+      <div className="flex items-center gap-2">
+        <Cpu size={14} className="text-accent-cyan" aria-hidden="true" />
+        <h4 className="font-medium text-slate-100">原生性能 raw evidence（工程采集）</h4>
+      </div>
+      <p className="leading-5 text-slate-400">
+        按预注册顺序独占运行冷缓存、完整预热、热缓存和取消探针；耗时、阶段、缓存与进程树 RSS
+        均来自 Rust 单调时钟和原生采集器。运行期间普通匹配会被原生 lease 阻止。
+      </p>
+      <p className="rounded border border-amber-400/35 bg-amber-400/10 p-2 font-medium leading-5 text-amber-100">
+        当前没有批准的 production protocol 或 trust root。本入口只生成 releaseEligible=false
+        的未审批原始证据，不能自行让 C137 或自动 verified 通过。
+      </p>
+
+      <div className="flex flex-wrap gap-2">
+        {running ? (
+          <TextButton tone="danger" disabled={cancelling} onClick={cancelPerformance}>
+            <Square size={13} />
+            {cancelling ? "正在取消并清理…" : "取消性能采集"}
+          </TextButton>
+        ) : (
+          <TextButton
+            tone="primary"
+            disabled={!manifest || blockers.length > 0 || disabled}
+            title={blockers[0] ?? (disabled ? "另一项基准正在运行。" : undefined)}
+            onClick={() => void runPerformance()}
+          >
+            <Play size={13} />
+            采集工程性能原始证据
+          </TextButton>
+        )}
+      </div>
+
+      {running ? (
+        <p className="leading-5 text-slate-300" role="status" aria-live="polite">
+          {cancelling
+            ? "正在等待活动作业、FFmpeg/FFprobe 后代和采样线程进入真实终态。"
+            : `当前阶段：${formatPerformancePhase(phase)}。`}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="rounded border border-amber-400/35 bg-amber-400/10 p-2 leading-5 text-amber-100" role="alert">
+          {error}
+        </p>
+      ) : null}
+
+      {evidence ? <PerformanceEvidenceSummary evidence={evidence} /> : null}
+      {evidence ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <TextButton tone="primary" onClick={downloadEvidence}>
+            <Download size={13} />
+            下载未审批 raw evidence
+          </TextButton>
+          {downloadStatus ? (
+            <span className="text-emerald-100" role="status">
+              {downloadStatus}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRawEvidenceV1 }) {
+  const validation = validateC137PerformanceEvidence(evidence);
+  const measured = getC137PerformanceMeasuredRuns(evidence);
+  const cold = measured.filter((run) => run.runKind === "cold");
+  const hot = measured.filter((run) => run.runKind === "hot");
+  const peaks = measured.map(getC137PerformancePeakRss).filter((value) => value !== null);
+  const cancellations = evidence.trials.filter(
+    (trial) => trial.trialType === "cancellation"
+  );
+  return (
+    <section className="grid gap-2 rounded border border-panel-line/70 bg-black/20 p-2" aria-label="性能 raw evidence 摘要">
+      <p className={validation.complete ? "text-emerald-100" : "text-amber-100"}>
+        {validation.complete
+          ? "原始采集链完整；仍需独立审批和 trust root。"
+          : "原始采集链不完整，禁止进入正式验收。"}
+      </p>
+      {evidence.collector.sampler === "windows-toolhelp-working-set-v1" ||
+      evidence.environment.storageScope === "system-volume" ? (
+        <p className="rounded border border-amber-400/35 bg-amber-400/10 p-2 text-amber-100">
+          当前仍是 ToolHelp 进程枚举和系统卷探测，只能用于工程回归；正式性能验收要求 Job
+          Object 进程归属与实际媒体卷环境收据。
+        </p>
+      ) : null}
+      <dl className="grid gap-1 leading-5 sm:grid-cols-2">
+        <div>
+          <dt className="inline text-slate-500">目标环境：</dt>
+          <dd className="inline">
+            {evidence.environment.operatingSystem} · {evidence.environment.physicalCoreCount} 物理核
+          </dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">采样：</dt>
+          <dd className="inline">{evidence.plan.memorySampleIntervalMs}ms · 进程树 RSS</dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">进程归属：</dt>
+          <dd className="inline">
+            {evidence.collector.sampler === "windows-job-object-working-set-v1"
+              ? "Job Object"
+              : evidence.collector.sampler === "windows-toolhelp-working-set-v1"
+                ? "ToolHelp（工程）"
+                : "不受支持"}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">存储范围：</dt>
+          <dd className="inline">
+            {evidence.environment.storageScope === "workload-media-volumes"
+              ? "实际媒体卷"
+              : "系统卷（工程）"}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">冷缓存最大：</dt>
+          <dd className="inline">{formatMaximumElapsed(cold)}</dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">热缓存最大：</dt>
+          <dd className="inline">{formatMaximumElapsed(hot)}</dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">峰值 RSS：</dt>
+          <dd className="inline">
+            {peaks.length > 0 ? formatBytes(Math.max(...peaks)) : "缺失"}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">取消探针：</dt>
+          <dd className="inline">
+            {cancellations.length} 次
+            {cancellations.length > 0
+              ? ` · 最大 ${Math.max(...cancellations.map((trial) => trial.latencyMs)).toFixed(0)}ms`
+              : ""}
+          </dd>
+        </div>
+      </dl>
+      <p className="text-slate-500">evidence digest：{evidence.evidenceDigest}</p>
     </section>
   );
 }
@@ -395,7 +699,7 @@ function BenchmarkRunReportView({ report }: { report: RealMediaBenchmarkRunRepor
           运行报告：{formatRunStatus(report.status)}
         </h4>
         <span className="text-slate-500">
-          耗时 {(report.wallElapsedMs / 1_000).toFixed(1)} 秒
+          协调器观测耗时 {(report.wallElapsedMs / 1_000).toFixed(1)} 秒（非性能证据）
         </span>
       </div>
       <p className="rounded border border-red-400/40 bg-red-400/10 p-2 font-medium leading-5 text-red-100">
@@ -575,6 +879,89 @@ function formatGateActual(value: string | number | boolean): string {
   return typeof value === "number" && !Number.isInteger(value)
     ? value.toFixed(4)
     : String(value);
+}
+
+function formatPerformancePhase(phase: RealMediaPerformancePhase | null): string {
+  if (phase === "acquiring-session") return "取得原生独占会话";
+  if (phase === "preflight") return "核验媒体身份与显式流";
+  if (phase === "resetting-cache") return "原子清空应用特征缓存";
+  if (phase === "running-cold") return "冷缓存测量";
+  if (phase === "running-warmup") return "完整预热（不计入冷/热门槛）";
+  if (phase === "running-hot") return "热缓存测量";
+  if (phase === "running-cancellation") return "协议化取消探针";
+  if (phase === "cleaning-up") return "确认后代退出并清理 session";
+  if (phase === "completed") return "完成";
+  return "准备中";
+}
+
+async function defaultPerformancePanelRunner(
+  manifest: RealMediaBenchmarkManifest,
+  options: RealMediaPerformancePanelRunOptions
+): Promise<C137PerformanceRawEvidenceV1> {
+  const plan = createEngineeringRealMediaPerformancePlan(
+    manifest,
+    `performance-${createOpaqueRunId()}`
+  );
+  const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+    signal: options.signal,
+    ffmpegPath: options.ffmpegPath,
+    onProgress: (progress) => options.onProgress(progress.phase)
+  });
+  if (journal.status === "cancelled") {
+    throw new Error("本次性能采集已取消并进入原生清理；上一份完整结果保持不变。");
+  }
+  return createC137PerformanceRawEvidenceFromJournal(journal);
+}
+
+function formatMaximumElapsed(runs: Array<{ elapsedMs: number }>): string {
+  if (runs.length === 0) return "缺失";
+  const milliseconds = Math.max(...runs.map((run) => run.elapsedMs));
+  return milliseconds >= 60_000
+    ? `${(milliseconds / 60_000).toFixed(2)} 分钟`
+    : `${(milliseconds / 1_000).toFixed(2)} 秒`;
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / 1_073_741_824).toFixed(2)} GiB`;
+}
+
+function createOpaqueRunId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `fallback-${Date.now().toString(36)}`;
+}
+
+function assertPerformanceEvidenceMatchesManifest(
+  evidence: C137PerformanceRawEvidenceV1,
+  manifest: RealMediaBenchmarkManifest
+): void {
+  const expectedWorkloadDigest = createRealMediaPerformanceWorkloadDigest(manifest);
+  if (evidence.plan.workloadDigest !== expectedWorkloadDigest) {
+    throw new Error("raw evidence 工作负载摘要与当前 manifest 不一致。");
+  }
+  const expectedCaseCount = manifest.cases.filter(
+    (benchmarkCase) => benchmarkCase.mediaKind === "real"
+  ).length;
+  if (evidence.plan.expectedCaseCount !== expectedCaseCount) {
+    throw new Error("raw evidence 计划 case 数与当前 manifest 的真实关系数不一致。");
+  }
+}
+
+function assertBenchmarkReportMatchesManifest(
+  report: RealMediaBenchmarkRunReport,
+  manifest: RealMediaBenchmarkManifest
+): void {
+  const expectedDigest = createRealMediaBenchmarkRunManifestDigest(
+    projectRealMediaBenchmarkRunManifest(manifest)
+  );
+  if (
+    report.manifestId !== manifest.id ||
+    report.datasetVersion !== manifest.datasetVersion ||
+    report.runManifestDigest !== expectedDigest
+  ) {
+    throw new Error("runner 返回的报告与当前 manifest 的 blind workload 摘要不一致。");
+  }
 }
 
 function formatError(error: unknown): string {

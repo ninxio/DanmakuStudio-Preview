@@ -13,6 +13,7 @@ mod export_files;
 mod manual_verification;
 mod media_probe;
 mod media_tools;
+mod process_supervision;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -31,6 +32,13 @@ pub fn run() {
             audio_alignment::start_audio_alignment_job,
             audio_alignment::get_audio_alignment_job,
             audio_alignment::cancel_audio_alignment_job,
+            audio_alignment::begin_alignment_benchmark_session,
+            audio_alignment::get_active_alignment_benchmark_session,
+            audio_alignment::reset_alignment_benchmark_caches,
+            audio_alignment::start_alignment_benchmark_job,
+            audio_alignment::get_alignment_benchmark_job,
+            audio_alignment::cancel_alignment_benchmark_job,
+            audio_alignment::finish_alignment_benchmark_session,
             media_probe::probe_media_timeline,
             media_probe::probe_media_identity,
             manual_verification::issue_manual_time_map_verification,

@@ -1,3 +1,6 @@
+use crate::process_supervision::{
+    SupervisedCommand, SupervisedOutputLimits, SupervisedProcessErrorKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -6,8 +9,14 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
     sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+const MEDIA_TOOL_DETECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const MEDIA_TOOL_DETECTION_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIA_TOOL_DETECTION_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+const MEDIA_TOOL_DETECTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MEDIA_TOOL_DETECTION_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +105,18 @@ struct MpvSidecarState {
 
 static MPV_SIDECAR: OnceLock<Mutex<MpvSidecarState>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaToolDetectionFailure {
+    Spawn,
+    Timeout,
+    StdoutOverflow,
+    StderrOverflow,
+    Reader,
+    Wait,
+    Cleanup,
+    NonZeroExit,
+}
+
 #[tauri::command]
 pub fn detect_media_tool(
     request: MediaToolDetectionRequest,
@@ -176,40 +197,208 @@ fn detect_media_tool_inner(
             message: "尚未配置 mpv 路径。请先选择 mpv 可执行文件。".to_string(),
         });
     }
-    let output = Command::new(&executable_path).arg("--version").output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let version = first_output_line(&output.stdout, &output.stderr);
-            Ok(MediaToolDetectionResult {
-                tool: tool.to_string(),
+    let limits = media_tool_detection_limits();
+    let primary = probe_media_tool_version(tool, Path::new(&executable_path), limits);
+    let primary_version = match primary {
+        Ok(version) => version,
+        Err(failure) => {
+            return Ok(unavailable_media_tool_result(
+                tool,
                 executable_path,
-                available: true,
-                version: version.clone(),
-                message: version.unwrap_or_else(|| format!("{} 可运行。", tool_display_name(tool))),
-            })
-        }
-        Ok(output) => {
-            let detail = first_output_line(&output.stderr, &output.stdout)
-                .unwrap_or_else(|| "进程退出但没有返回可读错误。".to_string());
-            Ok(MediaToolDetectionResult {
-                tool: tool.to_string(),
-                executable_path,
-                available: false,
-                version: None,
-                message: format!("{} 无法运行：{detail}", tool_display_name(tool)),
-            })
-        }
-        Err(error) => Ok(MediaToolDetectionResult {
-            tool: tool.to_string(),
-            executable_path,
-            available: false,
-            version: None,
-            message: format!(
-                "{} 启动失败：{}。请检查路径是否指向可执行文件。",
                 tool_display_name(tool),
-                error
-            ),
-        }),
+                failure,
+            ));
+        }
+    };
+
+    let display_name = tool_display_name(tool);
+    let version = format_detected_versions(&[(display_name, primary_version.as_deref())]);
+    let message = if primary_version.is_some() {
+        format!("{display_name} 可运行。")
+    } else {
+        format!("{display_name} 可运行，版本未知。")
+    };
+    Ok(MediaToolDetectionResult {
+        tool: tool.to_string(),
+        executable_path,
+        available: true,
+        version,
+        message,
+    })
+}
+
+fn media_tool_detection_limits() -> SupervisedOutputLimits {
+    SupervisedOutputLimits {
+        execution_timeout: MEDIA_TOOL_DETECTION_TIMEOUT,
+        output_drain_timeout: MEDIA_TOOL_DETECTION_OUTPUT_DRAIN_TIMEOUT,
+        termination_timeout: MEDIA_TOOL_DETECTION_TERMINATION_TIMEOUT,
+        poll_interval: MEDIA_TOOL_DETECTION_POLL_INTERVAL,
+        stdout_hard_limit: MEDIA_TOOL_DETECTION_OUTPUT_LIMIT_BYTES,
+        stderr_hard_limit: MEDIA_TOOL_DETECTION_OUTPUT_LIMIT_BYTES,
+    }
+}
+
+fn probe_media_tool_version(
+    tool: &str,
+    executable_path: &Path,
+    limits: SupervisedOutputLimits,
+) -> Result<Option<String>, MediaToolDetectionFailure> {
+    let mut command = SupervisedCommand::new(executable_path);
+    command.arg(media_tool_version_argument(tool));
+    run_media_tool_version_command(tool, &command, limits)
+}
+
+fn media_tool_version_argument(tool: &str) -> &'static str {
+    if tool.eq_ignore_ascii_case("mpv") {
+        "--version"
+    } else {
+        "-version"
+    }
+}
+
+fn run_media_tool_version_command(
+    tool: &str,
+    command: &SupervisedCommand,
+    limits: SupervisedOutputLimits,
+) -> Result<Option<String>, MediaToolDetectionFailure> {
+    let output = command
+        .output(limits, || false)
+        .map_err(|error| match error.kind() {
+            SupervisedProcessErrorKind::Spawn => MediaToolDetectionFailure::Spawn,
+            SupervisedProcessErrorKind::Timeout => MediaToolDetectionFailure::Timeout,
+            SupervisedProcessErrorKind::Cancelled => MediaToolDetectionFailure::Wait,
+            SupervisedProcessErrorKind::StdoutOverflow => MediaToolDetectionFailure::StdoutOverflow,
+            SupervisedProcessErrorKind::StderrOverflow => MediaToolDetectionFailure::StderrOverflow,
+            SupervisedProcessErrorKind::Reader => MediaToolDetectionFailure::Reader,
+            SupervisedProcessErrorKind::Wait => MediaToolDetectionFailure::Wait,
+            SupervisedProcessErrorKind::Cleanup => MediaToolDetectionFailure::Cleanup,
+        })?;
+    if !output.status.success() {
+        return Err(MediaToolDetectionFailure::NonZeroExit);
+    }
+    Ok(parse_media_tool_semantic_version(
+        tool,
+        &output.stdout,
+        &output.stderr,
+    ))
+}
+
+fn parse_media_tool_semantic_version(tool: &str, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    for bytes in [stdout, stderr] {
+        for line in String::from_utf8_lossy(bytes).lines() {
+            let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+            let Some(name) = fields.first() else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case(tool) {
+                continue;
+            }
+            let raw_version = if tool.eq_ignore_ascii_case("mpv") {
+                fields.get(1).copied()
+            } else if fields
+                .get(1)
+                .is_some_and(|marker| marker.eq_ignore_ascii_case("version"))
+            {
+                fields.get(2).copied()
+            } else {
+                None
+            };
+            let Some(raw_version) = raw_version else {
+                continue;
+            };
+            if let Some(version) = normalize_numeric_semantic_version(raw_version) {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_numeric_semantic_version(raw_version: &str) -> Option<String> {
+    let raw_version = raw_version
+        .strip_prefix('v')
+        .or_else(|| raw_version.strip_prefix('V'))
+        .unwrap_or(raw_version);
+    let numeric_prefix = raw_version
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>();
+    if numeric_prefix.ends_with('.') {
+        return None;
+    }
+    let suffix = raw_version.strip_prefix(&numeric_prefix)?;
+    if !suffix.is_empty() && !suffix.starts_with(['-', '+']) {
+        return None;
+    }
+    let components = numeric_prefix.split('.').collect::<Vec<_>>();
+    if !(2..=3).contains(&components.len())
+        || components.iter().any(|component| component.is_empty())
+    {
+        return None;
+    }
+    let mut parsed = components
+        .iter()
+        .map(|component| component.parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    while parsed.len() < 3 {
+        parsed.push(0);
+    }
+    Some(format!("{}.{}.{}", parsed[0], parsed[1], parsed[2]))
+}
+
+fn format_detected_versions(versions: &[(&str, Option<&str>)]) -> Option<String> {
+    let labels = versions
+        .iter()
+        .filter_map(|(name, version)| version.map(|version| format!("{name} {version}")))
+        .collect::<Vec<_>>();
+    (!labels.is_empty()).then(|| labels.join("；"))
+}
+
+fn unavailable_media_tool_result(
+    requested_tool: &str,
+    executable_path: String,
+    failed_tool_name: &str,
+    failure: MediaToolDetectionFailure,
+) -> MediaToolDetectionResult {
+    MediaToolDetectionResult {
+        tool: requested_tool.to_string(),
+        executable_path,
+        available: false,
+        version: None,
+        message: format_media_tool_detection_failure(failed_tool_name, failure),
+    }
+}
+
+fn format_media_tool_detection_failure(
+    tool_name: &str,
+    failure: MediaToolDetectionFailure,
+) -> String {
+    match failure {
+        MediaToolDetectionFailure::Spawn => {
+            format!("{tool_name} 无法在受监督进程中启动，请检查工具配置。")
+        }
+        MediaToolDetectionFailure::Timeout => {
+            format!("blocked:tool-timeout：{tool_name} 版本检测超过 10 秒，已终止其进程树。")
+        }
+        MediaToolDetectionFailure::StdoutOverflow => {
+            format!("blocked:resource-limit：{tool_name} 版本检测标准输出超过 64 KiB 硬上限。")
+        }
+        MediaToolDetectionFailure::StderrOverflow => {
+            format!("blocked:resource-limit：{tool_name} 版本检测错误输出超过 64 KiB 硬上限。")
+        }
+        MediaToolDetectionFailure::Reader => {
+            format!("{tool_name} 版本检测的有界输出读取失败。")
+        }
+        MediaToolDetectionFailure::Wait => {
+            format!("{tool_name} 版本检测的受监督进程状态读取失败。")
+        }
+        MediaToolDetectionFailure::Cleanup => {
+            format!("blocked:cleanup-failed：{tool_name} 版本检测的进程树未完成有界清理。")
+        }
+        MediaToolDetectionFailure::NonZeroExit => {
+            format!("{tool_name} 无法运行；为保护本地路径与访问凭据，未回显工具错误输出。")
+        }
     }
 }
 
@@ -595,15 +784,6 @@ fn resolve_tool_executable_path(tool: &str, executable_path: Option<&str>) -> St
     String::new()
 }
 
-fn first_output_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
-    let text = if stdout.is_empty() { stderr } else { stdout };
-    String::from_utf8_lossy(text)
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| truncate_text(line, 160))
-}
-
 fn tool_display_name(tool: &str) -> &'static str {
     match tool {
         "ffmpeg" => "FFmpeg",
@@ -674,6 +854,66 @@ mod tests {
     #[test]
     fn unknown_tool_is_rejected() {
         assert!(normalize_media_tool("vlc").is_err());
+    }
+
+    #[test]
+    fn detection_contract_uses_ten_second_and_64_kib_hard_limits() {
+        let limits = media_tool_detection_limits();
+
+        assert_eq!(limits.execution_timeout, Duration::from_secs(10));
+        assert_eq!(limits.stdout_hard_limit, 64 * 1024);
+        assert_eq!(limits.stderr_hard_limit, 64 * 1024);
+    }
+
+    #[test]
+    fn detection_uses_each_tools_supported_version_switch() {
+        assert_eq!(media_tool_version_argument("ffmpeg"), "-version");
+        assert_eq!(media_tool_version_argument("ffprobe"), "-version");
+        assert_eq!(media_tool_version_argument("mpv"), "--version");
+    }
+
+    #[test]
+    fn media_tool_versions_are_reduced_to_tool_name_and_numeric_semver() {
+        let ffmpeg = parse_media_tool_semantic_version(
+            "ffmpeg",
+            br#"ffmpeg version 7.1.1-full_build-www.example.test Copyright secret C:\Users\alice"#,
+            b"",
+        );
+        let mpv = parse_media_tool_semantic_version(
+            "mpv",
+            b"unrelated banner\nmpv v0.40.0-dirty Copyright private-builder",
+            b"",
+        );
+
+        assert_eq!(ffmpeg.as_deref(), Some("7.1.1"));
+        assert_eq!(mpv.as_deref(), Some("0.40.0"));
+        let ffmpeg_label = format_detected_versions(&[("FFmpeg", ffmpeg.as_deref())]).unwrap();
+        let mpv_label = format_detected_versions(&[("mpv", mpv.as_deref())]).unwrap();
+        assert_eq!(ffmpeg_label, "FFmpeg 7.1.1");
+        assert_eq!(mpv_label, "mpv 0.40.0");
+        assert!(!ffmpeg_label.contains("alice"));
+        assert!(!mpv_label.contains("private-builder"));
+    }
+
+    #[test]
+    fn successful_unknown_version_uses_the_existing_generic_contract() {
+        assert_eq!(
+            parse_media_tool_semantic_version(
+                "ffmpeg",
+                br#"wrapper ready at C:\Users\alice\private\ffmpeg.exe?token=secret"#,
+                b"",
+            ),
+            None
+        );
+        assert_eq!(
+            parse_media_tool_semantic_version("ffmpeg", b"ffmpeg version 7.1.private-path", b"",),
+            None
+        );
+        assert_eq!(
+            parse_media_tool_semantic_version("mpv", b"mpv v0.40secret", b""),
+            None
+        );
+        assert_eq!(format_detected_versions(&[("FFmpeg", None)]), None);
     }
 
     #[test]
@@ -757,5 +997,151 @@ mod tests {
         assert_eq!(tracks[0].title.as_deref(), Some("日语 2.0"));
         assert!(tracks[1].external);
         assert_eq!(tracks[1].track_type, "subtitle");
+    }
+
+    #[cfg(windows)]
+    fn supervised_detection_helper_command(test_name: &str) -> SupervisedCommand {
+        let mut command = SupervisedCommand::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+        command
+    }
+
+    #[cfg(windows)]
+    fn supervised_detection_test_limits(timeout: Duration) -> SupervisedOutputLimits {
+        SupervisedOutputLimits {
+            execution_timeout: timeout,
+            output_drain_timeout: Duration::from_millis(200),
+            termination_timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(5),
+            stdout_hard_limit: MEDIA_TOOL_DETECTION_OUTPUT_LIMIT_BYTES,
+            stderr_hard_limit: MEDIA_TOOL_DETECTION_OUTPUT_LIMIT_BYTES,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-tool detection timeout wrapper helper"]
+    #[allow(clippy::zombie_processes)]
+    fn supervised_detection_timeout_wrapper_helper() {
+        use std::io::Write as _;
+
+        let descendant = Command::new("ping.exe")
+            .args(["-t", "127.0.0.1"])
+            .spawn()
+            .unwrap();
+        writeln!(std::io::stdout(), "descendant={}", descendant.id()).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::mem::forget(descendant);
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-tool detection stdout overflow wrapper helper"]
+    fn supervised_detection_stdout_overflow_wrapper_helper() {
+        use std::io::Write as _;
+
+        let mut stdout = std::io::stdout();
+        for _ in 0..20 {
+            stdout.write_all(&[b'x'; 4 * 1024]).unwrap();
+        }
+        stdout.flush().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-tool detection stderr overflow wrapper helper"]
+    fn supervised_detection_stderr_overflow_wrapper_helper() {
+        use std::io::Write as _;
+
+        let mut stderr = std::io::stderr();
+        for _ in 0..20 {
+            stderr.write_all(&[b'e'; 4 * 1024]).unwrap();
+        }
+        stderr.flush().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "media-tool detection sensitive nonzero wrapper helper"]
+    fn supervised_detection_sensitive_nonzero_wrapper_helper() {
+        use std::io::Write as _;
+
+        let secret = br#"C:\Users\alice\private\ffmpeg.exe?api_key=secret-token&token=other"#;
+        std::io::stdout().write_all(secret).unwrap();
+        std::io::stderr().write_all(secret).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        std::process::exit(23);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malicious_wrapper_timeout_is_bounded_and_reports_no_raw_output() {
+        let command = supervised_detection_helper_command(
+            "media_tools::tests::supervised_detection_timeout_wrapper_helper",
+        );
+        let started = std::time::Instant::now();
+        let failure = run_media_tool_version_command(
+            "ffmpeg",
+            &command,
+            supervised_detection_test_limits(Duration::from_millis(150)),
+        )
+        .unwrap_err();
+        let message = format_media_tool_detection_failure("FFmpeg", failure);
+
+        assert_eq!(failure, MediaToolDetectionFailure::Timeout);
+        assert!(message.starts_with("blocked:tool-timeout"));
+        assert!(!message.contains("descendant="));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malicious_wrapper_stdout_and_stderr_overflow_are_hard_bounded() {
+        for (test_name, expected_failure) in [
+            (
+                "media_tools::tests::supervised_detection_stdout_overflow_wrapper_helper",
+                MediaToolDetectionFailure::StdoutOverflow,
+            ),
+            (
+                "media_tools::tests::supervised_detection_stderr_overflow_wrapper_helper",
+                MediaToolDetectionFailure::StderrOverflow,
+            ),
+        ] {
+            let command = supervised_detection_helper_command(test_name);
+            let started = std::time::Instant::now();
+            let failure = run_media_tool_version_command(
+                "ffmpeg",
+                &command,
+                supervised_detection_test_limits(Duration::from_secs(3)),
+            )
+            .unwrap_err();
+
+            assert_eq!(failure, expected_failure);
+            assert!(format_media_tool_detection_failure("FFmpeg", failure)
+                .starts_with("blocked:resource-limit"));
+            assert!(started.elapsed() < Duration::from_secs(4));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malicious_wrapper_nonzero_never_echoes_paths_or_secrets() {
+        let command = supervised_detection_helper_command(
+            "media_tools::tests::supervised_detection_sensitive_nonzero_wrapper_helper",
+        );
+        let failure = run_media_tool_version_command(
+            "ffmpeg",
+            &command,
+            supervised_detection_test_limits(Duration::from_secs(3)),
+        )
+        .unwrap_err();
+        let message = format_media_tool_detection_failure("FFmpeg", failure);
+
+        assert_eq!(failure, MediaToolDetectionFailure::NonZeroExit);
+        for secret in ["alice", "ffmpeg.exe", "secret-token", "token=other"] {
+            assert!(!message.contains(secret));
+        }
     }
 }

@@ -7,13 +7,23 @@ import {
   type RealMediaBenchmarkManifest
 } from "../../domain/alignment/realMediaBenchmark";
 import {
+  computeC137PerformanceEvidenceDigest,
+  createC137PerformancePlanDigest,
+  type C137PerformanceRawEvidenceV1
+} from "../../domain/alignment/c137PerformanceEvidence";
+import { createCompleteC137PerformanceEvidenceFixture } from "../../test/c137PerformanceEvidence";
+import { createRealMediaPerformanceWorkloadDigest } from "../../infrastructure/alignment/realMediaPerformanceRunner";
+import {
   REAL_MEDIA_BENCHMARK_RUNNER_VERSION,
+  createRealMediaBenchmarkRunManifestDigest,
+  projectRealMediaBenchmarkRunManifest,
   type RealMediaBenchmarkCaseRunResult,
   type RealMediaBenchmarkRunReport
 } from "../../infrastructure/alignment/realMediaBenchmarkRunner";
 import {
   RealMediaBenchmarkPanel,
-  type RealMediaBenchmarkPanelRunner
+  type RealMediaBenchmarkPanelRunner,
+  type RealMediaPerformancePanelRunner
 } from "./RealMediaBenchmarkPanel";
 
 let restoreObjectUrls: (() => void) | null = null;
@@ -49,6 +59,7 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(screen.getByText(/不会再次选择视频，也不会写入当前项目/)).toBeInTheDocument();
     expect(screen.getByText(/浏览器预览不能运行真实媒体基准/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "采集工程性能原始证据" })).toBeDisabled();
   });
 
   it("无效 JSON fail-closed，显示原因且不调用 runner", async () => {
@@ -90,7 +101,14 @@ describe("C137 真实媒体 benchmark 面板", () => {
   ])("$name 明确阻断运行并保留治理摘要", async ({ desktopAvailable, manifest, messages }) => {
     const user = userEvent.setup();
     const runner = vi.fn<RealMediaBenchmarkPanelRunner>();
-    render(<RealMediaBenchmarkPanel desktopAvailable={desktopAvailable} runner={runner} />);
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>();
+    render(
+      <RealMediaBenchmarkPanel
+        desktopAvailable={desktopAvailable}
+        runner={runner}
+        performanceRunner={performanceRunner}
+      />
+    );
     await openPanel(user);
     await uploadManifest(user, manifest);
 
@@ -104,7 +122,9 @@ describe("C137 真实媒体 benchmark 面板", () => {
     for (const message of messages)
       expect(screen.getByText(new RegExp(message))).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "采集工程性能原始证据" })).toBeDisabled();
     expect(runner).not.toHaveBeenCalled();
+    expect(performanceRunner).not.toHaveBeenCalled();
   });
 
   it("runner 异常会去除本地路径和身份摘要，并恢复可重试状态", async () => {
@@ -216,6 +236,156 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(text).toContain('"releaseEligible": false');
     for (const secret of collectManifestSecrets(manifest)) expect(text).not.toContain(secret);
     expect(screen.getByRole("status")).toHaveTextContent("已下载去敏报告");
+  });
+
+  it("拒绝复用相同 ID/version 但 blind workload 摘要属于另一清单的报告", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    const otherManifest = structuredClone(manifest);
+    otherManifest.cases[0].source.path = "C:\\private-benchmark\\other-source.mkv";
+    const runner = vi.fn<RealMediaBenchmarkPanelRunner>(() =>
+      Promise.resolve(createCompletedReport(otherManifest))
+    );
+    render(<RealMediaBenchmarkPanel desktopAvailable runner={runner} />);
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+    await user.click(await screen.findByRole("button", { name: "运行真实媒体精度基准" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "blind workload 摘要不一致"
+    );
+    expect(screen.queryByLabelText("C137 真实媒体运行报告")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "下载去敏稳定报告" })).not.toBeInTheDocument();
+  });
+
+  it("性能 raw evidence 与当前 manifest 绑定后才展示并下载去敏文件", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    const evidence = bindPerformanceEvidenceToManifest(manifest);
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>(() =>
+      Promise.resolve(evidence)
+    );
+    let downloadedBlob: Blob | null = null;
+    let downloadedName = "";
+    restoreObjectUrls = installObjectUrlMocks((blob) => {
+      downloadedBlob = blob;
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement
+    ) {
+      downloadedName = this.download;
+    });
+    render(
+      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
+    );
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+    await user.click(
+      await screen.findByRole("button", { name: "采集工程性能原始证据" })
+    );
+
+    const summary = await screen.findByLabelText("性能 raw evidence 摘要");
+    expect(summary).toHaveTextContent("原始采集链完整；仍需独立审批和 trust root");
+    expect(summary).toHaveTextContent("Windows · 4 物理核");
+    expect(summary).toHaveTextContent("ToolHelp（工程）");
+    expect(summary).toHaveTextContent("系统卷（工程）");
+    expect(summary).toHaveTextContent("正式性能验收要求 Job Object");
+    expect(summary).toHaveTextContent("1.00 GiB");
+    expect(summary).toHaveTextContent("1 次 · 最大 100ms");
+    expect(screen.getByText(/releaseEligible=false/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "下载未审批 raw evidence" }));
+    expect(downloadedName).toBe("c137-performance-plan-fixture-000001.json");
+    if (!downloadedBlob) throw new Error("下载测试没有捕获性能 evidence Blob");
+    const text = await readBlobText(downloadedBlob);
+    expect(text.endsWith("\n")).toBe(true);
+    expect(text).toContain('"reportKind":"c137-performance-raw-evidence"');
+    expect(text).toContain('"releaseEligible":false');
+    expect(text).toContain('"trustStatus":"untrusted-raw-evidence"');
+    for (const secret of collectManifestSecrets(manifest)) expect(text).not.toContain(secret);
+    expect(screen.getByRole("status")).toHaveTextContent("已下载未审批 raw evidence");
+  });
+
+  it("拒绝工作负载摘要不属于当前 manifest 的有效 raw evidence", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>(() =>
+      Promise.resolve(createCompleteC137PerformanceEvidenceFixture())
+    );
+    render(
+      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
+    );
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+    await user.click(
+      await screen.findByRole("button", { name: "采集工程性能原始证据" })
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "raw evidence 工作负载摘要与当前 manifest 不一致"
+    );
+    expect(screen.queryByLabelText("性能 raw evidence 摘要")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "下载未审批 raw evidence" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("拒绝计划 case 数与当前 manifest 真实关系数不一致的 raw evidence", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(2);
+    const evidence = bindPerformanceEvidenceToManifest(manifest);
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>(() =>
+      Promise.resolve(evidence)
+    );
+    render(
+      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
+    );
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+    await user.click(
+      await screen.findByRole("button", { name: "采集工程性能原始证据" })
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "raw evidence 计划 case 数与当前 manifest 的真实关系数不一致"
+    );
+    expect(screen.queryByLabelText("性能 raw evidence 摘要")).not.toBeInTheDocument();
+  });
+
+  it("取消性能采集会 abort 注入 runner，并等待原生资源进入终态", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    let signal: AbortSignal | undefined;
+    let rejectRun: ((reason?: unknown) => void) | undefined;
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>((_manifest, options) => {
+      signal = options.signal;
+      return new Promise<C137PerformanceRawEvidenceV1>((_resolve, reject) => {
+        rejectRun = reject;
+      });
+    });
+    render(
+      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
+    );
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+    await user.click(
+      await screen.findByRole("button", { name: "采集工程性能原始证据" })
+    );
+
+    expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "取消性能采集" }));
+    expect(signal?.aborted).toBe(true);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "等待活动作业、FFmpeg/FFprobe 后代和采样线程进入真实终态"
+    );
+    act(() => {
+      rejectRun?.(new Error("native cancellation terminal"));
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "性能采集已请求取消；尚未取得可分享的安全终态"
+    );
+    expect(screen.getByRole("button", { name: "采集工程性能原始证据" })).toBeEnabled();
   });
 });
 
@@ -339,6 +509,18 @@ function cloneGold(gold: RealMediaBenchmarkGold): RealMediaBenchmarkGold {
   return JSON.parse(JSON.stringify(gold)) as RealMediaBenchmarkGold;
 }
 
+function bindPerformanceEvidenceToManifest(
+  manifest: RealMediaBenchmarkManifest
+): C137PerformanceRawEvidenceV1 {
+  const evidence = createCompleteC137PerformanceEvidenceFixture();
+  const workloadDigest = createRealMediaPerformanceWorkloadDigest(manifest);
+  evidence.plan.workloadDigest = workloadDigest;
+  for (const trial of evidence.trials) trial.workloadDigest = workloadDigest;
+  evidence.planDigest = createC137PerformancePlanDigest(evidence.plan);
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigest(evidence);
+  return evidence;
+}
+
 function createCompletedReport(
   manifest: RealMediaBenchmarkManifest
 ): RealMediaBenchmarkRunReport {
@@ -424,7 +606,9 @@ function createReport(
     runnerVersion: REAL_MEDIA_BENCHMARK_RUNNER_VERSION,
     manifestId: manifest.id,
     datasetVersion: manifest.datasetVersion,
-    runManifestDigest: `sha256:${"0".repeat(64)}`,
+    runManifestDigest: createRealMediaBenchmarkRunManifestDigest(
+      projectRealMediaBenchmarkRunManifest(manifest)
+    ),
     wallElapsedMs: 1_500,
     skippedNonRealCaseCount: manifest.cases.filter((item) => item.mediaKind !== "real").length,
     preflight,
