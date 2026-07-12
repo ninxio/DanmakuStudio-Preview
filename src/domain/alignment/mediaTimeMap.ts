@@ -4,11 +4,18 @@ import type {
   MediaTimeMap,
   MediaTimeMapQuality,
   MediaTimeMapState,
-  MediaTimeMapVerificationRecord,
+  MediaTimeMapVerificationRevocation,
+  SignedManualMediaTimeMapVerificationRecord,
   SegmentTimingRule
 } from "../project/types";
-import { areMediaContentIdentitiesEqual, cloneMediaContentIdentity } from "../project/mediaIdentity";
+import {
+  areMediaContentIdentitiesEqual,
+  cloneMediaContentIdentity
+} from "../project/mediaIdentity";
 import type { Milliseconds } from "../shared/time";
+import { sha256Hex } from "../shared/sha256";
+import { readTimeMapSpanReviewDecision } from "./timeMapReviewDecision";
+import { readTimeMapSpanPlaybackReview } from "./timeMapPlaybackReviewEvidence";
 import {
   migrateLegacyTimeMap,
   reconcileTimeMapQualityClaim,
@@ -19,9 +26,13 @@ import {
 export const LEGACY_ALIGNMENT_ENGINE_VERSION = "legacy-v9";
 export const LEGACY_ALIGNMENT_FEATURE_VERSION = "legacy-v9";
 
-const TIME_MAP_CORE_DIGEST_PREFIX = "fnv1a64";
+const TIME_MAP_CORE_DIGEST_PREFIX = "sha256";
 const VERIFICATION_RECORD_REQUIRED_REASON =
   "缺少与当前时间图核心、revision 和媒体身份绑定的可信验证记录；已阻断“已验证”资格，必须重新校准或完成明确人工复核。";
+const LEGACY_MANUAL_RECORD_REASON =
+  "旧人工验证记录没有安装级签名，无法在保存重开后证明签发来源；必须重新完成人工复核。";
+const PERSISTED_MANUAL_RECORD_UNCHECKED_REASON =
+  "人工验证签名尚未通过本机安装级验证机构和撤销注册表复核；当前按未验证处理。";
 
 /**
  * 受信自动校准产物必须随应用代码发布。C137 尚无真实金标准 calibration，
@@ -32,8 +43,17 @@ const TRUSTED_AUTOMATIC_CALIBRATION_ARTIFACTS: readonly {
   version: string;
 }[] = [];
 
-/** JSON 反序列化无法恢复 WeakSet 身份，因此手写/导入的 manual record 永不自动受信。 */
-const domainIssuedManualVerificationRecords = new WeakSet<MediaTimeMapVerificationRecord>();
+interface RegisteredManualVerificationTrust {
+  status: "active" | "revoked";
+  requestDigest: string;
+}
+
+/**
+ * 只缓存 native 验证机构已经验证过的值身份，而不是 JS 对象身份。这样 structuredClone、
+ * undo/redo 和保存序列化不会丢失同一次运行中的信任；应用重启后仍必须重新查询 native
+ * 撤销注册表，任意 JSON 不能自己注册。
+ */
+const registeredManualVerificationTrust = new Map<string, RegisteredManualVerificationTrust>();
 
 export interface ManualMediaTimeMapVerificationInput {
   calibrationArtifactId: string;
@@ -42,8 +62,58 @@ export interface ManualMediaTimeMapVerificationInput {
   verifiedAt: string;
 }
 
+export interface ManualMediaTimeMapVerificationRequest {
+  payload: string;
+  requestDigest: string;
+  reviewEvidenceDigest: string;
+}
+
+export interface ManualMediaTimeMapVerificationSeal {
+  verificationId: string;
+  issuerKeyId: string;
+  issuerSequence: number;
+  signatureAlgorithm: "hmac-sha256-v1";
+  signature: string;
+  requestDigest: string;
+}
+
+export interface ManualMediaTimeMapVerificationAuthorityResult {
+  verificationId: string;
+  issuerKeyId: string;
+  signature: string;
+  requestDigest: string;
+  status: "active" | "revoked" | "unknown" | "invalid";
+  reason: string;
+}
+
+export interface ManualMediaTimeMapVerificationRevocationInput {
+  reason: string;
+  revokedBy: string;
+  revokedAt: string;
+}
+
+export interface ManualMediaTimeMapVerificationRevocationRequest extends ManualMediaTimeMapVerificationRevocationInput {
+  verificationId: string;
+  issuerKeyId: string;
+  signature: string;
+  requestDigest: string;
+}
+
+export interface ManualMediaTimeMapVerificationRevocationSeal {
+  verificationId: string;
+  issuerKeyId: string;
+  issuerSequence: number;
+  signatureAlgorithm: "hmac-sha256-v1";
+  signature: string;
+}
+
 export interface MediaTimeMapVerificationAssessment {
   trusted: boolean;
+  reason: string | null;
+}
+
+export interface ManualMediaTimeMapVerificationEligibility {
+  eligible: boolean;
   reason: string | null;
 }
 
@@ -95,7 +165,9 @@ export function createLegacyMediaTimeMap(input: LegacyMediaTimeMapInput): MediaT
   const reasons = ["由旧阶跃规则迁移，未经真实媒体重新分析或精度验证。"];
   migration.issues.forEach((issue) => reasons.push(issue.message));
   if (expectedRangeMismatch) {
-    reasons.push("旧候选声明的目标范围与 timingRules 推导范围不一致，已阻断并标记为 ambiguous。");
+    reasons.push(
+      "旧候选声明的目标范围与 timingRules 推导范围不一致，已阻断并标记为 ambiguous。"
+    );
   }
 
   return {
@@ -156,8 +228,8 @@ export function createConfirmedTimeMapId(candidateId: string, revision: number):
 }
 
 /**
- * 对正式映射核心生成稳定摘要。固定顺序的数组编码避免对象键顺序影响结果；质量等级、
- * 原因和备注不参与摘要，但所有会影响映射、校准判断或证据完整性的字段都会参与。
+ * 对正式映射核心生成稳定 SHA-256。固定顺序的数组编码避免对象键顺序影响结果；运行时
+ * 信任诊断不参与，但用户/算法写入的 reasons、notes 和所有映射、指标、证据字段均绑定。
  */
 export function computeMediaTimeMapCoreDigest(map: MediaTimeMap): string {
   const canonical = JSON.stringify([
@@ -187,7 +259,7 @@ export function computeMediaTimeMapCoreDigest(map: MediaTimeMap): string {
     map.featureVersion,
     map.parametersHash
   ]);
-  return `${TIME_MAP_CORE_DIGEST_PREFIX}:${fnv1a64(canonical)}`;
+  return `${TIME_MAP_CORE_DIGEST_PREFIX}:${sha256Hex(canonical)}`;
 }
 
 /** 检查 record 是否仍精确绑定当前 map，并且其签发来源受信。 */
@@ -201,7 +273,8 @@ export function assessMediaTimeMapVerification(
   if (map.state !== "confirmed") {
     return {
       trusted: false,
-      reason: "验证记录只能绑定 state=confirmed 的正式时间图，候选或已替代 revision 不能保持已验证资格。"
+      reason:
+        "验证记录只能绑定 state=confirmed 的正式时间图，候选或已替代 revision 不能保持已验证资格。"
     };
   }
   if (record.mapRevision !== map.revision) {
@@ -240,23 +313,229 @@ export function assessMediaTimeMapVerification(
           reason: "自动验证所声明的 calibration artifact/version 不在应用内置受信列表中。"
         };
   }
-  if (!domainIssuedManualVerificationRecords.has(record)) {
+  if (record.recordVersion === 1) {
     return {
       trusted: false,
-      reason: "人工验证记录不是由本次运行的明确领域复核函数签发，导入 JSON 不能自动取得可信状态。"
+      reason: LEGACY_MANUAL_RECORD_REASON
+    };
+  }
+  if (record.revocation) {
+    return {
+      trusted: false,
+      reason: `人工验证已于 ${record.revocation.revokedAt} 由 ${record.revocation.revokedBy} 撤销：${record.revocation.reason}`
+    };
+  }
+  let expectedRequest: ManualMediaTimeMapVerificationRequest;
+  try {
+    expectedRequest = createManualVerificationRequestWithoutEligibilityCheck(map, {
+      calibrationArtifactId: record.calibrationArtifactId,
+      calibrationArtifactVersion: record.calibrationArtifactVersion,
+      verifier: record.verifier,
+      verifiedAt: record.verifiedAt
+    });
+  } catch {
+    return {
+      trusted: false,
+      reason: "当前时间图已不满足签发门槛或人工差异分类要求，原验证失效。"
+    };
+  }
+  if (
+    record.requestDigest !== expectedRequest.requestDigest ||
+    record.reviewEvidenceDigest !== expectedRequest.reviewEvidenceDigest
+  ) {
+    return {
+      trusted: false,
+      reason: "人工验证签名请求摘要与当前时间图、复核证据或签发元数据不一致。"
+    };
+  }
+  const registered = registeredManualVerificationTrust.get(
+    createManualVerificationTrustKey(record)
+  );
+  if (!registered) {
+    return { trusted: false, reason: PERSISTED_MANUAL_RECORD_UNCHECKED_REASON };
+  }
+  if (registered.requestDigest !== record.requestDigest) {
+    return {
+      trusted: false,
+      reason: "本机验证机构返回的签发请求摘要与项目记录不一致。"
+    };
+  }
+  if (registered.status === "revoked") {
+    return {
+      trusted: false,
+      reason: "本机撤销注册表已将该人工验证标记为 revoked；项目文件不能自行恢复它。"
     };
   }
   return { trusted: true, reason: null };
 }
 
 /**
- * 人工复核唯一签发入口。当前 UI 尚未接入该闭环；调用方必须先提供完整 manual 证据和
- * 达标实测指标。记录在序列化后不会自动恢复运行时信任，避免任意 JSON 冒充人工签发。
+ * 在调用 native 安装级签发机构前创建唯一的规范化请求。自动分析结果不得调用此函数；
+ * 调用方必须来自明确人工动作，并先持久化 A/B 复核产物。
  */
-export function applyManualMediaTimeMapVerification(
+export function createManualMediaTimeMapVerificationRequest(
   map: MediaTimeMap,
   input: ManualMediaTimeMapVerificationInput
+): ManualMediaTimeMapVerificationRequest {
+  assertManualVerificationEligible(map, input);
+  return createManualVerificationRequestWithoutEligibilityCheck(map, input);
+}
+
+export function assessManualMediaTimeMapVerificationEligibility(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationInput
+): ManualMediaTimeMapVerificationEligibility {
+  try {
+    assertManualVerificationEligible(map, input);
+    return { eligible: true, reason: null };
+  } catch (error) {
+    return {
+      eligible: false,
+      reason: error instanceof Error ? error.message : "人工验证签发预检失败。"
+    };
+  }
+}
+
+/**
+ * 应用 native 签发结果。该函数只接受已回显当前 requestDigest 的 seal；生产调用必须由
+ * manualVerificationAuthority bridge 取得 seal，不能从项目 JSON 读取后直接调用。
+ */
+export function applyAuthorityIssuedManualMediaTimeMapVerification(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationInput,
+  seal: ManualMediaTimeMapVerificationSeal
 ): MediaTimeMap {
+  const request = createManualMediaTimeMapVerificationRequest(map, input);
+  assertManualVerificationSeal(seal, request.requestDigest);
+  const sourceIdentity = map.sourceIdentity;
+  const targetIdentity = map.targetIdentity;
+  if (!sourceIdentity || !targetIdentity) {
+    throw new Error("人工验证前必须记录源文件与目标文件的内容身份。");
+  }
+  const declaredVerified = createDeclaredVerifiedMap(map);
+  const record: SignedManualMediaTimeMapVerificationRecord = {
+    recordVersion: 2,
+    method: "manual-review",
+    verificationId: seal.verificationId,
+    issuerKeyId: seal.issuerKeyId,
+    issuerSequence: seal.issuerSequence,
+    signatureAlgorithm: seal.signatureAlgorithm,
+    signature: seal.signature,
+    requestDigest: request.requestDigest,
+    mapCoreDigest: computeMediaTimeMapCoreDigest(declaredVerified),
+    mapRevision: declaredVerified.revision,
+    sourceIdentity: cloneRequiredIdentity(sourceIdentity),
+    targetIdentity: cloneRequiredIdentity(targetIdentity),
+    calibrationArtifactId: input.calibrationArtifactId,
+    calibrationArtifactVersion: input.calibrationArtifactVersion,
+    reviewEvidenceDigest: request.reviewEvidenceDigest,
+    verifier: input.verifier,
+    verifiedAt: input.verifiedAt,
+    revocation: null
+  };
+  registerManualMediaTimeMapVerificationAuthorityResult({
+    verificationId: seal.verificationId,
+    issuerKeyId: seal.issuerKeyId,
+    signature: seal.signature,
+    requestDigest: seal.requestDigest,
+    status: "active",
+    reason: "刚刚由本机验证机构签发。"
+  });
+  return reconcileMediaTimeMapQuality({ ...declaredVerified, verification: record });
+}
+
+/** 将 native 复核结果注册到当前运行；unknown/invalid 始终不会取得信任。 */
+export function registerManualMediaTimeMapVerificationAuthorityResult(
+  result: ManualMediaTimeMapVerificationAuthorityResult
+): void {
+  assertNonEmptyAuthorityField("verificationId", result.verificationId);
+  assertNonEmptyAuthorityField("issuerKeyId", result.issuerKeyId);
+  assertSha256Digest("requestDigest", result.requestDigest);
+  assertHexDigest("signature", result.signature, 64);
+  const key = createManualVerificationTrustKey(result);
+  if (result.status === "active" || result.status === "revoked") {
+    registeredManualVerificationTrust.set(key, {
+      status: result.status,
+      requestDigest: result.requestDigest
+    });
+  } else {
+    registeredManualVerificationTrust.delete(key);
+  }
+}
+
+/** 测试和新项目切换时清空运行时缓存；不会影响 native 安装级注册表。 */
+export function clearRegisteredManualMediaTimeMapVerificationTrust(): void {
+  registeredManualVerificationTrust.clear();
+}
+
+export function createManualMediaTimeMapVerificationRevocationRequest(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationRevocationInput
+): ManualMediaTimeMapVerificationRevocationRequest {
+  const record = requireSignedManualVerificationRecord(map);
+  if (record.revocation) {
+    throw new Error("该人工验证已经撤销，不能重复撤销。");
+  }
+  validateRevocationInput(input);
+  return {
+    verificationId: record.verificationId,
+    issuerKeyId: record.issuerKeyId,
+    signature: record.signature,
+    requestDigest: record.requestDigest,
+    ...input
+  };
+}
+
+/** 应用 native 已原子登记的撤销回执；项目内回执只用于审计，信任以 native 注册表为准。 */
+export function applyAuthorityRevokedManualMediaTimeMapVerification(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationRevocationInput,
+  seal: ManualMediaTimeMapVerificationRevocationSeal
+): MediaTimeMap {
+  const record = requireSignedManualVerificationRecord(map);
+  validateRevocationInput(input);
+  if (
+    seal.verificationId !== record.verificationId ||
+    seal.issuerKeyId !== record.issuerKeyId
+  ) {
+    throw new Error("撤销回执没有绑定当前人工验证凭据。");
+  }
+  assertPositiveSafeInteger("issuerSequence", seal.issuerSequence);
+  if (seal.issuerSequence <= record.issuerSequence) {
+    throw new Error("撤销回执序号必须晚于原签发事件。");
+  }
+  if (seal.signatureAlgorithm !== "hmac-sha256-v1") {
+    throw new Error("撤销回执使用了不受支持的签名算法。");
+  }
+  assertHexDigest("signature", seal.signature, 64);
+  const revocation: MediaTimeMapVerificationRevocation = {
+    recordVersion: 1,
+    verificationId: record.verificationId,
+    issuerKeyId: record.issuerKeyId,
+    issuerSequence: seal.issuerSequence,
+    signatureAlgorithm: seal.signatureAlgorithm,
+    signature: seal.signature,
+    ...input
+  };
+  registerManualMediaTimeMapVerificationAuthorityResult({
+    verificationId: record.verificationId,
+    issuerKeyId: record.issuerKeyId,
+    signature: record.signature,
+    requestDigest: record.requestDigest,
+    status: "revoked",
+    reason: input.reason
+  });
+  return reconcileMediaTimeMapQuality({
+    ...map,
+    verification: { ...record, revocation },
+    quality: { ...map.quality, level: "verified" }
+  });
+}
+
+function assertManualVerificationEligible(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationInput
+): void {
   if (map.state !== "confirmed") {
     throw new Error("只能人工验证 state=confirmed 的正式时间图。");
   }
@@ -278,33 +557,147 @@ export function applyManualMediaTimeMapVerification(
       throw new Error(`人工验证字段 ${label} 不能为空。`);
     }
   }
-  const declaredVerified: MediaTimeMap = {
-    ...map,
-    quality: { ...map.quality, level: "verified" },
-    verification: null
-  };
+  if (!isIsoTimestamp(input.verifiedAt)) {
+    throw new Error("人工验证字段 verifiedAt 必须是规范 ISO 时间戳。");
+  }
+  map.spans.forEach((span, spanIndex) => {
+    if (span.kind === "ambiguous") {
+      throw new Error(`时间图第 ${spanIndex + 1} 段仍为 ambiguous，不能签发人工验证。`);
+    }
+    if (span.kind === "matched") {
+      if (!readTimeMapSpanPlaybackReview(map, spanIndex)) {
+        throw new Error(
+          `时间图第 ${spanIndex + 1} 段缺少与当前边界一致的真实 A/B 播放复核证据。`
+        );
+      }
+      return;
+    }
+    const review = readTimeMapSpanReviewDecision(map, spanIndex);
+    const expectedDecision = span.kind === "sourceOnly" ? "source-extra" : "target-extra";
+    if (review?.decision !== expectedDecision) {
+      throw new Error(
+        `时间图第 ${spanIndex + 1} 段必须先人工分类为“${expectedDecision}”，不能凭自动结果签发。`
+      );
+    }
+    if (!readTimeMapSpanPlaybackReview(map, spanIndex)) {
+      throw new Error(
+        `时间图第 ${spanIndex + 1} 段缺少与当前边界一致的真实 A/B 播放复核证据。`
+      );
+    }
+  });
+  createDeclaredVerifiedMap(map);
+}
+
+function createDeclaredVerifiedMap(map: MediaTimeMap): MediaTimeMap {
   const central = reconcileTimeMapQualityClaim(
     "verified",
-    declaredVerified.quality.reasons,
-    toTimeMapQualityInput(declaredVerified)
+    canonicalSignedQualityReasons(map.quality.reasons),
+    toTimeMapQualityInput(map)
   );
   if (central.assessment.level !== "verified") {
     throw new Error("时间图的实测指标与独立证据尚未达到中央 verified 门槛。");
   }
-  const record: MediaTimeMapVerificationRecord = {
-    recordVersion: 1,
-    method: "manual-review",
-    mapCoreDigest: computeMediaTimeMapCoreDigest(declaredVerified),
-    mapRevision: declaredVerified.revision,
-    sourceIdentity: cloneRequiredIdentity(sourceIdentity),
-    targetIdentity: cloneRequiredIdentity(targetIdentity),
-    calibrationArtifactId: input.calibrationArtifactId,
-    calibrationArtifactVersion: input.calibrationArtifactVersion,
-    verifier: input.verifier,
-    verifiedAt: input.verifiedAt
+  return {
+    ...map,
+    quality: { ...map.quality, level: "verified", reasons: [...central.reasons] },
+    verification: null
   };
-  domainIssuedManualVerificationRecords.add(record);
-  return reconcileMediaTimeMapQuality({ ...declaredVerified, verification: record });
+}
+
+function createManualVerificationRequestWithoutEligibilityCheck(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationInput
+): ManualMediaTimeMapVerificationRequest {
+  const normalizedMap = createDeclaredVerifiedMap(map);
+  const reviewEvidenceDigest = computeManualReviewEvidenceDigest(normalizedMap, input);
+  const payload = JSON.stringify([
+    "manual-time-map-verification-request-v1",
+    "manual-review",
+    normalizedMap.id,
+    normalizedMap.revision,
+    computeMediaTimeMapCoreDigest(normalizedMap),
+    canonicalContentIdentity(normalizedMap.sourceIdentity),
+    canonicalContentIdentity(normalizedMap.targetIdentity),
+    input.calibrationArtifactId,
+    input.calibrationArtifactVersion,
+    reviewEvidenceDigest,
+    input.verifier,
+    input.verifiedAt
+  ]);
+  return {
+    payload,
+    requestDigest: `sha256:${sha256Hex(payload)}`,
+    reviewEvidenceDigest
+  };
+}
+
+function assertManualVerificationSeal(
+  seal: ManualMediaTimeMapVerificationSeal,
+  expectedRequestDigest: string
+): void {
+  assertNonEmptyAuthorityField("verificationId", seal.verificationId);
+  assertNonEmptyAuthorityField("issuerKeyId", seal.issuerKeyId);
+  assertPositiveSafeInteger("issuerSequence", seal.issuerSequence);
+  if (seal.signatureAlgorithm !== "hmac-sha256-v1") {
+    throw new Error("人工验证签发结果使用了不受支持的签名算法。");
+  }
+  assertHexDigest("signature", seal.signature, 64);
+  if (seal.requestDigest !== expectedRequestDigest) {
+    throw new Error("人工验证签发结果没有回显当前规范化请求摘要。");
+  }
+}
+
+function requireSignedManualVerificationRecord(
+  map: MediaTimeMap
+): SignedManualMediaTimeMapVerificationRecord {
+  const record = map.verification;
+  if (!record || record.recordVersion !== 2 || record.method !== "manual-review") {
+    throw new Error("当前时间图没有可撤销的签名人工验证凭据。");
+  }
+  return record;
+}
+
+function validateRevocationInput(input: ManualMediaTimeMapVerificationRevocationInput): void {
+  for (const [label, value] of [
+    ["reason", input.reason],
+    ["revokedBy", input.revokedBy],
+    ["revokedAt", input.revokedAt]
+  ] as const) {
+    assertNonEmptyAuthorityField(label, value);
+  }
+}
+
+function createManualVerificationTrustKey(
+  value: Pick<
+    SignedManualMediaTimeMapVerificationRecord,
+    "verificationId" | "issuerKeyId" | "signature"
+  >
+): string {
+  return `${value.issuerKeyId}\u0000${value.verificationId}\u0000${value.signature}`;
+}
+
+function assertNonEmptyAuthorityField(label: string, value: string): void {
+  if (value.trim().length === 0 || value.length > 512) {
+    throw new Error(`人工验证字段 ${label} 必须是 1 到 512 个字符。`);
+  }
+}
+
+function assertSha256Digest(label: string, value: string): void {
+  if (!/^sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`人工验证字段 ${label} 必须是规范 SHA-256 摘要。`);
+  }
+}
+
+function assertHexDigest(label: string, value: string, length: number): void {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(value)) {
+    throw new Error(`人工验证字段 ${label} 必须是 ${length} 位小写十六进制。`);
+  }
+}
+
+function assertPositiveSafeInteger(label: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`人工验证字段 ${label} 必须是正整数。`);
+  }
 }
 
 /** 对持久化或外部输入的质量声明执行中央重算，且绝不自动提高声明等级。 */
@@ -315,9 +708,8 @@ export function reconcileMediaTimeMapQuality(map: MediaTimeMap): MediaTimeMap {
     toTimeMapQualityInput(map)
   );
   const missingIdentity = map.sourceIdentity === null || map.targetIdentity === null;
-  let level = reconciliation.level === "verified" && missingIdentity
-    ? "blocked"
-    : reconciliation.level;
+  let level =
+    reconciliation.level === "verified" && missingIdentity ? "blocked" : reconciliation.level;
   const reasons = [...reconciliation.reasons];
   if (level === "blocked" && reconciliation.level === "verified" && missingIdentity) {
     reasons.push("时间图缺少源文件或目标文件的内容身份快照，不能确认它仍对应当前媒体文件。");
@@ -384,7 +776,9 @@ function toTimeMapQualityInput(map: MediaTimeMap): TimeMapQualityInput {
   };
 }
 
-function canonicalStreamIdentity(stream: MediaTimeMap["sourceStream"]): readonly unknown[] | null {
+function canonicalStreamIdentity(
+  stream: MediaTimeMap["sourceStream"]
+): readonly unknown[] | null {
   return stream
     ? [
         stream.type,
@@ -402,7 +796,9 @@ function canonicalStreamIdentity(stream: MediaTimeMap["sourceStream"]): readonly
     : null;
 }
 
-function canonicalContentIdentity(identity: MediaContentIdentity | null): readonly unknown[] | null {
+function canonicalContentIdentity(
+  identity: MediaContentIdentity | null
+): readonly unknown[] | null {
   return identity
     ? [
         identity.algorithm,
@@ -426,7 +822,8 @@ function canonicalQualityMetrics(quality: MediaTimeMapQuality): readonly unknown
     quality.boundaryUncertaintyMs,
     quality.alternativeMargin,
     quality.anchorCount,
-    quality.heldOutAnchorCount
+    quality.heldOutAnchorCount,
+    canonicalSignedQualityReasons(quality.reasons)
   ];
 }
 
@@ -435,17 +832,87 @@ function canonicalEvidence(evidence: CompactMediaTimeMapEvidence): readonly unkn
     [...evidence.types].sort(),
     evidence.audioAnchorCount,
     evidence.visualAnchorCount,
-    evidence.heldOutAnchorCount
+    evidence.heldOutAnchorCount,
+    [...new Set(evidence.notes.map((note) => note.trim()).filter(Boolean))].sort()
   ];
 }
 
-function fnv1a64(value: string): string {
-  let hash = 0xcbf29ce484222325n;
-  for (const byte of new TextEncoder().encode(value)) {
-    hash ^= BigInt(byte);
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-  }
-  return hash.toString(16).padStart(16, "0");
+function computeManualReviewEvidenceDigest(
+  map: MediaTimeMap,
+  input: ManualMediaTimeMapVerificationInput
+): string {
+  const decisions = map.spans.flatMap((span, spanIndex) => {
+    if (span.kind === "matched") {
+      return [];
+    }
+    const review = readTimeMapSpanReviewDecision(map, spanIndex);
+    return [
+      [
+        spanIndex,
+        span.kind,
+        span.sourceStartMs,
+        span.sourceEndMs,
+        span.targetStartMs,
+        span.targetEndMs,
+        review?.decision ?? null,
+        review?.reviewedAt ?? null
+      ]
+    ];
+  });
+  const playbackReviews = map.spans.map((_, spanIndex) => {
+    const review = readTimeMapSpanPlaybackReview(map, spanIndex);
+    return [
+      spanIndex,
+      review?.spanDigest ?? null,
+      review?.spanAxes ?? null,
+      review?.startBoundaryAxes ?? null,
+      review?.endBoundaryAxes ?? null,
+      review?.reviewedAt ?? null
+    ];
+  });
+  const canonical = JSON.stringify([
+    "manual-time-map-review-evidence-v2",
+    map.id,
+    map.revision,
+    input.verifier,
+    input.verifiedAt,
+    decisions,
+    playbackReviews
+  ]);
+  return `sha256:${sha256Hex(canonical)}`;
+}
+
+function canonicalSignedQualityReasons(reasons: readonly string[]): string[] {
+  return [
+    ...new Set(
+      reasons
+        .map((reason) => reason.trim())
+        .filter((reason) => reason.length > 0 && !isRuntimeVerificationReason(reason))
+    )
+  ].sort();
+}
+
+function isRuntimeVerificationReason(reason: string): boolean {
+  return (
+    reason === VERIFICATION_RECORD_REQUIRED_REASON ||
+    reason === LEGACY_MANUAL_RECORD_REASON ||
+    reason === PERSISTED_MANUAL_RECORD_UNCHECKED_REASON ||
+    reason.startsWith("验证记录只能绑定") ||
+    reason.startsWith("验证记录绑定的 revision") ||
+    reason.startsWith("验证记录绑定的源/目标媒体身份") ||
+    reason.startsWith("验证记录的核心摘要") ||
+    reason.startsWith("自动验证所声明的 calibration artifact") ||
+    reason.startsWith("人工验证已于 ") ||
+    reason.startsWith("人工验证签名请求摘要") ||
+    reason.startsWith("本机验证机构返回的签发请求摘要") ||
+    reason.startsWith("本机撤销注册表") ||
+    reason.startsWith("当前时间图已不满足签发门槛")
+  );
+}
+
+function isIsoTimestamp(value: string): boolean {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
 function cloneRequiredIdentity(identity: MediaContentIdentity): MediaContentIdentity {
@@ -453,7 +920,9 @@ function cloneRequiredIdentity(identity: MediaContentIdentity): MediaContentIden
 }
 
 function uniqueReasons(reasons: readonly string[]): string[] {
-  return [...new Set(reasons.map((reason) => reason.trim()).filter((reason) => reason.length > 0))];
+  return [
+    ...new Set(reasons.map((reason) => reason.trim()).filter((reason) => reason.length > 0))
+  ];
 }
 
 export function supersedeMediaTimeMap(map: MediaTimeMap, timestamp: string): MediaTimeMap {

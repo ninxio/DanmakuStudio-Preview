@@ -1,20 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
-  applyManualMediaTimeMapVerification,
+  applyAuthorityIssuedManualMediaTimeMapVerification,
   assessMediaTimeMapVerification,
+  clearRegisteredManualMediaTimeMapVerificationTrust,
   computeMediaTimeMapCoreDigest,
   confirmCandidateTimeMap,
   createCandidateTimeMapId,
   createConfirmedTimeMapId,
   createLegacyMediaTimeMap,
+  createManualMediaTimeMapVerificationRequest,
   reconcileMediaTimeMapQuality,
+  registerManualMediaTimeMapVerificationAuthorityResult,
   supersedeMediaTimeMap
 } from "./mediaTimeMap";
 import type { MediaContentIdentity, MediaTimeMap } from "../project/types";
+import { createTimeMapSpanPlaybackReviewToken } from "./timeMapPlaybackReviewEvidence";
 
 const TIMESTAMP = "2026-07-12T00:00:00.000Z";
 
 describe("媒体时间图 revision", () => {
+  beforeEach(() => clearRegisteredManualMediaTimeMapVerificationTrust());
   it("旧正 gap 只迁移为 legacy-unverified candidate", () => {
     const map = createLegacyMediaTimeMap({
       id: createCandidateTimeMapId("candidate-1"),
@@ -140,6 +145,12 @@ describe("媒体时间图 revision", () => {
       },
       (candidate) => {
         candidate.parametersHash = "changed";
+      },
+      (candidate) => {
+        candidate.quality.reasons.push("被篡改的质量理由");
+      },
+      (candidate) => {
+        candidate.evidence.notes.push("被篡改的人工审计备注");
       }
     ];
 
@@ -150,21 +161,37 @@ describe("媒体时间图 revision", () => {
     }
   });
 
-  it("人工 record 只有明确领域签发的对象可信，JSON 往返不能冒充 trusted", () => {
-    const verified = applyManualMediaTimeMapVerification(createVerificationEligibleMap(), {
-      calibrationArtifactId: "manual-review-protocol",
-      calibrationArtifactVersion: "1",
-      verifier: "reviewer-1",
-      verifiedAt: TIMESTAMP
-    });
+  it("签名人工 record 按值跨 structuredClone 可信，应用重启前必须重新核验注册表", () => {
+    const verified = createSignedVerification();
 
     expect(verified.quality.level).toBe("verified");
     expect(assessMediaTimeMapVerification(verified)).toEqual({ trusted: true, reason: null });
+    expect(assessMediaTimeMapVerification(structuredClone(verified))).toEqual({
+      trusted: true,
+      reason: null
+    });
 
     const importedJson = JSON.parse(JSON.stringify(verified)) as MediaTimeMap;
+    clearRegisteredManualMediaTimeMapVerificationTrust();
     const reopened = reconcileMediaTimeMapQuality(importedJson);
     expect(reopened.quality.level).toBe("review");
-    expect(reopened.quality.reasons.join(" ")).toContain("导入 JSON 不能自动取得可信状态");
+    expect(reopened.quality.reasons.join(" ")).toContain("安装级验证机构");
+
+    const record = verified.verification;
+    if (!record || record.recordVersion !== 2) throw new Error("测试签名记录缺失");
+    registerManualMediaTimeMapVerificationAuthorityResult({
+      verificationId: record.verificationId,
+      issuerKeyId: record.issuerKeyId,
+      signature: record.signature,
+      requestDigest: record.requestDigest,
+      status: "active",
+      reason: "测试 native 复核"
+    });
+    const restored = reconcileMediaTimeMapQuality({
+      ...reopened,
+      quality: { ...reopened.quality, level: "verified" }
+    });
+    expect(restored.quality.level).toBe("verified");
   });
 
   it("自动 record 即使摘要正确，calibration artifact 不在内置白名单也不能 verified", () => {
@@ -189,12 +216,7 @@ describe("媒体时间图 revision", () => {
   });
 
   it("record 与 revision、身份或核心摘要任一不匹配时都会失去 verified", () => {
-    const verified = applyManualMediaTimeMapVerification(createVerificationEligibleMap(), {
-      calibrationArtifactId: "manual-review-protocol",
-      calibrationArtifactVersion: "1",
-      verifier: "reviewer-1",
-      verifiedAt: TIMESTAMP
-    });
+    const verified = createSignedVerification();
     const cases: Array<[string, (candidate: MediaTimeMap) => void]> = [
       ["revision", (candidate) => candidate.revision++],
       ["媒体身份", (candidate) => (candidate.sourceIdentity!.sizeBytes += 1)],
@@ -210,11 +232,102 @@ describe("媒体时间图 revision", () => {
       expect(reconciled.quality.reasons.join(" ")).toContain(reasonFragment);
     }
   });
+
+  it("拒绝 ambiguous 与没有逐段人工分类的单侧差异，分类 note 会进入签名摘要", () => {
+    const ambiguous = createVerificationEligibleMap();
+    ambiguous.spans = [
+      {
+        kind: "ambiguous",
+        sourceStartMs: 0,
+        sourceEndMs: 60_000,
+        targetStartMs: 0,
+        targetEndMs: 60_000
+      }
+    ];
+    expect(() =>
+      createManualMediaTimeMapVerificationRequest(ambiguous, verificationInput())
+    ).toThrow("ambiguous");
+
+    const oneSided = createVerificationEligibleMap();
+    oneSided.targetEndMs = 55_000;
+    oneSided.spans = [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 20_000,
+        targetStartMs: 0,
+        targetEndMs: 20_000
+      },
+      {
+        kind: "sourceOnly",
+        sourceStartMs: 20_000,
+        sourceEndMs: 25_000,
+        targetStartMs: 20_000,
+        targetEndMs: 20_000
+      },
+      {
+        kind: "matched",
+        sourceStartMs: 25_000,
+        sourceEndMs: 60_000,
+        targetStartMs: 20_000,
+        targetEndMs: 55_000
+      }
+    ];
+    attachTestPlaybackReviews(oneSided);
+    expect(() =>
+      createManualMediaTimeMapVerificationRequest(oneSided, verificationInput())
+    ).toThrow("source-extra");
+
+    oneSided.evidence.notes.push(`manual-span-review:v1:1:source-extra:${TIMESTAMP}`);
+    const request = createManualMediaTimeMapVerificationRequest(oneSided, verificationInput());
+    expect(request.reviewEvidenceDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const changed = structuredClone(oneSided);
+    changed.evidence.notes[changed.evidence.notes.length - 1] =
+      `manual-span-review:v1:1:source-extra:2026-07-12T00:00:01.000Z`;
+    expect(
+      createManualMediaTimeMapVerificationRequest(changed, verificationInput()).requestDigest
+    ).not.toBe(request.requestDigest);
+  });
 });
+
+function createSignedVerification(): MediaTimeMap {
+  return applyAuthorityIssuedManualMediaTimeMapVerification(
+    createVerificationEligibleMap(),
+    {
+      calibrationArtifactId: "manual-review-protocol",
+      calibrationArtifactVersion: "1",
+      verifier: "reviewer-1",
+      verifiedAt: TIMESTAMP
+    },
+    {
+      verificationId: "verification-1",
+      issuerKeyId: "install-key-1",
+      issuerSequence: 1,
+      signatureAlgorithm: "hmac-sha256-v1",
+      signature: "1".repeat(64),
+      requestDigest: createRequestDigest()
+    }
+  );
+}
+
+function verificationInput() {
+  return {
+    calibrationArtifactId: "manual-review-protocol",
+    calibrationArtifactVersion: "1",
+    verifier: "reviewer-1",
+    verifiedAt: TIMESTAMP
+  };
+}
+
+function createRequestDigest(): string {
+  const map = createVerificationEligibleMap();
+  const input = verificationInput();
+  return createManualMediaTimeMapVerificationRequest(map, input).requestDigest;
+}
 
 function createVerificationEligibleMap(): MediaTimeMap {
   const identity = createIdentity("1");
-  return {
+  return attachTestPlaybackReviews({
     id: "verified-map-1",
     revision: 1,
     sourceMediaId: "source-1",
@@ -265,7 +378,33 @@ function createVerificationEligibleMap(): MediaTimeMap {
     createdAt: TIMESTAMP,
     updatedAt: TIMESTAMP,
     confirmedAt: TIMESTAMP
-  };
+  });
+}
+
+function attachTestPlaybackReviews(map: MediaTimeMap): MediaTimeMap {
+  map.evidence.notes = map.evidence.notes.filter(
+    (note) => !note.startsWith("manual-playback-review:v1:")
+  );
+  map.evidence.notes.push(
+    ...map.spans.map((span, spanIndex) =>
+      createTimeMapSpanPlaybackReviewToken(
+        map,
+        spanIndex,
+        {
+          spanAxes:
+            span.kind === "sourceOnly"
+              ? ["source"]
+              : span.kind === "targetOnly"
+                ? ["target"]
+                : ["source", "target"],
+          startBoundaryAxes: span.kind === "matched" ? [] : ["source", "target"],
+          endBoundaryAxes: span.kind === "matched" ? [] : ["source", "target"]
+        },
+        TIMESTAMP
+      )
+    )
+  );
+  return map;
 }
 
 function createIdentity(digit: string): MediaContentIdentity {

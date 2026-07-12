@@ -18,10 +18,21 @@ import {
 } from "../../domain/alignment/globalAssignment";
 import { createMediaMatchCandidate } from "../../domain/alignment/mediaMatching";
 import {
+  assessManualMediaTimeMapVerificationEligibility,
+  assessMediaTimeMapVerification
+} from "../../domain/alignment/mediaTimeMap";
+import {
   validateTimeMap,
   type TimeMapSpan,
   type TimeMapSpanKind
 } from "../../domain/alignment/timeMap";
+import {
+  describeTimeMapSpanReviewAvailability,
+  readTimeMapSpanReviewDecision,
+  TIME_MAP_SPAN_REVIEW_LABELS,
+  type TimeMapSpanReviewDecision
+} from "../../domain/alignment/timeMapReviewDecision";
+import { readTimeMapSpanPlaybackReview } from "../../domain/alignment/timeMapPlaybackReviewEvidence";
 import type { SuspectedCutCandidate } from "../../domain/danmaku/cutHints";
 import { createId } from "../../domain/project/factory";
 import { findProjectMedia } from "../../domain/project/mediaLibrary";
@@ -43,7 +54,12 @@ import {
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
+import { isManualVerificationAuthorityAvailable } from "../../infrastructure/media/manualVerificationAuthority";
 import { useEditorStore } from "../../stores/editorStore";
+import {
+  TimeMapPlaybackReview,
+  type TimeMapPlaybackAdapterFactory
+} from "./TimeMapPlaybackReview";
 
 type BatchTaskState = "waiting" | "running" | "found" | "notFound" | "failed" | "cancelled";
 
@@ -83,10 +99,12 @@ interface GlobalBatchResolution {
 
 export function MediaMatchingPanel({
   project,
-  suspectedCutCandidates
+  suspectedCutCandidates,
+  playbackAdapterFactory
 }: {
   project: EditorProject;
   suspectedCutCandidates: SuspectedCutCandidate[];
+  playbackAdapterFactory?: TimeMapPlaybackAdapterFactory;
 }) {
   const sourceMedia = useMemo(
     () => project.mediaLibrary.filter((media) => media.role === "bilibiliReference"),
@@ -103,6 +121,9 @@ export function MediaMatchingPanel({
   const [candidateAssetSelections, setCandidateAssetSelections] = useState<
     Record<string, CandidateAssetSelection>
   >({});
+  const [activePlaybackCandidateId, setActivePlaybackCandidateId] = useState<string | null>(
+    null
+  );
   const activeJobRef = useRef<{ runToken: number; jobId: string } | null>(null);
   const cancelRequestedRef = useRef(false);
   const initializedProjectIdRef = useRef<string | null>(null);
@@ -132,6 +153,7 @@ export function MediaMatchingPanel({
     initializedProjectIdRef.current = project.id;
     sourceSelectionTouchedRef.current = false;
     targetSelectionTouchedRef.current = false;
+    setActivePlaybackCandidateId(null);
     setSelectedSourceIds(sourceMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setSelectedTargetIds(targetMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setTasks([]);
@@ -160,6 +182,17 @@ export function MediaMatchingPanel({
   }, [project]);
 
   useEffect(() => {
+    if (
+      activePlaybackCandidateId &&
+      !project.mediaMatchCandidates.some(
+        (candidate) => candidate.id === activePlaybackCandidateId
+      )
+    ) {
+      setActivePlaybackCandidateId(null);
+    }
+  }, [activePlaybackCandidateId, project.mediaMatchCandidates]);
+
+  useEffect(() => {
     if (projectEpochRef.current === projectEpoch) {
       return;
     }
@@ -173,6 +206,7 @@ export function MediaMatchingPanel({
     }
     sourceSelectionTouchedRef.current = false;
     targetSelectionTouchedRef.current = false;
+    setActivePlaybackCandidateId(null);
     setSelectedSourceIds(sourceMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setSelectedTargetIds(targetMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setRunning(false);
@@ -591,6 +625,11 @@ export function MediaMatchingPanel({
                 onSelectedAssetIdsChange={(assetIds) =>
                   updateCandidateAssetSelection(candidate.id, assetIds)
                 }
+                playbackOpen={activePlaybackCandidateId === candidate.id}
+                onPlaybackOpenChange={(open) =>
+                  setActivePlaybackCandidateId(open ? candidate.id : null)
+                }
+                playbackAdapterFactory={playbackAdapterFactory}
               />
             ))}
         </div>
@@ -919,12 +958,18 @@ function MediaMatchCandidateCard({
   candidate,
   project,
   selectedAssetIds,
-  onSelectedAssetIdsChange
+  onSelectedAssetIdsChange,
+  playbackOpen,
+  onPlaybackOpenChange,
+  playbackAdapterFactory
 }: {
   candidate: MediaMatchCandidate;
   project: EditorProject;
   selectedAssetIds: string[];
   onSelectedAssetIdsChange: (assetIds: string[]) => void;
+  playbackOpen: boolean;
+  onPlaybackOpenChange: (open: boolean) => void;
+  playbackAdapterFactory?: TimeMapPlaybackAdapterFactory;
 }) {
   const source = findProjectMedia(project, candidate.sourceMediaId);
   const target = findProjectMedia(project, candidate.targetMediaId);
@@ -1069,6 +1114,11 @@ function MediaMatchCandidateCard({
       <TimeMapReview
         timeMap={displayedTimeMap}
         relationState={candidate.state === "accepted" ? "accepted" : "candidate"}
+        sourceMedia={source}
+        targetMedia={target}
+        playbackOpen={playbackOpen}
+        onPlaybackOpenChange={onPlaybackOpenChange}
+        playbackAdapterFactory={playbackAdapterFactory}
       />
 
       {candidate.state === "pending" || candidate.state === "blocked" ? (
@@ -1130,12 +1180,17 @@ function MediaMatchCandidateCard({
       ) : null}
 
       {candidate.state === "accepted" ? (
-        <div className="mt-3 flex justify-end">
-          <TextButton onClick={() => revokeAcceptance(candidate.id)}>
-            <RotateCcw size={13} />
-            撤销确认并删除来源段
-          </TextButton>
-        </div>
+        <>
+          {confirmedTimeMap ? (
+            <ManualTimeMapVerificationControls timeMap={confirmedTimeMap} />
+          ) : null}
+          <div className="mt-3 flex justify-end">
+            <TextButton onClick={() => void revokeAcceptance(candidate.id)}>
+              <RotateCcw size={13} />
+              撤销确认并删除来源段
+            </TextButton>
+          </div>
+        </>
       ) : null}
 
       <details className="mt-3 rounded border border-panel-line/70 bg-black/10 p-2 text-[11px] text-slate-500">
@@ -1152,6 +1207,133 @@ function MediaMatchCandidateCard({
         </div>
       </details>
     </article>
+  );
+}
+
+const MANUAL_VERIFICATION_ARTIFACT_ID = "manual-a-b-review";
+const MANUAL_VERIFICATION_ARTIFACT_VERSION = "1";
+const MANUAL_VERIFIER = "本机用户";
+
+function ManualTimeMapVerificationControls({ timeMap }: { timeMap: MediaTimeMap }) {
+  const issueManualVerification = useEditorStore(
+    (state) => state.issueManualMediaTimeMapVerification
+  );
+  const revokeManualVerification = useEditorStore(
+    (state) => state.revokeManualMediaTimeMapVerification
+  );
+  const [busy, setBusy] = useState(false);
+  const persistedRecord =
+    timeMap.verification?.recordVersion === 2 && timeMap.verification.revocation === null
+      ? timeMap.verification
+      : null;
+  const verificationAssessment = assessMediaTimeMapVerification(timeMap);
+  const trustedRecord =
+    persistedRecord && verificationAssessment.trusted ? persistedRecord : null;
+  const desktopAvailable = isManualVerificationAuthorityAvailable();
+  const preflightInput = {
+    calibrationArtifactId: MANUAL_VERIFICATION_ARTIFACT_ID,
+    calibrationArtifactVersion: MANUAL_VERIFICATION_ARTIFACT_VERSION,
+    verifier: MANUAL_VERIFIER,
+    verifiedAt: new Date().toISOString()
+  };
+  const eligibility = assessManualMediaTimeMapVerificationEligibility(timeMap, preflightInput);
+  const disabledReason = !desktopAvailable
+    ? "安装级人工验证只在 Tauri 桌面端可用；浏览器预览不能签发或撤销凭据。"
+    : eligibility.reason;
+
+  const issue = async () => {
+    if (!desktopAvailable || !eligibility.eligible || busy) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await issueManualVerification(timeMap.id, {
+        ...preflightInput,
+        verifiedAt: new Date().toISOString()
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revoke = async () => {
+    if (!desktopAvailable || !trustedRecord || busy) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await revokeManualVerification(timeMap.id, {
+        reason: "用户在匹配页撤销了人工 A/B 复核验证。",
+        revokedBy: MANUAL_VERIFIER,
+        revokedAt: new Date().toISOString()
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section
+      className="mt-3 rounded border border-emerald-400/25 bg-emerald-400/5 p-2.5 text-[11px]"
+      data-testid="manual-time-map-verification"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-medium text-slate-200">整图人工验证</span>
+        {trustedRecord ? (
+          <span className="rounded border border-emerald-400/40 bg-emerald-400/10 px-2 py-0.5 text-emerald-100">
+            本机签名已验证
+          </span>
+        ) : persistedRecord ? (
+          <span className="rounded border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-amber-100">
+            签名记录未在本机受信
+          </span>
+        ) : null}
+        {trustedRecord ? (
+          <TextButton
+            className="ml-auto"
+            tone="danger"
+            disabled={!desktopAvailable || busy}
+            onClick={() => void revoke()}
+          >
+            撤销人工验证
+          </TextButton>
+        ) : (
+          <TextButton
+            className="ml-auto"
+            tone="primary"
+            disabled={!desktopAvailable || !eligibility.eligible || busy}
+            onClick={() => void issue()}
+          >
+            完成复核并签发
+          </TextButton>
+        )}
+      </div>
+      <p className="mt-1.5 leading-5 text-slate-400">
+        只有明确点击后，应用才会把分段人工分类、当前 revision
+        与媒体身份交给本机安装级验证机构签名；自动匹配和保存关系都不会触发签发。
+      </p>
+      {trustedRecord ? (
+        <p className="mt-1 leading-5 text-slate-500">
+          签发人：{trustedRecord.verifier} · 时间：
+          {new Date(trustedRecord.verifiedAt).toLocaleString("zh-CN")} · 凭据：
+          {trustedRecord.verificationId}
+        </p>
+      ) : persistedRecord ? (
+        <p className="mt-1 leading-5 text-amber-200" role="status">
+          当前签名不能作为导出依据：
+          {verificationAssessment.reason ?? "本机验证机构尚未确认该签名。"}
+          {eligibility.eligible ? " 可在完整复核后重新签发。" : ` ${eligibility.reason ?? ""}`}
+        </p>
+      ) : disabledReason ? (
+        <p className="mt-1 leading-5 text-amber-200" role="status">
+          当前不能签发：{disabledReason}
+        </p>
+      ) : (
+        <p className="mt-1 leading-5 text-emerald-100">
+          已通过签发预检；请确认已完成所有 A/B 试听，再点击签发。
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -1274,18 +1456,45 @@ interface TimeMapReviewValidation {
 }
 
 /**
- * 匹配页只负责解释和定位时间图，不在这里签发人工验证，也不伪装成 A/B 播放器。
+ * 匹配页用真实媒体完成 A/B 切换、区间循环和差异分类，但不会因此自动签发整图验证。
  * 两条轨道分别按自己的完整范围归一化，因此同一屏幕宽度不代表双方真实时长相同。
  */
 function TimeMapReview({
   timeMap,
-  relationState
+  relationState,
+  sourceMedia,
+  targetMedia,
+  playbackOpen,
+  onPlaybackOpenChange,
+  playbackAdapterFactory
 }: {
   timeMap: MediaTimeMap | undefined;
   relationState: "candidate" | "accepted";
+  sourceMedia: ProjectMediaReference | null | undefined;
+  targetMedia: ProjectMediaReference | null | undefined;
+  playbackOpen: boolean;
+  onPlaybackOpenChange: (open: boolean) => void;
+  playbackAdapterFactory?: TimeMapPlaybackAdapterFactory;
 }) {
   const setPlayhead = useEditorStore((state) => state.setPlayhead);
   const setPlaying = useEditorStore((state) => state.setPlaying);
+  const reviewCandidateTimeMapSpan = useEditorStore(
+    (state) => state.reviewCandidateTimeMapSpan
+  );
+  const [selectedSpanIndex, setSelectedSpanIndex] = useState(0);
+  const onPlaybackOpenChangeRef = useRef(onPlaybackOpenChange);
+
+  useEffect(() => {
+    onPlaybackOpenChangeRef.current = onPlaybackOpenChange;
+  }, [onPlaybackOpenChange]);
+
+  useEffect(() => {
+    setSelectedSpanIndex(0);
+  }, [timeMap?.id]);
+
+  useEffect(() => {
+    onPlaybackOpenChangeRef.current(false);
+  }, [timeMap?.id, timeMap?.revision]);
 
   if (!timeMap) {
     return (
@@ -1321,6 +1530,8 @@ function TimeMapReview({
   }
 
   const spanCounts = countTimeMapSpans(timeMap.spans);
+  const safeSelectedSpanIndex = Math.min(selectedSpanIndex, timeMap.spans.length - 1);
+  const selectedSpan = timeMap.spans[safeSelectedSpanIndex];
   const blockingReason =
     timeMap.quality.level === "blocked" ||
     timeMap.spans.some((span) => span.kind === "ambiguous")
@@ -1329,19 +1540,20 @@ function TimeMapReview({
       : null;
 
   const locateSpan = (span: TimeMapSpan, spanIndex: number) => {
+    setSelectedSpanIndex(spanIndex);
     setPlaying(false);
     setPlayhead(span.sourceStartMs);
     const positionedMs = useEditorStore.getState().project.timeline.playheadMs;
     const label = TIME_MAP_SPAN_LABELS[span.kind];
     if (positionedMs !== span.sourceStartMs) {
       setEditorStatus(
-        `当前编辑时间轴只能定位到参考 ${formatTimecode(positionedMs)}；第 ${spanIndex + 1} 段“${label}”起点为 ${formatTimecode(span.sourceStartMs)}。仅完成时间定位，未执行 A/B 播放。`,
+        `当前编辑时间轴只能定位到参考 ${formatTimecode(positionedMs)}；第 ${spanIndex + 1} 段“${label}”起点为 ${formatTimecode(span.sourceStartMs)}。已选择 A/B 复核区间，尚未开始播放。`,
         "warning"
       );
       return;
     }
     setEditorStatus(
-      `已将编辑页时间指针定位到参考 ${formatTimecode(span.sourceStartMs)}（第 ${spanIndex + 1} 段“${label}”起点）。仅完成时间定位，未执行 A/B 播放。`,
+      `已选择第 ${spanIndex + 1} 段“${label}”作为 A/B 复核区间，并将编辑页指针定位到参考 ${formatTimecode(span.sourceStartMs)}；点击“打开 A/B 复核”后播放。`,
       "neutral"
     );
   };
@@ -1350,6 +1562,11 @@ function TimeMapReview({
     <details
       className="mt-3 rounded border border-panel-line/70 bg-black/10 p-2.5 text-[11px] text-slate-400"
       data-testid="time-map-review"
+      onToggle={(event) => {
+        if (!event.currentTarget.open && playbackOpen) {
+          onPlaybackOpenChange(false);
+        }
+      }}
     >
       <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan">
         <span className="font-medium text-slate-200">来源↔原片时间图复核</span>
@@ -1362,9 +1579,32 @@ function TimeMapReview({
 
       <div className="mt-3 grid gap-3">
         <p className="leading-5 text-slate-400">
-          两条轨道按各自完整范围铺满，宽度只表示内容在本方时间轴中的位置。选择分段只会暂停并定位编辑页时间指针，不会自动播放或声称已完成
-          A/B 复核。
+          两条轨道按各自完整范围铺满，宽度只表示内容在本方时间轴中的位置。先选择要核对的分段，再打开
+          A/B 复核；共同内容按 TimeMap 同步切换，差异内容不会被强行映射。
         </p>
+
+        <TimeMapPlaybackReview
+          span={selectedSpan}
+          spanIndex={safeSelectedSpanIndex}
+          timeMapId={timeMap.id}
+          relationState={relationState}
+          persistedReview={Boolean(
+            readTimeMapSpanPlaybackReview(timeMap, safeSelectedSpanIndex)
+          )}
+          sourceMapRange={{
+            startMs: timeMap.sourceStartMs,
+            endMs: timeMap.sourceEndMs
+          }}
+          targetMapRange={{
+            startMs: timeMap.targetStartMs,
+            endMs: timeMap.targetEndMs
+          }}
+          sourceMedia={sourceMedia}
+          targetMedia={targetMedia}
+          open={playbackOpen}
+          onOpenChange={onPlaybackOpenChange}
+          adapterFactory={playbackAdapterFactory}
+        />
 
         <div
           className="grid gap-2 rounded border border-panel-line/70 bg-black/20 p-2"
@@ -1413,8 +1653,13 @@ function TimeMapReview({
             <li key={`${timeMap.id}-review-span-${spanIndex}`}>
               <button
                 type="button"
-                className="grid w-full gap-1 rounded border border-panel-line/70 bg-black/15 px-2.5 py-2 text-left text-slate-300 transition-colors hover:border-slate-500 hover:bg-white/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan"
+                className={`grid w-full gap-1 rounded border px-2.5 py-2 text-left text-slate-300 transition-colors hover:border-slate-500 hover:bg-white/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan ${
+                  safeSelectedSpanIndex === spanIndex
+                    ? "border-accent-cyan bg-accent-cyan/10"
+                    : "border-panel-line/70 bg-black/15"
+                }`}
                 aria-label={createTimeMapSpanAccessibleName(span, spanIndex)}
+                aria-pressed={safeSelectedSpanIndex === spanIndex}
                 onClick={() => locateSpan(span, spanIndex)}
               >
                 <span className="flex flex-wrap items-center gap-2">
@@ -1440,11 +1685,80 @@ function TimeMapReview({
                   </span>
                 ) : null}
               </button>
+              {relationState === "candidate" && span.kind !== "matched" ? (
+                <TimeMapSpanReviewControls
+                  timeMap={timeMap}
+                  span={span}
+                  spanIndex={spanIndex}
+                  onReview={(decision) =>
+                    reviewCandidateTimeMapSpan(timeMap.id, spanIndex, decision)
+                  }
+                />
+              ) : null}
             </li>
           ))}
         </ol>
       </div>
     </details>
+  );
+}
+
+const TIME_MAP_REVIEW_DECISIONS: readonly TimeMapSpanReviewDecision[] = [
+  "source-extra",
+  "target-extra",
+  "replacement",
+  "unresolved"
+];
+
+function TimeMapSpanReviewControls({
+  timeMap,
+  span,
+  spanIndex,
+  onReview
+}: {
+  timeMap: MediaTimeMap;
+  span: TimeMapSpan;
+  spanIndex: number;
+  onReview: (decision: TimeMapSpanReviewDecision) => void;
+}) {
+  const recorded = readTimeMapSpanReviewDecision(timeMap, spanIndex);
+  const unavailableReasons = new Set<string>();
+  const options = TIME_MAP_REVIEW_DECISIONS.map((decision) => {
+    const availability = describeTimeMapSpanReviewAvailability(span, decision);
+    if (!availability.allowed) {
+      unavailableReasons.add(availability.reason);
+    }
+    return { decision, availability };
+  });
+  return (
+    <fieldset className="mt-1 rounded border border-panel-line/60 bg-black/20 p-2">
+      <legend className="px-1 font-medium text-slate-400">人工判定这一段</legend>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map(({ decision, availability }) => (
+          <TextButton
+            key={decision}
+            className="h-7 px-2 text-[11px]"
+            tone={recorded?.decision === decision ? "primary" : "neutral"}
+            disabled={!availability.allowed}
+            aria-pressed={recorded?.decision === decision}
+            title={availability.reason}
+            onClick={() => onReview(decision)}
+          >
+            {TIME_MAP_SPAN_REVIEW_LABELS[decision]}
+          </TextButton>
+        ))}
+      </div>
+      <p className="mt-1.5 leading-5 text-slate-500">
+        {recorded
+          ? `已保存：${TIME_MAP_SPAN_REVIEW_LABELS[recorded.decision]} · ${new Date(recorded.reviewedAt).toLocaleString("zh-CN")}`
+          : "尚未人工分类；当前颜色只是算法候选结果。"}
+      </p>
+      {unavailableReasons.size > 0 ? (
+        <p className="mt-1 leading-5 text-amber-200">
+          灰色选项不会改写边界：{[...unavailableReasons].join("；")}
+        </p>
+      ) : null}
+    </fieldset>
   );
 }
 
@@ -1599,7 +1913,7 @@ function formatTimeMapStretchRatio(span: TimeMapSpan): string {
 }
 
 function createTimeMapSpanAccessibleName(span: TimeMapSpan, spanIndex: number): string {
-  return `第 ${spanIndex + 1} 段 ${TIME_MAP_SPAN_LABELS[span.kind]}，参考 ${formatTimeMapRange(span.sourceStartMs, span.sourceEndMs)}，原片 ${formatTimeMapRange(span.targetStartMs, span.targetEndMs)}；定位到参考起点 ${formatTimecode(span.sourceStartMs)}`;
+  return `第 ${spanIndex + 1} 段 ${TIME_MAP_SPAN_LABELS[span.kind]}，参考 ${formatTimeMapRange(span.sourceStartMs, span.sourceEndMs)}，原片 ${formatTimeMapRange(span.targetStartMs, span.targetEndMs)}；选择为 A/B 复核区间并定位到参考起点 ${formatTimecode(span.sourceStartMs)}`;
 }
 
 function UnlinkedLegacyTimeMapWarning() {

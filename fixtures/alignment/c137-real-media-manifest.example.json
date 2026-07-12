@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "c137-real-media-manifest-example",
   "name": "C137 真实媒体基准清单结构示例",
   "datasetVersion": "example-only-0",
@@ -13,11 +13,13 @@
       "id": "replace-with-real-relation-001",
       "title": "占位关系：请替换为本地真实媒体和双人复核标注",
       "mediaKind": "placeholder",
+      "split": "development",
       "scenarios": ["global-offset", "target-only"],
       "source": {
         "path": "C:\\REPLACE_WITH_LOCAL_MEDIA\\bilibili-reference.mkv",
         "audioStreamIndex": 1,
         "videoStreamIndex": 0,
+        "contentIdentity": null,
         "versionNote": "占位：记录 B 站参考的剪辑、编码、帧率和音轨版本。",
         "licenseNote": "占位：实际运行前记录该本地素材的合法测试依据。"
       },
@@ -25,12 +27,15 @@
         "path": "C:\\REPLACE_WITH_LOCAL_MEDIA\\original-episode.mkv",
         "audioStreamIndex": 1,
         "videoStreamIndex": 0,
+        "contentIdentity": null,
         "versionNote": "占位：记录原片来源、编码、帧率和音轨版本。",
         "licenseNote": "占位：实际运行前记录该本地素材的合法测试依据。"
       },
       "boundaryToleranceMs": 250,
       "versionNotes": ["占位标注，不代表任何真实节目、删减位置或时间关系。"],
       "licenseNotes": ["非真实基准；不得发布媒体路径，不得把本示例结果计入 C137 数据规模。"],
+      "independentAnnotations": [],
+      "adjudication": null,
       "gold": {
         "sourceStartMs": 0,
         "sourceEndMs": 60000,

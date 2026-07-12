@@ -2,7 +2,11 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { mapSourceTime } from "../alignment/timeMap";
-import { computeMediaTimeMapCoreDigest } from "../alignment/mediaTimeMap";
+import {
+  clearRegisteredManualMediaTimeMapVerificationTrust,
+  computeMediaTimeMapCoreDigest
+} from "../alignment/mediaTimeMap";
+import { applyTestManualMediaTimeMapVerification } from "../../test/manualVerification";
 import { createEmptyProject } from "./factory";
 import {
   parseProjectJson,
@@ -401,8 +405,58 @@ describe("project schema", () => {
     const reopened = parseProjectJson(JSON.stringify(project));
     expect(reopened.mediaTimeMaps[0].quality.level).toBe("review");
     expect(reopened.mediaTimeMaps[0].quality.reasons.join(" ")).toContain(
-      "导入 JSON 不能自动取得可信状态"
+      "没有安装级签名"
     );
+  });
+
+  it("v11 签名人工凭据完整序列化，保存重开前先降为 review 并保留待 native 复核记录", () => {
+    const map = createValidMediaTimeMap({
+      id: "signed-manual-map",
+      state: "confirmed",
+      confirmedAt: "2026-07-12T00:00:00.000Z"
+    });
+    map.quality = {
+      ...map.quality,
+      level: "review",
+      probability: 0.999,
+      p95ResidualMs: 80
+    };
+    map.evidence = {
+      ...map.evidence,
+      types: ["audio", "visual", "manual"],
+      visualAnchorCount: 12
+    };
+    const signed = applyTestManualMediaTimeMapVerification(map, {
+      calibrationArtifactId: "test-manual-review",
+      calibrationArtifactVersion: "1",
+      verifier: "vitest",
+      verifiedAt: "2026-07-12T00:00:00.000Z"
+    });
+    const project = {
+      ...createEmptyProject("签名人工凭据往返"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [signed]
+    };
+    const saved = serializeProject(project);
+    clearRegisteredManualMediaTimeMapVerificationTrust();
+    const reopened = parseProjectJson(saved);
+
+    expect(reopened.mediaTimeMaps[0].quality.level).toBe("review");
+    expect(reopened.mediaTimeMaps[0].verification).toMatchObject({
+      recordVersion: 2,
+      method: "manual-review",
+      revocation: null
+    });
+    const verification = reopened.mediaTimeMaps[0].verification;
+    if (!verification || verification.recordVersion !== 2) {
+      throw new Error("签名人工验证记录没有完成往返");
+    }
+    expect(verification.requestDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(verification.reviewEvidenceDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(validateProjectSchema(reopened).ok).toBe(true);
   });
 
   it("v11 时间图必须显式携带 verification=null 或合法 record", () => {

@@ -793,10 +793,25 @@ pub struct BoundaryRefinementResult {
     pub coarse_target_boundary_ms: i64,
     pub refined_target_boundary_ms: i64,
     pub shift_ms: i64,
+    pub uncertainty_start_ms: i64,
+    pub uncertainty_end_ms: i64,
     pub uncertainty_ms: i64,
     pub best_correlation: f64,
     pub alternative_margin: f64,
     pub ambiguous: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BoundaryContextSide {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BoundaryWindowMode {
+    Centered,
+    OneSided(BoundaryContextSide),
 }
 
 /// 在粗目标边界附近按整数毫秒搜索归一化互相关峰。该实现与 GCC-PHAT 的目标相同：
@@ -827,6 +842,50 @@ pub fn refine_boundary_by_correlation_with_cancel(
     config: &BoundaryRefinementConfig,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<BoundaryRefinementResult, String> {
+    refine_boundary_by_correlation_mode(
+        source_pcm,
+        target_pcm,
+        source_boundary_ms,
+        coarse_target_boundary_ms,
+        config,
+        BoundaryWindowMode::Centered,
+        cancel_flag,
+    )
+}
+
+/// Uses only the content immediately before or after a suspected edit boundary. A centered
+/// window is invalid at sourceOnly/targetOnly edges because half of it belongs to content that
+/// exists on only one axis. Callers can swap source/target to refine a source-axis boundary.
+pub fn refine_boundary_by_one_sided_correlation_with_cancel(
+    source_pcm: &[i16],
+    target_pcm: &[i16],
+    source_boundary_ms: i64,
+    coarse_target_boundary_ms: i64,
+    context_side: BoundaryContextSide,
+    config: &BoundaryRefinementConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<BoundaryRefinementResult, String> {
+    refine_boundary_by_correlation_mode(
+        source_pcm,
+        target_pcm,
+        source_boundary_ms,
+        coarse_target_boundary_ms,
+        config,
+        BoundaryWindowMode::OneSided(context_side),
+        cancel_flag,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_boundary_by_correlation_mode(
+    source_pcm: &[i16],
+    target_pcm: &[i16],
+    source_boundary_ms: i64,
+    coarse_target_boundary_ms: i64,
+    config: &BoundaryRefinementConfig,
+    window_mode: BoundaryWindowMode,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<BoundaryRefinementResult, String> {
     check_algorithm_cancelled(cancel_flag)?;
     validate_boundary_config(config)?;
     let window_samples = milliseconds_to_samples(config.window_ms, config.sample_rate)?;
@@ -838,7 +897,7 @@ pub fn refine_boundary_by_correlation_with_cancel(
         config.source_presentation_offset_ms,
         config.sample_rate,
     )?;
-    let source_window = centered_window(source_pcm, source_center, window_samples)
+    let source_window = boundary_window(source_pcm, source_center, window_samples, window_mode)
         .ok_or_else(|| "来源粗边界附近没有完整相关窗口。".to_string())?;
 
     let mut candidates = Vec::new();
@@ -854,7 +913,9 @@ pub fn refine_boundary_by_correlation_with_cancel(
             config.target_presentation_offset_ms,
             config.sample_rate,
         )?;
-        let Some(target_window) = centered_window(target_pcm, target_center, window_samples) else {
+        let Some(target_window) =
+            boundary_window(target_pcm, target_center, window_samples, window_mode)
+        else {
             continue;
         };
         candidates.push((
@@ -878,14 +939,6 @@ pub fn refine_boundary_by_correlation_with_cancel(
         .map(|(index, _)| index)
         .ok_or_else(|| "无法选择相关峰。".to_string())?;
     let (best_shift_ms, best_correlation) = candidates[best_index];
-    let second_best = candidates
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != best_index)
-        .map(|(_, item)| item.1)
-        .max_by(f64::total_cmp)
-        .unwrap_or(-1.0);
-    let alternative_margin = (best_correlation - second_best).max(0.0);
     let threshold = best_correlation - config.score_tolerance;
     let mut left = best_index;
     while left > 0 && candidates[left - 1].1 >= threshold {
@@ -895,15 +948,33 @@ pub fn refine_boundary_by_correlation_with_cancel(
     while right + 1 < candidates.len() && candidates[right + 1].1 >= threshold {
         right += 1;
     }
+    // Adjacent integer shifts inside the same broad peak are the uncertainty interval, not
+    // competing edit locations. Only a distinct peak outside that interval reduces the margin.
+    let second_best = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index < left || *index > right)
+        .map(|(_, item)| item.1)
+        .max_by(f64::total_cmp)
+        .unwrap_or(-1.0);
+    let alternative_margin = (best_correlation - second_best).max(0.0);
     let uncertainty_ms = candidates[right].0 - candidates[left].0;
     let refined_target_boundary_ms = coarse_target_boundary_ms
         .checked_add(best_shift_ms)
         .ok_or_else(|| "精修目标边界毫秒溢出。".to_string())?;
+    let uncertainty_start_ms = coarse_target_boundary_ms
+        .checked_add(candidates[left].0)
+        .ok_or_else(|| "边界不确定范围起点溢出。".to_string())?;
+    let uncertainty_end_ms = coarse_target_boundary_ms
+        .checked_add(candidates[right].0)
+        .ok_or_else(|| "边界不确定范围终点溢出。".to_string())?;
     Ok(BoundaryRefinementResult {
         source_boundary_ms,
         coarse_target_boundary_ms,
         refined_target_boundary_ms,
         shift_ms: best_shift_ms,
+        uncertainty_start_ms,
+        uncertainty_end_ms,
         uncertainty_ms,
         best_correlation,
         alternative_margin,
@@ -1709,6 +1780,25 @@ fn centered_window(samples: &[i16], center: usize, length: usize) -> Option<&[i1
     samples.get(start..end)
 }
 
+fn boundary_window(
+    samples: &[i16],
+    center: usize,
+    length: usize,
+    mode: BoundaryWindowMode,
+) -> Option<&[i16]> {
+    match mode {
+        BoundaryWindowMode::Centered => centered_window(samples, center, length),
+        BoundaryWindowMode::OneSided(BoundaryContextSide::Before) => {
+            let start = center.checked_sub(length)?;
+            samples.get(start..center)
+        }
+        BoundaryWindowMode::OneSided(BoundaryContextSide::After) => {
+            let end = center.checked_add(length)?;
+            samples.get(center..end)
+        }
+    }
+}
+
 fn normalized_cross_correlation(left: &[i16], right: &[i16]) -> f64 {
     if left.len() != right.len() || left.is_empty() {
         return -1.0;
@@ -1958,6 +2048,57 @@ mod tests {
         .unwrap();
         assert!(periodic.ambiguous);
         assert!(periodic.alternative_margin < 0.001);
+    }
+
+    #[test]
+    fn one_sided_correlation_recovers_both_edges_of_inserted_content() {
+        let source = deterministic_noise(5_000);
+        let insertion = (0..700)
+            .map(|index| if index % 37 < 13 { 20_000 } else { -7_000 })
+            .collect::<Vec<_>>();
+        let mut target = source[..2_500].to_vec();
+        target.extend_from_slice(&insertion);
+        target.extend_from_slice(&source[2_500..]);
+        let config = BoundaryRefinementConfig {
+            sample_rate: 1_000,
+            search_radius_ms: 80,
+            window_ms: 400,
+            score_tolerance: 0.001,
+            min_correlation: 0.9,
+            min_alternative_margin: 0.01,
+            max_uncertainty_ms: 5,
+            ..BoundaryRefinementConfig::default()
+        };
+
+        let before = refine_boundary_by_one_sided_correlation_with_cancel(
+            &source,
+            &target,
+            2_500,
+            2_470,
+            BoundaryContextSide::Before,
+            &config,
+            None,
+        )
+        .unwrap();
+        let after = refine_boundary_by_one_sided_correlation_with_cancel(
+            &source,
+            &target,
+            2_500,
+            3_230,
+            BoundaryContextSide::After,
+            &config,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(before.refined_target_boundary_ms, 2_500);
+        assert_eq!(after.refined_target_boundary_ms, 3_200);
+        for (result, expected) in [(&before, 2_500), (&after, 3_200)] {
+            assert!(result.uncertainty_start_ms <= expected);
+            assert!(result.uncertainty_end_ms >= expected);
+            assert!(result.uncertainty_ms <= 2);
+            assert!(!result.ambiguous);
+        }
     }
 
     #[test]

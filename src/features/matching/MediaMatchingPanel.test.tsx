@@ -24,14 +24,22 @@ import type {
   ProjectMediaRole
 } from "../../domain/project/types";
 import type { AlignmentProposal } from "../../domain/alignment/types";
+import { readTimeMapSpanReviewDecision } from "../../domain/alignment/timeMapReviewDecision";
+import {
+  applyAuthorityIssuedManualMediaTimeMapVerification,
+  createManualMediaTimeMapVerificationRequest
+} from "../../domain/alignment/mediaTimeMap";
 import {
   cancelTauriAudioAlignmentJob,
   startTauriAudioAlignmentJob,
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
+import type { MediaAdapter } from "../../infrastructure/media/mediaAdapter";
+import { isManualVerificationAuthorityAvailable } from "../../infrastructure/media/manualVerificationAuthority";
 import { useEditorStore } from "../../stores/editorStore";
 import { MediaMatchingPanel } from "./MediaMatchingPanel";
+import type { TimeMapPlaybackAdapterFactory } from "./TimeMapPlaybackReview";
 
 vi.mock("../../infrastructure/alignment/tauriAudioAlignment", async () => {
   const actual = await vi.importActual("../../infrastructure/alignment/tauriAudioAlignment");
@@ -42,6 +50,21 @@ vi.mock("../../infrastructure/alignment/tauriAudioAlignment", async () => {
     cancelTauriAudioAlignmentJob: vi.fn()
   };
 });
+
+vi.mock("../../infrastructure/media/manualVerificationAuthority", async () => {
+  const actual = await vi.importActual(
+    "../../infrastructure/media/manualVerificationAuthority"
+  );
+  return {
+    ...actual,
+    isManualVerificationAuthorityAvailable: vi.fn(() => false)
+  };
+});
+
+const defaultIssueManualVerification =
+  useEditorStore.getState().issueManualMediaTimeMapVerification;
+const defaultRevokeManualVerification =
+  useEditorStore.getState().revokeManualMediaTimeMapVerification;
 
 describe("多媒体自动匹配工作台", () => {
   beforeEach(() => {
@@ -57,8 +80,11 @@ describe("多媒体自动匹配工作台", () => {
       alignmentProposal: null,
       cutHintSettings: { ...DEFAULT_CUT_HINT_SEARCH_SETTINGS },
       timelineTool: "select",
-      workspacePage: "matching"
+      workspacePage: "matching",
+      issueManualMediaTimeMapVerification: defaultIssueManualVerification,
+      revokeManualMediaTimeMapVerification: defaultRevokeManualVerification
     });
+    vi.mocked(isManualVerificationAuthorityAvailable).mockReturnValue(false);
     vi.mocked(startTauriAudioAlignmentJob).mockImplementation((request) =>
       Promise.resolve({
         jobId: request.completePath.includes("ep1") ? "job-ep1" : "job-ep2",
@@ -655,7 +681,7 @@ describe("多媒体自动匹配工作台", () => {
     await user.click(matchedButton);
     expect(useEditorStore.getState().project.timeline.playheadMs).toBe(5_000);
     expect(useEditorStore.getState().status.message).toContain(
-      "仅完成时间定位，未执行 A/B 播放"
+      "已选择第 1 段“共同内容”作为 A/B 复核区间"
     );
 
     act(() => useEditorStore.getState().setPlaying(true));
@@ -664,7 +690,162 @@ describe("多媒体自动匹配工作台", () => {
     expect(sourceOnlyButton).toHaveFocus();
     expect(useEditorStore.getState().project.timeline.playheadMs).toBe(15_000);
     expect(useEditorStore.getState().isPlaying).toBe(false);
-    expect(useEditorStore.getState().status.message).toContain("第 2 段“参考独有”起点");
+    expect(useEditorStore.getState().status.message).toContain(
+      "已选择第 2 段“参考独有”作为 A/B 复核区间"
+    );
+  });
+
+  it("真实加载两路媒体，按 matched 映射切换播放头，并让单侧差异的边界前后循环可达", async () => {
+    const user = userEvent.setup();
+    const project = createMatchingProject();
+    project.mediaLibrary = project.mediaLibrary
+      .filter((media) => media.id !== "target-ep2")
+      .map((media) => ({
+        ...media,
+        fileName: `${media.id}.mp4`,
+        objectUrl: `blob:${media.id}`
+      }));
+    useEditorStore.setState({ project });
+    vi.mocked(startTauriAudioAlignmentJob).mockResolvedValue({
+      jobId: "job-v2-ab-playback",
+      status: "completed",
+      progress: 1,
+      message: "完成",
+      logs: [],
+      proposal: createFourKindV2Proposal(),
+      error: null,
+      updatedAtMs: 1
+    });
+    const playbackAdapter = createFakePlaybackAdapter();
+    const adapterFactory = vi.fn<TimeMapPlaybackAdapterFactory>(() => playbackAdapter.adapter);
+    render(<MatchingHarness playbackAdapterFactory={adapterFactory} />);
+
+    await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    const card = await screen.findByTestId("media-match-candidate");
+    const review = within(card).getByTestId("time-map-review");
+    await user.click(within(review).getByText("来源↔原片时间图复核"));
+    const playback = within(review).getByTestId("time-map-playback-review");
+    await user.click(within(playback).getByRole("button", { name: "打开 A/B 复核" }));
+
+    await waitFor(() =>
+      expect(within(playback).getByRole("button", { name: "播放当前段" })).toBeEnabled()
+    );
+    expect(playback).toHaveTextContent("任一时刻只播放当前 A 或 B 的声音");
+    await user.click(within(playback).getByRole("button", { name: "播放当前段" }));
+    await waitFor(() =>
+      expect(playbackAdapter.load).toHaveBeenCalledWith(
+        { kind: "url", name: "source-long", url: "blob:source-long" },
+        5_000
+      )
+    );
+
+    fireEvent.change(within(playback).getByRole("slider", { name: "参考 A当前分段播放位置" }), {
+      target: { value: "10000" }
+    });
+    await user.click(within(playback).getByRole("button", { name: "B · 目标原片" }));
+    await waitFor(() =>
+      expect(playbackAdapter.load).toHaveBeenLastCalledWith(
+        { kind: "url", name: "target-ep1", url: "blob:target-ep1" },
+        5_000
+      )
+    );
+    expect(playback).toHaveTextContent("已按 TimeMap 将播放头同步到原片 B 00:00:05.000");
+    await user.click(within(playback).getByRole("button", { name: "播放当前段" }));
+    expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeEnabled();
+
+    const sourceOnlyButton = within(review).getByRole("button", {
+      name: /第 2 段 参考独有/
+    });
+    await user.click(sourceOnlyButton);
+    await waitFor(() =>
+      expect(within(playback).getByRole("button", { name: "B · 目标原片" })).toBeDisabled()
+    );
+    await user.click(within(playback).getByRole("button", { name: "段首前后 3 秒" }));
+    await waitFor(() =>
+      expect(within(playback).getByRole("button", { name: "B · 目标原片" })).toBeEnabled()
+    );
+    await user.click(within(playback).getByRole("button", { name: "B · 目标原片" }));
+    await waitFor(() =>
+      expect(playbackAdapter.load).toHaveBeenLastCalledWith(
+        { kind: "url", name: "target-ep1", url: "blob:target-ep1" },
+        7_000
+      )
+    );
+    expect(playback).toHaveTextContent("差异段上下文仅用于前后对照，不声称逐帧映射");
+    expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeDisabled();
+    expect(within(playback).getByRole("button", { name: "循环复核区间：开" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+  });
+
+  it("四类人工判定按边界形状 fail-closed，并在项目保存重开后恢复", async () => {
+    const user = userEvent.setup();
+    const project = createMatchingProject();
+    project.mediaLibrary = project.mediaLibrary.filter((media) => media.id !== "target-ep2");
+    useEditorStore.setState({ project });
+    vi.mocked(startTauriAudioAlignmentJob).mockResolvedValue({
+      jobId: "job-v2-persistent-span-review",
+      status: "completed",
+      progress: 1,
+      message: "完成",
+      logs: [],
+      proposal: createFourKindV2Proposal(),
+      error: null,
+      updatedAtMs: 1
+    });
+    render(<MatchingHarness />);
+
+    await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    const review = within(await screen.findByTestId("media-match-candidate")).getByTestId(
+      "time-map-review"
+    );
+    await user.click(within(review).getByText("来源↔原片时间图复核"));
+    const sourceOnlyButton = within(review).getByRole("button", {
+      name: /第 2 段 参考独有/
+    });
+    const sourceOnlyItem = sourceOnlyButton.closest("li");
+    if (!sourceOnlyItem) throw new Error("未找到参考独有分段容器");
+    const controls = within(sourceOnlyItem);
+    expect(controls.getByRole("button", { name: "参考多出" })).toBeEnabled();
+    expect(controls.getByRole("button", { name: "原片多出" })).toBeDisabled();
+    expect(controls.getByRole("button", { name: "版本替换" })).toBeDisabled();
+    expect(controls.getByRole("button", { name: "无法判断" })).toBeEnabled();
+    expect(sourceOnlyItem).toHaveTextContent("灰色选项不会改写边界");
+
+    await user.click(controls.getByRole("button", { name: "参考多出" }));
+    const reviewedMap = useEditorStore.getState().project.mediaTimeMaps[0];
+    expect(readTimeMapSpanReviewDecision(reviewedMap, 1)?.decision).toBe("source-extra");
+    expect(reviewedMap.verification).toBeNull();
+    expect(reviewedMap.evidence.types).toContain("manual");
+    const saved = serializeProject(useEditorStore.getState().project);
+
+    act(() => useEditorStore.getState().openProjectFromText(saved, "reviewed-project.json"));
+    const reopenedMap = useEditorStore
+      .getState()
+      .project.mediaTimeMaps.find((timeMap) => timeMap.id === reviewedMap.id);
+    expect(reopenedMap).toBeDefined();
+    expect(readTimeMapSpanReviewDecision(reopenedMap!, 1)?.decision).toBe("source-extra");
+
+    const reopenedReview = within(
+      await screen.findByTestId("media-match-candidate")
+    ).getByTestId("time-map-review");
+    await user.click(within(reopenedReview).getByText("来源↔原片时间图复核"));
+    expect(reopenedReview).toHaveTextContent("已保存：参考多出");
+
+    const ambiguousButton = within(reopenedReview).getByRole("button", {
+      name: /第 4 段 无法判断/
+    });
+    const ambiguousItem = ambiguousButton.closest("li");
+    if (!ambiguousItem) throw new Error("未找到无法判断分段容器");
+    await user.click(within(ambiguousItem).getByRole("button", { name: "版本替换" }));
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
+    expect(useEditorStore.getState().project.mediaTimeMaps[0]?.quality.level).toBe("review");
+    expect(
+      within(await screen.findByTestId("media-match-candidate")).getByRole("button", {
+        name: "保存关系供试听复核"
+      })
+    ).toBeEnabled();
   });
 
   it("候选保存后卡片改用独立的已确认时间图复核", async () => {
@@ -692,6 +873,100 @@ describe("多媒体自动匹配工作台", () => {
     expect(
       within(acceptedReview).getByRole("button", { name: /第 1 段 共同内容/ })
     ).toBeInTheDocument();
+    const verification = within(card).getByTestId("manual-time-map-verification");
+    expect(within(verification).getByRole("button", { name: "完成复核并签发" })).toBeDisabled();
+    expect(verification).toHaveTextContent("安装级人工验证只在 Tauri 桌面端可用");
+  });
+
+  it("只在桌面预检通过后由明确按钮签发，并为活动签名提供真实撤销动作", async () => {
+    const user = userEvent.setup();
+    configureSingleTargetV2Project("verified");
+    vi.mocked(isManualVerificationAuthorityAvailable).mockReturnValue(true);
+    const issue = vi.fn<typeof defaultIssueManualVerification>(() => Promise.resolve());
+    const revoke = vi.fn<typeof defaultRevokeManualVerification>(() => Promise.resolve());
+    useEditorStore.setState({
+      issueManualMediaTimeMapVerification: issue,
+      revokeManualMediaTimeMapVerification: revoke
+    });
+    render(<MatchingHarness />);
+
+    await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    await screen.findByTestId("media-match-candidate");
+    const candidateMap = useEditorStore.getState().project.mediaTimeMaps[0];
+    act(() =>
+      useEditorStore.getState().recordTimeMapSpanPlaybackReview(candidateMap.id, 0, {
+        spanAxes: ["source", "target"],
+        startBoundaryAxes: [],
+        endBoundaryAxes: []
+      })
+    );
+    const card = await screen.findByTestId("media-match-candidate");
+    await user.click(within(card).getByRole("button", { name: "保存关系供试听复核" }));
+
+    const verification = within(card).getByTestId("manual-time-map-verification");
+    expect(verification).toHaveTextContent("已通过签发预检");
+    await user.click(within(verification).getByRole("button", { name: "完成复核并签发" }));
+    await waitFor(() => expect(issue).toHaveBeenCalledTimes(1));
+    const confirmedMap = useEditorStore
+      .getState()
+      .project.mediaTimeMaps.find((timeMap) => timeMap.state === "confirmed");
+    expect(confirmedMap).toBeDefined();
+    const issueCall = issue.mock.calls[0];
+    if (!issueCall) throw new Error("签发按钮没有调用 store action");
+    expect(issueCall[0]).toBe(confirmedMap?.id);
+    expect(issueCall[1]).toMatchObject({
+      calibrationArtifactId: "manual-a-b-review",
+      calibrationArtifactVersion: "1",
+      verifier: "本机用户"
+    });
+    expect(Number.isFinite(Date.parse(issueCall[1].verifiedAt))).toBe(true);
+
+    if (!confirmedMap) throw new Error("签发 UI 测试缺少确认时间图");
+    const verificationInput = {
+      calibrationArtifactId: "manual-a-b-review",
+      calibrationArtifactVersion: "1",
+      verifier: "本机用户",
+      verifiedAt: "2026-07-12T10:00:00.000Z"
+    };
+    const verificationRequest = createManualMediaTimeMapVerificationRequest(
+      confirmedMap,
+      verificationInput
+    );
+    const issuedMap = applyAuthorityIssuedManualMediaTimeMapVerification(
+      confirmedMap,
+      verificationInput,
+      {
+        verificationId: "verification-ui-test",
+        issuerKeyId: "issuer-ui-test",
+        issuerSequence: 1,
+        signatureAlgorithm: "hmac-sha256-v1",
+        signature: "a".repeat(64),
+        requestDigest: verificationRequest.requestDigest
+      }
+    );
+    act(() => {
+      useEditorStore.setState((state) => ({
+        project: {
+          ...state.project,
+          mediaTimeMaps: state.project.mediaTimeMaps.map((timeMap) =>
+            timeMap.id === confirmedMap.id ? issuedMap : timeMap
+          )
+        }
+      }));
+    });
+
+    const signedPanel = within(card).getByTestId("manual-time-map-verification");
+    expect(signedPanel).toHaveTextContent("本机签名已验证");
+    await user.click(within(signedPanel).getByRole("button", { name: "撤销人工验证" }));
+    await waitFor(() => expect(revoke).toHaveBeenCalledTimes(1));
+    const revokeCall = revoke.mock.calls[0];
+    if (!revokeCall) throw new Error("撤销按钮没有调用 store action");
+    expect(revokeCall[0]).toBe(confirmedMap.id);
+    expect(revokeCall[1]).toMatchObject({
+      reason: "用户在匹配页撤销了人工 A/B 复核验证。",
+      revokedBy: "本机用户"
+    });
+    expect(Number.isFinite(Date.parse(revokeCall[1].revokedAt))).toBe(true);
   });
 
   it("候选时间图缺失时明确报错并禁止确认", async () => {
@@ -1157,14 +1432,47 @@ describe("多媒体自动匹配工作台", () => {
 });
 
 function MatchingHarness({
-  suspectedCutCandidates = []
+  suspectedCutCandidates = [],
+  playbackAdapterFactory
 }: {
   suspectedCutCandidates?: SuspectedCutCandidate[];
+  playbackAdapterFactory?: TimeMapPlaybackAdapterFactory;
 }) {
   const project = useEditorStore((state) => state.project);
   return (
-    <MediaMatchingPanel project={project} suspectedCutCandidates={suspectedCutCandidates} />
+    <MediaMatchingPanel
+      project={project}
+      suspectedCutCandidates={suspectedCutCandidates}
+      playbackAdapterFactory={playbackAdapterFactory}
+    />
   );
+}
+
+function createFakePlaybackAdapter(): {
+  adapter: MediaAdapter;
+  load: ReturnType<typeof vi.fn<MediaAdapter["load"]>>;
+} {
+  let currentTimeMs = 0;
+  const load = vi.fn<MediaAdapter["load"]>((_source, startPositionMs = 0) => {
+    currentTimeMs = startPositionMs;
+    return Promise.resolve();
+  });
+  return {
+    load,
+    adapter: {
+      load,
+      play: vi.fn<MediaAdapter["play"]>(() => Promise.resolve()),
+      pause: vi.fn<MediaAdapter["pause"]>(),
+      seek: vi.fn<MediaAdapter["seek"]>((positionMs) => {
+        currentTimeMs = positionMs;
+      }),
+      getCurrentTimeMs: vi.fn<MediaAdapter["getCurrentTimeMs"]>(() => currentTimeMs),
+      getDurationMs: vi.fn<MediaAdapter["getDurationMs"]>(() => 180_000),
+      getTracks: vi.fn<MediaAdapter["getTracks"]>(() => []),
+      setPlaybackRate: vi.fn<MediaAdapter["setPlaybackRate"]>(),
+      dispose: vi.fn<MediaAdapter["dispose"]>()
+    }
+  };
 }
 
 function createMatchingProject(): EditorProject {

@@ -10,6 +10,7 @@ mod alignment_v2;
 mod app_settings;
 mod audio_alignment;
 mod export_files;
+mod manual_verification;
 mod media_probe;
 mod media_tools;
 
@@ -32,6 +33,9 @@ pub fn run() {
             audio_alignment::cancel_audio_alignment_job,
             media_probe::probe_media_timeline,
             media_probe::probe_media_identity,
+            manual_verification::issue_manual_time_map_verification,
+            manual_verification::verify_manual_time_map_verification,
+            manual_verification::revoke_manual_time_map_verification,
             media_tools::detect_media_tool,
             media_tools::start_mpv_sidecar,
             media_tools::stop_mpv_sidecar,

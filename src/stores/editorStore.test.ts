@@ -1,4 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const manualVerificationMocks = vi.hoisted(() => ({
+  rehydrateProject: vi.fn()
+}));
+
+vi.mock("../infrastructure/media/manualVerificationAuthority", () => ({
+  issuePersistedManualMediaTimeMapVerification: vi.fn(() =>
+    Promise.reject(new Error("测试未配置人工验证签发"))
+  ),
+  rehydrateProjectManualMediaTimeMapVerifications: manualVerificationMocks.rehydrateProject,
+  revokePersistedManualMediaTimeMapVerification: vi.fn(() =>
+    Promise.reject(new Error("测试未配置人工验证撤销"))
+  )
+}));
 import type { DanmakuClip } from "../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../domain/danmaku/cutHints";
 import { createHistoryState } from "../domain/history/history";
@@ -100,6 +114,10 @@ function mockRevokeObjectUrl(): ReturnType<typeof vi.fn> {
 
 describe("editor store", () => {
   beforeEach(() => {
+    manualVerificationMocks.rehydrateProject.mockReset();
+    manualVerificationMocks.rehydrateProject.mockImplementation((project: EditorProject) =>
+      Promise.resolve(project)
+    );
     resetStore();
   });
 
@@ -141,6 +159,58 @@ describe("editor store", () => {
     useEditorStore.getState().openProjectFromText(serializeProject(nextProject));
     expect(revokeSpy).toHaveBeenCalledWith("blob:old-project");
     expect(useEditorStore.getState().project.name).toBe("打开的项目");
+  });
+
+  it("迟到的安装级验证恢复结果不能跨 projectEpoch 覆盖后来打开的项目", async () => {
+    const resolveFirst = vi.fn<(project: EditorProject) => void>();
+    manualVerificationMocks.rehydrateProject
+      .mockImplementationOnce(
+        (project: EditorProject) =>
+          new Promise<EditorProject>((resolve) => {
+            resolveFirst.mockImplementation(() =>
+              resolve({ ...project, name: "不应写回的迟到项目" })
+            );
+          })
+      )
+      .mockImplementationOnce((project: EditorProject) => Promise.resolve(project));
+
+    useEditorStore
+      .getState()
+      .openProjectFromText(serializeProject(createEmptyProject("先打开")));
+    useEditorStore
+      .getState()
+      .openProjectFromText(serializeProject(createEmptyProject("后打开")));
+    await Promise.resolve();
+    expect(useEditorStore.getState().project.name).toBe("后打开");
+
+    expect(resolveFirst).toHaveBeenCalledTimes(0);
+    resolveFirst(createEmptyProject());
+    await Promise.resolve();
+    expect(useEditorStore.getState().project.name).toBe("后打开");
+  });
+
+  it("同一项目验证恢复期间的用户编辑不会被打开时快照覆盖", async () => {
+    const resolveHydration = vi.fn<(project: EditorProject) => void>();
+    manualVerificationMocks.rehydrateProject.mockImplementationOnce(
+      () =>
+        new Promise<EditorProject>((resolve) => {
+          resolveHydration.mockImplementation(resolve);
+        })
+    );
+    useEditorStore
+      .getState()
+      .openProjectFromText(serializeProject(createEmptyProject("并发编辑")));
+    useEditorStore.getState().setGlobalOffset(1_234);
+    expect(useEditorStore.getState().project.globalOffsetMs).toBe(1_234);
+
+    expect(resolveHydration).toHaveBeenCalledTimes(0);
+    resolveHydration({
+      ...createEmptyProject("不应覆盖当前项目"),
+      globalOffsetMs: 0
+    });
+    await Promise.resolve();
+    expect(useEditorStore.getState().project.name).toBe("并发编辑");
+    expect(useEditorStore.getState().project.globalOffsetMs).toBe(1_234);
   });
 
   it("打开旧版项目时提示 schema 迁移和片段边界兼容", () => {
@@ -629,7 +699,7 @@ describe("editor store", () => {
     }
   });
 
-  it("接受媒体匹配候选会生成段内映射，并可显式撤销确认后撤销/重做", () => {
+  it("接受媒体匹配候选会生成段内映射，并可显式撤销确认后撤销/重做", async () => {
     const project = createEmptyProject();
     const asset = createAsset("asset-match", "match.xml");
     project.assets = [asset];
@@ -699,10 +769,51 @@ describe("editor store", () => {
     expect(accepted.syncAnchors).toEqual([]);
     expect(accepted.cutMarkers).toEqual([]);
 
-    useEditorStore.getState().revokeMediaMatchCandidateAcceptance(candidate.id);
+    const foreignIdentity = {
+      algorithm: "sha256-full-file-v2",
+      sizeBytes: 1,
+      modifiedUnixMs: 1,
+      firstSampleDigest: "1".repeat(64),
+      middleSampleDigest: "2".repeat(64),
+      lastSampleDigest: "3".repeat(64)
+    };
+    useEditorStore.setState((state) => ({
+      project: {
+        ...state.project,
+        mediaTimeMaps: state.project.mediaTimeMaps.map((map) =>
+          map.state === "confirmed"
+            ? {
+                ...map,
+                verification: {
+                  recordVersion: 2 as const,
+                  method: "manual-review" as const,
+                  verificationId: "foreign-verification",
+                  issuerKeyId: "another-installation",
+                  issuerSequence: 1,
+                  signatureAlgorithm: "hmac-sha256-v1" as const,
+                  signature: "1".repeat(64),
+                  requestDigest: `sha256:${"2".repeat(64)}`,
+                  mapCoreDigest: `sha256:${"3".repeat(64)}`,
+                  mapRevision: map.revision,
+                  sourceIdentity: foreignIdentity,
+                  targetIdentity: foreignIdentity,
+                  calibrationArtifactId: "manual-a-b-review",
+                  calibrationArtifactVersion: "1",
+                  reviewEvidenceDigest: `sha256:${"4".repeat(64)}`,
+                  verifier: "other-device",
+                  verifiedAt: "2026-07-12T00:00:00.000Z",
+                  revocation: null
+                }
+              }
+            : map
+        )
+      }
+    }));
+    await useEditorStore.getState().revokeMediaMatchCandidateAcceptance(candidate.id);
     expect(useEditorStore.getState().project.danmakuSourceSegments).toEqual([]);
     expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
     expect(useEditorStore.getState().history.past.at(-1)?.label).toBe("撤销媒体匹配确认");
+    expect(useEditorStore.getState().status.message).toContain("无法修改原安装撤销注册表");
 
     useEditorStore.getState().undo();
     expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
@@ -723,7 +834,7 @@ describe("editor store", () => {
     expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
     expect(useEditorStore.getState().status.message).toContain("不能单独删除");
 
-    useEditorStore.getState().revokeMediaMatchCandidateAcceptance(candidate.id);
+    await useEditorStore.getState().revokeMediaMatchCandidateAcceptance(candidate.id);
     expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
       state: "pending",
       appliedSegmentIds: []

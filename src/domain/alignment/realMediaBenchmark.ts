@@ -11,7 +11,7 @@ import {
  * 结果只保存 caseId、场景和聚合指标，因而可以安全分享而不泄漏本地路径。
  */
 
-export const REAL_MEDIA_BENCHMARK_SCHEMA_VERSION = 1 as const;
+export const REAL_MEDIA_BENCHMARK_SCHEMA_VERSION = 2 as const;
 
 export type RealMediaBenchmarkScenario =
   | "global-offset"
@@ -28,12 +28,20 @@ export type RealMediaBenchmarkScenario =
   | "codec-variant";
 
 export type RealMediaBenchmarkMediaKind = "real" | "synthetic" | "placeholder";
+export type RealMediaBenchmarkSplit = "development" | "frozen-test";
 export type BenchmarkEditKind = Exclude<TimeMapSpanKind, "matched">;
+
+export interface RealMediaBenchmarkContentIdentity {
+  algorithm: "sha256-full-file-v2";
+  sizeBytes: number;
+  digest: string;
+}
 
 export interface RealMediaBenchmarkMediaInput {
   path: string;
   audioStreamIndex: number;
   videoStreamIndex: number | null;
+  contentIdentity: RealMediaBenchmarkContentIdentity | null;
   versionNote: string;
   licenseNote: string;
 }
@@ -67,16 +75,31 @@ export interface RealMediaBenchmarkGold {
   ambiguousSpans: RealMediaBenchmarkAmbiguousSpan[];
 }
 
+export interface RealMediaBenchmarkIndependentAnnotation {
+  /** Pseudonymous stable reviewer identifier; never store a person's real name here. */
+  reviewerId: string;
+  gold: RealMediaBenchmarkGold;
+}
+
+export interface RealMediaBenchmarkAdjudication {
+  status: "not-needed" | "resolved";
+  adjudicatorId: string | null;
+  note: string;
+}
+
 export interface RealMediaBenchmarkCase {
   id: string;
   title: string;
   mediaKind: RealMediaBenchmarkMediaKind;
+  split: RealMediaBenchmarkSplit;
   scenarios: RealMediaBenchmarkScenario[];
   source: RealMediaBenchmarkMediaInput;
   target: RealMediaBenchmarkMediaInput;
   boundaryToleranceMs: number;
   versionNotes: string[];
   licenseNotes: string[];
+  independentAnnotations: RealMediaBenchmarkIndependentAnnotation[];
+  adjudication: RealMediaBenchmarkAdjudication | null;
   gold: RealMediaBenchmarkGold;
 }
 
@@ -220,6 +243,7 @@ export const C137_BENCHMARK_MINIMUMS = {
   realRelationCount: 150,
   longReferenceRelationCount: 30,
   goldEditCount: 500,
+  frozenTestRatio: 0.3,
   relationsPerRequiredScenario: 1
 } as const;
 
@@ -243,6 +267,8 @@ const SCENARIOS = new Set<RealMediaBenchmarkScenario>([
   "pts-offset",
   "codec-variant"
 ]);
+const BENCHMARK_SPLITS = new Set<RealMediaBenchmarkSplit>(["development", "frozen-test"]);
+const SHA256_HEX = /^[a-f0-9]{64}$/i;
 
 export function validateRealMediaBenchmarkManifest(
   value: unknown
@@ -252,7 +278,7 @@ export function validateRealMediaBenchmarkManifest(
     return { valid: false, issues: ["真实媒体基准 manifest 必须是对象。"] };
   }
   if (value.schemaVersion !== REAL_MEDIA_BENCHMARK_SCHEMA_VERSION) {
-    issues.push("真实媒体基准 manifest schemaVersion 必须为 1。");
+    issues.push("真实媒体基准 manifest schemaVersion 必须为 2。v1 缺少媒体身份、双人标注和冻结集治理字段，不能用于精度验收。");
   }
   validateRequiredString(value.id, "manifest.id", issues);
   validateRequiredString(value.name, "manifest.name", issues);
@@ -359,7 +385,7 @@ export function validateRealMediaBenchmarkResult(
     return { valid: false, issues: ["真实媒体评测结果必须是对象。"] };
   }
   if (value.schemaVersion !== REAL_MEDIA_BENCHMARK_SCHEMA_VERSION) {
-    issues.push("真实媒体评测结果 schemaVersion 必须为 1。");
+    issues.push("真实媒体评测结果 schemaVersion 必须为 2。");
   }
   validateRequiredString(value.manifestId, "result.manifestId", issues);
   validateRequiredString(value.datasetVersion, "result.datasetVersion", issues);
@@ -814,6 +840,10 @@ function evaluateC137BenchmarkGate(
     )
   );
   const longReferenceCount = scenarioCounts.get("long-reference") ?? 0;
+  const frozenTestCount = realCases.filter(
+    (benchmarkCase) => benchmarkCase.split === "frozen-test"
+  ).length;
+  const frozenTestRatio = realCases.length === 0 ? 0 : frozenTestCount / realCases.length;
   const dataChecks: C137BenchmarkGateCheck[] = [
     createGateCheck(
       "real-relations",
@@ -832,6 +862,12 @@ function evaluateC137BenchmarkGate(
       realSummary.goldEditCount >= C137_BENCHMARK_MINIMUMS.goldEditCount,
       realSummary.goldEditCount,
       `至少 ${C137_BENCHMARK_MINIMUMS.goldEditCount} 个真实标注编辑事件`
+    ),
+    createGateCheck(
+      "frozen-test-ratio",
+      frozenTestRatio >= C137_BENCHMARK_MINIMUMS.frozenTestRatio,
+      frozenTestRatio,
+      `至少 ${Math.round(C137_BENCHMARK_MINIMUMS.frozenTestRatio * 100)}% 真实关系属于从不参与参数选择的 frozen-test`
     ),
     ...C137_REQUIRED_SCENARIOS.map((scenario) => {
       const count = scenarioCounts.get(scenario) ?? 0;
@@ -1150,6 +1186,9 @@ function validateManifestCase(value: unknown, caseIndex: number, issues: string[
   ) {
     issues.push(`${prefix}.mediaKind 无效。`);
   }
+  if (typeof value.split !== "string" || !BENCHMARK_SPLITS.has(value.split as RealMediaBenchmarkSplit)) {
+    issues.push(`${prefix}.split 必须为 development 或 frozen-test。`);
+  }
   if (
     !Array.isArray(value.scenarios) ||
     value.scenarios.length === 0 ||
@@ -1161,10 +1200,13 @@ function validateManifestCase(value: unknown, caseIndex: number, issues: string[
   ) {
     issues.push(`${prefix}.scenarios 必须是非空且不重复的已知场景数组。`);
   }
-  validateMediaInput(value.source, `${prefix}.source`, issues);
-  validateMediaInput(value.target, `${prefix}.target`, issues);
+  const isReal = value.mediaKind === "real";
+  validateMediaInput(value.source, `${prefix}.source`, isReal, issues);
+  validateMediaInput(value.target, `${prefix}.target`, isReal, issues);
   if (!isNonNegativeInteger(value.boundaryToleranceMs)) {
     issues.push(`${prefix}.boundaryToleranceMs 必须是非负整数毫秒。`);
+  } else if (isReal && (value.boundaryToleranceMs < 40 || value.boundaryToleranceMs > 100)) {
+    issues.push(`${prefix}.boundaryToleranceMs 对真实关系必须位于 40–100ms。`);
   }
   if (!isNonEmptyStringArray(value.versionNotes)) {
     issues.push(`${prefix}.versionNotes 至少需要一条版本说明。`);
@@ -1173,8 +1215,9 @@ function validateManifestCase(value: unknown, caseIndex: number, issues: string[
     issues.push(`${prefix}.licenseNotes 至少需要一条许可说明。`);
   }
   validateGold(value.gold, prefix, issues);
+  validateIndependentAnnotations(value, prefix, issues);
   validateScenarioGoldConsistency(value, prefix, issues);
-  if (value.mediaKind === "real") {
+  if (isReal) {
     validateRealGoldAnchorDistribution(value.gold, prefix, issues);
   }
 }
@@ -1251,7 +1294,12 @@ function validateScenarioGoldConsistency(
   }
 }
 
-function validateMediaInput(value: unknown, prefix: string, issues: string[]): void {
+function validateMediaInput(
+  value: unknown,
+  prefix: string,
+  requireIdentity: boolean,
+  issues: string[]
+): void {
   if (!isRecord(value)) {
     issues.push(`${prefix} 必须是对象。`);
     return;
@@ -1263,8 +1311,215 @@ function validateMediaInput(value: unknown, prefix: string, issues: string[]): v
   if (value.videoStreamIndex !== null && !isNonNegativeInteger(value.videoStreamIndex)) {
     issues.push(`${prefix}.videoStreamIndex 必须为非负整数或 null。`);
   }
+  if (value.contentIdentity === null) {
+    if (requireIdentity) {
+      issues.push(`${prefix}.contentIdentity 真实媒体必须绑定全文件 SHA-256。`);
+    }
+  } else if (!isBenchmarkContentIdentity(value.contentIdentity)) {
+    issues.push(`${prefix}.contentIdentity 必须是 sha256-full-file-v2 全文件身份。`);
+  }
   validateRequiredString(value.versionNote, `${prefix}.versionNote`, issues);
   validateRequiredString(value.licenseNote, `${prefix}.licenseNote`, issues);
+}
+
+function validateIndependentAnnotations(
+  benchmarkCase: Record<string, unknown>,
+  prefix: string,
+  issues: string[]
+): void {
+  const annotations = benchmarkCase.independentAnnotations;
+  const isReal = benchmarkCase.mediaKind === "real";
+  if (!Array.isArray(annotations)) {
+    issues.push(`${prefix}.independentAnnotations 必须是数组。`);
+    return;
+  }
+  if (isReal && annotations.length < 2) {
+    issues.push(`${prefix}.independentAnnotations 真实关系至少需要两名独立复核者。`);
+  }
+  const reviewerIds = new Set<string>();
+  annotations.forEach((annotation, index) => {
+    const annotationPrefix = `${prefix}.independentAnnotations[${index}]`;
+    if (!isRecord(annotation)) {
+      issues.push(`${annotationPrefix} 必须是对象。`);
+      return;
+    }
+    validateRequiredString(annotation.reviewerId, `${annotationPrefix}.reviewerId`, issues);
+    if (typeof annotation.reviewerId === "string") {
+      if (reviewerIds.has(annotation.reviewerId)) {
+        issues.push(`${annotationPrefix}.reviewerId 必须与其他复核者不同。`);
+      }
+      reviewerIds.add(annotation.reviewerId);
+    }
+    validateGold(annotation.gold, annotationPrefix, issues);
+  });
+
+  if (!isReal) {
+    if (benchmarkCase.adjudication !== null) {
+      validateAdjudication(benchmarkCase.adjudication, prefix, false, reviewerIds, issues);
+    }
+    return;
+  }
+  if (annotations.length < 2 || !isRecord(annotations[0]) || !isRecord(annotations[1])) {
+    return;
+  }
+  const toleranceMs = isNonNegativeInteger(benchmarkCase.boundaryToleranceMs)
+    ? benchmarkCase.boundaryToleranceMs
+    : 0;
+  const requiresAdjudication = annotationsDisagreeBeyondTolerance(
+    annotations[0].gold,
+    annotations[1].gold,
+    toleranceMs
+  );
+  validateAdjudication(
+    benchmarkCase.adjudication,
+    prefix,
+    requiresAdjudication,
+    reviewerIds,
+    issues
+  );
+  if (
+    !requiresAdjudication &&
+    isRecord(benchmarkCase.adjudication) &&
+    benchmarkCase.adjudication.status === "not-needed" &&
+    (annotationsDisagreeBeyondTolerance(annotations[0].gold, benchmarkCase.gold, toleranceMs) ||
+      annotationsDisagreeBeyondTolerance(annotations[1].gold, benchmarkCase.gold, toleranceMs))
+  ) {
+    issues.push(
+      `${prefix}.gold 必须与两份独立标注保持在容差内；否则需要记录第三人仲裁。`
+    );
+  }
+}
+
+function validateAdjudication(
+  value: unknown,
+  prefix: string,
+  required: boolean,
+  reviewerIds: ReadonlySet<string>,
+  issues: string[]
+): void {
+  const field = `${prefix}.adjudication`;
+  if (!isRecord(value)) {
+    issues.push(`${field} 真实关系必须记录是否需要仲裁。`);
+    return;
+  }
+  if (value.status !== "not-needed" && value.status !== "resolved") {
+    issues.push(`${field}.status 必须为 not-needed 或 resolved。`);
+  }
+  validateRequiredString(value.note, `${field}.note`, issues);
+  if (required) {
+    if (value.status !== "resolved") {
+      issues.push(`${field} 两份独立标注超出容差或结构不一致，必须完成仲裁。`);
+    }
+    if (!isNonEmptyString(value.adjudicatorId)) {
+      issues.push(`${field}.adjudicatorId 仲裁时必须填写。`);
+    } else if (reviewerIds.has(value.adjudicatorId)) {
+      issues.push(`${field}.adjudicatorId 必须独立于两名原始复核者。`);
+    }
+  } else if (value.status === "not-needed" && value.adjudicatorId !== null) {
+    issues.push(`${field}.adjudicatorId 无需仲裁时必须为 null。`);
+  }
+}
+
+function isBenchmarkContentIdentity(value: unknown): value is RealMediaBenchmarkContentIdentity {
+  return (
+    isRecord(value) &&
+    value.algorithm === "sha256-full-file-v2" &&
+    isNonNegativeInteger(value.sizeBytes) &&
+    value.sizeBytes > 0 &&
+    typeof value.digest === "string" &&
+    SHA256_HEX.test(value.digest)
+  );
+}
+
+interface AnnotationBoundaryVector {
+  key: string;
+  values: number[];
+}
+
+function annotationsDisagreeBeyondTolerance(
+  first: unknown,
+  second: unknown,
+  toleranceMs: number
+): boolean {
+  const firstVectors = collectAnnotationBoundaryVectors(first);
+  const secondVectors = collectAnnotationBoundaryVectors(second);
+  if (firstVectors === null || secondVectors === null || firstVectors.length !== secondVectors.length) {
+    return true;
+  }
+  return firstVectors.some((firstVector, index) => {
+    const secondVector = secondVectors[index];
+    return (
+      secondVector === undefined ||
+      firstVector.key !== secondVector.key ||
+      firstVector.values.length !== secondVector.values.length ||
+      firstVector.values.some(
+        (value, valueIndex) =>
+          Math.abs(value - (secondVector.values[valueIndex] ?? Number.POSITIVE_INFINITY)) > toleranceMs
+      )
+    );
+  });
+}
+
+function collectAnnotationBoundaryVectors(gold: unknown): AnnotationBoundaryVector[] | null {
+  if (!isRecord(gold) || !Array.isArray(gold.matchedAnchors)) {
+    return null;
+  }
+  const totalRange = [gold.sourceStartMs, gold.sourceEndMs, gold.targetStartMs, gold.targetEndMs];
+  if (!totalRange.every(isNonNegativeInteger)) {
+    return null;
+  }
+  const vectors: AnnotationBoundaryVector[] = [
+    { key: "total-range", values: totalRange }
+  ];
+  const anchors = gold.matchedAnchors
+    .map((anchor) => {
+      if (
+        !isRecord(anchor) ||
+        !isNonEmptyString(anchor.id) ||
+        !isNonNegativeInteger(anchor.sourceMs) ||
+        !isNonNegativeInteger(anchor.targetMs)
+      ) {
+        return null;
+      }
+      return {
+        key: `anchor:${anchor.id}`,
+        values: [anchor.sourceMs, anchor.targetMs]
+      } satisfies AnnotationBoundaryVector;
+    })
+    .filter((item): item is AnnotationBoundaryVector => item !== null)
+    .sort((left, right) => left.key.localeCompare(right.key));
+  if (anchors.length !== gold.matchedAnchors.length) {
+    return null;
+  }
+  vectors.push(...anchors);
+  for (const kind of EDIT_KINDS) {
+    const field = `${kind}Spans`;
+    const rawSpansValue: unknown = gold[field];
+    if (!Array.isArray(rawSpansValue)) {
+      return null;
+    }
+    const spans: TimeMapSpan[] = [];
+    for (const spanValue of rawSpansValue as unknown[]) {
+      if (!isTimeMapSpan(spanValue) || spanValue.kind !== kind) {
+        return null;
+      }
+      spans.push(spanValue);
+    }
+    spans.sort(
+      (left, right) =>
+        left.sourceStartMs - right.sourceStartMs ||
+        left.targetStartMs - right.targetStartMs ||
+        left.sourceEndMs - right.sourceEndMs ||
+        left.targetEndMs - right.targetEndMs
+    );
+    spans.forEach((span, index) =>
+      vectors.push({
+        key: `${kind}:${index}`,
+        values: [span.sourceStartMs, span.sourceEndMs, span.targetStartMs, span.targetEndMs]
+      })
+    );
+  }
+  return vectors;
 }
 
 function validateGold(value: unknown, casePrefix: string, issues: string[]): void {

@@ -193,7 +193,11 @@ export type MediaTimeMapVerificationMethod = "automatic-calibration" | "manual-r
  * 只有在本次运行中由明确的领域签发函数创建时才可信。这样不能靠导入任意 JSON
  * 把时间图提升为 verified。
  */
-export interface MediaTimeMapVerificationRecord {
+/**
+ * C137 首个预览版记录。它没有持久化签名，只能作为旧审计信息保留，不能在保存重开后
+ * 恢复人工信任。
+ */
+export interface LegacyMediaTimeMapVerificationRecord {
   recordVersion: 1;
   method: MediaTimeMapVerificationMethod;
   mapCoreDigest: string;
@@ -205,6 +209,48 @@ export interface MediaTimeMapVerificationRecord {
   verifier: string;
   verifiedAt: string;
 }
+
+export interface MediaTimeMapVerificationRevocation {
+  recordVersion: 1;
+  verificationId: string;
+  issuerKeyId: string;
+  issuerSequence: number;
+  signatureAlgorithm: "hmac-sha256-v1";
+  signature: string;
+  reason: string;
+  revokedBy: string;
+  revokedAt: string;
+}
+
+/**
+ * 由桌面端安装级验证机构签发的人工复核凭据。签名密钥和撤销注册表均不进入项目 JSON；
+ * 因此仅修改项目文件不能伪造或恢复一份已撤销凭据。换机或本机密钥丢失时必须
+ * fail-closed，重新完成人工复核。
+ */
+export interface SignedManualMediaTimeMapVerificationRecord {
+  recordVersion: 2;
+  method: "manual-review";
+  verificationId: string;
+  issuerKeyId: string;
+  issuerSequence: number;
+  signatureAlgorithm: "hmac-sha256-v1";
+  signature: string;
+  requestDigest: string;
+  mapCoreDigest: string;
+  mapRevision: number;
+  sourceIdentity: MediaContentIdentity;
+  targetIdentity: MediaContentIdentity;
+  calibrationArtifactId: string;
+  calibrationArtifactVersion: string;
+  reviewEvidenceDigest: string;
+  verifier: string;
+  verifiedAt: string;
+  revocation: MediaTimeMapVerificationRevocation | null;
+}
+
+export type MediaTimeMapVerificationRecord =
+  | LegacyMediaTimeMapVerificationRecord
+  | SignedManualMediaTimeMapVerificationRecord;
 
 /** 来源（B 站/XML 时间轴）到目标原片时间轴的正式分段映射。 */
 export interface MediaTimeMap {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyManualMediaTimeMapVerification } from "../alignment/mediaTimeMap";
+import { applyTestManualMediaTimeMapVerification as applyManualMediaTimeMapVerification } from "../../test/manualVerification";
 import type { AlignmentProposal } from "../alignment/types";
 import type { DanmakuClip } from "../danmaku/types";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";

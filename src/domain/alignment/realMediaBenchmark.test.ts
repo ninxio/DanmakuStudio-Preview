@@ -51,6 +51,17 @@ describe("C137 真实媒体 manifest", () => {
     expect(validation.issues.join("\n")).toContain("licenseNotes");
   });
 
+  it("拒绝缺少冻结集治理字段的旧 v1 清单", () => {
+    const manifest = createManifest([createBidirectionalCase()]);
+    const legacy = structuredClone(manifest) as unknown as Record<string, unknown>;
+    legacy.schemaVersion = 1;
+
+    const validation = validateRealMediaBenchmarkManifest(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("v1 缺少媒体身份、双人标注和冻结集治理字段");
+  });
+
   it("拒绝只在时间轴局部放置 anchor 的真实关系", () => {
     const benchmarkCase = createTargetOnlyCase("real");
     benchmarkCase.gold.matchedAnchors = benchmarkCase.gold.matchedAnchors.slice(0, 2);
@@ -59,6 +70,40 @@ describe("C137 真实媒体 manifest", () => {
 
     expect(validation.valid).toBe(false);
     expect(validation.issues.join("\n")).toContain("至少需要 5 个独立 matched anchor");
+  });
+
+  it("真实关系必须绑定全文件身份、冻结分组和两份独立标注", () => {
+    const benchmarkCase = createTargetOnlyCase("real");
+    benchmarkCase.source.contentIdentity = null;
+    benchmarkCase.independentAnnotations = benchmarkCase.independentAnnotations.slice(0, 1);
+    benchmarkCase.boundaryToleranceMs = 250;
+
+    const validation = validateRealMediaBenchmarkManifest(createManifest([benchmarkCase]));
+    const issues = validation.issues.join("\n");
+
+    expect(validation.valid).toBe(false);
+    expect(issues).toContain("全文件 SHA-256");
+    expect(issues).toContain("至少需要两名独立复核者");
+    expect(issues).toContain("40–100ms");
+  });
+
+  it("两份标注的边界超出容差时必须由第三人仲裁", () => {
+    const benchmarkCase = createTargetOnlyCase("real");
+    benchmarkCase.independentAnnotations[1].gold.targetOnlySpans[0].targetEndMs += 500;
+
+    const unresolved = validateRealMediaBenchmarkManifest(createManifest([benchmarkCase]));
+    expect(unresolved.valid).toBe(false);
+    expect(unresolved.issues.join("\n")).toContain("必须完成仲裁");
+
+    benchmarkCase.adjudication = {
+      status: "resolved",
+      adjudicatorId: "reviewer-gamma",
+      note: "第三名复核者逐帧确认后采用 adjudicated gold。"
+    };
+    expect(validateRealMediaBenchmarkManifest(createManifest([benchmarkCase]))).toEqual({
+      valid: true,
+      issues: []
+    });
   });
 });
 
@@ -210,6 +255,7 @@ describe("C137 纯 TimeMap 评测", () => {
 
   it("真实样本规模或必需场景不足时 gate 必须是 insufficient-data", () => {
     const benchmarkCase = createTargetOnlyCase("real");
+    benchmarkCase.split = "development";
     const result = evaluateSingle(benchmarkCase, createTargetOnlySpans());
 
     expect(result.realMediaOverall.relationCount).toBe(1);
@@ -220,6 +266,12 @@ describe("C137 纯 TimeMap 评测", () => {
       {
         passed: false,
         actual: 1
+      }
+    );
+    expect(result.gate.dataChecks.find((check) => check.id === "frozen-test-ratio")).toMatchObject(
+      {
+        passed: false,
+        actual: 0
       }
     );
   });
@@ -236,6 +288,10 @@ describe("C137 纯 TimeMap 评测", () => {
       ];
       benchmarkCase.gold.targetOnlySpans = [targetOnly(2_000, 2_000, 2_100)];
       benchmarkCase.gold.ambiguousSpans = [ambiguous(3_000, 3_100, 3_100, 3_200)];
+      benchmarkCase.independentAnnotations = [
+        { reviewerId: "reviewer-alpha", gold: structuredClone(benchmarkCase.gold) },
+        { reviewerId: "reviewer-beta", gold: structuredClone(benchmarkCase.gold) }
+      ];
       return benchmarkCase;
     });
     const predictions = cases.map((benchmarkCase) => ({
@@ -266,7 +322,7 @@ function evaluateSingle(benchmarkCase: RealMediaBenchmarkCase, spans: TimeMapSpa
 
 function createManifest(cases: RealMediaBenchmarkCase[]): RealMediaBenchmarkManifest {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: "unit-real-media-benchmark",
     name: "单元测试基准",
     datasetVersion: "unit-1",
@@ -282,6 +338,7 @@ function createMediaInput(side: "source" | "target") {
     path: `C:\\unit-test\\${side}.mkv`,
     audioStreamIndex: 1,
     videoStreamIndex: 0,
+    contentIdentity: null,
     versionNote: `${side} 单元测试版本`,
     licenseNote: "程序构造路径，不指向真实媒体。"
   };
@@ -290,16 +347,19 @@ function createMediaInput(side: "source" | "target") {
 function createBidirectionalCase(
   mediaKind: RealMediaBenchmarkMediaKind = "synthetic"
 ): RealMediaBenchmarkCase {
-  return {
+  return finalizeBenchmarkCase({
     id: "bidirectional-edits",
     title: "双边编辑与 ambiguous",
     mediaKind,
+    split: "development",
     scenarios: ["source-only", "target-only", "ambiguous", "multi-edit"],
     source: createMediaInput("source"),
     target: createMediaInput("target"),
     boundaryToleranceMs: 250,
     versionNotes: ["程序构造的双边编辑。"],
     licenseNotes: ["不包含真实媒体。"],
+    independentAnnotations: [],
+    adjudication: null,
     gold: {
       sourceStartMs: 0,
       sourceEndMs: 30_000,
@@ -317,7 +377,7 @@ function createBidirectionalCase(
       targetOnlySpans: [targetOnly(10_000, 10_000, 15_000)],
       ambiguousSpans: [ambiguous(25_000, 27_000, 28_000, 31_000)]
     }
-  };
+  });
 }
 
 function createBidirectionalSpans(): TimeMapSpan[] {
@@ -333,16 +393,19 @@ function createBidirectionalSpans(): TimeMapSpan[] {
 }
 
 function createNoEditCase(): RealMediaBenchmarkCase {
-  return {
+  return finalizeBenchmarkCase({
     id: "delay-and-drift",
     title: "全局延迟与线性漂移",
     mediaKind: "synthetic",
+    split: "development",
     scenarios: ["global-offset", "time-stretch"],
     source: createMediaInput("source"),
     target: createMediaInput("target"),
     boundaryToleranceMs: 250,
     versionNotes: ["程序构造的单位斜率 gold。"],
     licenseNotes: ["不包含真实媒体。"],
+    independentAnnotations: [],
+    adjudication: null,
     gold: {
       sourceStartMs: 0,
       sourceEndMs: 10_000,
@@ -357,22 +420,25 @@ function createNoEditCase(): RealMediaBenchmarkCase {
       targetOnlySpans: [],
       ambiguousSpans: []
     }
-  };
+  });
 }
 
 function createTargetOnlyCase(
   mediaKind: RealMediaBenchmarkMediaKind = "synthetic"
 ): RealMediaBenchmarkCase {
-  return {
+  return finalizeBenchmarkCase({
     id: "target-only-cut",
     title: "原片独有内容",
     mediaKind,
+    split: "development",
     scenarios: ["target-only"],
     source: createMediaInput("source"),
     target: createMediaInput("target"),
     boundaryToleranceMs: 250,
     versionNotes: ["程序构造的 5 秒 targetOnly。"],
     licenseNotes: ["不包含真实媒体。"],
+    independentAnnotations: [],
+    adjudication: null,
     gold: {
       sourceStartMs: 0,
       sourceEndMs: 20_000,
@@ -398,7 +464,36 @@ function createTargetOnlyCase(
       targetOnlySpans: [targetOnly(10_000, 10_000, 15_000)],
       ambiguousSpans: []
     }
+  });
+}
+
+function finalizeBenchmarkCase(benchmarkCase: RealMediaBenchmarkCase): RealMediaBenchmarkCase {
+  if (benchmarkCase.mediaKind !== "real") {
+    return benchmarkCase;
+  }
+  const digestSeed = benchmarkCase.id.includes("target") ? "a" : "b";
+  benchmarkCase.split = "frozen-test";
+  benchmarkCase.boundaryToleranceMs = 100;
+  benchmarkCase.source.contentIdentity = {
+    algorithm: "sha256-full-file-v2",
+    sizeBytes: 1_024,
+    digest: digestSeed.repeat(64)
   };
+  benchmarkCase.target.contentIdentity = {
+    algorithm: "sha256-full-file-v2",
+    sizeBytes: 2_048,
+    digest: (digestSeed === "a" ? "b" : "c").repeat(64)
+  };
+  benchmarkCase.independentAnnotations = [
+    { reviewerId: "reviewer-alpha", gold: structuredClone(benchmarkCase.gold) },
+    { reviewerId: "reviewer-beta", gold: structuredClone(benchmarkCase.gold) }
+  ];
+  benchmarkCase.adjudication = {
+    status: "not-needed",
+    adjudicatorId: null,
+    note: "两名独立复核者的边界在 100ms 容差内一致。"
+  };
+  return benchmarkCase;
 }
 
 function createTargetOnlySpans(): TimeMapSpan[] {

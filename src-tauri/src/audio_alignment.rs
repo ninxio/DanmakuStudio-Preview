@@ -2,9 +2,11 @@ use crate::{
     alignment_v2::{
         align_features_edit_aware_with_cancel, extract_fine_features_with_cancel,
         extract_landmarks_with_cancel, match_landmarks_affine_with_cancel,
-        refine_boundary_by_correlation_with_cancel, AffineHypothesis, AffineMatchConfig,
-        BoundaryRefinementConfig, EditAlignmentConfig, EditAlignmentMode, EditPathKind,
-        EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig, SpectralLandmark,
+        refine_boundary_by_correlation_with_cancel,
+        refine_boundary_by_one_sided_correlation_with_cancel, AffineHypothesis, AffineMatchConfig,
+        BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig, EditAlignmentMode,
+        EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
+        SpectralLandmark,
     },
     media_probe::{
         probe_audio_decode_timelines_with_ffprobe, probe_media_content_identity,
@@ -78,7 +80,8 @@ const OFFSET_PATH_STABLE_SUPPORT_RATIO: f64 = 0.7;
 const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.0-rust";
-const ALIGNMENT_V2_FEATURE_VERSION: &str = "pcm-s16le-16k-pts-async-landmark48-fine50-v2";
+const ALIGNMENT_V2_FEATURE_VERSION: &str =
+    "pcm-s16le-16k-pts-async-landmark48-fine50-dual-boundary-v3";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -414,6 +417,7 @@ struct V2BoundarySummary {
     refined_count: usize,
     ambiguous_count: usize,
     max_uncertainty_ms: Option<u64>,
+    evidence_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1135,6 +1139,7 @@ where
         boundary_summary.refined_count,
         boundary_summary.ambiguous_count
     ));
+    extraction_notes.extend(boundary_summary.evidence_notes.iter().cloned());
     let mut proposal = create_v2_alignment_proposal(
         chunk_alignment,
         boundary_summary,
@@ -2025,58 +2030,105 @@ fn refine_v2_span_boundaries(
     cancel_flag: Option<&AtomicBool>,
 ) -> V2BoundarySummary {
     let mut summary = V2BoundarySummary::default();
-    if spans.len() < 2 {
-        summary.max_uncertainty_ms = Some(0);
-        return summary;
-    }
+    let mut edit_side_refined = vec![[false; 2]; spans.len()];
+    let mut non_edit_ambiguity_count = 0usize;
     for boundary_index in 1..spans.len() {
         if check_cancelled(cancel_flag).is_err() {
-            summary.ambiguous_count = summary.ambiguous_count.saturating_add(1);
             return summary;
         }
         let left = &spans[boundary_index - 1];
         let right = &spans[boundary_index];
-        if matches!(
-            left.kind,
-            AudioTimeMapSpanKind::SourceOnly | AudioTimeMapSpanKind::Ambiguous
-        ) || matches!(
-            right.kind,
-            AudioTimeMapSpanKind::SourceOnly | AudioTimeMapSpanKind::Ambiguous
-        ) {
-            // Correlation currently moves the target boundary only. A sourceOnly edit needs a
-            // symmetric source-axis refinement; until that exists, report unknown and block
-            // instead of claiming a fabricated 0 ms uncertainty.
-            summary.ambiguous_count += 1;
+        if left.kind == AudioTimeMapSpanKind::Ambiguous
+            || right.kind == AudioTimeMapSpanKind::Ambiguous
+        {
+            non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
+            continue;
+        }
+        let left_is_edit = is_v2_edit_span(left.kind);
+        let right_is_edit = is_v2_edit_span(right.kind);
+        if left_is_edit && right_is_edit {
+            summary.evidence_notes.push(format!(
+                "删减边界 #{} 两侧都是单轴内容，缺少共同音频上下文，不能精修。",
+                boundary_index
+            ));
             continue;
         }
         let Ok(source_boundary_ms) = i64::try_from(left.source_end_ms) else {
+            non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
             continue;
         };
         let Ok(target_boundary_ms) = i64::try_from(left.target_end_ms) else {
+            non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
             continue;
         };
         summary.attempted_count += 1;
-        let result = match refine_boundary_by_correlation_with_cancel(
-            source_pcm,
-            target_pcm,
-            source_boundary_ms,
-            target_boundary_ms,
-            &BoundaryRefinementConfig {
-                sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-                source_presentation_offset_ms: v2_normalized_pcm_origin_ms(source_input),
-                target_presentation_offset_ms: v2_normalized_pcm_origin_ms(target_input),
-                search_radius_ms: 500,
-                window_ms: 300,
-                score_tolerance: 0.01,
-                min_correlation: 0.50,
-                min_alternative_margin: 0.005,
-                max_uncertainty_ms: 150,
-            },
-            cancel_flag,
-        ) {
+        let edit_context = if right_is_edit {
+            Some((
+                boundary_index,
+                0usize,
+                right.kind,
+                BoundaryContextSide::Before,
+            ))
+        } else if left_is_edit {
+            Some((
+                boundary_index - 1,
+                1usize,
+                left.kind,
+                BoundaryContextSide::After,
+            ))
+        } else {
+            None
+        };
+        let result = match edit_context {
+            Some((_, _, AudioTimeMapSpanKind::SourceOnly, context_side)) => {
+                // Swap the axes: target content is the fixed reference and the source boundary
+                // is searched. This is the symmetric operation that the old implementation
+                // lacked for sourceOnly edits.
+                refine_boundary_by_one_sided_correlation_with_cancel(
+                    target_pcm,
+                    source_pcm,
+                    target_boundary_ms,
+                    source_boundary_ms,
+                    context_side,
+                    &v2_boundary_refinement_config(target_input, source_input),
+                    cancel_flag,
+                )
+            }
+            Some((_, _, AudioTimeMapSpanKind::TargetOnly, context_side)) => {
+                refine_boundary_by_one_sided_correlation_with_cancel(
+                    source_pcm,
+                    target_pcm,
+                    source_boundary_ms,
+                    target_boundary_ms,
+                    context_side,
+                    &v2_boundary_refinement_config(source_input, target_input),
+                    cancel_flag,
+                )
+            }
+            Some(_) => unreachable!("edit_context only contains single-axis spans"),
+            None => refine_boundary_by_correlation_with_cancel(
+                source_pcm,
+                target_pcm,
+                source_boundary_ms,
+                target_boundary_ms,
+                &v2_boundary_refinement_config(source_input, target_input),
+                cancel_flag,
+            ),
+        };
+        let result = match result {
             Ok(result) => result,
-            Err(_) => {
-                summary.ambiguous_count += 1;
+            Err(error) => {
+                if let Some((edit_index, _, edit_kind, context_side)) = edit_context {
+                    summary.evidence_notes.push(format!(
+                        "{} span #{} 的{}边界精修失败：{}",
+                        format_v2_span_kind(edit_kind),
+                        edit_index + 1,
+                        format_v2_context_side(context_side),
+                        redact_sensitive_media_text(&error)
+                    ));
+                } else {
+                    non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
+                }
                 continue;
             }
         };
@@ -2087,32 +2139,146 @@ fn refine_v2_span_boundaries(
                 .max(result.uncertainty_ms.max(0) as u64),
         );
         if result.ambiguous {
-            summary.ambiguous_count += 1;
+            if let Some((edit_index, _, edit_kind, context_side)) = edit_context {
+                summary.evidence_notes.push(format!(
+                    "{} span #{} 的{}边界存在多个相关峰：corr {:.3}，margin {:.3}，候选范围 [{}，{}] ms。",
+                    format_v2_span_kind(edit_kind),
+                    edit_index + 1,
+                    format_v2_context_side(context_side),
+                    result.best_correlation,
+                    result.alternative_margin,
+                    result.uncertainty_start_ms,
+                    result.uncertainty_end_ms
+                ));
+            } else {
+                non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
+            }
             continue;
         }
-        let Ok(refined_target_ms) = u64::try_from(result.refined_target_boundary_ms) else {
-            summary.ambiguous_count += 1;
+        let Ok(refined_axis_ms) = u64::try_from(result.refined_target_boundary_ms) else {
+            if edit_context.is_none() {
+                non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
+            }
             continue;
         };
-        let previous_target_start = spans[boundary_index - 1].target_start_ms;
-        let next_target_end = spans[boundary_index].target_end_ms;
-        if refined_target_ms < previous_target_start || refined_target_ms > next_target_end {
-            summary.ambiguous_count += 1;
-            continue;
-        }
-        let old_left_end = spans[boundary_index - 1].target_end_ms;
-        let old_right_start = spans[boundary_index].target_start_ms;
-        spans[boundary_index - 1].target_end_ms = refined_target_ms;
-        spans[boundary_index].target_start_ms = refined_target_ms;
+        let refine_source_axis =
+            edit_context.is_some_and(|(_, _, kind, _)| kind == AudioTimeMapSpanKind::SourceOnly);
+        let (old_left_end, old_right_start) = if refine_source_axis {
+            let old = (
+                spans[boundary_index - 1].source_end_ms,
+                spans[boundary_index].source_start_ms,
+            );
+            spans[boundary_index - 1].source_end_ms = refined_axis_ms;
+            spans[boundary_index].source_start_ms = refined_axis_ms;
+            old
+        } else {
+            let old = (
+                spans[boundary_index - 1].target_end_ms,
+                spans[boundary_index].target_start_ms,
+            );
+            spans[boundary_index - 1].target_end_ms = refined_axis_ms;
+            spans[boundary_index].target_start_ms = refined_axis_ms;
+            old
+        };
         if validate_v2_time_map_spans(spans).is_ok() {
             summary.refined_count += 1;
+            if let Some((edit_index, edit_side, edit_kind, context_side)) = edit_context {
+                edit_side_refined[edit_index][edit_side] = true;
+                summary.evidence_notes.push(format!(
+                    "{} span #{} 的{}边界已用{}单侧共同音频精修：{} -> {} ms，不确定范围 [{}，{}] ms（corr {:.3}，margin {:.3}）。",
+                    format_v2_span_kind(edit_kind),
+                    edit_index + 1,
+                    if edit_side == 0 { "起始" } else { "结束" },
+                    format_v2_context_side(context_side),
+                    result.coarse_target_boundary_ms,
+                    result.refined_target_boundary_ms,
+                    result.uncertainty_start_ms,
+                    result.uncertainty_end_ms,
+                    result.best_correlation,
+                    result.alternative_margin
+                ));
+            }
         } else {
-            spans[boundary_index - 1].target_end_ms = old_left_end;
-            spans[boundary_index].target_start_ms = old_right_start;
-            summary.ambiguous_count += 1;
+            if refine_source_axis {
+                spans[boundary_index - 1].source_end_ms = old_left_end;
+                spans[boundary_index].source_start_ms = old_right_start;
+            } else {
+                spans[boundary_index - 1].target_end_ms = old_left_end;
+                spans[boundary_index].target_start_ms = old_right_start;
+            }
+            if edit_context.is_none() {
+                non_edit_ambiguity_count = non_edit_ambiguity_count.saturating_add(1);
+            }
         }
     }
+    for (span_index, span) in spans.iter().enumerate() {
+        if !is_v2_edit_span(span.kind) {
+            continue;
+        }
+        for (side_index, refined) in edit_side_refined[span_index].iter().enumerate() {
+            if !refined {
+                summary.ambiguous_count = summary.ambiguous_count.saturating_add(1);
+                summary.evidence_notes.push(format!(
+                    "{} span #{} 缺少可靠的{}侧共同音频边界证据；不会把粗 DP 边界冒充精确时间。",
+                    format_v2_span_kind(span.kind),
+                    span_index + 1,
+                    if side_index == 0 {
+                        "删减前"
+                    } else {
+                        "删减后"
+                    }
+                ));
+            }
+        }
+    }
+    summary.ambiguous_count = summary
+        .ambiguous_count
+        .saturating_add(non_edit_ambiguity_count);
+    if summary.max_uncertainty_ms.is_none() && !spans.iter().any(|span| is_v2_edit_span(span.kind))
+    {
+        summary.max_uncertainty_ms = Some(0);
+    }
     summary
+}
+
+fn is_v2_edit_span(kind: AudioTimeMapSpanKind) -> bool {
+    matches!(
+        kind,
+        AudioTimeMapSpanKind::SourceOnly | AudioTimeMapSpanKind::TargetOnly
+    )
+}
+
+fn v2_boundary_refinement_config(
+    fixed_input: &AlignmentAudioInput,
+    searched_input: &AlignmentAudioInput,
+) -> BoundaryRefinementConfig {
+    BoundaryRefinementConfig {
+        sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+        source_presentation_offset_ms: v2_normalized_pcm_origin_ms(fixed_input),
+        target_presentation_offset_ms: v2_normalized_pcm_origin_ms(searched_input),
+        search_radius_ms: 500,
+        window_ms: 300,
+        score_tolerance: 0.01,
+        min_correlation: 0.50,
+        min_alternative_margin: 0.005,
+        max_uncertainty_ms: 150,
+    }
+}
+
+fn format_v2_span_kind(kind: AudioTimeMapSpanKind) -> &'static str {
+    match kind {
+        AudioTimeMapSpanKind::Matched => "matched",
+        AudioTimeMapSpanKind::SourceOnly => "sourceOnly",
+        AudioTimeMapSpanKind::TargetOnly => "targetOnly",
+        AudioTimeMapSpanKind::Ambiguous => "ambiguous",
+    }
+}
+
+fn format_v2_context_side(side: BoundaryContextSide) -> &'static str {
+    match side {
+        BoundaryContextSide::Before => "删减前",
+        BoundaryContextSide::After => "删减后",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6694,6 +6860,162 @@ mod tests {
         assert!(status.success(), "FFmpeg V2 fixture 生成失败");
     }
 
+    fn generate_v2_vfr_ffmpeg_fixture(
+        output_path: &Path,
+        primary_audio_filter: &str,
+        video_select_filter: &str,
+        output_offset: &str,
+    ) {
+        let filter_complex =
+            format!("{primary_audio_filter};[1:v]{video_select_filter},format=yuv420p[v]");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc=exprs=0.45*sin(2*PI*(180+23*t)*t)+0.3*sin(2*PI*(620+11*t)*t)+0.2*sin(2*PI*(1200+7*t)*t):s=16000:d=16",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=30:duration=16",
+                "-filter_complex",
+                &filter_complex,
+                "-map",
+                "[main]",
+                "-map",
+                "[v]",
+                "-c:a",
+                "pcm_s16le",
+                "-c:v",
+                "ffv1",
+                "-fps_mode:v:0",
+                "vfr",
+                "-avoid_negative_ts",
+                "disabled",
+                "-output_ts_offset",
+                output_offset,
+            ])
+            .arg(output_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "FFmpeg VFR fixture 生成失败");
+    }
+
+    fn probe_video_frame_pts_ms(path: &Path) -> Vec<i64> {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_frames",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "FFprobe VFR PTS 失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<f64>().ok())
+            .map(|seconds| (seconds * 1_000.0).round() as i64)
+            .collect()
+    }
+
+    fn assert_genuine_vfr_pts(path: &Path, expected_start_ms: i64) {
+        let pts = probe_video_frame_pts_ms(path);
+        assert!(pts.len() > 80, "VFR 帧数过少：{}", pts.len());
+        assert!(pts.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(
+            pts[0].abs_diff(expected_start_ms) <= 150,
+            "首个保留视频帧 PTS={} ms，容器展示起点={} ms",
+            pts[0],
+            expected_start_ms
+        );
+        let deltas = pts
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<HashSet<_>>();
+        assert!(deltas.len() >= 3, "视频帧 PTS 仍近似固定间隔：{deltas:?}");
+        let min_delta = *deltas.iter().min().unwrap();
+        let max_delta = *deltas.iter().max().unwrap();
+        assert!(max_delta - min_delta >= 30, "VFR PTS 差异不足：{deltas:?}");
+    }
+
+    fn assert_v2_bilateral_edit_gold(time_map: &AudioAlignmentTimeMapDto) {
+        let source_only_spans = time_map
+            .spans
+            .iter()
+            .filter(|span| span.kind == AudioTimeMapSpanKind::SourceOnly)
+            .collect::<Vec<_>>();
+        let target_only_spans = time_map
+            .spans
+            .iter()
+            .filter(|span| span.kind == AudioTimeMapSpanKind::TargetOnly)
+            .collect::<Vec<_>>();
+        assert_eq!(source_only_spans.len(), 1, "spans={:?}", time_map.spans);
+        assert_eq!(target_only_spans.len(), 1, "spans={:?}", time_map.spans);
+        let source_only = source_only_spans[0];
+        let target_only = target_only_spans[0];
+        assert!(source_only.source_start_ms.abs_diff(10_000) <= 200);
+        assert!(source_only.source_end_ms.abs_diff(11_000) <= 200);
+        assert!(source_only.target_start_ms.abs_diff(11_220) <= 250);
+        assert_eq!(source_only.target_start_ms, source_only.target_end_ms);
+        assert!(target_only.source_start_ms.abs_diff(5_000) <= 200);
+        assert_eq!(target_only.source_start_ms, target_only.source_end_ms);
+        assert!(target_only.target_start_ms.abs_diff(5_100) <= 250);
+        assert!(target_only.target_end_ms.abs_diff(6_120) <= 250);
+        let source_only_ms = source_only_spans
+            .iter()
+            .map(|span| span.source_end_ms - span.source_start_ms)
+            .sum::<u64>();
+        let target_only_ms = target_only_spans
+            .iter()
+            .map(|span| span.target_end_ms - span.target_start_ms)
+            .sum::<u64>();
+        assert!(
+            (700..=1_300).contains(&source_only_ms),
+            "sourceOnly={source_only_ms}, spans={:?}",
+            time_map.spans
+        );
+        assert!(
+            (700..=1_400).contains(&target_only_ms),
+            "targetOnly={target_only_ms}, spans={:?}",
+            time_map.spans
+        );
+        for (kind, expected_side_count) in [
+            ("sourceOnly", source_only_spans.len() * 2),
+            ("targetOnly", target_only_spans.len() * 2),
+        ] {
+            let refined_side_count = time_map
+                .evidence
+                .notes
+                .iter()
+                .filter(|note| note.contains(&format!("{kind} span #")) && note.contains("已用"))
+                .count();
+            assert_eq!(
+                refined_side_count, expected_side_count,
+                "{kind} 缺少双侧证据：{:?}",
+                time_map.evidence.notes
+            );
+        }
+        assert!(time_map
+            .quality
+            .boundary_uncertainty_ms
+            .is_some_and(|value| value <= 150));
+        validate_v2_time_map_spans(&time_map.spans).unwrap();
+    }
+
     fn localization_target_frames(count: usize) -> Vec<AudioFeatureFrame> {
         (0..count)
             .map(|index| AudioFeatureFrame {
@@ -7288,7 +7610,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_unrefined_source_only_boundaries_are_unknown_and_blocking() {
+    fn v2_silent_source_only_boundaries_are_attempted_but_remain_blocking() {
         let mut spans = vec![
             AudioTimeMapSpanDto {
                 kind: AudioTimeMapSpanKind::Matched,
@@ -7322,10 +7644,14 @@ mod tests {
             None,
         );
 
-        assert_eq!(summary.attempted_count, 0);
+        assert_eq!(summary.attempted_count, 2);
         assert_eq!(summary.refined_count, 0);
         assert_eq!(summary.ambiguous_count, 2);
-        assert_eq!(summary.max_uncertainty_ms, None);
+        assert!(summary.max_uncertainty_ms.is_some_and(|value| value >= 150));
+        assert!(summary
+            .evidence_notes
+            .iter()
+            .any(|note| note.contains("不会把粗 DP 边界冒充精确时间")));
     }
 
     #[test]
@@ -7413,17 +7739,122 @@ mod tests {
             time_map.source_stream.as_ref().unwrap().timeline_offset_ms,
             Some(0)
         );
-        assert!(time_map
-            .spans
-            .iter()
-            .any(|span| { span.kind == AudioTimeMapSpanKind::SourceOnly }));
-        assert!(time_map
-            .spans
-            .iter()
-            .any(|span| { span.kind == AudioTimeMapSpanKind::TargetOnly }));
+        assert_v2_bilateral_edit_gold(time_map);
         assert!(time_map.evidence.selected_track_reason.contains("音轨 #0"));
         assert!((time_map.evidence.alternative_track_scores[0].scale - 1.02).abs() < 0.01);
-        validate_v2_time_map_spans(&time_map.spans).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ffmpeg_v2_vfr_container_keeps_audio_pts_and_bilateral_edit_boundaries() {
+        if !ffmpeg_test_tools_available() {
+            eprintln!("跳过 Alignment V2 VFR 金标准：ffmpeg/ffprobe 不可用。");
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "alignment-v2-vfr-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source-vfr-negative-pts.mkv");
+        let target_path = directory.join("target-vfr-positive-pts.mkv");
+        generate_v2_vfr_ffmpeg_fixture(
+            &source_path,
+            "[0:a]asplit=2[x0][x1];[x0]atrim=start=0:end=5,asetpts=PTS-STARTPTS[a0];[x1]atrim=start=6:end=16,asetpts=PTS-STARTPTS[a1];[a0][a1]concat=n=2:v=0:a=1[main]",
+            "select=not(mod(n\\,2))+not(mod(n\\,5))",
+            "-0.25",
+        );
+        generate_v2_vfr_ffmpeg_fixture(
+            &target_path,
+            "[0:a]asplit=2[x0][x1];[x0]atrim=start=0:end=11,asetpts=PTS-STARTPTS[a0];[x1]atrim=start=12:end=16,asetpts=PTS-STARTPTS[a1];[a0][a1]concat=n=2:v=0:a=1,atempo=0.980392[main]",
+            "select=not(mod(n\\,3))+not(mod(n\\,7))",
+            "0.5",
+        );
+
+        assert_genuine_vfr_pts(&source_path, -250);
+        assert_genuine_vfr_pts(&target_path, 500);
+        let source_snapshot =
+            probe_media_timeline_with_ffprobe(&source_path.to_string_lossy(), Path::new("ffprobe"))
+                .unwrap();
+        let target_snapshot =
+            probe_media_timeline_with_ffprobe(&target_path.to_string_lossy(), Path::new("ffprobe"))
+                .unwrap();
+        let source_audio = source_snapshot.audio_streams.first().unwrap();
+        let target_audio = target_snapshot.audio_streams.first().unwrap();
+        assert_eq!(source_audio.start_time_ms, -250);
+        assert_eq!(target_audio.start_time_ms, 500);
+        assert_eq!(source_audio.timeline_offset_ms, 0);
+        assert_eq!(target_audio.timeline_offset_ms, 0);
+        let source_decode_timeline = probe_audio_decode_timelines_with_ffprobe(
+            &source_path.to_string_lossy(),
+            Path::new("ffprobe"),
+        )
+        .unwrap();
+        let target_decode_timeline = probe_audio_decode_timelines_with_ffprobe(
+            &target_path.to_string_lossy(),
+            Path::new("ffprobe"),
+        )
+        .unwrap();
+        assert_eq!(
+            source_decode_timeline
+                .get(&source_audio.stream_index)
+                .and_then(|timeline| timeline.first_decoded_pts_ms),
+            Some(-250)
+        );
+        assert_eq!(
+            target_decode_timeline
+                .get(&target_audio.stream_index)
+                .and_then(|timeline| timeline.first_decoded_pts_ms),
+            Some(500)
+        );
+
+        let proposal = align_audio_files_inner(AudioAlignmentRequest {
+            complete_path: target_path.to_string_lossy().to_string(),
+            source_path: source_path.to_string_lossy().to_string(),
+            ffmpeg_path: Some("ffmpeg".to_string()),
+            ffprobe_path: Some("ffprobe".to_string()),
+            complete_audio_stream_index: None,
+            source_audio_stream_index: None,
+            sample_rate: None,
+            window_ms: None,
+            match_threshold: None,
+            min_gap_ms: None,
+            max_cells: Some(ALIGNMENT_V2_MAX_DP_CELLS),
+            enable_visual_evidence: Some(false),
+            visual_sample_interval_ms: None,
+            localization_mode: Some(true),
+        })
+        .unwrap();
+        let time_map = proposal
+            .time_map
+            .as_ref()
+            .expect("VFR 容器应输出音频时间图");
+
+        assert_eq!(
+            time_map.source_stream.as_ref().unwrap().stream_type,
+            "audio"
+        );
+        assert_eq!(
+            time_map.target_stream.as_ref().unwrap().stream_type,
+            "audio"
+        );
+        assert_eq!(
+            time_map.source_stream.as_ref().unwrap().start_ms,
+            Some(-250)
+        );
+        assert_eq!(time_map.target_stream.as_ref().unwrap().start_ms, Some(500));
+        assert_eq!(
+            time_map.source_stream.as_ref().unwrap().timeline_offset_ms,
+            Some(0)
+        );
+        assert_eq!(
+            time_map.target_stream.as_ref().unwrap().timeline_offset_ms,
+            Some(0)
+        );
+        assert_eq!(time_map.evidence.types, vec!["audio"]);
+        assert_v2_bilateral_edit_gold(time_map);
+        assert!((time_map.evidence.alternative_track_scores[0].scale - 1.02).abs() < 0.01);
         let _ = std::fs::remove_dir_all(directory);
     }
 

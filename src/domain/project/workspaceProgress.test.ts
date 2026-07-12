@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyManualMediaTimeMapVerification } from "../alignment/mediaTimeMap";
+import { applyTestManualMediaTimeMapVerification as applyManualMediaTimeMapVerification } from "../../test/manualVerification";
 import { createDanmakuSourceSegment } from "./sourceTimeline";
 import { createEmptyProject } from "./factory";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";

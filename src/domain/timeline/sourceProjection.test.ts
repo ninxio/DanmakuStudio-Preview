@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { migrateLegacyTimeMap, type TimeMapSpan } from "../alignment/timeMap";
-import { applyManualMediaTimeMapVerification } from "../alignment/mediaTimeMap";
+import { applyTestManualMediaTimeMapVerification as applyManualMediaTimeMapVerification } from "../../test/manualVerification";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "../project/factory";
 import { createDanmakuSourceBinding } from "../project/mediaLibrary";

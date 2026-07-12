@@ -12,11 +12,11 @@ describe("媒体适配器", () => {
     const bridge = createBridge();
     const adapter = new TauriMpvMediaAdapter("C:\\tools\\mpv.exe", bridge);
 
-    await adapter.load({ kind: "file", name: "full.mkv", url: "D:\\media\\full.mkv" });
+    await adapter.load({ kind: "file", name: "full.mkv", url: "D:\\media\\full.mkv" }, 8_765);
     expect(bridge.start).toHaveBeenCalledWith({
       mpvPath: "C:\\tools\\mpv.exe",
       mediaPath: "D:\\media\\full.mkv",
-      startPositionMs: 0,
+      startPositionMs: 8_765,
       startPaused: true
     });
     expect(adapter.getDurationMs()).toBe(3_000_000);
@@ -39,7 +39,10 @@ describe("媒体适配器", () => {
     expect(bridge.control).toHaveBeenCalledWith({ action: "play" });
     expect(bridge.control).toHaveBeenCalledWith({ action: "seek", positionMs: 12_345 });
     expect(bridge.control).toHaveBeenCalledWith({ action: "pause" });
-    expect(bridge.control).toHaveBeenCalledWith({ action: "setPlaybackRate", playbackRate: 1.25 });
+    expect(bridge.control).toHaveBeenCalledWith({
+      action: "setPlaybackRate",
+      playbackRate: 1.25
+    });
 
     adapter.dispose();
     expect(bridge.stop).toHaveBeenCalledTimes(1);
@@ -47,17 +50,27 @@ describe("媒体适配器", () => {
 
   it("mpv 适配器拒绝 blob URL 和空 mpv 路径", async () => {
     const bridge = createBridge();
-    await expect(new TauriMpvMediaAdapter("", bridge).load({ kind: "file", name: "demo", url: "D:\\demo.mkv" }))
-      .rejects.toThrow("尚未配置 mpv 路径");
     await expect(
-      new TauriMpvMediaAdapter("mpv", bridge).load({ kind: "file", name: "demo", url: "blob:demo" })
+      new TauriMpvMediaAdapter("", bridge).load({
+        kind: "file",
+        name: "demo",
+        url: "D:\\demo.mkv"
+      })
+    ).rejects.toThrow("尚未配置 mpv 路径");
+    await expect(
+      new TauriMpvMediaAdapter("mpv", bridge).load({
+        kind: "file",
+        name: "demo",
+        url: "blob:demo"
+      })
     ).rejects.toThrow("真实本地文件路径");
   });
 
   it("mpv 适配器可以加载本次会话的 Emby 授权播放地址", async () => {
     const bridge = createBridge();
     const adapter = new TauriMpvMediaAdapter("C:\\tools\\mpv.exe", bridge);
-    const url = "https://emby.example.test/Videos/item/stream?api_key=secret-token&MediaSourceId=source-1";
+    const url =
+      "https://emby.example.test/Videos/item/stream?api_key=secret-token&MediaSourceId=source-1";
 
     await adapter.load({ kind: "url", name: "Episode 1", url });
 

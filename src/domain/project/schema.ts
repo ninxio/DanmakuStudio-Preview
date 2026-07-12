@@ -1140,12 +1140,41 @@ function isMediaTimeMapVerificationRecordOrNull(
   if (value === null) {
     return true;
   }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.recordVersion === 2) {
+    return (
+      value.method === "manual-review" &&
+      isNonEmptyString(value.verificationId) &&
+      isNonEmptyString(value.issuerKeyId) &&
+      isPositiveInteger(value.issuerSequence) &&
+      value.signatureAlgorithm === "hmac-sha256-v1" &&
+      isLowerHex(value.signature, 64) &&
+      isSha256Digest(value.requestDigest) &&
+      isSha256Digest(value.mapCoreDigest) &&
+      isPositiveInteger(value.mapRevision) &&
+      isMediaContentIdentity(value.sourceIdentity) &&
+      isMediaContentIdentity(value.targetIdentity) &&
+      isNonEmptyString(value.calibrationArtifactId) &&
+      isNonEmptyString(value.calibrationArtifactVersion) &&
+      isSha256Digest(value.reviewEvidenceDigest) &&
+      isNonEmptyString(value.verifier) &&
+      isNonEmptyString(value.verifiedAt) &&
+      isMediaTimeMapVerificationRevocationOrNull(
+        value.revocation,
+        value.verificationId,
+        value.issuerKeyId,
+        value.issuerSequence
+      )
+    );
+  }
   return (
-    isRecord(value) &&
     value.recordVersion === 1 &&
     (value.method === "automatic-calibration" || value.method === "manual-review") &&
     typeof value.mapCoreDigest === "string" &&
-    /^fnv1a64:[0-9a-f]{16}$/.test(value.mapCoreDigest) &&
+    (/^fnv1a64:[0-9a-f]{16}$/.test(value.mapCoreDigest) ||
+      isSha256Digest(value.mapCoreDigest)) &&
     isPositiveInteger(value.mapRevision) &&
     isMediaContentIdentity(value.sourceIdentity) &&
     isMediaContentIdentity(value.targetIdentity) &&
@@ -1154,6 +1183,36 @@ function isMediaTimeMapVerificationRecordOrNull(
     isNonEmptyString(value.verifier) &&
     isNonEmptyString(value.verifiedAt)
   );
+}
+
+function isMediaTimeMapVerificationRevocationOrNull(
+  value: unknown,
+  verificationId: string,
+  issuerKeyId: string,
+  issueSequence: number
+): boolean {
+  return (
+    value === null ||
+    (isRecord(value) &&
+      value.recordVersion === 1 &&
+      value.verificationId === verificationId &&
+      value.issuerKeyId === issuerKeyId &&
+      isPositiveInteger(value.issuerSequence) &&
+      value.issuerSequence > issueSequence &&
+      value.signatureAlgorithm === "hmac-sha256-v1" &&
+      isLowerHex(value.signature, 64) &&
+      isNonEmptyString(value.reason) &&
+      isNonEmptyString(value.revokedBy) &&
+      isNonEmptyString(value.revokedAt))
+  );
+}
+
+function isSha256Digest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function isLowerHex(value: unknown, length: number): value is string {
+  return typeof value === "string" && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
 }
 
 function isTimeMapSpan(value: unknown): boolean {

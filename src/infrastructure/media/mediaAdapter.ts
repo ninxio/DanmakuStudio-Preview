@@ -16,7 +16,7 @@ export interface MediaSource {
 }
 
 export interface MediaAdapter {
-  load(source: MediaSource): Promise<void>;
+  load(source: MediaSource, startPositionMs?: Milliseconds): Promise<void>;
   play(): Promise<void>;
   pause(): void;
   seek(timeMs: Milliseconds): void;
@@ -34,7 +34,7 @@ export class HtmlVideoMediaAdapter implements MediaAdapter {
     this.video = video;
   }
 
-  async load(source: MediaSource): Promise<void> {
+  async load(source: MediaSource, startPositionMs: Milliseconds = 0): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const onLoaded = (): void => {
         cleanup();
@@ -42,7 +42,11 @@ export class HtmlVideoMediaAdapter implements MediaAdapter {
       };
       const onError = (): void => {
         cleanup();
-        reject(new Error("HTML Video 无法播放此视频。请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。"));
+        reject(
+          new Error(
+            "HTML Video 无法播放此视频。请改用 MP4/WebM；MKV 或复杂编码需要后续启用 mpv 播放器。"
+          )
+        );
       };
       const cleanup = (): void => {
         this.video.removeEventListener("loadedmetadata", onLoaded);
@@ -53,6 +57,7 @@ export class HtmlVideoMediaAdapter implements MediaAdapter {
       this.video.src = source.url;
       this.video.load();
     });
+    this.seek(startPositionMs);
   }
 
   async play(): Promise<void> {
@@ -113,9 +118,14 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
     this.bridge = bridge;
   }
 
-  async load(source: MediaSource): Promise<void> {
+  async load(
+    source: MediaSource,
+    startPositionMs: Milliseconds = this.currentTimeMs
+  ): Promise<void> {
     if (this.mpvPath.length === 0) {
-      throw new Error("尚未配置 mpv 路径。请在“设置中心 / 播放器与工具”里选择 mpv 可执行文件。");
+      throw new Error(
+        "尚未配置 mpv 路径。请在“设置中心 / 播放器与工具”里选择 mpv 可执行文件。"
+      );
     }
     if (!isSupportedMpvSource(source)) {
       throw new Error("mpv 播放需要真实本地文件路径，或本次会话生成的 Emby 授权播放地址。");
@@ -124,7 +134,7 @@ export class TauriMpvMediaAdapter implements NativeMpvMediaAdapter {
       {
         mpvPath: this.mpvPath,
         mediaPath: source.url,
-        startPositionMs: this.currentTimeMs,
+        startPositionMs: Math.max(0, Math.round(startPositionMs)),
         startPaused: true
       },
       this.bridge

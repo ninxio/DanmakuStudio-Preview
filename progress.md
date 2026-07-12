@@ -1,3 +1,14 @@
+- 2026-07-12：C137 完成第二阶段“真实 A/B 复核、持久签发与双侧边界精修”里程碑并重新打包；目标仍保持进行中，真实冻结集样本数仍为 **0**，不得宣称准确率、校准或性能验收完成。
+  - A/B 复核闭环：匹配页现在直接使用项目内参考 A 与原片 B，按 TimeMap 在共同内容间仿射同步切换，并支持当前段、段首前后 3 秒、段尾前后 3 秒循环；任一时刻只播放一侧音频。`sourceOnly/targetOnly` 的另一侧只作为边界上下文，不伪装逐帧映射；四类人工判定为“参考多出 / 原片多出 / 版本替换 / 无法判断”，不兼容判定会 fail-closed。
+  - 播放证据与显式签发：每个 span 必须保存与媒体 ID、span kind 和四个边界绑定的 `manual-playback-review:v1` token；共同段要求 A/B 两侧真实启动，单侧差异还要求双方段首/段尾上下文。自动分析、接受候选和保存项目都不会签发，只有用户点击“完成复核并签发”且无歧义、差异已分类、质量达门槛时才进入 native 签发。
+  - 持久信任链：移除进程内对象身份信任，v11 record v2 改为 SHA-256 规范化核心摘要与安装级 HMAC-SHA256；Tauri 使用系统随机 secret、不可变原子签发/撤销事件和持久撤销注册表。项目打开先降为 `review` 再异步核验；换机、密钥丢失、注册表损坏、项目 JSON 篡改、跨项目迟到结果和核验期间编辑都不能错误恢复 `verified`。当前威胁边界不覆盖能读写同账户应用数据目录的恶意本地进程。
+  - 双向局部边界：音频路径在编辑边界前后分别做单侧相关与峰值竞争，`targetOnly` 精修目标轴、`sourceOnly` 交换轴后精修来源轴；每个编辑必须同时具备左右证据，输出 coarse→refined、相关度、margin 和双侧不确定范围，静态、缺侧或多峰证据继续阻断。视觉回退仍只负责粗仿射关系，不冒充局部边界证据。
+  - FFmpeg 金标准：新增正/负 PTS、评论音轨规避、1.02 速度漂移、双向 1 秒编辑、四边界误差与不确定范围回归；另用真实非均匀视频帧 PTS 验证至少三种帧间隔和 30ms 以上差值，确保 VFR 下的音频 PTS 主链仍恢复漂移与双向删增，且不依赖固定 FPS 或视觉兜底。
+  - 真实基准治理：manifest 升级为不兼容的 v2，真实 case 强制 `development/frozen-test`、`sha256-full-file-v2` 身份、40–100ms 标注容差、至少两名独立标注者及必要的第三方仲裁，冻结测试占比不得低于 30%；本地 preflight 去重探测媒体、核对全文件身份和显式音视频流，公开结果不泄露本地路径或实测哈希。示例仍是 placeholder，不能计入准确率。
+  - 自动验收：`audit:source`、ESLint、production/Tauri build、`git diff --check`、`cargo check --all-targets`、严格 Clippy 与格式检查均通过；Vitest 为 70 个文件 / 521 项，Rust 为 89/89，Chromium E2E 为 4/4。E2E 覆盖四类判定启禁矩阵、mpv 启动失败时不产生播放证据、签发命令零调用、5 个未验证分集全部阻断；目检截图为 `c137-four-kind-review.png`、`c137-ab-review-fail-closed.png`、`c137-manual-signing-fail-closed.png` 和 `c137-export-gate-blocked.png`。
+  - 第二阶段 release：安装器 `src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `3400582` 字节，SHA256 `A36C66F31BEA422BE5BB3CBAD7424ECE50A24BFCD1E59260760E99629D6ABB7E`；portable exe 为 `src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `13487616` 字节，SHA256 `9EACCCF2CDBEB05722302E57A51EB312F8BADF967B99B6E0B2145E89636B769D`。本阶段 checkpoint 标签为 `checkpoint/c137-ab-review-verification-20260712`。
+  - 尚未完成：真实媒体关系仍为 0，因而没有统计概率校准、规定硬件性能报告、1000 个冻结关系判断或 20 套北极星长合集 5/5 验收；播放 token 当前证明播放调用真实开始及覆盖轴/边界，尚未累计最小播放时长。以上门槛未满足前，C137 不得标记完成或开放自动 `verified`。
+
 - 2026-07-12：C137“真实媒体高精度时间映射引擎”完成第一阶段工程主链并进入安全预览；目标仍保持进行中，真实冻结集样本数为 **0**，不得宣称高精度、准确率通过或自动 `verified`。
   - 目标与门槛：新增 `docs/goals/C137-high-precision-time-map.md`，明确 PTS、多音轨、速度漂移、双向增删、重复内容、独立视觉、边界不确定度、真实金标准、校准和性能门槛；真实样本、双人标注、1000 个冻结关系判断和 20 套北极星合集尚未建立，因此 C137 不能标记完成。
   - P0 安全降级：旧引擎不再显示高可信或“没有删减”，不能批量确认；旧单对单“视频对齐实验室”和重复路径选择入口已退役，只保留手工 JSON 只读诊断。自动分析唯一入口为匹配页项目素材批量匹配。

@@ -95,6 +95,27 @@ import {
   updateMediaMatchCandidateRange as updateProjectMediaMatchCandidateRange,
   type MediaMatchRangePatch
 } from "../domain/alignment/mediaMatching";
+import {
+  reviewCandidateTimeMapSpan as reviewProjectCandidateTimeMapSpan,
+  type TimeMapSpanReviewDecision
+} from "../domain/alignment/timeMapReviewDecision";
+import {
+  recordCandidateTimeMapSpanPlaybackReview as recordProjectTimeMapSpanPlaybackReview,
+  type TimeMapSpanPlaybackEvidence
+} from "../domain/alignment/timeMapPlaybackReviewEvidence";
+import {
+  assessMediaTimeMapVerification,
+  clearRegisteredManualMediaTimeMapVerificationTrust,
+  computeMediaTimeMapCoreDigest,
+  reconcileMediaTimeMapQuality,
+  type ManualMediaTimeMapVerificationInput,
+  type ManualMediaTimeMapVerificationRevocationInput
+} from "../domain/alignment/mediaTimeMap";
+import {
+  issuePersistedManualMediaTimeMapVerification,
+  rehydrateProjectManualMediaTimeMapVerifications,
+  revokePersistedManualMediaTimeMapVerification
+} from "../infrastructure/media/manualVerificationAuthority";
 import { createAlignmentApplyBlockers } from "../domain/alignment/alignmentReport";
 import {
   isAlignmentAnchorApplied,
@@ -159,8 +180,26 @@ interface EditorStore {
   importMediaPaths: (paths: string[], role: ProjectMediaRole) => void;
   addMediaMatchCandidate: (candidate: MediaMatchCandidate) => void;
   updateMediaMatchCandidateRange: (candidateId: string, patch: MediaMatchRangePatch) => void;
+  reviewCandidateTimeMapSpan: (
+    timeMapId: string,
+    spanIndex: number,
+    decision: TimeMapSpanReviewDecision
+  ) => void;
+  recordTimeMapSpanPlaybackReview: (
+    timeMapId: string,
+    spanIndex: number,
+    evidence: TimeMapSpanPlaybackEvidence
+  ) => void;
   acceptMediaMatchCandidate: (candidateId: string, assetIds: string[]) => void;
-  revokeMediaMatchCandidateAcceptance: (candidateId: string) => void;
+  issueManualMediaTimeMapVerification: (
+    timeMapId: string,
+    input: ManualMediaTimeMapVerificationInput
+  ) => Promise<void>;
+  revokeManualMediaTimeMapVerification: (
+    timeMapId: string,
+    input: ManualMediaTimeMapVerificationRevocationInput
+  ) => Promise<void>;
+  revokeMediaMatchCandidateAcceptance: (candidateId: string) => Promise<void>;
   rejectMediaMatchCandidate: (candidateId: string) => void;
   importVideoFile: (file: File) => void;
   removeMedia: () => void;
@@ -432,6 +471,50 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
   },
 
+  reviewCandidateTimeMapSpan: (timeMapId, spanIndex, decision) => {
+    try {
+      commitProject(set, get, "记录时间图差异分类", (project) =>
+        reviewProjectCandidateTimeMapSpan(
+          project,
+          timeMapId,
+          spanIndex,
+          decision,
+          new Date().toISOString()
+        )
+      );
+      set({
+        status: {
+          message: "已保存这一段的人工分类；整张时间图仍需完成验证后才能导出。",
+          tone: "success"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法保存这一段的人工分类", error) });
+    }
+  },
+
+  recordTimeMapSpanPlaybackReview: (timeMapId, spanIndex, evidence) => {
+    try {
+      commitProject(set, get, "记录真实 A/B 播放复核", (project) =>
+        recordProjectTimeMapSpanPlaybackReview(
+          project,
+          timeMapId,
+          spanIndex,
+          evidence,
+          new Date().toISOString()
+        )
+      );
+      set({
+        status: {
+          message: "已保存本段真实 A/B 播放复核证据。",
+          tone: "success"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法保存 A/B 播放复核证据", error) });
+    }
+  },
+
   acceptMediaMatchCandidate: (candidateId, assetIds) => {
     try {
       const beforeCount = get().project.danmakuSourceSegments.length;
@@ -450,12 +533,143 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
     }
   },
 
-  revokeMediaMatchCandidateAcceptance: (candidateId) => {
+  issueManualMediaTimeMapVerification: async (timeMapId, input) => {
+    const snapshot = get();
+    const timeMap = snapshot.project.mediaTimeMaps.find((item) => item.id === timeMapId);
+    if (!timeMap) {
+      set({ status: { message: "待签发的时间图不存在。", tone: "error" } });
+      return;
+    }
+    const projectEpoch = snapshot.projectEpoch;
+    const coreDigest = computeMediaTimeMapCoreDigest(timeMap);
     try {
-      commitProject(set, get, "撤销媒体匹配确认", (project) =>
-        revokeProjectMediaMatchCandidateAcceptance(project, candidateId)
-      );
-      set({ status: { message: "已撤销匹配确认，候选已恢复到复核队列。", tone: "success" } });
+      const issued = await issuePersistedManualMediaTimeMapVerification(timeMap, input);
+      const current = get();
+      const currentMap = current.project.mediaTimeMaps.find((item) => item.id === timeMapId);
+      if (
+        current.projectEpoch !== projectEpoch ||
+        !currentMap ||
+        computeMediaTimeMapCoreDigest(currentMap) !== coreDigest
+      ) {
+        try {
+          await revokePersistedManualMediaTimeMapVerification(issued, {
+            reason: "签发期间项目或时间图发生变化，未应用的凭据已由竞态保护撤销。",
+            revokedBy: "system:stale-project-guard",
+            revokedAt: new Date().toISOString()
+          });
+        } catch {
+          // Native issue registry remains the authority. A later project open still rechecks it;
+          // never attach this stale seal to a different project even if compensating revoke fails.
+        }
+        if (get().projectEpoch === projectEpoch) {
+          set({
+            status: {
+              message: "签发期间时间图发生变化，未把旧验证写回项目；请重新完成复核。",
+              tone: "warning"
+            }
+          });
+        }
+        return;
+      }
+      commitProject(set, get, "签发人工时间图验证", (project) => ({
+        ...project,
+        mediaTimeMaps: project.mediaTimeMaps.map((item) =>
+          item.id === timeMapId ? issued : item
+        )
+      }));
+      set({ status: { message: "人工复核凭据已由本机签发并写入项目。", tone: "success" } });
+    } catch (error) {
+      if (get().projectEpoch === projectEpoch) {
+        set({ status: createErrorStatus("人工验证签发失败", error) });
+      }
+    }
+  },
+
+  revokeManualMediaTimeMapVerification: async (timeMapId, input) => {
+    const snapshot = get();
+    const timeMap = snapshot.project.mediaTimeMaps.find((item) => item.id === timeMapId);
+    if (!timeMap) {
+      set({ status: { message: "待撤销验证的时间图不存在。", tone: "error" } });
+      return;
+    }
+    const projectEpoch = snapshot.projectEpoch;
+    const coreDigest = computeMediaTimeMapCoreDigest(timeMap);
+    try {
+      const revoked = await revokePersistedManualMediaTimeMapVerification(timeMap, input);
+      const current = get();
+      const currentMap = current.project.mediaTimeMaps.find((item) => item.id === timeMapId);
+      if (
+        current.projectEpoch !== projectEpoch ||
+        !currentMap ||
+        computeMediaTimeMapCoreDigest(currentMap) !== coreDigest
+      ) {
+        return;
+      }
+      commitProject(set, get, "撤销人工时间图验证", (project) => ({
+        ...project,
+        mediaTimeMaps: project.mediaTimeMaps.map((item) =>
+          item.id === timeMapId ? revoked : item
+        )
+      }));
+      set({ status: { message: "人工验证已写入本机撤销注册表。", tone: "success" } });
+    } catch (error) {
+      if (get().projectEpoch === projectEpoch) {
+        set({ status: createErrorStatus("人工验证撤销失败", error) });
+      }
+    }
+  },
+
+  revokeMediaMatchCandidateAcceptance: async (candidateId) => {
+    const snapshot = get();
+    const candidate = snapshot.project.mediaMatchCandidates.find(
+      (item) => item.id === candidateId
+    );
+    const confirmedMap = candidate?.confirmedTimeMapId
+      ? snapshot.project.mediaTimeMaps.find((map) => map.id === candidate.confirmedTimeMapId)
+      : null;
+    const hasUntrustedForeignVerification =
+      confirmedMap?.verification?.recordVersion === 2 &&
+      confirmedMap.verification.revocation === null &&
+      !assessMediaTimeMapVerification(confirmedMap).trusted;
+    let revokedVerifiedMap = confirmedMap ?? null;
+    try {
+      if (
+        confirmedMap?.verification?.recordVersion === 2 &&
+        confirmedMap.verification.revocation === null &&
+        assessMediaTimeMapVerification(confirmedMap).trusted
+      ) {
+        revokedVerifiedMap = await revokePersistedManualMediaTimeMapVerification(confirmedMap, {
+          reason: "用户撤销了对应媒体匹配关系。",
+          revokedBy: "user:match-revocation",
+          revokedAt: new Date().toISOString()
+        });
+        if (
+          get().projectEpoch !== snapshot.projectEpoch ||
+          get().project.mediaMatchCandidates.find((item) => item.id === candidateId)
+            ?.confirmedTimeMapId !== candidate?.confirmedTimeMapId
+        ) {
+          return;
+        }
+      }
+      commitProject(set, get, "撤销媒体匹配确认", (project) => {
+        const withRevocation = revokedVerifiedMap
+          ? {
+              ...project,
+              mediaTimeMaps: project.mediaTimeMaps.map((map) =>
+                map.id === revokedVerifiedMap?.id ? revokedVerifiedMap : map
+              )
+            }
+          : project;
+        return revokeProjectMediaMatchCandidateAcceptance(withRevocation, candidateId);
+      });
+      set({
+        status: {
+          message: hasUntrustedForeignVerification
+            ? "已撤销匹配确认；旧签名不受本机信任，无法修改原安装撤销注册表，已仅作为 superseded 审计保留。"
+            : "已撤销匹配确认，候选已恢复到复核队列。",
+          tone: "success"
+        }
+      });
     } catch (error) {
       set({ status: createErrorStatus("无法撤销匹配确认", error) });
     }
@@ -861,8 +1075,20 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
 
   openProjectFromText: (text, sourceFileName) => {
     try {
-      const { project: parsedProject, migration } = parseProjectJsonWithMetadata(text);
+      const { project: parsedWithCachedTrust, migration } = parseProjectJsonWithMetadata(text);
+      clearRegisteredManualMediaTimeMapVerificationTrust();
+      const parsedProject: EditorProject = {
+        ...parsedWithCachedTrust,
+        mediaTimeMaps: parsedWithCachedTrust.mediaTimeMaps.map((map) =>
+          reconcileMediaTimeMapQuality(
+            map.verification?.recordVersion === 2
+              ? { ...map, quality: { ...map.quality, level: "verified" } }
+              : map
+          )
+        )
+      };
       const project = reconcileMediaMatchCandidates(parsedProject, parsedProject.updatedAt);
+      const projectEpoch = get().projectEpoch + 1;
       revokeProjectObjectUrls(get().project);
       set({
         project,
@@ -871,8 +1097,30 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         exportDraft: null,
         alignmentProposal: project.alignmentProposal,
         timelineTool: "select",
-        projectEpoch: get().projectEpoch + 1,
+        projectEpoch,
         status: createOpenProjectStatus(project.name, migration)
+      });
+      void rehydrateProjectManualMediaTimeMapVerifications(project).then((rehydrated) => {
+        set((state) => {
+          if (state.projectEpoch !== projectEpoch) {
+            return {};
+          }
+          const merged = mergeRehydratedManualVerificationMaps(
+            state.project,
+            project,
+            rehydrated
+          );
+          return {
+            project: merged.project,
+            status:
+              merged.restoredCount > 0
+                ? {
+                    message: `已打开项目“${merged.project.name}”，并通过本机签发/撤销注册表恢复 ${merged.restoredCount} 张人工验证时间图。`,
+                    tone: "success"
+                  }
+                : state.status
+          };
+        });
       });
     } catch (error) {
       set({
@@ -1798,6 +2046,45 @@ function commitProject(
     selection: selection ?? state.selection,
     exportDraft: null
   }));
+}
+
+function mergeRehydratedManualVerificationMaps(
+  currentProject: EditorProject,
+  openedSnapshot: EditorProject,
+  rehydratedSnapshot: EditorProject
+): { project: EditorProject; restoredCount: number } {
+  const openedById = new Map(openedSnapshot.mediaTimeMaps.map((map) => [map.id, map]));
+  const rehydratedById = new Map(rehydratedSnapshot.mediaTimeMaps.map((map) => [map.id, map]));
+  let restoredCount = 0;
+  const mediaTimeMaps = currentProject.mediaTimeMaps.map((currentMap) => {
+    const openedMap = openedById.get(currentMap.id);
+    const rehydratedMap = rehydratedById.get(currentMap.id);
+    if (
+      !openedMap ||
+      !rehydratedMap ||
+      !hasSameManualVerificationHydrationInput(currentMap, openedMap)
+    ) {
+      return currentMap;
+    }
+    if (rehydratedMap.quality.level === "verified") {
+      restoredCount += 1;
+    }
+    return rehydratedMap;
+  });
+  return { project: { ...currentProject, mediaTimeMaps }, restoredCount };
+}
+
+function hasSameManualVerificationHydrationInput(
+  currentMap: EditorProject["mediaTimeMaps"][number],
+  openedMap: EditorProject["mediaTimeMaps"][number]
+): boolean {
+  return (
+    currentMap.revision === openedMap.revision &&
+    currentMap.state === openedMap.state &&
+    currentMap.updatedAt === openedMap.updatedAt &&
+    computeMediaTimeMapCoreDigest(currentMap) === computeMediaTimeMapCoreDigest(openedMap) &&
+    JSON.stringify(currentMap.verification) === JSON.stringify(openedMap.verification)
+  );
 }
 
 function revokeProjectObjectUrls(project: EditorProject): void {

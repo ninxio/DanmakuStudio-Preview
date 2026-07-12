@@ -54,7 +54,27 @@ Emby 绑定只代表“这个项目对应哪一集、哪个媒体源”，不等
 
 schema v10/v11 下，自动候选先保存 candidate `MediaTimeMap`，接受后复制为独立 confirmed revision，来源段只通过 `timeMapId` 引用它。正式投影只读取 confirmed map：`matched` 使用整数端点有理插值，`sourceOnly` 明确舍弃参考独有弹幕，`targetOnly` 推动后续目标边界，`ambiguous` 阻断导出。旧 `targetStartMs + timingRules` 只用于迁移兼容，不能消费 V2 结果。
 
-`verified` 需要 v11 verification record 精确绑定规范化 map 摘要、revision、双端全文件 SHA-256 身份和校准来源；当前自动 calibration 白名单为空。媒体身份由 Rust 从同一文件句柄流式计算，并在分析前后、导出预检和 native 写盘前重复核验。任何缺失、替换、竞态或 provenance 不一致都会安全降级或阻断。
+`verified` 需要 v11 verification record 精确绑定规范化 map SHA-256 摘要、revision、双端全文件 SHA-256 身份、复核证据摘要和签发来源；当前自动 calibration 白名单为空。规范化 map 摘要覆盖 spans、指标、非运行时 reasons/notes 和引擎 provenance。媒体身份由 Rust 从同一文件句柄流式计算，并在分析前后、导出预检和 native 写盘前重复核验。任何缺失、替换、竞态或 provenance 不一致都会安全降级或阻断。
+
+### 人工播放证据与签发信任链
+
+匹配页的双源 A/B 复核通过 `src/domain/alignment/timeMapPlaybackReviewEvidence.ts` 保存 `manual-playback-review:v1` token。token 只在媒体适配器的真实播放调用开始后写入，记录 span 索引、证据 mask 和复核时间；其中 `spanDigest` 绑定双端媒体 ID、span kind 与四个整数毫秒边界。`matched` 要求播放 A/B 两轴，单侧差异要求播放有内容的一轴并分别复核段首、段尾两侧边界；边界、kind 或媒体 ID 改变后读取函数不会承认旧 token。当前证据没有累计播放时长，因此只证明所需播放调用实际开始，不证明用户已经观看某个最小时长。
+
+人工签发入口位于 `src/domain/alignment/mediaTimeMap.ts`、`src/infrastructure/media/manualVerificationAuthority.ts` 和 `src-tauri/src/manual_verification.rs`。领域预检要求 confirmed map、完整媒体身份、每个 span 的当前播放 token、每个 `sourceOnly/targetOnly` 的对应人工分类、无 `ambiguous`，且中央实测质量达到 `verified` 门槛；`reviewEvidenceDigest` 由 map ID/revision、分类记录、播放证据、复核者和完成时间确定性重算，UI 不能自由传入摘要。只有匹配页的明确用户动作调用 native 签发，自动分析、接受候选、保存和打开项目均不会签发。
+
+native 验证机构首次使用时在 Tauri 应用本地数据目录生成 256-bit 安装级 secret，以 HMAC-SHA256 签发规范化请求。签发和撤销使用递增序号写为不可变事件文件，先写临时文件并 `sync_all`，再原子 rename；项目 JSON 只保存 record v2 的 verification ID、issuer key ID、序号、请求摘要、签名和可读撤销回执，不保存 secret 或权威注册表。撤销后的项目即使删掉 JSON 内回执，本机注册表仍返回 revoked。
+
+项目打开时，signed record 先确定性降为 `review`，再异步查询本机签发/撤销注册表；只有签名、请求摘要和 active 状态全部通过才恢复 `verified`。恢复结果按 map ID/revision/verification 输入合并，并受 `projectEpoch` 保护，不能覆盖项目切换或核验期间的其他编辑。项目换机、安装级 secret 丢失、注册表损坏或 issuer 不匹配一律 fail-closed；未受信的外机记录仍可随匹配关系撤销并保留为 superseded 审计，不能造成操作死锁。
+
+这一信任边界防止只编辑 `.danmaku-project.json` 伪造、恢复或移植 `verified`，不等于操作系统级密钥保险箱：当前 secret 与事件注册表依赖应用本地数据目录及系统账户权限，不宣称抵抗能够读取并改写同一账户应用数据的恶意本地进程。
+
+### 真实媒体 benchmark 治理
+
+`src/domain/alignment/realMediaBenchmark.ts` 的 manifest schema v2 是准确率验收的唯一结构化入口。它强制 `datasetVersion`、许可说明、`development/frozen-test` split、`real/synthetic/placeholder` 类型、显式音视频流和场景；真实关系还必须绑定 `sha256-full-file-v2` 身份、40–100ms 标注容差、至少五个覆盖五等分区间的 matched anchors、两名不同复核者的独立 gold，以及超出容差时由第三人完成的仲裁。示例 manifest 标记 `isExample=true`，禁止把 placeholder 冒充 real。
+
+`src/infrastructure/alignment/realMediaBenchmarkPreflight.ts` 在本地运行前对每个唯一路径重新执行媒体探测，核对全文件身份与指定音频/视频流；失败关系不能进入评测。媒体路径只存在于本地 manifest 和运行输入，分享结果只保留 case ID、dataset version、场景和聚合指标，不带路径或实测哈希。C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 gold 编辑事件、至少 30% 永不参与参数选择的 frozen-test，并覆盖所有必需场景；质量闸门在数据不足时不会执行或取得 `verifiedEligible`。
+
+当前仓库只有 manifest v2 的 placeholder 结构示例，真实媒体关系仍为 0；尚无统计概率校准、规定硬件性能报告或 20 套北极星长合集 5/5 验收。因此上述工程闸门不能被描述为已经通过，自动结果仍最高为 `review`。
 
 ## 匹配评分
 
