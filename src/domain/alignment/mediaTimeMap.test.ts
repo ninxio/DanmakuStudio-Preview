@@ -15,6 +15,7 @@ import {
 } from "./mediaTimeMap";
 import type { MediaContentIdentity, MediaTimeMap } from "../project/types";
 import { createTimeMapSpanPlaybackReviewToken } from "./timeMapPlaybackReviewEvidence";
+import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../../test/manualVerification";
 
 const TIMESTAMP = "2026-07-12T00:00:00.000Z";
 
@@ -383,23 +384,16 @@ function createVerificationEligibleMap(): MediaTimeMap {
 
 function attachTestPlaybackReviews(map: MediaTimeMap): MediaTimeMap {
   map.evidence.notes = map.evidence.notes.filter(
-    (note) => !note.startsWith("manual-playback-review:v1:")
+    (note) =>
+      !note.startsWith("manual-playback-review:v1:") &&
+      !note.startsWith("manual-playback-review:v2:")
   );
   map.evidence.notes.push(
-    ...map.spans.map((span, spanIndex) =>
+    ...map.spans.map((_, spanIndex) =>
       createTimeMapSpanPlaybackReviewToken(
         map,
         spanIndex,
-        {
-          spanAxes:
-            span.kind === "sourceOnly"
-              ? ["source"]
-              : span.kind === "targetOnly"
-                ? ["target"]
-                : ["source", "target"],
-          startBoundaryAxes: span.kind === "matched" ? [] : ["source", "target"],
-          endBoundaryAxes: span.kind === "matched" ? [] : ["source", "target"]
-        },
+        createTestCompleteTimeMapSpanPlaybackEvidence(map, spanIndex),
         TIMESTAMP
       )
     )

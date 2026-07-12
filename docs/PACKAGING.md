@@ -33,6 +33,18 @@ corepack pnpm tauri:build
 
 当前威胁边界是“项目 JSON 单独被修改或移机”：它不能伪造 HMAC，也不能在原安装上删除权威撤销状态。secret 目前依赖应用数据目录和系统账户权限，并非 Windows Credential Manager/TPM 密钥；具有同账户应用数据读写能力的恶意本地进程不在这一保证范围内。
 
+## C137 benchmark 与完整验收边界
+
+桌面包包含匹配页折叠的“高级：C137 精度基准”入口，但它只运行 TimeMap 组件级开发验收。用户导入本机 manifest v2 后，应用把完整清单投影成不含 gold、split、场景、复核者或仲裁答案的 blind `RunManifest`，并重新核验真实媒体的全文件身份及显式音视频流。`RunManifest` 使用 canonical JSON SHA-256 与通过的 preflight receipt 绑定；blind runner 随后调用与产品匹配相同的 Tauri `start/get/cancel_audio_alignment_job` 和 Rust Alignment V2，不使用测试预测或前端伪结果。
+
+生产请求会显式传递参考/原片音轨和视频流。Rust 结果还会回报视觉 fallback/校验实际消费的视频流，runner 必须复核这些流，且视觉缓存按实际流索引隔离。每个 case 的 sealed receipt 记录成功、失败或取消、单调时钟 wall elapsed、engine/feature、实际视觉流和去敏参数摘要。只有所有真实 case 成功并与 blind SHA-256 一致时才揭示 gold 进行组件评估；失败、取消或未确认安全退出都会令 `evaluation=null`，超时任务未退出时也不会继续启动下一 case。
+
+从高级入口下载的 JSON 采用独立 schema 和 validator，固定标记 `scope: "time-map-component"`、`releaseEligible: false`。报告不包含本地媒体路径、媒体 SHA-256、生产参数 hash 或原始诊断。组件子闸门即使通过，也不等于 release 通过，不会改变项目的人工签发状态或授予 `verified`。
+
+完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部 `trustContext`。外部信任根必须对受信 protocol、数据审批/preflight/prediction receipts 及每类 raw report evidence 提供 canonical SHA-256；内嵌 evidence digest 不能自我批准。安装包默认不携带任何审批白名单或 trust context，因此缺少外部受信摘要时必定返回 `incomplete-evidence`，保持 fail-closed。
+
+release 不携带真实媒体、gold、许可材料或 raw 性能记录。当前仓库也没有用于采集和冻结真实关系的生成器，亦没有在规定硬件上生成冷/热缓存耗时、进程树峰值 RSS、取消延迟等性能 evidence 的生成器；安装包中的 UI 与 evaluator 不能替代这些外部数据生产和审批步骤。
+
 ## Web 生产构建
 
 仅构建 Web 静态文件：

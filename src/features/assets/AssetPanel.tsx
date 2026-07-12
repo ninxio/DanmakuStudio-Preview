@@ -16,7 +16,7 @@ import {
   WandSparkles
 } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import {
   createAlignmentApplyBlockers,
@@ -144,6 +144,11 @@ import {
 import { WorkspaceProgressBanner } from "../workspace/WorkspaceProgressBanner";
 import { MediaMatchingPanel } from "../matching/MediaMatchingPanel";
 import { useEditorStore, type EditorStatus } from "../../stores/editorStore";
+
+const RealMediaBenchmarkPanel = lazy(async () => {
+  const module = await import("../matching/RealMediaBenchmarkPanel");
+  return { default: module.RealMediaBenchmarkPanel };
+});
 
 export type AssetPanelSection = "materials" | "matching" | "editing" | "export";
 type PartWindowMode = "full" | "prefix" | "suffix" | "range";
@@ -899,6 +904,15 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 text="匹配需要弹幕 XML、B 站参考素材和原片素材。"
               />
             )}
+            <Suspense
+              fallback={
+                <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-500">
+                  正在载入高级精度基准工具…
+                </section>
+              }
+            >
+              <RealMediaBenchmarkPanel />
+            </Suspense>
           </div>
         ) : null}
         {section === "export" ? (

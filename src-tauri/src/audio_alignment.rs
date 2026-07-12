@@ -111,6 +111,8 @@ pub struct AudioAlignmentRequest {
     ffprobe_path: Option<String>,
     complete_audio_stream_index: Option<u32>,
     source_audio_stream_index: Option<u32>,
+    complete_video_stream_index: Option<u32>,
+    source_video_stream_index: Option<u32>,
     sample_rate: Option<u32>,
     window_ms: Option<u64>,
     match_threshold: Option<f64>,
@@ -313,6 +315,8 @@ pub struct AudioAlignmentTimeMapDto {
     evidence: AudioTimeMapEvidenceDto,
     source_stream: Option<AudioTimeMapStreamIdentityDto>,
     target_stream: Option<AudioTimeMapStreamIdentityDto>,
+    source_visual_stream: Option<AudioTimeMapStreamIdentityDto>,
+    target_visual_stream: Option<AudioTimeMapStreamIdentityDto>,
     source_identity: Option<MediaContentIdentity>,
     target_identity: Option<MediaContentIdentity>,
     engine_version: &'static str,
@@ -2419,6 +2423,8 @@ fn create_v2_alignment_proposal(
         },
         source_stream: Some(v2_stream_identity(&pair.source_input.stream)),
         target_stream: Some(v2_stream_identity(&pair.target_input.stream)),
+        source_visual_stream: None,
+        target_visual_stream: None,
         source_identity: pair.source_input.content_identity.clone(),
         target_identity: pair.target_input.content_identity.clone(),
         engine_version: ALIGNMENT_V2_ENGINE_VERSION,
@@ -2661,6 +2667,8 @@ fn create_blocked_v2_affine_proposal(
         },
         source_stream: Some(v2_stream_identity(&pair.source_input.stream)),
         target_stream: Some(v2_stream_identity(&pair.target_input.stream)),
+        source_visual_stream: None,
+        target_visual_stream: None,
         source_identity: pair.source_input.content_identity.clone(),
         target_identity: pair.target_input.content_identity.clone(),
         engine_version: ALIGNMENT_V2_ENGINE_VERSION,
@@ -2756,8 +2764,12 @@ fn try_v2_visual_fallback(
 ) -> Result<AudioAlignmentProposal, String> {
     check_cancelled(cancel_flag)?;
     notes.push(format!("音频主路径已阻断：{audio_reason}"));
-    let source_input = match probe_alignment_visual_input(&request.source_path, "B 站参考", options)
-    {
+    let source_input = match probe_alignment_visual_input(
+        &request.source_path,
+        "B 站参考",
+        request.source_video_stream_index,
+        options,
+    ) {
         Ok(input) => input,
         Err(error) => {
             if error == AUDIO_ALIGNMENT_CANCELLED {
@@ -2770,20 +2782,24 @@ fn try_v2_visual_fallback(
             ));
         }
     };
-    let target_input =
-        match probe_alignment_visual_input(&request.complete_path, "目标原片", options) {
-            Ok(input) => input,
-            Err(error) => {
-                if error == AUDIO_ALIGNMENT_CANCELLED {
-                    return Err(error);
-                }
-                return Ok(create_blocked_visual_fallback_without_map(
-                    audio_reason,
-                    &format!("目标原片视觉不可用：{}", truncate_visual_note(&error)),
-                    notes,
-                ));
+    let target_input = match probe_alignment_visual_input(
+        &request.complete_path,
+        "目标原片",
+        request.complete_video_stream_index,
+        options,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            if error == AUDIO_ALIGNMENT_CANCELLED {
+                return Err(error);
             }
-        };
+            return Ok(create_blocked_visual_fallback_without_map(
+                audio_reason,
+                &format!("目标原片视觉不可用：{}", truncate_visual_note(&error)),
+                notes,
+            ));
+        }
+    };
     let source_features = match get_v2_visual_features(
         &request.source_path,
         "B 站参考",
@@ -3050,6 +3066,8 @@ fn create_visual_affine_fallback_proposal(
         },
         source_stream: Some(v2_video_stream_identity(&source_input.stream)),
         target_stream: Some(v2_video_stream_identity(&target_input.stream)),
+        source_visual_stream: Some(v2_video_stream_identity(&source_input.stream)),
+        target_visual_stream: Some(v2_video_stream_identity(&target_input.stream)),
         source_identity: source_input.content_identity.clone(),
         target_identity: target_input.content_identity.clone(),
         engine_version: ALIGNMENT_V2_ENGINE_VERSION,
@@ -3221,8 +3239,12 @@ fn apply_v2_visual_validation(
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<(), String> {
     check_cancelled(cancel_flag)?;
-    let source_input = match probe_alignment_visual_input(&request.source_path, "B 站参考", options)
-    {
+    let source_input = match probe_alignment_visual_input(
+        &request.source_path,
+        "B 站参考",
+        request.source_video_stream_index,
+        options,
+    ) {
         Ok(input) => input,
         Err(error) => {
             append_v2_visual_validation_unavailable(
@@ -3232,17 +3254,21 @@ fn apply_v2_visual_validation(
             return Ok(());
         }
     };
-    let target_input =
-        match probe_alignment_visual_input(&request.complete_path, "目标原片", options) {
-            Ok(input) => input,
-            Err(error) => {
-                append_v2_visual_validation_unavailable(
-                    proposal,
-                    format!("目标视频视觉校验不可用：{}", truncate_visual_note(&error)),
-                );
-                return Ok(());
-            }
-        };
+    let target_input = match probe_alignment_visual_input(
+        &request.complete_path,
+        "目标原片",
+        request.complete_video_stream_index,
+        options,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            append_v2_visual_validation_unavailable(
+                proposal,
+                format!("目标视频视觉校验不可用：{}", truncate_visual_note(&error)),
+            );
+            return Ok(());
+        }
+    };
     let source_features = match get_v2_visual_features(
         &request.source_path,
         "B 站参考",
@@ -3277,6 +3303,10 @@ fn apply_v2_visual_validation(
             return Ok(());
         }
     };
+    if let Some(time_map) = &mut proposal.time_map {
+        time_map.source_visual_stream = Some(v2_video_stream_identity(&source_input.stream));
+        time_map.target_visual_stream = Some(v2_video_stream_identity(&target_input.stream));
+    }
     let Some(time_map) = proposal.time_map.as_ref() else {
         append_v2_visual_validation_unavailable(
             proposal,
@@ -4015,6 +4045,7 @@ fn get_visual_features(
 fn probe_alignment_visual_input(
     media_path: &str,
     label: &str,
+    requested_stream_index: Option<u32>,
     options: &AudioAlignmentOptions,
 ) -> Result<AlignmentVisualInput, String> {
     let snapshot =
@@ -4033,13 +4064,7 @@ fn probe_alignment_visual_input(
             ALIGNMENT_V2_VISUAL_MAX_DURATION_MS / (60 * 60 * 1_000)
         ));
     }
-    let stream = snapshot
-        .video_streams
-        .iter()
-        .filter(|stream| !stream.is_commentary)
-        .max_by_key(|stream| (stream.is_default, std::cmp::Reverse(stream.stream_index)))
-        .cloned()
-        .ok_or_else(|| format!("{label}没有可用于视觉回退的非 commentary 视频流。"))?;
+    let stream = select_alignment_video_stream(&snapshot, requested_stream_index, label)?;
     if stream.timeline_offset_ms < 0 {
         return Err(format!(
             "{label}视频流 #{} 的展示时间偏移为负，无法安全归一化视觉 PTS。",
@@ -4052,6 +4077,28 @@ fn probe_alignment_visual_input(
         content_identity: snapshot.content_identity,
         stream,
     })
+}
+
+fn select_alignment_video_stream(
+    snapshot: &MediaProbeSnapshot,
+    requested_stream_index: Option<u32>,
+    label: &str,
+) -> Result<VideoStreamProbe, String> {
+    if let Some(stream_index) = requested_stream_index {
+        return snapshot
+            .video_streams
+            .iter()
+            .find(|stream| stream.stream_index == stream_index)
+            .cloned()
+            .ok_or_else(|| format!("{label}未找到显式指定的视频流 #{stream_index}。"));
+    }
+    snapshot
+        .video_streams
+        .iter()
+        .filter(|stream| !stream.is_commentary)
+        .max_by_key(|stream| (stream.is_default, std::cmp::Reverse(stream.stream_index)))
+        .cloned()
+        .ok_or_else(|| format!("{label}没有可用于视觉回退的非 commentary 视频流。"))
 }
 
 fn get_v2_visual_features(
@@ -6694,6 +6741,38 @@ mod tests {
         }
     }
 
+    fn test_video_stream(stream_index: u32, is_default: bool) -> VideoStreamProbe {
+        VideoStreamProbe {
+            stream_index,
+            codec_name: Some("h264".to_string()),
+            start_time_ms: 0,
+            timeline_offset_ms: 0,
+            duration_ms: Some(120_000),
+            time_base: Some("1/90000".to_string()),
+            frame_rate: Some(24.0),
+            language: None,
+            title: Some(format!("Video {stream_index}")),
+            is_default,
+            is_commentary: false,
+        }
+    }
+
+    fn test_visual_input(stream_index: u32) -> AlignmentVisualInput {
+        AlignmentVisualInput {
+            presentation_origin_ms: 0,
+            media_duration_ms: Some(120_000),
+            content_identity: Some(MediaContentIdentity {
+                algorithm: "sha256-full-file-v2",
+                size_bytes: 1_024,
+                modified_unix_ms: 1,
+                first_sample_digest: "a".repeat(64),
+                middle_sample_digest: "a".repeat(64),
+                last_sample_digest: "a".repeat(64),
+            }),
+            stream: test_video_stream(stream_index, stream_index == 1),
+        }
+    }
+
     fn frames(values: &[f64]) -> Vec<AudioFeatureFrame> {
         values
             .iter()
@@ -7112,6 +7191,8 @@ mod tests {
             },
             source_stream: None,
             target_stream: None,
+            source_visual_stream: None,
+            target_visual_stream: None,
             source_identity: None,
             target_identity: None,
             engine_version: ALIGNMENT_V2_ENGINE_VERSION,
@@ -7460,6 +7541,51 @@ mod tests {
     }
 
     #[test]
+    fn v2_explicit_video_stream_overrides_default_and_changes_cache_key() {
+        let snapshot = MediaProbeSnapshot {
+            path: "hidden-test-path.mkv".to_string(),
+            presentation_origin_ms: 0,
+            duration_ms: Some(120_000),
+            content_identity: None,
+            video_streams: vec![test_video_stream(1, true), test_video_stream(4, false)],
+            audio_streams: Vec::new(),
+            preferred_audio_stream_index: None,
+        };
+        assert_eq!(
+            select_alignment_video_stream(&snapshot, None, "测试")
+                .unwrap()
+                .stream_index,
+            1
+        );
+        assert_eq!(
+            select_alignment_video_stream(&snapshot, Some(4), "测试")
+                .unwrap()
+                .stream_index,
+            4
+        );
+        assert!(select_alignment_video_stream(&snapshot, Some(9), "测试")
+            .unwrap_err()
+            .contains("#9"));
+
+        let first = create_v2_visual_feature_cache_key(
+            "hidden-test-path.mkv",
+            &test_options(),
+            &test_visual_input(1),
+            1_000,
+        )
+        .unwrap();
+        let explicit = create_v2_visual_feature_cache_key(
+            "hidden-test-path.mkv",
+            &test_options(),
+            &test_visual_input(4),
+            1_000,
+        )
+        .unwrap();
+        assert_ne!(first, explicit);
+        assert!(explicit.contains("stream=4:"));
+    }
+
+    #[test]
     fn v2_stream_pair_uses_language_alias_as_soft_prior_and_rejects_commentary() {
         let source = test_audio_input(1, 0);
         let mut commentary = test_audio_input(2, 0);
@@ -7712,6 +7838,8 @@ mod tests {
             ffprobe_path: Some("ffprobe".to_string()),
             complete_audio_stream_index: None,
             source_audio_stream_index: None,
+            complete_video_stream_index: None,
+            source_video_stream_index: None,
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -7816,6 +7944,8 @@ mod tests {
             ffprobe_path: Some("ffprobe".to_string()),
             complete_audio_stream_index: None,
             source_audio_stream_index: None,
+            complete_video_stream_index: None,
+            source_video_stream_index: None,
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -7922,6 +8052,8 @@ mod tests {
             ffprobe_path: Some("ffprobe".to_string()),
             complete_audio_stream_index: None,
             source_audio_stream_index: None,
+            complete_video_stream_index: None,
+            source_video_stream_index: None,
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -7946,6 +8078,14 @@ mod tests {
         assert_eq!(
             time_map.target_stream.as_ref().unwrap().stream_type,
             "video"
+        );
+        assert_eq!(
+            time_map.source_visual_stream.as_ref().unwrap().index,
+            time_map.source_stream.as_ref().unwrap().index
+        );
+        assert_eq!(
+            time_map.target_visual_stream.as_ref().unwrap().index,
+            time_map.target_stream.as_ref().unwrap().index
         );
         assert!(time_map.target_start_ms.abs_diff(8_000) <= 1_000);
         assert!(time_map.evidence.types.contains(&"visual"));
@@ -8362,6 +8502,8 @@ mod tests {
             ffprobe_path: None,
             complete_audio_stream_index: None,
             source_audio_stream_index: None,
+            complete_video_stream_index: None,
+            source_video_stream_index: None,
             sample_rate: Some(8000),
             window_ms: Some(0),
             match_threshold: None,

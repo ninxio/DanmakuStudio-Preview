@@ -15,7 +15,10 @@ import {
 import type { Milliseconds } from "../shared/time";
 import { sha256Hex } from "../shared/sha256";
 import { readTimeMapSpanReviewDecision } from "./timeMapReviewDecision";
-import { readTimeMapSpanPlaybackReview } from "./timeMapPlaybackReviewEvidence";
+import {
+  readTimeMapSpanPlaybackReview,
+  summarizeTimeMapSpanPlaybackEvidence
+} from "./timeMapPlaybackReviewEvidence";
 import {
   migrateLegacyTimeMap,
   reconcileTimeMapQualityClaim,
@@ -864,14 +867,13 @@ function computeManualReviewEvidenceDigest(
     return [
       spanIndex,
       review?.spanDigest ?? null,
-      review?.spanAxes ?? null,
-      review?.startBoundaryAxes ?? null,
-      review?.endBoundaryAxes ?? null,
+      review?.policyVersion ?? null,
+      review ? summarizeTimeMapSpanPlaybackEvidence(review) : null,
       review?.reviewedAt ?? null
     ];
   });
   const canonical = JSON.stringify([
-    "manual-time-map-review-evidence-v2",
+    "manual-time-map-review-evidence-v3",
     map.id,
     map.revision,
     input.verifier,

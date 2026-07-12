@@ -72,7 +72,17 @@ native 验证机构首次使用时在 Tauri 应用本地数据目录生成 256-b
 
 `src/domain/alignment/realMediaBenchmark.ts` 的 manifest schema v2 是准确率验收的唯一结构化入口。它强制 `datasetVersion`、许可说明、`development/frozen-test` split、`real/synthetic/placeholder` 类型、显式音视频流和场景；真实关系还必须绑定 `sha256-full-file-v2` 身份、40–100ms 标注容差、至少五个覆盖五等分区间的 matched anchors、两名不同复核者的独立 gold，以及超出容差时由第三人完成的仲裁。示例 manifest 标记 `isExample=true`，禁止把 placeholder 冒充 real。
 
-`src/infrastructure/alignment/realMediaBenchmarkPreflight.ts` 在本地运行前对每个唯一路径重新执行媒体探测，核对全文件身份与指定音频/视频流；失败关系不能进入评测。媒体路径只存在于本地 manifest 和运行输入，分享结果只保留 case ID、dataset version、场景和聚合指标，不带路径或实测哈希。C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 gold 编辑事件、至少 30% 永不参与参数选择的 frozen-test，并覆盖所有必需场景；质量闸门在数据不足时不会执行或取得 `verifiedEligible`。
+`src/infrastructure/alignment/realMediaBenchmarkPreflight.ts` 在本地运行前对每个唯一路径重新执行媒体探测，核对全文件身份与指定音频/视频流；任何身份或流不一致都会在启动分析前阻断。探测器原始错误不会进入可分享结果，避免工具诊断回显本地路径、媒体摘要或授权信息。
+
+`src/infrastructure/alignment/realMediaBenchmarkRunner.ts` 把真实媒体运行拆成 blind 执行和事后评估两个信任域：完整 manifest 先投影为只含 case ID、媒体引用、内容身份和显式流的 `RunManifest`，剥离 gold、split、场景、复核者与仲裁信息，并用 canonical JSON 的 SHA-256 形成执行摘要。通过 preflight 的摘要凭据后，blind runner 才逐 case 调用生产 `start/get/cancel_audio_alignment_job`，固定启用 Alignment V2 localization，并把 manifest 指定的参考/原片音轨和视频流贯穿到 Rust 请求。视觉 fallback/校验返回实际消费的 `sourceVisualStream`、`targetVisualStream`；runner 会与 blind manifest 复核，视觉特征缓存 key 也包含实际视频流索引，不能用“请求过某条流”代替“确实分析过该流”。
+
+blind runner 的 sealed receipt 受 `RunManifest` SHA-256 约束，按 manifest 顺序保存每个真实关系的 `success/failed/cancelled`、单调时钟 wall elapsed、engine/feature 和无敏感信息的参数摘要；它是执行输入与输出的封口记录，不是外部审批签名。只有所有真实 case 都成功且 receipt 摘要、case 顺序与 prediction 身份一致时，协调器才把完整 manifest 的 gold 交给 evaluator。任一启动、读取、身份、流或 TimeMap 错误，以及任一取消，都会令 `evaluation=null`，不会伪装成 missing prediction 后继续计算质量；超时任务必须等待后端进入真实终态，无法在宽限期内安全退出时停止后续 case，避免残留 FFmpeg/CPU 任务与下一关系重叠。
+
+组件级可分享报告有独立 schema、validator 和稳定 JSON 序列化，只保留 manifest/dataset ID、blind SHA-256、case 状态、wall elapsed、实际视觉流、engine/feature、参数摘要和评估指标；不包含媒体路径、媒体 SHA-256、生产 `parametersHash` 或原始 diagnostics。报告固定声明 `scope: "time-map-component"` 和 `releaseEligible: false`。匹配页的“高级：C137 精度基准”只是该组件 runner 的开发/验收入口；即使组件子闸门显示通过，也不代表完整 release 验收，更不会授予项目时间图 `verified`。
+
+完整 release 判定由 `src/domain/alignment/c137Acceptance.ts` 的严格 `C137AcceptanceBundle` 单独负责。它把 protocol、环境、runner、数据审批/preflight/prediction receipts，以及关系、TimeMap、校准、视觉 fallback、降级、北极星、性能、UI 和 release raw reports 绑定到 canonical SHA-256。bundle 内嵌的 evidence digest 不能自我担保：调用者还必须提供外部 `trustContext`，其中列出受信 protocol、receipts 和每类 raw report evidence 的摘要。release 默认不内置任何审批白名单；缺少 trust context、摘要不命中、证据缺项或严格 schema 不通过都会得到 `incomplete-evidence`，而不是 pass。
+
+C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 gold 编辑事件、至少 30% 永不参与参数选择的 frozen-test，并覆盖所有必需场景。当前领域层已有 bundle schema、摘要重算和硬门槛 evaluator，但仓库还没有采集/冻结合法真实媒体数据的生成器，也没有在规定硬件上生成冷/热缓存 wall elapsed、进程树峰值 RSS 和取消延迟等性能 raw report 的生成器；不能用手写汇总替代这些外部证据。
 
 当前仓库只有 manifest v2 的 placeholder 结构示例，真实媒体关系仍为 0；尚无统计概率校准、规定硬件性能报告或 20 套北极星长合集 5/5 验收。因此上述工程闸门不能被描述为已经通过，自动结果仍最高为 `review`。
 

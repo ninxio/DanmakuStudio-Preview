@@ -11,6 +11,8 @@
 1. 在真实媒体冻结测试集达到本目标门槛之前，不得对外宣称自动匹配或删减检测“精度通过”。
 2. 算法的任何结论都先是候选；即使达到高质量门槛，也只能进入可批量人工确认状态，不能静默写入已确认映射。
 
+当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、完整 C137 acceptance bundle 的 fail-closed 聚合器，以及 A/B 播放复核证据 v2。这些能力解决的是“怎样盲跑生产算法、怎样防止局部指标或自报 JSON 冒充完整验收”，不代表真实准确率已经通过。仓库仍缺少达到规模的授权真实冻结集、正式批准的验收协议和外部信任根、规定硬件上的完整性能原始测量、20 套北极星长合集结果与真实媒体回归。
+
 ## 产品目标
 
 让用户在北极星场景中得到可复核、可解释、真实进入弹幕投影链路的时间映射：导入 5 集原片、1 个首尾相连且随机删减的 B 站长参考和对应 XML 后，软件应定位每集、区分全局延迟与时间伸缩、识别双方独有或替换内容，并给出带不确定范围的候选；用户确认后，分别导出与 5 集原片同步的弹幕 XML。
@@ -312,6 +314,18 @@ Audfprint 风格 landmark 可作为实现和准确率基线；Panako 可作为�
 - 可拖动边界与实时投影预览；
 - 不确定范围、音画一致性和为什么不能批量确认的结果说明。
 
+### A/B 播放复核证据 v2
+
+A/B 复核不再以“用户点过播放按钮”作为完成证据，而是按来源/目标轴分别累计实际有效播放时长和去重后的时间覆盖范围：
+
+- matched 与差异 span 的每个适用轴默认至少需要 2 秒有效播放、覆盖至少 1.5 秒；
+- 非 matched 差异的段首、段尾边界在来源 A、原片 B 两侧分别至少需要 1.5 秒有效播放、覆盖至少 1 秒；
+- 当实际可复核区间短于上述基准时，有效时长上限收缩到区间长度，覆盖要求收缩到区间长度的 80%，避免短片段永远无法完成；
+- 正常 UI 采集只累计连续、前向且速率合理的播放观测；暂停、后台、倒退、seek、大幅跳跃和只试听同一小段不会转化为足额覆盖；
+- v2 证据 token 绑定当前 span 摘要、策略版本、各证据槽和复核时间，span 变化后旧证据失效。
+
+这只证明规定的人工试听覆盖已完成；在 20 套北极星 UI 走查和真实媒体回归完成前，不能把该机制本身计作发布验收通过。
+
 ## 投影和导出闸门
 
 弹幕投影必须直接消费已确认 TimeMap：
@@ -373,6 +387,24 @@ Audfprint 风格 landmark 可作为实现和准确率基线；Panako 可作为�
 - 边界由两名标注者独立复核，目标分歧不超过 40–100ms；超出时仲裁。
 - 至少 30% 关系和事件冻结为从不参与参数选择的测试集。
 - 每次算法、特征或默认参数变化都生成按场景分层的差异报告，不只报告总平均值。
+
+### 已完成的 blind runner 与门禁基础设施
+
+production blind benchmark runner 已能执行以下闭环：
+
+1. 从治理 manifest 投影出以 case ID 和来源/目标 media input 为核心的执行清单；执行进程看不到 gold、development/frozen split、场景标签、复核者或仲裁结果。
+2. 对执行清单生成规范化 SHA-256，preflight 必须先验证真实媒体身份和显式音视频流，清单或 preflight receipt 不一致时禁止启动。
+3. 每个 real case 通过与产品相同的 Tauri Alignment V2 job API 启动、轮询和取消；结果还会复核 V2 引擎、媒体身份和流身份。synthetic/placeholder 不进入真实关系执行。
+4. 只有所有 real case 均成功并形成 blind run receipt 后，评测层才重新接触 gold；失败、超时或取消会使 evaluation 保持 `null`，不能伪装成普通 missing prediction。
+5. 可分享报告保存总/单 case wall time、参数摘要、状态和失败码，并移除本地路径、媒体 SHA 和原始工具错误；当前 wall time 不是规定硬件性能报告。
+
+现有 `evaluateRealMediaBenchmark` 只评估“已知正确媒体 pair 的 TimeMap 组件”，其 gate 明确为 `time-map-component`。即使 150 个已知 pair 的组件指标全部通过，`verifiedEligible` 仍恒为 `false`，也不能替代 Top-1/Top-K、全局 N×M 分配、校准、性能、北极星、UI 或 release 验收。
+
+完整 C137 acceptance bundle 已定义 versioned protocol、数据审批/preflight/prediction receipts，以及 dataset、关系排名、TimeMap、校准、视觉回退、安全降级、北极星、性能、UI 和 release 原始报告。最终 gate 只使用 frozen-test 原始 evidence 重算门槛；缺报告、digest 不一致、synthetic、real-development 或未批准阈值均只能得到 `incomplete-evidence`。
+
+acceptance 不内置可自行放行的非空白名单。调用方必须从独立信任根提供受信 protocol、三类 receipt 和每份 raw report 的 canonical SHA-256；报告摘要从原始内容重算并排除自身 `evidenceDigest`。默认没有外部 trust context 时，即使 bundle 字段齐全也必须保持 `incomplete-evidence`。当前 release 尚无正式批准的协议摘要、数据审批 receipt 和外部信任根，因此不存在可用于真实发布放行的 production trust context。
+
+尚未完成的是性能原始测量生成器：需要在规定 4 核目标机上结构化记录硬件/工具链指纹、真实阶段耗时、冷/热缓存控制与命中统计、应用及 FFmpeg 子进程树峰值内存、取消响应和输出一致性。blind runner 当前记录的 wall time 不能替代这些证据。
 
 ### 指标
 
@@ -443,11 +475,20 @@ Audfprint 风格 landmark 可作为实现和准确率基线；Panako 可作为�
 - [x] 批量确认只包含达到全部门槛且无未解决事件的候选。
 - [x] 导出页说明实际 TimeMap span 和验证误差，健康检查覆盖所有阻塞条件。
 
-当前剩余限制：双侧证据、不确定范围与 A/B 人工复核虽已落地，但尚未通过真实冻结媒体、实测校准、规定硬件性能和 20 套北极星长合集验证，不能据此宣称准确率达标。
+### 评测与信任门禁工程基础
+
+- [x] production blind runner 在不暴露 gold/split/复核信息的执行清单上调用真实 Tauri Alignment V2 job，并在全部成功后才允许组件评测。
+- [x] 已知 pair 的 TimeMap component gate 不再授予 `verifiedEligible`，组件通过不能冒充完整 C137 通过。
+- [x] 完整 acceptance bundle 能从 frozen 原始 evidence 重算固定门槛；缺证据、非 real-frozen、digest 不一致或无外部 trust 时 fail closed。
+- [x] A/B 播放复核证据 v2 按轴记录有效时长和覆盖范围，并执行 span、边界两级最小时长要求。
+
+当前剩余限制：双侧证据、不确定范围、A/B 人工复核、blind runner 和 fail-closed acceptance 虽已落地，但尚未通过真实冻结媒体、实测校准、批准的 production trust、规定硬件性能和 20 套北极星长合集验证，不能据此宣称准确率达标。
 
 ### 真实准确率与发布
 
 - [ ] 真实媒体基准规模、双人标注和冻结集达到要求。
+- [ ] 正式批准 versioned 验收协议、校准/取消阈值、数据审批 receipts 与独立 production trust root。
+- [ ] 性能原始测量生成器在规定 4 核目标机输出硬件/工具链、阶段耗时、冷/热缓存、进程树峰值内存、取消响应和一致性证据。
 - [ ] 所有上线准确率、校准和性能门槛通过并有可重复报告。
 - [ ] 北极星 20 套长合集 5/5 定位和完整导出通过。
 - [ ] 源码审计、lint、前端/Rust 单测、真实媒体回归、E2E、构建和 Tauri release 通过。

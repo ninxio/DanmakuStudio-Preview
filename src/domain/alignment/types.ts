@@ -129,6 +129,9 @@ export interface AlignmentTimeMapProposal {
   evidence: AlignmentTimeMapEvidence;
   sourceStream: AlignmentTimeMapStreamIdentity | null;
   targetStream: AlignmentTimeMapStreamIdentity | null;
+  /** Explicit visual streams actually consumed by V2 validation/fallback, independent of audio. */
+  sourceVisualStream?: AlignmentTimeMapStreamIdentity | null;
+  targetVisualStream?: AlignmentTimeMapStreamIdentity | null;
   sourceIdentity: MediaContentIdentity | null;
   targetIdentity: MediaContentIdentity | null;
   engineVersion: string;

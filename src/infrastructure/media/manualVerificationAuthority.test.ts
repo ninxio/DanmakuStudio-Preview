@@ -9,6 +9,7 @@ import {
 } from "../../domain/alignment/mediaTimeMap";
 import type { MediaContentIdentity, MediaTimeMap } from "../../domain/project/types";
 import { createTimeMapSpanPlaybackReviewToken } from "../../domain/alignment/timeMapPlaybackReviewEvidence";
+import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../../test/manualVerification";
 import {
   issuePersistedManualMediaTimeMapVerification,
   rehydratePersistedManualMediaTimeMapVerification,
@@ -231,11 +232,7 @@ function createVerificationEligibleMap(): MediaTimeMap {
     createTimeMapSpanPlaybackReviewToken(
       map,
       0,
-      {
-        spanAxes: ["source", "target"],
-        startBoundaryAxes: [],
-        endBoundaryAxes: []
-      },
+      createTestCompleteTimeMapSpanPlaybackEvidence(map, 0),
       TIMESTAMP
     )
   );

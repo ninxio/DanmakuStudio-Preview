@@ -40,6 +40,7 @@ import { isManualVerificationAuthorityAvailable } from "../../infrastructure/med
 import { useEditorStore } from "../../stores/editorStore";
 import { MediaMatchingPanel } from "./MediaMatchingPanel";
 import type { TimeMapPlaybackAdapterFactory } from "./TimeMapPlaybackReview";
+import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../../test/manualVerification";
 
 vi.mock("../../infrastructure/alignment/tauriAudioAlignment", async () => {
   const actual = await vi.importActual("../../infrastructure/alignment/tauriAudioAlignment");
@@ -751,7 +752,8 @@ describe("多媒体自动匹配工作台", () => {
     );
     expect(playback).toHaveTextContent("已按 TimeMap 将播放头同步到原片 B 00:00:05.000");
     await user.click(within(playback).getByRole("button", { name: "播放当前段" }));
-    expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeEnabled();
+    expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeDisabled();
+    expect(playback).toHaveTextContent("只累计页面可见且播放器时间连续向前推进");
 
     const sourceOnlyButton = within(review).getByRole("button", {
       name: /第 2 段 参考独有/
@@ -777,6 +779,59 @@ describe("多媒体自动匹配工作台", () => {
       "aria-pressed",
       "true"
     );
+  });
+
+  it("必须让 matched 的 A 与 B 分别推进到最低有效试听时长，单次 play 不会解锁", async () => {
+    const user = userEvent.setup();
+    const project = createMatchingProject();
+    project.mediaLibrary = project.mediaLibrary
+      .filter((media) => media.id !== "target-ep2")
+      .map((media) => ({
+        ...media,
+        fileName: `${media.id}.mp4`,
+        objectUrl: `blob:${media.id}`
+      }));
+    useEditorStore.setState({ project });
+    vi.mocked(startTauriAudioAlignmentJob).mockResolvedValue({
+      jobId: "job-v2-effective-playback",
+      status: "completed",
+      progress: 1,
+      message: "完成",
+      logs: [],
+      proposal: createV2Proposal(0, "review"),
+      error: null,
+      updatedAtMs: 1
+    });
+    const playbackAdapter = createAdvancingPlaybackAdapter();
+    render(<MatchingHarness playbackAdapterFactory={() => playbackAdapter.adapter} />);
+
+    await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    const review = within(await screen.findByTestId("media-match-candidate")).getByTestId(
+      "time-map-review"
+    );
+    await user.click(within(review).getByText("来源↔原片时间图复核"));
+    const playback = within(review).getByTestId("time-map-playback-review");
+    await user.click(within(playback).getByRole("button", { name: "打开 A/B 复核" }));
+    await user.click(await within(playback).findByRole("button", { name: "播放当前段" }));
+
+    expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeDisabled();
+    expect(playback).toHaveTextContent("共同内容 · 参考 A");
+    expect(playback).toHaveTextContent("共同内容 · 原片 B");
+    await waitFor(
+      () => expect(playback).toHaveTextContent("有效 2.0 秒/2.0 秒 · 覆盖 1.5 秒/1.5 秒"),
+      { timeout: 2_000 }
+    );
+    expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeDisabled();
+
+    await user.click(within(playback).getByRole("button", { name: "暂停当前段" }));
+    await user.click(within(playback).getByRole("button", { name: "B · 目标原片" }));
+    await user.click(within(playback).getByRole("button", { name: "播放当前段" }));
+    await waitFor(
+      () =>
+        expect(within(playback).getByRole("button", { name: "记录本段已复核" })).toBeEnabled(),
+      { timeout: 2_000 }
+    );
+    expect(playback).toHaveTextContent("已达到本段要求的有效试听时长和覆盖范围");
   });
 
   it("四类人工判定按边界形状 fail-closed，并在项目保存重开后恢复", async () => {
@@ -894,11 +949,13 @@ describe("多媒体自动匹配工作台", () => {
     await screen.findByTestId("media-match-candidate");
     const candidateMap = useEditorStore.getState().project.mediaTimeMaps[0];
     act(() =>
-      useEditorStore.getState().recordTimeMapSpanPlaybackReview(candidateMap.id, 0, {
-        spanAxes: ["source", "target"],
-        startBoundaryAxes: [],
-        endBoundaryAxes: []
-      })
+      useEditorStore
+        .getState()
+        .recordTimeMapSpanPlaybackReview(
+          candidateMap.id,
+          0,
+          createTestCompleteTimeMapSpanPlaybackEvidence(candidateMap, 0)
+        )
     );
     const card = await screen.findByTestId("media-match-candidate");
     await user.click(within(card).getByRole("button", { name: "保存关系供试听复核" }));
@@ -1467,6 +1524,38 @@ function createFakePlaybackAdapter(): {
         currentTimeMs = positionMs;
       }),
       getCurrentTimeMs: vi.fn<MediaAdapter["getCurrentTimeMs"]>(() => currentTimeMs),
+      getDurationMs: vi.fn<MediaAdapter["getDurationMs"]>(() => 180_000),
+      getTracks: vi.fn<MediaAdapter["getTracks"]>(() => []),
+      setPlaybackRate: vi.fn<MediaAdapter["setPlaybackRate"]>(),
+      dispose: vi.fn<MediaAdapter["dispose"]>()
+    }
+  };
+}
+
+function createAdvancingPlaybackAdapter(): { adapter: MediaAdapter } {
+  let currentTimeMs = 0;
+  let playing = false;
+  return {
+    adapter: {
+      load: vi.fn<MediaAdapter["load"]>((_source, startPositionMs = 0) => {
+        currentTimeMs = startPositionMs;
+        playing = false;
+        return Promise.resolve();
+      }),
+      play: vi.fn<MediaAdapter["play"]>(() => {
+        playing = true;
+        return Promise.resolve();
+      }),
+      pause: vi.fn<MediaAdapter["pause"]>(() => {
+        playing = false;
+      }),
+      seek: vi.fn<MediaAdapter["seek"]>((positionMs) => {
+        currentTimeMs = positionMs;
+      }),
+      getCurrentTimeMs: vi.fn<MediaAdapter["getCurrentTimeMs"]>(() => {
+        if (playing) currentTimeMs += 200;
+        return currentTimeMs;
+      }),
       getDurationMs: vi.fn<MediaAdapter["getDurationMs"]>(() => 180_000),
       getTracks: vi.fn<MediaAdapter["getTracks"]>(() => []),
       setPlaybackRate: vi.fn<MediaAdapter["setPlaybackRate"]>(),

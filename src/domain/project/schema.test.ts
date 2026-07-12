@@ -7,6 +7,7 @@ import {
   computeMediaTimeMapCoreDigest
 } from "../alignment/mediaTimeMap";
 import { applyTestManualMediaTimeMapVerification } from "../../test/manualVerification";
+import { readTimeMapSpanPlaybackReview } from "../alignment/timeMapPlaybackReviewEvidence";
 import { createEmptyProject } from "./factory";
 import {
   parseProjectJson,
@@ -350,7 +351,9 @@ describe("project schema", () => {
     const parsed = result.project;
     expect(result.migration).toMatchObject({ fromVersion: 10, toVersion: 11 });
     expect(parsed.mediaTimeMaps[0].quality.level).toBe("review");
-    expect(parsed.mediaTimeMaps[0].quality.reasons.join(" ")).toContain("v10 没有可绑定时间图核心");
+    expect(parsed.mediaTimeMaps[0].quality.reasons.join(" ")).toContain(
+      "v10 没有可绑定时间图核心"
+    );
     expect(parsed.mediaTimeMaps[0].verification).toBeNull();
     expect(parsed.mediaTimeMaps[1].quality.level).toBe("review");
 
@@ -404,9 +407,7 @@ describe("project schema", () => {
     expect(validateProjectSchema(project).ok).toBe(true);
     const reopened = parseProjectJson(JSON.stringify(project));
     expect(reopened.mediaTimeMaps[0].quality.level).toBe("review");
-    expect(reopened.mediaTimeMaps[0].quality.reasons.join(" ")).toContain(
-      "没有安装级签名"
-    );
+    expect(reopened.mediaTimeMaps[0].quality.reasons.join(" ")).toContain("没有安装级签名");
   });
 
   it("v11 签名人工凭据完整序列化，保存重开前先降为 review 并保留待 native 复核记录", () => {
@@ -1230,6 +1231,32 @@ describe("project schema", () => {
     expect(migration).toBeNull();
   });
 
+  it("保存重开时保留旧 v1 播放审计文本，但不会把一次启动迁移成有效 v2 证据", () => {
+    const legacyPlaybackNote = `manual-playback-review:v1:0:${"a".repeat(64)}:source,target:::2026-07-11T00:00:00.000Z`;
+    const map = createValidMediaTimeMap({
+      evidence: {
+        types: ["audio", "manual"],
+        audioAnchorCount: 50,
+        visualAnchorCount: 0,
+        heldOutAnchorCount: 10,
+        notes: ["测试音频证据。", legacyPlaybackNote]
+      }
+    });
+    const project = {
+      ...createEmptyProject("旧播放证据审计"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [map]
+    };
+
+    const parsed = parseProjectJson(serializeProject(project));
+    const reopenedMap = parsed.mediaTimeMaps[0];
+    expect(reopenedMap?.evidence.notes).toContain(legacyPlaybackNote);
+    expect(reopenedMap && readTimeMapSpanPlaybackReview(reopenedMap, 0)).toBeNull();
+  });
+
   it("拒绝不支持的 schema 版本", () => {
     const project = createEmptyProject();
     expect(validateProjectSchema({ ...project, schemaVersion: 999 }).ok).toBe(false);
@@ -1671,11 +1698,14 @@ function createValidMediaTimeMap(overrides: Partial<MediaTimeMap> = {}): MediaTi
           : "2026-07-11T00:00:00.000Z",
     ...overrides,
     sourceIdentity:
-      "sourceIdentity" in overrides ? (overrides.sourceIdentity ?? null) : createValidMediaIdentity(),
+      "sourceIdentity" in overrides
+        ? (overrides.sourceIdentity ?? null)
+        : createValidMediaIdentity(),
     targetIdentity:
-      "targetIdentity" in overrides ? (overrides.targetIdentity ?? null) : createValidMediaIdentity(),
-    verification:
-      "verification" in overrides ? (overrides.verification ?? null) : null
+      "targetIdentity" in overrides
+        ? (overrides.targetIdentity ?? null)
+        : createValidMediaIdentity(),
+    verification: "verification" in overrides ? (overrides.verification ?? null) : null
   };
 }
 

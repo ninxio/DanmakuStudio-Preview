@@ -300,6 +300,27 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
 
   await page.getByTestId("workspace-nav-matching").click();
   const matchingPanel = page.getByTestId("media-matching-panel");
+  const benchmarkPanel = page.getByTestId("real-media-benchmark-panel");
+  await benchmarkPanel
+    .getByRole("button", { name: /高级：C137 精度基准（开发与验收）/ })
+    .click();
+  await benchmarkPanel
+    .getByLabel("选择 C137 benchmark manifest JSON")
+    .setInputFiles(resolve("fixtures", "alignment", "c137-real-media-manifest.example.json"));
+  await expect(benchmarkPanel).toContainText("示例 manifest 只用于理解格式");
+  await expect(benchmarkPanel).toContainText("真实 0");
+  await expect(
+    benchmarkPanel.getByRole("button", { name: "运行真实媒体精度基准" })
+  ).toBeDisabled();
+  await benchmarkPanel.scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: resolve(screenshotDir, "c137-benchmark-governance-blocked.png"),
+    fullPage: true
+  });
+  await benchmarkPanel
+    .getByRole("button", { name: /高级：C137 精度基准（开发与验收）/ })
+    .click();
+
   await expect(matchingPanel).toContainText("将分析 1 个参考 × 5 个原片，共 5 组");
   await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
   await expect(page.getByTestId("media-match-candidate")).toHaveCount(5);

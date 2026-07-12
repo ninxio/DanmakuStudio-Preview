@@ -208,8 +208,14 @@ export interface C137BenchmarkGateCheck {
 }
 
 export interface C137BenchmarkGateResult {
+  /**
+   * This evaluator only measures a TimeMap for an already-known media pair. It does not cover
+   * relationship ranking, calibration, performance, North Star, UI, or release acceptance.
+   */
+  scope: "time-map-component";
   status: C137BenchmarkGateStatus;
-  verifiedEligible: boolean;
+  /** A component result must never grant full C137 verified eligibility. */
+  verifiedEligible: false;
   dataChecks: C137BenchmarkGateCheck[];
   qualityChecks: C137BenchmarkGateCheck[];
   reasons: string[];
@@ -406,6 +412,38 @@ export function validateRealMediaBenchmarkResult(
   }
   if (!isC137GateResult(value.gate)) {
     issues.push("result.gate 结构不完整。");
+  }
+  if (
+    Array.isArray(value.caseResults) &&
+    value.caseResults.every(isBenchmarkCaseResult) &&
+    Array.isArray(value.scenarioSummaries) &&
+    value.scenarioSummaries.every(isBenchmarkScenarioSummary) &&
+    isBenchmarkSummary(value.overall) &&
+    isBenchmarkSummary(value.realMediaOverall)
+  ) {
+    const caseResults = value.caseResults as RealMediaBenchmarkCaseResult[];
+    const expectedOverall = summarizeCaseResults(caseResults);
+    const expectedRealOverall = summarizeCaseResults(
+      caseResults.filter((item) => item.mediaKind === "real")
+    );
+    const expectedScenarioSummaries = [...new Set(caseResults.flatMap((item) => item.scenarios))]
+      .sort()
+      .map((scenario) => ({
+        scenario,
+        ...summarizeCaseResults(caseResults.filter((item) => item.scenarios.includes(scenario)))
+      }));
+    if (!deepEqualUnknown(value.overall, expectedOverall)) {
+      issues.push("result.overall 与 caseResults 重算结果不一致，拒绝接受外部 summary。");
+    }
+    if (!deepEqualUnknown(value.realMediaOverall, expectedRealOverall)) {
+      issues.push("result.realMediaOverall 与真实 caseResults 重算结果不一致。");
+    }
+    if (!deepEqualUnknown(value.scenarioSummaries, expectedScenarioSummaries)) {
+      issues.push("result.scenarioSummaries 与 caseResults 分层重算结果不一致。");
+    }
+  }
+  if (isC137GateResult(value.gate) && !isTimeMapComponentGateSelfConsistent(value.gate)) {
+    issues.push("result.gate 状态与 dataChecks/qualityChecks 不一致，拒绝接受外部 gate。");
   }
   return { valid: issues.length === 0, issues };
 }
@@ -881,6 +919,7 @@ function evaluateC137BenchmarkGate(
   ];
   if (dataChecks.some((check) => !check.passed)) {
     return {
+      scope: "time-map-component",
       status: "insufficient-data",
       verifiedEligible: false,
       dataChecks,
@@ -998,8 +1037,9 @@ function evaluateC137BenchmarkGate(
   ];
   const failedChecks = qualityChecks.filter((check) => !check.passed);
   return {
+    scope: "time-map-component",
     status: failedChecks.length === 0 ? "pass" : "fail",
-    verifiedEligible: failedChecks.length === 0,
+    verifiedEligible: false,
     dataChecks,
     qualityChecks,
     reasons:
@@ -1718,21 +1758,57 @@ function isEventReferenceArray(value: unknown): boolean {
   );
 }
 
-function isC137GateResult(value: unknown): boolean {
+function isC137GateResult(value: unknown): value is C137BenchmarkGateResult {
   return (
     isRecord(value) &&
+    value.scope === "time-map-component" &&
     (value.status === "insufficient-data" ||
       value.status === "pass" ||
       value.status === "fail") &&
-    typeof value.verifiedEligible === "boolean" &&
+    value.verifiedEligible === false &&
     Array.isArray(value.dataChecks) &&
     value.dataChecks.every(isGateCheck) &&
     Array.isArray(value.qualityChecks) &&
     value.qualityChecks.every(isGateCheck) &&
-    isNonEmptyStringArray(value.reasons) &&
-    (value.status === "pass"
-      ? value.verifiedEligible === true
-      : value.verifiedEligible === false)
+    isNonEmptyStringArray(value.reasons)
+  );
+}
+
+function isTimeMapComponentGateSelfConsistent(value: C137BenchmarkGateResult): boolean {
+  const dataPassed = value.dataChecks.every((check) => check.passed);
+  const qualityPassed =
+    value.qualityChecks.length > 0 && value.qualityChecks.every((check) => check.passed);
+  if (value.status === "insufficient-data") {
+    return !dataPassed && value.qualityChecks.length === 0;
+  }
+  if (!dataPassed || value.qualityChecks.length === 0) {
+    return false;
+  }
+  return value.status === "pass" ? qualityPassed : !qualityPassed;
+}
+
+function deepEqualUnknown(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) {
+    return true;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => deepEqualUnknown(item, right[index]))
+    );
+  }
+  if (!isRecord(left) || !isRecord(right)) {
+    return false;
+  }
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key, index) => key === rightKeys[index] && deepEqualUnknown(left[key], right[key])
+    )
   );
 }
 

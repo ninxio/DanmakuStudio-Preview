@@ -150,6 +150,17 @@ describe("C137 纯 TimeMap 评测", () => {
     expect(caseResult.mappingCoverage).toBe(1);
   });
 
+  it("拒绝篡改序列化 summary 或组件 gate", () => {
+    const result = evaluateSingle(createBidirectionalCase(), createBidirectionalSpans());
+    const summaryTampered = structuredClone(result);
+    summaryTampered.overall.mappingCoverage = 0;
+    expect(validateRealMediaBenchmarkResult(summaryTampered)).toMatchObject({ valid: false });
+
+    const gateTampered = structuredClone(result);
+    gateTampered.gate.status = "pass";
+    expect(validateRealMediaBenchmarkResult(gateTampered)).toMatchObject({ valid: false });
+  });
+
   it("错误边界同时计为边界误差、漏报和误报", () => {
     const benchmarkCase = createTargetOnlyCase();
     const predicted: TimeMapSpan[] = [
@@ -274,6 +285,23 @@ describe("C137 纯 TimeMap 评测", () => {
         actual: 0
       }
     );
+  });
+
+  it("150 个完美已知 pair 只能通过 time-map component，不能授予完整 verified", () => {
+    const cases = Array.from({ length: 150 }, (_, index) => createFourEditRealCase(index));
+    const predictions = cases.map((benchmarkCase) => ({
+      caseId: benchmarkCase.id,
+      spans: createFourEditSpans()
+    }));
+
+    const result = evaluateRealMediaBenchmark(createManifest(cases), predictions);
+
+    expect(result.gate).toMatchObject({
+      scope: "time-map-component",
+      status: "pass",
+      verifiedEligible: false
+    });
+    expect(result.realMediaOverall.goldEditCount).toBe(600);
   });
 
   it("数据规模达标但只映射时间轴开头时 coverage 闸门必须失败", () => {
@@ -421,6 +449,60 @@ function createNoEditCase(): RealMediaBenchmarkCase {
       ambiguousSpans: []
     }
   });
+}
+
+function createFourEditRealCase(index: number): RealMediaBenchmarkCase {
+  const benchmarkCase = finalizeBenchmarkCase({
+    id: `four-edit-real-${index}`,
+    title: `四事件真实关系 ${index}`,
+    mediaKind: "real",
+    split: "frozen-test",
+    scenarios: [...C137_REQUIRED_SCENARIOS, "multi-edit"],
+    source: createMediaInput("source"),
+    target: createMediaInput("target"),
+    boundaryToleranceMs: 100,
+    versionNotes: ["用于证明纯 TimeMap 组件通过不等于完整 C137 通过。"],
+    licenseNotes: ["单元测试结构数据，不代表真实媒体授权。"],
+    independentAnnotations: [],
+    adjudication: null,
+    gold: {
+      sourceStartMs: 0,
+      sourceEndMs: 50_000,
+      targetStartMs: 0,
+      targetEndMs: 56_000,
+      matchedAnchors: [
+        { id: "a-0", sourceMs: 1_000, targetMs: 1_000 },
+        { id: "a-1", sourceMs: 11_000, targetMs: 16_000 },
+        { id: "a-2", sourceMs: 22_000, targetMs: 25_000 },
+        { id: "a-3", sourceMs: 32_000, targetMs: 36_000 },
+        { id: "a-4", sourceMs: 41_000, targetMs: 47_000 },
+        { id: "a-5", sourceMs: 49_000, targetMs: 55_000 }
+      ],
+      sourceOnlySpans: [sourceOnly(20_000, 22_000, 25_000)],
+      targetOnlySpans: [
+        targetOnly(10_000, 10_000, 15_000),
+        targetOnly(40_000, 44_000, 46_000)
+      ],
+      ambiguousSpans: [ambiguous(30_000, 32_000, 33_000, 36_000)]
+    }
+  });
+  benchmarkCase.source.path = `C:\\unit-test\\source-${index}.mkv`;
+  benchmarkCase.target.path = `C:\\unit-test\\target-${index}.mkv`;
+  return benchmarkCase;
+}
+
+function createFourEditSpans(): TimeMapSpan[] {
+  return [
+    matched(0, 10_000, 0, 10_000),
+    targetOnly(10_000, 10_000, 15_000),
+    matched(10_000, 20_000, 15_000, 25_000),
+    sourceOnly(20_000, 22_000, 25_000),
+    matched(22_000, 30_000, 25_000, 33_000),
+    ambiguous(30_000, 32_000, 33_000, 36_000),
+    matched(32_000, 40_000, 36_000, 44_000),
+    targetOnly(40_000, 44_000, 46_000),
+    matched(40_000, 50_000, 46_000, 56_000)
+  ];
 }
 
 function createTargetOnlyCase(

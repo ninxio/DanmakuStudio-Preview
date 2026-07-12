@@ -8,6 +8,8 @@ export interface TauriAudioAlignmentRequest {
   ffprobePath?: string | null;
   completeAudioStreamIndex?: number | null;
   sourceAudioStreamIndex?: number | null;
+  completeVideoStreamIndex?: number | null;
+  sourceVideoStreamIndex?: number | null;
   sampleRate?: number;
   windowMs?: number;
   matchThreshold?: number;
@@ -20,11 +22,17 @@ export interface TauriAudioAlignmentRequest {
 
 export interface NormalizedTauriAudioAlignmentRequest extends Omit<
   TauriAudioAlignmentRequest,
-  "ffprobePath" | "completeAudioStreamIndex" | "sourceAudioStreamIndex"
+  | "ffprobePath"
+  | "completeAudioStreamIndex"
+  | "sourceAudioStreamIndex"
+  | "completeVideoStreamIndex"
+  | "sourceVideoStreamIndex"
 > {
   ffprobePath: string | null;
   completeAudioStreamIndex: number | null;
   sourceAudioStreamIndex: number | null;
+  completeVideoStreamIndex: number | null;
+  sourceVideoStreamIndex: number | null;
 }
 
 export type AudioAlignmentInvoker = (
@@ -159,11 +167,26 @@ function normalizeAudioAlignmentRequest(
     sourceAudioStreamIndex: normalizeAudioStreamIndex(
       request.sourceAudioStreamIndex,
       "参考视频音轨索引"
+    ),
+    completeVideoStreamIndex: normalizeStreamIndex(
+      request.completeVideoStreamIndex,
+      "原片视频流索引"
+    ),
+    sourceVideoStreamIndex: normalizeStreamIndex(
+      request.sourceVideoStreamIndex,
+      "参考视频流索引"
     )
   };
 }
 
 function normalizeAudioStreamIndex(
+  value: number | null | undefined,
+  label: string
+): number | null {
+  return normalizeStreamIndex(value, label);
+}
+
+function normalizeStreamIndex(
   value: number | null | undefined,
   label: string
 ): number | null {

@@ -74,7 +74,7 @@ describe("Tauri 音频对齐调用", () => {
     });
   });
 
-  it("以 camelCase 把 FFprobe 与显式音轨索引传给 Rust", async () => {
+  it("以 camelCase 把 FFprobe 与显式音视频流索引传给 Rust", async () => {
     const request: TauriAudioAlignmentRequest = {
       completePath: "D:\\media\\full.mkv",
       sourcePath: "D:\\media\\reference.mkv",
@@ -82,6 +82,8 @@ describe("Tauri 音频对齐调用", () => {
       ffprobePath: "C:\\tools\\ffprobe.exe",
       completeAudioStreamIndex: 2,
       sourceAudioStreamIndex: 4,
+      completeVideoStreamIndex: 6,
+      sourceVideoStreamIndex: 8,
       localizationMode: true
     };
     tauriMocks.invoke.mockResolvedValue(emptyProposal);
@@ -96,6 +98,8 @@ describe("Tauri 音频对齐调用", () => {
         ffprobePath: "C:\\tools\\ffprobe.exe",
         completeAudioStreamIndex: 2,
         sourceAudioStreamIndex: 4,
+        completeVideoStreamIndex: 6,
+        sourceVideoStreamIndex: 8,
         localizationMode: true
       }
     });
@@ -121,7 +125,9 @@ describe("Tauri 音频对齐调用", () => {
       {
         ffprobePath: null,
         completeAudioStreamIndex: null,
-        sourceAudioStreamIndex: null
+        sourceAudioStreamIndex: null,
+        completeVideoStreamIndex: null,
+        sourceVideoStreamIndex: null
       }
     ]);
   });
@@ -151,7 +157,9 @@ describe("Tauri 音频对齐调用", () => {
         ffmpegPath: null,
         ffprobePath: null,
         completeAudioStreamIndex: null,
-        sourceAudioStreamIndex: null
+        sourceAudioStreamIndex: null,
+        completeVideoStreamIndex: null,
+        sourceVideoStreamIndex: null
       }
     });
   });
@@ -190,6 +198,34 @@ describe("Tauri 音频对齐调用", () => {
         invoker
       )
     ).rejects.toThrow("参考视频音轨索引必须是非负安全整数或 null。");
+    expect(invoker).not.toHaveBeenCalled();
+  });
+
+  it("分别校验原片与参考视频流索引", async () => {
+    const invoker = vi.fn<AudioAlignmentInvoker>(() => Promise.resolve(emptyProposal));
+
+    await expect(
+      runTauriAudioAlignment(
+        {
+          completePath: "full.mp4",
+          sourcePath: "reference.mp4",
+          ffmpegPath: null,
+          completeVideoStreamIndex: -1
+        },
+        invoker
+      )
+    ).rejects.toThrow("原片视频流索引必须是非负安全整数或 null。");
+    await expect(
+      runTauriAudioAlignment(
+        {
+          completePath: "full.mp4",
+          sourcePath: "reference.mp4",
+          ffmpegPath: null,
+          sourceVideoStreamIndex: 1.5
+        },
+        invoker
+      )
+    ).rejects.toThrow("参考视频流索引必须是非负安全整数或 null。");
     expect(invoker).not.toHaveBeenCalled();
   });
 

@@ -103,9 +103,15 @@ export async function preflightRealMediaBenchmark(
             { path, ffprobePath: options.ffprobePath, ffmpegPath: options.ffmpegPath },
             options.probe
           );
-        } catch (error: unknown) {
+        } catch {
           for (const binding of pathBindings) {
-            issues.push(createIssue(binding, "probe-failed", `媒体探测失败：${formatFailure(error)}`));
+            issues.push(
+              createIssue(
+                binding,
+                "probe-failed",
+                "媒体探测失败，无法核验冻结清单；原始工具错误已从可分享结果移除。"
+              )
+            );
           }
           continue;
         }
@@ -198,8 +204,4 @@ function createIssue(
     code,
     message
   };
-}
-
-function formatFailure(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

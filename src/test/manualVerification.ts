@@ -3,6 +3,8 @@ import {
   createManualMediaTimeMapVerificationRequest
 } from "../domain/alignment/mediaTimeMap";
 import {
+  createEmptyTimeMapSpanPlaybackEvidence,
+  createTimeMapSpanPlaybackRequirements,
   createTimeMapSpanPlaybackReviewToken,
   type TimeMapSpanPlaybackEvidence
 } from "../domain/alignment/timeMapPlaybackReviewEvidence";
@@ -45,11 +47,11 @@ export function applyTestManualMediaTimeMapVerification(
     }
   };
   reviewedMap.evidence.notes.push(
-    ...reviewedMap.spans.map((span, spanIndex) =>
+    ...reviewedMap.spans.map((_, spanIndex) =>
       createTimeMapSpanPlaybackReviewToken(
         reviewedMap,
         spanIndex,
-        createCompletePlaybackEvidence(span.kind),
+        createTestCompleteTimeMapSpanPlaybackEvidence(reviewedMap, spanIndex),
         input.verifiedAt
       )
     )
@@ -66,24 +68,22 @@ export function applyTestManualMediaTimeMapVerification(
   });
 }
 
-function createCompletePlaybackEvidence(
-  kind: MediaTimeMap["spans"][number]["kind"]
+/** 构造刚好满足当前 v2 策略的测试证据，避免测试依赖一次 play() 的旧语义。 */
+export function createTestCompleteTimeMapSpanPlaybackEvidence(
+  map: MediaTimeMap,
+  spanIndex: number
 ): TimeMapSpanPlaybackEvidence {
-  if (kind === "matched") {
-    return {
-      spanAxes: ["source", "target"],
-      startBoundaryAxes: [],
-      endBoundaryAxes: []
+  const evidence = createEmptyTimeMapSpanPlaybackEvidence();
+  for (const requirement of createTimeMapSpanPlaybackRequirements(map, spanIndex)) {
+    evidence.slots[requirement.slot] = {
+      effectiveDurationMs: requirement.minimumEffectiveMs,
+      coveredRanges: [
+        {
+          startMs: requirement.interval.startMs,
+          endMs: requirement.interval.startMs + requirement.minimumCoveredMs
+        }
+      ]
     };
   }
-  return {
-    spanAxes:
-      kind === "sourceOnly"
-        ? ["source"]
-        : kind === "targetOnly"
-          ? ["target"]
-          : ["source", "target"],
-    startBoundaryAxes: ["source", "target"],
-    endBoundaryAxes: ["source", "target"]
-  };
+  return evidence;
 }

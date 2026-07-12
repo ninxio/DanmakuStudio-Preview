@@ -25,6 +25,11 @@ import {
   type ProjectMediaRole
 } from "../domain/project/types";
 import { serializeProject } from "../domain/project/schema";
+import {
+  createEmptyTimeMapSpanPlaybackEvidence,
+  readTimeMapSpanPlaybackReview
+} from "../domain/alignment/timeMapPlaybackReviewEvidence";
+import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../test/manualVerification";
 import { parseBilibiliXml } from "../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "./editorStore";
 
@@ -860,6 +865,84 @@ describe("editor store", () => {
     });
   });
 
+  it("A/B 播放证据拒绝零时长提交，并让有效 v2 摘要在保存重开后仍可复核", () => {
+    const project = createEmptyProject();
+    const asset = createAsset("asset-playback", "playback.xml");
+    project.assets = [asset];
+    project.mediaLibrary = [
+      createProjectMediaReference("source-playback", "bilibiliReference"),
+      createProjectMediaReference("target-playback", "targetOriginal")
+    ];
+    project.danmakuSourceBindings = [
+      {
+        id: "binding-playback",
+        assetId: asset.id,
+        sourceMediaId: "source-playback",
+        linkedAt: "2026-07-12T00:00:00.000Z",
+        updatedAt: "2026-07-12T00:00:00.000Z"
+      }
+    ];
+    resetStore(project);
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-playback",
+      batchId: "batch-playback",
+      sourceMediaId: "source-playback",
+      targetMediaId: "target-playback",
+      proposal: {
+        anchors: [],
+        cutCandidates: [],
+        confidence: 0.9,
+        diagnostics: [],
+        matchRange: {
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetStartMs: 0,
+          targetEndMs: 60_000,
+          coverage: 1
+        }
+      }
+    });
+    useEditorStore.getState().addMediaMatchCandidate(candidate);
+    const candidateMap = useEditorStore.getState().project.mediaTimeMaps[0];
+    if (!candidateMap) throw new Error("A/B store 测试缺少候选时间图");
+    const initialRevision = candidateMap.revision;
+    const initialHistoryLength = useEditorStore.getState().history.past.length;
+
+    useEditorStore
+      .getState()
+      .recordTimeMapSpanPlaybackReview(
+        candidateMap.id,
+        0,
+        createEmptyTimeMapSpanPlaybackEvidence()
+      );
+    expect(useEditorStore.getState().project.mediaTimeMaps[0]?.revision).toBe(initialRevision);
+    expect(useEditorStore.getState().history.past).toHaveLength(initialHistoryLength);
+    expect(useEditorStore.getState().status.tone).toBe("error");
+    expect(useEditorStore.getState().status.message).toContain("播放复核尚未完成");
+
+    useEditorStore
+      .getState()
+      .recordTimeMapSpanPlaybackReview(
+        candidateMap.id,
+        0,
+        createTestCompleteTimeMapSpanPlaybackEvidence(candidateMap, 0)
+      );
+    const reviewedMap = useEditorStore.getState().project.mediaTimeMaps[0];
+    expect(reviewedMap?.revision).toBe(initialRevision + 1);
+    expect(
+      reviewedMap?.evidence.notes.some((note) => note.startsWith("manual-playback-review:v2:"))
+    ).toBe(true);
+    expect(reviewedMap && readTimeMapSpanPlaybackReview(reviewedMap, 0)).not.toBeNull();
+
+    const serialized = serializeProject(useEditorStore.getState().project);
+    useEditorStore.getState().openProjectFromText(serialized, "playback-review.json");
+    const reopenedMap = useEditorStore.getState().project.mediaTimeMaps[0];
+    expect(reopenedMap && readTimeMapSpanPlaybackReview(reopenedMap, 0)).toMatchObject({
+      evidenceVersion: 2,
+      policyVersion: 2
+    });
+  });
+
   it("同一候选绑定多个 XML 时删除其中一个不会留下 confirmed 时间图孤儿段", () => {
     const project = createEmptyProject();
     const firstAsset = createAsset("asset-multi-a", "multi-a.xml");
@@ -913,7 +996,9 @@ describe("editor store", () => {
       appliedSegmentIds: [expect.stringContaining(secondAsset.id)]
     });
     const serialized = serializeProject(afterRemoval);
-    expect(() => useEditorStore.getState().openProjectFromText(serialized, "multi.json")).not.toThrow();
+    expect(() =>
+      useEditorStore.getState().openProjectFromText(serialized, "multi.json")
+    ).not.toThrow();
     expect(useEditorStore.getState().project.danmakuSourceSegments).toHaveLength(1);
   });
 

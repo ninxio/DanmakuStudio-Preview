@@ -60,6 +60,23 @@ describe("C137 真实媒体基准运行前核验", () => {
     expect(result.checkedFileCount).toBe(0);
     expect(probe).not.toHaveBeenCalled();
   });
+
+  it("探测器错误也会移除清单路径和 SHA-256", async () => {
+    const manifest = createManifest();
+    const source = manifest.cases[0].source;
+    const probe = vi.fn(() =>
+      Promise.reject(new Error(`无法读取 ${source.path}，identity=${source.contentIdentity?.digest}`))
+    );
+
+    const result = await preflightRealMediaBenchmark(manifest, { probe });
+    const serialized = JSON.stringify(result);
+
+    expect(result.ok).toBe(false);
+    expect(result.issues.every((issue) => issue.code === "probe-failed")).toBe(true);
+    expect(serialized).not.toContain(source.path);
+    expect(serialized).not.toContain(source.contentIdentity?.digest);
+    expect(serialized).toContain("原始工具错误已从可分享结果移除");
+  });
 });
 
 function createManifest(): RealMediaBenchmarkManifest {

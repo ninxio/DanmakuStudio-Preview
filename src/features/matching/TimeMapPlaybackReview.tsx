@@ -16,11 +16,13 @@ import {
 } from "../../domain/alignment/timeMapPlayback";
 import type { TimeMapSpan } from "../../domain/alignment/timeMap";
 import {
+  accumulateTimeMapPlaybackObservation,
+  assessTimeMapSpanPlaybackEvidence,
   createEmptyTimeMapSpanPlaybackEvidence,
   describeMissingTimeMapSpanPlaybackEvidence,
-  markTimeMapSpanPlaybackStarted
+  resetTimeMapPlaybackAccumulator
 } from "../../domain/alignment/timeMapPlaybackReviewEvidence";
-import type { ProjectMediaReference } from "../../domain/project/types";
+import type { MediaTimeMap, ProjectMediaReference } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import {
   HtmlVideoMediaAdapter,
@@ -51,6 +53,7 @@ interface PlaybackMediaPair {
 }
 
 interface TimeMapPlaybackReviewProps {
+  timeMap: MediaTimeMap;
   span: TimeMapSpan;
   spanIndex: number;
   timeMapId: string;
@@ -73,6 +76,7 @@ const defaultAdapterFactory: TimeMapPlaybackAdapterFactory = ({ backend, video, 
       : null;
 
 export function TimeMapPlaybackReview({
+  timeMap,
   span,
   spanIndex,
   timeMapId,
@@ -105,6 +109,8 @@ export function TimeMapPlaybackReview({
   const positionRef = useRef(initialInterval?.startMs ?? 0);
   const playingRef = useRef(false);
   const operationRef = useRef(0);
+  const playbackAccumulatorRef = useRef(resetTimeMapPlaybackAccumulator());
+  const sessionEvidenceRef = useRef(createEmptyTimeMapSpanPlaybackEvidence());
   const [adapterReady, setAdapterReady] = useState(false);
   const [activeAxis, setActiveAxis] = useState<TimeMapPlaybackAxis>(plan.initialAxis);
   const [positionMs, setPositionMs] = useState(initialInterval?.startMs ?? 0);
@@ -126,23 +132,24 @@ export function TimeMapPlaybackReview({
     [loopScope, sourceMapRange, span, targetMapRange]
   );
 
-  const setPlaying = useCallback((next: boolean) => {
-    playingRef.current = next;
-    setPlayingState(next);
+  const resetPlaybackObservation = useCallback(() => {
+    playbackAccumulatorRef.current = resetTimeMapPlaybackAccumulator();
   }, []);
+
+  const setPlaying = useCallback(
+    (next: boolean) => {
+      playingRef.current = next;
+      if (!next) resetPlaybackObservation();
+      setPlayingState(next);
+    },
+    [resetPlaybackObservation]
+  );
 
   const updatePosition = useCallback((next: number) => {
     const normalized = Math.max(0, Math.round(next));
     positionRef.current = normalized;
     setPositionMs((current) => (current === normalized ? current : normalized));
   }, []);
-
-  const markPlayback = useCallback(
-    (axis: TimeMapPlaybackAxis) => {
-      setSessionEvidence((current) => markTimeMapSpanPlaybackStarted(current, loopScope, axis));
-    },
-    [loopScope]
-  );
 
   useEffect(() => {
     operationRef.current += 1;
@@ -152,7 +159,9 @@ export function TimeMapPlaybackReview({
     setLoading(false);
     setError(null);
     setLoopScope("span");
-    setSessionEvidence(createEmptyTimeMapSpanPlaybackEvidence());
+    const emptyEvidence = createEmptyTimeMapSpanPlaybackEvidence();
+    sessionEvidenceRef.current = emptyEvidence;
+    setSessionEvidence(emptyEvidence);
     setActiveAxis(plan.initialAxis);
     const interval = intervalForAxis(plan, plan.initialAxis);
     updatePosition(interval?.startMs ?? 0);
@@ -237,7 +246,6 @@ export function TimeMapPlaybackReview({
             return false;
           }
           setPlaying(true);
-          markPlayback(axis);
         }
         return true;
       } catch (loadError) {
@@ -260,7 +268,6 @@ export function TimeMapPlaybackReview({
       playbackPair.source,
       playbackPair.target,
       setPlaying,
-      markPlayback,
       updatePosition
     ]
   );
@@ -332,7 +339,6 @@ export function TimeMapPlaybackReview({
     try {
       await adapter.play();
       setPlaying(true);
-      markPlayback(activeAxis);
       setError(null);
       setStatus(
         `正在播放${axisLabel(activeAxis)}第 ${spanIndex + 1} 段${loopEnabled ? "，到段尾后循环" : "，到段尾后暂停"}。`
@@ -345,7 +351,6 @@ export function TimeMapPlaybackReview({
     boundaryContext,
     loadAxis,
     loopEnabled,
-    markPlayback,
     plan,
     playbackPair.backend,
     setPlaying,
@@ -411,6 +416,16 @@ export function TimeMapPlaybackReview({
   );
 
   useEffect(() => {
+    const handleVisibilityChange = (): void => {
+      if (document.hidden || document.visibilityState === "hidden") {
+        resetPlaybackObservation();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [resetPlaybackObservation]);
+
+  useEffect(() => {
     if (!open || !adapterReady) {
       return;
     }
@@ -428,10 +443,29 @@ export function TimeMapPlaybackReview({
       if (!interval) {
         return;
       }
+      const accumulation = accumulateTimeMapPlaybackObservation(
+        sessionEvidenceRef.current,
+        playbackAccumulatorRef.current,
+        {
+          scope: loopScope,
+          axis: activeAxis,
+          positionMs: Math.max(0, Math.round(currentPositionMs)),
+          observedAtMs: performance.now(),
+          playing: true,
+          visible: !document.hidden && document.visibilityState !== "hidden"
+        },
+        interval
+      );
+      playbackAccumulatorRef.current = accumulation.accumulator;
+      sessionEvidenceRef.current = accumulation.evidence;
+      if (accumulation.creditedDurationMs > 0) {
+        setSessionEvidence(accumulation.evidence);
+      }
       const boundary = resolveTimeMapPlaybackBoundary(interval, currentPositionMs, loopEnabled);
       if (!boundary.reachedEnd || boundary.seekToMs === null) {
         return;
       }
+      resetPlaybackObservation();
       adapter.seek(boundary.seekToMs);
       updatePosition(boundary.seekToMs);
       if (boundary.shouldPause) {
@@ -446,8 +480,10 @@ export function TimeMapPlaybackReview({
     adapterReady,
     boundaryContext,
     loopEnabled,
+    loopScope,
     open,
     plan,
+    resetPlaybackObservation,
     setPlaying,
     updatePosition
   ]);
@@ -491,8 +527,14 @@ export function TimeMapPlaybackReview({
     counterpartKind
   );
   const canOpen = playbackPair.available && Boolean(activeInterval);
+  const playbackProgress = assessTimeMapSpanPlaybackEvidence(
+    timeMap,
+    spanIndex,
+    sessionEvidence
+  );
   const missingPlaybackEvidence = describeMissingTimeMapSpanPlaybackEvidence(
-    span,
+    timeMap,
+    spanIndex,
     sessionEvidence
   );
 
@@ -687,9 +729,53 @@ export function TimeMapPlaybackReview({
             </div>
             <p className="mt-1 leading-5 text-slate-500">
               {missingPlaybackEvidence.length === 0
-                ? "播放器已完成本段要求的真实 A/B 启动组合，可以保存证据。"
+                ? "已达到本段要求的有效试听时长和覆盖范围，可以保存证据。"
                 : `还需：${missingPlaybackEvidence.join("、")}。`}
             </p>
+            <p className="mt-1 leading-5 text-slate-500">
+              只累计页面可见且播放器时间连续向前推进的 1
+              倍速试听；暂停、后台、拖动、切轴和循环跳回均不计时。
+            </p>
+            <ul className="mt-2 grid gap-1.5" aria-label="本段有效试听进度">
+              {playbackProgress.map((progress) => {
+                const completion = Math.min(
+                  1,
+                  progress.effectiveDurationMs / progress.minimumEffectiveMs,
+                  progress.coveredDurationMs / progress.minimumCoveredMs
+                );
+                return (
+                  <li
+                    key={progress.slot}
+                    className="grid gap-1 rounded border border-panel-line/60 bg-black/20 px-2 py-1.5"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span
+                        className={progress.complete ? "text-emerald-100" : "text-slate-300"}
+                      >
+                        {progress.label}
+                      </span>
+                      <span className="text-slate-500">
+                        有效{" "}
+                        {formatPlaybackSeconds(
+                          Math.min(progress.effectiveDurationMs, progress.minimumEffectiveMs)
+                        )}
+                        /{formatPlaybackSeconds(progress.minimumEffectiveMs)} · 覆盖{" "}
+                        {formatPlaybackSeconds(
+                          Math.min(progress.coveredDurationMs, progress.minimumCoveredMs)
+                        )}
+                        /{formatPlaybackSeconds(progress.minimumCoveredMs)}
+                      </span>
+                    </div>
+                    <progress
+                      className="h-1.5 w-full accent-cyan-400"
+                      max={1}
+                      value={completion}
+                      aria-label={`${progress.label}完成进度`}
+                    />
+                  </li>
+                );
+              })}
+            </ul>
             {relationState === "accepted" && !persistedReview ? (
               <p className="mt-1 leading-5 text-amber-200">
                 已确认图缺少本段播放证据；请撤销确认，回到候选完成真实播放复核后再保存关系。
@@ -806,6 +892,10 @@ function formatPlaybackError(error: unknown, backend: TimeMapPlaybackBackend | n
 
 function axisLabel(axis: TimeMapPlaybackAxis): string {
   return axis === "source" ? "参考 A" : "原片 B";
+}
+
+function formatPlaybackSeconds(milliseconds: number): string {
+  return `${(Math.max(0, milliseconds) / 1_000).toFixed(1)} 秒`;
 }
 
 function reviewIntervalForAxis(

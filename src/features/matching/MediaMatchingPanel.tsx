@@ -1584,6 +1584,7 @@ function TimeMapReview({
         </p>
 
         <TimeMapPlaybackReview
+          timeMap={timeMap}
           span={selectedSpan}
           spanIndex={safeSelectedSpanIndex}
           timeMapId={timeMap.id}
