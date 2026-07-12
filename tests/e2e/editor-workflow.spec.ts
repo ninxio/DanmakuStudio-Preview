@@ -88,7 +88,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
   await page.getByLabel("新手引导").click();
   await expect(page.getByTestId("workflow-overview-dialog")).toContainText(
-    "1 个 XML · 0/0 个原片已确认 · 0 个待复核"
+    "1 个 XML · 0/0 个原片已有保存关系 · 0 个候选待复核"
   );
   await expect(page.getByTestId("workflow-overview-dialog")).toContainText("按顺序放入时间轴");
   await page.getByLabel("关闭新手引导").click();

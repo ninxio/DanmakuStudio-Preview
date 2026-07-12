@@ -496,7 +496,7 @@ describe("多媒体自动匹配工作台", () => {
 
     await waitFor(() =>
       expect(useEditorStore.getState().status.message).toBe(
-        "所选 3 组素材已有候选或确认关系，无需重复分析。"
+        "所选 3 组素材已有候选或已保存关系，无需重复分析。"
       )
     );
     expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(4);
@@ -523,7 +523,7 @@ describe("多媒体自动匹配工作台", () => {
     render(<MatchingHarness />);
 
     const legacyQuality = screen.getByTestId("confirmed-time-map-quality");
-    expect(legacyQuality).toHaveTextContent("确认时间图缺失");
+    expect(legacyQuality).toHaveTextContent("已保存关系的时间图缺失");
     expect(legacyQuality).toHaveTextContent("导出闸门：已阻断");
     expect(legacyQuality).toHaveTextContent("正式导出已停用旧规则兼容投影");
 
@@ -539,7 +539,7 @@ describe("多媒体自动匹配工作台", () => {
     );
     expect(
       within(screen.getByLabelText("批量匹配任务")).getByText(
-        "已有候选或已确认关系，未重复分析"
+        "已有候选或已保存关系，未重复分析"
       )
     ).toBeInTheDocument();
   });
@@ -550,6 +550,7 @@ describe("多媒体自动匹配工作台", () => {
     const warning = screen.getByTestId("legacy-alignment-warning");
     expect(warning).toHaveTextContent("实验性定位线索");
     expect(warning).toHaveTextContent("尚未通过真实媒体精度基准");
+    expect(warning).toHaveTextContent("Alignment V2 也尚未在冻结真实媒体集完成校准");
     expect(warning).toHaveTextContent("必须逐项试听或预览复核");
     expect(warning).toHaveTextContent("自动结果不能直接作为导出依据");
     expect(screen.queryByText(/高可信候选/)).not.toBeInTheDocument();
@@ -903,7 +904,7 @@ describe("多媒体自动匹配工作台", () => {
     ).toBeEnabled();
   });
 
-  it("候选保存后卡片改用独立的已确认时间图复核", async () => {
+  it("候选保存后明确显示关系待复核，不用绿色已确认暗示可导出", async () => {
     const user = userEvent.setup();
     configureSingleTargetV2Project("review");
     render(<MatchingHarness />);
@@ -916,7 +917,10 @@ describe("多媒体自动匹配工作台", () => {
       expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("accepted")
     );
     const acceptedReview = within(card).getByTestId("time-map-review");
-    expect(acceptedReview).toHaveTextContent("已确认图 · 共同内容 1");
+    expect(acceptedReview).toHaveTextContent("关系已保存 / 待完成复核 · 共同内容 1");
+    const savedState = within(card).getByText("关系已保存 / 待完成复核");
+    expect(savedState).toHaveClass("text-accent-yellow");
+    expect(savedState).not.toHaveClass("text-accent-green");
     expect(
       useEditorStore.getState().project.mediaMatchCandidates[0]?.confirmedTimeMapId
     ).not.toBeNull();
@@ -1014,6 +1018,7 @@ describe("多媒体自动匹配工作台", () => {
 
     const signedPanel = within(card).getByTestId("manual-time-map-verification");
     expect(signedPanel).toHaveTextContent("本机签名已验证");
+    expect(within(card).getByText("已验证 · 可导出")).toHaveClass("text-accent-green");
     await user.click(within(signedPanel).getByRole("button", { name: "撤销人工验证" }));
     await waitFor(() => expect(revoke).toHaveBeenCalledTimes(1));
     const revokeCall = revoke.mock.calls[0];
@@ -1114,7 +1119,7 @@ describe("多媒体自动匹配工作台", () => {
       "仍不能导出"
     ]
   ] as const)(
-    "%s 候选保存后在已确认关系显示 provenance 重算后的确认图质量",
+    "%s 候选保存后在已保存关系显示 provenance 重算后的时间图质量",
     async (level, expectedLevel, label, buttonName, gateText, message) => {
       configureSingleTargetV2Project(level);
       render(<MatchingHarness />);

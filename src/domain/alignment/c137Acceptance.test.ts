@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { createCompleteC137PerformanceEvidenceFixture } from "../../test/c137PerformanceEvidence";
+import {
+  createCompleteC137PerformanceEvidenceFixture,
+  createCompleteC137PerformanceEvidenceV2Fixture
+} from "../../test/c137PerformanceEvidence";
 import {
   computeC137PerformanceEnvironmentDigest,
-  computeC137PerformanceEvidenceDigest
+  computeC137PerformanceEnvironmentDigestV2,
+  computeC137PerformanceEvidenceDigest,
+  computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceWorkloadStorageReceiptDigest,
+  createC137PerformancePlanDigest,
+  type C137PerformanceRawEvidenceV2
 } from "./c137PerformanceEvidence";
 import {
   computeC137CanonicalDigest,
@@ -57,13 +65,219 @@ describe("C137 fail-closed acceptance gate", () => {
     });
   });
 
-  it("只有完整 real-frozen 原始 evidence 才能 pass", () => {
+  it("v1 工程 evidence 即使伪装正式字段、自摘要并由调用方自建 trustContext 也只能 incomplete", () => {
     const bundle = createCompleteBundle();
+    const raw = bundle.reports.performance!.rawEvidence;
+    if (raw.schemaVersion !== 1) throw new Error("expected legacy v1 engineering evidence");
+    raw.evidenceDigest = computeC137PerformanceEvidenceDigest(raw);
+    refreshReportEvidenceDigests(bundle);
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
-    expect(gate.status).toBe("pass");
-    expect(gate.verifiedEligible).toBe(true);
-    expect(gate.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(raw.schemaVersion).toBe(1);
+    expect(raw.collector.sampler).toBe("windows-job-object-working-set-v1");
+    expect(raw.environment.storageScope).toBe("workload-media-volumes");
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+    expect(gate.checks.find((check) => check.id === "external-trust-authority"))
+      .toMatchObject({
+        status: "incomplete",
+        actual: "unverified-caller-snapshot"
+      });
+    const rawSchemaCheck = gate.checks.find(
+      (check) => check.id === "performance-formal-raw-schema-version"
+    );
+    expect(rawSchemaCheck).toMatchObject({
+      status: "incomplete",
+      actual: 1
+    });
+    expect(rawSchemaCheck?.requirement).toContain("schemaVersion=2");
+    expect(gate.checks.find((check) => check.id === "performance-raw-evidence")).toMatchObject({
+      status: "pass"
+    });
+  });
+
+  it("旧 protocol v2 缺少正式 raw schema 绑定时严格拒绝", () => {
+    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+      protocol: Record<string, unknown>;
+    };
+    legacy.protocol.schemaVersion = 2;
+    delete legacy.protocol.requiredPerformanceRawSchemaVersion;
+
+    const validation = validateC137AcceptanceBundle(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 3");
+    expect(validation.issues.join("\n")).toContain(
+      "bundle.protocol.requiredPerformanceRawSchemaVersion 缺失"
+    );
+  });
+
+  it("performance report v2 不能冒充绑定 raw v2 的 v3 报告", () => {
+    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+      reports: { performance: Record<string, unknown> };
+    };
+    legacy.reports.performance.schemaVersion = 2;
+
+    const validation = validateC137AcceptanceBundle(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain(
+      "bundle.reports.performance.schemaVersion 必须为 3"
+    );
+  });
+
+  it("raw v2 即使改写为 Job、完整绑定存储、自摘要和自建信任上下文，仍缺三项原生正式 receipt", () => {
+    const bundle = createCompleteV2Bundle();
+    const raw = bundle.reports.performance!.rawEvidence;
+    if (raw.schemaVersion !== 2) throw new Error("expected raw evidence v2");
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(raw.collector.sampler).toBe("windows-job-object-working-set-v1");
+    expect(raw.assurance.jobMemoryReceipt).toBeNull();
+    expect(raw.assurance.terminalCleanupReceipt).toBeNull();
+    expect(raw.assurance.attestation).toBeNull();
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+    expect(
+      gate.checks.find((check) => check.id === "performance-formal-raw-schema-version")
+    ).toMatchObject({ status: "pass", actual: 2 });
+    const storageCheck = gate.checks.find((check) => check.id === "workload-storage-receipt");
+    expect(storageCheck).toMatchObject({ status: "pass" });
+    expect(storageCheck?.requirement).toContain("结构完整");
+    expect(storageCheck?.requirement).toContain("native attestation");
+    expect(storageCheck?.requirement).not.toContain("原生 v2 生成");
+    for (const id of [
+      "job-memory-receipt",
+      "terminal-cleanup-receipt",
+      "native-attestation"
+    ]) {
+      expect(gate.checks.find((check) => check.id === id)).toMatchObject({
+        status: "incomplete",
+        actual: "not-verifiable-in-schema-v2"
+      });
+    }
+  });
+
+  it("另一工作负载的 raw v2 即使完整闭环重签也不能绑定当前冻结集", () => {
+    const bundle = createCompleteV2Bundle();
+    const raw = bundle.reports.performance!.rawEvidence;
+    if (raw.schemaVersion !== 2) throw new Error("expected raw evidence v2");
+    rebindV2EvidenceWorkload(raw, digest("e"));
+    bundle.protocol.performancePlanDigest = raw.planDigest;
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(raw.runManifestDigest).not.toBe(bundle.manifestDigest);
+    expect(
+      gate.checks.find((check) => check.id === "performance-workload-manifest-binding")
+    ).toMatchObject({
+      status: "incomplete",
+      actual: raw.runManifestDigest
+    });
+    expect(gate.checks.find((check) => check.id === "performance-measurements"))
+      .toMatchObject({ status: "incomplete", actual: false });
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
+  it("协议锁定 Top-K 后，冻结 decision 少报候选即使重签全部 report 也必须失败", () => {
+    const bundle = createCompleteBundle();
+    const decision = bundle.reports.relationshipRanking!.decisions[0];
+    decision.rankedCandidateIds = [decision.goldCandidateId];
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(bundle.protocol.topK).toBe(5);
+    expect(gate.checks.find((check) => check.id === "ranking-top-k-reported")).toMatchObject({
+      status: "fail",
+      actual: 999
+    });
+    expect(gate.status).toBe("incomplete-evidence");
+    expect(gate.reasons.join("\n")).toContain("external-trust-authority");
+    expect(gate.reasons.join("\n")).toContain("ranking-top-k-reported");
+  });
+
+  it.each([
+    ["ranking mediaKind", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.relationshipRanking!.decisions[0].mediaKind = "synthetic";
+    }],
+    ["TimeMap split", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.timeMap!.cases[0].split = "development";
+    }],
+    ["TimeMap scenarios", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.timeMap!.cases[0].scenarios = ["global-offset"];
+    }],
+    ["visual metadata", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.visualFallback!.cases[0].split = "calibration";
+    }],
+    ["degradation metadata", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.degradation!.cases[0].mediaKind = "synthetic";
+    }]
+  ] as const)("%s 与 dataset 不一致时，重签 report 仍必须被元数据闭环阻断", (_label, mutate) => {
+    const bundle = createCompleteBundle();
+    mutate(bundle);
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(gate.checks.find((check) => check.id === "case-metadata-consistency"))
+      .toMatchObject({ status: "incomplete", actual: false });
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
+  it.each([
+    ["缺少 frozen decision", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.calibration!.samples.pop();
+    }],
+    ["metadata 不一致", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.calibration!.samples[0].split = "development";
+    }],
+    ["伪造 correct", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.calibration!.samples[0].correct = false;
+    }],
+    ["decisionId 不一致", (bundle: C137AcceptanceBundle) => {
+      bundle.reports.calibration!.samples[0].decisionId = "unbound-calibration-decision";
+    }]
+  ] as const)("calibration %s 时，重签 report 仍不能冒充一对一校准", (_label, mutate) => {
+    const bundle = createCompleteBundle();
+    mutate(bundle);
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(gate.checks.find((check) => check.id === "calibration-samples"))
+      .toMatchObject({ status: "incomplete", actual: false });
+  });
+
+  it("dataset gold 事件计数与 TimeMap 原始事件不一致时，重签 report 仍必须阻断", () => {
+    const bundle = createCompleteBundle();
+    bundle.reports.dataset!.cases[0].goldEditEventCount += 1;
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(gate.checks.find((check) => check.id === "gold-edit-event-count-binding"))
+      .toMatchObject({ status: "incomplete", actual: false });
+  });
+
+  it("任一冻结 time-stretch case 漏报漂移时，其他完美样本不能掩盖", () => {
+    const bundle = createCompleteBundle();
+    bundle.reports.timeMap!.cases[0].endDriftAt45MinutesMs = null;
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(gate.checks.find((check) => check.id === "drift-measurements"))
+      .toMatchObject({ status: "incomplete", actual: false });
+    expect(gate.checks.find((check) => check.id === "time-map-end-drift-45m"))
+      .toMatchObject({ status: "pass" });
   });
 
   it("修改硬件或工具链字段但保留旧环境摘要时严格拒绝", () => {
@@ -186,7 +400,7 @@ describe("C137 fail-closed acceptance gate", () => {
     const top1 = gate.checks.find((check) => check.id === "ranking-same-audio-top1");
 
     expect(top1).toMatchObject({ status: "fail", actual: 0.994 });
-    expect(gate.status).toBe("fail");
+    expect(gate.status).toBe("incomplete-evidence");
     expect(gate.verifiedEligible).toBe(false);
   });
 
@@ -257,6 +471,7 @@ describe("C137 fail-closed acceptance gate", () => {
   it("ToolHelp engineering raw 不能晋升为正式性能通过", () => {
     const bundle = createCompleteBundle();
     const raw = bundle.reports.performance!.rawEvidence;
+    if (raw.schemaVersion !== 1) throw new Error("expected legacy v1 engineering evidence");
     raw.collector.sampler = "windows-toolhelp-working-set-v1";
     for (const trial of raw.trials) {
       if (trial.trialType === "run") {
@@ -353,7 +568,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
     goldDigest,
     datasetVersion: "real-frozen-1",
     predictionsDigest,
-    protocolId: "c137-acceptance@2",
+    protocolId: "c137-acceptance@3",
     environmentDigest,
     buildDigest,
     engineVersion: "alignment-v2",
@@ -403,15 +618,16 @@ function createCompleteBundle(): C137AcceptanceBundle {
     datasetVersion: "real-frozen-1",
     certificationClass: "real-frozen",
     protocol: {
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: "c137-acceptance",
-      version: "2",
+      version: "3",
       topK: 5,
       calibrationBinCount: 10,
       requiredColdRuns: 1,
       requiredHotRuns: 1,
       requiredCancellationRuns: 1,
       performancePlanDigest: performanceEvidence.planDigest,
+      requiredPerformanceRawSchemaVersion: 2,
       maximumMemorySampleIntervalMs: 100,
       requiredMonotonicClock: "rust-std-instant-session-relative-v1",
       requiredMemorySampler: "windows-job-object-working-set-v1",
@@ -477,7 +693,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
         manifestDigest,
         datasetVersion: "real-frozen-1",
         predictionsDigest,
-        protocolId: "c137-acceptance@2",
+        protocolId: "c137-acceptance@3",
         environmentDigest,
         buildDigest,
         engineVersion: "alignment-v2",
@@ -545,7 +761,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
         }))
       },
       performance: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         binding: { ...binding },
         rawEvidence: structuredClone(performanceEvidence)
       },
@@ -576,6 +792,87 @@ function createCompleteBundle(): C137AcceptanceBundle {
   return bundle;
 }
 
+function createCompleteV2Bundle(): C137AcceptanceBundle {
+  const bundle = createCompleteBundle();
+  const raw = createCompleteC137PerformanceEvidenceV2Fixture();
+  raw.collector.sampler = "windows-job-object-working-set-v1";
+  for (const trial of raw.trials) {
+    if (trial.trialType === "run") {
+      for (const item of trial.cases) {
+        item.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+      }
+    } else {
+      trial.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+    }
+  }
+  raw.evidenceDigest = computeC137PerformanceEvidenceDigestV2(raw);
+
+  const measured = raw.environment;
+  const environmentWithoutDigest: Omit<C137EnvironmentFingerprint, "digest"> = {
+    schemaVersion: 2,
+    operatingSystem: measured.operatingSystem,
+    operatingSystemVersion: measured.operatingSystemVersion,
+    architecture: measured.architecture,
+    cpuModel: measured.cpuModel,
+    physicalCoreCount: measured.physicalCoreCount,
+    logicalCoreCount: measured.logicalCoreCount,
+    totalMemoryBytes: measured.totalMemoryBytes,
+    storageScope: measured.storageScope,
+    storageKind: measured.storageKind,
+    powerProfile: measured.powerProfile,
+    ffmpegVersion: measured.ffmpeg.version,
+    ffmpegBinaryDigest: measured.ffmpeg.binaryDigest,
+    ffprobeVersion: measured.ffprobe.version,
+    ffprobeBinaryDigest: measured.ffprobe.binaryDigest
+  };
+  const environmentDigest = computeC137EnvironmentDigest(environmentWithoutDigest);
+  bundle.environment = { ...environmentWithoutDigest, digest: environmentDigest };
+  bundle.protocol.targetEnvironmentDigest = environmentDigest;
+  bundle.protocol.performancePlanDigest = raw.planDigest;
+  if (bundle.receipts.predictionRun !== null) {
+    bundle.receipts.predictionRun.environmentDigest = environmentDigest;
+  }
+  for (const key of REPORT_KEYS) {
+    const report = bundle.reports[key];
+    if (report !== null) report.binding.environmentDigest = environmentDigest;
+  }
+  const binding = bundle.reports.performance?.binding;
+  if (!binding) throw new Error("expected performance report binding");
+  bundle.reports.performance = {
+    schemaVersion: 3,
+    binding,
+    rawEvidence: raw
+  };
+  refreshReportEvidenceDigests(bundle);
+  return bundle;
+}
+
+function rebindV2EvidenceWorkload(
+  raw: C137PerformanceRawEvidenceV2,
+  workloadDigest: C137Digest
+): void {
+  raw.runManifestDigest = workloadDigest;
+  raw.plan.workloadDigest = workloadDigest;
+  raw.environment.workloadStorage.runManifestDigest = workloadDigest;
+  raw.environment.workloadStorage.workloadDigest = workloadDigest;
+  raw.environment.workloadStorage.receiptDigest =
+    computeC137PerformanceWorkloadStorageReceiptDigest(
+      raw.environment.workloadStorage
+    );
+  const { digest: ignoredEnvironmentDigest, ...unsignedEnvironment } = raw.environment;
+  void ignoredEnvironmentDigest;
+  raw.environment.digest = computeC137PerformanceEnvironmentDigestV2(unsignedEnvironment);
+  raw.collector.runManifestDigest = workloadDigest;
+  raw.collector.workloadDigest = workloadDigest;
+  raw.collector.workloadStorageReceiptDigest =
+    raw.environment.workloadStorage.receiptDigest;
+  raw.assurance.workloadStorageReceiptDigest =
+    raw.environment.workloadStorage.receiptDigest;
+  for (const trial of raw.trials) trial.workloadDigest = workloadDigest;
+  raw.planDigest = createC137PerformancePlanDigest(raw.plan);
+  raw.evidenceDigest = computeC137PerformanceEvidenceDigestV2(raw);
+}
+
 function relationshipDecision(
   index: number,
   caseId: string,
@@ -584,6 +881,10 @@ function relationshipDecision(
   prefix: string
 ): C137RelationshipDecisionEvidence {
   const goldCandidateId = `${prefix}-gold-${index}`;
+  const distractors = Array.from(
+    { length: 4 },
+    (_, distractorIndex) => `${prefix}-wrong-${index}-${distractorIndex}`
+  );
   return {
     decisionId: `${prefix}-decision-${index}`,
     caseId,
@@ -592,8 +893,8 @@ function relationshipDecision(
     modality: "same-audio",
     goldCandidateId,
     rankedCandidateIds: correct
-      ? [goldCandidateId, `${prefix}-wrong-${index}`]
-      : [`${prefix}-wrong-${index}`, goldCandidateId],
+      ? [goldCandidateId, ...distractors]
+      : [distractors[0], goldCandidateId, ...distractors.slice(1)],
     verifiedCandidateId: null
   };
 }

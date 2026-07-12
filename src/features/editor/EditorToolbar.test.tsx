@@ -90,7 +90,7 @@ describe("编辑器工具栏", () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByText(/1 个 XML · 0\/0 个原片已确认 · 0 个待复核/)).toBeInTheDocument()
+      expect(screen.getByText(/1 个 XML · 0\/0 个原片已有保存关系 · 0 个候选待复核/)).toBeInTheDocument()
     );
     expect(
       screen

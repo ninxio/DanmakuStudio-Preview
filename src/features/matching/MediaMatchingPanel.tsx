@@ -281,7 +281,7 @@ export function MediaMatchingPanel({
         : "waiting",
       progress: existingPairKeys.has(createMediaPairKey(source.id, target.id)) ? 1 : 0,
       message: existingPairKeys.has(createMediaPairKey(source.id, target.id))
-        ? "已有候选或已确认关系，未重复分析"
+        ? "已有候选或已保存关系，未重复分析"
         : "等待分析",
       jobId: null,
       logs: []
@@ -289,7 +289,7 @@ export function MediaMatchingPanel({
     setTasks(initialTasks);
     if (pendingPairs.length === 0) {
       setEditorStatus(
-        `所选 ${pairs.length} 组素材已有候选或确认关系，无需重复分析。`,
+        `所选 ${pairs.length} 组素材已有候选或已保存关系，无需重复分析。`,
         "neutral"
       );
       return;
@@ -545,8 +545,8 @@ export function MediaMatchingPanel({
         <WandSparkles size={16} className="text-accent-cyan" />
         <h3 className="text-sm font-medium text-slate-100">自动匹配项目素材</h3>
         <span className="ml-auto text-[11px] text-slate-500">
-          {confirmedTargetCount(project)} / {targetMedia.length} 个原片已确认 ·{" "}
-          {pendingCandidates.length} 个待复核
+          {savedRelationTargetCount(project)} / {targetMedia.length} 个原片已有保存关系 ·{" "}
+          {pendingCandidates.length} 个候选待复核
         </span>
       </div>
       <p className="mt-2 leading-5 text-slate-500">
@@ -559,8 +559,8 @@ export function MediaMatchingPanel({
       >
         <div className="font-medium">实验性定位线索</div>
         <p className="mt-1">
-          当前旧对齐引擎尚未通过真实媒体精度基准，旧引擎分数未经校准；Alignment V2
-          请以每张卡片的质量等级、实测指标和导出闸门为准。范围、起点和删减修正仍必须逐项试听或预览复核，自动结果不能直接作为导出依据。
+          当前旧对齐引擎尚未通过真实媒体精度基准，旧引擎分数未经校准。Alignment V2
+          也尚未在冻结真实媒体集完成校准。请以每张卡片的质量等级、实测指标和导出闸门为准；范围、起点和删减修正仍必须逐项试听或预览复核，自动结果不能直接作为导出依据。
         </p>
       </div>
 
@@ -982,6 +982,7 @@ function MediaMatchCandidateCard({
   const displayedTimeMap = candidate.state === "accepted" ? confirmedTimeMap : candidateTimeMap;
   const displayedTimeMapState = candidate.state === "accepted" ? "confirmed" : "candidate";
   const timeMapGate = describeTimeMapGate(candidateTimeMap, "candidate");
+  const displayedTimeMapGate = describeTimeMapGate(displayedTimeMap, displayedTimeMapState);
   const acceptLabel = timeMapGate.exportReady
     ? "确认关系并用于导出"
     : timeMapGate.canSaveRelationship
@@ -1094,9 +1095,9 @@ function MediaMatchCandidateCard({
           </div>
         </div>
         <span
-          className={`rounded border px-2 py-0.5 text-[11px] ${candidateStateClass(candidate.state)}`}
+          className={`rounded border px-2 py-0.5 text-[11px] ${candidateStateClass(candidate.state, displayedTimeMapGate.exportReady)}`}
         >
-          {candidateStateText(candidate)}
+          {candidateStateText(candidate, displayedTimeMapGate.exportReady)}
         </span>
         <span className="rounded border border-panel-line px-2 py-0.5 text-[11px] text-slate-400">
           {candidate.proposal.timeMap
@@ -1505,7 +1506,7 @@ function TimeMapReview({
       >
         <div className="font-medium">来源↔原片时间图复核</div>
         <p className="mt-1 leading-5">
-          {relationState === "accepted" ? "已确认" : "候选"}
+          {relationState === "accepted" ? "已保存关系的" : "候选"}
           时间图缺失，无法安全绘制或定位分段。请重新分析这组素材。
         </p>
       </section>
@@ -1571,7 +1572,11 @@ function TimeMapReview({
       <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan">
         <span className="font-medium text-slate-200">来源↔原片时间图复核</span>
         <span className="ml-2 text-slate-500">
-          {relationState === "accepted" ? "已确认图 · " : "候选图 · "}
+          {relationState === "accepted"
+            ? timeMap.quality.level === "verified"
+              ? "已验证 · 可导出 · "
+              : "关系已保存 / 待完成复核 · "
+            : "候选图 · "}
           共同内容 {spanCounts.matched} · 参考独有 {spanCounts.sourceOnly} · 原片独有{" "}
           {spanCounts.targetOnly} · 无法判断 {spanCounts.ambiguous}
         </span>
@@ -1925,7 +1930,7 @@ function UnlinkedLegacyTimeMapWarning() {
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="rounded border border-accent-red/50 bg-accent-red/10 px-2 py-0.5 text-[11px] font-medium">
-          确认时间图缺失
+          已保存关系的时间图缺失
         </span>
         <span className="text-[11px] font-medium">导出闸门：已阻断</span>
       </div>
@@ -1947,7 +1952,7 @@ function describeTimeMapGate(
       kind: "missing",
       label: "时间图缺失",
       message: isConfirmedRelation
-        ? "确认时间图缺失，这条关系数据异常，不能导出；请重新分析或人工建立可验证映射。"
+        ? "已保存关系的时间图缺失，这条关系数据异常，不能导出；请重新分析或人工建立可验证映射。"
         : "候选时间图缺失，这个候选数据异常，不能确认或导出；请重新运行匹配。",
       canSaveRelationship: false,
       exportReady: false
@@ -1957,7 +1962,7 @@ function describeTimeMapGate(
     return {
       kind: "state-error",
       label: "时间图异常",
-      message: `${isConfirmedRelation ? "确认关系" : "候选"}引用的时间图状态为 ${timeMap.state}，预期为 ${expectedState}，不能继续确认或导出。`,
+      message: `${isConfirmedRelation ? "已保存关系" : "候选"}引用的时间图状态为 ${timeMap.state}，预期为 ${expectedState}，不能继续保存或导出。`,
       canSaveRelationship: false,
       exportReady: false
     };
@@ -1968,7 +1973,7 @@ function describeTimeMapGate(
       kind: "verified",
       label: "已验证",
       message: isConfirmedRelation
-        ? "确认图已达到导出质量门槛，可用于导出。"
+        ? "已验证时间图达到导出质量门槛，可用于导出。"
         : "质量指标已达到导出门槛；确认关系后可用于导出。",
       canSaveRelationship: true,
       exportReady: true
@@ -2000,7 +2005,7 @@ function describeTimeMapGate(
     kind: "blocked",
     label: "已阻断",
     message: isConfirmedRelation
-      ? "确认图不满足质量门槛，仍不能导出；请先处理歧义或证据不足问题。"
+      ? "已保存时间图不满足质量门槛，仍不能导出；请先处理歧义或证据不足问题。"
       : "证据不足或存在歧义，不能确认，也不能导出；请查看原因并重新分析。",
     canSaveRelationship: false,
     exportReady: false
@@ -2073,10 +2078,10 @@ function ConfirmedRelations({ project }: { project: EditorProject }) {
   ];
   return (
     <div className="mt-4">
-      <h4 className="text-sm font-medium text-slate-100">已确认关系</h4>
+      <h4 className="text-sm font-medium text-slate-100">已保存关系</h4>
       {sourceIds.length === 0 ? (
         <p className="mt-2 rounded border border-dashed border-panel-line p-3 leading-5 text-slate-500">
-          尚未确认关系。接受候选后，会按参考素材分别显示多条映射，不会把不同视频放在同一时间标尺上。
+          尚无已保存关系。保存候选后，会按参考素材分别显示多条映射；完成复核和验证前，这些关系不能用于正式导出。
         </p>
       ) : (
         <div className="mt-2 grid gap-2" data-testid="confirmed-media-relations">
@@ -2193,7 +2198,7 @@ function areCandidateAssetSelectionsEqual(
   );
 }
 
-function confirmedTargetCount(project: EditorProject): number {
+function savedRelationTargetCount(project: EditorProject): number {
   return new Set(
     project.danmakuSourceSegments
       .filter((segment) => segment.kind === "content" && segment.targetMediaId)
@@ -2243,17 +2248,23 @@ function batchTaskStateText(state: BatchTaskState): string {
   return "失败";
 }
 
-function candidateStateText(candidate: MediaMatchCandidate): string {
+function candidateStateText(candidate: MediaMatchCandidate, exportReady: boolean): string {
   if (candidate.state === "pending") return "待复核";
-  if (candidate.state === "accepted") return "已确认";
+  if (candidate.state === "accepted")
+    return exportReady ? "已验证 · 可导出" : "关系已保存 / 待完成复核";
   if (candidate.state === "rejected") return "已忽略";
   if (candidate.proposal.timeMap?.quality.level === "blocked") return "已阻断";
   return "缺少 XML 绑定";
 }
 
-function candidateStateClass(state: MediaMatchCandidate["state"]): string {
+function candidateStateClass(
+  state: MediaMatchCandidate["state"],
+  exportReady: boolean
+): string {
   if (state === "accepted")
-    return "border-accent-green/40 bg-accent-green/10 text-accent-green";
+    return exportReady
+      ? "border-accent-green/40 bg-accent-green/10 text-accent-green"
+      : "border-accent-yellow/40 bg-accent-yellow/10 text-accent-yellow";
   if (state === "rejected") return "border-panel-line bg-black/20 text-slate-500";
   if (state === "blocked")
     return "border-accent-yellow/40 bg-accent-yellow/10 text-accent-yellow";

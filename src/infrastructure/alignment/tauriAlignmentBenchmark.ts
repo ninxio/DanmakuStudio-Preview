@@ -1,25 +1,61 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { AlignmentProposal } from "../../domain/alignment/types";
+import { sha256Hex } from "../../domain/shared/sha256";
 import type {
   AudioAlignmentJobStatus,
   AudioAlignmentStageKey,
   NormalizedTauriAudioAlignmentRequest,
   TauriAudioAlignmentRequest
 } from "./tauriAudioAlignment";
+import type { RealMediaBenchmarkRunManifest } from "./realMediaBenchmarkRunner";
 
-export const ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION = 1 as const;
+export const ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION = 2 as const;
 export const ALIGNMENT_BENCHMARK_MIN_SAMPLE_INTERVAL_MS = 10;
 export const ALIGNMENT_BENCHMARK_MAX_SAMPLE_INTERVAL_MS = 1_000;
+export const ALIGNMENT_BENCHMARK_MAX_RUN_MANIFEST_BYTES = 16 * 1024 * 1024;
+const ALIGNMENT_BENCHMARK_MAX_CASES = 1_000;
 
 export interface AlignmentBenchmarkSessionRequest {
+  schemaVersion: typeof ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION;
   ffmpegPath: string | null;
   ffprobePath: string | null;
   memorySampleIntervalMs: number;
+  runManifestCanonicalJson: string;
+  runManifestDigest: `sha256:${string}`;
+  workloadDigest: `sha256:${string}`;
 }
 
 export interface AlignmentBenchmarkToolFingerprint {
   version: string;
   binaryDigest: `sha256:${string}`;
+}
+
+export interface AlignmentBenchmarkWorkloadStorageBinding {
+  bindingOrdinal: number;
+  caseOrdinal: number;
+  side: "source" | "target";
+  volumeOrdinal: number;
+}
+
+export interface AlignmentBenchmarkWorkloadStorageVolume {
+  volumeOrdinal: number;
+  bindingCount: number;
+  driveType: "fixed";
+  seekPenalty: "incurs" | "none";
+  measurementStatus: "complete";
+}
+
+export interface AlignmentBenchmarkWorkloadStorageReceipt {
+  schemaVersion: typeof ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION;
+  runManifestDigest: `sha256:${string}`;
+  workloadDigest: `sha256:${string}`;
+  bindingCount: number;
+  uniqueMediaCount: number;
+  volumeCount: number;
+  mediaSetDigest: `sha256:${string}`;
+  bindings: AlignmentBenchmarkWorkloadStorageBinding[];
+  volumes: AlignmentBenchmarkWorkloadStorageVolume[];
+  receiptDigest: `sha256:${string}`;
 }
 
 export interface AlignmentBenchmarkEnvironmentReceipt {
@@ -34,8 +70,9 @@ export interface AlignmentBenchmarkEnvironmentReceipt {
   physicalCoreCount: number;
   logicalCoreCount: number;
   totalMemoryBytes: number;
-  storageScope: "system-volume" | "workload-media-volumes";
+  storageScope: "workload-media-volumes";
   storageKind: string;
+  workloadStorage: AlignmentBenchmarkWorkloadStorageReceipt;
   powerProfile: string;
   ffmpeg: AlignmentBenchmarkToolFingerprint;
   ffprobe: AlignmentBenchmarkToolFingerprint;
@@ -101,9 +138,7 @@ export interface AlignmentBenchmarkStageTiming {
 export interface AlignmentBenchmarkMemoryTelemetry {
   scope: "application-process-tree";
   sampler:
-    | "windows-toolhelp-working-set-v1"
-    | "windows-job-object-working-set-v1"
-    | "unsupported";
+    "windows-toolhelp-working-set-v1" | "windows-job-object-working-set-v1" | "unsupported";
   sampleIntervalMs: number;
   sampleCount: number;
   failedSampleCount: number;
@@ -160,16 +195,48 @@ export interface AlignmentBenchmarkInvoker {
   finish: (sessionId: string) => Promise<AlignmentBenchmarkSessionSnapshot>;
 }
 
+export function createAlignmentBenchmarkRunManifestCanonicalJson(
+  runManifest: RealMediaBenchmarkRunManifest
+): string {
+  assertRunManifestShape(runManifest);
+  if (
+    runManifest.cases.length === 0 ||
+    runManifest.cases.length > ALIGNMENT_BENCHMARK_MAX_CASES
+  ) {
+    throw new Error(
+      `原生性能 blind run manifest 必须包含 1–${ALIGNMENT_BENCHMARK_MAX_CASES} 个真实 case。`
+    );
+  }
+  const canonical = canonicalJson(runManifest);
+  requireBoundedUtf8(
+    canonical,
+    "blind run manifest",
+    ALIGNMENT_BENCHMARK_MAX_RUN_MANIFEST_BYTES
+  );
+  return canonical;
+}
+
 export async function beginAlignmentBenchmarkSession(
   request: AlignmentBenchmarkSessionRequest,
   invoker: AlignmentBenchmarkInvoker = defaultAlignmentBenchmarkInvoker
 ): Promise<AlignmentBenchmarkSessionSnapshot> {
   ensureDesktopBenchmark(invoker === defaultAlignmentBenchmarkInvoker);
   const normalized = normalizeSessionRequest(request);
+  let response: unknown;
   try {
-    return assertSessionSnapshot(await invoker.begin(normalized));
+    response = await invoker.begin(normalized);
   } catch {
     throw new Error("无法取得原生性能独占会话；详细系统信息未进入可分享错误。");
+  }
+  try {
+    return assertSessionSnapshot(response);
+  } catch {
+    const released = await bestEffortReleaseSessionAfterInvalidBeginResponse(invoker, response);
+    throw new Error(
+      released
+        ? "无法取得原生性能独占会话；详细系统信息未进入可分享错误。"
+        : "无法取得原生性能独占会话，且原生会话回收状态不确定；请重启应用后再运行。详细系统信息未进入可分享错误。"
+    );
   }
 }
 
@@ -208,14 +275,27 @@ export async function startAlignmentBenchmarkJob(
   ensureDesktopBenchmark(invoker === defaultAlignmentBenchmarkInvoker);
   const normalizedSessionId = normalizeOpaqueId(sessionId, "性能会话 ID");
   const normalizedRequest = normalizeAlignmentRequest(request);
+  let response: unknown;
   try {
-    const snapshot = assertJobSnapshot(
-      await invoker.startJob(normalizedSessionId, normalizedRequest)
-    );
+    response = await invoker.startJob(normalizedSessionId, normalizedRequest);
+  } catch {
+    throw new Error("原生性能任务启动失败；媒体路径和工具输出未进入错误。");
+  }
+  try {
+    const snapshot = assertJobSnapshot(response);
     assertMatchingId(snapshot.sessionId, normalizedSessionId);
     return snapshot;
   } catch {
-    throw new Error("原生性能任务启动失败；媒体路径和工具输出未进入错误。");
+    const recovered = await bestEffortCancelJobAfterInvalidStartResponse(
+      invoker,
+      normalizedSessionId,
+      response
+    );
+    throw new Error(
+      recovered
+        ? "原生性能任务启动失败；媒体路径和工具输出未进入错误。"
+        : "原生性能任务启动失败，且活动作业回收状态不确定；请重启应用后再运行。媒体路径和工具输出未进入错误。"
+    );
   }
 }
 
@@ -281,6 +361,128 @@ export function isAlignmentBenchmarkJobFinished(status: AudioAlignmentJobStatus)
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
+const INVALID_RESPONSE_RECOVERY_POLL_INTERVAL_MS = 50;
+const INVALID_RESPONSE_RECOVERY_MAX_POLLS = 600;
+
+async function bestEffortReleaseSessionAfterInvalidBeginResponse(
+  invoker: AlignmentBenchmarkInvoker,
+  invalidResponse: unknown
+): Promise<boolean> {
+  const responseSessionId = readRecoveryOpaqueId(invalidResponse, "sessionId");
+  if (responseSessionId === null) return false;
+
+  let active: unknown;
+  try {
+    active = await invoker.getActive();
+  } catch {
+    return false;
+  }
+  if (readRecoveryOpaqueId(active, "sessionId") !== responseSessionId) return false;
+
+  try {
+    const terminal = await invoker.finish(responseSessionId);
+    if (readRecoveryReleasedSession(terminal, responseSessionId)) return true;
+  } catch {
+    // The command may have released the lease before its transport failed. Re-check below.
+  }
+
+  try {
+    const remaining = await invoker.getActive();
+    return remaining === null;
+  } catch {
+    return false;
+  }
+}
+
+async function bestEffortCancelJobAfterInvalidStartResponse(
+  invoker: AlignmentBenchmarkInvoker,
+  expectedSessionId: string,
+  invalidResponse: unknown
+): Promise<boolean> {
+  const responseSessionId = readRecoveryOpaqueId(invalidResponse, "sessionId");
+  const responseJobId = readRecoveryOpaqueId(invalidResponse, "jobId");
+  if (responseSessionId !== expectedSessionId || responseJobId === null) return false;
+
+  let active: unknown;
+  try {
+    active = await invoker.getActive();
+  } catch {
+    return false;
+  }
+  const sessionId = readRecoveryOpaqueId(active, "sessionId");
+  const jobId = readRecoveryOpaqueId(active, "activeJobId");
+  if (sessionId !== expectedSessionId || jobId === null || jobId !== responseJobId) {
+    return false;
+  }
+
+  try {
+    const cancelled = await invoker.cancelJob(sessionId, jobId);
+    if (readRecoveryJobState(cancelled, sessionId, jobId) === "terminal") return true;
+  } catch {
+    // Cancellation may have been accepted before the transport failed; poll the lease state.
+  }
+
+  for (let poll = 0; poll < INVALID_RESPONSE_RECOVERY_MAX_POLLS; poll += 1) {
+    let snapshot: unknown;
+    try {
+      snapshot = await invoker.getJob(sessionId, jobId);
+    } catch {
+      return false;
+    }
+    const state = readRecoveryJobState(snapshot, sessionId, jobId);
+    if (state === "terminal") return true;
+    if (state === "invalid") return false;
+    if (poll + 1 < INVALID_RESPONSE_RECOVERY_MAX_POLLS) {
+      await waitForInvalidResponseRecovery(INVALID_RESPONSE_RECOVERY_POLL_INTERVAL_MS);
+    }
+  }
+  return false;
+}
+
+function readRecoveryOpaqueId(value: unknown, key: string): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = (value as Record<string, unknown>)[key];
+  if (typeof candidate !== "string" || !/^[A-Za-z0-9._:-]{8,160}$/.test(candidate)) {
+    return null;
+  }
+  return candidate;
+}
+
+function readRecoveryReleasedSession(value: unknown, expectedSessionId: string): boolean {
+  return (
+    readRecoveryOpaqueId(value, "sessionId") === expectedSessionId &&
+    readRecoveryString(value, "status") === "released"
+  );
+}
+
+function readRecoveryJobState(
+  value: unknown,
+  expectedSessionId: string,
+  expectedJobId: string
+): "pending" | "terminal" | "invalid" {
+  if (
+    readRecoveryOpaqueId(value, "sessionId") !== expectedSessionId ||
+    readRecoveryOpaqueId(value, "jobId") !== expectedJobId
+  ) {
+    return "invalid";
+  }
+  const status = readRecoveryString(value, "status");
+  if (status === "completed" || status === "failed" || status === "cancelled") {
+    return "terminal";
+  }
+  return status === "queued" || status === "running" ? "pending" : "invalid";
+}
+
+function readRecoveryString(value: unknown, key: string): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "string" ? candidate : null;
+}
+
+function waitForInvalidResponseRecovery(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
+}
+
 const defaultAlignmentBenchmarkInvoker: AlignmentBenchmarkInvoker = {
   begin: (request) =>
     invoke<AlignmentBenchmarkSessionSnapshot>("begin_alignment_benchmark_session", { request }),
@@ -314,6 +516,20 @@ const defaultAlignmentBenchmarkInvoker: AlignmentBenchmarkInvoker = {
 function normalizeSessionRequest(
   request: AlignmentBenchmarkSessionRequest
 ): AlignmentBenchmarkSessionRequest {
+  requireExactKeys(
+    request as unknown as Record<string, unknown>,
+    [
+      "schemaVersion",
+      "ffmpegPath",
+      "ffprobePath",
+      "memorySampleIntervalMs",
+      "runManifestCanonicalJson",
+      "runManifestDigest",
+      "workloadDigest"
+    ],
+    "benchmark session request"
+  );
+  requireSchemaVersion(request.schemaVersion, "benchmark session request.schemaVersion");
   if (
     !Number.isSafeInteger(request.memorySampleIntervalMs) ||
     request.memorySampleIntervalMs < ALIGNMENT_BENCHMARK_MIN_SAMPLE_INTERVAL_MS ||
@@ -323,10 +539,55 @@ function normalizeSessionRequest(
       `内存采样间隔必须是 ${ALIGNMENT_BENCHMARK_MIN_SAMPLE_INTERVAL_MS}–${ALIGNMENT_BENCHMARK_MAX_SAMPLE_INTERVAL_MS}ms 的安全整数。`
     );
   }
+  requireBoundedUtf8(
+    request.runManifestCanonicalJson,
+    "blind run manifest",
+    ALIGNMENT_BENCHMARK_MAX_RUN_MANIFEST_BYTES
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(request.runManifestCanonicalJson) as unknown;
+  } catch {
+    throw new Error("blind run manifest 必须是 canonical JSON。");
+  }
+  assertRunManifestShape(parsed);
+  const runManifest = parsed;
+  if (
+    runManifest.cases.length === 0 ||
+    runManifest.cases.length > ALIGNMENT_BENCHMARK_MAX_CASES
+  ) {
+    throw new Error(
+      `blind run manifest 必须包含 1–${ALIGNMENT_BENCHMARK_MAX_CASES} 个真实 case。`
+    );
+  }
+  const canonical = canonicalJson(parsed);
+  if (canonical !== request.runManifestCanonicalJson) {
+    throw new Error("blind run manifest JSON 不是递归 key 排序的 canonical JSON。");
+  }
+  const runManifestDigest = requireSha256Digest(
+    request.runManifestDigest,
+    "benchmark session request.runManifestDigest"
+  );
+  const workloadDigest = requireSha256Digest(
+    request.workloadDigest,
+    "benchmark session request.workloadDigest"
+  );
+  const expectedDigest = `sha256:${sha256Hex(canonical)}` as const;
+  if (
+    runManifestDigest !== expectedDigest ||
+    workloadDigest !== expectedDigest ||
+    runManifestDigest !== workloadDigest
+  ) {
+    throw new Error("blind run manifest/workload digest 与 canonical JSON 不一致。");
+  }
   return {
+    schemaVersion: ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION,
     ffmpegPath: normalizeOptionalPath(request.ffmpegPath),
     ffprobePath: normalizeOptionalPath(request.ffprobePath),
-    memorySampleIntervalMs: request.memorySampleIntervalMs
+    memorySampleIntervalMs: request.memorySampleIntervalMs,
+    runManifestCanonicalJson: canonical,
+    runManifestDigest,
+    workloadDigest
   };
 }
 
@@ -355,10 +616,7 @@ function normalizeAlignmentRequest(
   };
 }
 
-function normalizeStreamIndex(
-  value: number | null | undefined,
-  label: string
-): number | null {
+function normalizeStreamIndex(value: number | null | undefined, label: string): number | null {
   if (value === null || value === undefined) return null;
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${label}必须是非负安全整数或 null。`);
@@ -415,12 +673,13 @@ const MEMORY_SAMPLERS = [
   "windows-job-object-working-set-v1",
   "unsupported"
 ] as const;
-const STORAGE_SCOPES = ["system-volume", "workload-media-volumes"] as const;
+const STORAGE_SCOPES = ["workload-media-volumes"] as const;
 const MAX_ENVIRONMENT_ISSUES = 128;
 const MAX_STAGE_TIMINGS = 512;
 const MAX_TEXT_LENGTH = 4_096;
 const MAX_SHORT_TEXT_LENGTH = 512;
 const MAX_CACHE_ENTRY_COUNT = 1_000_000;
+const MAX_WORKLOAD_BINDINGS = ALIGNMENT_BENCHMARK_MAX_CASES * 2;
 const MAX_U128 = 340_282_366_920_938_463_463_374_607_431_768_211_455n;
 
 function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapshot {
@@ -481,6 +740,29 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
 
 function assertEnvironmentReceipt(value: unknown): AlignmentBenchmarkEnvironmentReceipt {
   const environment = requireRecord(value, "environment receipt");
+  requireExactKeys(
+    environment,
+    [
+      "schemaVersion",
+      "collectorVersion",
+      "measurementStatus",
+      "issues",
+      "operatingSystem",
+      "operatingSystemVersion",
+      "architecture",
+      "cpuModel",
+      "physicalCoreCount",
+      "logicalCoreCount",
+      "totalMemoryBytes",
+      "storageScope",
+      "storageKind",
+      "workloadStorage",
+      "powerProfile",
+      "ffmpeg",
+      "ffprobe"
+    ],
+    "environment receipt"
+  );
   requireSchemaVersion(environment.schemaVersion, "environment.schemaVersion");
   const issues = requireBoundedStringArray(
     environment.issues,
@@ -561,6 +843,7 @@ function assertEnvironmentReceipt(value: unknown): AlignmentBenchmarkEnvironment
       1,
       MAX_SHORT_TEXT_LENGTH
     ),
+    workloadStorage: assertWorkloadStorageReceipt(environment.workloadStorage),
     powerProfile: requireBoundedString(
       environment.powerProfile,
       "environment.powerProfile",
@@ -572,18 +855,182 @@ function assertEnvironmentReceipt(value: unknown): AlignmentBenchmarkEnvironment
   };
 }
 
+function assertWorkloadStorageReceipt(
+  value: unknown
+): AlignmentBenchmarkWorkloadStorageReceipt {
+  const receipt = requireRecord(value, "environment.workloadStorage");
+  requireExactKeys(
+    receipt,
+    [
+      "schemaVersion",
+      "runManifestDigest",
+      "workloadDigest",
+      "bindingCount",
+      "uniqueMediaCount",
+      "volumeCount",
+      "mediaSetDigest",
+      "bindings",
+      "volumes",
+      "receiptDigest"
+    ],
+    "environment.workloadStorage"
+  );
+  requireSchemaVersion(receipt.schemaVersion, "environment.workloadStorage.schemaVersion");
+  const runManifestDigest = requireSha256Digest(
+    receipt.runManifestDigest,
+    "environment.workloadStorage.runManifestDigest"
+  );
+  const workloadDigest = requireSha256Digest(
+    receipt.workloadDigest,
+    "environment.workloadStorage.workloadDigest"
+  );
+  if (runManifestDigest !== workloadDigest) {
+    throw new Error("invalid environment.workloadStorage workload binding");
+  }
+  const bindingCount = requirePositiveSafeInteger(
+    receipt.bindingCount,
+    "environment.workloadStorage.bindingCount"
+  );
+  if (bindingCount > MAX_WORKLOAD_BINDINGS || bindingCount % 2 !== 0) {
+    throw new Error("invalid environment.workloadStorage.bindingCount");
+  }
+  const uniqueMediaCount = requirePositiveSafeInteger(
+    receipt.uniqueMediaCount,
+    "environment.workloadStorage.uniqueMediaCount"
+  );
+  if (uniqueMediaCount > bindingCount) {
+    throw new Error("invalid environment.workloadStorage.uniqueMediaCount");
+  }
+  const volumeCount = requirePositiveSafeInteger(
+    receipt.volumeCount,
+    "environment.workloadStorage.volumeCount"
+  );
+  if (volumeCount > uniqueMediaCount) {
+    throw new Error("invalid environment.workloadStorage.volumeCount");
+  }
+  const bindings = assertWorkloadStorageBindings(receipt.bindings, bindingCount, volumeCount);
+  const volumes = assertWorkloadStorageVolumes(receipt.volumes, volumeCount, bindings);
+  const mediaSetDigest = requireSha256Digest(
+    receipt.mediaSetDigest,
+    "environment.workloadStorage.mediaSetDigest"
+  );
+  const withoutReceiptDigest: Omit<AlignmentBenchmarkWorkloadStorageReceipt, "receiptDigest"> =
+    {
+      schemaVersion: ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION,
+      runManifestDigest,
+      workloadDigest,
+      bindingCount,
+      uniqueMediaCount,
+      volumeCount,
+      mediaSetDigest,
+      bindings,
+      volumes
+    };
+  const receiptDigest = requireSha256Digest(
+    receipt.receiptDigest,
+    "environment.workloadStorage.receiptDigest"
+  );
+  const expectedReceiptDigest = `sha256:${sha256Hex(canonicalJson(withoutReceiptDigest))}`;
+  if (receiptDigest !== expectedReceiptDigest) {
+    throw new Error("invalid environment.workloadStorage.receiptDigest binding");
+  }
+  return { ...withoutReceiptDigest, receiptDigest };
+}
+
+function assertWorkloadStorageBindings(
+  value: unknown,
+  bindingCount: number,
+  volumeCount: number
+): AlignmentBenchmarkWorkloadStorageBinding[] {
+  if (!Array.isArray(value) || value.length !== bindingCount) {
+    throw new Error("invalid environment.workloadStorage.bindings");
+  }
+  return value.map((item, bindingOrdinal) => {
+    const binding = requireRecord(
+      item,
+      `environment.workloadStorage.bindings[${bindingOrdinal}]`
+    );
+    requireExactKeys(
+      binding,
+      ["bindingOrdinal", "caseOrdinal", "side", "volumeOrdinal"],
+      `environment.workloadStorage.bindings[${bindingOrdinal}]`
+    );
+    const expectedCaseOrdinal = Math.floor(bindingOrdinal / 2);
+    const expectedSide = bindingOrdinal % 2 === 0 ? "source" : "target";
+    if (
+      binding.bindingOrdinal !== bindingOrdinal ||
+      binding.caseOrdinal !== expectedCaseOrdinal ||
+      binding.side !== expectedSide ||
+      !Number.isSafeInteger(binding.volumeOrdinal) ||
+      (binding.volumeOrdinal as number) < 0 ||
+      (binding.volumeOrdinal as number) >= volumeCount
+    ) {
+      throw new Error(`invalid environment.workloadStorage.bindings[${bindingOrdinal}]`);
+    }
+    return {
+      bindingOrdinal,
+      caseOrdinal: expectedCaseOrdinal,
+      side: expectedSide,
+      volumeOrdinal: binding.volumeOrdinal as number
+    };
+  });
+}
+
+function assertWorkloadStorageVolumes(
+  value: unknown,
+  volumeCount: number,
+  bindings: AlignmentBenchmarkWorkloadStorageBinding[]
+): AlignmentBenchmarkWorkloadStorageVolume[] {
+  if (!Array.isArray(value) || value.length !== volumeCount) {
+    throw new Error("invalid environment.workloadStorage.volumes");
+  }
+  const actualBindingCounts = Array.from({ length: volumeCount }, () => 0);
+  const minimumBindingOrdinals = Array.from({ length: volumeCount }, () => Infinity);
+  for (const binding of bindings) {
+    actualBindingCounts[binding.volumeOrdinal] += 1;
+    minimumBindingOrdinals[binding.volumeOrdinal] = Math.min(
+      minimumBindingOrdinals[binding.volumeOrdinal],
+      binding.bindingOrdinal
+    );
+  }
+  let previousMinimum = -1;
+  return value.map((item, volumeOrdinal) => {
+    const volume = requireRecord(item, `environment.workloadStorage.volumes[${volumeOrdinal}]`);
+    requireExactKeys(
+      volume,
+      ["volumeOrdinal", "bindingCount", "driveType", "seekPenalty", "measurementStatus"],
+      `environment.workloadStorage.volumes[${volumeOrdinal}]`
+    );
+    if (
+      volume.volumeOrdinal !== volumeOrdinal ||
+      volume.bindingCount !== actualBindingCounts[volumeOrdinal] ||
+      actualBindingCounts[volumeOrdinal] <= 0 ||
+      volume.driveType !== "fixed" ||
+      (volume.seekPenalty !== "incurs" && volume.seekPenalty !== "none") ||
+      volume.measurementStatus !== "complete" ||
+      minimumBindingOrdinals[volumeOrdinal] <= previousMinimum
+    ) {
+      throw new Error(`invalid environment.workloadStorage.volumes[${volumeOrdinal}]`);
+    }
+    previousMinimum = minimumBindingOrdinals[volumeOrdinal];
+    return {
+      volumeOrdinal,
+      bindingCount: actualBindingCounts[volumeOrdinal],
+      driveType: "fixed",
+      seekPenalty: volume.seekPenalty,
+      measurementStatus: "complete"
+    };
+  });
+}
+
 function assertToolFingerprint(
   value: unknown,
   path: string
 ): AlignmentBenchmarkToolFingerprint {
   const fingerprint = requireRecord(value, path);
+  requireExactKeys(fingerprint, ["version", "binaryDigest"], path);
   return {
-    version: requireBoundedString(
-      fingerprint.version,
-      `${path}.version`,
-      1,
-      MAX_TEXT_LENGTH
-    ),
+    version: requireBoundedString(fingerprint.version, `${path}.version`, 1, MAX_TEXT_LENGTH),
     binaryDigest: requireSha256Digest(fingerprint.binaryDigest, `${path}.binaryDigest`)
   };
 }
@@ -591,10 +1038,7 @@ function assertToolFingerprint(
 function assertCacheResetReceipt(value: unknown): AlignmentBenchmarkCacheResetReceipt {
   const receipt = requireRecord(value, "cache reset receipt");
   requireSchemaVersion(receipt.schemaVersion, "cache reset receipt.schemaVersion");
-  const sessionId = requireOpaqueResponseId(
-    receipt.sessionId,
-    "cache reset receipt.sessionId"
-  );
+  const sessionId = requireOpaqueResponseId(receipt.sessionId, "cache reset receipt.sessionId");
   const resetTickNs = requireCanonicalDecimalTick(
     receipt.resetTickNs,
     "cache reset receipt.resetTickNs"
@@ -684,10 +1128,7 @@ function assertJobTelemetry(
   const endTickNs =
     telemetry.endTickNs === null
       ? null
-      : requireCanonicalDecimalTick(
-          telemetry.endTickNs,
-          "benchmark job telemetry.endTickNs"
-        );
+      : requireCanonicalDecimalTick(telemetry.endTickNs, "benchmark job telemetry.endTickNs");
   if (terminal !== (endTickNs !== null)) {
     throw new Error("invalid benchmark job terminal tick state");
   }
@@ -699,12 +1140,7 @@ function assertJobTelemetry(
   if (endTickNs !== null) {
     requireElapsedMatchesTicks(startTickNs, endTickNs, elapsedMs, "benchmark job telemetry");
   }
-  const stages = assertStageTimings(
-    telemetry.stages,
-    startTickNs,
-    endTickNs,
-    jobStatus
-  );
+  const stages = assertStageTimings(telemetry.stages, startTickNs, endTickNs, jobStatus);
   const cache = assertCacheTelemetry(telemetry.cache);
   const memory = assertMemoryTelemetry(telemetry.memory, terminal);
   const cancellation = assertCancellationTelemetry(
@@ -801,10 +1237,7 @@ function assertCacheTelemetry(value: unknown): AlignmentBenchmarkCacheTelemetry 
       cache.audioFeatures,
       "benchmark job telemetry.cache.audioFeatures"
     ),
-    landmarks: assertCacheCounter(
-      cache.landmarks,
-      "benchmark job telemetry.cache.landmarks"
-    ),
+    landmarks: assertCacheCounter(cache.landmarks, "benchmark job telemetry.cache.landmarks"),
     visualFeatures: assertCacheCounter(
       cache.visualFeatures,
       "benchmark job telemetry.cache.visualFeatures"
@@ -934,7 +1367,11 @@ function assertCancellationTelemetry(
     "benchmark job telemetry.cancellation.commandAccepted"
   );
   if (cancellation.terminalTickNs === "") {
-    if (isAlignmentBenchmarkJobFinished(jobStatus) || jobEndTickNs !== null || latencyMs !== 0) {
+    if (
+      isAlignmentBenchmarkJobFinished(jobStatus) ||
+      jobEndTickNs !== null ||
+      latencyMs !== 0
+    ) {
       throw new Error("invalid pending cancellation sentinel");
     }
     return { requestTickNs, terminalTickNs: "", latencyMs, commandAccepted };
@@ -947,7 +1384,12 @@ function assertCancellationTelemetry(
     throw new Error("invalid cancellation terminal binding");
   }
   requireTickOrder(requestTickNs, terminalTickNs, "benchmark cancellation");
-  requireElapsedMatchesTicks(requestTickNs, terminalTickNs, latencyMs, "benchmark cancellation");
+  requireElapsedMatchesTicks(
+    requestTickNs,
+    terminalTickNs,
+    latencyMs,
+    "benchmark cancellation"
+  );
   return { requestTickNs, terminalTickNs, latencyMs, commandAccepted };
 }
 
@@ -975,6 +1417,131 @@ function assertMatchingId(actual: string, expected: string): void {
   if (actual !== expected) throw new Error("mismatched native response identifier");
 }
 
+function assertRunManifestShape(
+  value: unknown
+): asserts value is RealMediaBenchmarkRunManifest {
+  const manifest = requireRecord(value, "blind run manifest");
+  requireExactKeys(
+    manifest,
+    ["schemaVersion", "manifestId", "datasetVersion", "cases"],
+    "blind run manifest"
+  );
+  if (manifest.schemaVersion !== 1) throw new Error("blind run manifest schema 无效。");
+  requireNonBlankString(manifest.manifestId, "blind run manifest.manifestId");
+  requireNonBlankString(manifest.datasetVersion, "blind run manifest.datasetVersion");
+  if (!Array.isArray(manifest.cases)) throw new Error("blind run manifest cases 无效。");
+  const caseIds = new Set<string>();
+  manifest.cases.forEach((item, caseOrdinal) => {
+    const benchmarkCase = requireRecord(item, `blind run manifest.cases[${caseOrdinal}]`);
+    requireExactKeys(
+      benchmarkCase,
+      ["caseId", "source", "target"],
+      `blind run manifest.cases[${caseOrdinal}]`
+    );
+    const caseId = requireNonBlankString(
+      benchmarkCase.caseId,
+      `blind run manifest.cases[${caseOrdinal}].caseId`
+    );
+    if (caseIds.has(caseId)) throw new Error("blind run manifest caseId 重复。");
+    caseIds.add(caseId);
+    assertRunManifestMediaInput(
+      benchmarkCase.source,
+      `blind run manifest.cases[${caseOrdinal}].source`
+    );
+    assertRunManifestMediaInput(
+      benchmarkCase.target,
+      `blind run manifest.cases[${caseOrdinal}].target`
+    );
+  });
+}
+
+function assertRunManifestMediaInput(value: unknown, path: string): void {
+  const media = requireRecord(value, path);
+  requireExactKeys(
+    media,
+    [
+      "path",
+      "audioStreamIndex",
+      "videoStreamIndex",
+      "contentIdentity",
+      "versionNote",
+      "licenseNote"
+    ],
+    path
+  );
+  requireNonBlankString(media.path, `${path}.path`);
+  if (!Number.isSafeInteger(media.audioStreamIndex) || (media.audioStreamIndex as number) < 0) {
+    throw new Error(`${path}.audioStreamIndex 无效。`);
+  }
+  if (
+    media.videoStreamIndex !== null &&
+    (!Number.isSafeInteger(media.videoStreamIndex) || (media.videoStreamIndex as number) < 0)
+  ) {
+    throw new Error(`${path}.videoStreamIndex 无效。`);
+  }
+  requireNonBlankString(media.versionNote, `${path}.versionNote`);
+  requireNonBlankString(media.licenseNote, `${path}.licenseNote`);
+  const identity = requireRecord(media.contentIdentity, `${path}.contentIdentity`);
+  requireExactKeys(identity, ["algorithm", "sizeBytes", "digest"], `${path}.contentIdentity`);
+  if (
+    identity.algorithm !== "sha256-full-file-v2" ||
+    !Number.isSafeInteger(identity.sizeBytes) ||
+    (identity.sizeBytes as number) < 0 ||
+    typeof identity.digest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(identity.digest)
+  ) {
+    throw new Error(`${path}.contentIdentity 无效。`);
+  }
+}
+
+function requireNonBlankString(value: unknown, path: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${path} 无效。`);
+  }
+  return value;
+}
+
+function requireExactKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string
+): void {
+  const keys = Object.keys(value);
+  const allowedKeys = new Set(allowed);
+  if (keys.length !== allowed.length || keys.some((key) => !allowedKeys.has(key))) {
+    throw new Error(`invalid ${path} fields`);
+  }
+}
+
+function requireBoundedUtf8(value: unknown, path: string, maximumBytes: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    new TextEncoder().encode(value).byteLength > maximumBytes
+  ) {
+    throw new Error(`${path} 大小无效。`);
+  }
+  return value;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("canonical JSON 不接受非有限数值。");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("canonical JSON 不接受 undefined、函数或 symbol。");
+}
+
 function requireSchemaVersion(value: unknown, path: string): void {
   if (value !== ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION) {
     throw new Error(`invalid ${path}`);
@@ -986,11 +1553,7 @@ function requireRecord(value: unknown, path: string): Record<string, unknown> {
   return value;
 }
 
-function requireEnum<T extends string>(
-  value: unknown,
-  allowed: readonly T[],
-  path: string
-): T {
+function requireEnum<T extends string>(value: unknown, allowed: readonly T[], path: string): T {
   if (!isOneOf(value, allowed)) throw new Error(`invalid ${path}`);
   return value;
 }

@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AlignmentProposal } from "../../domain/alignment/types";
+import { computeC137CanonicalDigest } from "../../domain/alignment/c137Acceptance";
 import {
   serializeC137PerformanceEvidence,
   validateC137PerformanceEvidence
 } from "../../domain/alignment/c137PerformanceEvidence";
+import type { AlignmentProposal } from "../../domain/alignment/types";
 import type {
   RealMediaBenchmarkGold,
   RealMediaBenchmarkManifest
@@ -84,19 +85,27 @@ describe("C137 原生性能 evidence 调度器", () => {
     });
 
     const rawEvidence = createC137PerformanceRawEvidenceFromJournal(journal);
+    expect(rawEvidence.schemaVersion).toBe(2);
     expect(validateC137PerformanceEvidence(rawEvidence)).toEqual({
       valid: true,
       complete: true,
       issues: [],
       completenessIssues: []
     });
-
     const serialized = serializeC137PerformanceEvidence(rawEvidence);
     expect(serialized).not.toContain(manifest.cases[0].source.path);
     expect(serialized).not.toContain(manifest.cases[0].target.path);
     expect(serialized).not.toContain(manifest.cases[0].source.contentIdentity?.digest);
     expect(serialized).not.toContain(manifest.id);
     expect(serialized).not.toContain(manifest.datasetVersion);
+    const beginRequest = vi.mocked(invoker.begin).mock.calls[0][0];
+    expect(beginRequest.schemaVersion).toBe(2);
+    expect(beginRequest.runManifestDigest).toBe(beginRequest.workloadDigest);
+    expect(JSON.parse(beginRequest.runManifestCanonicalJson)).toMatchObject({
+      schemaVersion: 1,
+      cases: [{ caseId: "private-case-1" }]
+    });
+    expect(JSON.stringify(journal)).not.toContain("runManifestCanonicalJson");
   });
 
   it("运行计划 workload 被篡改时在取得原生 lease 前拒绝", async () => {
@@ -116,6 +125,57 @@ describe("C137 原生性能 evidence 调度器", () => {
         benchmarkInvoker: invoker
       })
     ).rejects.toThrow("workloadDigest");
+  });
+
+  it("原生 workload receipt 与冻结 manifest 不匹配时 fail closed、跳过 preflight 并仍 finish", async () => {
+    const manifest = createManifest(false);
+    const plan = createEngineeringRealMediaPerformancePlan(
+      manifest,
+      "performance-plan-receipt-mismatch"
+    );
+    const events: string[] = [];
+    const invoker = createSuccessfulInvoker(manifest, events);
+    invoker.begin = vi.fn((request: AlignmentBenchmarkSessionRequest) => {
+      events.push("begin");
+      const parsed = JSON.parse(request.runManifestCanonicalJson) as { cases: unknown[] };
+      return Promise.resolve(
+        createSession(`sha256:${"f".repeat(64)}`, parsed.cases.length)
+      );
+    });
+    const probe = vi.fn(() => Promise.reject(new Error("preflight must not run")));
+
+    const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+      benchmarkInvoker: invoker,
+      preflightOptions: { probe }
+    });
+
+    expect(journal.status).toBe("failed");
+    expect(journal.issueCodes).toContain("workload-storage-receipt-mismatch");
+    expect(probe).not.toHaveBeenCalled();
+    expect(invoker.finish).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["begin", "finish"]);
+  });
+
+  it("begin 失败时不运行 preflight 或 job", async () => {
+    const manifest = createManifest(false);
+    const plan = createEngineeringRealMediaPerformancePlan(
+      manifest,
+      "performance-plan-begin-failed"
+    );
+    const invoker = createSuccessfulInvoker(manifest, []);
+    invoker.begin = vi.fn(() => Promise.reject(new Error("native begin failed")));
+    const probe = vi.fn(() => Promise.reject(new Error("preflight must not run")));
+
+    const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+      benchmarkInvoker: invoker,
+      preflightOptions: { probe }
+    });
+
+    expect(journal.status).toBe("failed");
+    expect(journal.issueCodes).toContain("collector-exception");
+    expect(probe).not.toHaveBeenCalled();
+    expect(invoker.startJob).not.toHaveBeenCalled();
+    expect(invoker.finish).not.toHaveBeenCalled();
   });
 
   it("真实 case 超过 raw evidence 上限时在取得原生 lease 前拒绝", async () => {
@@ -229,6 +289,7 @@ describe("C137 原生性能 evidence 调度器", () => {
       Array.from({ length: 4 }, () => "C:\\private-performance\\source.mkv")
     );
     const raw = createC137PerformanceRawEvidenceFromJournal(journal);
+    expect(raw.schemaVersion).toBe(2);
     expect(validateC137PerformanceEvidence(raw).complete).toBe(true);
     const firstCase = raw.trials.find((trial) => trial.trialType === "run")?.cases[0];
     expect(firstCase?.timeMapParametersHash).toBe("fnv1a64:0123456789abcdef");
@@ -346,6 +407,59 @@ describe("C137 原生性能 evidence 调度器", () => {
     expect(invoker.startJob).toHaveBeenCalledTimes(1);
     expect(invoker.cancelJob).toHaveBeenCalledTimes(1);
     expect(journal.issueCodes).toContain("cleanup-blocked");
+  });
+
+  it("start 响应无效时 bridge 恢复 active job，runner finally 仍释放 session", async () => {
+    const manifest = createManifest(false);
+    const plan = createEngineeringRealMediaPerformancePlan(
+      manifest,
+      "performance-plan-invalid-start-response"
+    );
+    const events: string[] = [];
+    const base = createSuccessfulInvoker(manifest, events);
+    const baseStart = base.startJob;
+    const invoker: AlignmentBenchmarkInvoker = {
+      ...base,
+      startJob: vi.fn(async (
+        sessionId: string,
+        request: NormalizedTauriAudioAlignmentRequest
+      ) => {
+        const snapshot = await baseStart(sessionId, request);
+        return {
+          ...snapshot,
+          schemaVersion: 1
+        } as unknown as AlignmentBenchmarkJobSnapshot;
+      }),
+      getActive: vi.fn(() =>
+        Promise.resolve({
+          ...createSession(),
+          activeJobId: "benchmark-job-1"
+        })
+      )
+    };
+
+    const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+      benchmarkInvoker: invoker,
+      preflightOptions: { probe: createProbe(manifest) },
+      wait: () => Promise.resolve(),
+      now: createClock()
+    });
+
+    expect(journal.status).toBe("failed");
+    expect(journal.terminalSessionStatus).toBe("released");
+    expect(journal.issueCodes).toContain("trial-failed");
+    expect(invoker.getActive).toHaveBeenCalledOnce();
+    expect(invoker.cancelJob).toHaveBeenCalledWith("benchmark-session-1", "benchmark-job-1");
+    expect(invoker.getJob).toHaveBeenCalledWith("benchmark-session-1", "benchmark-job-1");
+    expect(invoker.finish).toHaveBeenCalledWith("benchmark-session-1");
+    expect(events).toEqual([
+      "begin",
+      "reset:1",
+      "start:1",
+      "cancel:1",
+      "get:1",
+      "finish"
+    ]);
   });
 
   it("用户在 trial 前取消只生成 cancelled journal，不把用户取消冒充正式取消探针", async () => {
@@ -471,9 +585,10 @@ function createSuccessfulInvoker(
   let jobSequence = 0;
   const cancelledJobs = new Set<string>();
   const invoker: AlignmentBenchmarkInvoker = {
-    begin: vi.fn(() => {
+    begin: vi.fn((request: AlignmentBenchmarkSessionRequest) => {
       events.push("begin");
-      return Promise.resolve(createSession());
+      const parsed = JSON.parse(request.runManifestCanonicalJson) as { cases: unknown[] };
+      return Promise.resolve(createSession(request.workloadDigest, parsed.cases.length));
     }),
     getActive: vi.fn(() => Promise.resolve(createSession())),
     resetCaches: vi.fn(
@@ -481,7 +596,7 @@ function createSuccessfulInvoker(
       generation += 1;
       events.push(`reset:${generation}`);
       return Promise.resolve({
-        schemaVersion: 1 as const,
+        schemaVersion: 2 as const,
         sessionId,
         resetTickNs: String(generation * 1_000),
         previousGeneration: generation - 1,
@@ -564,9 +679,12 @@ function createSuccessfulInvoker(
   return invoker;
 }
 
-function createSession(): AlignmentBenchmarkSessionSnapshot {
+function createSession(
+  workloadDigest: `sha256:${string}` = `sha256:${"d".repeat(64)}`,
+  caseCount = 1
+): AlignmentBenchmarkSessionSnapshot {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     sessionId: "benchmark-session-1",
     status: "active",
     sessionOriginTickNs: "0",
@@ -574,7 +692,7 @@ function createSession(): AlignmentBenchmarkSessionSnapshot {
     memoryScope: "application-process-tree",
     memorySampleIntervalMs: 20,
     environment: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       collectorVersion: "windows-toolhelp-working-set-v1",
       measurementStatus: "complete",
       issues: [],
@@ -585,14 +703,50 @@ function createSession(): AlignmentBenchmarkSessionSnapshot {
       physicalCoreCount: 4,
       logicalCoreCount: 8,
       totalMemoryBytes: 16_000_000_000,
-      storageScope: "system-volume",
+      storageScope: "workload-media-volumes",
       storageKind: "fixed-local",
+      workloadStorage: createWorkloadStorageReceipt(workloadDigest, caseCount),
       powerProfile: "balanced",
       ffmpeg: { version: "ffmpeg 7", binaryDigest: `sha256:${"a".repeat(64)}` },
       ffprobe: { version: "ffprobe 7", binaryDigest: `sha256:${"b".repeat(64)}` }
     },
     activeJobId: null,
     cleanupIssue: null
+  };
+}
+
+function createWorkloadStorageReceipt(
+  workloadDigest: `sha256:${string}`,
+  caseCount: number
+) {
+  const bindings = Array.from({ length: caseCount * 2 }, (_, bindingOrdinal) => ({
+    bindingOrdinal,
+    caseOrdinal: Math.floor(bindingOrdinal / 2),
+    side: bindingOrdinal % 2 === 0 ? ("source" as const) : ("target" as const),
+    volumeOrdinal: 0
+  }));
+  const withoutReceiptDigest = {
+    schemaVersion: 2 as const,
+    runManifestDigest: workloadDigest,
+    workloadDigest,
+    bindingCount: bindings.length,
+    uniqueMediaCount: bindings.length,
+    volumeCount: 1,
+    mediaSetDigest: `sha256:${"c".repeat(64)}` as const,
+    bindings,
+    volumes: [
+      {
+        volumeOrdinal: 0,
+        bindingCount: bindings.length,
+        driveType: "fixed" as const,
+        seekPenalty: "none" as const,
+        measurementStatus: "complete" as const
+      }
+    ]
+  };
+  return {
+    ...withoutReceiptDigest,
+    receiptDigest: computeC137CanonicalDigest(withoutReceiptDigest)
   };
 }
 
@@ -609,7 +763,7 @@ function createJobSnapshot(
   const startTick = sequence * 1_000_000_000;
   const endTick = startTick + 500_000_000;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     sessionId,
     jobId: `benchmark-job-${sequence}`,
     status,
@@ -618,7 +772,7 @@ function createJobSnapshot(
     proposal,
     errorCode: status === "failed" ? "test-failed" : null,
     telemetry: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       clock: "rust-std-instant-session-relative-v1",
       startTickNs: String(startTick),
       endTickNs: terminal ? String(endTick) : null,

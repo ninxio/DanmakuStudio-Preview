@@ -176,8 +176,8 @@ describe("createWorkspaceProgress", () => {
 
     expect(progress.confirmedTargetCount).toBe(1);
     expect(matching?.state).toBe("active");
-    expect(matching?.stateText).toBe("1 / 2 个原片已确认");
-    expect(matching?.blockers).toContain("还有 1 个原片未确认匹配关系。");
+    expect(matching?.stateText).toBe("1 / 2 个原片已有保存关系");
+    expect(matching?.blockers).toContain("还有 1 个原片没有保存匹配关系。");
   });
 });
 

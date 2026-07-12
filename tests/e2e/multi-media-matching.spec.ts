@@ -424,7 +424,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   }
   await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E01");
   await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E05");
-  await expect(matchingPanel).toContainText("5 / 5 个原片已确认");
+  await expect(matchingPanel).toContainText("5 / 5 个原片已有保存关系");
 
   const verification = candidateCards.nth(0).getByTestId("manual-time-map-verification");
   await expect(verification).toContainText("自动匹配和保存关系都不会触发签发");

@@ -6,6 +6,7 @@ Danmaku Studio 是一个把 B 站 XML 弹幕对齐到本地视频、处理不同
 
 - 在素材页一次多选导入多个 B 站参考视频、多个目标原片和一个或多个 Bilibili XML，并把每个 XML 绑定到对应参考素材。
 - 匹配页直接对项目素材运行 1×N、N×1 或 N×M 批量匹配；项目级全局分配会阻止参考/原片区间冲突，并保留重复内容的竞争候选。
+- 当前这条 N×M 主链会先展开所选参考素材与原片的笛卡尔积，逐 pair 串行运行 Alignment V2，再对每个 pair 的最佳候选做项目级全局分配；它不是并行任务，也不是 GPU 批处理。Alignment V2 对单个媒体仍有 60 分钟 PCM 硬上限，所以超过 60 分钟的单文件长合集尚不能作为完整参考直接进入当前 V2。
 - 匹配评分：基于目标绑定、片名/季集、时长差、弹幕密度、同步线索和已有音频/视觉提案诊断，给出“很可能匹配 / 需要确认 / 看起来不是同一集”的可解释结论。
 - 把 XML 弹幕素材放入时间轴，支持按顺序自动排列。
 - 看视频预览和时间轴，移动片段、微调弹幕、禁用弹幕或调整全局偏移。
@@ -18,9 +19,9 @@ Danmaku Studio 是一个把 B 站 XML 弹幕对齐到本地视频、处理不同
 - Alignment Engine V2：在 Tauri 桌面端读取媒体 PTS 和候选音轨，使用声谱 landmark Top-K、仿射 offset/scale、edit-aware 分块 DP 与局部相关边界精修，输出 `matched/sourceOnly/targetOnly/ambiguous` 分段时间图；无共同音轨时可独立使用绑定视频流 PTS 的视觉 DCT/梯度回退。候选最高进入人工复核，不会静默写成已验证。
 - 匹配页双源 A/B 复核：按 TimeMap 切换参考 A/原片 B、循环共同内容或差异边界，并把累计有效试听写成 `manual-playback-review:v2` 证据。共同内容要求 A/B 各有效推进 2.0 秒且唯一覆盖至少 1.5 秒；单侧差异的存在侧要求 2.0/1.5 秒，段首和段尾的 A/B 边界各要求 1.5/1.0 秒。短区间要求累计完整区间时长并唯一覆盖至少 80%。只有页面可见、1 倍速且媒体时间连续向前推进才计入；暂停、后台、停滞、seek、切轴和循环跳回均不计时。token 绑定策略版本、媒体、span、有效时长和覆盖摘要；旧 v1 token 只保留审计文本并 fail-closed。
 - 可持久人工验证：只有用户显式点击“完成复核并签发”且每个 span 都有当前播放证据、所有单侧差异已分类、没有 `ambiguous`、实测质量达到中央门槛时，桌面端才用安装级 HMAC-SHA256 密钥签发 v11 verification record。签发、撤销和项目打开后的复核都查询本机不可变事件注册表；自动匹配、接受关系和保存项目不会自动签发。
-- 真实媒体基准治理：benchmark manifest v2 区分 `development/frozen-test` 和 `real/synthetic/placeholder`，真实关系必须绑定全文件 SHA-256、显式音视频流、许可/版本说明、两份独立标注和必要的第三人仲裁。本地 preflight 会重新探测唯一媒体文件并核对身份与流索引；可分享结果不带本地路径和实测哈希。
-- 匹配页底部默认收起“高级：C137 精度基准（开发与验收）”，这是唯一真实 benchmark 执行入口：只选择 manifest JSON，不重复选择媒体路径；桌面端可运行、取消并下载去敏稳定报告。浏览器、example manifest 或 0 个 `mediaKind=real` 关系都会明确阻断。报告固定为 `scope=time-map-component`、`releaseEligible=false`，组件子闸门通过也绝不代表 release 通过；界面中的“协调器观测耗时”只是流程诊断，不是性能证据。
-- 同一高级区复用已导入 manifest 和其媒体引用，不增加第二个文件或路径选择器；它可取得 native exclusive session，按预注册的 cold → warmup → hot → cancel 计划运行生产对齐核心，并导出 strict raw v1 性能工程证据。raw 包含原生单调时钟、显式阶段、缓存重置/命中、进程树 RSS 和取消终态，但始终是 `releaseEligible=false` 的 `untrusted-raw-evidence`，不内置受信协议或 trust root。
+- 真实媒体基准治理：benchmark manifest v2 区分 `development/frozen-test` 和 `real/synthetic/placeholder`，真实关系必须绑定全文件 SHA-256、显式音视频流、许可/版本说明、两份独立标注和必要的第三人仲裁。本地 preflight 会重新探测唯一媒体文件并核对身份与流索引；可分享结果移除本地路径和单媒体实测哈希等直接字段，但保留 manifest/dataset ID 与稳定摘要，因此同一数据集及其多次运行仍可被关联，不是匿名化产物。
+- 匹配页底部默认收起“高级：C137 精度基准（开发与验收）”，这是唯一真实 benchmark 执行入口：只选择 manifest JSON，不重复选择媒体路径；桌面端可运行、取消并下载移除直接媒体标识的稳定报告。浏览器、example manifest 或 0 个 `mediaKind=real` 关系都会明确阻断。报告固定为 `scope=time-map-component`、`releaseEligible=false`，组件子闸门通过也绝不代表 release 通过；界面中的“协调器观测耗时”只是流程诊断，不是性能证据。
+- 同一高级区复用已导入 manifest 和其媒体引用，不增加第二个文件或路径选择器；它可取得 native exclusive session，按预注册的 cold → warmup → hot → cancel 计划运行生产对齐核心，并导出 strict raw v2 性能工程证据。session 在任何工具探测前固定 blind manifest 中的全部真实媒体，只对每个 distinct 文件计算一次完整 SHA-256，并从固定句柄解析实际媒体卷；raw v2 保存不含路径、卷 GUID/serial 或单媒体 SHA 的 `workloadStorage` 回执。`runManifestDigest`、`mediaSetDigest` 等稳定摘要仍会保留，用于证据绑定，也允许关联同一数据集的多次运行。raw 同时包含原生单调时钟、显式阶段、缓存重置/命中、ToolHelp 进程树 RSS 和取消终态，但始终是 `releaseEligible=false` 的 `untrusted-raw-evidence`，不内置受信协议或 trust root。
 - Windows 一次性媒体工具进程已统一进入 lifecycle Job Object：子进程以挂起状态创建，先加入私有 Job 再恢复执行，Job 启用 kill-on-close，且只继承显式标准流句柄。FFmpeg/FFprobe 的输出、执行、收尾均有硬上限；取消、超时、输出溢出、读取异常或后代未退出会终止并等待整个 Job 清空，无法可信清理时设置粘性 `blocked:process-cleanup`，使当前结果及后续媒体分析 fail-closed。该 Job 只负责生命周期安全，不是下述正式 RSS 采样器。
 - FFprobe 普通媒体时间线探测限制为 30 秒、8 MiB stdout / 256 KiB stderr；音频逐帧/packet PTS 探测限制为 5 分钟、128 MiB 紧凑 stdout / 1 MiB stderr，并且只在 Job 全部退出后解析，单条记录上限 1 MiB、不同音频流上限 256。Chocolatey `ShimGen` 不会被当作 FFmpeg/FFprobe 真二进制执行或指纹化：只有规范 Chocolatey 路径、版本资源和候选树检查全部通过且恰好找到一个真实 exe 时才继续，并对该真实 exe 固定、哈希和执行；路径、reparse/symlink、版本资源或唯一性验证失败均关闭执行并要求显式配置真实路径。
 - Windows 本地对齐还会为参考视频和目标原片各持有贯穿整个 run 的 `FILE_SHARE_READ` 只读 media lease，运行期间拒绝覆盖、删除、rename 和路径替换。lease 内先计算 run-start 全文件 SHA-256；FFprobe frame/packet PTS 的 expected / before / after 三份身份必须完全一致；音频、landmark 和视觉缓存键全部绑定 `sha256-full-file-v2`；FFmpeg 成功后会在解析 PCM/帧前复核身份；命中缓存也必须通过 run-final SHA 与 TimeMap 双端身份复核。视觉证据在读取缓存或解码前后都必须与音频 TimeMap 同一媒体世代，避免把音频 A 与视觉 B 混为一条结论。
@@ -88,8 +89,8 @@ corepack prepare pnpm@9.15.4 --activate
 
 ## 常用操作
 
-- 顶部工具栏：新建、打开、保存、导入参考视频、导入 XML、导出 XML、撤销、重做、播放暂停、缩放、新手引导和设置。
-- 四页工作流：素材页负责唯一导入入口；匹配页负责批量自动匹配、全局分配和双时间轴复核；编辑页负责精修；导出页只消费已确认且通过质量闸门的时间图。
+- 顶部工具栏：新建、打开、保存、素材/匹配/编辑/导出四页导航、撤销、重做、新手引导和设置；播放、暂停与缩放只在编辑页出现。视频、XML 的导入只在素材页操作，XML/ZIP 的实际导出只在导出页操作。
+- 四页工作流：素材页分别管理原片素材、B 站参考素材和弹幕 XML 三类输入；匹配页负责 1×N、N×1、N×M 批量匹配、全局分配和双时间轴复核；编辑页负责精修；导出页只消费已保存、已完成复核且通过质量闸门的时间图。
 - 右侧检查器：编辑当前弹幕、片段或版本差异；空白时会提示选中不同对象后能做什么。
 - 底部时间轴：点击或拖动播放头，滚轮横向滚动，Ctrl/Command + 滚轮缩放，拖动片段或弹幕。
 - 导出摘要：查看导出前检查、版本差异数量、累计调整时长、版本差异明细、负时间限制明细、验证状态，并在需要时下载检查报告和导出报告。
@@ -97,13 +98,12 @@ corepack prepare pnpm@9.15.4 --activate
 
 ## 推荐流程
 
-1. 导入参考视频和 XML。
-2. 绑定目标原片，本地视频或授权 Emby 条目都可以。
-3. 查看匹配评分；低置信结果只进入人工确认，不会自动改项目。
-4. 把弹幕素材放到时间轴。
-5. 看预览，调整不准的地方。
-6. 如果视频版本有差异，就标记当前视频哪里比完整版多了或少了多久。
-7. 通过导出前检查后导出 XML；导出的 XML 会重新解析验证，原始 XML 不会被直接修改。
+1. 在素材页分别批量导入多个原片、一个或多个 B 站参考视频和对应弹幕 XML，再把每个 XML 绑定到它所属的参考素材；导入后不需要在后续页面重新选择路径。
+2. 进入匹配页，按实际素材关系选择 1×N、N×1 或 N×M 组合并开始批量匹配；系统只生成候选，不会静默写成已验证关系。
+3. 逐项复核候选的参考范围、原片范围、共同内容、双方独有内容和无法判断区间。未完成真实基准校准或人工复核的关系只能保存为待复核，不能用于正式导出。
+4. 在编辑页预览已保存关系，并用片段、偏移、版本差异、锚点或单条调整精修弹幕投影；所有修改保持非破坏性。
+5. 在导出页按原片分集检查来源范围、删减修正、弹幕数量和阻断原因；只有已验证且通过质量闸门的时间图才能进入正式分集导出。
+6. 一键导出全部分集 XML 或 ZIP。每份导出 XML 都会重新解析验证，原始 XML 始终不被直接修改。
 
 ## 快捷键
 
@@ -124,10 +124,11 @@ corepack prepare pnpm@9.15.4 --activate
 - mpv 后端当前以桌面 sidecar 方式运行，不把 mpv 画面嵌入 React 预览区；未配置 mpv 或没有真实本地路径时，界面不会假装支持 MKV。HTML Video 播放失败时会明确提示改用 MP4/WebM 或启用 mpv 播放器。
 - V2 媒体分析依赖用户主动导入且合法拥有/授权读取的本地媒体，以及本机 FFmpeg/FFprobe。网页模式不伪装为可执行高精度媒体分析或写盘前身份核验。
 - 当前 V2 已有 PTS、多音轨、声谱 landmark、速度漂移、双向编辑、局部边界和独立视觉回退的工程实现，但真实冻结集样本数仍为 **0**，benchmark manifest v2 示例只有 placeholder。尚未完成统计概率校准、规定硬件性能报告或 20 套北极星长合集 5/5 验收。自动结果最高为 `review`；正式按原片分集导出只接受带可信验证来源的 `verified` 时间图。因此本阶段 release 是安全预览，不代表准确率或性能验收完成。
+- 当前媒体匹配主链为 FFmpeg `-vn` 音频解码加 Rust CPU radix-2 FFT、landmark、edit-aware DP 与相关精修；安装包没有 CUDA/cuFFT 计算后端，NVIDIA GPU 不会参与主匹配。下一步先把 PTS、PCM 粗特征和 landmark 改为每媒体一次的流式预处理/索引，用 Top-K 粗筛减少进入精对齐的 pair，再接入带 CPU 等价校验和自动回退的可选 CUDA/cuFFT 后端；NVDEC 只适合视觉回退的解码阶段，不能替代音频计算后端。
 - 视觉回退目前只建立粗粒度全局仿射关系，不负责宣称局部删减边界；大幅裁切、极端调色、长静态或黑场会保守阻断。
 - A/B 播放证据 v2 已累计最小时长与唯一覆盖，但它只证明完成了规定的有效试听过程，不能单独证明人工判断正确。签发仍同时要求逐段分类、无 ambiguous、媒体身份和中央质量门槛。
-- 完整 C137 acceptance 还要求 `real-frozen` 证据包、固定协议、全部原始报告、UI/性能/release 回执及独立信任根。release 默认不内置审批白名单；未提供严格的外部 `trustContext` 时结果必为 `incomplete-evidence`、`verifiedEligible=false`，永远不会通过完整验收。
-- C137 acceptance protocol v2 会绑定性能 plan 摘要、原生单调时钟、最大内存采样间隔和取消探针数量，并明确要求 `windows-job-object-working-set-v1` 与 `workload-media-volumes`。虽然一次性媒体工具已由 lifecycle Job Object 安全监管，当前性能 raw 的 RSS 采样器身份仍是 `windows-toolhelp-working-set-v1`，仍按 ToolHelp/PID 快照计数；环境存储范围也仍是只探测系统卷的 `system-volume`。因此当前 raw 会被正式门禁拒绝，不得晋升为发布性能证据；后续还需实现独立的 Job Object working-set 正式采样器、探测实际 workload 媒体卷，再结合受信协议和真实授权数据重新采集。
+- 完整 C137 acceptance 还要求 `real-frozen` 证据包、固定协议、全部原始报告、UI/性能/release 回执及独立信任根。当前 `trustContext` 只是调用方提供的摘要快照，可发现内容变化但不能证明签发者身份；release 默认不内置审批白名单，`external-trust-authority` 会保持未完成，直到存在可独立验证的签名或受信封装。因此当前结果必为 `incomplete-evidence`、`verifiedEligible=false`，不能通过完整验收。
+- C137 acceptance protocol v3 / performance report v3 明确要求 raw schema v2，并分别检查当前冻结 manifest、`workloadStorage`、Job 内存覆盖、终态清理和 native attestation。统计报告还必须逐项闭合：每个冻结 decision 恰好提供协议锁定的 Top-K，校准样本与全部冻结 decision 一对一并从排名重算 `correct`，dataset 的 gold 编辑数逐 case 等于 TimeMap 原始事件数，所有 frozen time-stretch case 均提供 45 分钟漂移；跨报告的 mediaKind/split/scenarios 不一致同样失败关闭。实际 workload 媒体卷现已由 native v2 固定句柄逐卷探测并形成可复算回执；旧 raw v1 即使改写 sampler/storage 字符串并重算所有自摘要也不能晋级。当前 RSS 仍是 `windows-toolhelp-working-set-v1`，raw v2 的 Job memory、terminal cleanup 与 attestation 三项 assurance 仍为空，所以正式门禁继续返回 `incomplete-evidence`。后续还需实现诚实限定覆盖范围的 Job working-set receipt、原生终态清理 receipt 与独立外部 attestation，再在受信协议和真实授权数据上采集。
 - 人工签名的信任根是本机应用数据目录中的安装级 secret 与撤销注册表。仅篡改 `.danmaku-project.json` 不能伪造签名或恢复已撤销凭据；项目换机、secret 丢失、注册表损坏或签发来源不匹配时会 fail-closed 为 `review`。该设计不宣称抵抗能够读取并篡改同一系统账户应用数据目录的恶意本地进程。
 - Emby 集成只处理用户配置且有权限访问的媒体库元数据，不实现视频下载、DRM 绕过、账号绕过、私有接口爬取或未授权媒体访问。
 - Emby 密码和 token 不写入项目文件、Tauri 配置文件或 localStorage；本次会话密码关闭应用后失效。
@@ -154,11 +155,12 @@ corepack pnpm tauri:build
 ## 后续路线
 
 - 完善音频对齐实用化：把进程内特征缓存扩展为可管理的持久缓存；用真实 Emby 服务器样本继续验证不同媒体源、转码策略和低码率采样兼容性。
+- 把当前逐 pair 串行 N×M 改为“每媒体一次流式预处理/长参考索引 → 全部 pair 的低成本 Top-K 粗筛 → 只对候选关系运行精对齐”，取消单文件长参考的 60 分钟整段 PCM 依赖；随后增加可选 CUDA/cuFFT 声谱和批量相关后端，CPU 保留为确定性基线、等价复核与自动回退。
 - 完善 mpv 体验：嵌入式窗口、自动重试、更多错误诊断，以及更多真实 Emby 服务器、转码策略和网络失败场景验证。
 - 扩展播放器化能力：把当前会话级缓存状态升级为可管理的持久缓存，并补充更多剧集批量工作台自动化。
 - 建立双人标注的真实冻结媒体集，完成关系、投影误差、删减边界、视觉回退、校准与性能门槛；门槛通过前不开放自动 `verified`。
 - 用真实媒体继续审计 A/B 播放证据 v2 的时长/覆盖门槛与签发误用率，并根据审计结果版本化调整策略。
-- 在现有 lifecycle Job Object 之上实现独立的 `windows-job-object-working-set-v1` 正式 RSS 采样器，替换性能 raw 中的 ToolHelp/PID 快照；同时探测所有实际 workload 媒体卷，并在受信协议下使用真实授权数据生成可审批的正式性能证据。
+- 在现有 lifecycle Job Object 之上实现不虚报覆盖范围的 Job working-set receipt，替换性能 raw 中的 ToolHelp/PID 快照；补齐终态 cleanup receipt 与独立 native attestation，并在受信协议下使用真实授权数据生成可审批的正式性能证据。
 - 完成 20 套北极星长合集的 5/5 定位、跨集零错配和完整导出验收，并发布规定硬件上的可重复性能报告。
 - 扩展 Playwright E2E 覆盖导出 XML 后重新导入、复杂编辑撤销恢复和更多窄窗口截图。
 - 评估系统凭证库保存敏感凭证，并在后续设置 schema 升级时补充迁移界面和冲突提示。

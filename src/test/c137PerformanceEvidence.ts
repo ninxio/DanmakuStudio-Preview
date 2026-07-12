@@ -1,22 +1,34 @@
 import {
   appendC137PerformanceCacheResetReceipt,
+  appendC137PerformanceCacheResetReceiptV2,
   appendC137PerformanceTrial,
+  appendC137PerformanceTrialV2,
   computeC137PerformanceCacheResetReceiptDigest,
+  computeC137PerformanceCacheResetReceiptDigestV2,
   computeC137PerformanceCaseOutputDigest,
   computeC137PerformanceCanonicalDigest,
   computeC137PerformanceEnvironmentDigest,
+  computeC137PerformanceEnvironmentDigestV2,
+  computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformanceEvidenceDraft,
+  createC137PerformanceEvidenceDraftV2,
   finalizeC137PerformanceEvidence,
+  finalizeC137PerformanceEvidenceV2,
   type C137PerformanceCacheCountsV1,
   type C137PerformanceCacheResetReceiptV1,
+  type C137PerformanceCacheResetReceiptV2,
   type C137PerformanceCacheTelemetryV1,
   type C137PerformanceEnvironmentV1,
+  type C137PerformanceEnvironmentV2,
   type C137PerformanceMemoryTelemetryV1,
   type C137PerformanceNativeTelemetryV1,
   type C137PerformancePlanV1,
   type C137PerformanceRawEvidenceV1,
+  type C137PerformanceRawEvidenceV2,
   type C137PerformanceRunKindV1,
   type C137PerformanceRunV1,
+  type C137PerformanceTrialV2,
+  type C137PerformanceWorkloadStorageReceiptV2,
   type C137PerformanceStageTimingV1
 } from "../domain/alignment/c137PerformanceEvidence";
 
@@ -79,6 +91,99 @@ export function createCompleteC137PerformanceEvidenceFixture(): C137PerformanceR
   );
   draft = appendC137PerformanceTrial(draft, createCancellation(cancelReset));
   return finalizeC137PerformanceEvidence(draft, "complete");
+}
+
+export function createCompleteC137PerformanceEvidenceV2Fixture(): C137PerformanceRawEvidenceV2 {
+  const legacy = createCompleteC137PerformanceEvidenceFixture();
+  const unsignedStorage: Omit<C137PerformanceWorkloadStorageReceiptV2, "receiptDigest"> = {
+    schemaVersion: 2,
+    runManifestDigest: WORKLOAD_DIGEST,
+    workloadDigest: WORKLOAD_DIGEST,
+    bindingCount: 2,
+    uniqueMediaCount: 2,
+    volumeCount: 1,
+    mediaSetDigest: digest("4"),
+    bindings: [
+      { bindingOrdinal: 0, caseOrdinal: 0, side: "source", volumeOrdinal: 0 },
+      { bindingOrdinal: 1, caseOrdinal: 0, side: "target", volumeOrdinal: 0 }
+    ],
+    volumes: [
+      {
+        volumeOrdinal: 0,
+        bindingCount: 2,
+        driveType: "fixed",
+        seekPenalty: "none",
+        measurementStatus: "complete"
+      }
+    ]
+  };
+  const workloadStorage: C137PerformanceWorkloadStorageReceiptV2 = {
+    ...unsignedStorage,
+    receiptDigest: computeC137PerformanceWorkloadStorageReceiptDigest(unsignedStorage)
+  };
+  const unsignedEnvironment: Omit<C137PerformanceEnvironmentV2, "digest"> = {
+    schemaVersion: 2,
+    measurementStatus: "complete",
+    issues: [],
+    operatingSystem: "Windows",
+    operatingSystemVersion: "11-test",
+    architecture: "x86_64",
+    cpuModel: "4-core fixture",
+    physicalCoreCount: 4,
+    logicalCoreCount: 8,
+    totalMemoryBytes: 16 * 1_073_741_824,
+    storageScope: "workload-media-volumes",
+    storageKind: "fixed:none",
+    workloadStorage,
+    powerProfile: "fixture",
+    ffmpeg: { version: "ffmpeg-fixture", binaryDigest: digest("a") },
+    ffprobe: { version: "ffprobe-fixture", binaryDigest: digest("b") }
+  };
+  const environment: C137PerformanceEnvironmentV2 = {
+    ...unsignedEnvironment,
+    digest: computeC137PerformanceEnvironmentDigestV2(unsignedEnvironment)
+  };
+  let draft = createC137PerformanceEvidenceDraftV2({
+    runManifestDigest: WORKLOAD_DIGEST,
+    plan: legacy.plan,
+    environment,
+    collector: {
+      schemaVersion: 2,
+      collectorVersion: "c137-native-collector-fixture-v2",
+      nativeSchemaVersion: 2,
+      clock: "rust-std-instant-session-relative-v1",
+      memoryScope: "application-process-tree",
+      sampler: "windows-toolhelp-working-set-v1",
+      sessionId: SESSION_ID,
+      sessionOriginTickNs: "0",
+      memorySampleIntervalMs: 100,
+      terminalSessionStatus: "released",
+      runManifestDigest: WORKLOAD_DIGEST,
+      workloadDigest: WORKLOAD_DIGEST,
+      workloadStorageReceiptDigest: workloadStorage.receiptDigest
+    },
+    preflight: legacy.preflight,
+    status: "complete"
+  });
+  const resetDigestByTrial = new Map<string, C137PerformanceCacheResetReceiptV2["receiptDigest"]>();
+  for (const reset of legacy.cacheResets) {
+    const { receiptDigest: ignoredDigest, ...unsignedReset } = reset;
+    void ignoredDigest;
+    const unsignedV2 = { ...unsignedReset, schemaVersion: 2 as const };
+    const resetV2: C137PerformanceCacheResetReceiptV2 = {
+      ...unsignedV2,
+      receiptDigest: computeC137PerformanceCacheResetReceiptDigestV2(unsignedV2)
+    };
+    resetDigestByTrial.set(resetV2.trialId, resetV2.receiptDigest);
+    draft = appendC137PerformanceCacheResetReceiptV2(draft, resetV2);
+  }
+  for (const trial of legacy.trials) {
+    draft = appendC137PerformanceTrialV2(
+      draft,
+      convertTrialToV2(trial, resetDigestByTrial)
+    );
+  }
+  return finalizeC137PerformanceEvidenceV2(draft, "complete");
 }
 
 export function createFixturePlan(): C137PerformancePlanV1 {
@@ -318,6 +423,31 @@ function createCancellation(reset: C137PerformanceCacheResetReceiptV1) {
         commandAccepted: true
       }
     }
+  };
+}
+
+function convertTrialToV2(
+  trial: C137PerformanceRawEvidenceV1["trials"][number],
+  resetDigestByTrial: ReadonlyMap<string, C137PerformanceCacheResetReceiptV2["receiptDigest"]>
+): C137PerformanceTrialV2 {
+  if (trial.trialType === "cancellation") {
+    return {
+      ...structuredClone(trial),
+      cacheResetReceiptDigest:
+        resetDigestByTrial.get(trial.trialId) ?? trial.cacheResetReceiptDigest,
+      telemetry: { ...structuredClone(trial.telemetry), schemaVersion: 2 }
+    };
+  }
+  return {
+    ...structuredClone(trial),
+    cacheResetReceiptDigest:
+      trial.cacheResetReceiptDigest === null
+        ? null
+        : (resetDigestByTrial.get(trial.trialId) ?? trial.cacheResetReceiptDigest),
+    cases: trial.cases.map((item) => ({
+      ...structuredClone(item),
+      telemetry: { ...structuredClone(item.telemetry), schemaVersion: 2 }
+    }))
   };
 }
 

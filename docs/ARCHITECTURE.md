@@ -9,17 +9,17 @@ Danmaku Timeline Studio 使用非破坏性编辑模型。原始 XML 解析为资
 - `src/stores`：Zustand 编辑器状态和命令入口。
 - `src/features`：业务 UI，包含导入、导出、资源、预览、检查器和时间轴。
 - `src/components`：通用 UI 组件。
-- `src-tauri`：Tauri 2 桌面壳配置。当前 Web Demo 使用浏览器文件 API，桌面模式后续可替换为原生文件系统能力。
+- `src-tauri`：Tauri 2 桌面壳与 Windows 原生能力。当前桌面模式已负责原生多选文件/目录、媒体路径引用、FFmpeg/FFprobe 与 mpv 进程监管、媒体身份核验、安装级人工验证和 release 打包；网页模式只保留能力受限的浏览器 fallback。
 
 ## 时间模型
 
 内部统一使用整数毫秒。最终弹幕时间由纯函数计算：
 
 ```ts
-clipRelative = item.sourceTimeMs - clip.sourceInMs
-clipTime = clip.timelineStartMs + clipRelative + clip.localOffsetMs
-adjusted = clipTime + itemAdjustments[item.id] + project.globalOffsetMs
-resolved = applyCutMapping(adjusted, cutMarkers)
+clipRelative = item.sourceTimeMs - clip.sourceInMs;
+clipTime = clip.timelineStartMs + clipRelative + clip.localOffsetMs;
+adjusted = clipTime + itemAdjustments[item.id] + project.globalOffsetMs;
+resolved = applyCutMapping(adjusted, cutMarkers);
 ```
 
 版本差异表示“当前视频播放到某点时，完整版额外存在或少了一段内容”。对于该点之后的弹幕，累计 `targetGapMs`。
@@ -86,7 +86,7 @@ FFprobe 普通媒体时间线探测的执行/输出边界为 30 秒、8 MiB stdo
 
 Windows PATH 中若命中 Chocolatey `ShimGen`，监管器不会启动 shim 再追踪它的后代。只有可执行文件位于规范化的 `%ChocolateyInstall%\bin`、其 Windows version resource 明确匹配 ShimGen，且在规范化的 Chocolatey `lib` 树中经有界、拒绝 reparse/symlink 的遍历恰好找到一个同名真实 exe 时，才固定并执行该真实二进制；路径规范化、reparse/version-resource 验证、遍历完整性或唯一性任一失败都会 fail-closed，要求用户显式提供真实路径。benchmark 的大小、mtime、文件索引与 SHA-256 指纹因此绑定真实 FFmpeg/FFprobe，而不是 .NET shim。
 
-这个 Job Object 只提供子进程树的**生命周期所有权和清理**，不改变 performance raw 的采样器声明，也不构成正式 RSS 证据。当前工程 raw 仍由 `windows-toolhelp-working-set-v1` 通过 ToolHelp/PID 快照计算 working set，存储范围仍是 `system-volume`；正式 acceptance 继续要求另行实现 `windows-job-object-working-set-v1` 并覆盖 `workload-media-volumes`。
+这个 Job Object 只提供子进程树的**生命周期所有权和清理**，不改变 performance raw 的采样器声明，也不构成正式 RSS 证据。当前工程 raw 仍由 `windows-toolhelp-working-set-v1` 通过 ToolHelp/PID 快照计算 working set。存储侧已升级为 native v2：会话在任何工具探测前固定 blind manifest 的全部 distinct 媒体，从句柄解析并去重实际 workload 卷，生成 path-free `workloadStorage` 回执；这解决了存储范围归属，但不会自动解决 Job membership 内存覆盖。
 
 ### 真实媒体 benchmark 治理
 
@@ -98,15 +98,15 @@ Windows PATH 中若命中 Chocolatey `ShimGen`，监管器不会启动 shim 再�
 
 blind runner 的 sealed receipt 受 `RunManifest` SHA-256 约束，按 manifest 顺序保存每个真实关系的 `success/failed/cancelled`、单调时钟 wall elapsed、engine/feature 和无敏感信息的参数摘要；它是执行输入与输出的封口记录，不是外部审批签名。只有所有真实 case 都成功且 receipt 摘要、case 顺序与 prediction 身份一致时，协调器才把完整 manifest 的 gold 交给 evaluator。任一启动、读取、身份、流或 TimeMap 错误，以及任一取消，都会令 `evaluation=null`，不会伪装成 missing prediction 后继续计算质量；超时任务必须等待后端进入真实终态，无法在宽限期内安全退出时停止后续 case，避免残留 FFmpeg/CPU 任务与下一关系重叠。
 
-组件级可分享报告有独立 schema、validator 和稳定 JSON 序列化，只保留 manifest/dataset ID、blind SHA-256、case 状态、wall elapsed、实际视觉流、engine/feature、参数摘要和评估指标；不包含媒体路径、媒体 SHA-256、生产 `parametersHash` 或原始 diagnostics。报告固定声明 `scope: "time-map-component"` 和 `releaseEligible: false`。匹配页的“高级：C137 精度基准”同时承载组件 runner 与下述原生性能工程采集；其中组件报告子区只做 TimeMap 组件开发/验收。组件子闸门即使显示通过，也不代表完整 release 验收，更不会授予项目时间图 `verified`。
+组件级可分享报告有独立 schema、validator 和稳定 JSON 序列化，只保留 manifest/dataset ID、blind SHA-256、case 状态、wall elapsed、实际视觉流、engine/feature、参数摘要和评估指标；不包含媒体路径、单媒体 SHA-256、生产 `parametersHash` 或原始 diagnostics。性能 raw 同样移除路径、卷 GUID/serial 和单媒体 SHA，但两类产物都会保留 `runManifestDigest`、`mediaSetDigest` 或等价的稳定数据集摘要以完成证据绑定，因此可以关联同一数据集及其多次运行，不能描述为匿名或不可关联。报告固定声明 `scope: "time-map-component"` 和 `releaseEligible: false`。匹配页的“高级：C137 精度基准”同时承载组件 runner 与下述原生性能工程采集；其中组件报告子区只做 TimeMap 组件开发/验收。组件子闸门即使显示通过，也不代表完整 release 验收，更不会授予项目时间图 `verified`。
 
-`src/infrastructure/alignment/realMediaPerformanceRunner.ts` 和 `src-tauri/src/audio_alignment.rs` 已实现独立的性能工程采集链。runner 先取得 native exclusive session；有普通对齐任务、其他 benchmark session 或未退出后代时不会发放 lease。同一 session 内按预注册且不可选择性删减的 cold → warmup → hot → cancel 顺序运行与产品匹配相同的 Rust Alignment V2；cold 和 cancel 前对音频特征、landmark 与视觉特征三类应用缓存执行原子重置，hot 必须复用同 session 中完整 warmup 的结果。采集器以 Rust `Instant` 的 session-relative 整数纳秒 tick 记录真实阶段边界、缓存命中/未命中/写入/淘汰、进程树 working set 和从首次取消到真实终态的延迟。后代退出或缓存清理无法确认时，session 保持 `cleanup-blocked`，不会假装已释放。
+`src/infrastructure/alignment/realMediaPerformanceRunner.ts` 和 `src-tauri/src/audio_alignment.rs` 已实现独立的性能工程采集链。runner 把冻结后的 blind `RunManifest` canonical JSON 与摘要一并交给 native v2；native 在任何 FFmpeg/FFprobe/系统探测前取得 exclusive lease，并为全部 distinct 媒体持有 `FILE_SHARE_READ` pin。重复长参考先按 handle identity 去重，每个 distinct 文件只完整哈希一次；每个 benchmark job 只能命中同一个已注册 case 的 source/target 与显式流，跨 case 配对、未注册路径或流错配都会拒绝。同一 session 再按预注册且不可选择性删减的 cold → warmup → hot → cancel 顺序运行与产品匹配相同的 Rust Alignment V2；cold 和 cancel 前对三类应用缓存执行原子重置，hot 必须复用同 session 中完整 warmup。采集器以 Rust `Instant` 的 session-relative 整数纳秒 tick 记录真实阶段边界、缓存计数、进程树 working set 和取消延迟。后代退出、媒体 pin、工具链或缓存清理无法确认时，session 保持 `cleanup-blocked`，不会假装已释放。
 
-`src/domain/alignment/c137PerformanceEvidence.ts` 将上述日志封装为 strict raw v1：它严格拒绝未知字段，重算 plan/environment/reset/evidence 摘要和 tick 差，核对完整 trial 顺序、cold/hot 缓存语义、输出一致性、采样覆盖/最大间隔、进程树残留和取消终态。该格式固定为 `releaseEligible: false` 和 `trustStatus: "untrusted-raw-evidence"`；结构完整只说明采集链自洽，不产生审批或信任。匹配页性能面板复用同一份已导入 manifest 及其媒体引用，没有另一个媒体选择器。组件 benchmark 报告中的前端/协调器 wall elapsed 不是性能证据，只有该 native session 中的单调 tick 和原生采样可进入 raw。
+`src/domain/alignment/c137PerformanceEvidence.ts` 将上述日志封装为 strict raw v2，并继续只读兼容历史 raw v1。v2 严格拒绝未知字段与 v1/v2 混搭，重算 plan/environment/workload storage/reset/evidence 摘要，核对每个 case 恰好一个 source/target、volume ordinal 与反向计数、完整 trial 顺序、cold/hot 缓存语义、输出一致性、采样覆盖和取消终态。raw v2 固定为 `releaseEligible: false` / `untrusted-raw-evidence`；`assurance` 中尚未实现的 Job memory、terminal cleanup 与 attestation 必须为 `null`，调用方不能加一个 formal 布尔值自我放行。匹配页性能面板复用同一份 manifest，没有第二个媒体选择器，并把 native v2 显示为“ToolHelp（工程）+ 实际媒体卷”；组件 wall elapsed 仍不是性能证据。
 
-完整 release 判定由 `src/domain/alignment/c137Acceptance.ts` 的严格 `C137AcceptanceBundle` 单独负责。acceptance protocol v2 进一步绑定性能 plan 摘要、必需 cold/hot/cancel 次数、最大内存采样间隔和 `rust-std-instant-session-relative-v1` 单调时钟，并要求 `windows-job-object-working-set-v1` 进程归属与 `workload-media-volumes` 存储范围；performance report v2 直接携带 strict raw v1，不再接受手写耗时汇总。bundle 把 protocol、环境、runner、数据审批/preflight/prediction receipts，以及关系、TimeMap、校准、视觉 fallback、降级、北极星、性能、UI 和 release raw reports 绑定到 canonical SHA-256。bundle 内嵌的 evidence digest 不能自我担保：调用者还必须提供外部 `trustContext`，其中列出受信 protocol、receipts 和每类 raw report evidence 的摘要。release 默认不内置任何审批白名单；缺少 trust context、摘要不命中、证据缺项或严格 schema 不通过都会得到 `incomplete-evidence`，而不是 pass。
+完整 release 判定由 `src/domain/alignment/c137Acceptance.ts` 的严格 `C137AcceptanceBundle` 单独负责。acceptance protocol v3 / performance report v3 绑定性能 plan、必需 cold/hot/cancel 次数、最大采样间隔、原生单调时钟与 formal raw schema v2；还分别检查 raw 的 runManifestDigest 等于当前冻结 bundle、path-free workload storage receipt 结构与工作负载绑定、Job memory receipt、terminal cleanup receipt 和 native attestation。统计 evidence 不允许选择性漏报：每个 frozen decision 必须恰好提供协议 Top-K，calibration 与全部 frozen decision 一对一且 `correct` 从 Top-1/gold 重算，dataset 的 gold 编辑计数逐 case 与 TimeMap 事件闭合，每个 frozen time-stretch case 都必须有漂移值；ranking/TimeMap/visual/degradation 的 mediaKind、split 和适用 scenarios 还要与 dataset 一致。旧 raw v1 改字符串、自摘要和自建 `trustContext` 仍会被 schema 门阻断；raw v2 即使 storage 闭合且把 sampler 字符串改为 Job，也会因后三项 assurance 缺失而保持 incomplete。bundle 其余 protocol、环境、runner、数据审批/preflight/prediction receipts 和十类 raw reports 继续绑定 canonical SHA-256；`trustContext` 只是一份调用方摘要快照，不是已认证 authority。release 默认不内置审批白名单，当前另有固定未完成的 `external-trust-authority` 检查；缺少可验证签名/受信封装、摘要不命中或证据缺项都会得到 `incomplete-evidence`。
 
-C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 gold 编辑事件、至少 30% 永不参与参数选择的 frozen-test，并覆盖所有必需场景。当前领域层已有 bundle schema、摘要重算、硬门槛 evaluator 和性能工程 raw 生成器，但仓库仍没有采集/冻结合法真实媒体数据的生成器。虽然短命媒体进程已经由上述 lifecycle Job 无竞态接管并安全收尾，当前 Windows **RSS 采样**仍使用 `windows-toolhelp-working-set-v1` 的 ToolHelp 快照和 `GetProcessMemoryInfo`；采样证据没有按 Job membership 汇总，仍不能排除 session baseline 的 PID 复用。环境回执的 storage kind 也仍是通过 Windows 系统卷 seek-penalty 得到的 `system-volume`，未证明实际参考/原片媒体所在卷的存储类型。因此即使 strict raw v1 结构完整，当前采集结果也只能用于工程回归，不得晋升为正式发布性能证据。正式采集还必须实现独立的 `windows-job-object-working-set-v1` sampler、实际媒体卷探测、受信协议与独立 trust root，并在真实授权数据上重新生成和审批证据；不能用 lifecycle cleanup Job、UI 摘要或手写汇总替代。
+C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 gold 编辑事件、至少 30% 永不参与参数选择的 frozen-test，并覆盖所有必需场景。当前领域层已有 bundle schema、摘要重算、硬门槛 evaluator、raw v2 和实际媒体卷回执，但仓库仍没有采集/冻结合法真实媒体数据的生成器。当前 Windows **RSS 采样**仍使用 `windows-toolhelp-working-set-v1` 的 ToolHelp/PID 快照，没有按 Job membership 汇总，也不能排除 session baseline 的 PID 复用；正式 Job 覆盖、原生终态 cleanup receipt 与独立 attestation 仍未实现。因此即使 raw v2 工程结构完整，当前结果也不得晋升为正式发布性能证据；不能用 lifecycle cleanup Job、storage receipt、UI 摘要或手写汇总替代剩余正式证据。
 
 当前仓库只有 manifest v2 的 placeholder 结构示例，真实媒体关系仍为 0；尚无统计概率校准、规定硬件性能报告或 20 套北极星长合集 5/5 验收。因此上述工程闸门不能被描述为已经通过，自动结果仍最高为 `review`。
 
@@ -155,10 +155,14 @@ C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 go
 
 ## 智能对齐扩展
 
-`AlignmentProvider` 允许未来引入音频指纹、静音段、镜头切换、感知哈希、字幕时间、动态时间规整等算法。本阶段只有 `ManualAlignmentProvider`，不伪造自动匹配。
+产品中的自动媒体分析只有匹配页一个入口。它直接消费素材页已经导入并保存真实本地路径的 B 站参考素材与原片，按 1×N、N×1 或 N×M 建立任务，再通过 `src/infrastructure/alignment/tauriAudioAlignment.ts` 调用与真实 benchmark 共用的 Rust Alignment V2 job API。匹配页不会再次弹出文件选择器，也不会把 Emby 临时播放 URL 交给 FFmpeg；只有本地路径已连接、媒体身份可核验的项目素材才能进入自动分析。`AlignmentProvider` 与 `ManualAlignmentProvider` 仍作为领域兼容和测试扩展保留，但不代表当前产品只有手工匹配。
 
-视频对齐实验室会把本地 FFmpeg 任务或导入的 JSON 解析为 `AlignmentProposal`，再进入同一套复核、阻断和非破坏性应用流程。音频候选版本差异不会直接写入时间轴；用户可以逐条定位到候选源时间，按不确定区间和实际试听结果修正毫秒时间与差异时长，然后把单条候选包装成最小 `AlignmentProposal` 走现有版本差异写入路径。被接受的候选只生成 `CutMarker` 等编辑规则，不改写原始 XML。
+当前 UI 编排把所选 source×target 展开为笛卡尔积，并用单个 `for...of` 依次等待每个 pair；全部 pair 完成后才运行项目级全局 assignment。单 pair 内部的 Top-K 目前用于选择最佳仿射位置、歧义诊断和降级，产品层送入全局求解的是每个 pair 的最佳持久候选，而不是所有 pair-local Top-K 的联合优化。后端虽然会缓存 landmark，但细 PCM、50ms 特征、edit-aware DP 和边界相关仍按进入精对齐的 pair 工作；V2 还会在探测阶段拒绝任一超过 60 分钟的媒体。因此“支持 N×M 编排”不能解释为已经具备高吞吐长合集批处理。
 
-已绑定本地目标原片时，实验室会把 `mediaBinding.localPath` 作为完整版输入的默认值。已绑定 Emby 目标原片时，用户可显式点击“使用 Emby 授权输入”：前端用当前应用会话中的 Emby 密码重新登录，读取条目元数据确认条目仍可访问，再生成 `/Videos/{itemId}/stream` 临时播放地址交给 FFmpeg。密码、token 和临时播放 URL 只停留在当前内存状态，不写入项目文件、设置备份或 `mediaBinding`；如果会话密码缺失或 FFmpeg 无法读取服务器流，用户仍可改用本地路径。
+当前 release 是 CPU-only matching：FFmpeg 以 `-vn` 解码单声道 PCM，Rust 自实现 radix-2 FFT 并在 CPU 上完成 landmark、DP 和相关精修；仓库和安装包都没有 CUDA/cuFFT backend 或 GPU 设置。目标流水线是先为每个媒体建立一次可版本化、可取消、受内容身份约束的流式 PTS/landmark/粗特征索引，再对 N×M 做低成本 Top-K 粗筛，只让候选 pair 进入精对齐；之后才增加可选 CUDA/cuFFT 声谱与批量相关后端，并逐 case 与 CPU 基线做容差内等价校验，初始化失败、显存不足或结果越界时自动回退 CPU。NVDEC 只能优化独立视觉回退的帧解码，不能替代音频匹配计算。
 
-音频特征缓存位于 Tauri 后端进程内，不写入 `.danmaku-project.json`。本地文件缓存 key 由规范化本地路径、文件大小、修改时间、FFmpeg 路径、采样率和特征窗口组成；远程 Emby 输入缓存 key 使用已遮蔽 token 的 URL 与同一组特征参数。匹配阈值和最小缺失时长变化时可复用同一组特征，换文件、换窗口或文件更新后会重新提取。任务日志和提案诊断会说明完整版/当前视频是缓存命中还是新提取。
+Alignment V2 从显式音视频流的 frame/packet PTS 开始，经过多音轨候选、声谱 landmark、全局仿射 offset/scale、edit-aware 分块对齐和局部边界精修，生成带 `matched/sourceOnly/targetOnly/ambiguous` 分段的 `MediaTimeMap`。无共同音轨时可以使用绑定视频流身份的独立视觉回退。项目级全局分配负责处理多素材竞争与区间冲突；所有自动结果先进入候选，关系保存后仍须 A/B 复核、差异分类和质量闸门验证，不能因“已保存”被视为可导出。
+
+候选及其确认副本都只保存紧凑时间图、证据摘要、双端媒体身份和算法 provenance，不改写原始 XML，也不剪切视频。正式弹幕投影直接消费已验证的 confirmed `MediaTimeMap`：共同内容按整数端点插值，参考独有内容被舍弃，原片独有内容推进后续目标边界，无法判断区间阻断导出。旧 `CutMarker`/阶跃规则只承担迁移兼容和人工编辑，不再承接 V2 精确映射。
+
+音频、landmark、视觉和媒体快照缓存位于 Tauri 后端进程内，不写入 `.danmaku-project.json`。缓存 key 强制绑定算法版本、相关参数、文件大小和 `sha256-full-file-v2` 完整内容身份，不再以 path/size/mtime 或带 token 的 URL 作为身份边界；每次运行的 media lease、起止全文件摘要、PTS 探测和最终 TimeMap 还会再次核对同一双端媒体世代。缓存命中只减少重复提取，不能绕过身份、流选择、取消或导出质量检查。

@@ -1,8 +1,10 @@
 import { sha256Hex } from "../shared/sha256";
 
 export const C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION_V2 = 2 as const;
 export const C137_PERFORMANCE_PLAN_SCHEMA_VERSION = 1 as const;
 export const C137_PERFORMANCE_NATIVE_SCHEMA_VERSION = 1 as const;
+export const C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2 = 2 as const;
 export const C137_PERFORMANCE_MAX_TRIALS = 64;
 export const C137_PERFORMANCE_MAX_CASES_PER_RUN = 1_000;
 export const C137_PERFORMANCE_MAX_STAGES_PER_CASE = 128;
@@ -261,6 +263,147 @@ export interface C137PerformanceRawEvidenceV1 extends C137PerformanceEvidenceDra
   evidenceDigest: C137PerformanceDigest;
 }
 
+export interface C137PerformanceWorkloadStorageBindingV2 {
+  bindingOrdinal: number;
+  caseOrdinal: number;
+  side: "source" | "target";
+  volumeOrdinal: number;
+}
+
+export interface C137PerformanceWorkloadStorageVolumeV2 {
+  volumeOrdinal: number;
+  bindingCount: number;
+  driveType: "fixed";
+  seekPenalty: "incurs" | "none";
+  measurementStatus: "complete";
+}
+
+/**
+ * Path-free native receipt for the exact media volumes used by the frozen run manifest.
+ * The digest intentionally covers only these fields (apart from receiptDigest itself),
+ * matching the native schema-v2 receipt byte-for-byte after canonical JSON encoding.
+ */
+export interface C137PerformanceWorkloadStorageReceiptV2 {
+  schemaVersion: typeof C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2;
+  runManifestDigest: C137PerformanceDigest;
+  workloadDigest: C137PerformanceDigest;
+  bindingCount: number;
+  uniqueMediaCount: number;
+  volumeCount: number;
+  mediaSetDigest: C137PerformanceDigest;
+  bindings: C137PerformanceWorkloadStorageBindingV2[];
+  volumes: C137PerformanceWorkloadStorageVolumeV2[];
+  receiptDigest: C137PerformanceDigest;
+}
+
+export interface C137PerformanceEnvironmentV2 {
+  schemaVersion: typeof C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2;
+  digest: C137PerformanceDigest;
+  measurementStatus: "complete" | "incomplete";
+  issues: string[];
+  operatingSystem: string;
+  operatingSystemVersion: string;
+  architecture: string;
+  cpuModel: string;
+  physicalCoreCount: number;
+  logicalCoreCount: number;
+  totalMemoryBytes: number;
+  storageScope: "workload-media-volumes";
+  storageKind: string;
+  workloadStorage: C137PerformanceWorkloadStorageReceiptV2;
+  powerProfile: string;
+  ffmpeg: C137PerformanceToolchainV1;
+  ffprobe: C137PerformanceToolchainV1;
+}
+
+export interface C137PerformanceCollectorV2 {
+  schemaVersion: typeof C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2;
+  collectorVersion: string;
+  nativeSchemaVersion: typeof C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2;
+  clock: "rust-std-instant-session-relative-v1";
+  memoryScope: "application-process-tree";
+  sampler:
+    | "windows-toolhelp-working-set-v1"
+    | "windows-job-object-working-set-v1"
+    | "unsupported";
+  sessionId: string;
+  sessionOriginTickNs: "0";
+  memorySampleIntervalMs: number;
+  terminalSessionStatus: "released" | "cleanup-blocked" | null;
+  runManifestDigest: C137PerformanceDigest;
+  workloadDigest: C137PerformanceDigest;
+  workloadStorageReceiptDigest: C137PerformanceDigest;
+}
+
+export type C137PerformanceStageTimingV2 = C137PerformanceStageTimingV1;
+export type C137PerformanceCacheTelemetryV2 = C137PerformanceCacheTelemetryV1;
+export type C137PerformanceMemoryTelemetryV2 = C137PerformanceMemoryTelemetryV1;
+export type C137PerformanceCancellationTelemetryV2 =
+  C137PerformanceCancellationTelemetryV1;
+
+export interface C137PerformanceCacheResetReceiptV2
+  extends Omit<C137PerformanceCacheResetReceiptV1, "schemaVersion"> {
+  schemaVersion: typeof C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2;
+}
+
+export interface C137PerformanceNativeTelemetryV2
+  extends Omit<C137PerformanceNativeTelemetryV1, "schemaVersion"> {
+  schemaVersion: typeof C137_PERFORMANCE_NATIVE_SCHEMA_VERSION_V2;
+}
+
+export interface C137PerformanceCaseV2
+  extends Omit<C137PerformanceCaseV1, "telemetry"> {
+  telemetry: C137PerformanceNativeTelemetryV2;
+}
+
+export interface C137PerformanceRunV2
+  extends Omit<C137PerformanceRunV1, "cases"> {
+  cases: C137PerformanceCaseV2[];
+}
+
+export interface C137PerformanceCancellationTrialV2
+  extends Omit<C137PerformanceCancellationTrialV1, "telemetry"> {
+  telemetry: C137PerformanceNativeTelemetryV2;
+}
+
+export type C137PerformanceTrialV2 =
+  | C137PerformanceRunV2
+  | C137PerformanceCancellationTrialV2;
+
+export interface C137PerformanceAssuranceV2 {
+  schemaVersion: 1;
+  workloadStorageReceiptDigest: C137PerformanceDigest;
+  jobMemoryReceipt: null;
+  terminalCleanupReceipt: null;
+  attestation: null;
+}
+
+export interface C137PerformanceEvidenceDraftV2 {
+  schemaVersion: typeof C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION_V2;
+  reportKind: "c137-performance-raw-evidence";
+  releaseEligible: false;
+  trustStatus: "untrusted-raw-evidence";
+  runManifestDigest: C137PerformanceDigest;
+  plan: C137PerformancePlanV1;
+  planDigest: C137PerformanceDigest;
+  environment: C137PerformanceEnvironmentV2;
+  collector: C137PerformanceCollectorV2;
+  assurance: C137PerformanceAssuranceV2;
+  preflight: C137PerformancePreflightV1;
+  cacheResets: C137PerformanceCacheResetReceiptV2[];
+  trials: C137PerformanceTrialV2[];
+  status: C137PerformanceEvidenceStatus;
+  issueCodes: string[];
+}
+
+export interface C137PerformanceRawEvidenceV2 extends C137PerformanceEvidenceDraftV2 {
+  evidenceDigest: C137PerformanceDigest;
+}
+
+export type C137PerformanceRawEvidence =
+  | C137PerformanceRawEvidenceV1
+  | C137PerformanceRawEvidenceV2;
+
 export interface C137PerformanceEvidenceValidation {
   valid: boolean;
   complete: boolean;
@@ -302,6 +445,15 @@ export function computeC137PerformanceEnvironmentDigest(
   });
 }
 
+export function computeC137PerformanceEnvironmentDigestV2(
+  environment: Omit<C137PerformanceEnvironmentV2, "digest">
+): C137PerformanceDigest {
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-environment-v2",
+    environment
+  });
+}
+
 export function computeC137PerformanceCanonicalDigest(value: unknown): C137PerformanceDigest {
   return `sha256:${sha256Hex(canonicalJson(value))}`;
 }
@@ -313,6 +465,26 @@ export function computeC137PerformanceCacheResetReceiptDigest(
     domain: "c137-performance-cache-reset-v1",
     receipt
   });
+}
+
+export function computeC137PerformanceCacheResetReceiptDigestV2(
+  receipt: Omit<C137PerformanceCacheResetReceiptV2, "receiptDigest">
+): C137PerformanceDigest {
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-cache-reset-v2",
+    receipt
+  });
+}
+
+export function computeC137PerformanceWorkloadStorageReceiptDigest(
+  receipt:
+    | Omit<C137PerformanceWorkloadStorageReceiptV2, "receiptDigest">
+    | C137PerformanceWorkloadStorageReceiptV2
+): C137PerformanceDigest {
+  const payload = "receiptDigest" in receipt
+    ? omitWorkloadStorageReceiptDigest(receipt)
+    : receipt;
+  return computeC137PerformanceCanonicalDigest(payload);
 }
 
 export function computeC137PerformanceCaseOutputDigest(input: {
@@ -338,6 +510,18 @@ export function computeC137PerformanceEvidenceDigest(
     : evidence;
   return computeC137PerformanceCanonicalDigest({
     domain: "c137-performance-raw-evidence-v1",
+    evidence: payload
+  });
+}
+
+export function computeC137PerformanceEvidenceDigestV2(
+  evidence: C137PerformanceEvidenceDraftV2 | C137PerformanceRawEvidenceV2
+): C137PerformanceDigest {
+  const payload = "evidenceDigest" in evidence
+    ? omitEvidenceDigestV2(evidence)
+    : evidence;
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-raw-evidence-v2",
     evidence: payload
   });
 }
@@ -408,7 +592,107 @@ export function finalizeC137PerformanceEvidence(
   return evidence;
 }
 
+export function createC137PerformanceEvidenceDraftV2(input: {
+  runManifestDigest: C137PerformanceDigest;
+  plan: C137PerformancePlanV1;
+  environment: C137PerformanceEnvironmentV2;
+  collector: C137PerformanceCollectorV2;
+  preflight: C137PerformancePreflightV1;
+  status?: C137PerformanceEvidenceStatus;
+  issueCodes?: string[];
+}): C137PerformanceEvidenceDraftV2 {
+  return {
+    schemaVersion: C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION_V2,
+    reportKind: "c137-performance-raw-evidence",
+    releaseEligible: false,
+    trustStatus: "untrusted-raw-evidence",
+    runManifestDigest: input.runManifestDigest,
+    plan: structuredClone(input.plan),
+    planDigest: createC137PerformancePlanDigest(input.plan),
+    environment: structuredClone(input.environment),
+    collector: structuredClone(input.collector),
+    assurance: {
+      schemaVersion: 1,
+      workloadStorageReceiptDigest: input.environment.workloadStorage.receiptDigest,
+      jobMemoryReceipt: null,
+      terminalCleanupReceipt: null,
+      attestation: null
+    },
+    preflight: structuredClone(input.preflight),
+    cacheResets: [],
+    trials: [],
+    status: input.status ?? "failed",
+    issueCodes: [...new Set(input.issueCodes ?? [])]
+  };
+}
+
+export function appendC137PerformanceCacheResetReceiptV2(
+  draft: C137PerformanceEvidenceDraftV2,
+  receipt: C137PerformanceCacheResetReceiptV2
+): C137PerformanceEvidenceDraftV2 {
+  return {
+    ...draft,
+    cacheResets: [...draft.cacheResets, structuredClone(receipt)]
+  };
+}
+
+export function appendC137PerformanceTrialV2(
+  draft: C137PerformanceEvidenceDraftV2,
+  trial: C137PerformanceTrialV2
+): C137PerformanceEvidenceDraftV2 {
+  return {
+    ...draft,
+    trials: [...draft.trials, structuredClone(trial)]
+  };
+}
+
+export function finalizeC137PerformanceEvidenceV2(
+  draft: C137PerformanceEvidenceDraftV2,
+  status: C137PerformanceEvidenceStatus,
+  issueCodes: string[] = draft.issueCodes
+): C137PerformanceRawEvidenceV2 {
+  const finalizedDraft: C137PerformanceEvidenceDraftV2 = {
+    ...structuredClone(draft),
+    status,
+    issueCodes: [...new Set(issueCodes)]
+  };
+  const evidence: C137PerformanceRawEvidenceV2 = {
+    ...finalizedDraft,
+    evidenceDigest: computeC137PerformanceEvidenceDigestV2(finalizedDraft)
+  };
+  const validation = validateC137PerformanceEvidence(evidence);
+  if (!validation.valid) {
+    throw new Error(`C137 性能 raw evidence v2 无效：${validation.issues.join("；")}`);
+  }
+  return evidence;
+}
+
 export function validateC137PerformanceEvidence(
+  value: unknown
+): C137PerformanceEvidenceValidation {
+  if (!isRecord(value)) {
+    return {
+      valid: false,
+      complete: false,
+      issues: ["evidence 必须为对象。"],
+      completenessIssues: []
+    };
+  }
+  if (value.schemaVersion === C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION) {
+    return validateC137PerformanceEvidenceV1(value);
+  }
+  if (value.schemaVersion === C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION_V2) {
+    return validateC137PerformanceEvidenceV2(value);
+  }
+  return {
+    valid: false,
+    complete: false,
+    issues: ["evidence.schemaVersion 不是受支持的严格 schema。"],
+    completenessIssues: []
+  };
+}
+
+function validateC137PerformanceEvidenceV1(
   value: unknown
 ): C137PerformanceEvidenceValidation {
   const issues: string[] = [];
@@ -488,7 +772,118 @@ export function validateC137PerformanceEvidence(
   };
 }
 
-export function parseC137PerformanceEvidence(json: string): C137PerformanceRawEvidenceV1 {
+function validateC137PerformanceEvidenceV2(
+  value: unknown
+): C137PerformanceEvidenceValidation {
+  const issues: string[] = [];
+  const completenessIssues: string[] = [];
+  const record = strictRecord(
+    value,
+    "evidence",
+    [
+      "schemaVersion",
+      "reportKind",
+      "releaseEligible",
+      "trustStatus",
+      "runManifestDigest",
+      "plan",
+      "planDigest",
+      "environment",
+      "collector",
+      "assurance",
+      "preflight",
+      "cacheResets",
+      "trials",
+      "status",
+      "issueCodes",
+      "evidenceDigest"
+    ],
+    issues
+  );
+  if (record === null) return { valid: false, complete: false, issues, completenessIssues };
+  requireLiteral(record.schemaVersion, 2, "evidence.schemaVersion", issues);
+  requireLiteral(record.reportKind, "c137-performance-raw-evidence", "evidence.reportKind", issues);
+  requireLiteral(record.releaseEligible, false, "evidence.releaseEligible", issues);
+  requireLiteral(record.trustStatus, "untrusted-raw-evidence", "evidence.trustStatus", issues);
+  requireDigest(record.runManifestDigest, "evidence.runManifestDigest", issues);
+  validatePlan(record.plan, issues);
+  requireDigest(record.planDigest, "evidence.planDigest", issues);
+  validateEnvironmentV2(record.environment, issues);
+  validateCollectorV2(record.collector, issues);
+  validateAssuranceV2(record.assurance, issues);
+  validatePreflight(record.preflight, issues);
+  validateCacheResets(record.cacheResets, issues, 2);
+  validateTrials(record.trials, issues, 2);
+  requireOneOf(
+    record.status,
+    ["complete", "failed", "cancelled", "cleanup-blocked", "preflight-failed"],
+    "evidence.status",
+    issues
+  );
+  validateStringArray(record.issueCodes, "evidence.issueCodes", issues, 256);
+  requireDigest(record.evidenceDigest, "evidence.evidenceDigest", issues);
+  if (issues.length > 0) return { valid: false, complete: false, issues, completenessIssues };
+
+  const evidence = value as C137PerformanceRawEvidenceV2;
+  const storage = evidence.environment.workloadStorage;
+  if (evidence.planDigest !== createC137PerformancePlanDigest(evidence.plan)) {
+    issues.push("evidence.planDigest 与预注册计划不一致。");
+  }
+  if (
+    evidence.runManifestDigest !== evidence.plan.workloadDigest ||
+    storage.runManifestDigest !== evidence.runManifestDigest ||
+    storage.workloadDigest !== evidence.runManifestDigest
+  ) {
+    issues.push("run manifest、plan 与 workload storage receipt 摘要未闭合。");
+  }
+  if (storage.bindingCount !== evidence.plan.expectedCaseCount * 2) {
+    issues.push("workload storage bindingCount 与计划 case 数不一致。");
+  }
+  if (
+    evidence.environment.digest !==
+    computeC137PerformanceEnvironmentDigestV2(omitEnvironmentDigestV2(evidence.environment))
+  ) {
+    issues.push("evidence.environment.digest 与 v2 环境字段不一致。");
+  }
+  if (
+    storage.receiptDigest !==
+    computeC137PerformanceWorkloadStorageReceiptDigest(storage)
+  ) {
+    issues.push("workload storage receiptDigest 与 path-free receipt 字段不一致。");
+  }
+  if (
+    evidence.collector.runManifestDigest !== evidence.runManifestDigest ||
+    evidence.collector.workloadDigest !== evidence.plan.workloadDigest ||
+    evidence.collector.workloadStorageReceiptDigest !== storage.receiptDigest
+  ) {
+    issues.push("collector 未绑定同一 run manifest/workload/storage receipt。");
+  }
+  if (evidence.assurance.workloadStorageReceiptDigest !== storage.receiptDigest) {
+    issues.push("assurance 未绑定 workload storage receipt。");
+  }
+  for (const receipt of evidence.cacheResets) {
+    if (
+      receipt.receiptDigest !==
+      computeC137PerformanceCacheResetReceiptDigestV2(omitReceiptDigestV2(receipt))
+    ) {
+      issues.push(`cache reset ${receipt.trialId} v2 receiptDigest 不一致。`);
+    }
+  }
+  if (evidence.evidenceDigest !== computeC137PerformanceEvidenceDigestV2(evidence)) {
+    issues.push("evidence.evidenceDigest 与 raw evidence v2 不一致。");
+  }
+  if (issues.length > 0) return { valid: false, complete: false, issues, completenessIssues };
+
+  evaluateCompleteness(evidence, completenessIssues);
+  return {
+    valid: true,
+    complete: completenessIssues.length === 0,
+    issues: [],
+    completenessIssues
+  };
+}
+
+export function parseC137PerformanceEvidence(json: string): C137PerformanceRawEvidence {
   let value: unknown;
   try {
     value = JSON.parse(json) as unknown;
@@ -499,11 +894,11 @@ export function parseC137PerformanceEvidence(json: string): C137PerformanceRawEv
   if (!validation.valid) {
     throw new Error(`C137 性能 evidence 无效：${validation.issues.join("；")}`);
   }
-  return value as C137PerformanceRawEvidenceV1;
+  return value as C137PerformanceRawEvidence;
 }
 
 export function serializeC137PerformanceEvidence(
-  evidence: C137PerformanceRawEvidenceV1
+  evidence: C137PerformanceRawEvidence
 ): string {
   const validation = validateC137PerformanceEvidence(evidence);
   if (!validation.valid) {
@@ -514,21 +909,29 @@ export function serializeC137PerformanceEvidence(
 
 export function getC137PerformanceMeasuredRuns(
   evidence: C137PerformanceRawEvidenceV1
-): C137PerformanceRunV1[] {
+): C137PerformanceRunV1[];
+export function getC137PerformanceMeasuredRuns(
+  evidence: C137PerformanceRawEvidenceV2
+): C137PerformanceRunV2[];
+export function getC137PerformanceMeasuredRuns(
+  evidence: C137PerformanceRawEvidence
+): Array<C137PerformanceRunV1 | C137PerformanceRunV2> {
   return evidence.trials.filter(
-    (trial): trial is C137PerformanceRunV1 =>
+    (trial): trial is C137PerformanceRunV1 | C137PerformanceRunV2 =>
       trial.trialType === "run" && trial.runKind !== "warmup"
   );
 }
 
-export function getC137PerformancePeakRss(run: C137PerformanceRunV1): number | null {
+export function getC137PerformancePeakRss(
+  run: C137PerformanceRunV1 | C137PerformanceRunV2
+): number | null {
   const peaks = run.cases.map((item) => item.telemetry.memory.peakProcessTreeRssBytes);
   if (peaks.length === 0 || peaks.some((item) => item === null)) return null;
   return Math.max(...(peaks as number[]));
 }
 
 function evaluateCompleteness(
-  evidence: C137PerformanceRawEvidenceV1,
+  evidence: C137PerformanceRawEvidence,
   issues: string[]
 ): void {
   if (evidence.status !== "complete") issues.push(`evidence status 为 ${evidence.status}。`);
@@ -569,7 +972,7 @@ function evaluateCompleteness(
     issues.push("实际 trial 数量与预注册计划不一致，不能挑选性删除或补写 trial。");
   }
   const resetByTrial = new Map(evidence.cacheResets.map((item) => [item.trialId, item]));
-  const runById = new Map<string, C137PerformanceRunV1>();
+  const runById = new Map<string, C137PerformanceRunV1 | C137PerformanceRunV2>();
   const completedOutputDigests: string[] = [];
   for (let index = 0; index < expected.length; index += 1) {
     const planned = expected[index];
@@ -630,11 +1033,11 @@ function evaluateCompleteness(
 }
 
 function validateCompleteRun(
-  evidence: C137PerformanceRawEvidenceV1,
+  evidence: C137PerformanceRawEvidence,
   planned: C137PerformancePlanTrialV1,
-  run: C137PerformanceRunV1,
-  resetByTrial: Map<string, C137PerformanceCacheResetReceiptV1>,
-  runById: Map<string, C137PerformanceRunV1>,
+  run: C137PerformanceRunV1 | C137PerformanceRunV2,
+  resetByTrial: Map<string, C137PerformanceCacheResetReceiptV1 | C137PerformanceCacheResetReceiptV2>,
+  runById: Map<string, C137PerformanceRunV1 | C137PerformanceRunV2>,
   issues: string[]
 ): void {
   if (run.status !== "completed") issues.push(`run ${run.trialId} 未完成。`);
@@ -770,8 +1173,8 @@ function validateCompleteRun(
 
 function validateCompleteCase(
   plan: C137PerformancePlanV1,
-  run: C137PerformanceRunV1,
-  item: C137PerformanceCaseV1,
+  run: C137PerformanceRunV1 | C137PerformanceRunV2,
+  item: C137PerformanceCaseV1 | C137PerformanceCaseV2,
   issues: string[]
 ): void {
   const telemetry = item.telemetry;
@@ -829,10 +1232,10 @@ function validateCompleteCase(
 }
 
 function validateCompleteCancellation(
-  evidence: C137PerformanceRawEvidenceV1,
+  evidence: C137PerformanceRawEvidence,
   planned: C137PerformancePlanTrialV1,
-  trial: C137PerformanceCancellationTrialV1,
-  resetByTrial: Map<string, C137PerformanceCacheResetReceiptV1>,
+  trial: C137PerformanceCancellationTrialV1 | C137PerformanceCancellationTrialV2,
+  resetByTrial: Map<string, C137PerformanceCacheResetReceiptV1 | C137PerformanceCacheResetReceiptV2>,
   issues: string[]
 ): void {
   const reset = resetByTrial.get(trial.trialId);
@@ -912,7 +1315,7 @@ function validateCompleteCancellation(
 }
 
 function validateStageSequence(
-  telemetry: C137PerformanceNativeTelemetryV1,
+  telemetry: C137PerformanceNativeTelemetryV1 | C137PerformanceNativeTelemetryV2,
   label: string,
   terminalStatus: "completed" | "cancelled",
   issues: string[]
@@ -1078,6 +1481,131 @@ function validateEnvironment(value: unknown, issues: string[]): void {
   validateToolchain(record.ffprobe, `${path}.ffprobe`, issues);
 }
 
+function validateEnvironmentV2(value: unknown, issues: string[]): void {
+  const path = "evidence.environment";
+  const record = strictRecord(value, path, ["schemaVersion", "digest", "measurementStatus", "issues", "operatingSystem", "operatingSystemVersion", "architecture", "cpuModel", "physicalCoreCount", "logicalCoreCount", "totalMemoryBytes", "storageScope", "storageKind", "workloadStorage", "powerProfile", "ffmpeg", "ffprobe"], issues);
+  if (!record) return;
+  requireLiteral(record.schemaVersion, 2, `${path}.schemaVersion`, issues);
+  requireDigest(record.digest, `${path}.digest`, issues);
+  requireOneOf(record.measurementStatus, ["complete", "incomplete"], `${path}.measurementStatus`, issues);
+  validateStringArray(record.issues, `${path}.issues`, issues, 64);
+  for (const key of ["operatingSystem", "operatingSystemVersion", "architecture", "cpuModel", "storageKind", "powerProfile"]) requireString(record[key], `${path}.${key}`, issues);
+  requirePositiveSafeInteger(record.physicalCoreCount, `${path}.physicalCoreCount`, issues);
+  requirePositiveSafeInteger(record.logicalCoreCount, `${path}.logicalCoreCount`, issues);
+  requirePositiveSafeInteger(record.totalMemoryBytes, `${path}.totalMemoryBytes`, issues);
+  requireLiteral(record.storageScope, "workload-media-volumes", `${path}.storageScope`, issues);
+  validateWorkloadStorageReceiptV2(record.workloadStorage, issues);
+  validateToolchain(record.ffmpeg, `${path}.ffmpeg`, issues);
+  validateToolchain(record.ffprobe, `${path}.ffprobe`, issues);
+}
+
+function validateWorkloadStorageReceiptV2(value: unknown, issues: string[]): void {
+  const path = "evidence.environment.workloadStorage";
+  const record = strictRecord(value, path, ["schemaVersion", "runManifestDigest", "workloadDigest", "bindingCount", "uniqueMediaCount", "volumeCount", "mediaSetDigest", "bindings", "volumes", "receiptDigest"], issues);
+  if (!record) return;
+  requireLiteral(record.schemaVersion, 2, `${path}.schemaVersion`, issues);
+  requireDigest(record.runManifestDigest, `${path}.runManifestDigest`, issues);
+  requireDigest(record.workloadDigest, `${path}.workloadDigest`, issues);
+  requireBoundedPositiveSafeInteger(
+    record.bindingCount,
+    `${path}.bindingCount`,
+    1,
+    C137_PERFORMANCE_MAX_CASES_PER_RUN * 2,
+    issues
+  );
+  requirePositiveSafeInteger(record.uniqueMediaCount, `${path}.uniqueMediaCount`, issues);
+  requirePositiveSafeInteger(record.volumeCount, `${path}.volumeCount`, issues);
+  requireDigest(record.mediaSetDigest, `${path}.mediaSetDigest`, issues);
+  requireDigest(record.receiptDigest, `${path}.receiptDigest`, issues);
+
+  const bindingCount = Number.isSafeInteger(record.bindingCount)
+    ? (record.bindingCount as number)
+    : 0;
+  const uniqueMediaCount = Number.isSafeInteger(record.uniqueMediaCount)
+    ? (record.uniqueMediaCount as number)
+    : 0;
+  const volumeCount = Number.isSafeInteger(record.volumeCount)
+    ? (record.volumeCount as number)
+    : 0;
+  if (bindingCount % 2 !== 0) issues.push(`${path}.bindingCount 必须由 source/target 成对组成。`);
+  if (
+    volumeCount < 1 ||
+    uniqueMediaCount < volumeCount ||
+    bindingCount < uniqueMediaCount
+  ) {
+    issues.push(`${path} 必须满足 1 <= volumeCount <= uniqueMediaCount <= bindingCount。`);
+  }
+
+  validateArray(record.bindings, `${path}.bindings`, issues, C137_PERFORMANCE_MAX_CASES_PER_RUN * 2, (item, itemPath) => {
+    const binding = strictRecord(item, itemPath, ["bindingOrdinal", "caseOrdinal", "side", "volumeOrdinal"], issues);
+    if (!binding) return;
+    requireNonNegativeSafeInteger(binding.bindingOrdinal, `${itemPath}.bindingOrdinal`, issues);
+    requireNonNegativeSafeInteger(binding.caseOrdinal, `${itemPath}.caseOrdinal`, issues);
+    requireOneOf(binding.side, ["source", "target"], `${itemPath}.side`, issues);
+    requireNonNegativeSafeInteger(binding.volumeOrdinal, `${itemPath}.volumeOrdinal`, issues);
+  });
+  validateArray(record.volumes, `${path}.volumes`, issues, C137_PERFORMANCE_MAX_CASES_PER_RUN * 2, (item, itemPath) => {
+    const volume = strictRecord(item, itemPath, ["volumeOrdinal", "bindingCount", "driveType", "seekPenalty", "measurementStatus"], issues);
+    if (!volume) return;
+    requireNonNegativeSafeInteger(volume.volumeOrdinal, `${itemPath}.volumeOrdinal`, issues);
+    requirePositiveSafeInteger(volume.bindingCount, `${itemPath}.bindingCount`, issues);
+    requireLiteral(volume.driveType, "fixed", `${itemPath}.driveType`, issues);
+    requireOneOf(volume.seekPenalty, ["incurs", "none"], `${itemPath}.seekPenalty`, issues);
+    requireLiteral(volume.measurementStatus, "complete", `${itemPath}.measurementStatus`, issues);
+  });
+
+  if (!Array.isArray(record.bindings) || !Array.isArray(record.volumes)) return;
+  if (record.bindings.length !== bindingCount) {
+    issues.push(`${path}.bindings 长度与 bindingCount 不一致。`);
+  }
+  if (record.volumes.length !== volumeCount) {
+    issues.push(`${path}.volumes 长度与 volumeCount 不一致。`);
+  }
+  const actualVolumeCounts = Array.from({ length: Math.max(volumeCount, 0) }, () => 0);
+  const firstBindingOrdinals = Array.from(
+    { length: Math.max(volumeCount, 0) },
+    () => Number.POSITIVE_INFINITY
+  );
+  for (const [index, item] of record.bindings.entries()) {
+    if (!isRecord(item)) continue;
+    const expectedCaseOrdinal = Math.floor(index / 2);
+    const expectedSide = index % 2 === 0 ? "source" : "target";
+    if (
+      item.bindingOrdinal !== index ||
+      item.caseOrdinal !== expectedCaseOrdinal ||
+      item.side !== expectedSide
+    ) {
+      issues.push(`${path}.bindings[${index}] 未形成连续 case/source/target 闭环。`);
+    }
+    if (
+      Number.isSafeInteger(item.volumeOrdinal) &&
+      (item.volumeOrdinal as number) >= 0 &&
+      (item.volumeOrdinal as number) < volumeCount
+    ) {
+      const ordinal = item.volumeOrdinal as number;
+      actualVolumeCounts[ordinal] += 1;
+      firstBindingOrdinals[ordinal] = Math.min(firstBindingOrdinals[ordinal], index);
+    } else {
+      issues.push(`${path}.bindings[${index}].volumeOrdinal 未指向已声明 volume。`);
+    }
+  }
+  let previousFirstBindingOrdinal = -1;
+  for (const [index, item] of record.volumes.entries()) {
+    if (!isRecord(item)) continue;
+    if (
+      item.volumeOrdinal !== index ||
+      item.bindingCount !== actualVolumeCounts[index] ||
+      actualVolumeCounts[index] <= 0
+    ) {
+      issues.push(`${path}.volumes[${index}] ordinal/bindingCount 与 bindings 反向汇总不一致。`);
+    }
+    if (firstBindingOrdinals[index] <= previousFirstBindingOrdinal) {
+      issues.push(`${path}.volumes[${index}] 未按首次 binding 顺序编号。`);
+    }
+    previousFirstBindingOrdinal = firstBindingOrdinals[index];
+  }
+}
+
 function validateToolchain(value: unknown, path: string, issues: string[]): void {
   const record = strictRecord(value, path, ["version", "binaryDigest"], issues);
   if (!record) return;
@@ -1101,6 +1629,36 @@ function validateCollector(value: unknown, issues: string[]): void {
   if (record.terminalSessionStatus !== null) requireOneOf(record.terminalSessionStatus, ["released", "cleanup-blocked"], `${path}.terminalSessionStatus`, issues);
 }
 
+function validateCollectorV2(value: unknown, issues: string[]): void {
+  const path = "evidence.collector";
+  const record = strictRecord(value, path, ["schemaVersion", "collectorVersion", "nativeSchemaVersion", "clock", "memoryScope", "sampler", "sessionId", "sessionOriginTickNs", "memorySampleIntervalMs", "terminalSessionStatus", "runManifestDigest", "workloadDigest", "workloadStorageReceiptDigest"], issues);
+  if (!record) return;
+  requireLiteral(record.schemaVersion, 2, `${path}.schemaVersion`, issues);
+  requireString(record.collectorVersion, `${path}.collectorVersion`, issues);
+  requireLiteral(record.nativeSchemaVersion, 2, `${path}.nativeSchemaVersion`, issues);
+  requireLiteral(record.clock, "rust-std-instant-session-relative-v1", `${path}.clock`, issues);
+  requireLiteral(record.memoryScope, "application-process-tree", `${path}.memoryScope`, issues);
+  requireOneOf(record.sampler, ["windows-toolhelp-working-set-v1", "windows-job-object-working-set-v1", "unsupported"], `${path}.sampler`, issues);
+  requireOpaqueId(record.sessionId, `${path}.sessionId`, issues);
+  requireLiteral(record.sessionOriginTickNs, "0", `${path}.sessionOriginTickNs`, issues);
+  requireBoundedPositiveSafeInteger(record.memorySampleIntervalMs, `${path}.memorySampleIntervalMs`, 10, 1_000, issues);
+  if (record.terminalSessionStatus !== null) requireOneOf(record.terminalSessionStatus, ["released", "cleanup-blocked"], `${path}.terminalSessionStatus`, issues);
+  requireDigest(record.runManifestDigest, `${path}.runManifestDigest`, issues);
+  requireDigest(record.workloadDigest, `${path}.workloadDigest`, issues);
+  requireDigest(record.workloadStorageReceiptDigest, `${path}.workloadStorageReceiptDigest`, issues);
+}
+
+function validateAssuranceV2(value: unknown, issues: string[]): void {
+  const path = "evidence.assurance";
+  const record = strictRecord(value, path, ["schemaVersion", "workloadStorageReceiptDigest", "jobMemoryReceipt", "terminalCleanupReceipt", "attestation"], issues);
+  if (!record) return;
+  requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
+  requireDigest(record.workloadStorageReceiptDigest, `${path}.workloadStorageReceiptDigest`, issues);
+  requireLiteral(record.jobMemoryReceipt, null, `${path}.jobMemoryReceipt`, issues);
+  requireLiteral(record.terminalCleanupReceipt, null, `${path}.terminalCleanupReceipt`, issues);
+  requireLiteral(record.attestation, null, `${path}.attestation`, issues);
+}
+
 function validatePreflight(value: unknown, issues: string[]): void {
   const path = "evidence.preflight";
   const record = strictRecord(value, path, ["ok", "realRelationCount", "checkedFileCount", "issueCodes"], issues);
@@ -1111,11 +1669,15 @@ function validatePreflight(value: unknown, issues: string[]): void {
   validateStringArray(record.issueCodes, `${path}.issueCodes`, issues, 256);
 }
 
-function validateCacheResets(value: unknown, issues: string[]): void {
+function validateCacheResets(
+  value: unknown,
+  issues: string[],
+  schemaVersion: 1 | 2 = 1
+): void {
   validateArray(value, "evidence.cacheResets", issues, C137_PERFORMANCE_MAX_TRIALS, (item, path) => {
     const record = strictRecord(item, path, ["schemaVersion", "receiptDigest", "trialId", "sessionId", "resetTickNs", "previousGeneration", "cacheGeneration", "before", "after", "allCachesEmpty"], issues);
     if (!record) return;
-    requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
+    requireLiteral(record.schemaVersion, schemaVersion, `${path}.schemaVersion`, issues);
     requireDigest(record.receiptDigest, `${path}.receiptDigest`, issues);
     requireOpaqueId(record.trialId, `${path}.trialId`, issues);
     requireOpaqueId(record.sessionId, `${path}.sessionId`, issues);
@@ -1135,14 +1697,18 @@ function validateCacheResets(value: unknown, issues: string[]): void {
   );
 }
 
-function validateTrials(value: unknown, issues: string[]): void {
+function validateTrials(
+  value: unknown,
+  issues: string[],
+  schemaVersion: 1 | 2 = 1
+): void {
   validateArray(value, "evidence.trials", issues, C137_PERFORMANCE_MAX_TRIALS, (item, path) => {
     if (!isRecord(item)) {
       issues.push(`${path} 必须为对象。`);
       return;
     }
-    if (item.trialType === "run") validateRun(item, path, issues);
-    else if (item.trialType === "cancellation") validateCancellation(item, path, issues);
+    if (item.trialType === "run") validateRun(item, path, issues, schemaVersion);
+    else if (item.trialType === "cancellation") validateCancellation(item, path, issues, schemaVersion);
     else issues.push(`${path}.trialType 无效。`);
   });
   validateUniqueObjectStringField(
@@ -1154,7 +1720,12 @@ function validateTrials(value: unknown, issues: string[]): void {
   );
 }
 
-function validateRun(value: unknown, path: string, issues: string[]): void {
+function validateRun(
+  value: unknown,
+  path: string,
+  issues: string[],
+  schemaVersion: 1 | 2 = 1
+): void {
   const record = strictRecord(value, path, ["trialType", "trialId", "runKind", "repetition", "sessionId", "workloadDigest", "status", "startTickNs", "endTickNs", "elapsedMs", "cacheResetReceiptDigest", "warmupTrialId", "outputDigest", "cases"], issues);
   if (!record) return;
   requireLiteral(record.trialType, "run", `${path}.trialType`, issues);
@@ -1170,10 +1741,15 @@ function validateRun(value: unknown, path: string, issues: string[]): void {
   requireNullableDigest(record.cacheResetReceiptDigest, `${path}.cacheResetReceiptDigest`, issues);
   requireNullableOpaqueId(record.warmupTrialId, `${path}.warmupTrialId`, issues);
   requireNullableDigest(record.outputDigest, `${path}.outputDigest`, issues);
-  validateArray(record.cases, `${path}.cases`, issues, C137_PERFORMANCE_MAX_CASES_PER_RUN, validateCase);
+  validateArray(record.cases, `${path}.cases`, issues, C137_PERFORMANCE_MAX_CASES_PER_RUN, (item, itemPath, itemIssues) => validateCase(item, itemPath, itemIssues, schemaVersion));
 }
 
-function validateCancellation(value: unknown, path: string, issues: string[]): void {
+function validateCancellation(
+  value: unknown,
+  path: string,
+  issues: string[],
+  schemaVersion: 1 | 2 = 1
+): void {
   const record = strictRecord(value, path, ["trialType", "trialId", "repetition", "sessionId", "workloadDigest", "caseOrdinal", "jobId", "triggerStageKey", "requestTickNs", "terminalTickNs", "latencyMs", "commandAccepted", "terminalStatus", "processTreeEmpty", "residualProcessCount", "cacheResetReceiptDigest", "telemetry"], issues);
   if (!record) return;
   requireLiteral(record.trialType, "cancellation", `${path}.trialType`, issues);
@@ -1192,10 +1768,15 @@ function validateCancellation(value: unknown, path: string, issues: string[]): v
   requireBoolean(record.processTreeEmpty, `${path}.processTreeEmpty`, issues);
   requireNonNegativeSafeInteger(record.residualProcessCount, `${path}.residualProcessCount`, issues);
   requireDigest(record.cacheResetReceiptDigest, `${path}.cacheResetReceiptDigest`, issues);
-  validateTelemetry(record.telemetry, `${path}.telemetry`, issues);
+  validateTelemetry(record.telemetry, `${path}.telemetry`, issues, schemaVersion);
 }
 
-function validateCase(value: unknown, path: string, issues: string[]): void {
+function validateCase(
+  value: unknown,
+  path: string,
+  issues: string[],
+  schemaVersion: 1 | 2 = 1
+): void {
   const record = strictRecord(value, path, ["caseOrdinal", "jobId", "status", "requestParametersDigest", "timeMapParametersHash", "timeMapDigest", "outputDigest", "telemetry"], issues);
   if (!record) return;
   requireNonNegativeSafeInteger(record.caseOrdinal, `${path}.caseOrdinal`, issues);
@@ -1209,13 +1790,18 @@ function validateCase(value: unknown, path: string, issues: string[]): void {
   );
   requireNullableDigest(record.timeMapDigest, `${path}.timeMapDigest`, issues);
   requireNullableDigest(record.outputDigest, `${path}.outputDigest`, issues);
-  validateTelemetry(record.telemetry, `${path}.telemetry`, issues);
+  validateTelemetry(record.telemetry, `${path}.telemetry`, issues, schemaVersion);
 }
 
-function validateTelemetry(value: unknown, path: string, issues: string[]): void {
+function validateTelemetry(
+  value: unknown,
+  path: string,
+  issues: string[],
+  schemaVersion: 1 | 2 = 1
+): void {
   const record = strictRecord(value, path, ["schemaVersion", "clock", "startTickNs", "endTickNs", "elapsedMs", "stages", "cache", "memory", "cancellation"], issues);
   if (!record) return;
-  requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
+  requireLiteral(record.schemaVersion, schemaVersion, `${path}.schemaVersion`, issues);
   requireLiteral(record.clock, "rust-std-instant-session-relative-v1", `${path}.clock`, issues);
   requireDecimalTick(record.startTickNs, `${path}.startTickNs`, issues);
   requireNullableDecimalTick(record.endTickNs, `${path}.endTickNs`, issues);
@@ -1290,13 +1876,45 @@ function omitEvidenceDigest(evidence: C137PerformanceRawEvidenceV1): C137Perform
   return draft;
 }
 
+function omitEvidenceDigestV2(
+  evidence: C137PerformanceRawEvidenceV2
+): C137PerformanceEvidenceDraftV2 {
+  const { evidenceDigest, ...draft } = evidence;
+  void evidenceDigest;
+  return draft;
+}
+
 function omitEnvironmentDigest(environment: C137PerformanceEnvironmentV1): Omit<C137PerformanceEnvironmentV1, "digest"> {
   const { digest, ...value } = environment;
   void digest;
   return value;
 }
 
+function omitEnvironmentDigestV2(
+  environment: C137PerformanceEnvironmentV2
+): Omit<C137PerformanceEnvironmentV2, "digest"> {
+  const { digest, ...value } = environment;
+  void digest;
+  return value;
+}
+
 function omitReceiptDigest(receipt: C137PerformanceCacheResetReceiptV1): Omit<C137PerformanceCacheResetReceiptV1, "receiptDigest"> {
+  const { receiptDigest, ...value } = receipt;
+  void receiptDigest;
+  return value;
+}
+
+function omitReceiptDigestV2(
+  receipt: C137PerformanceCacheResetReceiptV2
+): Omit<C137PerformanceCacheResetReceiptV2, "receiptDigest"> {
+  const { receiptDigest, ...value } = receipt;
+  void receiptDigest;
+  return value;
+}
+
+function omitWorkloadStorageReceiptDigest(
+  receipt: C137PerformanceWorkloadStorageReceiptV2
+): Omit<C137PerformanceWorkloadStorageReceiptV2, "receiptDigest"> {
   const { receiptDigest, ...value } = receipt;
   void receiptDigest;
   return value;
@@ -1399,7 +2017,7 @@ function validateStringArray(value: unknown, path: string, issues: string[], max
     .forEach((item, index) => requireString(item, `${path}[${index}]`, issues));
 }
 
-function requireLiteral(value: unknown, expected: string | number | boolean, path: string, issues: string[]): void {
+function requireLiteral(value: unknown, expected: string | number | boolean | null, path: string, issues: string[]): void {
   if (value !== expected) issues.push(`${path} 必须为 ${String(expected)}。`);
 }
 

@@ -92,9 +92,9 @@ export function createWorkspaceProgress(project: EditorProject): WorkspaceProgre
       state: matchingState,
       stateText:
         matchingState === "complete"
-          ? `${confirmedTargetCount} / ${targetMedia.length} 个原片已确认`
+          ? `${confirmedTargetCount} / ${targetMedia.length} 个原片已有保存关系`
           : matchingState === "active"
-            ? `${confirmedTargetCount} / ${targetMedia.length} 个原片已确认`
+            ? `${confirmedTargetCount} / ${targetMedia.length} 个原片已有保存关系`
             : matchingState === "blocked"
               ? "需处理"
               : "等待素材",
@@ -153,7 +153,7 @@ export function createWorkspaceProgress(project: EditorProject): WorkspaceProgre
     progressPercent: Math.round((completeStepCount / steps.length) * 100),
     recommendedPage: recommended.page,
     recommendedAction: recommended.action,
-    liveSummary: `${assetCount} 个 XML · ${confirmedTargetCount}/${targetMedia.length} 个原片已确认 · ${pendingMatchCandidateCount} 个待复核`,
+    liveSummary: `${assetCount} 个 XML · ${confirmedTargetCount}/${targetMedia.length} 个原片已有保存关系 · ${pendingMatchCandidateCount} 个候选待复核`,
     projection,
     exportableEpisodeCount,
     confirmedTargetCount,
@@ -198,7 +198,7 @@ function createMatchingBlockers(input: {
     blockers.push("还没有正片来源段，无法投影到原片。");
   }
   if (input.targetCount > 0 && input.confirmedTargetCount < input.targetCount) {
-    blockers.push(`还有 ${input.targetCount - input.confirmedTargetCount} 个原片未确认匹配关系。`);
+    blockers.push(`还有 ${input.targetCount - input.confirmedTargetCount} 个原片没有保存匹配关系。`);
   }
   for (const issue of input.projection.issues) {
     if (issue.severity === "error") {

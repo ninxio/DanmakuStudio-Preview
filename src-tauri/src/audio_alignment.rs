@@ -113,7 +113,13 @@ const DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 20;
 const MIN_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 10;
 const MAX_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const BENCHMARK_RESIDUAL_GRACE_MS: u64 = 2_000;
-const BENCHMARK_TELEMETRY_VERSION: &str = "alignment-benchmark-native-v1";
+const BENCHMARK_TELEMETRY_VERSION: &str = "alignment-benchmark-native-v2";
+const ALIGNMENT_BENCHMARK_MAX_CASES: usize = 1_000;
+const ALIGNMENT_BENCHMARK_MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+const ALIGNMENT_BENCHMARK_MAX_ID_BYTES: usize = 512;
+const ALIGNMENT_BENCHMARK_MAX_NOTE_BYTES: usize = 4 * 1024;
+const ALIGNMENT_BENCHMARK_MAX_PATH_UTF16_UNITS: usize = 32_767;
+const ALIGNMENT_BENCHMARK_MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const BENCHMARK_PROCESS_CLEANUP_REASON: &str =
     "受监督媒体进程未能可信收尾；lease 与工具 pin 按 fail-closed 保持占用。";
 const BENCHMARK_TOOL_VERSION_TIMEOUT_MS: u64 = 10_000;
@@ -380,7 +386,8 @@ pub struct AudioAlignmentJobSnapshot {
     updated_at_ms: u64,
 }
 
-const ALIGNMENT_BENCHMARK_SCHEMA_VERSION: u8 = 1;
+const ALIGNMENT_BENCHMARK_SCHEMA_VERSION: u8 = 2;
+const ALIGNMENT_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -391,11 +398,92 @@ pub enum AlignmentBenchmarkSessionStatus {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BeginAlignmentBenchmarkSessionRequest {
+    schema_version: u8,
+    run_manifest_canonical_json: String,
+    run_manifest_digest: String,
+    workload_digest: String,
     ffmpeg_path: Option<String>,
     ffprobe_path: Option<String>,
     memory_sample_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlignmentBenchmarkBlindRunManifest {
+    schema_version: u8,
+    manifest_id: String,
+    dataset_version: String,
+    cases: Vec<AlignmentBenchmarkBlindCase>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlignmentBenchmarkBlindCase {
+    case_id: String,
+    source: AlignmentBenchmarkBlindMediaInput,
+    target: AlignmentBenchmarkBlindMediaInput,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlignmentBenchmarkBlindMediaInput {
+    path: String,
+    audio_stream_index: u32,
+    video_stream_index: Option<u32>,
+    content_identity: AlignmentBenchmarkBlindContentIdentity,
+    version_note: String,
+    license_note: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AlignmentBenchmarkBlindContentIdentity {
+    algorithm: String,
+    size_bytes: u64,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AlignmentBenchmarkBindingSide {
+    Source,
+    Target,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkWorkloadBindingReceipt {
+    binding_ordinal: usize,
+    case_ordinal: usize,
+    side: AlignmentBenchmarkBindingSide,
+    volume_ordinal: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkWorkloadVolumeReceipt {
+    volume_ordinal: usize,
+    binding_count: usize,
+    drive_type: &'static str,
+    seek_penalty: &'static str,
+    measurement_status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkWorkloadStorageReceipt {
+    schema_version: u8,
+    run_manifest_digest: String,
+    workload_digest: String,
+    binding_count: usize,
+    unique_media_count: usize,
+    volume_count: usize,
+    media_set_digest: String,
+    bindings: Vec<AlignmentBenchmarkWorkloadBindingReceipt>,
+    volumes: Vec<AlignmentBenchmarkWorkloadVolumeReceipt>,
+    receipt_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -421,6 +509,7 @@ pub struct AlignmentBenchmarkEnvironmentReceipt {
     total_memory_bytes: u64,
     storage_scope: &'static str,
     storage_kind: String,
+    workload_storage: AlignmentBenchmarkWorkloadStorageReceipt,
     power_profile: String,
     ffmpeg: AlignmentBenchmarkToolFingerprint,
     ffprobe: AlignmentBenchmarkToolFingerprint,
@@ -830,7 +919,7 @@ struct AlignmentBenchmarkOutstandingReceipt {
 }
 
 #[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct AlignmentBenchmarkWindowsFileIdentity {
     volume_serial_number: u32,
     file_index: u64,
@@ -847,6 +936,38 @@ struct AlignmentBenchmarkPinnedTool {
     identity: AlignmentBenchmarkWindowsFileIdentity,
 }
 
+struct AlignmentBenchmarkPinnedMedia {
+    canonical_path: PathBuf,
+    expected_digest: String,
+    expected_size_bytes: u64,
+    expected_content_identity: MediaContentIdentity,
+    #[cfg(windows)]
+    file: File,
+    #[cfg(windows)]
+    identity: AlignmentBenchmarkWindowsFileIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct AlignmentBenchmarkRegisteredBinding {
+    binding_ordinal: usize,
+    pin_index: usize,
+    audio_stream_index: u32,
+    video_stream_index: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct AlignmentBenchmarkRegisteredCase {
+    case_ordinal: usize,
+    source: AlignmentBenchmarkRegisteredBinding,
+    target: AlignmentBenchmarkRegisteredBinding,
+}
+
+struct AlignmentBenchmarkRegisteredWorkload {
+    pins: Vec<AlignmentBenchmarkPinnedMedia>,
+    cases: Vec<AlignmentBenchmarkRegisteredCase>,
+    receipt: AlignmentBenchmarkWorkloadStorageReceipt,
+}
+
 struct AlignmentBenchmarkSessionEntry {
     session_id: String,
     status: AlignmentBenchmarkSessionStatus,
@@ -856,7 +977,9 @@ struct AlignmentBenchmarkSessionEntry {
     environment: AlignmentBenchmarkEnvironmentReceipt,
     ffmpeg_tool: AlignmentBenchmarkPinnedTool,
     ffprobe_tool: AlignmentBenchmarkPinnedTool,
+    workload: AlignmentBenchmarkRegisteredWorkload,
     toolchain_integrity_failed: bool,
+    workload_integrity_failed: bool,
     baseline_descendants: HashSet<u32>,
     active_job_id: Option<String>,
     cleanup_reason: Option<String>,
@@ -881,6 +1004,8 @@ struct PreparedAlignmentBenchmarkJob {
     session_id: String,
     job_id: String,
     request: AudioAlignmentRequest,
+    expected_source_identity: MediaContentIdentity,
+    expected_target_identity: MediaContentIdentity,
     cancel_flag: Arc<AtomicBool>,
     telemetry: Arc<AlignmentBenchmarkRunTelemetry>,
     sample_interval_ms: u64,
@@ -1139,6 +1264,224 @@ fn acquire_alignment_benchmark_initialization_lease(
     Ok(AlignmentBenchmarkInitializationLease { armed: true })
 }
 
+fn parse_alignment_benchmark_run_manifest(
+    canonical_json: &str,
+    run_manifest_digest: &str,
+    workload_digest: &str,
+) -> Result<AlignmentBenchmarkBlindRunManifest, String> {
+    if canonical_json.len() > ALIGNMENT_BENCHMARK_MAX_MANIFEST_BYTES {
+        return Err("runManifestCanonicalJson 超过 16 MiB 上限。".to_string());
+    }
+    if !is_canonical_alignment_benchmark_sha256(run_manifest_digest)
+        || !is_canonical_alignment_benchmark_sha256(workload_digest)
+    {
+        return Err("runManifestDigest 与 workloadDigest 必须是规范小写 sha256 摘要。".to_string());
+    }
+    if run_manifest_digest != workload_digest {
+        return Err("workloadDigest 必须与 blind run manifest 摘要完全一致。".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(canonical_json)
+        .map_err(|_| "runManifestCanonicalJson 不是有效 JSON。".to_string())?;
+    validate_alignment_benchmark_manifest_json_shape(&value)?;
+    let recanonicalized = canonicalize_alignment_benchmark_json(&value)?;
+    if canonical_json != recanonicalized {
+        return Err("runManifestCanonicalJson 不是规范 canonical JSON。".to_string());
+    }
+    let observed_digest = format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(recanonicalized.as_bytes())
+    );
+    if observed_digest != run_manifest_digest {
+        return Err("blind run manifest canonical JSON 与声明摘要不一致。".to_string());
+    }
+    let manifest: AlignmentBenchmarkBlindRunManifest = serde_json::from_value(value)
+        .map_err(|_| "blind run manifest 字段类型无效或含未知字段。".to_string())?;
+    validate_alignment_benchmark_run_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_alignment_benchmark_manifest_json_shape(
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| "blind run manifest 必须是对象。".to_string())?;
+    require_exact_alignment_benchmark_json_keys(
+        root,
+        &["schemaVersion", "manifestId", "datasetVersion", "cases"],
+        "blind run manifest",
+    )?;
+    let cases = root
+        .get("cases")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "blind run manifest cases 必须是数组。".to_string())?;
+    for (case_ordinal, case) in cases.iter().enumerate() {
+        let case = case
+            .as_object()
+            .ok_or_else(|| format!("blind run case {case_ordinal} 必须是对象。"))?;
+        require_exact_alignment_benchmark_json_keys(
+            case,
+            &["caseId", "source", "target"],
+            "blind run case",
+        )?;
+        for side in ["source", "target"] {
+            let media = case
+                .get(side)
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| format!("blind run case {case_ordinal} 的媒体字段无效。"))?;
+            require_exact_alignment_benchmark_json_keys(
+                media,
+                &[
+                    "path",
+                    "audioStreamIndex",
+                    "videoStreamIndex",
+                    "contentIdentity",
+                    "versionNote",
+                    "licenseNote",
+                ],
+                "blind run media",
+            )?;
+            let identity = media
+                .get("contentIdentity")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| "blind run media contentIdentity 无效。".to_string())?;
+            require_exact_alignment_benchmark_json_keys(
+                identity,
+                &["algorithm", "sizeBytes", "digest"],
+                "blind run media contentIdentity",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn require_exact_alignment_benchmark_json_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    if object.len() != expected.len()
+        || expected.iter().any(|key| !object.contains_key(*key))
+        || object
+            .keys()
+            .any(|key| !expected.iter().any(|expected| key == expected))
+    {
+        return Err(format!("{label} 缺少必需字段或含未知字段。"));
+    }
+    Ok(())
+}
+
+fn validate_alignment_benchmark_run_manifest(
+    manifest: &AlignmentBenchmarkBlindRunManifest,
+) -> Result<(), String> {
+    if manifest.schema_version != ALIGNMENT_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION {
+        return Err("blind run manifest schemaVersion 必须为 1。".to_string());
+    }
+    if manifest.manifest_id.trim().is_empty()
+        || manifest.dataset_version.trim().is_empty()
+        || manifest.manifest_id.len() > ALIGNMENT_BENCHMARK_MAX_ID_BYTES
+        || manifest.dataset_version.len() > ALIGNMENT_BENCHMARK_MAX_ID_BYTES
+    {
+        return Err("blind run manifestId 与 datasetVersion 不能为空。".to_string());
+    }
+    if manifest.cases.is_empty() || manifest.cases.len() > ALIGNMENT_BENCHMARK_MAX_CASES {
+        return Err(format!(
+            "blind run manifest 必须包含 1–{ALIGNMENT_BENCHMARK_MAX_CASES} 个 case。"
+        ));
+    }
+    let mut case_ids = HashSet::with_capacity(manifest.cases.len());
+    for benchmark_case in &manifest.cases {
+        if benchmark_case.case_id.trim().is_empty()
+            || benchmark_case.case_id.len() > ALIGNMENT_BENCHMARK_MAX_ID_BYTES
+            || !case_ids.insert(benchmark_case.case_id.clone())
+        {
+            return Err("blind run manifest caseId 不能为空或重复。".to_string());
+        }
+        validate_alignment_benchmark_blind_media(&benchmark_case.source)?;
+        validate_alignment_benchmark_blind_media(&benchmark_case.target)?;
+    }
+    Ok(())
+}
+
+fn validate_alignment_benchmark_blind_media(
+    media: &AlignmentBenchmarkBlindMediaInput,
+) -> Result<(), String> {
+    let path = media.path.trim();
+    if path.is_empty()
+        || path.encode_utf16().count() > ALIGNMENT_BENCHMARK_MAX_PATH_UTF16_UNITS
+        || is_remote_media_input(path)
+        || alignment_benchmark_path_uses_unsupported_remote_namespace(path)
+    {
+        return Err("blind run manifest 仅接受非空本地媒体路径。".to_string());
+    }
+    if media.version_note.trim().is_empty()
+        || media.license_note.trim().is_empty()
+        || media.version_note.len() > ALIGNMENT_BENCHMARK_MAX_NOTE_BYTES
+        || media.license_note.len() > ALIGNMENT_BENCHMARK_MAX_NOTE_BYTES
+    {
+        return Err("blind run media 必须包含非空版本和许可说明。".to_string());
+    }
+    if media.content_identity.algorithm != "sha256-full-file-v2"
+        || media.content_identity.size_bytes == 0
+        || media.content_identity.size_bytes > ALIGNMENT_BENCHMARK_MAX_JSON_SAFE_INTEGER
+        || !is_lowercase_alignment_benchmark_sha256_hex(&media.content_identity.digest)
+    {
+        return Err("blind run media 必须包含非空 sha256-full-file-v2 全文件身份。".to_string());
+    }
+    Ok(())
+}
+
+fn is_canonical_alignment_benchmark_sha256(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(is_lowercase_alignment_benchmark_sha256_hex)
+}
+
+fn is_lowercase_alignment_benchmark_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_alignment_benchmark_bytes(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn canonicalize_alignment_benchmark_json(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            serde_json::to_string(value).map_err(|_| "canonical JSON 标量序列化失败。".to_string())
+        }
+        serde_json::Value::String(_) => serde_json::to_string(value)
+            .map_err(|_| "canonical JSON 字符串序列化失败。".to_string()),
+        serde_json::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(canonicalize_alignment_benchmark_json)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", values.join(",")))
+        }
+        serde_json::Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    let key_json = serde_json::to_string(key)
+                        .map_err(|_| "canonical JSON 对象键序列化失败。".to_string())?;
+                    let value_json = canonicalize_alignment_benchmark_json(&object[key])?;
+                    Ok(format!("{key_json}:{value_json}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(format!("{{{}}}", fields.join(",")))
+        }
+    }
+}
+
 fn begin_alignment_benchmark_session_inner(
     request: BeginAlignmentBenchmarkSessionRequest,
 ) -> Result<AlignmentBenchmarkSessionSnapshot, String> {
@@ -1148,6 +1491,16 @@ fn begin_alignment_benchmark_session_inner(
                 .to_string(),
         );
     }
+    if request.schema_version != ALIGNMENT_BENCHMARK_SCHEMA_VERSION {
+        return Err(format!(
+            "原生对齐基准 begin schemaVersion 必须为 {ALIGNMENT_BENCHMARK_SCHEMA_VERSION}。"
+        ));
+    }
+    let manifest = parse_alignment_benchmark_run_manifest(
+        &request.run_manifest_canonical_json,
+        &request.run_manifest_digest,
+        &request.workload_digest,
+    )?;
     let sample_interval_ms = request
         .memory_sample_interval_ms
         .unwrap_or(DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS);
@@ -1164,10 +1517,25 @@ fn begin_alignment_benchmark_session_inner(
         .map(PathBuf::from)
         .unwrap_or_else(|| resolve_ffprobe_path(ffmpeg_request));
     let mut initialization_lease = acquire_alignment_benchmark_initialization_lease()?;
+    // Pin and hash every workload file before ToolHelp, tool-version, power, registry or storage
+    // environment probes run. A failed initialization drops all local pins before the exclusive
+    // initialization lease is released and never publishes a partial session.
+    let workload = prepare_alignment_benchmark_workload(
+        &manifest,
+        &request.run_manifest_digest,
+        &request.workload_digest,
+    )?;
+    let workload_receipt = workload.receipt.clone();
     let (baseline_descendants, (environment, ffmpeg_tool, ffprobe_tool)) =
         collect_alignment_benchmark_baseline_before_probe(
             || sample_process_tree_memory(std::process::id()).map(|sample| sample.descendants),
-            || collect_alignment_benchmark_environment(ffmpeg_request, &ffprobe_request),
+            || {
+                collect_alignment_benchmark_environment(
+                    ffmpeg_request,
+                    &ffprobe_request,
+                    workload_receipt,
+                )
+            },
         )?;
 
     let mut coordinator = alignment_benchmark_coordinator()
@@ -1190,7 +1558,9 @@ fn begin_alignment_benchmark_session_inner(
         environment,
         ffmpeg_tool,
         ffprobe_tool,
+        workload,
         toolchain_integrity_failed: false,
+        workload_integrity_failed: false,
         baseline_descendants,
         active_job_id: None,
         cleanup_reason,
@@ -1367,6 +1737,20 @@ fn prepare_alignment_benchmark_job(
         block_alignment_benchmark_session_for_toolchain(session);
         return Err("基准媒体工具在任务启动前未通过固定身份复核。".to_string());
     }
+    if session.workload_integrity_failed {
+        block_alignment_benchmark_session_for_workload(session);
+        return Err("固定 workload media 在任务启动前未通过身份复核。".to_string());
+    }
+    let (expected_source_identity, expected_target_identity) =
+        match validate_alignment_benchmark_registered_job_request(&session.workload, &mut request) {
+            Ok(identities) => identities,
+            Err(error) => {
+                if error.starts_with("blocked:workload-media-integrity") {
+                    block_alignment_benchmark_session_for_workload(session);
+                }
+                return Err("benchmark job 未匹配同一个已注册 blind case。".to_string());
+            }
+        };
     let receipt_generation = consume_alignment_benchmark_reset_receipt(
         session.outstanding_receipt.as_mut(),
         session.cache_generation,
@@ -1401,6 +1785,8 @@ fn prepare_alignment_benchmark_job(
         session_id: session_id.to_string(),
         job_id,
         request,
+        expected_source_identity,
+        expected_target_identity,
         cancel_flag,
         telemetry,
         sample_interval_ms: session.sample_interval_ms,
@@ -1454,6 +1840,127 @@ fn block_alignment_benchmark_session_for_toolchain(session: &mut AlignmentBenchm
         Some("固定媒体工具身份复核失败；lease 与只读 pin 保持占用。".to_string());
 }
 
+fn block_alignment_benchmark_session_for_workload(session: &mut AlignmentBenchmarkSessionEntry) {
+    session.workload_integrity_failed = true;
+    session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+    session.cleanup_reason =
+        Some("固定 workload media 身份复核失败；lease、媒体与工具 pin 保持占用。".to_string());
+}
+
+fn validate_alignment_benchmark_registered_job_request(
+    workload: &AlignmentBenchmarkRegisteredWorkload,
+    request: &mut AudioAlignmentRequest,
+) -> Result<(MediaContentIdentity, MediaContentIdentity), String> {
+    if workload.pins.is_empty() || workload.cases.is_empty() {
+        return Err("benchmark workload 注册为空。".to_string());
+    }
+    let source_pin_index =
+        resolve_alignment_benchmark_registered_request_pin(&workload.pins, &request.source_path)?;
+    let target_pin_index =
+        resolve_alignment_benchmark_registered_request_pin(&workload.pins, &request.complete_path)?;
+    let source_audio_stream_index = request
+        .source_audio_stream_index
+        .ok_or_else(|| "benchmark job 必须显式声明 source audio stream。".to_string())?;
+    let target_audio_stream_index = request
+        .complete_audio_stream_index
+        .ok_or_else(|| "benchmark job 必须显式声明 target audio stream。".to_string())?;
+    let registered_index = find_alignment_benchmark_registered_case(
+        &workload.cases,
+        source_pin_index,
+        target_pin_index,
+        source_audio_stream_index,
+        target_audio_stream_index,
+        request.source_video_stream_index,
+        request.complete_video_stream_index,
+    )?;
+    let registered = &workload.cases[registered_index];
+    verify_alignment_benchmark_pinned_media(&workload.pins[registered.source.pin_index])
+        .and_then(|_| {
+            verify_alignment_benchmark_pinned_media(&workload.pins[registered.target.pin_index])
+        })
+        .map_err(|_| {
+            "blocked:workload-media-integrity：当前 case 媒体 pin 身份复核失败。".to_string()
+        })?;
+    request.source_path = workload.pins[registered.source.pin_index]
+        .canonical_path
+        .to_string_lossy()
+        .into_owned();
+    request.complete_path = workload.pins[registered.target.pin_index]
+        .canonical_path
+        .to_string_lossy()
+        .into_owned();
+    Ok((
+        workload.pins[registered.source.pin_index]
+            .expected_content_identity
+            .clone(),
+        workload.pins[registered.target.pin_index]
+            .expected_content_identity
+            .clone(),
+    ))
+}
+
+fn find_alignment_benchmark_registered_case(
+    cases: &[AlignmentBenchmarkRegisteredCase],
+    source_pin_index: usize,
+    target_pin_index: usize,
+    source_audio_stream_index: u32,
+    target_audio_stream_index: u32,
+    source_video_stream_index: Option<u32>,
+    target_video_stream_index: Option<u32>,
+) -> Result<usize, String> {
+    let matching = cases
+        .iter()
+        .enumerate()
+        .filter(|(_, benchmark_case)| {
+            benchmark_case.source.pin_index == source_pin_index
+                && benchmark_case.target.pin_index == target_pin_index
+                && benchmark_case.source.audio_stream_index == source_audio_stream_index
+                && benchmark_case.target.audio_stream_index == target_audio_stream_index
+                && benchmark_case.source.video_stream_index == source_video_stream_index
+                && benchmark_case.target.video_stream_index == target_video_stream_index
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err("benchmark job 的媒体、配对或显式流不属于唯一已注册 case。".to_string());
+    }
+    Ok(matching[0])
+}
+
+#[cfg(windows)]
+fn resolve_alignment_benchmark_registered_request_pin(
+    pins: &[AlignmentBenchmarkPinnedMedia],
+    path: &str,
+) -> Result<usize, String> {
+    if path.trim().is_empty()
+        || is_remote_media_input(path)
+        || alignment_benchmark_path_uses_unsupported_remote_namespace(path)
+    {
+        return Err("benchmark job 媒体路径不是已注册本地路径。".to_string());
+    }
+    let file = open_alignment_benchmark_media_read_pin(Path::new(path.trim()))?;
+    let identity = windows_alignment_benchmark_file_identity(&file)?;
+    let final_path = windows_alignment_benchmark_final_path(&file)?;
+    let matching = pins
+        .iter()
+        .enumerate()
+        .filter(|(_, pinned)| pinned.identity == identity && pinned.canonical_path == final_path)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err("benchmark job 媒体 canonical final path 未注册或不唯一。".to_string());
+    }
+    Ok(matching[0])
+}
+
+#[cfg(not(windows))]
+fn resolve_alignment_benchmark_registered_request_pin(
+    _pins: &[AlignmentBenchmarkPinnedMedia],
+    _path: &str,
+) -> Result<usize, String> {
+    Err("unsupported：benchmark workload 注册校验当前只支持 Windows。".to_string())
+}
+
 fn verify_alignment_benchmark_session_toolchain_by_id(session_id: &str) -> Result<(), String> {
     let mut coordinator = alignment_benchmark_coordinator()
         .lock()
@@ -1464,6 +1971,15 @@ fn verify_alignment_benchmark_session_toolchain_by_id(session_id: &str) -> Resul
         block_alignment_benchmark_session_for_toolchain(session);
         return Err("固定媒体工具身份复核失败。".to_string());
     }
+    Ok(())
+}
+
+fn block_alignment_benchmark_session_for_workload_by_id(session_id: &str) -> Result<(), String> {
+    let mut coordinator = alignment_benchmark_coordinator()
+        .lock()
+        .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
+    let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
+    block_alignment_benchmark_session_for_workload(session);
     Ok(())
 }
 
@@ -1878,11 +2394,31 @@ fn run_alignment_benchmark_job(prepared: PreparedAlignmentBenchmarkJob) {
     let toolchain_telemetry_complete =
         verify_alignment_benchmark_session_toolchain_by_id(&prepared.session_id).is_ok();
 
+    let (result, workload_identity_failed) = match result {
+        Ok(proposal) => bind_alignment_benchmark_proposal_to_workload(
+            proposal,
+            &prepared.expected_source_identity,
+            &prepared.expected_target_identity,
+        ),
+        Err(error) => (Err(error), false),
+    };
+    if workload_identity_failed {
+        let _ = block_alignment_benchmark_session_for_workload_by_id(&prepared.session_id);
+    }
+
     let pending = if !toolchain_telemetry_complete {
         AlignmentBenchmarkPendingTerminal {
             status: AudioAlignmentJobStatus::Failed,
             proposal: None,
             error_code: Some("toolchain-integrity-failed".to_string()),
+        }
+    } else if workload_identity_failed {
+        AlignmentBenchmarkPendingTerminal {
+            status: AudioAlignmentJobStatus::Failed,
+            proposal: None,
+            // Keep the existing bridge contract while the session lifecycle carries the
+            // path-free workload-integrity reason and retains all pins fail-closed.
+            error_code: Some("alignment-failed".to_string()),
         }
     } else if !cache_telemetry_complete {
         AlignmentBenchmarkPendingTerminal {
@@ -2096,6 +2632,8 @@ fn finalize_alignment_benchmark_job(
         session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
         session.cleanup_reason =
             Some("固定媒体工具身份复核失败；lease 与只读 pin 保持占用。".to_string());
+    } else if session.workload_integrity_failed {
+        block_alignment_benchmark_session_for_workload(session);
     } else {
         session.status = AlignmentBenchmarkSessionStatus::Active;
         session.cleanup_reason = None;
@@ -2207,6 +2745,12 @@ fn finish_alignment_benchmark_session_inner(
         block_alignment_benchmark_session_for_toolchain(session);
         return Ok(create_alignment_benchmark_session_snapshot(session));
     }
+    if session.workload_integrity_failed
+        || verify_alignment_benchmark_workload(&session.workload).is_err()
+    {
+        block_alignment_benchmark_session_for_workload(session);
+        return Ok(create_alignment_benchmark_session_snapshot(session));
+    }
     let sample = match sample_process_tree_memory(std::process::id()) {
         Ok(sample) => sample,
         Err(_) => {
@@ -2294,9 +2838,813 @@ fn create_alignment_benchmark_id(prefix: &str, sequence: u64) -> Result<String, 
 }
 
 #[cfg(not(windows))]
+fn prepare_alignment_benchmark_workload(
+    _manifest: &AlignmentBenchmarkBlindRunManifest,
+    _run_manifest_digest: &str,
+    _workload_digest: &str,
+) -> Result<AlignmentBenchmarkRegisteredWorkload, String> {
+    Err("unsupported：workload media pin 与卷回执当前只支持 Windows。".to_string())
+}
+
+#[cfg(windows)]
+fn prepare_alignment_benchmark_workload(
+    manifest: &AlignmentBenchmarkBlindRunManifest,
+    run_manifest_digest: &str,
+    workload_digest: &str,
+) -> Result<AlignmentBenchmarkRegisteredWorkload, String> {
+    let mut pins = Vec::<AlignmentBenchmarkPinnedMedia>::new();
+    let mut pin_indexes = HashMap::<AlignmentBenchmarkWindowsFileIdentity, usize>::new();
+    let mut cases = Vec::with_capacity(manifest.cases.len());
+
+    for (case_ordinal, benchmark_case) in manifest.cases.iter().enumerate() {
+        let source = register_alignment_benchmark_media_binding(
+            &benchmark_case.source,
+            case_ordinal * 2,
+            &mut pins,
+            &mut pin_indexes,
+        )?;
+        let target = register_alignment_benchmark_media_binding(
+            &benchmark_case.target,
+            case_ordinal * 2 + 1,
+            &mut pins,
+            &mut pin_indexes,
+        )?;
+        cases.push(AlignmentBenchmarkRegisteredCase {
+            case_ordinal,
+            source,
+            target,
+        });
+    }
+
+    reject_ambiguous_alignment_benchmark_case_registrations(&cases)?;
+
+    // Every distinct media handle is now pinned. Only after that invariant is established may
+    // the native collector inspect the actual volumes backing those handles.
+    let volume_measurements = pins
+        .iter()
+        .map(windows_alignment_benchmark_media_volume)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (bindings, volumes) =
+        create_alignment_benchmark_volume_receipts(&cases, &volume_measurements)?;
+    let media_set_digest = create_alignment_benchmark_media_set_digest(manifest)?;
+    let mut receipt = AlignmentBenchmarkWorkloadStorageReceipt {
+        schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+        run_manifest_digest: run_manifest_digest.to_string(),
+        workload_digest: workload_digest.to_string(),
+        binding_count: bindings.len(),
+        unique_media_count: pins.len(),
+        volume_count: volumes.len(),
+        media_set_digest,
+        bindings,
+        volumes,
+        receipt_digest: String::new(),
+    };
+    receipt.receipt_digest = create_alignment_benchmark_workload_receipt_digest(&receipt)?;
+    Ok(AlignmentBenchmarkRegisteredWorkload {
+        pins,
+        cases,
+        receipt,
+    })
+}
+
+#[cfg(windows)]
+fn register_alignment_benchmark_media_binding(
+    media: &AlignmentBenchmarkBlindMediaInput,
+    binding_ordinal: usize,
+    pins: &mut Vec<AlignmentBenchmarkPinnedMedia>,
+    pin_indexes: &mut HashMap<AlignmentBenchmarkWindowsFileIdentity, usize>,
+) -> Result<AlignmentBenchmarkRegisteredBinding, String> {
+    let (file, identity, canonical_path) = open_alignment_benchmark_media_candidate(media)?;
+    let pin_index = if let Some(existing_index) = pin_indexes.get(&identity).copied() {
+        let existing = &pins[existing_index];
+        if existing.expected_digest != media.content_identity.digest
+            || existing.expected_size_bytes != media.content_identity.size_bytes
+            || existing.canonical_path != canonical_path
+        {
+            return Err("同一媒体文件身份对应了互相冲突的 blind manifest 声明。".to_string());
+        }
+        existing_index
+    } else {
+        let observed_digest = sha256_alignment_benchmark_pinned_file(&file)?;
+        if identity.file_size != media.content_identity.size_bytes
+            || observed_digest != media.content_identity.digest
+        {
+            return Err("blind run manifest 媒体完整身份与固定句柄不一致。".to_string());
+        }
+        let expected_content_identity =
+            alignment_benchmark_pinned_media_content_identity(&file, &observed_digest)?;
+        let candidate = AlignmentBenchmarkPinnedMedia {
+            canonical_path,
+            expected_digest: observed_digest,
+            expected_size_bytes: identity.file_size,
+            expected_content_identity,
+            file,
+            identity,
+        };
+        verify_alignment_benchmark_pinned_media(&candidate)?;
+        let index = pins.len();
+        pin_indexes.insert(identity, index);
+        pins.push(candidate);
+        index
+    };
+    Ok(AlignmentBenchmarkRegisteredBinding {
+        binding_ordinal,
+        pin_index,
+        audio_stream_index: media.audio_stream_index,
+        video_stream_index: media.video_stream_index,
+    })
+}
+
+#[cfg(windows)]
+fn open_alignment_benchmark_media_candidate(
+    media: &AlignmentBenchmarkBlindMediaInput,
+) -> Result<(File, AlignmentBenchmarkWindowsFileIdentity, PathBuf), String> {
+    let requested_path = Path::new(media.path.trim());
+    if !requested_path.is_absolute() {
+        return Err("blind run manifest 媒体路径必须是绝对本地路径。".to_string());
+    }
+    let file = open_alignment_benchmark_media_read_pin(requested_path)?;
+    let identity = windows_alignment_benchmark_file_identity(&file)?;
+    let canonical_path = windows_alignment_benchmark_final_path(&file)?;
+    Ok((file, identity, canonical_path))
+}
+
+#[cfg(windows)]
+fn open_alignment_benchmark_media_read_pin(path: &Path) -> Result<File, String> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|_| {
+            "blocked:workload-media-pin：无法固定本地媒体；路径与系统详情已隐藏。".to_string()
+        })
+}
+
+#[cfg(windows)]
+fn alignment_benchmark_pinned_media_content_identity(
+    file: &File,
+    full_digest: &str,
+) -> Result<MediaContentIdentity, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| "固定 workload media 无法读取身份元数据。".to_string())?;
+    let modified_unix_ms = metadata
+        .modified()
+        .map_err(|_| "固定 workload media 无法读取修改时间。".to_string())?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "固定 workload media 修改时间无效。".to_string())?
+        .as_millis();
+    let modified_unix_ms = u64::try_from(modified_unix_ms)
+        .map_err(|_| "固定 workload media 修改时间超出支持范围。".to_string())?;
+    if metadata.len() == 0
+        || metadata.len() != windows_alignment_benchmark_file_identity(file)?.file_size
+    {
+        return Err("固定 workload media 身份元数据不一致。".to_string());
+    }
+    if full_digest.len() != 64
+        || !full_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("固定 workload media 全文件摘要格式无效。".to_string());
+    }
+    Ok(MediaContentIdentity {
+        algorithm: "sha256-full-file-v2",
+        size_bytes: metadata.len(),
+        modified_unix_ms,
+        first_sample_digest: full_digest.to_string(),
+        middle_sample_digest: full_digest.to_string(),
+        last_sample_digest: full_digest.to_string(),
+    })
+}
+
+#[cfg(windows)]
+fn windows_alignment_benchmark_final_path(file: &File) -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_GUID,
+    };
+
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: file owns a valid handle and buffer is writable for the capacity supplied.
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle().cast(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_GUID,
+        )
+    } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(
+            "固定媒体句柄无法解析本地卷 GUID canonical path；远程或无卷 GUID 输入已拒绝。"
+                .to_string(),
+        );
+    }
+    buffer.truncate(length);
+    let raw = std::ffi::OsString::from_wide(&buffer)
+        .to_string_lossy()
+        .into_owned();
+    if !is_alignment_benchmark_local_volume_guid_path(&raw) {
+        return Err("固定媒体句柄没有解析到规范本地卷 GUID path。".to_string());
+    }
+    // Keep the verbatim \\?\Volume{GUID}\ prefix. std::fs/OpenOptions passes it to CreateFileW,
+    // while current FFmpeg/FFprobe Windows file I/O recognizes an existing extended prefix and
+    // leaves it unchanged. Reusing this exact handle-derived path removes the mutable drive-letter
+    // and mounted-folder namespace from job validation, reopening and execution.
+    Ok(PathBuf::from(raw))
+}
+
+#[cfg(windows)]
+fn verify_alignment_benchmark_pinned_media(
+    pinned: &AlignmentBenchmarkPinnedMedia,
+) -> Result<(), String> {
+    let handle_identity = windows_alignment_benchmark_file_identity(&pinned.file)?;
+    let current_path_file = open_alignment_benchmark_media_read_pin(&pinned.canonical_path)?;
+    let current_path_identity = windows_alignment_benchmark_file_identity(&current_path_file)?;
+    let current_final_path = windows_alignment_benchmark_final_path(&current_path_file)?;
+    if handle_identity != pinned.identity
+        || current_path_identity != pinned.identity
+        || current_final_path != pinned.canonical_path
+        || handle_identity.file_size != pinned.expected_size_bytes
+    {
+        return Err("固定 workload media 身份或 canonical final path 发生变化。".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_alignment_benchmark_pinned_media(
+    _pinned: &AlignmentBenchmarkPinnedMedia,
+) -> Result<(), String> {
+    Err("unsupported：workload media pin 当前只支持 Windows。".to_string())
+}
+
+fn verify_alignment_benchmark_workload(
+    workload: &AlignmentBenchmarkRegisteredWorkload,
+) -> Result<(), String> {
+    for pinned in &workload.pins {
+        verify_alignment_benchmark_pinned_media(pinned)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AlignmentBenchmarkVolumeMeasurement {
+    stable_key: String,
+    seek_penalty: bool,
+}
+
+#[cfg(windows)]
+fn windows_alignment_benchmark_media_volume(
+    pinned: &AlignmentBenchmarkPinnedMedia,
+) -> Result<AlignmentBenchmarkVolumeMeasurement, String> {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    const WINDOWS_DRIVE_FIXED: u32 = 3;
+
+    let guid_path = pinned
+        .canonical_path
+        .to_str()
+        .ok_or_else(|| "固定媒体句柄返回的实际卷 GUID 无效。".to_string())?;
+    let volume_root = alignment_benchmark_volume_guid_root_from_handle_path(guid_path)?;
+    let volume_length = volume_root.encode_utf16().count();
+    let volume_name = volume_root
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: volume_name is a NUL-terminated root path returned by Windows.
+    let drive_type = unsafe { GetDriveTypeW(volume_name.as_ptr()) };
+    if drive_type != WINDOWS_DRIVE_FIXED {
+        return Err("workload media 位于非固定本地卷，正式基准已拒绝。".to_string());
+    }
+    let stable_key = String::from_utf16_lossy(&volume_name[..volume_length]).to_ascii_lowercase();
+    let seek_penalty = windows_alignment_benchmark_volume_seek_penalty(&volume_name)?;
+    Ok(AlignmentBenchmarkVolumeMeasurement {
+        stable_key,
+        seek_penalty,
+    })
+}
+
+fn alignment_benchmark_volume_guid_root_from_handle_path(path: &str) -> Result<String, String> {
+    const PREFIX: &str = r"\\?\Volume{";
+    let prefix = path
+        .get(..PREFIX.len())
+        .filter(|value| value.eq_ignore_ascii_case(PREFIX))
+        .ok_or_else(|| "固定媒体句柄没有返回规范卷 GUID 路径。".to_string())?;
+    let remainder = path
+        .get(prefix.len()..)
+        .ok_or_else(|| "固定媒体句柄返回的卷 GUID 路径不完整。".to_string())?;
+    let close = remainder
+        .find(r"}\")
+        .ok_or_else(|| "固定媒体句柄返回的卷 GUID 根目录不完整。".to_string())?;
+    let identifier = &remainder[..close];
+    let valid_guid = identifier.len() == 36
+        && identifier.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    if !valid_guid {
+        return Err("固定媒体句柄返回的卷 GUID 格式无效。".to_string());
+    }
+    let root_end = PREFIX.len() + close + 2;
+    path.get(..root_end)
+        .map(str::to_string)
+        .ok_or_else(|| "固定媒体句柄返回的卷 GUID 根目录无法截取。".to_string())
+}
+
+fn is_alignment_benchmark_local_volume_guid_path(path: &str) -> bool {
+    alignment_benchmark_volume_guid_root_from_handle_path(path.trim()).is_ok()
+}
+
+fn alignment_benchmark_path_uses_unsupported_remote_namespace(path: &str) -> bool {
+    let path = path.trim();
+    path.starts_with("//")
+        || (path.starts_with(r"\\") && !is_alignment_benchmark_local_volume_guid_path(path))
+}
+
+#[cfg(any(windows, test))]
+fn validate_alignment_benchmark_volume_device_flags(
+    removable_media: bool,
+    media_removable: bool,
+    media_hotplug: bool,
+    device_hotplug: bool,
+) -> Result<(), String> {
+    if removable_media || media_removable || media_hotplug || device_hotplug {
+        return Err("workload media 位于可移除或可热插拔设备，正式基准已拒绝。".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_alignment_benchmark_device_u32(
+    bytes: &[u8],
+    offset: usize,
+    error: &'static str,
+) -> Result<u32, String> {
+    bytes
+        .get(offset..offset.saturating_add(std::mem::size_of::<u32>()))
+        .and_then(|value| <[u8; 4]>::try_from(value).ok())
+        .map(u32::from_ne_bytes)
+        .ok_or_else(|| error.to_string())
+}
+
+#[cfg(windows)]
+fn create_alignment_benchmark_hotplug_buffer() -> Vec<u8> {
+    use windows_sys::Win32::System::Ioctl::STORAGE_HOTPLUG_INFO;
+
+    let size = std::mem::size_of::<STORAGE_HOTPLUG_INFO>() as u32;
+    let mut bytes = vec![0_u8; size as usize];
+    bytes[..std::mem::size_of::<u32>()].copy_from_slice(&size.to_ne_bytes());
+    bytes
+}
+
+#[cfg(windows)]
+fn parse_alignment_benchmark_hotplug_buffer(
+    bytes: &[u8],
+    returned: u32,
+) -> Result<(bool, bool, bool), String> {
+    use windows_sys::Win32::System::Ioctl::STORAGE_HOTPLUG_INFO;
+
+    let minimum = std::mem::size_of::<STORAGE_HOTPLUG_INFO>();
+    let returned = returned as usize;
+    if returned < minimum || returned > bytes.len() {
+        return Err("实际 workload 卷热插拔属性读取边界无效。".to_string());
+    }
+    let reported_size = read_alignment_benchmark_device_u32(
+        bytes,
+        std::mem::offset_of!(STORAGE_HOTPLUG_INFO, Size),
+        "实际 workload 卷热插拔属性 Size 无效。",
+    )? as usize;
+    if reported_size < minimum || reported_size > returned {
+        return Err("实际 workload 卷热插拔属性 Size 与返回边界不一致。".to_string());
+    }
+    let read_flag = |offset: usize| {
+        bytes
+            .get(offset)
+            .copied()
+            .map(|value| value != 0)
+            .ok_or_else(|| "实际 workload 卷热插拔属性字段不完整。".to_string())
+    };
+    Ok((
+        read_flag(std::mem::offset_of!(STORAGE_HOTPLUG_INFO, MediaRemovable))?,
+        read_flag(std::mem::offset_of!(STORAGE_HOTPLUG_INFO, MediaHotplug))?,
+        read_flag(std::mem::offset_of!(STORAGE_HOTPLUG_INFO, DeviceHotplug))?,
+    ))
+}
+
+#[cfg(windows)]
+fn parse_alignment_benchmark_storage_device_descriptor(
+    bytes: &[u8],
+    returned: u32,
+    expected_version: u32,
+    expected_size: u32,
+) -> Result<bool, String> {
+    use windows_sys::Win32::System::Ioctl::STORAGE_DEVICE_DESCRIPTOR;
+
+    let minimum = std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia) + 1;
+    let returned = returned as usize;
+    if returned < minimum || returned > bytes.len() {
+        return Err("实际 workload 卷设备描述属性读取边界无效。".to_string());
+    }
+    let version = read_alignment_benchmark_device_u32(
+        bytes,
+        std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, Version),
+        "实际 workload 卷设备描述 Version 无效。",
+    )?;
+    let size = read_alignment_benchmark_device_u32(
+        bytes,
+        std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, Size),
+        "实际 workload 卷设备描述 Size 无效。",
+    )?;
+    if version < minimum as u32
+        || version > size
+        || size < minimum as u32
+        || size as usize > returned
+        || version != expected_version
+        || size != expected_size
+    {
+        return Err("实际 workload 卷设备描述 Version/Size 与返回边界不一致。".to_string());
+    }
+    Ok(bytes[std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia)] != 0)
+}
+
+#[cfg(windows)]
+fn windows_alignment_benchmark_volume_seek_penalty(
+    nul_terminated_volume_name: &[u16],
+) -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+        System::{
+            Ioctl::{
+                PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
+                DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_GET_HOTPLUG_INFO,
+                IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_DESCRIPTOR_HEADER, STORAGE_DEVICE_DESCRIPTOR,
+                STORAGE_PROPERTY_QUERY,
+            },
+            IO::DeviceIoControl,
+        },
+    };
+
+    if nul_terminated_volume_name.len() < 2 {
+        return Err("实际卷身份无效。".to_string());
+    }
+    let mut device_path = nul_terminated_volume_name.to_vec();
+    if device_path.len() >= 2 && device_path[device_path.len() - 2] == b'\\' as u16 {
+        device_path.remove(device_path.len() - 2);
+    }
+    // SAFETY: device_path is NUL-terminated; the call opens only the already-resolved local volume.
+    let handle = unsafe {
+        CreateFileW(
+            device_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err("实际 workload 卷无法打开以核验设备属性。".to_string());
+    }
+    let result = (|| -> Result<bool, String> {
+        let device_query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut header = STORAGE_DESCRIPTOR_HEADER::default();
+        let mut returned = 0_u32;
+        // SAFETY: handle and both synchronous query buffers are valid for their supplied sizes.
+        let header_ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                (&device_query as *const STORAGE_PROPERTY_QUERY).cast(),
+                std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                (&mut header as *mut STORAGE_DESCRIPTOR_HEADER).cast(),
+                std::mem::size_of::<STORAGE_DESCRIPTOR_HEADER>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let minimum_device_descriptor_size =
+            std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia) + 1;
+        let header_capacity = std::mem::size_of::<STORAGE_DESCRIPTOR_HEADER>();
+        if header_ok == 0
+            || returned as usize != header_capacity
+            || header.Version < minimum_device_descriptor_size as u32
+            || header.Version > header.Size
+            || header.Size < minimum_device_descriptor_size as u32
+            || header.Size > 1024 * 1024
+        {
+            return Err("实际 workload 卷设备描述属性不可用。".to_string());
+        }
+        let descriptor_word_count = (header.Size as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut descriptor_words = vec![0_u64; descriptor_word_count];
+        let descriptor_capacity = descriptor_words.len() * std::mem::size_of::<u64>();
+        returned = 0;
+        // SAFETY: the u64-backed buffer is suitably aligned and has at least header.Size bytes.
+        let descriptor_ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                (&device_query as *const STORAGE_PROPERTY_QUERY).cast(),
+                std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                descriptor_words.as_mut_ptr().cast(),
+                header.Size,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if descriptor_ok == 0
+            || returned < minimum_device_descriptor_size as u32
+            || returned > header.Size
+            || returned as usize > descriptor_capacity
+        {
+            return Err("实际 workload 卷设备描述属性读取不完整。".to_string());
+        }
+        // SAFETY: descriptor_words owns returned initialized output bytes from DeviceIoControl.
+        let descriptor_bytes = unsafe {
+            std::slice::from_raw_parts(descriptor_words.as_ptr().cast::<u8>(), returned as usize)
+        };
+        let removable_media = parse_alignment_benchmark_storage_device_descriptor(
+            descriptor_bytes,
+            returned,
+            header.Version,
+            header.Size,
+        )?;
+
+        let mut hotplug_bytes = create_alignment_benchmark_hotplug_buffer();
+        returned = 0;
+        // SAFETY: the output buffer is writable for the exact supplied size and no input is used.
+        let hotplug_ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_GET_HOTPLUG_INFO,
+                std::ptr::null(),
+                0,
+                hotplug_bytes.as_mut_ptr().cast(),
+                hotplug_bytes.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if hotplug_ok == 0 {
+            return Err("实际 workload 卷热插拔属性不可用。".to_string());
+        }
+        let (media_removable, media_hotplug, device_hotplug) =
+            parse_alignment_benchmark_hotplug_buffer(&hotplug_bytes, returned)?;
+        validate_alignment_benchmark_volume_device_flags(
+            removable_media,
+            media_removable,
+            media_hotplug,
+            device_hotplug,
+        )?;
+
+        let seek_query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceSeekPenaltyProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
+        returned = 0;
+        // SAFETY: handle and both synchronous query buffers are valid for the exact supplied sizes.
+        let seek_ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                (&seek_query as *const STORAGE_PROPERTY_QUERY).cast(),
+                std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                (&mut descriptor as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR).cast(),
+                std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let descriptor_size = std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32;
+        if seek_ok == 0
+            || returned != descriptor_size
+            || descriptor.Size < descriptor_size
+            || descriptor.Size > returned
+            || descriptor.Version < descriptor_size
+            || descriptor.Version > descriptor.Size
+        {
+            return Err("实际 workload 卷 seek-penalty 属性不可用。".to_string());
+        }
+        Ok(descriptor.IncursSeekPenalty)
+    })();
+    // SAFETY: handle is owned by this function and closed exactly once.
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+fn create_alignment_benchmark_volume_receipts(
+    cases: &[AlignmentBenchmarkRegisteredCase],
+    measurements: &[AlignmentBenchmarkVolumeMeasurement],
+) -> Result<
+    (
+        Vec<AlignmentBenchmarkWorkloadBindingReceipt>,
+        Vec<AlignmentBenchmarkWorkloadVolumeReceipt>,
+    ),
+    String,
+> {
+    let mut volume_ordinals = HashMap::<String, usize>::new();
+    let mut volume_seek_penalties = Vec::<bool>::new();
+    let mut volume_binding_counts = Vec::<usize>::new();
+    let mut bindings = Vec::with_capacity(cases.len() * 2);
+    for benchmark_case in cases {
+        for (side, binding) in [
+            (
+                AlignmentBenchmarkBindingSide::Source,
+                &benchmark_case.source,
+            ),
+            (
+                AlignmentBenchmarkBindingSide::Target,
+                &benchmark_case.target,
+            ),
+        ] {
+            let measurement = measurements
+                .get(binding.pin_index)
+                .ok_or_else(|| "workload volume measurement 与 pin 注册不一致。".to_string())?;
+            let volume_ordinal =
+                if let Some(ordinal) = volume_ordinals.get(&measurement.stable_key).copied() {
+                    if volume_seek_penalties[ordinal] != measurement.seek_penalty {
+                        return Err("同一实际卷返回了冲突的 seek-penalty 属性。".to_string());
+                    }
+                    ordinal
+                } else {
+                    let ordinal = volume_ordinals.len();
+                    volume_ordinals.insert(measurement.stable_key.clone(), ordinal);
+                    volume_seek_penalties.push(measurement.seek_penalty);
+                    volume_binding_counts.push(0);
+                    ordinal
+                };
+            volume_binding_counts[volume_ordinal] =
+                volume_binding_counts[volume_ordinal].saturating_add(1);
+            bindings.push(AlignmentBenchmarkWorkloadBindingReceipt {
+                binding_ordinal: binding.binding_ordinal,
+                case_ordinal: benchmark_case.case_ordinal,
+                side,
+                volume_ordinal,
+            });
+        }
+    }
+    let volumes = volume_binding_counts
+        .into_iter()
+        .enumerate()
+        .map(
+            |(volume_ordinal, binding_count)| AlignmentBenchmarkWorkloadVolumeReceipt {
+                volume_ordinal,
+                binding_count,
+                drive_type: "fixed",
+                seek_penalty: if volume_seek_penalties[volume_ordinal] {
+                    "incurs"
+                } else {
+                    "none"
+                },
+                measurement_status: "complete",
+            },
+        )
+        .collect();
+    Ok((bindings, volumes))
+}
+
+fn create_alignment_benchmark_media_set_digest(
+    manifest: &AlignmentBenchmarkBlindRunManifest,
+) -> Result<String, String> {
+    let bindings = manifest
+        .cases
+        .iter()
+        .enumerate()
+        .flat_map(|(case_ordinal, benchmark_case)| {
+            [
+                (
+                    AlignmentBenchmarkBindingSide::Source,
+                    &benchmark_case.source,
+                ),
+                (
+                    AlignmentBenchmarkBindingSide::Target,
+                    &benchmark_case.target,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(move |(side_ordinal, (side, media))| {
+                serde_json::json!({
+                    "bindingOrdinal": case_ordinal * 2 + side_ordinal,
+                    "caseOrdinal": case_ordinal,
+                    "side": side,
+                    "audioStreamIndex": media.audio_stream_index,
+                    "videoStreamIndex": media.video_stream_index,
+                    "contentIdentity": {
+                        "algorithm": media.content_identity.algorithm,
+                        "sizeBytes": media.content_identity.size_bytes,
+                        "digest": media.content_identity.digest,
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let projection = serde_json::json!({
+        "schemaVersion": ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+        "bindings": bindings,
+    });
+    let canonical = canonicalize_alignment_benchmark_json(&projection)?;
+    Ok(format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(canonical.as_bytes())
+    ))
+}
+
+fn create_alignment_benchmark_workload_receipt_digest(
+    receipt: &AlignmentBenchmarkWorkloadStorageReceipt,
+) -> Result<String, String> {
+    let mut value = serde_json::to_value(receipt)
+        .map_err(|_| "workload storage receipt 无法序列化。".to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "workload storage receipt 不是对象。".to_string())?;
+    object.remove("receiptDigest");
+    let canonical = canonicalize_alignment_benchmark_json(&value)?;
+    Ok(format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(canonical.as_bytes())
+    ))
+}
+
+fn summarize_alignment_benchmark_storage_kind(
+    receipt: &AlignmentBenchmarkWorkloadStorageReceipt,
+) -> Result<String, String> {
+    if receipt.volumes.is_empty()
+        || receipt.volume_count != receipt.volumes.len()
+        || receipt
+            .volumes
+            .iter()
+            .any(|volume| volume.drive_type != "fixed" || volume.measurement_status != "complete")
+    {
+        return Err("workload storage receipt 没有形成完整固定卷闭环。".to_string());
+    }
+    let incurs = receipt
+        .volumes
+        .iter()
+        .filter(|volume| volume.seek_penalty == "incurs")
+        .count();
+    if receipt
+        .volumes
+        .iter()
+        .any(|volume| volume.seek_penalty != "incurs" && volume.seek_penalty != "none")
+    {
+        return Err("workload storage receipt seek-penalty 无效。".to_string());
+    }
+    Ok(match (receipt.volume_count, incurs) {
+        (1, 1) => "workload-media-single-volume-rotational-seek-penalty",
+        (1, 0) => "workload-media-single-volume-nonrotational-no-seek-penalty",
+        (count, value) if count == value => {
+            "workload-media-multi-volume-all-rotational-seek-penalty"
+        }
+        (_, 0) => "workload-media-multi-volume-all-nonrotational-no-seek-penalty",
+        _ => "workload-media-multi-volume-mixed-seek-penalty",
+    }
+    .to_string())
+}
+
+fn reject_ambiguous_alignment_benchmark_case_registrations(
+    cases: &[AlignmentBenchmarkRegisteredCase],
+) -> Result<(), String> {
+    let mut registrations = HashSet::with_capacity(cases.len());
+    for benchmark_case in cases {
+        let key = (
+            benchmark_case.source.pin_index,
+            benchmark_case.source.audio_stream_index,
+            benchmark_case.source.video_stream_index,
+            benchmark_case.target.pin_index,
+            benchmark_case.target.audio_stream_index,
+            benchmark_case.target.video_stream_index,
+        );
+        if !registrations.insert(key) {
+            return Err(
+                "blind run manifest 含重复执行 case，无法唯一注册 benchmark job。".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn collect_alignment_benchmark_environment(
     _ffmpeg_path: &str,
     _ffprobe_path: &Path,
+    _workload_storage: AlignmentBenchmarkWorkloadStorageReceipt,
 ) -> Result<
     (
         AlignmentBenchmarkEnvironmentReceipt,
@@ -2312,6 +3660,7 @@ fn collect_alignment_benchmark_environment(
 fn collect_alignment_benchmark_environment(
     ffmpeg_path: &str,
     ffprobe_path: &Path,
+    workload_storage: AlignmentBenchmarkWorkloadStorageReceipt,
 ) -> Result<
     (
         AlignmentBenchmarkEnvironmentReceipt,
@@ -2360,13 +3709,7 @@ fn collect_alignment_benchmark_environment(
         }
         Err(_) => "unknown".to_string(),
     };
-    let storage_kind = match windows_system_storage_kind() {
-        Ok(kind) => kind,
-        Err(_) => {
-            issues.push("storage-kind-unavailable".to_string());
-            "unknown".to_string()
-        }
-    };
+    let storage_kind = summarize_alignment_benchmark_storage_kind(&workload_storage)?;
     if power_profile == "unknown" {
         issues.push("power-profile-unavailable".to_string());
     }
@@ -2388,8 +3731,9 @@ fn collect_alignment_benchmark_environment(
             physical_core_count,
             logical_core_count,
             total_memory_bytes,
-            storage_scope: "system-volume",
+            storage_scope: "workload-media-volumes",
             storage_kind,
+            workload_storage,
             power_profile,
             ffmpeg,
             ffprobe,
@@ -2819,98 +4163,6 @@ fn windows_active_power_profile() -> Result<String, String> {
         }
     }
     Ok("custom".to_string())
-}
-
-#[cfg(windows)]
-fn windows_system_storage_kind() -> Result<String, String> {
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-        Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        },
-        System::{
-            Ioctl::{
-                PropertyStandardQuery, StorageDeviceSeekPenaltyProperty,
-                DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
-                STORAGE_PROPERTY_QUERY,
-            },
-            SystemInformation::GetWindowsDirectoryW,
-            IO::DeviceIoControl,
-        },
-    };
-
-    let mut windows_directory = vec![0_u16; 32_768];
-    // SAFETY: buffer is writable and its length is passed to the API.
-    let length = unsafe {
-        GetWindowsDirectoryW(
-            windows_directory.as_mut_ptr(),
-            windows_directory.len() as u32,
-        )
-    };
-    if length < 2 || length as usize >= windows_directory.len() {
-        return Err("无法定位 Windows 系统卷。".to_string());
-    }
-    let drive = String::from_utf16_lossy(&windows_directory[..length as usize]);
-    let prefix = drive
-        .get(..2)
-        .filter(|value| value.ends_with(':'))
-        .ok_or_else(|| "Windows 系统目录没有可识别的卷前缀。".to_string())?;
-    let device_path = format!(r"\\.\{prefix}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: device_path is NUL-terminated and other pointer arguments are null by contract.
-    let handle = unsafe {
-        CreateFileW(
-            device_path.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err("Windows 系统卷无法打开以读取 seek-penalty 属性。".to_string());
-    }
-    let query = STORAGE_PROPERTY_QUERY {
-        PropertyId: StorageDeviceSeekPenaltyProperty,
-        QueryType: PropertyStandardQuery,
-        AdditionalParameters: [0],
-    };
-    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR::default();
-    let mut returned = 0_u32;
-    // SAFETY: the handle is valid; query/descriptor point to initialized buffers of the sizes
-    // supplied, and the call is synchronous because OVERLAPPED is null.
-    let ok = unsafe {
-        DeviceIoControl(
-            handle,
-            IOCTL_STORAGE_QUERY_PROPERTY,
-            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
-            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
-            (&mut descriptor as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR).cast(),
-            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
-            &mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    // SAFETY: handle is owned by this function and closed exactly once.
-    unsafe { CloseHandle(handle) };
-    let descriptor_size = std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32;
-    if ok == 0
-        || returned < descriptor_size
-        || descriptor.Size < descriptor_size
-        || descriptor.Version < descriptor_size
-    {
-        return Err("Windows 系统卷 seek-penalty 属性不可用。".to_string());
-    }
-    Ok(if descriptor.IncursSeekPenalty {
-        "system-volume-rotational-seek-penalty"
-    } else {
-        "system-volume-nonrotational-no-seek-penalty"
-    }
-    .to_string())
 }
 
 #[cfg(not(windows))]
@@ -7384,6 +8636,51 @@ fn verify_proposal_time_map_identities_match_run(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlignmentBenchmarkProposalIdentityBinding {
+    Bound,
+    MissingTimeMap,
+}
+
+fn verify_alignment_benchmark_proposal_media_identities(
+    proposal: &AudioAlignmentProposal,
+    expected_source_identity: &MediaContentIdentity,
+    expected_target_identity: &MediaContentIdentity,
+) -> Result<AlignmentBenchmarkProposalIdentityBinding, String> {
+    if proposal.time_map.is_none() {
+        return Ok(AlignmentBenchmarkProposalIdentityBinding::MissingTimeMap);
+    }
+    verify_proposal_time_map_identities_match_run(
+        proposal,
+        expected_source_identity,
+        expected_target_identity,
+    )
+    .map_err(|_| {
+        "blocked:workload-media-integrity：benchmark proposal 的媒体身份与注册 workload 不一致。"
+            .to_string()
+    })?;
+    Ok(AlignmentBenchmarkProposalIdentityBinding::Bound)
+}
+
+fn bind_alignment_benchmark_proposal_to_workload(
+    proposal: AudioAlignmentProposal,
+    expected_source_identity: &MediaContentIdentity,
+    expected_target_identity: &MediaContentIdentity,
+) -> (Result<AudioAlignmentProposal, String>, bool) {
+    match verify_alignment_benchmark_proposal_media_identities(
+        &proposal,
+        expected_source_identity,
+        expected_target_identity,
+    ) {
+        Ok(AlignmentBenchmarkProposalIdentityBinding::Bound) => (Ok(proposal), false),
+        Ok(AlignmentBenchmarkProposalIdentityBinding::MissingTimeMap) => (
+            Err("benchmark proposal 未产出可用于正式 case 的 timeMap。".to_string()),
+            false,
+        ),
+        Err(error) => (Err(error), true),
+    }
+}
+
 fn run_supervised_ffmpeg_output<I, S>(
     executable: &str,
     args: I,
@@ -11211,6 +12508,64 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_proposal_binding_separates_missing_map_from_identity_mismatch() {
+        let mut proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![AudioTimeMapSpanDto {
+                    kind: AudioTimeMapSpanKind::Matched,
+                    source_start_ms: 0,
+                    source_end_ms: 120_000,
+                    target_start_ms: 0,
+                    target_end_ms: 120_000,
+                }],
+                matched_step_count: 20,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            v2_test_pair_candidate(),
+            0.5,
+            "benchmark identity".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let source = proposal
+            .time_map
+            .as_ref()
+            .unwrap()
+            .source_identity
+            .clone()
+            .unwrap();
+        let target = proposal
+            .time_map
+            .as_ref()
+            .unwrap()
+            .target_identity
+            .clone()
+            .unwrap();
+        assert_eq!(
+            verify_alignment_benchmark_proposal_media_identities(&proposal, &source, &target),
+            Ok(AlignmentBenchmarkProposalIdentityBinding::Bound)
+        );
+
+        proposal.time_map.as_mut().unwrap().source_identity =
+            Some(test_media_content_identity('d', source.size_bytes, 1));
+        let (mismatch_result, mismatch_is_integrity_failure) =
+            bind_alignment_benchmark_proposal_to_workload(proposal.clone(), &source, &target);
+        let mismatch = mismatch_result.unwrap_err();
+        assert!(mismatch_is_integrity_failure);
+        assert!(mismatch.starts_with("blocked:workload-media-integrity"));
+        assert!(!mismatch.contains(&source.first_sample_digest));
+
+        proposal.time_map = None;
+        let (missing_result, missing_is_integrity_failure) =
+            bind_alignment_benchmark_proposal_to_workload(proposal, &source, &target);
+        let missing = missing_result.unwrap_err();
+        assert!(!missing_is_integrity_failure);
+        assert!(missing.contains("未产出"));
+        assert!(!missing.starts_with("blocked:workload-media-integrity"));
+    }
+
+    #[test]
     fn visual_evidence_updates_proposal_as_auxiliary_signal() {
         let mut proposal = AudioAlignmentProposal {
             anchors: vec![
@@ -11729,6 +13084,381 @@ mod tests {
         assert!(validate_alignment_benchmark_lease_availability(false, false, 0, true).is_err());
     }
 
+    fn benchmark_test_blind_manifest() -> AlignmentBenchmarkBlindRunManifest {
+        let identity = AlignmentBenchmarkBlindContentIdentity {
+            algorithm: "sha256-full-file-v2".to_string(),
+            size_bytes: 128,
+            digest: "c".repeat(64),
+        };
+        AlignmentBenchmarkBlindRunManifest {
+            schema_version: ALIGNMENT_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION,
+            manifest_id: "frozen-c137".to_string(),
+            dataset_version: "2026-07-13".to_string(),
+            cases: vec![AlignmentBenchmarkBlindCase {
+                case_id: "case-001".to_string(),
+                source: AlignmentBenchmarkBlindMediaInput {
+                    path: r"C:\private\reference.mkv".to_string(),
+                    audio_stream_index: 2,
+                    video_stream_index: Some(0),
+                    content_identity: identity.clone(),
+                    version_note: "reference".to_string(),
+                    license_note: "local-only".to_string(),
+                },
+                target: AlignmentBenchmarkBlindMediaInput {
+                    path: r"C:\private\original.mkv".to_string(),
+                    audio_stream_index: 3,
+                    video_stream_index: None,
+                    content_identity: identity,
+                    version_note: "original".to_string(),
+                    license_note: "local-only".to_string(),
+                },
+            }],
+        }
+    }
+
+    fn benchmark_test_canonical_manifest(
+        manifest: &AlignmentBenchmarkBlindRunManifest,
+    ) -> (String, String) {
+        let value = serde_json::to_value(manifest).unwrap();
+        let canonical = canonicalize_alignment_benchmark_json(&value).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            sha256_alignment_benchmark_bytes(canonical.as_bytes())
+        );
+        (canonical, digest)
+    }
+
+    fn benchmark_test_registered_binding(
+        binding_ordinal: usize,
+        pin_index: usize,
+        audio_stream_index: u32,
+        video_stream_index: Option<u32>,
+    ) -> AlignmentBenchmarkRegisteredBinding {
+        AlignmentBenchmarkRegisteredBinding {
+            binding_ordinal,
+            pin_index,
+            audio_stream_index,
+            video_stream_index,
+        }
+    }
+
+    #[test]
+    fn benchmark_v2_strict_manifest_binds_canonical_json_and_digest() {
+        let manifest = benchmark_test_blind_manifest();
+        let (canonical, digest) = benchmark_test_canonical_manifest(&manifest);
+        let parsed = parse_alignment_benchmark_run_manifest(&canonical, &digest, &digest).unwrap();
+        assert_eq!(parsed.cases.len(), 1);
+        assert_eq!(parsed.cases[0].source.audio_stream_index, 2);
+
+        let pretty = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(parse_alignment_benchmark_run_manifest(&pretty, &digest, &digest).is_err());
+        assert!(parse_alignment_benchmark_run_manifest(
+            &canonical,
+            &digest.to_ascii_uppercase(),
+            &digest.to_ascii_uppercase(),
+        )
+        .is_err());
+        let other = format!("sha256:{}", "d".repeat(64));
+        assert!(parse_alignment_benchmark_run_manifest(&canonical, &digest, &other).is_err());
+    }
+
+    #[test]
+    fn benchmark_v2_strict_manifest_rejects_unknown_missing_and_duplicate_cases() {
+        let manifest = benchmark_test_blind_manifest();
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("gold".to_string(), serde_json::json!({}));
+        let canonical = canonicalize_alignment_benchmark_json(&value).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            sha256_alignment_benchmark_bytes(canonical.as_bytes())
+        );
+        assert!(parse_alignment_benchmark_run_manifest(&canonical, &digest, &digest).is_err());
+
+        let mut missing = serde_json::to_value(&manifest).unwrap();
+        missing["cases"][0]["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("videoStreamIndex");
+        let canonical = canonicalize_alignment_benchmark_json(&missing).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            sha256_alignment_benchmark_bytes(canonical.as_bytes())
+        );
+        assert!(parse_alignment_benchmark_run_manifest(&canonical, &digest, &digest).is_err());
+
+        let mut duplicate = manifest;
+        duplicate.cases.push(duplicate.cases[0].clone());
+        let (canonical, digest) = benchmark_test_canonical_manifest(&duplicate);
+        assert!(parse_alignment_benchmark_run_manifest(&canonical, &digest, &digest).is_err());
+    }
+
+    #[test]
+    fn benchmark_v2_volume_receipt_deduplicates_same_volume_by_first_binding() {
+        let cases = vec![
+            AlignmentBenchmarkRegisteredCase {
+                case_ordinal: 0,
+                source: benchmark_test_registered_binding(0, 0, 1, Some(0)),
+                target: benchmark_test_registered_binding(1, 1, 2, None),
+            },
+            AlignmentBenchmarkRegisteredCase {
+                case_ordinal: 1,
+                source: benchmark_test_registered_binding(2, 2, 1, Some(0)),
+                target: benchmark_test_registered_binding(3, 3, 2, None),
+            },
+        ];
+        let measurements = vec![
+            AlignmentBenchmarkVolumeMeasurement {
+                stable_key: "volume-b".to_string(),
+                seek_penalty: false,
+            },
+            AlignmentBenchmarkVolumeMeasurement {
+                stable_key: "volume-b".to_string(),
+                seek_penalty: false,
+            },
+            AlignmentBenchmarkVolumeMeasurement {
+                stable_key: "volume-a".to_string(),
+                seek_penalty: true,
+            },
+            AlignmentBenchmarkVolumeMeasurement {
+                stable_key: "volume-b".to_string(),
+                seek_penalty: false,
+            },
+        ];
+        let (bindings, volumes) =
+            create_alignment_benchmark_volume_receipts(&cases, &measurements).unwrap();
+
+        assert_eq!(bindings.len(), 4);
+        assert_eq!(bindings[0].volume_ordinal, 0);
+        assert_eq!(bindings[1].volume_ordinal, 0);
+        assert_eq!(bindings[2].volume_ordinal, 1);
+        assert_eq!(bindings[3].volume_ordinal, 0);
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0].binding_count, 3);
+        assert_eq!(volumes[0].seek_penalty, "none");
+        assert_eq!(volumes[1].binding_count, 1);
+        assert_eq!(volumes[1].seek_penalty, "incurs");
+    }
+
+    #[test]
+    fn benchmark_volume_guid_root_is_derived_from_handle_path_for_mounted_folders() {
+        let handle_path =
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\mounted\media\episode.mkv";
+        let root = alignment_benchmark_volume_guid_root_from_handle_path(handle_path).unwrap();
+        assert_eq!(root, r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\");
+        assert!(alignment_benchmark_volume_guid_root_from_handle_path(
+            r"C:\mounted\media\episode.mkv"
+        )
+        .is_err());
+        assert!(alignment_benchmark_volume_guid_root_from_handle_path(
+            r"\\?\Volume{not-a-guid}\episode.mkv"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn benchmark_volume_guid_namespace_is_local_but_unc_and_malformed_guid_are_not() {
+        let local = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\mounted\media\episode.mkv";
+        assert!(is_alignment_benchmark_local_volume_guid_path(local));
+        assert!(!alignment_benchmark_path_uses_unsupported_remote_namespace(
+            local
+        ));
+
+        for remote_or_invalid in [
+            r"\\server\share\episode.mkv",
+            r"\\?\UNC\server\share\episode.mkv",
+            r"//server/share/episode.mkv",
+            r"\\?\Volume{not-a-guid}\episode.mkv",
+            r"\\?\C:\episode.mkv",
+        ] {
+            assert!(!is_alignment_benchmark_local_volume_guid_path(
+                remote_or_invalid
+            ));
+            assert!(alignment_benchmark_path_uses_unsupported_remote_namespace(
+                remote_or_invalid
+            ));
+        }
+    }
+
+    #[test]
+    fn benchmark_manifest_accepts_local_volume_guid_and_rejects_unc_namespace() {
+        let mut media = benchmark_test_blind_manifest().cases[0].source.clone();
+        media.path =
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\mounted\episode.mkv".to_string();
+        assert!(validate_alignment_benchmark_blind_media(&media).is_ok());
+
+        media.path = r"\\server\share\episode.mkv".to_string();
+        let error = validate_alignment_benchmark_blind_media(&media).unwrap_err();
+        assert!(error.contains("本地媒体"));
+        assert!(!error.contains("server"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn benchmark_hotplug_buffer_initializes_and_validates_size_and_returned_bounds() {
+        use windows_sys::Win32::System::Ioctl::STORAGE_HOTPLUG_INFO;
+
+        let mut bytes = create_alignment_benchmark_hotplug_buffer();
+        let expected = std::mem::size_of::<STORAGE_HOTPLUG_INFO>() as u32;
+        assert_eq!(
+            read_alignment_benchmark_device_u32(
+                &bytes,
+                std::mem::offset_of!(STORAGE_HOTPLUG_INFO, Size),
+                "size",
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_alignment_benchmark_hotplug_buffer(&bytes, expected).unwrap(),
+            (false, false, false)
+        );
+
+        assert!(parse_alignment_benchmark_hotplug_buffer(&bytes, expected + 1).is_err());
+        bytes[..4].copy_from_slice(&0_u32.to_ne_bytes());
+        assert!(parse_alignment_benchmark_hotplug_buffer(&bytes, expected).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn benchmark_device_descriptor_parser_rejects_version_size_and_returned_overrun() {
+        use windows_sys::Win32::System::Ioctl::STORAGE_DEVICE_DESCRIPTOR;
+
+        let minimum = std::mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia) + 1;
+        let size = std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>();
+        let mut bytes = vec![0_u8; size];
+        bytes[..4].copy_from_slice(&(size as u32).to_ne_bytes());
+        bytes[4..8].copy_from_slice(&(size as u32).to_ne_bytes());
+        assert!(!parse_alignment_benchmark_storage_device_descriptor(
+            &bytes,
+            size as u32,
+            size as u32,
+            size as u32,
+        )
+        .unwrap());
+
+        assert!(parse_alignment_benchmark_storage_device_descriptor(
+            &bytes,
+            size as u32 + 1,
+            size as u32,
+            size as u32,
+        )
+        .is_err());
+        bytes[..4].copy_from_slice(&((minimum - 1) as u32).to_ne_bytes());
+        assert!(parse_alignment_benchmark_storage_device_descriptor(
+            &bytes,
+            size as u32,
+            (minimum - 1) as u32,
+            size as u32,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn benchmark_volume_device_flags_fail_closed_for_every_removable_or_hotplug_signal() {
+        assert!(
+            validate_alignment_benchmark_volume_device_flags(false, false, false, false).is_ok()
+        );
+        for flags in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let error = validate_alignment_benchmark_volume_device_flags(
+                flags.0, flags.1, flags.2, flags.3,
+            )
+            .unwrap_err();
+            assert!(error.contains("已拒绝"));
+            assert!(!error.contains(r"C:\"));
+            assert!(!error.contains("Volume{"));
+        }
+    }
+
+    #[test]
+    fn benchmark_v2_registered_case_rejects_unregistered_and_cross_pairing() {
+        let cases = vec![
+            AlignmentBenchmarkRegisteredCase {
+                case_ordinal: 0,
+                source: benchmark_test_registered_binding(0, 0, 2, Some(0)),
+                target: benchmark_test_registered_binding(1, 1, 3, None),
+            },
+            AlignmentBenchmarkRegisteredCase {
+                case_ordinal: 1,
+                source: benchmark_test_registered_binding(2, 2, 4, None),
+                target: benchmark_test_registered_binding(3, 3, 5, Some(1)),
+            },
+        ];
+        assert_eq!(
+            find_alignment_benchmark_registered_case(&cases, 0, 1, 2, 3, Some(0), None).unwrap(),
+            0
+        );
+        assert!(
+            find_alignment_benchmark_registered_case(&cases, 0, 3, 2, 5, Some(0), Some(1)).is_err()
+        );
+        assert!(
+            find_alignment_benchmark_registered_case(&cases, 9, 1, 2, 3, Some(0), None).is_err()
+        );
+        assert!(
+            find_alignment_benchmark_registered_case(&cases, 0, 1, 99, 3, Some(0), None).is_err()
+        );
+    }
+
+    #[test]
+    fn benchmark_v2_workload_receipt_is_path_free_and_canonically_digested() {
+        let manifest = benchmark_test_blind_manifest();
+        let (_, run_digest) = benchmark_test_canonical_manifest(&manifest);
+        let media_set_digest = create_alignment_benchmark_media_set_digest(&manifest).unwrap();
+        let mut receipt = AlignmentBenchmarkWorkloadStorageReceipt {
+            schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+            run_manifest_digest: run_digest.clone(),
+            workload_digest: run_digest,
+            binding_count: 2,
+            unique_media_count: 2,
+            volume_count: 1,
+            media_set_digest,
+            bindings: vec![
+                AlignmentBenchmarkWorkloadBindingReceipt {
+                    binding_ordinal: 0,
+                    case_ordinal: 0,
+                    side: AlignmentBenchmarkBindingSide::Source,
+                    volume_ordinal: 0,
+                },
+                AlignmentBenchmarkWorkloadBindingReceipt {
+                    binding_ordinal: 1,
+                    case_ordinal: 0,
+                    side: AlignmentBenchmarkBindingSide::Target,
+                    volume_ordinal: 0,
+                },
+            ],
+            volumes: vec![AlignmentBenchmarkWorkloadVolumeReceipt {
+                volume_ordinal: 0,
+                binding_count: 2,
+                drive_type: "fixed",
+                seek_penalty: "none",
+                measurement_status: "complete",
+            }],
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest =
+            create_alignment_benchmark_workload_receipt_digest(&receipt).unwrap();
+        assert!(is_canonical_alignment_benchmark_sha256(
+            &receipt.receipt_digest
+        ));
+        assert_eq!(
+            receipt.receipt_digest,
+            create_alignment_benchmark_workload_receipt_digest(&receipt).unwrap()
+        );
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(!serialized.contains("reference.mkv"));
+        assert!(!serialized.contains("original.mkv"));
+        assert!(!serialized.contains(&"c".repeat(64)));
+        assert!(!serialized.to_ascii_lowercase().contains("volume{"));
+        assert!(!serialized.to_ascii_lowercase().contains("serial"));
+    }
+
     #[test]
     fn benchmark_never_commits_active_after_environment_cleanup_fault() {
         let (healthy_status, healthy_reason) = alignment_benchmark_initial_lifecycle_state(false);
@@ -11992,6 +13722,141 @@ configuration: --extra-cflags=C:\Users\alice\sdk"#;
 
     #[cfg(windows)]
     #[test]
+    fn windows_benchmark_workload_pin_hashes_distinct_media_once_and_deduplicates_aliases() {
+        let path = temp_audio_cache_path("alignment-workload-media-dedup");
+        fs::write(&path, b"registered-workload-media").unwrap();
+        let digest = sha256_alignment_benchmark_bytes(b"registered-workload-media");
+        let media = AlignmentBenchmarkBlindMediaInput {
+            path: path.to_string_lossy().into_owned(),
+            audio_stream_index: 1,
+            video_stream_index: Some(0),
+            content_identity: AlignmentBenchmarkBlindContentIdentity {
+                algorithm: "sha256-full-file-v2".to_string(),
+                size_bytes: b"registered-workload-media".len() as u64,
+                digest,
+            },
+            version_note: "fixture".to_string(),
+            license_note: "fixture".to_string(),
+        };
+        let mut pins = Vec::new();
+        let mut indexes = HashMap::new();
+        let first =
+            register_alignment_benchmark_media_binding(&media, 0, &mut pins, &mut indexes).unwrap();
+        let second =
+            register_alignment_benchmark_media_binding(&media, 1, &mut pins, &mut indexes).unwrap();
+
+        assert_eq!(pins.len(), 1);
+        assert_eq!(first.pin_index, second.pin_index);
+        assert!(verify_alignment_benchmark_pinned_media(&pins[0]).is_ok());
+        let probed_identity = probe_media_content_identity_cancellable(&path, None).unwrap();
+        assert_eq!(pins[0].expected_content_identity, probed_identity);
+        assert!(fs::write(&path, b"mutated").is_err());
+        assert!(fs::remove_file(&path).is_err());
+
+        drop(pins);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_benchmark_workload_pin_rejects_full_identity_mismatch() {
+        let path = temp_audio_cache_path("alignment-workload-media-mismatch");
+        fs::write(&path, b"registered-workload-media").unwrap();
+        let media = AlignmentBenchmarkBlindMediaInput {
+            path: path.to_string_lossy().into_owned(),
+            audio_stream_index: 1,
+            video_stream_index: None,
+            content_identity: AlignmentBenchmarkBlindContentIdentity {
+                algorithm: "sha256-full-file-v2".to_string(),
+                size_bytes: b"registered-workload-media".len() as u64,
+                digest: "f".repeat(64),
+            },
+            version_note: "fixture".to_string(),
+            license_note: "fixture".to_string(),
+        };
+        let mut pins = Vec::new();
+        let mut indexes = HashMap::new();
+        let error = register_alignment_benchmark_media_binding(&media, 0, &mut pins, &mut indexes)
+            .expect_err("mismatched full digest must fail before session publication");
+
+        assert!(error.contains("完整身份"));
+        assert!(pins.is_empty());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real Windows volume receipt smoke test"]
+    fn windows_benchmark_workload_receipt_uses_actual_media_volume_without_paths() {
+        if !ffmpeg_test_tools_available() {
+            eprintln!("跳过实际卷 GUID workload smoke：ffmpeg/ffprobe 不可用。");
+            return;
+        }
+        let path = temp_audio_cache_path("alignment-workload-volume-receipt").with_extension("mkv");
+        generate_v2_ffmpeg_fixture(&path, "[0:a]anull[main]", "0", "440");
+        let original_identity = probe_media_content_identity_cancellable(&path, None).unwrap();
+        let media = AlignmentBenchmarkBlindMediaInput {
+            path: path.to_string_lossy().into_owned(),
+            audio_stream_index: 0,
+            video_stream_index: None,
+            content_identity: AlignmentBenchmarkBlindContentIdentity {
+                algorithm: "sha256-full-file-v2".to_string(),
+                size_bytes: original_identity.size_bytes,
+                digest: original_identity.first_sample_digest.clone(),
+            },
+            version_note: "fixture".to_string(),
+            license_note: "fixture".to_string(),
+        };
+        let manifest = AlignmentBenchmarkBlindRunManifest {
+            schema_version: ALIGNMENT_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION,
+            manifest_id: "volume-fixture".to_string(),
+            dataset_version: "1".to_string(),
+            cases: vec![AlignmentBenchmarkBlindCase {
+                case_id: "same-volume".to_string(),
+                source: media.clone(),
+                target: AlignmentBenchmarkBlindMediaInput {
+                    audio_stream_index: 1,
+                    ..media
+                },
+            }],
+        };
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let workload = prepare_alignment_benchmark_workload(&manifest, &digest, &digest).unwrap();
+
+        assert_eq!(workload.pins.len(), 1);
+        assert_eq!(workload.receipt.unique_media_count, 1);
+        assert_eq!(workload.receipt.binding_count, 2);
+        assert_eq!(workload.receipt.volume_count, 1);
+        assert_eq!(workload.receipt.volumes[0].binding_count, 2);
+        assert_eq!(workload.receipt.volumes[0].drive_type, "fixed");
+        let canonical_path = workload.pins[0].canonical_path.clone();
+        let canonical_text = canonical_path.to_string_lossy();
+        assert!(is_alignment_benchmark_local_volume_guid_path(
+            &canonical_text
+        ));
+        assert!(verify_alignment_benchmark_pinned_media(&workload.pins[0]).is_ok());
+        let reopened = open_alignment_benchmark_media_read_pin(&canonical_path).unwrap();
+        assert_eq!(
+            windows_alignment_benchmark_file_identity(&reopened).unwrap(),
+            workload.pins[0].identity
+        );
+        let guid_identity =
+            probe_media_content_identity_cancellable(&canonical_path, None).unwrap();
+        assert_eq!(guid_identity, original_identity);
+        let guid_probe = probe_media_timeline_with_ffprobe(&canonical_text, Path::new("ffprobe"))
+            .expect("ffprobe must consume the handle-derived volume GUID media path");
+        assert_eq!(guid_probe.audio_streams.len(), 2);
+        let serialized = serde_json::to_string(&workload.receipt).unwrap();
+        assert!(!serialized.contains(&path.to_string_lossy().to_string()));
+        assert!(!serialized.contains("Volume{"));
+
+        drop(reopened);
+        drop(workload);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn alignment_media_read_lease_blocks_overwrite_and_rename_until_drop() {
         let source = temp_audio_cache_path("alignment-media-lease-source");
         let target = temp_audio_cache_path("alignment-media-lease-target");
@@ -12021,12 +13886,51 @@ configuration: --extra-cflags=C:\Users\alice\sdk"#;
             eprintln!("跳过原生 benchmark 环境收据测试：ffmpeg/ffprobe 不可用。");
             return;
         }
-        let (environment, ffmpeg_tool, ffprobe_tool) =
-            collect_alignment_benchmark_environment("ffmpeg", Path::new("ffprobe")).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut workload_storage = AlignmentBenchmarkWorkloadStorageReceipt {
+            schema_version: ALIGNMENT_BENCHMARK_SCHEMA_VERSION,
+            run_manifest_digest: digest.clone(),
+            workload_digest: digest,
+            binding_count: 2,
+            unique_media_count: 2,
+            volume_count: 1,
+            media_set_digest: format!("sha256:{}", "b".repeat(64)),
+            bindings: vec![
+                AlignmentBenchmarkWorkloadBindingReceipt {
+                    binding_ordinal: 0,
+                    case_ordinal: 0,
+                    side: AlignmentBenchmarkBindingSide::Source,
+                    volume_ordinal: 0,
+                },
+                AlignmentBenchmarkWorkloadBindingReceipt {
+                    binding_ordinal: 1,
+                    case_ordinal: 0,
+                    side: AlignmentBenchmarkBindingSide::Target,
+                    volume_ordinal: 0,
+                },
+            ],
+            volumes: vec![AlignmentBenchmarkWorkloadVolumeReceipt {
+                volume_ordinal: 0,
+                binding_count: 2,
+                drive_type: "fixed",
+                seek_penalty: "none",
+                measurement_status: "complete",
+            }],
+            receipt_digest: String::new(),
+        };
+        workload_storage.receipt_digest =
+            create_alignment_benchmark_workload_receipt_digest(&workload_storage).unwrap();
+        let (environment, ffmpeg_tool, ffprobe_tool) = collect_alignment_benchmark_environment(
+            "ffmpeg",
+            Path::new("ffprobe"),
+            workload_storage,
+        )
+        .unwrap();
         assert!(environment.physical_core_count > 0);
         assert!(environment.logical_core_count >= environment.physical_core_count);
         assert!(environment.total_memory_bytes > 0);
-        assert_eq!(environment.storage_scope, "system-volume");
+        assert_eq!(environment.storage_scope, "workload-media-volumes");
+        assert_eq!(environment.workload_storage.binding_count, 2);
         assert!(environment.ffmpeg.binary_digest.starts_with("sha256:"));
         assert!(environment.ffprobe.binary_digest.starts_with("sha256:"));
         for version in [&environment.ffmpeg.version, &environment.ffprobe.version] {

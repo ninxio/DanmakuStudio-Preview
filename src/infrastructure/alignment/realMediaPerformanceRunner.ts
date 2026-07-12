@@ -7,23 +7,23 @@ import {
   type C137Digest
 } from "../../domain/alignment/c137Acceptance";
 import {
-  appendC137PerformanceCacheResetReceipt,
-  appendC137PerformanceTrial,
-  computeC137PerformanceCacheResetReceiptDigest,
+  appendC137PerformanceCacheResetReceiptV2,
+  appendC137PerformanceTrialV2,
+  computeC137PerformanceCacheResetReceiptDigestV2,
   computeC137PerformanceCaseOutputDigest,
-  computeC137PerformanceEnvironmentDigest,
-  createC137PerformanceEvidenceDraft,
+  computeC137PerformanceEnvironmentDigestV2,
+  createC137PerformanceEvidenceDraftV2,
   createC137PerformancePlanDigest,
-  finalizeC137PerformanceEvidence,
+  finalizeC137PerformanceEvidenceV2,
   C137_PERFORMANCE_MAX_CASES_PER_RUN,
-  type C137PerformanceCacheResetReceiptV1,
-  type C137PerformanceEnvironmentV1,
-  type C137PerformanceEvidenceDraftV1,
+  type C137PerformanceCacheResetReceiptV2,
+  type C137PerformanceEnvironmentV2,
+  type C137PerformanceEvidenceDraftV2,
   type C137PerformanceEvidenceStatus,
-  type C137PerformanceNativeTelemetryV1,
+  type C137PerformanceNativeTelemetryV2,
   type C137PerformancePlanV1,
-  type C137PerformanceRawEvidenceV1,
-  type C137PerformanceTrialV1
+  type C137PerformanceRawEvidenceV2,
+  type C137PerformanceTrialV2
 } from "../../domain/alignment/c137PerformanceEvidence";
 import type { RealMediaBenchmarkManifest } from "../../domain/alignment/realMediaBenchmark";
 import {
@@ -32,6 +32,7 @@ import {
   projectRealMediaBenchmarkRunManifest,
   validateRealMediaBenchmarkProposalBinding,
   type RealMediaBenchmarkBlindCase,
+  type RealMediaBenchmarkRunManifest,
   type RealMediaBenchmarkRunnerOptions
 } from "./realMediaBenchmarkRunner";
 import {
@@ -41,6 +42,7 @@ import {
 import {
   beginAlignmentBenchmarkSession,
   cancelAlignmentBenchmarkJob,
+  createAlignmentBenchmarkRunManifestCanonicalJson,
   finishAlignmentBenchmarkSession,
   getAlignmentBenchmarkJob,
   isAlignmentBenchmarkJobFinished,
@@ -58,7 +60,7 @@ import {
 } from "./tauriAlignmentBenchmark";
 
 export const REAL_MEDIA_PERFORMANCE_COLLECTOR_VERSION =
-  "c137-native-performance-collector-v1" as const;
+  "c137-native-performance-collector-v2" as const;
 
 export type RealMediaPerformanceTrialKind = "cold" | "warmup" | "hot" | "cancellation";
 
@@ -265,7 +267,7 @@ export function createRealMediaPerformanceWorkloadDigest(
  */
 export function createC137PerformanceRawEvidenceFromJournal(
   journal: RealMediaPerformanceCollectionJournal
-): C137PerformanceRawEvidenceV1 {
+): C137PerformanceRawEvidenceV2 {
   if (!journal.session || !journal.environment) {
     throw new Error("没有原生 session/environment receipt，不能生成性能 raw evidence。");
   }
@@ -284,13 +286,14 @@ export function createC137PerformanceRawEvidenceFromJournal(
     )
   );
   const resetByTrial = new Map(rawResets.map((receipt) => [receipt.trialId, receipt]));
-  let draft: C137PerformanceEvidenceDraftV1 = createC137PerformanceEvidenceDraft({
+  let draft: C137PerformanceEvidenceDraftV2 = createC137PerformanceEvidenceDraftV2({
+    runManifestDigest: environment.workloadStorage.runManifestDigest,
     plan,
     environment,
     collector: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       collectorVersion: `${journal.collectorVersion}+${journal.environment.collectorVersion}`,
-      nativeSchemaVersion: journal.session.schemaVersion,
+      nativeSchemaVersion: 2,
       clock: "rust-std-instant-session-relative-v1",
       memoryScope: "application-process-tree",
       sampler: findJournalSampler(journal),
@@ -298,20 +301,23 @@ export function createC137PerformanceRawEvidenceFromJournal(
       sessionOriginTickNs: journal.session.sessionOriginTickNs,
       memorySampleIntervalMs: journal.session.memorySampleIntervalMs,
       terminalSessionStatus:
-        journal.terminalSessionStatus === "active" ? null : journal.terminalSessionStatus
+        journal.terminalSessionStatus === "active" ? null : journal.terminalSessionStatus,
+      runManifestDigest: environment.workloadStorage.runManifestDigest,
+      workloadDigest: environment.workloadStorage.workloadDigest,
+      workloadStorageReceiptDigest: environment.workloadStorage.receiptDigest
     },
     preflight: structuredClone(journal.preflight),
     status: toRawEvidenceStatus(journal.status),
     issueCodes: [...journal.issueCodes]
   });
   for (const reset of rawResets) {
-    draft = appendC137PerformanceCacheResetReceipt(draft, reset);
+    draft = appendC137PerformanceCacheResetReceiptV2(draft, reset);
   }
   for (const trial of journal.trials) {
     const rawTrial = toRawTrial(trial, resetByTrial);
-    draft = appendC137PerformanceTrial(draft, rawTrial);
+    draft = appendC137PerformanceTrialV2(draft, rawTrial);
   }
-  return finalizeC137PerformanceEvidence(
+  return finalizeC137PerformanceEvidenceV2(
     draft,
     toRawEvidenceStatus(journal.status),
     journal.issueCodes
@@ -408,6 +414,17 @@ export async function collectRealMediaPerformanceEvidence(
     );
     return journal;
   }
+  const runManifestCanonicalJson = createAlignmentBenchmarkRunManifestCanonicalJson(runManifest);
+  const runManifestDigest = createRealMediaBenchmarkRunManifestDigest(runManifest) as C137Digest;
+  const beginRequest = Object.freeze({
+    schemaVersion: 2 as const,
+    ffmpegPath: executionOptions.ffmpegPath ?? null,
+    ffprobePath: executionOptions.ffprobePath ?? null,
+    memorySampleIntervalMs: planSnapshot.memorySampleIntervalMs,
+    runManifestCanonicalJson,
+    runManifestDigest,
+    workloadDigest: planSnapshot.workloadDigest
+  });
 
   let session: AlignmentBenchmarkSessionSnapshot | null = null;
   const activeJobRef: { current: AlignmentBenchmarkJobSnapshot | null } = { current: null };
@@ -422,15 +439,15 @@ export async function collectRealMediaPerformanceEvidence(
       planSnapshot.trialOrder.length
     );
     session = await beginAlignmentBenchmarkSession(
-      {
-        ffmpegPath: executionOptions.ffmpegPath ?? null,
-        ffprobePath: executionOptions.ffprobePath ?? null,
-        memorySampleIntervalMs: planSnapshot.memorySampleIntervalMs
-      },
+      beginRequest,
       executionOptions.benchmarkInvoker
     );
     journal.session = cloneSessionSnapshot(session);
     journal.environment = structuredClone(session.environment);
+    if (!sessionWorkloadStorageMatchesRunManifest(session, runManifest, runManifestDigest)) {
+      journal.issueCodes.push("workload-storage-receipt-mismatch");
+      return journal;
+    }
     if (session.environment.measurementStatus !== "complete") {
       journal.issueCodes.push("environment-incomplete");
     }
@@ -1127,6 +1144,27 @@ function validateExecutionPlan(
   return issues;
 }
 
+function sessionWorkloadStorageMatchesRunManifest(
+  session: AlignmentBenchmarkSessionSnapshot,
+  runManifest: RealMediaBenchmarkRunManifest,
+  runManifestDigest: C137Digest
+): boolean {
+  const receipt = session.environment.workloadStorage;
+  const expectedBindingCount = runManifest.cases.length * 2;
+  return (
+    session.environment.storageScope === "workload-media-volumes" &&
+    receipt.runManifestDigest === runManifestDigest &&
+    receipt.workloadDigest === runManifestDigest &&
+    receipt.bindingCount === expectedBindingCount &&
+    receipt.bindings.length === expectedBindingCount &&
+    receipt.uniqueMediaCount > 0 &&
+    receipt.uniqueMediaCount <= expectedBindingCount &&
+    receipt.volumeCount > 0 &&
+    receipt.volumeCount <= receipt.uniqueMediaCount &&
+    receipt.volumes.length === receipt.volumeCount
+  );
+}
+
 function createProductionRunnerOptions(
   plan: RealMediaPerformanceExecutionPlan,
   options: RealMediaPerformanceRunnerOptions
@@ -1354,9 +1392,9 @@ function toRawPerformancePlan(
 
 function toRawPerformanceEnvironment(
   environment: AlignmentBenchmarkEnvironmentReceipt
-): C137PerformanceEnvironmentV1 {
-  const withoutDigest: Omit<C137PerformanceEnvironmentV1, "digest"> = {
-    schemaVersion: 1,
+): C137PerformanceEnvironmentV2 {
+  const withoutDigest: Omit<C137PerformanceEnvironmentV2, "digest"> = {
+    schemaVersion: 2,
     measurementStatus: environment.measurementStatus,
     // Native diagnostic text may contain platform-specific details. Only stable ordinal issue
     // codes enter the shareable evidence envelope.
@@ -1370,22 +1408,23 @@ function toRawPerformanceEnvironment(
     totalMemoryBytes: environment.totalMemoryBytes,
     storageScope: environment.storageScope,
     storageKind: environment.storageKind,
+    workloadStorage: structuredClone(environment.workloadStorage),
     powerProfile: environment.powerProfile,
     ffmpeg: structuredClone(environment.ffmpeg),
     ffprobe: structuredClone(environment.ffprobe)
   };
   return {
     ...withoutDigest,
-    digest: computeC137PerformanceEnvironmentDigest(withoutDigest)
+    digest: computeC137PerformanceEnvironmentDigestV2(withoutDigest)
   };
 }
 
 function toRawCacheResetReceipt(
   receipt: AlignmentBenchmarkCacheResetReceipt,
   trialId: string
-): C137PerformanceCacheResetReceiptV1 {
-  const withoutDigest: Omit<C137PerformanceCacheResetReceiptV1, "receiptDigest"> = {
-    schemaVersion: 1,
+): C137PerformanceCacheResetReceiptV2 {
+  const withoutDigest: Omit<C137PerformanceCacheResetReceiptV2, "receiptDigest"> = {
+    schemaVersion: 2,
     trialId,
     sessionId: receipt.sessionId,
     resetTickNs: receipt.resetTickNs,
@@ -1397,14 +1436,14 @@ function toRawCacheResetReceipt(
   };
   return {
     ...withoutDigest,
-    receiptDigest: computeC137PerformanceCacheResetReceiptDigest(withoutDigest)
+    receiptDigest: computeC137PerformanceCacheResetReceiptDigestV2(withoutDigest)
   };
 }
 
 function toRawTrial(
   trial: RealMediaPerformanceTrialEvidence,
-  resetByTrial: Map<string, C137PerformanceCacheResetReceiptV1>
-): C137PerformanceTrialV1 {
+  resetByTrial: Map<string, C137PerformanceCacheResetReceiptV2>
+): C137PerformanceTrialV2 {
   if (trial.kind === "run") {
     const run = trial.run;
     return {
@@ -1462,7 +1501,7 @@ function toRawTrial(
 
 function toRawTelemetry(
   telemetry: AlignmentBenchmarkJobTelemetry
-): C137PerformanceNativeTelemetryV1 {
+): C137PerformanceNativeTelemetryV2 {
   return structuredClone(telemetry);
 }
 

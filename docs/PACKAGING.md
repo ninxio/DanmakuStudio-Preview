@@ -25,6 +25,8 @@ corepack pnpm tauri:build
 
 最终用户安装和运行 NSIS 包时不需要 Node.js、pnpm、Rust 或 Visual Studio Build Tools。Windows 10/11 通常已预装 WebView2 Runtime；若目标机器缺失 WebView2，应按安装器提示或微软官方运行时安装指引补齐。
 
+当前安装包的媒体匹配后端只使用 CPU，不包含 CUDA Toolkit、cuFFT runtime、CUDA kernel 或 GPU 后端选择项。即使机器安装了 NVIDIA 驱动或 FFmpeg 列出了 CUDA/NVDEC 硬件加速，Alignment V2 的 `-vn` 音频解码、声谱 FFT、landmark、动态规划与相关精修仍不会自动使用 NVIDIA GPU；仅安装 CUDA Toolkit 也不会改变这一行为。可选 CUDA/cuFFT 后端必须在后续实现、与 CPU 基线做等价验证并完成独立打包测试后才能启用。
+
 ## C137 安装级人工验证状态
 
 人工 `verified` 的 HMAC-SHA256 secret 不会编入安装包，也不会写入 `.danmaku-project.json`。它在用户首次明确签发时由 Tauri 使用系统随机数生成，保存在该安装的应用本地数据目录；同目录还保存以原子 rename 提交的不可变签发/撤销事件。项目文件只携带可审计的签名元数据和撤销回执。
@@ -43,7 +45,7 @@ corepack pnpm tauri:build
 
 取消不仅终止受监督进程，也贯穿后续解析：FFprobe JSON 在反序列化前后和逐流归一化时检查，compact PTS 逐记录检查，V2 PCM 分块、legacy PCM/频谱分块、视觉特征逐帧检查。取消或身份变化发生后不会写缓存、返回部分 TimeMap 或继续生成性能结论。
 
-这里的 Job 只负责进程树生命周期和有界清理，不是 C137 正式性能协议要求的 RSS sampler。当前 strict raw v1 仍声明 `windows-toolhelp-working-set-v1` 与 `system-volume`；安装包并未因此获得 `windows-job-object-working-set-v1` 或 `workload-media-volumes` 正式证据能力。
+这里的 Job 只负责进程树生命周期和有界清理，不是 C137 正式性能协议要求的 RSS sampler。当前 strict raw v2 仍如实声明 `windows-toolhelp-working-set-v1`；实际媒体卷已经由 native v2 固定句柄探测并形成 `workload-media-volumes` 回执，但安装包并未因此获得正式 Job 内存覆盖、终态 cleanup 或 attestation 证据。
 
 ## C137 benchmark 与完整验收边界
 
@@ -51,13 +53,13 @@ corepack pnpm tauri:build
 
 生产请求会显式传递参考/原片音轨和视频流。Rust 结果还会回报视觉 fallback/校验实际消费的视频流，runner 必须复核这些流，且视觉缓存按实际流索引隔离。每个 case 的 sealed receipt 记录成功、失败或取消、单调时钟 wall elapsed、engine/feature、实际视觉流和去敏参数摘要。只有所有真实 case 成功并与 blind SHA-256 一致时才揭示 gold 进行组件评估；失败、取消或未确认安全退出都会令 `evaluation=null`，超时任务未退出时也不会继续启动下一 case。
 
-从高级入口下载的 JSON 采用独立 schema 和 validator，固定标记 `scope: "time-map-component"`、`releaseEligible: false`。报告不包含本地媒体路径、媒体 SHA-256、生产参数 hash 或原始诊断。组件子闸门即使通过，也不等于 release 通过，不会改变项目的人工签发状态或授予 `verified`。
+从高级入口下载的 JSON 采用独立 schema 和 validator，固定标记 `scope: "time-map-component"`、`releaseEligible: false`。报告不包含本地媒体路径、单媒体 SHA-256、生产参数 hash 或原始诊断；但其中的 manifest、dataset 与 evidence 稳定摘要仍可把同一数据集或多次运行关联起来，因此它是“移除直接本地标识的稳定报告”，不是不可关联的匿名报告。组件子闸门即使通过，也不等于 release 通过，不会改变项目的人工签发状态或授予 `verified`。
 
-同一高级区内的性能工程采集复用已导入 manifest 中的媒体引用，不会再要求选择第二组路径。它先取得 native exclusive session，原子清空应用特征缓存，然后严格按 cold → warmup → hot → cancel 计划运行与产品相同的对齐核心。导出的 strict raw v1 记录 Rust 原生单调时钟、阶段边界、缓存计数、进程树 RSS 和取消退出终态，并固定标记 `releaseEligible: false`、`trustStatus: "untrusted-raw-evidence"`。组件报告里的“协调器观测耗时”不属于性能证据。
+同一高级区内的性能工程采集复用已导入 manifest 中的媒体引用，不会再要求选择第二组路径。native v2 在任何工具探测前校验 canonical blind manifest，为全部 distinct 媒体取得会话级只读 pin，只完整哈希一次，并从固定句柄探测实际卷；每个 job 只能使用注册 case 的配对和显式流。随后严格按 cold → warmup → hot → cancel 计划运行生产对齐核心。导出的 strict raw v2 保存 path-free `workloadStorage`、Rust 单调时钟、阶段边界、缓存计数、ToolHelp RSS 和取消终态，并固定标记 `releaseEligible: false`、`trustStatus: "untrusted-raw-evidence"`。它不会保存路径、卷 GUID/serial 或单媒体 SHA，但稳定的 run manifest、workload、media-set 与 receipt 摘要仍可跨运行关联同一工作负载。组件报告里的协调器 wall time 不属于性能证据。
 
-完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部 `trustContext`。acceptance protocol v2 必须绑定性能 plan 摘要、cold/hot/cancel 次数、最大采样间隔和原生单调时钟，并要求 Job Object 进程归属及实际媒体卷环境收据；performance report v2 直接携带 strict raw v1，不接受手写耗时汇总。外部信任根必须对受信 protocol、数据审批/preflight/prediction receipts 及每类 raw report evidence 提供 canonical SHA-256；内嵌 evidence digest 不能自我批准。安装包默认不携带任何审批白名单或 trust context，因此缺少外部受信摘要时必定返回 `incomplete-evidence`，保持 fail-closed。
+完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部信任。acceptance protocol v3 / performance report v3 只接受 formal raw schema v2，并独立检查当前冻结 manifest、实际媒体卷 receipt 的结构与工作负载绑定、Job memory receipt、terminal cleanup receipt 与 native attestation；storage 自摘要本身不证明原生来源，来源真实性仍依赖后两者及 authority。统计 evidence 还逐项核对协议 Top-K、calibration↔ranking decision、dataset gold 事件↔TimeMap 事件、全部 frozen time-stretch 漂移和跨报告 case metadata，重签摘要不能掩盖选择性漏报。当前 raw v2 的后三项 assurance 必须为 `null`，所以即使调用方改写 sampler 字符串、重算全部摘要并自建 `trustContext`，结果仍是 `incomplete-evidence`。`trustContext` 只是一份调用方提供的摘要快照，可用于发现内容变化，不能证明签发者身份；当前 `external-trust-authority` 检查固定为未完成，直到存在可独立验证的签名或受信封装。安装包默认也不携带审批白名单或可自行签发的外部 authority。
 
-release 不携带真实媒体、gold、许可材料或 raw 性能记录。当前仓库已能生成冷/热缓存耗时、进程树峰值 RSS 和取消延迟的性能工程 raw，但仍没有采集和冻结合法真实关系的生成器。生命周期 Job 已解决一次性媒体工具的进程树接管与失败清理，却没有替换性能报告中的 ToolHelp/PID RSS 采样；存储回执也仍只探测 Windows 系统卷的 seek-penalty，而不是实际媒体卷。这些限制使当前 raw 不得晋升为正式发布性能证据；正式证据必须另行实现 `windows-job-object-working-set-v1`、探测 `workload-media-volumes`，再用真实授权数据按受信协议重新采集并由独立 trust root 审批。
+release 不携带真实媒体、gold、许可材料或 raw 性能记录。当前仓库已能生成冷/热缓存耗时、ToolHelp 进程树峰值 RSS、取消延迟和实际 workload 卷回执，但仍没有采集/冻结合法真实关系的生成器。正式证据还必须实现诚实限定覆盖范围的 Job working-set receipt、终态 cleanup receipt 与独立外部 attestation，再用真实授权数据按获批协议重新采集；实际媒体卷回执或 lifecycle Job 不能单独替代这些要求。
 
 ## Web 生产构建
 
@@ -79,3 +81,4 @@ corepack pnpm build
 - Web 构建没有安装级 secret、签发命令或权威撤销注册表，因此只能展示/编辑复核状态，不能签发、恢复或撤销人工 `verified`。
 - release 不打包真实媒体 benchmark。仓库中的 manifest v2 文件是 `isExample=true` 的 placeholder；实际数据集路径、全文件身份和授权说明由评测者保留在本机，运行前通过 Tauri preflight 重新核对媒体身份和显式流索引。
 - 当前真实媒体关系数仍为 0，尚未完成统计校准、规定硬件性能报告、20 套北极星长合集验收。A/B v2 token 已要求共同内容和单侧差异达到 2000/1500 ms 有效/覆盖时长、边界达到 1500/1000 ms，但这些门槛也尚未在授权真实冻结集上完成充分性校准。因此现阶段安装包是 fail-closed 的工程预览，不能作为准确率、性能或人工观看充分性的验收证明。
+- 当前 N×M 匹配逐 pair 串行运行，且 V2 对单个媒体仍有 60 分钟 PCM 上限；本 release 不适合直接处理超过 60 分钟的单文件长合集，也不能把 4090 视为已启用的加速器。

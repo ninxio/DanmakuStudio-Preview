@@ -1,4 +1,12 @@
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -7,11 +15,17 @@ import {
   type RealMediaBenchmarkManifest
 } from "../../domain/alignment/realMediaBenchmark";
 import {
-  computeC137PerformanceEvidenceDigest,
+  computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceEnvironmentDigestV2,
+  computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformancePlanDigest,
-  type C137PerformanceRawEvidenceV1
+  type C137PerformanceRawEvidenceV1,
+  type C137PerformanceRawEvidenceV2
 } from "../../domain/alignment/c137PerformanceEvidence";
-import { createCompleteC137PerformanceEvidenceFixture } from "../../test/c137PerformanceEvidence";
+import {
+  createCompleteC137PerformanceEvidenceFixture,
+  createCompleteC137PerformanceEvidenceV2Fixture
+} from "../../test/c137PerformanceEvidence";
 import { createRealMediaPerformanceWorkloadDigest } from "../../infrastructure/alignment/realMediaPerformanceRunner";
 import {
   REAL_MEDIA_BENCHMARK_RUNNER_VERSION,
@@ -200,7 +214,7 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(report).toHaveTextContent("没有生成部分或推测性的组件质量结论");
   });
 
-  it("完成后显示组件子闸门与 release 限界，并下载不含路径和摘要的稳定报告", async () => {
+  it("完成后显示组件子闸门与 release 限界，并提示稳定摘要仍可关联运行", async () => {
     const user = userEvent.setup();
     const manifest = createRealManifest(1);
     const report = createCompletedReport(manifest);
@@ -228,14 +242,44 @@ describe("C137 真实媒体 benchmark 面板", () => {
     );
     expect(reportView).toHaveTextContent("releaseEligible=false，绝不代表 release 通过");
 
-    await user.click(screen.getByRole("button", { name: "下载去敏稳定报告" }));
+    expect(screen.getByText(/清单标识与稳定摘要/)).toHaveTextContent(
+      "清单标识与稳定摘要仍可能关联同一数据集或多次运行"
+    );
+    await user.click(
+      screen.getByRole("button", { name: "下载已移除路径与单媒体哈希的稳定报告" })
+    );
     expect(downloadedName).toBe("c137-ui-manifest-ui-dataset-1-time-map-report.json");
     if (!downloadedBlob) throw new Error("下载测试没有捕获报告 Blob");
     const text = await readBlobText(downloadedBlob);
     expect(text.endsWith("\n")).toBe(true);
     expect(text).toContain('"releaseEligible": false');
-    for (const secret of collectManifestSecrets(manifest)) expect(text).not.toContain(secret);
-    expect(screen.getByRole("status")).toHaveTextContent("已下载去敏报告");
+    for (const secret of collectManifestSecrets(manifest)) {
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
+    }
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "已下载已移除本地路径与单媒体内容哈希的稳定报告"
+    );
+  });
+
+  it("合法报告字符串字段含 JSON 转义的 Windows 路径时仍阻止展示与下载", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    const sourcePath = manifest.cases[0]?.source.path;
+    if (!sourcePath) throw new Error("路径泄漏测试缺少参考媒体路径");
+    const report = createCompletedReport(manifest);
+    report.reasons = [`合法字符串字段意外回显 ${sourcePath}`];
+    const runner = vi.fn<RealMediaBenchmarkPanelRunner>(() => Promise.resolve(report));
+    render(<RealMediaBenchmarkPanel desktopAvailable runner={runner} />);
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+
+    await user.click(screen.getByRole("button", { name: "运行真实媒体精度基准" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("报告仍含本地媒体路径或身份摘要，已阻止下载");
+    expect(alert).not.toHaveTextContent(sourcePath);
+    expect(screen.queryByLabelText("C137 真实媒体运行报告")).not.toBeInTheDocument();
   });
 
   it("拒绝复用相同 ID/version 但 blind workload 摘要属于另一清单的报告", async () => {
@@ -251,11 +295,13 @@ describe("C137 真实媒体 benchmark 面板", () => {
     await uploadManifest(user, manifest);
     await user.click(await screen.findByRole("button", { name: "运行真实媒体精度基准" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "blind workload 摘要不一致"
-    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("blind workload 摘要不一致");
     expect(screen.queryByLabelText("C137 真实媒体运行报告")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "下载去敏稳定报告" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: "下载已移除路径与单媒体哈希的稳定报告"
+      })
+    ).not.toBeInTheDocument();
   });
 
   it("性能 raw evidence 与当前 manifest 绑定后才展示并下载去敏文件", async () => {
@@ -275,21 +321,29 @@ describe("C137 真实媒体 benchmark 面板", () => {
     ) {
       downloadedName = this.download;
     });
-    render(
-      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
-    );
+    render(<RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />);
     await openPanel(user);
     await uploadManifest(user, manifest);
-    await user.click(
-      await screen.findByRole("button", { name: "采集工程性能原始证据" })
-    );
+    await user.click(await screen.findByRole("button", { name: "采集工程性能原始证据" }));
 
     const summary = await screen.findByLabelText("性能 raw evidence 摘要");
-    expect(summary).toHaveTextContent("原始采集链完整；仍需独立审批和 trust root");
+    expect(screen.getByText(/runManifestDigest、mediaSetDigest/)).toHaveTextContent(
+      "稳定摘要也可能关联同一数据集或多次运行"
+    );
+    expect(screen.getByText(/CPU、操作系统、内存/)).toHaveTextContent(
+      "CPU、操作系统、内存、工具二进制摘要与运行标识"
+    );
+    expect(summary).toHaveTextContent(
+      "工程采集记录结构完整；正式证据链仍未完成，不能进入正式验收"
+    );
+    expect(
+      within(summary).getByText("工程采集记录结构完整；正式证据链仍未完成，不能进入正式验收。")
+    ).toHaveClass("text-amber-100");
     expect(summary).toHaveTextContent("Windows · 4 物理核");
     expect(summary).toHaveTextContent("ToolHelp（工程）");
-    expect(summary).toHaveTextContent("系统卷（工程）");
-    expect(summary).toHaveTextContent("正式性能验收要求 Job Object");
+    expect(summary).toHaveTextContent("实际媒体卷（1 卷）");
+    expect(summary).toHaveTextContent("实际媒体卷收据已由 native v2 采集并闭合");
+    expect(summary).toHaveTextContent("正式性能验收仍要求 Job Object");
     expect(summary).toHaveTextContent("1.00 GiB");
     expect(summary).toHaveTextContent("1 次 · 最大 100ms");
     expect(screen.getByText(/releaseEligible=false/)).toBeInTheDocument();
@@ -302,7 +356,10 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(text).toContain('"reportKind":"c137-performance-raw-evidence"');
     expect(text).toContain('"releaseEligible":false');
     expect(text).toContain('"trustStatus":"untrusted-raw-evidence"');
-    for (const secret of collectManifestSecrets(manifest)) expect(text).not.toContain(secret);
+    for (const secret of collectManifestSecrets(manifest)) {
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
+    }
     expect(screen.getByRole("status")).toHaveTextContent("已下载未审批 raw evidence");
   });
 
@@ -312,14 +369,10 @@ describe("C137 真实媒体 benchmark 面板", () => {
     const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>(() =>
       Promise.resolve(createCompleteC137PerformanceEvidenceFixture())
     );
-    render(
-      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
-    );
+    render(<RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />);
     await openPanel(user);
     await uploadManifest(user, manifest);
-    await user.click(
-      await screen.findByRole("button", { name: "采集工程性能原始证据" })
-    );
+    await user.click(await screen.findByRole("button", { name: "采集工程性能原始证据" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "raw evidence 工作负载摘要与当前 manifest 不一致"
@@ -337,19 +390,69 @@ describe("C137 真实媒体 benchmark 面板", () => {
     const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>(() =>
       Promise.resolve(evidence)
     );
-    render(
-      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
-    );
+    render(<RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />);
     await openPanel(user);
     await uploadManifest(user, manifest);
-    await user.click(
-      await screen.findByRole("button", { name: "采集工程性能原始证据" })
-    );
+    await user.click(await screen.findByRole("button", { name: "采集工程性能原始证据" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "raw evidence 计划 case 数与当前 manifest 的真实关系数不一致"
     );
     expect(screen.queryByLabelText("性能 raw evidence 摘要")).not.toBeInTheDocument();
+  });
+
+  it("manifest 版本变化会立即 abort 旧采集并阻止旧 promise 回写", async () => {
+    const user = userEvent.setup();
+    const firstManifest = createRealManifest(1);
+    const nextManifest = structuredClone(firstManifest);
+    nextManifest.datasetVersion = "ui-dataset-2";
+    nextManifest.name = "UI 真实基准 v2";
+    let firstSignal: AbortSignal | undefined;
+    let resolveFirst: ((evidence: C137PerformanceRawEvidenceV2) => void) | undefined;
+    let invocation = 0;
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>((manifest, options) => {
+      invocation += 1;
+      if (invocation === 1) {
+        firstSignal = options.signal;
+        return new Promise<C137PerformanceRawEvidenceV2>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return Promise.resolve(bindPerformanceEvidenceToManifest(manifest));
+    });
+    render(<RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />);
+    await openPanel(user);
+    await uploadManifest(user, firstManifest);
+    await user.click(await screen.findByRole("button", { name: "采集工程性能原始证据" }));
+
+    const manifestInput = screen.getByLabelText("选择 C137 benchmark manifest JSON");
+    manifestInput.removeAttribute("disabled");
+    fireEvent.change(manifestInput, {
+      target: {
+        files: [
+          new File([JSON.stringify(nextManifest)], "governed-manifest-v2.json", {
+            type: "application/json"
+          })
+        ]
+      }
+    });
+
+    await screen.findByText(`${nextManifest.name} · ${nextManifest.datasetVersion}`);
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+    await act(async () => {
+      resolveFirst?.(bindPerformanceEvidenceToManifest(firstManifest));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByLabelText("性能 raw evidence 摘要")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "采集工程性能原始证据" }));
+    expect(await screen.findByLabelText("性能 raw evidence 摘要")).toHaveTextContent(
+      "工程采集记录结构完整"
+    );
+    expect(performanceRunner).toHaveBeenCalledTimes(2);
+    expect(performanceRunner.mock.calls[1]?.[0].datasetVersion).toBe("ui-dataset-2");
   });
 
   it("取消性能采集会 abort 注入 runner，并等待原生资源进入终态", async () => {
@@ -363,14 +466,10 @@ describe("C137 真实媒体 benchmark 面板", () => {
         rejectRun = reject;
       });
     });
-    render(
-      <RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />
-    );
+    render(<RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />);
     await openPanel(user);
     await uploadManifest(user, manifest);
-    await user.click(
-      await screen.findByRole("button", { name: "采集工程性能原始证据" })
-    );
+    await user.click(await screen.findByRole("button", { name: "采集工程性能原始证据" }));
 
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "取消性能采集" }));
@@ -511,13 +610,28 @@ function cloneGold(gold: RealMediaBenchmarkGold): RealMediaBenchmarkGold {
 
 function bindPerformanceEvidenceToManifest(
   manifest: RealMediaBenchmarkManifest
-): C137PerformanceRawEvidenceV1 {
-  const evidence = createCompleteC137PerformanceEvidenceFixture();
+): C137PerformanceRawEvidenceV2 {
+  const evidence = createCompleteC137PerformanceEvidenceV2Fixture();
   const workloadDigest = createRealMediaPerformanceWorkloadDigest(manifest);
+  evidence.runManifestDigest = workloadDigest;
   evidence.plan.workloadDigest = workloadDigest;
   for (const trial of evidence.trials) trial.workloadDigest = workloadDigest;
+  evidence.environment.workloadStorage.runManifestDigest = workloadDigest;
+  evidence.environment.workloadStorage.workloadDigest = workloadDigest;
+  evidence.environment.workloadStorage.receiptDigest =
+    computeC137PerformanceWorkloadStorageReceiptDigest(evidence.environment.workloadStorage);
+  const { digest, ...environmentWithoutDigest } = evidence.environment;
+  void digest;
+  evidence.environment.digest =
+    computeC137PerformanceEnvironmentDigestV2(environmentWithoutDigest);
+  evidence.collector.runManifestDigest = workloadDigest;
+  evidence.collector.workloadDigest = workloadDigest;
+  evidence.collector.workloadStorageReceiptDigest =
+    evidence.environment.workloadStorage.receiptDigest;
+  evidence.assurance.workloadStorageReceiptDigest =
+    evidence.environment.workloadStorage.receiptDigest;
   evidence.planDigest = createC137PerformancePlanDigest(evidence.plan);
-  evidence.evidenceDigest = computeC137PerformanceEvidenceDigest(evidence);
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
   return evidence;
 }
 

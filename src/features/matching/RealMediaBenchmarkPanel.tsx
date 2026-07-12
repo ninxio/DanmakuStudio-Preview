@@ -12,7 +12,8 @@ import {
   getC137PerformancePeakRss,
   serializeC137PerformanceEvidence,
   validateC137PerformanceEvidence,
-  type C137PerformanceRawEvidenceV1
+  type C137PerformanceRawEvidence,
+  type C137PerformanceRawEvidenceV2
 } from "../../domain/alignment/c137PerformanceEvidence";
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import {
@@ -47,7 +48,7 @@ export interface RealMediaPerformancePanelRunOptions {
 export type RealMediaPerformancePanelRunner = (
   manifest: RealMediaBenchmarkManifest,
   options: RealMediaPerformancePanelRunOptions
-) => Promise<C137PerformanceRawEvidenceV1>;
+) => Promise<C137PerformanceRawEvidence>;
 
 interface RealMediaBenchmarkPanelProps {
   runner?: RealMediaBenchmarkPanelRunner;
@@ -187,7 +188,7 @@ export function RealMediaBenchmarkPanel({
         text,
         "application/json;charset=utf-8"
       );
-      setDownloadStatus(`已下载去敏报告：${fileName}。`);
+      setDownloadStatus(`已下载已移除本地路径与单媒体内容哈希的稳定报告：${fileName}。`);
       setRunError(null);
     } catch (error: unknown) {
       setRunError(`无法下载报告：${formatError(error)}`);
@@ -328,16 +329,22 @@ export function RealMediaBenchmarkPanel({
           {report ? <BenchmarkRunReportView report={report} /> : null}
 
           {report ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <TextButton tone="primary" onClick={downloadReport}>
-                <Download size={13} />
-                下载去敏稳定报告
-              </TextButton>
-              {downloadStatus ? (
-                <span className="text-emerald-100" role="status">
-                  {downloadStatus}
-                </span>
-              ) : null}
+            <div className="grid gap-2">
+              <p className="leading-5 text-amber-100">
+                已移除本地路径与单媒体内容哈希，但 path-free
+                不等于匿名；清单标识与稳定摘要仍可能关联同一数据集或多次运行。
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <TextButton tone="primary" onClick={downloadReport}>
+                  <Download size={13} />
+                  下载已移除路径与单媒体哈希的稳定报告
+                </TextButton>
+                {downloadStatus ? (
+                  <span className="text-emerald-100" role="status">
+                    {downloadStatus}
+                  </span>
+                ) : null}
+              </div>
             </div>
           ) : null}
 
@@ -370,7 +377,7 @@ function PerformanceEvidencePanel({
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [phase, setPhase] = useState<RealMediaPerformancePhase | null>(null);
-  const [evidence, setEvidence] = useState<C137PerformanceRawEvidenceV1 | null>(null);
+  const [evidence, setEvidence] = useState<C137PerformanceRawEvidence | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [downloadStatus, setDownloadStatus] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -386,11 +393,17 @@ function PerformanceEvidencePanel({
   );
 
   useEffect(() => {
+    operationRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setRunning(false);
+    setCancelling(false);
+    onBusyChange(false);
     setEvidence(null);
     setError(null);
     setDownloadStatus(null);
     setPhase(null);
-  }, [manifest]);
+  }, [manifest, onBusyChange]);
 
   const runPerformance = async (): Promise<void> => {
     if (!manifest || blockers.length > 0 || disabled || running) return;
@@ -487,6 +500,11 @@ function PerformanceEvidencePanel({
         当前没有批准的 production protocol 或 trust root。本入口只生成 releaseEligible=false
         的未审批原始证据，不能自行让 C137 或自动 verified 通过。
       </p>
+      <p className="leading-5 text-slate-400">
+        下载文件会移除本地路径与单媒体内容哈希，但 path-free 不等于匿名；文件仍含
+        CPU、操作系统、内存、工具二进制摘要与运行标识，其中的 runManifestDigest、mediaSetDigest
+        等稳定摘要也可能关联同一数据集或多次运行。
+      </p>
 
       <div className="flex flex-wrap gap-2">
         {running ? (
@@ -515,7 +533,10 @@ function PerformanceEvidencePanel({
         </p>
       ) : null}
       {error ? (
-        <p className="rounded border border-amber-400/35 bg-amber-400/10 p-2 leading-5 text-amber-100" role="alert">
+        <p
+          className="rounded border border-amber-400/35 bg-amber-400/10 p-2 leading-5 text-amber-100"
+          role="alert"
+        >
           {error}
         </p>
       ) : null}
@@ -538,34 +559,40 @@ function PerformanceEvidencePanel({
   );
 }
 
-function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRawEvidenceV1 }) {
+function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRawEvidence }) {
   const validation = validateC137PerformanceEvidence(evidence);
-  const measured = getC137PerformanceMeasuredRuns(evidence);
+  const measured =
+    evidence.schemaVersion === 2
+      ? getC137PerformanceMeasuredRuns(evidence)
+      : getC137PerformanceMeasuredRuns(evidence);
   const cold = measured.filter((run) => run.runKind === "cold");
   const hot = measured.filter((run) => run.runKind === "hot");
   const peaks = measured.map(getC137PerformancePeakRss).filter((value) => value !== null);
-  const cancellations = evidence.trials.filter(
-    (trial) => trial.trialType === "cancellation"
-  );
+  const cancellations = evidence.trials.filter((trial) => trial.trialType === "cancellation");
   return (
-    <section className="grid gap-2 rounded border border-panel-line/70 bg-black/20 p-2" aria-label="性能 raw evidence 摘要">
-      <p className={validation.complete ? "text-emerald-100" : "text-amber-100"}>
+    <section
+      className="grid gap-2 rounded border border-panel-line/70 bg-black/20 p-2"
+      aria-label="性能 raw evidence 摘要"
+    >
+      <p className="text-amber-100">
         {validation.complete
-          ? "原始采集链完整；仍需独立审批和 trust root。"
-          : "原始采集链不完整，禁止进入正式验收。"}
+          ? "工程采集记录结构完整；正式证据链仍未完成，不能进入正式验收。"
+          : "工程采集记录结构不完整；正式证据链未完成，禁止进入正式验收。"}
       </p>
       {evidence.collector.sampler === "windows-toolhelp-working-set-v1" ||
       evidence.environment.storageScope === "system-volume" ? (
         <p className="rounded border border-amber-400/35 bg-amber-400/10 p-2 text-amber-100">
-          当前仍是 ToolHelp 进程枚举和系统卷探测，只能用于工程回归；正式性能验收要求 Job
-          Object 进程归属与实际媒体卷环境收据。
+          {evidence.schemaVersion === 2
+            ? "实际媒体卷收据已由 native v2 采集并闭合，但进程归属仍是 ToolHelp（工程）；正式性能验收仍要求 Job Object 完整归属与外部 trust root。"
+            : "当前仍是 ToolHelp 进程枚举和系统卷探测，只能用于工程回归；正式性能验收要求 Job Object 进程归属与实际媒体卷环境收据。"}
         </p>
       ) : null}
       <dl className="grid gap-1 leading-5 sm:grid-cols-2">
         <div>
           <dt className="inline text-slate-500">目标环境：</dt>
           <dd className="inline">
-            {evidence.environment.operatingSystem} · {evidence.environment.physicalCoreCount} 物理核
+            {evidence.environment.operatingSystem} · {evidence.environment.physicalCoreCount}{" "}
+            物理核
           </dd>
         </div>
         <div>
@@ -585,9 +612,11 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
         <div>
           <dt className="inline text-slate-500">存储范围：</dt>
           <dd className="inline">
-            {evidence.environment.storageScope === "workload-media-volumes"
-              ? "实际媒体卷"
-              : "系统卷（工程）"}
+            {evidence.schemaVersion === 2
+              ? `实际媒体卷（${evidence.environment.workloadStorage.volumeCount} 卷）`
+              : evidence.environment.storageScope === "workload-media-volumes"
+                ? "实际媒体卷（旧版未绑定）"
+                : "系统卷（工程）"}
           </dd>
         </div>
         <div>
@@ -824,16 +853,25 @@ function assertReportContainsNoManifestSecrets(
   reportText: string,
   manifest: RealMediaBenchmarkManifest
 ): void {
-  const leaked = collectManifestSecrets(manifest).some((secret) => reportText.includes(secret));
+  const leaked = collectManifestSecrets(manifest).some((secret) =>
+    createSerializedSecretVariants(secret).some((variant) => reportText.includes(variant))
+  );
   if (leaked) {
     throw new Error("报告仍含本地媒体路径或身份摘要，已阻止下载。");
   }
 }
 
+function createSerializedSecretVariants(secret: string): string[] {
+  const jsonEscaped = JSON.stringify(secret).slice(1, -1);
+  return jsonEscaped === secret ? [secret] : [secret, jsonEscaped];
+}
+
 function sanitizeManifestSecrets(text: string, manifest: RealMediaBenchmarkManifest): string {
   let sanitized = text;
   for (const secret of collectManifestSecrets(manifest)) {
-    sanitized = sanitized.split(secret).join("[已隐藏本地媒体]");
+    for (const variant of createSerializedSecretVariants(secret)) {
+      sanitized = sanitized.split(variant).join("[已隐藏本地媒体]");
+    }
   }
   return sanitized.replace(/\b[a-f0-9]{64}\b/giu, "[已隐藏 SHA-256]");
 }
@@ -897,7 +935,7 @@ function formatPerformancePhase(phase: RealMediaPerformancePhase | null): string
 async function defaultPerformancePanelRunner(
   manifest: RealMediaBenchmarkManifest,
   options: RealMediaPerformancePanelRunOptions
-): Promise<C137PerformanceRawEvidenceV1> {
+): Promise<C137PerformanceRawEvidenceV2> {
   const plan = createEngineeringRealMediaPerformancePlan(
     manifest,
     `performance-${createOpaqueRunId()}`
@@ -933,7 +971,7 @@ function createOpaqueRunId(): string {
 }
 
 function assertPerformanceEvidenceMatchesManifest(
-  evidence: C137PerformanceRawEvidenceV1,
+  evidence: C137PerformanceRawEvidence,
   manifest: RealMediaBenchmarkManifest
 ): void {
   const expectedWorkloadDigest = createRealMediaPerformanceWorkloadDigest(manifest);

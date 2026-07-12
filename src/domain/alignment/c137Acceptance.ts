@@ -6,15 +6,17 @@ import {
   getC137PerformanceMeasuredRuns,
   getC137PerformancePeakRss,
   validateC137PerformanceEvidence,
-  type C137PerformanceRawEvidenceV1
+  type C137PerformanceRawEvidenceV1,
+  type C137PerformanceRawEvidenceV2
 } from "./c137PerformanceEvidence";
 import { sha256Hex } from "../shared/sha256";
 
 export const C137_ACCEPTANCE_SCHEMA_VERSION = 1 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 2 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 3 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
-export const C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION = 2 as const;
+export const C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION = 3 as const;
+export const C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION = 2 as const;
 
 export const C137_FIXED_ACCEPTANCE_THRESHOLDS = {
   targetPhysicalCoreCount: 4,
@@ -76,6 +78,7 @@ export interface C137AcceptanceProtocol {
   requiredHotRuns: number;
   requiredCancellationRuns: number;
   performancePlanDigest: C137Digest;
+  requiredPerformanceRawSchemaVersion: typeof C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION;
   maximumMemorySampleIntervalMs: number;
   requiredMonotonicClock: "rust-std-instant-session-relative-v1";
   requiredMemorySampler: "windows-job-object-working-set-v1";
@@ -296,7 +299,12 @@ export interface C137NorthStarReport {
 export interface C137PerformanceReport {
   schemaVersion: typeof C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION;
   binding: C137EvidenceBinding;
-  rawEvidence: C137PerformanceRawEvidenceV1;
+  /**
+   * v1 remains readable as engineering evidence during migration. The formal gate independently
+   * requires native v2 evidence plus its four assurance receipts, so legacy evidence can never
+   * grant release status.
+   */
+  rawEvidence: C137PerformanceRawEvidenceV1 | C137PerformanceRawEvidenceV2;
 }
 
 export interface C137UiWalkthroughReceipt {
@@ -357,6 +365,13 @@ export type C137BoundAcceptanceReport = Exclude<
   null
 >;
 
+/**
+ * An unauthenticated digest snapshot supplied by the caller.
+ *
+ * It is useful for detecting mutation against a separately captured snapshot,
+ * but it is not an authority credential and must never make a release eligible
+ * by itself. A future formal gate needs a separately verified authority envelope.
+ */
 export interface C137AcceptanceTrustContext {
   trustedProtocolDigest: C137Digest;
   trustedReceiptDigests: {
@@ -479,10 +494,6 @@ export function evaluateC137AcceptanceBundle(
 
   const bundle = value as C137AcceptanceBundle;
   const evidenceChecks = evaluateEvidenceCompleteness(bundle, trustContext);
-  if (evidenceChecks.some((check) => check.status === "incomplete")) {
-    return createAcceptanceGate(evidenceChecks);
-  }
-
   const reports = requireCompleteReports(bundle.reports);
   const receipts = requireCompleteReceipts(bundle.receipts);
   if (reports === null || receipts === null) {
@@ -491,7 +502,7 @@ export function evaluateC137AcceptanceBundle(
 
   const thresholdChecks = [
     ...evaluateDatasetThresholds(reports.dataset),
-    ...evaluateRelationshipThresholds(reports.relationshipRanking),
+    ...evaluateRelationshipThresholds(reports.relationshipRanking, bundle.protocol),
     ...evaluateTimeMapThresholds(reports.timeMap),
     ...evaluateCalibrationThresholds(reports.calibration, bundle.protocol),
     ...evaluateVisualFallbackThresholds(reports.visualFallback),
@@ -684,8 +695,15 @@ function evaluateExternalTrust(
   bundle: C137AcceptanceBundle,
   value: C137AcceptanceTrustContext | undefined
 ): C137AcceptanceCheck[] {
+  const authorityCheck = createCheck(
+    "external-trust-authority",
+    "incomplete",
+    "unverified-caller-snapshot",
+    "调用方摘要快照只能检测内容变化，不能证明签发者身份；正式放行必须验证独立 authority 的签名或受信封装"
+  );
   if (value === undefined) {
     return [
+      authorityCheck,
       createCheck(
         "external-trust-context",
         "incomplete",
@@ -697,6 +715,7 @@ function evaluateExternalTrust(
   const validation = validateC137AcceptanceTrustContext(value);
   if (!validation.valid) {
     return [
+      authorityCheck,
       createCheck(
         "external-trust-context",
         "incomplete",
@@ -707,7 +726,7 @@ function evaluateExternalTrust(
   }
 
   const trust = value;
-  const checks: C137AcceptanceCheck[] = [];
+  const checks: C137AcceptanceCheck[] = [authorityCheck];
   const protocolDigest = computeC137CanonicalDigest(bundle.protocol);
   checks.push(
     createCheck(
@@ -770,6 +789,7 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
     return [];
   }
   const datasetIds = new Set(reports.dataset.cases.map((item) => item.caseId));
+  const datasetById = new Map(reports.dataset.cases.map((item) => [item.caseId, item]));
   const timeMapIds = new Set(reports.timeMap.cases.map((item) => item.caseId));
   const rankingCaseIds = new Set(reports.relationshipRanking.decisions.map((item) => item.caseId));
   const everyDatasetCaseMeasured = [...datasetIds].every(
@@ -781,6 +801,40 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
     ...reports.visualFallback.cases.map((item) => item.caseId),
     ...reports.degradation.cases.map((item) => item.caseId)
   ].every((caseId) => datasetIds.has(caseId));
+  const caseMetadataConsistent =
+    reports.relationshipRanking.decisions.every((item) => {
+      const datasetCase = datasetById.get(item.caseId);
+      return (
+        datasetCase !== undefined &&
+        item.mediaKind === datasetCase.mediaKind &&
+        item.split === datasetCase.split
+      );
+    }) &&
+    reports.timeMap.cases.every((item) => {
+      const datasetCase = datasetById.get(item.caseId);
+      return (
+        datasetCase !== undefined &&
+        item.mediaKind === datasetCase.mediaKind &&
+        item.split === datasetCase.split &&
+        sameStringSet(item.scenarios, datasetCase.scenarios)
+      );
+    }) &&
+    reports.visualFallback.cases.every((item) => {
+      const datasetCase = datasetById.get(item.caseId);
+      return (
+        datasetCase !== undefined &&
+        item.mediaKind === datasetCase.mediaKind &&
+        item.split === datasetCase.split
+      );
+    }) &&
+    reports.degradation.cases.every((item) => {
+      const datasetCase = datasetById.get(item.caseId);
+      return (
+        datasetCase !== undefined &&
+        item.mediaKind === datasetCase.mediaKind &&
+        item.split === datasetCase.split
+      );
+    });
   const frozenTimeMapCases = reports.timeMap.cases.filter(isFrozenRealEvidence);
   const measurementsComplete =
     frozenTimeMapCases.length > 0 &&
@@ -795,10 +849,51 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
             (event.boundaryErrorMs !== null && event.durationErrorMs !== null)
         )
     );
-  const driftEvidenceComplete = frozenTimeMapCases.some(
-    (item) => item.scenarios.includes("time-stretch") && item.endDriftAt45MinutesMs !== null
+  const frozenTimeStretchCases = frozenTimeMapCases.filter((item) =>
+    item.scenarios.includes("time-stretch")
   );
-  const calibrationComplete = reports.calibration.samples.some(isFrozenRealEvidence);
+  const driftEvidenceComplete =
+    frozenTimeStretchCases.length > 0 &&
+    frozenTimeStretchCases.every((item) => item.endDriftAt45MinutesMs !== null);
+  const frozenRankingDecisions = reports.relationshipRanking.decisions.filter(isFrozenRealEvidence);
+  const rankingByDecisionId = new Map(
+    reports.relationshipRanking.decisions.map((item) => [item.decisionId, item])
+  );
+  const calibrationByDecisionId = new Map(
+    reports.calibration.samples.map((item) => [item.decisionId, item])
+  );
+  const frozenCalibrationSamples = reports.calibration.samples.filter(isFrozenRealEvidence);
+  const everyCalibrationSampleBound = reports.calibration.samples.every((sample) => {
+    const decision = rankingByDecisionId.get(sample.decisionId);
+    return (
+      decision !== undefined &&
+      sample.mediaKind === decision.mediaKind &&
+      sample.split === decision.split &&
+      sample.correct === (decision.rankedCandidateIds[0] === decision.goldCandidateId)
+    );
+  });
+  const calibrationComplete =
+    frozenRankingDecisions.length > 0 &&
+    frozenCalibrationSamples.length === frozenRankingDecisions.length &&
+    everyCalibrationSampleBound &&
+    frozenRankingDecisions.every((decision) => {
+      const sample = calibrationByDecisionId.get(decision.decisionId);
+      return (
+        sample !== undefined &&
+        sample.mediaKind === decision.mediaKind &&
+        sample.split === decision.split &&
+        sample.correct === (decision.rankedCandidateIds[0] === decision.goldCandidateId)
+      );
+    });
+  const timeMapByCaseId = new Map(reports.timeMap.cases.map((item) => [item.caseId, item]));
+  const goldEditEventCountsConsistent = reports.dataset.cases.every((datasetCase) => {
+    const timeMapCase = timeMapByCaseId.get(datasetCase.caseId);
+    return (
+      timeMapCase !== undefined &&
+      datasetCase.goldEditEventCount ===
+        timeMapCase.editDecisions.filter((event) => event.goldKind !== null).length
+    );
+  });
   const visualComplete =
     reports.visualFallback.cases.length > 0 &&
     reports.visualFallback.cases.every(
@@ -813,9 +908,14 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
   const performanceValidation = validateC137PerformanceEvidence(
     reports.performance.rawEvidence
   );
+  const performanceRaw = reports.performance.rawEvidence;
+  const performanceWorkloadManifestBound =
+    performanceRaw.schemaVersion === 1 ||
+    performanceRaw.runManifestDigest === bundle.manifestDigest;
   const performanceComplete =
     performanceValidation.valid &&
     performanceValidation.complete &&
+    performanceWorkloadManifestBound &&
     matchesC137PerformanceEnvironment(bundle.environment, reports.performance.rawEvidence) &&
     reports.performance.rawEvidence.planDigest === bundle.protocol.performancePlanDigest &&
     reports.performance.rawEvidence.collector.clock === bundle.protocol.requiredMonotonicClock &&
@@ -836,6 +936,18 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
       "每个数据集 case 必须有 ranking 与 TimeMap 原始 evidence，且报告不得引用清单外 case"
     ),
     createCheck(
+      "case-metadata-consistency",
+      caseMetadataConsistent ? "pass" : "incomplete",
+      caseMetadataConsistent,
+      "ranking、TimeMap、视觉回退和降级报告的 mediaKind/split 必须与 dataset 一致，TimeMap scenarios 还必须与 dataset 完全一致"
+    ),
+    createCheck(
+      "gold-edit-event-count-binding",
+      goldEditEventCountsConsistent ? "pass" : "incomplete",
+      goldEditEventCountsConsistent,
+      "每个 dataset case 声明的 goldEditEventCount 必须等于对应 TimeMap 中 goldKind 非空的原始事件数"
+    ),
+    createCheck(
       "time-map-measurements",
       measurementsComplete ? "pass" : "incomplete",
       measurementsComplete,
@@ -845,13 +957,13 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
       "drift-measurements",
       driftEvidenceComplete ? "pass" : "incomplete",
       driftEvidenceComplete,
-      "至少一组冻结 time-stretch 关系必须提供 45 分钟片尾漂移"
+      "每个冻结 time-stretch 关系都必须提供 45 分钟片尾漂移，禁止选择性漏测"
     ),
     createCheck(
       "calibration-samples",
       calibrationComplete ? "pass" : "incomplete",
       calibrationComplete,
-      "必须提供冻结真实关系的校准样本"
+      "校准样本必须与全部冻结 ranking decision 一对一，mediaKind/split 一致，且 correct 必须由 Top-1 是否命中 gold 重算"
     ),
     createCheck(
       "visual-fallback-samples",
@@ -866,6 +978,14 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
       "必须提供冻结真实无法判断/冲突/PTS 风险的降级样本"
     ),
     createCheck(
+      "performance-workload-manifest-binding",
+      performanceWorkloadManifestBound ? "pass" : "incomplete",
+      performanceRaw.schemaVersion === 2
+        ? performanceRaw.runManifestDigest
+        : "not-applicable-schema-v1",
+      "raw v2 性能 evidence 的 runManifestDigest 必须与当前冻结验收 bundle.manifestDigest 完全一致，禁止跨工作负载复用性能证据"
+    ),
+    createCheck(
       "performance-measurements",
       performanceComplete ? "pass" : "incomplete",
       performanceComplete,
@@ -876,7 +996,7 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
 
 function matchesC137PerformanceEnvironment(
   environment: C137EnvironmentFingerprint,
-  rawEvidence: C137PerformanceRawEvidenceV1
+  rawEvidence: C137PerformanceRawEvidenceV1 | C137PerformanceRawEvidenceV2
 ): boolean {
   const measured = rawEvidence.environment;
   return (
@@ -952,7 +1072,8 @@ function evaluateDatasetThresholds(report: C137DatasetReport): C137AcceptanceChe
 }
 
 function evaluateRelationshipThresholds(
-  report: C137RelationshipRankingReport
+  report: C137RelationshipRankingReport,
+  protocol: C137AcceptanceProtocol
 ): C137AcceptanceCheck[] {
   const frozen = report.decisions.filter(isFrozenRealEvidence);
   const sameAudio = frozen.filter((item) => item.modality === "same-audio");
@@ -964,7 +1085,9 @@ function evaluateRelationshipThresholds(
     (item) =>
       item.verifiedCandidateId !== null && item.verifiedCandidateId !== item.goldCandidateId
   ).length;
-  const topKReported = frozen.filter((item) => item.rankedCandidateIds.length > 0).length;
+  const topKReported = frozen.filter(
+    (item) => item.rankedCandidateIds.length === protocol.topK
+  ).length;
   return [
     thresholdCheck(
       "ranking-frozen-decisions",
@@ -992,7 +1115,7 @@ function evaluateRelationshipThresholds(
       "ranking-top-k-reported",
       topKReported === frozen.length && frozen.length > 0,
       topKReported,
-      "每个 frozen-test 判断均保存有序候选，以便报告 Top-K"
+      `每个 frozen-test 判断必须恰好保存 ${protocol.topK} 个不重复的有序候选，以便报告协议锁定的 Top-K`
     )
   ];
 }
@@ -1203,8 +1326,18 @@ function evaluatePerformanceThresholds(
   report: C137PerformanceReport,
   protocol: C137AcceptanceProtocol
 ): C137AcceptanceCheck[] {
+  const rawSchemaVersion = readRuntimeIntegerField(report.rawEvidence, "schemaVersion");
+  const requiredRawSchemaVersion = readRuntimeIntegerField(
+    protocol,
+    "requiredPerformanceRawSchemaVersion"
+  );
+  const formalRawSchemaMatches =
+    requiredRawSchemaVersion === C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION &&
+    rawSchemaVersion === requiredRawSchemaVersion;
   const validation = validateC137PerformanceEvidence(report.rawEvidence);
-  const measuredRuns = getC137PerformanceMeasuredRuns(report.rawEvidence);
+  const measuredRuns = report.rawEvidence.schemaVersion === 1
+    ? getC137PerformanceMeasuredRuns(report.rawEvidence)
+    : getC137PerformanceMeasuredRuns(report.rawEvidence);
   const coldRuns = measuredRuns.filter((item) => item.runKind === "cold");
   const hotRuns = measuredRuns.filter((item) => item.runKind === "hot");
   const coldElapsed = maximum(coldRuns.map((item) => item.elapsedMs));
@@ -1223,12 +1356,55 @@ function evaluatePerformanceThresholds(
   );
   const maximumCancellationP95 =
     protocol.cancellationThreshold.maximumP95Ms ?? Number.NEGATIVE_INFINITY;
+  const v2Evidence = report.rawEvidence.schemaVersion === 2
+    ? report.rawEvidence
+    : null;
+  const assurance = v2Evidence?.assurance ?? null;
+  const workloadStorageReceiptComplete =
+    formalRawSchemaMatches &&
+    validation.valid &&
+    v2Evidence !== null &&
+    assurance !== null &&
+    assurance.workloadStorageReceiptDigest ===
+      v2Evidence.environment.workloadStorage.receiptDigest;
   return [
+    createCheck(
+      "performance-formal-raw-schema-version",
+      formalRawSchemaMatches ? "pass" : "incomplete",
+      rawSchemaVersion ?? "missing",
+      `正式性能验收只接受原生采集链生成的 raw evidence schemaVersion=${C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION}；v1 工程证据即使改写采样器、存储范围和自摘要也不得晋升`
+    ),
+    createCheck(
+      "workload-storage-receipt",
+      workloadStorageReceiptComplete ? "pass" : "incomplete",
+      workloadStorageReceiptComplete
+        ? (v2Evidence?.environment.workloadStorage.receiptDigest ?? "missing")
+        : "missing-or-unbound",
+      "正式性能验收必须有结构完整、经严格重算并绑定 run manifest/workload 的 path-free 工作负载存储 receipt；其原生来源真实性由独立 native attestation 与 authority 验证"
+    ),
+    createCheck(
+      "job-memory-receipt",
+      "incomplete",
+      "not-verifiable-in-schema-v2",
+      "raw v2 仅预留空字段，尚无 Job Object 进程成员、采样覆盖与峰值内存 receipt 的严格 schema、原生签发与 authority 验证；任意对象不得通过"
+    ),
+    createCheck(
+      "terminal-cleanup-receipt",
+      "incomplete",
+      "not-verifiable-in-schema-v2",
+      "raw v2 仅预留空字段，尚无活动进程归零、输出读取器回收和 session 释放 receipt 的严格 schema、原生签发与 authority 验证；任意对象不得通过"
+    ),
+    createCheck(
+      "native-attestation",
+      "incomplete",
+      "not-verifiable-in-schema-v2",
+      "raw v2 仅预留空字段，尚无独立信任根可核验的原生采集器 attestation schema 和验证器；调用方自建 trustContext 或任意对象不能替代"
+    ),
     thresholdCheck(
       "performance-raw-evidence",
       validation.valid && validation.complete,
       validation.complete,
-      "性能报告必须来自完整、严格校验的 raw evidence v1"
+      "性能报告必须包含完整、严格校验的工程原始测量"
     ),
     thresholdCheck(
       "performance-plan-binding",
@@ -1421,6 +1597,14 @@ function isFrozenRealEvidence(value: {
   return value.mediaKind === "real" && value.split === "frozen-test";
 }
 
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  const rightValues = new Set(right);
+  return left.every((value) => rightValues.has(value));
+}
+
 function evaluateEditClassification(
   events: readonly C137EditDecisionEvidence[]
 ): ClassificationMetrics {
@@ -1538,6 +1722,7 @@ function createAcceptanceGate(checks: C137AcceptanceCheck[]): C137AcceptanceGate
   const incomplete = checks.filter((check) => check.status === "incomplete");
   const failed = checks.filter((check) => check.status === "fail");
   const status = incomplete.length > 0 ? "incomplete-evidence" : failed.length > 0 ? "fail" : "pass";
+  const diagnostics = [...incomplete, ...failed];
   return {
     scope: "c137-release-acceptance",
     status,
@@ -1546,7 +1731,7 @@ function createAcceptanceGate(checks: C137AcceptanceCheck[]): C137AcceptanceGate
     reasons:
       status === "pass"
         ? ["完整 real-frozen C137 evidence、硬门槛、UI 与 release 验收均已通过。"]
-        : (incomplete.length > 0 ? incomplete : failed).map(
+        : diagnostics.map(
             (check) => `${check.id}：${check.requirement}（实际：${String(check.actual)}）。`
           )
   };
@@ -1659,6 +1844,7 @@ function validateProtocol(value: unknown, issues: string[]): void {
       "requiredHotRuns",
       "requiredCancellationRuns",
       "performancePlanDigest",
+      "requiredPerformanceRawSchemaVersion",
       "maximumMemorySampleIntervalMs",
       "requiredMonotonicClock",
       "requiredMemorySampler",
@@ -1698,6 +1884,12 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   requireDigest(record.performancePlanDigest, "bundle.protocol.performancePlanDigest", issues);
+  requireLiteral(
+    record.requiredPerformanceRawSchemaVersion,
+    C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION,
+    "bundle.protocol.requiredPerformanceRawSchemaVersion",
+    issues
+  );
   requirePositiveInteger(
     record.maximumMemorySampleIntervalMs,
     "bundle.protocol.maximumMemorySampleIntervalMs",
@@ -2475,6 +2667,14 @@ function requireTimestamp(value: unknown, path: string, issues: string[]): void 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readRuntimeIntegerField(value: unknown, field: string): number | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const fieldValue = value[field];
+  return isNonNegativeInteger(fieldValue) ? fieldValue : null;
 }
 
 function isNonEmptyString(value: unknown): value is string {

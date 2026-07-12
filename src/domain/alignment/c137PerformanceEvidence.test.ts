@@ -7,6 +7,9 @@ import {
   computeC137PerformanceCanonicalDigest,
   computeC137PerformanceEnvironmentDigest,
   computeC137PerformanceEvidenceDigest,
+  computeC137PerformanceEnvironmentDigestV2,
+  computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformanceEvidenceDraft,
   createC137PerformancePlanDigest,
   finalizeC137PerformanceEvidence,
@@ -22,11 +25,13 @@ import {
   type C137PerformanceNativeTelemetryV1,
   type C137PerformancePlanV1,
   type C137PerformanceRawEvidenceV1,
+  type C137PerformanceRawEvidenceV2,
   type C137PerformanceRunKindV1,
   type C137PerformanceRunV1,
   type C137PerformanceStageTimingV1,
   type C137PerformanceTrialV1
 } from "./c137PerformanceEvidence";
+import { createCompleteC137PerformanceEvidenceV2Fixture } from "../../test/c137PerformanceEvidence";
 
 const MEBIBYTE = 1_024 * 1_024;
 const ONE_GIBIBYTE = 1_024 * MEBIBYTE;
@@ -386,6 +391,97 @@ describe("C137 raw performance evidence v1", () => {
   });
 });
 
+describe("C137 raw performance evidence v2", () => {
+  it("strictly round-trips complete path-free workload storage evidence", () => {
+    const evidence = createCompleteC137PerformanceEvidenceV2Fixture();
+
+    expect(validateC137PerformanceEvidence(evidence)).toEqual({
+      valid: true,
+      complete: true,
+      issues: [],
+      completenessIssues: []
+    });
+    expect(evidence.collector.sampler).toBe("windows-toolhelp-working-set-v1");
+    expect(evidence.releaseEligible).toBe(false);
+    expect(evidence.trustStatus).toBe("untrusted-raw-evidence");
+    const serialized = serializeC137PerformanceEvidence(evidence);
+    expect(parseC137PerformanceEvidence(serialized)).toEqual(evidence);
+    expect(serializeC137PerformanceEvidence(parseC137PerformanceEvidence(serialized))).toBe(
+      serialized
+    );
+  });
+
+  it("keeps schema v1 readable without upgrading it", () => {
+    const evidence = createCompleteEvidence();
+    const parsed = parseC137PerformanceEvidence(serializeC137PerformanceEvidence(evidence));
+
+    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed).toEqual(evidence);
+  });
+
+  it("rejects unknown top-level and mixed nested schema versions", () => {
+    const unknown = { ...createCompleteEvidence(), schemaVersion: 99 };
+    expect(validateC137PerformanceEvidence(unknown).valid).toBe(false);
+
+    const mixed = cloneV2Evidence();
+    const first = mixed.trials[0];
+    if (!first || first.trialType !== "run") throw new Error("expected v2 run");
+    (first.cases[0].telemetry as { schemaVersion: number }).schemaVersion = 1;
+    mixed.evidenceDigest = computeC137PerformanceEvidenceDigestV2(mixed);
+    expect(validateC137PerformanceEvidence(mixed).valid).toBe(false);
+  });
+
+  it.each([
+    ["binding ordinal", (value: C137PerformanceRawEvidenceV2) => {
+      value.environment.workloadStorage.bindings[0].bindingOrdinal = 1;
+    }],
+    ["binding side", (value: C137PerformanceRawEvidenceV2) => {
+      value.environment.workloadStorage.bindings[1].side = "source";
+    }],
+    ["volume reverse count", (value: C137PerformanceRawEvidenceV2) => {
+      value.environment.workloadStorage.volumes[0].bindingCount = 1;
+    }]
+  ] as const)("rejects tampered %s even after all enclosing digests are recomputed", (_label, mutate) => {
+    const evidence = cloneV2Evidence();
+    mutate(evidence);
+    resignV2Evidence(evidence);
+    expect(validateC137PerformanceEvidence(evidence).valid).toBe(false);
+  });
+
+  it("rejects stale receipt and cross-envelope digest bindings", () => {
+    const staleReceipt = cloneV2Evidence();
+    staleReceipt.environment.workloadStorage.receiptDigest = digest("f");
+    staleReceipt.environment.digest = computeC137PerformanceEnvironmentDigestV2(
+      omitV2EnvironmentDigest(staleReceipt.environment)
+    );
+    staleReceipt.evidenceDigest = computeC137PerformanceEvidenceDigestV2(staleReceipt);
+    expect(validateC137PerformanceEvidence(staleReceipt).valid).toBe(false);
+
+    const staleCollector = cloneV2Evidence();
+    staleCollector.collector.runManifestDigest = digest("e");
+    staleCollector.evidenceDigest = computeC137PerformanceEvidenceDigestV2(staleCollector);
+    expect(validateC137PerformanceEvidence(staleCollector).valid).toBe(false);
+  });
+
+  it.each([
+    "jobMemoryReceipt",
+    "terminalCleanupReceipt",
+    "attestation"
+  ] as const)("rejects a forged %s assurance object after the envelope is re-signed", (field) => {
+    const forged = cloneV2Evidence();
+    (forged.assurance as unknown as Record<string, unknown>)[field] = {};
+    forged.evidenceDigest = computeC137PerformanceEvidenceDigestV2(forged);
+    expect(validateC137PerformanceEvidence(forged).valid).toBe(false);
+  });
+
+  it("rejects a forged formal eligibility flag", () => {
+    const formalFlag = cloneV2Evidence();
+    (formalFlag.assurance as unknown as Record<string, unknown>).formalEligible = true;
+    formalFlag.evidenceDigest = computeC137PerformanceEvidenceDigestV2(formalFlag);
+    expect(validateC137PerformanceEvidence(formalFlag).valid).toBe(false);
+  });
+});
+
 function createCompleteEvidence(): C137PerformanceRawEvidenceV1 {
   const plan = createPlan();
   let draft = createC137PerformanceEvidenceDraft({
@@ -735,6 +831,33 @@ function requireCancellation(
     throw new Error("expected cancellation trial");
   }
   return trial;
+}
+
+function cloneV2Evidence(): C137PerformanceRawEvidenceV2 {
+  return structuredClone(createCompleteC137PerformanceEvidenceV2Fixture());
+}
+
+function resignV2Evidence(evidence: C137PerformanceRawEvidenceV2): void {
+  evidence.environment.workloadStorage.receiptDigest =
+    computeC137PerformanceWorkloadStorageReceiptDigest(
+      evidence.environment.workloadStorage
+    );
+  evidence.environment.digest = computeC137PerformanceEnvironmentDigestV2(
+    omitV2EnvironmentDigest(evidence.environment)
+  );
+  evidence.collector.workloadStorageReceiptDigest =
+    evidence.environment.workloadStorage.receiptDigest;
+  evidence.assurance.workloadStorageReceiptDigest =
+    evidence.environment.workloadStorage.receiptDigest;
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
+}
+
+function omitV2EnvironmentDigest(
+  environment: C137PerformanceRawEvidenceV2["environment"]
+): Omit<C137PerformanceRawEvidenceV2["environment"], "digest"> {
+  const { digest: ignoredDigest, ...unsigned } = environment;
+  void ignoredDigest;
+  return unsigned;
 }
 
 function digest(character: string): `sha256:${string}` {

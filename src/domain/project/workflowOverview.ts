@@ -139,8 +139,8 @@ export function createWorkflowOverview(
       label: "去匹配页复核候选",
       detail:
         workspace.pendingMatchCandidateCount > 0
-          ? `有 ${formatCount(workspace.pendingMatchCandidateCount)} 个候选待复核；确认后才会生成来源段。`
-          : `已确认 ${formatCount(workspace.confirmedTargetCount)} / ${formatCount(targetCount)} 个原片。`,
+          ? `有 ${formatCount(workspace.pendingMatchCandidateCount)} 个候选待复核；保存关系后才会生成来源段，完成验证前仍不能导出。`
+          : `${formatCount(workspace.confirmedTargetCount)} / ${formatCount(targetCount)} 个原片已有保存关系；请继续完成复核和验证。`,
       enabled: assetCount > 0 && targetCount > 0 && referenceCount > 0,
       reason:
         assetCount === 0 || targetCount === 0 || referenceCount === 0

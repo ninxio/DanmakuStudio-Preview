@@ -524,7 +524,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       const addedCount = get().project.danmakuSourceSegments.length - beforeCount;
       set({
         status: {
-          message: `已确认匹配关系，新增 ${Math.max(0, addedCount)} 个来源段。`,
+          message: `关系已保存，新增 ${Math.max(0, addedCount)} 个来源段；完成复核和验证前不能正式导出。`,
           tone: "success"
         }
       });
