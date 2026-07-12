@@ -152,8 +152,8 @@ test.beforeEach(async ({ page }) => {
       };
 
       const mockWindow = window as unknown as MockTauriWindow;
-      let jobIndex = 0;
-      const completedJobs = new Map<string, Record<string, unknown>>();
+      let batchJobIndex = 0;
+      const completedBatchJobs = new Map<string, Record<string, unknown>>();
       mockWindow.isTauri = true;
       mockWindow.__C136_DIALOG_CALLS__ = [];
       mockWindow.__C137_VERIFICATION_CALLS__ = [];
@@ -194,56 +194,67 @@ test.beforeEach(async ({ page }) => {
             }
             return null;
           }
-          if (command === "start_audio_alignment_job") {
-            const currentIndex = jobIndex;
-            jobIndex += 1;
-            const jobId = `c136-job-${currentIndex + 1}`;
+          if (command === "start_audio_alignment_batch_job") {
+            const request = (args.request ?? {}) as {
+              pairs?: Array<{ sourceMediaId: string; targetMediaId: string }>;
+            };
+            const pairs = request.pairs ?? [];
+            batchJobIndex += 1;
+            const jobId = `c137-batch-job-${batchJobIndex}`;
             const snapshot = {
+              schemaVersion: 1,
               jobId,
               status: "completed",
               progress: 1,
-              message: "已定位对应片段",
-              stageKey: "completed",
-              stageLabel: "分析完成",
-              stageIndex: 9,
-              stageCount: 9,
-              stageProgress: 1,
-              logs: [`模拟桌面定位任务 ${currentIndex + 1}`],
-              proposal: {
-                anchors: [
-                  {
-                    id: `anchor-${currentIndex + 1}`,
-                    sourceMs: currentIndex * 60_000 + 5_000,
-                    targetMs: 5_000,
-                    confidence: 0.94,
-                    origin: "automatic"
+              message: "批量分析完成",
+              totalPairCount: pairs.length,
+              processedPairCount: pairs.length,
+              failedPairCount: 0,
+              currentPairOrdinal: null,
+              pairs: pairs.map((pair, currentIndex) => ({
+                pairOrdinal: currentIndex + 1,
+                sourceMediaId: pair.sourceMediaId,
+                targetMediaId: pair.targetMediaId,
+                status: "completed",
+                progress: 1,
+                message: "已定位对应片段",
+                proposal: {
+                  anchors: [
+                    {
+                      id: `anchor-${currentIndex + 1}`,
+                      sourceMs: currentIndex * 60_000 + 5_000,
+                      targetMs: 5_000,
+                      confidence: 0.94,
+                      origin: "automatic"
+                    }
+                  ],
+                  cutCandidates: [],
+                  confidence: 0.9,
+                  diagnostics: ["E2E 使用确定性桌面批任务结果；真实定位由 Rust 测试覆盖。"],
+                  timeMap: createTimeMap(currentIndex),
+                  matchRange: {
+                    sourceStartMs: currentIndex * 60_000,
+                    sourceEndMs: (currentIndex + 1) * 60_000,
+                    targetStartMs: 0,
+                    targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
+                    coverage: currentIndex === 0 ? 0.72 : 0.96
                   }
-                ],
-                cutCandidates: [],
-                confidence: 0.9,
-                diagnostics: ["E2E 使用确定性桌面桥接结果；真实定位由 Rust 测试覆盖。"],
-                timeMap: createTimeMap(currentIndex),
-                matchRange: {
-                  sourceStartMs: currentIndex * 60_000,
-                  sourceEndMs: (currentIndex + 1) * 60_000,
-                  targetStartMs: 0,
-                  targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
-                  coverage: currentIndex === 0 ? 0.72 : 0.96
-                }
-              },
+                },
+                error: null
+              })),
               error: null,
               updatedAtMs: Date.now()
             };
-            completedJobs.set(jobId, snapshot);
+            completedBatchJobs.set(jobId, snapshot);
             return snapshot;
           }
-          if (command === "get_audio_alignment_job") {
+          if (command === "get_audio_alignment_batch_job") {
             const jobId = typeof args.jobId === "string" ? args.jobId : "";
-            return completedJobs.get(jobId) ?? null;
+            return completedBatchJobs.get(jobId) ?? null;
           }
-          if (command === "cancel_audio_alignment_job") {
+          if (command === "cancel_audio_alignment_batch_job") {
             const jobId = typeof args.jobId === "string" ? args.jobId : "";
-            return completedJobs.get(jobId) ?? null;
+            return completedBatchJobs.get(jobId) ?? null;
           }
           if (command === "start_mpv_sidecar") {
             throw new Error("E2E 未连接真实 mpv 与真实媒体，播放证据不得成立。");
@@ -359,7 +370,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
   await expect(page.getByTestId("media-match-candidate")).toHaveCount(5);
   await expect(page.getByTestId("status-bar")).toContainText(
-    "pairwise 找到 5、全局采用 4、阻断备选 1"
+    "找到 5 组可能对应片段，其中 4 组建议优先复核，1 组需要额外复核"
   );
   const firstCandidate = page.getByTestId("media-match-candidate").nth(0);
   await firstCandidate.getByText("来源↔原片时间图复核").click();

@@ -47,11 +47,12 @@ import type {
 } from "../../domain/project/types";
 import { formatTimecode } from "../../domain/shared/time";
 import {
-  cancelTauriAudioAlignmentJob,
-  getTauriAudioAlignmentJob,
+  cancelTauriAudioAlignmentBatchJob,
+  getTauriAudioAlignmentBatchJob,
   isAudioAlignmentJobFinished,
-  startTauriAudioAlignmentJob,
-  type AudioAlignmentJobSnapshot
+  startTauriAudioAlignmentBatchJob,
+  type AudioAlignmentBatchJobSnapshot,
+  type AudioAlignmentBatchPairSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
 import { isManualVerificationAuthorityAvailable } from "../../infrastructure/media/manualVerificationAuthority";
@@ -82,8 +83,8 @@ interface CandidateAssetSelection {
 interface StagedPairwiseCandidate {
   pairId: string;
   candidate: MediaMatchCandidate;
-  sourceOrderHint: number;
-  targetOrderHint: number;
+  sourceOrderHint: number | null;
+  targetOrderHint: number | null;
 }
 
 interface ResolvedGlobalCandidate extends StagedPairwiseCandidate {
@@ -200,9 +201,17 @@ export function MediaMatchingPanel({
     batchTokenRef.current += 1;
     cancelRequestedRef.current = true;
     const activeJob = activeJobRef.current;
-    activeJobRef.current = null;
     if (activeJob) {
-      void cancelTauriAudioAlignmentJob(activeJob.jobId).catch(() => undefined);
+      void cancelTauriAudioAlignmentBatchJob(activeJob.jobId)
+        .then((snapshot) => {
+          if (
+            isAudioAlignmentJobFinished(snapshot.status) &&
+            activeJobRef.current?.jobId === activeJob.jobId
+          ) {
+            activeJobRef.current = null;
+          }
+        })
+        .catch(() => undefined);
     }
     sourceSelectionTouchedRef.current = false;
     targetSelectionTouchedRef.current = false;
@@ -219,7 +228,7 @@ export function MediaMatchingPanel({
       cancelRequestedRef.current = true;
       const activeJob = activeJobRef.current;
       if (activeJob) {
-        void cancelTauriAudioAlignmentJob(activeJob.jobId).catch(() => undefined);
+        void cancelTauriAudioAlignmentBatchJob(activeJob.jobId).catch(() => undefined);
       }
     },
     []
@@ -232,6 +241,24 @@ export function MediaMatchingPanel({
   const hasCancelledTasks = tasks.some((task) => task.state === "cancelled");
 
   const runBatch = async () => {
+    const unfinishedPriorJob = activeJobRef.current;
+    if (unfinishedPriorJob) {
+      try {
+        const stopped = await cancelTauriAudioAlignmentBatchJob(unfinishedPriorJob.jobId);
+        if (!isAudioAlignmentJobFinished(stopped.status)) {
+          throw new Error("原生批次尚未进入终态");
+        }
+        if (activeJobRef.current?.jobId === unfinishedPriorJob.jobId) {
+          activeJobRef.current = null;
+        }
+      } catch {
+        setEditorStatus(
+          "上一次原生批次的清理状态仍不确定，已拒绝启动新任务。请再次尝试；若持续失败，请重启应用以回收媒体进程。",
+          "error"
+        );
+        return;
+      }
+    }
     const selectedSources = selectedSourceIds
       .map((id) => sourceMedia.find((media) => media.id === id))
       .filter((media): media is ProjectMediaReference => Boolean(media));
@@ -243,7 +270,11 @@ export function MediaMatchingPanel({
       return;
     }
     const pairs = selectedSources.flatMap((source) =>
-      selectedTargets.map((target) => ({ source, target, id: `${source.id}:${target.id}` }))
+      selectedTargets.map((target) => ({
+        source,
+        target,
+        id: createMediaPairKey(source.id, target.id)
+      }))
     );
     const existingPairKeys = new Set([
       ...useEditorStore
@@ -266,10 +297,10 @@ export function MediaMatchingPanel({
       (pair) => !existingPairKeys.has(createMediaPairKey(pair.source.id, pair.target.id))
     );
     const sourceOrderById = new Map(
-      selectedSources.map((media, index) => [media.id, index] as const)
+      selectedSources.map((media) => [media.id, semanticEpisodeOrderHint(media)] as const)
     );
     const targetOrderById = new Map(
-      selectedTargets.map((media, index) => [media.id, index] as const)
+      selectedTargets.map((media) => [media.id, semanticEpisodeOrderHint(media)] as const)
     );
     const batchId = createId("media_match_batch");
     const initialTasks: BatchTask[] = pairs.map(({ source, target, id }) => ({
@@ -305,17 +336,12 @@ export function MediaMatchingPanel({
     const settings = loadAppSettings().alignment;
     const stagedCandidates: StagedPairwiseCandidate[] = [];
     let contextInvalidated = false;
-    let failedCount = 0;
-
-    for (const pair of pendingPairs) {
-      if (cancelRequestedRef.current || !isRunCurrent()) {
-        break;
+    const isBatchContextCurrent = () => {
+      if (!isRunCurrent()) {
+        return false;
       }
-      const isPairCurrent = () => {
-        if (!isRunCurrent()) {
-          return false;
-        }
-        const currentProject = useEditorStore.getState().project;
+      const currentProject = useEditorStore.getState().project;
+      return pendingPairs.every((pair) => {
         const currentSource = findProjectMedia(currentProject, pair.source.id);
         const currentTarget = findProjectMedia(currentProject, pair.target.id);
         return (
@@ -324,132 +350,117 @@ export function MediaMatchingPanel({
           normalizeLocalPath(currentTarget?.localPath) ===
             normalizeLocalPath(pair.target.localPath)
         );
-      };
-      updateTask(pair.id, {
-        state: "running",
-        progress: 0,
-        message: "正在定位参考视频中的对应片段"
       });
-      let pairJobId: string | null = null;
-      try {
-        let snapshot = await startTauriAudioAlignmentJob({
-          completePath: requireLocalPath(pair.target),
-          sourcePath: requireLocalPath(pair.source),
-          ffmpegPath: settings.ffmpegPath.trim() || null,
-          windowMs: settings.windowMs,
-          minGapMs: settings.minGapMs,
-          matchThreshold: settings.matchThreshold,
-          localizationMode: true
-        });
-        pairJobId = snapshot.jobId;
-        if (!isRunCurrent()) {
-          if (!isAudioAlignmentJobFinished(snapshot.status)) {
-            void cancelTauriAudioAlignmentJob(snapshot.jobId).catch(() => undefined);
-          }
-          break;
-        }
-        activeJobRef.current = { runToken, jobId: snapshot.jobId };
-        if (!isPairCurrent()) {
-          contextInvalidated = true;
-          if (!isAudioAlignmentJobFinished(snapshot.status)) {
-            void cancelTauriAudioAlignmentJob(snapshot.jobId).catch(() => undefined);
-          }
-          break;
-        }
-        updateTaskFromSnapshot(pair.id, snapshot);
-        if (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status)) {
-          try {
-            snapshot = await cancelTauriAudioAlignmentJob(snapshot.jobId);
-            if (isRunCurrent()) {
-              updateTaskFromSnapshot(pair.id, snapshot);
-            }
-          } catch {
-            // 后端任务可能已结束；前端仍按已取消处理，并且不会创建候选。
-          }
-          if (isRunCurrent()) {
-            updateTask(pair.id, { state: "cancelled", message: "已取消" });
-          }
-          break;
-        }
-        while (!isAudioAlignmentJobFinished(snapshot.status)) {
-          await waitForPoll();
-          if (cancelRequestedRef.current || !isPairCurrent()) {
-            break;
-          }
-          snapshot = await getTauriAudioAlignmentJob(snapshot.jobId);
-          if (!isPairCurrent()) {
-            contextInvalidated = true;
-            if (!isAudioAlignmentJobFinished(snapshot.status)) {
-              void cancelTauriAudioAlignmentJob(snapshot.jobId).catch(() => undefined);
-            }
-            break;
-          }
-          updateTaskFromSnapshot(pair.id, snapshot);
-        }
-        if (!isPairCurrent()) {
-          contextInvalidated = true;
-          if (!isAudioAlignmentJobFinished(snapshot.status)) {
-            void cancelTauriAudioAlignmentJob(snapshot.jobId).catch(() => undefined);
-          }
-          break;
-        }
-        if (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status)) {
-          updateTask(pair.id, { state: "cancelled", message: "已取消" });
-          break;
-        }
-        if (snapshot.status === "cancelled") {
-          updateTask(pair.id, { state: "cancelled", message: snapshot.message || "已取消" });
-          continue;
-        }
-        if (snapshot.status === "failed") {
-          throw new Error(snapshot.error ?? snapshot.message ?? "分析失败");
-        }
-        if (!snapshot.proposal?.matchRange) {
-          updateTask(pair.id, {
-            state: "notFound",
-            progress: 1,
-            message: "没有找到可信对应片段"
-          });
-          continue;
-        }
-        const currentProject = useEditorStore.getState().project;
-        const proposal = augmentAlignmentProposalWithDanmakuEvidence(
-          snapshot.proposal,
-          danmakuEvidenceForSource(currentProject, pair.source.id, suspectedCutCandidates)
-        );
-        const candidate = createMediaMatchCandidate(currentProject, {
-          id: createId("media_match_candidate"),
-          batchId,
+    };
+    const pendingSourceIds = new Set(pendingPairs.map((pair) => pair.source.id));
+    const pendingTargetIds = new Set(pendingPairs.map((pair) => pair.target.id));
+    let snapshot: AudioAlignmentBatchJobSnapshot | null = null;
+    let batchJobId: string | null = null;
+    let batchFailure: string | null = null;
+    let cancelSent = false;
+    let cleanupUnconfirmed = false;
+
+    try {
+      snapshot = await startTauriAudioAlignmentBatchJob({
+        sources: selectedSources
+          .filter((media) => pendingSourceIds.has(media.id))
+          .map((media) => ({ mediaId: media.id, path: requireLocalPath(media) })),
+        targets: selectedTargets
+          .filter((media) => pendingTargetIds.has(media.id))
+          .map((media) => ({ mediaId: media.id, path: requireLocalPath(media) })),
+        pairs: pendingPairs.map((pair) => ({
           sourceMediaId: pair.source.id,
-          targetMediaId: pair.target.id,
-          proposal
-        });
-        stagedCandidates.push({
-          pairId: pair.id,
-          candidate,
-          sourceOrderHint: sourceOrderById.get(pair.source.id) ?? 0,
-          targetOrderHint: targetOrderById.get(pair.target.id) ?? 0
-        });
-        updateTask(pair.id, {
-          state: "found",
-          progress: 1,
-          message: `Pairwise 已找到 ${formatTimecode(candidate.sourceStartMs)}–${formatTimecode(candidate.sourceEndMs)}，等待全局分配`
-        });
-      } catch (error) {
-        if (isRunCurrent()) {
-          failedCount += 1;
-          updateTask(pair.id, {
-            state: "failed",
-            message: error instanceof Error ? error.message : "分析失败"
-          });
+          targetMediaId: pair.target.id
+        })),
+        ffmpegPath: settings.ffmpegPath.trim() || null,
+        windowMs: settings.windowMs,
+        minGapMs: settings.minGapMs,
+        matchThreshold: settings.matchThreshold,
+        localizationMode: true
+      });
+      batchJobId = snapshot.jobId;
+      if (!isRunCurrent()) {
+        if (!isAudioAlignmentJobFinished(snapshot.status)) {
+          void cancelTauriAudioAlignmentBatchJob(snapshot.jobId).catch(() => undefined);
         }
-      } finally {
-        if (
-          activeJobRef.current?.runToken === runToken &&
-          activeJobRef.current.jobId === pairJobId
-        ) {
-          activeJobRef.current = null;
+        return;
+      }
+      activeJobRef.current = { runToken, jobId: snapshot.jobId };
+      if (!isBatchContextCurrent()) {
+        contextInvalidated = true;
+        if (!isAudioAlignmentJobFinished(snapshot.status)) {
+          void cancelTauriAudioAlignmentBatchJob(snapshot.jobId).catch(() => undefined);
         }
+      } else {
+        updateTasksFromBatchSnapshot(snapshot);
+      }
+
+      while (
+        !contextInvalidated &&
+        isRunCurrent() &&
+        !isAudioAlignmentJobFinished(snapshot.status)
+      ) {
+        if (cancelRequestedRef.current && !cancelSent) {
+          cancelSent = true;
+          try {
+            snapshot = await cancelTauriAudioAlignmentBatchJob(snapshot.jobId);
+            if (isBatchContextCurrent()) {
+              updateTasksFromBatchSnapshot(snapshot);
+            }
+          } catch (error) {
+            batchFailure = error instanceof Error ? error.message : "停止批次时发生错误";
+          }
+          continue;
+        }
+        await waitForPoll();
+        if (!isRunCurrent()) {
+          break;
+        }
+        if (!isBatchContextCurrent()) {
+          contextInvalidated = true;
+          const activeJob = activeJobRef.current;
+          if (
+            activeJob?.runToken === runToken &&
+            activeJob.jobId === snapshot.jobId &&
+            !isAudioAlignmentJobFinished(snapshot.status)
+          ) {
+            void cancelTauriAudioAlignmentBatchJob(snapshot.jobId).catch(() => undefined);
+          }
+          break;
+        }
+        if (cancelRequestedRef.current && !cancelSent) {
+          continue;
+        }
+        snapshot = await getTauriAudioAlignmentBatchJob(snapshot.jobId);
+        if (isBatchContextCurrent()) {
+          updateTasksFromBatchSnapshot(snapshot);
+        }
+      }
+    } catch (error) {
+      batchFailure = error instanceof Error ? error.message : "批量匹配未能完成";
+    } finally {
+      const ownsActiveJob =
+        activeJobRef.current?.runToken === runToken &&
+        activeJobRef.current.jobId === batchJobId;
+      if (ownsActiveJob && snapshot && !isAudioAlignmentJobFinished(snapshot.status)) {
+        try {
+          snapshot = await cancelTauriAudioAlignmentBatchJob(snapshot.jobId);
+          if (isBatchContextCurrent()) {
+            updateTasksFromBatchSnapshot(snapshot);
+          }
+        } catch {
+          cleanupUnconfirmed = true;
+          batchFailure =
+            "原生批次清理状态不确定；已保留任务引用并阻止新任务，必要时请重启应用。";
+        }
+      }
+      if (
+        ownsActiveJob &&
+        !cleanupUnconfirmed &&
+        snapshot &&
+        isAudioAlignmentJobFinished(snapshot.status)
+      ) {
+        activeJobRef.current = null;
       }
     }
 
@@ -464,6 +475,131 @@ export function MediaMatchingPanel({
       setRunning(false);
       return;
     }
+    if (cleanupUnconfirmed) {
+      setTasks((current) =>
+        current.map((task) =>
+          task.state === "waiting" || task.state === "running"
+            ? {
+                ...task,
+                state: "failed",
+                progress: 1,
+                message: "原生任务清理状态不确定；未应用任何迟到结果"
+              }
+            : task
+        )
+      );
+      setEditorStatus(batchFailure ?? "原生批次清理状态不确定。", "error");
+      setRunning(false);
+      return;
+    }
+    if (!snapshot) {
+      const cancelledBeforeStart = cancelRequestedRef.current;
+      setTasks((current) =>
+        current.map((task) =>
+          pendingPairs.some((pair) => pair.id === task.id)
+            ? {
+                ...task,
+                state: cancelledBeforeStart ? "cancelled" : "failed",
+                progress: 1,
+                message: cancelledBeforeStart
+                  ? "未开始，已取消"
+                  : (batchFailure ?? "批量匹配未能开始")
+              }
+            : task
+        )
+      );
+      setEditorStatus(
+        cancelledBeforeStart
+          ? "批量匹配已取消：任务尚未开始。"
+          : `批量匹配未能开始：${batchFailure ?? "未收到原生批任务状态。"}`,
+        cancelledBeforeStart ? "warning" : "error"
+      );
+      setRunning(false);
+      return;
+    }
+    if (snapshot.status === "failed") {
+      batchFailure = snapshot.error ?? batchFailure ?? snapshot.message;
+    }
+    const pairSnapshots = new Map(
+      snapshot.pairs.map((pairSnapshot) => [
+        createMediaPairKey(pairSnapshot.sourceMediaId, pairSnapshot.targetMediaId),
+        pairSnapshot
+      ])
+    );
+    let failedCount = 0;
+    let cancelledCount = 0;
+    for (const pair of pendingPairs) {
+      const pairSnapshot = pairSnapshots.get(createMediaPairKey(pair.source.id, pair.target.id));
+      if (!pairSnapshot) {
+        if (cancelRequestedRef.current) {
+          cancelledCount += 1;
+          updateTask(pair.id, { state: "cancelled", progress: 1, message: "未完成，已停止" });
+        } else {
+          failedCount += 1;
+          updateTask(pair.id, {
+            state: "failed",
+            progress: 1,
+            message: batchFailure ?? "这组素材未能完成分析"
+          });
+        }
+        continue;
+      }
+      if (pairSnapshot.status === "failed") {
+        failedCount += 1;
+        updateTask(pair.id, batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot.jobId));
+        continue;
+      }
+      if (pairSnapshot.status === "cancelled") {
+        cancelledCount += 1;
+        updateTask(pair.id, batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot.jobId));
+        continue;
+      }
+      if (pairSnapshot.status !== "completed") {
+        if (cancelRequestedRef.current) {
+          cancelledCount += 1;
+          updateTask(pair.id, { state: "cancelled", progress: 1, message: "未完成，已停止" });
+        } else {
+          failedCount += 1;
+          updateTask(pair.id, {
+            state: "failed",
+            progress: 1,
+            message: batchFailure ?? "这组素材未能完成分析"
+          });
+        }
+        continue;
+      }
+      if (!pairSnapshot.proposal?.matchRange) {
+        updateTask(pair.id, {
+          state: "notFound",
+          progress: 1,
+          message: "没有找到可信对应片段"
+        });
+        continue;
+      }
+      const currentProject = useEditorStore.getState().project;
+      const proposal = augmentAlignmentProposalWithDanmakuEvidence(
+        pairSnapshot.proposal,
+        danmakuEvidenceForSource(currentProject, pair.source.id, suspectedCutCandidates)
+      );
+      const candidate = createMediaMatchCandidate(currentProject, {
+        id: createId("media_match_candidate"),
+        batchId,
+        sourceMediaId: pair.source.id,
+        targetMediaId: pair.target.id,
+        proposal
+      });
+      stagedCandidates.push({
+        pairId: pair.id,
+        candidate,
+        sourceOrderHint: sourceOrderById.get(pair.source.id) ?? null,
+        targetOrderHint: targetOrderById.get(pair.target.id) ?? null
+      });
+      updateTask(pair.id, {
+        state: "found",
+        progress: 1,
+        message: `已找到 ${formatTimecode(candidate.sourceStartMs)}–${formatTimecode(candidate.sourceEndMs)}，正在与整批结果比较`
+      });
+    }
     const globalResolution = resolveGlobalBatch(stagedCandidates);
     globalResolution.candidates.forEach((resolved) => {
       addCandidate(resolved.candidate);
@@ -473,41 +609,41 @@ export function MediaMatchingPanel({
         message: resolved.globalMessage
       });
     });
-    const batchSummary = `pairwise 找到 ${stagedCandidates.length}、全局采用 ${globalResolution.adoptedCount}、阻断备选 ${globalResolution.blockedCount}`;
-    if (cancelRequestedRef.current) {
-      setTasks((current) =>
-        current.map((task) =>
-          task.state === "waiting"
-            ? { ...task, state: "cancelled", message: "批次已取消" }
-            : task
-        )
-      );
+    const batchSummary = `找到 ${stagedCandidates.length} 组可能对应片段，其中 ${globalResolution.adoptedCount} 组建议优先复核，${globalResolution.blockedCount} 组需要额外复核`;
+    const cancelled =
+      snapshot.status === "cancelled" ||
+      (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status));
+    if (cancelled) {
       setEditorStatus(
-        `批量匹配已取消：已完成结果中 ${batchSummary}；未完成任务已取消。`,
+        `批量匹配已取消：已完成结果中${batchSummary}；${cancelledCount} 组未完成。`,
         "warning"
       );
     } else {
       const skippedCount = pairs.length - pendingPairs.length;
+      const summaryPrefix = snapshot.status === "failed" ? "批量匹配提前结束" : "批量匹配完成";
       setEditorStatus(
-        `批量匹配完成：${batchSummary}${
+        `${summaryPrefix}：${batchSummary}${
           skippedCount > 0 ? `，跳过 ${skippedCount} 组已有结果` : ""
-        }${failedCount > 0 ? `，${failedCount} 组失败` : ""}。`,
-        failedCount > 0 || globalResolution.blockedCount > 0 ? "warning" : "success"
+        }${failedCount > 0 ? `，${failedCount} 组未能完成分析` : ""}${
+          batchFailure ? `；${batchFailure}` : ""
+        }。`,
+        snapshot.status === "failed" || failedCount > 0 || globalResolution.blockedCount > 0
+          ? "warning"
+          : "success"
       );
     }
     setRunning(false);
   };
 
-  const cancelBatch = async () => {
+  const cancelBatch = () => {
     cancelRequestedRef.current = true;
-    const activeJob = activeJobRef.current;
-    if (activeJob) {
-      try {
-        await cancelTauriAudioAlignmentJob(activeJob.jobId);
-      } catch {
-        // 任务可能恰好结束；循环会在下一次状态检查时停止。
-      }
-    }
+    setTasks((current) =>
+      current.map((task) =>
+        task.state === "waiting" || task.state === "running"
+          ? { ...task, message: "正在停止；已经找到的结果会保留" }
+          : task
+      )
+    );
   };
 
   const selectedAssetIdsForCandidate = (candidate: MediaMatchCandidate): string[] =>
@@ -527,13 +663,23 @@ export function MediaMatchingPanel({
     );
   };
 
-  const updateTaskFromSnapshot = (taskId: string, snapshot: AudioAlignmentJobSnapshot) => {
-    updateTask(taskId, {
-      jobId: snapshot.jobId,
-      progress: snapshot.progress,
-      message: snapshot.stageLabel || snapshot.message,
-      logs: snapshot.logs
-    });
+  const updateTasksFromBatchSnapshot = (snapshot: AudioAlignmentBatchJobSnapshot) => {
+    const pairSnapshots = new Map(
+      snapshot.pairs.map((pairSnapshot) => [
+        createMediaPairKey(pairSnapshot.sourceMediaId, pairSnapshot.targetMediaId),
+        pairSnapshot
+      ])
+    );
+    setTasks((current) =>
+      current.map((task) => {
+        const pairSnapshot = pairSnapshots.get(
+          createMediaPairKey(task.sourceMediaId, task.targetMediaId)
+        );
+        return pairSnapshot
+          ? { ...task, ...batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot.jobId) }
+          : task;
+      })
+    );
   };
 
   return (
@@ -588,7 +734,7 @@ export function MediaMatchingPanel({
       <div className="mt-3 flex flex-wrap items-center gap-2 rounded border border-panel-line bg-black/15 p-2">
         <span className="mr-auto text-slate-400">
           将分析 {selectedSourceIds.length} 个参考 × {selectedTargetIds.length} 个原片，共{" "}
-          {pairCount} 组；任务顺序执行并复用音频特征缓存。
+          {pairCount} 组；所选组合会合并为一个批次并按顺序检查，界面不会逐组重复启动任务。
         </span>
         {running ? (
           <TextButton tone="danger" onClick={() => void cancelBatch()}>
@@ -640,6 +786,43 @@ export function MediaMatchingPanel({
   );
 }
 
+function batchTaskPatchFromPairSnapshot(
+  snapshot: AudioAlignmentBatchPairSnapshot,
+  jobId: string | null
+): Partial<BatchTask> {
+  const base = {
+    jobId,
+    progress: snapshot.progress,
+    logs: snapshot.message ? [snapshot.message] : []
+  };
+  if (snapshot.status === "queued") {
+    return { ...base, state: "waiting", message: "等待前面的组合完成" };
+  }
+  if (snapshot.status === "running") {
+    return { ...base, state: "running", message: "正在寻找可能对应的片段" };
+  }
+  if (snapshot.status === "failed") {
+    return {
+      ...base,
+      state: "failed",
+      progress: 1,
+      message: snapshot.error ?? "这组素材未能完成分析"
+    };
+  }
+  if (snapshot.status === "cancelled") {
+    return { ...base, state: "cancelled", progress: 1, message: "未完成，已停止" };
+  }
+  if (!snapshot.proposal?.matchRange) {
+    return { ...base, state: "notFound", progress: 1, message: "没有找到可信对应片段" };
+  }
+  return {
+    ...base,
+    state: "found",
+    progress: 1,
+    message: `已找到 ${formatTimecode(snapshot.proposal.matchRange.sourceStartMs)}–${formatTimecode(snapshot.proposal.matchRange.sourceEndMs)}，等待整批比较`
+  };
+}
+
 function resolveGlobalBatch(
   stagedCandidates: readonly StagedPairwiseCandidate[]
 ): GlobalBatchResolution {
@@ -668,7 +851,7 @@ function resolveGlobalBatch(
     }
   }
   const ambiguityReason = assignment.ambiguous
-    ? `全局 Top1/Top2 组合差距仅 ${formatQualityRatio(assignment.normalizedMargin)}，这些互斥关系无法唯一确定，需人工复核。`
+    ? `两套可行组合的把握接近（差距 ${formatQualityRatio(assignment.normalizedMargin)}），目前无法唯一确定，需人工复核。`
     : null;
   let adoptedCount = 0;
   const candidates = stagedCandidates.map((staged): ResolvedGlobalCandidate => {
@@ -684,7 +867,7 @@ function resolveGlobalBatch(
           staged.candidate,
           "全局分配：进入本批次最佳无冲突组合。"
         ),
-        globalMessage: `Pairwise 已找到 ${rangeText}；全局采用`
+        globalMessage: `已找到 ${rangeText}；建议优先复核`
       };
     }
 
@@ -695,11 +878,21 @@ function resolveGlobalBatch(
         rejection?.reason ?? "notInBestCombination",
         rejection?.conflictsWith.length ?? 0
       );
+    const resolvedCandidate =
+      rejection?.reason === "blocked"
+        ? staged.candidate
+        : blockCandidateForGlobalReview(staged.candidate, reason);
+    const globalMessage =
+      rejection?.reason === "blocked"
+        ? `已找到 ${rangeText}；证据不足，暂不建议采用`
+        : `已找到 ${rangeText}；与其他结果冲突，作为备选保留：${reason}`;
     return {
       ...staged,
       adopted: false,
-      candidate: blockCandidateForGlobalReview(staged.candidate, reason),
-      globalMessage: `Pairwise 已找到 ${rangeText}；全局阻断备选：${reason}`
+      // A central quality block can be resolved by the existing per-span review workflow.
+      // Do not add a second, persistent global blocker that manual review cannot clear.
+      candidate: resolvedCandidate,
+      globalMessage
     };
   });
   return {
@@ -731,9 +924,9 @@ function createGlobalMatchHypothesis(staged: StagedPairwiseCandidate): GlobalMat
     ),
     alternativeMargin: clampUnitScore(quality?.alternativeMargin ?? 0),
     repeatedContentOnly: timeMap?.evidence.repeatedContentOnly ?? false,
-    blocked:
-      quality?.level === "blocked" ||
-      Boolean(timeMap?.spans.some((span) => span.kind === "ambiguous")),
+    // A reviewable ambiguous span is a candidate result, not a globally invalid hypothesis.
+    // Only the central quality gate may exclude the whole hypothesis before assignment.
+    blocked: quality?.level === "blocked",
     sourceOrderHint: staged.sourceOrderHint,
     targetOrderHint: staged.targetOrderHint
   };
@@ -747,15 +940,15 @@ function describeGlobalRejection(
     return `同一素材组合只能采用一个定位答案；此项与 ${conflictCount} 个已采用答案互斥，已保留供复核。`;
   }
   if (reason === "sourceOverlap") {
-    return `全局分配发现同一参考时间范围冲突（与 ${conflictCount} 个已采用结果冲突），未采用此备选。`;
+    return `同一参考时间范围冲突（与 ${conflictCount} 个优先结果冲突），此项需单独复核。`;
   }
   if (reason === "targetOverlap") {
-    return `全局分配发现同一原片时间范围冲突（与 ${conflictCount} 个已采用结果冲突），未采用此备选。`;
+    return `同一原片时间范围冲突（与 ${conflictCount} 个优先结果冲突），此项需单独复核。`;
   }
   if (reason === "blocked") {
-    return "Pairwise 时间图已被质量闸门阻断，未进入全局组合。";
+    return "这组定位证据不足，暂不建议采用。";
   }
-  return "此结果未进入全局最佳组合，已作为阻断备选保留。";
+  return "另一个整体组合更可信，此结果已作为备选保留。";
 }
 
 function appendCandidateDiagnostic(
@@ -2237,6 +2430,18 @@ function normalizeLocalPath(path: string | null | undefined): string {
 
 function toggleId(ids: string[], id: string): string[] {
   return ids.includes(id) ? ids.filter((candidate) => candidate !== id) : [...ids, id];
+}
+
+function semanticEpisodeOrderHint(media: ProjectMediaReference): number | null {
+  // Ordering is only a soft prior when the project carries explicit episode semantics. Import
+  // array order and file names are not authoritative and must not silently steer assignment.
+  const match = media.episodeKey?.match(/^(?:S(\d+))?E(\d+)(?::|$)/i);
+  if (!match) {
+    return null;
+  }
+  const season = match[1] ? Number.parseInt(match[1], 10) : 0;
+  const episode = Number.parseInt(match[2], 10);
+  return season * 100_000 + episode;
 }
 
 function createMediaPairKey(sourceMediaId: string, targetMediaId: string): string {

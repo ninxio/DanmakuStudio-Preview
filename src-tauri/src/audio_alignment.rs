@@ -1,12 +1,14 @@
 use crate::{
     alignment_v2::{
         align_features_edit_aware_with_cancel, extract_fine_features_with_cancel,
-        extract_landmarks_and_fine_features_with_cancel, match_landmarks_affine_with_cancel,
-        refine_boundary_by_correlation_with_cancel,
-        refine_boundary_by_one_sided_correlation_with_cancel, AffineHypothesis, AffineMatchConfig,
-        BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig, EditAlignmentMode,
-        EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
-        SpectralLandmark,
+        extract_landmarks_and_fine_features_with_backend_request,
+        match_landmarks_affine_with_cancel, refine_boundary_by_correlation_with_cancel,
+        refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_request,
+        AffineHypothesis, AffineMatchConfig, BoundaryContextSide, BoundaryRefinementConfig,
+        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
+        FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, SpectralBackendExecution,
+        SpectralBackendRequest, SpectralLandmark, StreamingLandmarkExtractor,
+        STREAMING_CPU_SPECTRAL_BACKEND_ID,
     },
     media_probe::{
         probe_audio_decode_timelines_with_ffprobe_cancellable,
@@ -17,6 +19,7 @@ use crate::{
     process_supervision::{
         process_supervision_cleanup_faulted, resolve_supervised_executable, SupervisedCommand,
         SupervisedOutput, SupervisedOutputLimits, SupervisedProcessErrorKind,
+        SupervisedStreamingLimits, SupervisedStreamingOutput,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -93,7 +96,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.1-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-shared-spectrum-artifact-cache-dual-boundary-v4";
+    "pcm-s16le-16k-pts-streaming-coarse-cuda-batch-artifact-cache-dual-boundary-v6";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -105,18 +108,22 @@ const ALIGNMENT_V2_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 const ALIGNMENT_V2_MAX_PCM_BYTES: usize =
     ALIGNMENT_V2_SAMPLE_RATE as usize * (ALIGNMENT_V2_MAX_DURATION_MS as usize / 1_000) * 2;
 const ALIGNMENT_V2_MAX_STDERR_BYTES: usize = 1024 * 1024;
+const ALIGNMENT_V2_COARSE_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
+const ALIGNMENT_V2_COARSE_DURATION_SLACK_MS: u64 = 60_000;
+const ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES: usize = 32 * 1024;
+const ALIGNMENT_V2_COARSE_STDOUT_BUFFERED_CHUNKS: usize = 2;
+const ALIGNMENT_V2_COARSE_MAX_LANDMARKS: usize = 48 * 48 * 64;
 const ALIGNMENT_V2_MIN_TRACK_MARGIN: f64 = 0.10;
 const ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE: f64 = 0.20;
 const ALIGNMENT_V2_MAX_UNSELECTED_STREAMS: usize = 12;
-// The V2 cache owns decoded mono PCM as well as landmarks/fine features. Bound it by
-// resident artifact bytes instead of entry count: one hour of 16 kHz mono i16 PCM is
-// about 110 MiB, while a 20-minute episode is about 37 MiB. 768 MiB retains the common
-// one-long-reference + episode-batch working set without granting the process an
-// unbounded media cache; larger sets degrade by per-entry LRU eviction.
+// Short-media V2 entries own decoded mono PCM plus landmarks/fine features; long-media
+// coarse-only entries own only the bounded index until windowed fine decode exists. Bound both
+// forms by resident bytes instead of entry count. One hour of 16 kHz mono i16 PCM is about
+// 110 MiB, while a 20-minute episode is about 37 MiB; larger sets degrade by LRU eviction.
 const MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES: usize = 768 * 1024 * 1024;
-// Candidate PCM must remain alive until track-pair selection finishes, otherwise the
-// winning cold-path track would have to be decoded a second time. Fail closed before a
-// pathological multi-track input can make that transient working set unbounded.
+// Short candidate PCM must remain alive until track-pair selection finishes to preserve the
+// one-decode shared-FFT path. Long candidates contribute only the bounded coarse index here.
+// Fail closed before a pathological multi-track input can make either working set unbounded.
 const MAX_V2_ACTIVE_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
 // Product orchestration is deliberately sequential today. Enforce the same boundary in native
 // code so multiple callers cannot each reserve the per-run 1 GiB artifact budget and exhaust the
@@ -777,10 +784,17 @@ struct CachedAudioFeatures {
 #[derive(Debug, Clone)]
 struct CachedV2Landmarks {
     landmarks: Arc<Vec<SpectralLandmark>>,
-    pcm: Arc<Vec<i16>>,
+    pcm: Option<Arc<Vec<i16>>>,
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
     cache_key: String,
     cache_hit: bool,
+    spectral_backend: SpectralBackendExecution,
+}
+
+struct V2CandidateExtractionState<'a> {
+    notes: &'a mut Vec<String>,
+    retained_artifact_bytes: &'a mut usize,
+    spectral_backend_request: &'a SpectralBackendRequest,
 }
 
 #[derive(Debug)]
@@ -791,9 +805,10 @@ struct DecodedV2Audio {
 
 #[derive(Debug, Clone)]
 struct V2MediaArtifact {
-    pcm: Arc<Vec<i16>>,
+    pcm: Option<Arc<Vec<i16>>>,
     landmarks: Arc<Vec<SpectralLandmark>>,
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
+    spectral_backend: SpectralBackendExecution,
 }
 
 #[derive(Debug, Clone)]
@@ -913,6 +928,8 @@ struct V2TrackPairCandidate {
     observation_count: usize,
     source_landmark_count: usize,
     target_landmark_count: usize,
+    source_spectral_backend_id: String,
+    target_spectral_backend_id: String,
 }
 
 #[derive(Debug)]
@@ -4867,6 +4884,9 @@ where
     // with too many long tracks is rejected without leaving a partially warmed artifact set.
     ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)?;
     check_cancelled(cancel_flag)?;
+    // Resolve capability once for the whole alignment run; candidate tracks and both media then
+    // share the same planned backend identity during cache lookup and extraction.
+    let spectral_backend_request = resolve_spectral_backend_request()?;
 
     benchmark_stage("extracting-source", "提取参考音轨 landmark");
     update_progress(0.12, "正在为 B 站参考候选音轨提取 16 kHz landmark。")?;
@@ -4878,8 +4898,11 @@ where
         options,
         &source_inputs,
         cancel_flag,
-        &mut extraction_notes,
-        &mut retained_artifact_bytes,
+        &mut V2CandidateExtractionState {
+            notes: &mut extraction_notes,
+            retained_artifact_bytes: &mut retained_artifact_bytes,
+            spectral_backend_request: &spectral_backend_request,
+        },
     )?;
     benchmark_stage("extracting-complete", "提取目标原片 landmark");
     update_progress(0.40, "正在为目标原片候选音轨提取 16 kHz landmark。")?;
@@ -4889,8 +4912,11 @@ where
         options,
         &target_inputs,
         cancel_flag,
-        &mut extraction_notes,
-        &mut retained_artifact_bytes,
+        &mut V2CandidateExtractionState {
+            notes: &mut extraction_notes,
+            retained_artifact_bytes: &mut retained_artifact_bytes,
+            spectral_backend_request: &spectral_backend_request,
+        },
     )?;
     check_cancelled(cancel_flag)?;
     if source_landmarks.is_empty() || target_landmarks.is_empty() {
@@ -5014,6 +5040,8 @@ where
                 observation_count: result.observation_count,
                 source_landmark_count: result.source_landmark_count,
                 target_landmark_count: result.target_landmark_count,
+                source_spectral_backend_id: source_artifact.spectral_backend.backend_id.clone(),
+                target_spectral_backend_id: target_artifact.spectral_backend.backend_id.clone(),
             });
         }
     }
@@ -5235,15 +5263,7 @@ fn probe_alignment_audio_candidates(
         cancel_flag,
     )
     .map_err(|error| format_alignment_probe_error(&format!("{label}媒体时间线探测失败"), error))?;
-    if snapshot
-        .duration_ms
-        .is_some_and(|duration| duration > ALIGNMENT_V2_MAX_DURATION_MS)
-    {
-        return Err(format!(
-            "blocked:resource-limit：{label}时长超过 Alignment V2 当前 {} 分钟的单次 PCM 上限。",
-            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
-        ));
-    }
+    check_v2_coarse_probe_duration(snapshot.duration_ms, label)?;
     let decode_timelines = probe_audio_decode_timelines_with_ffprobe_cancellable(
         media_path,
         &options.ffprobe_path,
@@ -5314,6 +5334,19 @@ fn probe_alignment_audio_candidates(
             ))
         })
         .collect()
+}
+
+fn check_v2_coarse_probe_duration(duration_ms: Option<u64>, label: &str) -> Result<(), String> {
+    // Long media are intentionally admitted to the bounded streaming coarse stage. The
+    // one-hour full-PCM limit is enforced only when a selected candidate enters fine alignment;
+    // rejecting it here would make the streaming path unreachable from the production entry.
+    if duration_ms.is_some_and(|duration| duration > ALIGNMENT_V2_COARSE_MAX_DURATION_MS) {
+        return Err(format!(
+            "blocked:resource-limit：{label}时长超过流式粗定位当前 {} 小时上限。",
+            ALIGNMENT_V2_COARSE_MAX_DURATION_MS / (60 * 60 * 1_000)
+        ));
+    }
+    Ok(())
 }
 
 fn alignment_audio_input_from_snapshot(
@@ -5412,39 +5445,46 @@ fn extract_v2_landmark_candidates(
     options: &AudioAlignmentOptions,
     inputs: &[AlignmentAudioInput],
     cancel_flag: Option<&AtomicBool>,
-    notes: &mut Vec<String>,
-    retained_artifact_bytes: &mut usize,
+    state: &mut V2CandidateExtractionState<'_>,
 ) -> Result<HashMap<u32, CachedV2Landmarks>, String> {
     let mut output = HashMap::new();
     for input in inputs {
-        if let Err(error) = check_v2_duration_limit(input, label) {
-            notes.push(error);
-            continue;
-        }
-        let estimated_pcm_bytes = input
-            .media_duration_ms
-            .and_then(v2_pcm_bytes_for_duration_ms)
-            .unwrap_or(0);
-        ensure_v2_active_artifact_budget(*retained_artifact_bytes, estimated_pcm_bytes)?;
-        match get_v2_landmarks(media_path, label, options, input, cancel_flag) {
+        match get_v2_landmarks(
+            media_path,
+            label,
+            options,
+            input,
+            cancel_flag,
+            Some(state.spectral_backend_request),
+        ) {
             Ok(artifact) if !artifact.landmarks.is_empty() => {
                 let artifact_bytes = cached_v2_landmark_retained_bytes(&artifact);
-                let next_retained_bytes =
-                    ensure_v2_active_artifact_budget(*retained_artifact_bytes, artifact_bytes)?;
-                *retained_artifact_bytes = next_retained_bytes;
-                notes.push(format!(
-                    "{label}音轨 #{} landmark {}：{} 个。",
+                let next_retained_bytes = ensure_v2_active_artifact_budget(
+                    *state.retained_artifact_bytes,
+                    artifact_bytes,
+                )?;
+                *state.retained_artifact_bytes = next_retained_bytes;
+                state.notes.push(format!(
+                    "{label}音轨 #{} landmark {}：{} 个；声谱后端 {}（{}）。",
                     input.stream.stream_index,
                     if artifact.cache_hit {
                         "缓存命中"
                     } else {
                         "新提取"
                     },
-                    artifact.landmarks.len()
+                    artifact.landmarks.len(),
+                    artifact.spectral_backend.backend_id,
+                    artifact.spectral_backend.backend_detail
                 ));
+                if let Some(reason) = &artifact.spectral_backend.fallback_reason {
+                    state.notes.push(format!(
+                        "{label}音轨 #{} 声谱后端说明：{reason}",
+                        input.stream.stream_index
+                    ));
+                }
                 output.insert(input.stream.stream_index, artifact);
             }
-            Ok(_) => notes.push(format!(
+            Ok(_) => state.notes.push(format!(
                 "{label}音轨 #{} 只有静音或重复性过高，未得到可用 landmark。",
                 input.stream.stream_index
             )),
@@ -5453,10 +5493,11 @@ fn extract_v2_landmark_candidates(
                 if is_media_identity_guard_error(&error)
                     || error == AUDIO_ALIGNMENT_CANCELLED
                     || error.starts_with("blocked:resource-limit")
+                    || error.starts_with("blocked:cuda-fft")
                 {
                     return Err(error);
                 }
-                notes.push(format!(
+                state.notes.push(format!(
                     "{label}音轨 #{} landmark 提取失败：{error}",
                     input.stream.stream_index
                 ));
@@ -5467,10 +5508,12 @@ fn extract_v2_landmark_candidates(
 }
 
 fn check_v2_duration_limit(input: &AlignmentAudioInput, label: &str) -> Result<(), String> {
-    if input
-        .media_duration_ms
-        .is_some_and(|duration| duration > ALIGNMENT_V2_MAX_DURATION_MS)
-    {
+    let Some(duration_ms) = input.media_duration_ms else {
+        return Err(format!(
+            "blocked:resource-limit：{label}时长未知，只允许进入有界流式粗定位；当前不能安全执行完整 PCM 细对齐。"
+        ));
+    };
+    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
         return Err(format!(
             "blocked:resource-limit：{label}时长超过 Alignment V2 当前 {} 分钟的单次 PCM 上限。",
             ALIGNMENT_V2_MAX_DURATION_MS / 60_000
@@ -5489,6 +5532,16 @@ fn v2_pcm_bytes_for_duration_ms(duration_ms: u64) -> Option<usize> {
 }
 
 fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usize, String> {
+    if should_stream_v2_coarse_only(input) {
+        // Long candidates retain only the duration-independent coarse index. The selected long
+        // track still stops at the existing fine-stage 60-minute gate until windowed fine decode
+        // is implemented.
+        return ALIGNMENT_V2_COARSE_MAX_LANDMARKS
+            .checked_mul(std::mem::size_of::<SpectralLandmark>())
+            .ok_or_else(|| {
+                "blocked:resource-limit：流式粗定位 landmark 驻留上界溢出。".to_string()
+            });
+    }
     let duration_ms = input
         .media_duration_ms
         .unwrap_or(ALIGNMENT_V2_MAX_DURATION_MS);
@@ -5501,12 +5554,10 @@ fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usiz
             / ALIGNMENT_V2_LANDMARK_HOP_MS as u128,
     )
     .map_err(|_| "blocked:resource-limit：候选帧数无法表示。".to_string())?;
-    // LandmarkConfig below emits at most 4 anchors * 5 fanout landmarks per frame.
     let landmark_bytes = frame_count
         .checked_mul(20)
         .and_then(|count| count.checked_mul(std::mem::size_of::<SpectralLandmark>()))
         .ok_or_else(|| "blocked:resource-limit：landmark 驻留上界溢出。".to_string())?;
-    // FineFeatureConfig currently stores time + Vec metadata + 14 f32 values per frame.
     let fine_bytes_per_frame =
         std::mem::size_of::<FineFeatureFrame>().saturating_add(14 * std::mem::size_of::<f32>());
     let fine_bytes = frame_count
@@ -5516,6 +5567,20 @@ fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usiz
         .checked_add(landmark_bytes)
         .and_then(|value| value.checked_add(fine_bytes))
         .ok_or_else(|| "blocked:resource-limit：候选音轨制品驻留上界溢出。".to_string())
+}
+
+fn should_stream_v2_coarse_only(input: &AlignmentAudioInput) -> bool {
+    input
+        .media_duration_ms
+        .is_none_or(|duration| duration > ALIGNMENT_V2_MAX_DURATION_MS)
+}
+
+fn v2_landmark_artifact_kind(input: &AlignmentAudioInput) -> &'static str {
+    if should_stream_v2_coarse_only(input) {
+        "landmark-streaming-coarse"
+    } else {
+        "landmark-full"
+    }
 }
 
 fn ensure_v2_candidate_set_active_budget(
@@ -5551,14 +5616,16 @@ fn cached_v2_landmark_retained_bytes(artifact: &CachedV2Landmarks) -> usize {
         pcm: artifact.pcm.clone(),
         landmarks: artifact.landmarks.clone(),
         fine_features: artifact.fine_features.clone(),
+        spectral_backend: artifact.spectral_backend.clone(),
     })
 }
 
 fn v2_media_artifact_payload_bytes(artifact: &V2MediaArtifact) -> usize {
     let pcm_bytes = artifact
         .pcm
-        .capacity()
-        .saturating_mul(std::mem::size_of::<i16>());
+        .as_ref()
+        .map(|pcm| pcm.capacity().saturating_mul(std::mem::size_of::<i16>()))
+        .unwrap_or(0);
     let landmark_bytes = artifact
         .landmarks
         .capacity()
@@ -5583,6 +5650,17 @@ fn v2_media_artifact_payload_bytes(artifact: &V2MediaArtifact) -> usize {
     pcm_bytes
         .saturating_add(landmark_bytes)
         .saturating_add(fine_bytes)
+        .saturating_add(artifact.spectral_backend.backend_id.len())
+        .saturating_add(artifact.spectral_backend.requested_backend.len())
+        .saturating_add(artifact.spectral_backend.backend_detail.len())
+        .saturating_add(
+            artifact
+                .spectral_backend
+                .fallback_reason
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0),
+        )
 }
 
 fn v2_media_artifact_resident_bytes(cache_key: &str, artifact: &V2MediaArtifact) -> usize {
@@ -5602,14 +5680,53 @@ fn get_v2_landmarks(
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
     cancel_flag: Option<&AtomicBool>,
+    shared_backend_request: Option<&SpectralBackendRequest>,
 ) -> Result<CachedV2Landmarks, String> {
     check_cancelled(cancel_flag)?;
-    let cache_key = create_v2_audio_cache_key(media_path, options, input, "landmark")?;
-    if let Some(artifact) = v2_landmark_cache()
-        .lock()
-        .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?
-        .get(&cache_key)
+    let streaming_coarse = should_stream_v2_coarse_only(input);
+    let owned_backend_request;
+    let backend_request = if let Some(request) = shared_backend_request {
+        Some(request)
+    } else {
+        owned_backend_request = resolve_spectral_backend_request()?;
+        Some(&owned_backend_request)
+    };
+    if streaming_coarse
+        && backend_request.is_some_and(|request| request.requested_backend == "cuda")
     {
+        return Err(
+            "blocked:cuda-fft-unsupported：长媒体流式粗定位尚未组成跨 stdout chunk 的 CUDA 批次，强制 CUDA 时不允许假装加速。"
+                .to_string(),
+        );
+    }
+    let planned_backend_id = if streaming_coarse {
+        STREAMING_CPU_SPECTRAL_BACKEND_ID
+    } else {
+        backend_request
+            .expect("short-media cache lookup must resolve a spectral backend")
+            .planned_backend_id
+            .as_str()
+    };
+    let mut cache_key = create_v2_audio_cache_key_for_backend(
+        media_path,
+        options,
+        input,
+        v2_landmark_artifact_kind(input),
+        planned_backend_id,
+    )?;
+    let cached_artifact = {
+        let mut cache = v2_landmark_cache()
+            .lock()
+            .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+        cache.get(&cache_key)
+    };
+    if let Some(artifact) = cached_artifact {
+        verify_media_content_identity_after_tool_output(
+            media_path,
+            input.content_identity.as_ref(),
+            cancel_flag,
+            "V2 landmark 缓存复用",
+        )?;
         benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
         return Ok(CachedV2Landmarks {
             landmarks: artifact.landmarks,
@@ -5617,47 +5734,80 @@ fn get_v2_landmarks(
             fine_features: artifact.fine_features,
             cache_key,
             cache_hit: true,
+            spectral_backend: artifact.spectral_backend,
         });
     }
     benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
-    let pcm = Arc::new(decode_v2_pcm(
-        media_path,
-        label,
-        options,
-        input,
-        cancel_flag,
-    )?);
     let presentation_offset_ms = input
         .decode_timeline
         .as_ref()
         .map(|item| item.normalized_pcm_origin_ms)
         .unwrap_or(0);
-    let extracted = extract_landmarks_and_fine_features_with_cancel(
-        &pcm,
-        &LandmarkConfig {
-            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-            presentation_offset_ms,
-            window_ms: 50,
-            hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
-            max_hash_occurrences: 64,
-            ..LandmarkConfig::default()
-        },
-        &FineFeatureConfig {
-            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-            presentation_offset_ms,
-            window_ms: 50,
-            hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
-        },
-        cancel_flag,
+    let (pcm, landmarks, fine_features, spectral_backend) = if streaming_coarse {
+        let coarse =
+            decode_v2_coarse_landmarks_streaming(media_path, label, options, input, cancel_flag)?;
+        (
+            None,
+            Arc::new(coarse.landmarks),
+            None,
+            SpectralBackendExecution {
+                backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
+                requested_backend: "streaming-cpu".to_string(),
+                backend_detail: "CPU 流式 radix-2 f64 FFT".to_string(),
+                fallback_reason: Some(
+                    "长媒体流式粗定位尚未跨 stdout chunk 组成 CUDA 批次，本次仅使用有界 CPU 索引。"
+                        .to_string(),
+                ),
+            },
+        )
+    } else {
+        let pcm = Arc::new(decode_v2_pcm(
+            media_path,
+            label,
+            options,
+            input,
+            cancel_flag,
+        )?);
+        let extracted = extract_landmarks_and_fine_features_with_backend_request(
+            &pcm,
+            &LandmarkConfig {
+                sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+                presentation_offset_ms,
+                window_ms: 50,
+                hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
+                max_hash_occurrences: 64,
+                ..LandmarkConfig::default()
+            },
+            &FineFeatureConfig {
+                sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+                presentation_offset_ms,
+                window_ms: 50,
+                hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
+            },
+            cancel_flag,
+            backend_request.expect("short-media extraction must resolve a spectral backend"),
+        )?;
+        (
+            Some(pcm),
+            Arc::new(extracted.bundle.landmarks),
+            Some(Arc::new(extracted.bundle.fine_features)),
+            extracted.spectral_backend,
+        )
+    };
+    cache_key = create_v2_audio_cache_key_for_backend(
+        media_path,
+        options,
+        input,
+        v2_landmark_artifact_kind(input),
+        &spectral_backend.backend_id,
     )?;
-    let landmarks = Arc::new(extracted.landmarks);
-    let fine_features = Arc::new(extracted.fine_features);
     // Cancellation after extraction must never publish a partially trusted warm artifact.
     check_cancelled(cancel_flag)?;
     let artifact = V2MediaArtifact {
         pcm: pcm.clone(),
         landmarks: landmarks.clone(),
-        fine_features: Some(fine_features.clone()),
+        fine_features: fine_features.clone(),
+        spectral_backend: spectral_backend.clone(),
     };
     let mut cache = v2_landmark_cache()
         .lock()
@@ -5675,22 +5825,39 @@ fn get_v2_landmarks(
     Ok(CachedV2Landmarks {
         landmarks,
         pcm,
-        fine_features: Some(fine_features),
+        fine_features,
         cache_key,
         cache_hit: false,
+        spectral_backend,
     })
 }
 
+#[cfg(test)]
 fn create_v2_audio_cache_key(
     media_path: &str,
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
     artifact: &str,
 ) -> Result<String, String> {
+    let backend_id = if should_stream_v2_coarse_only(input) {
+        STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string()
+    } else {
+        resolve_spectral_backend_request()?.planned_backend_id
+    };
+    create_v2_audio_cache_key_for_backend(media_path, options, input, artifact, &backend_id)
+}
+
+fn create_v2_audio_cache_key_for_backend(
+    media_path: &str,
+    options: &AudioAlignmentOptions,
+    input: &AlignmentAudioInput,
+    artifact: &str,
+    spectral_backend_id: &str,
+) -> Result<String, String> {
     let legacy_identity = create_audio_feature_cache_key(media_path, options, input)?;
     let timeline = input.decode_timeline.as_ref();
     Ok(format!(
-        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|artifact={artifact}|ptsOrigin={}|streamPtsOffset={}|firstDecodedPts={:?}|ptsDiscontinuities={}|maxPtsGap={:?}|skipSamples={}|discardPadding={}|normalizedPcmOrigin={}|{legacy_identity}",
+        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|artifact={artifact}|spectralBackend={spectral_backend_id}|ptsOrigin={}|streamPtsOffset={}|firstDecodedPts={:?}|ptsDiscontinuities={}|maxPtsGap={:?}|skipSamples={}|discardPadding={}|normalizedPcmOrigin={}|{legacy_identity}",
         input.presentation_origin_ms,
         input.stream.timeline_offset_ms,
         timeline.and_then(|item| item.first_decoded_pts_ms),
@@ -5714,7 +5881,13 @@ fn decode_v2_audio(
 ) -> Result<DecodedV2Audio, String> {
     check_v2_duration_limit(input, label)?;
     check_cancelled(cancel_flag)?;
-    let expected_cache_key = create_v2_audio_cache_key(media_path, options, input, "landmark")?;
+    let expected_cache_key = create_v2_audio_cache_key_for_backend(
+        media_path,
+        options,
+        input,
+        v2_landmark_artifact_kind(input),
+        &landmark_artifact.spectral_backend.backend_id,
+    )?;
     if landmark_artifact.cache_key != expected_cache_key {
         return Err(format!(
             "blocked:media-identity-changed：{label}粗定位制品与当前内容身份、音轨、PTS 或算法参数不一致。"
@@ -5732,14 +5905,24 @@ fn decode_v2_audio(
         if fine_features.is_empty() {
             return Err(format!("{label}没有可用的 50 ms 细粒度音频特征。"));
         }
-        return Ok(DecodedV2Audio {
-            pcm: landmark_artifact.pcm.clone(),
-            fine_features,
-        });
+        let pcm = landmark_artifact.pcm.clone().ok_or_else(|| {
+            "blocked:artifact-missing：细特征制品缺少对应的完整 PCM。".to_string()
+        })?;
+        return Ok(DecodedV2Audio { pcm, fine_features });
     }
 
+    let pcm = match landmark_artifact.pcm.clone() {
+        Some(pcm) => pcm,
+        None => Arc::new(decode_v2_pcm(
+            media_path,
+            label,
+            options,
+            input,
+            cancel_flag,
+        )?),
+    };
     let fine_features = Arc::new(extract_fine_features_with_cancel(
-        &landmark_artifact.pcm,
+        &pcm,
         &FineFeatureConfig {
             sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
             presentation_offset_ms: input
@@ -5758,9 +5941,10 @@ fn decode_v2_audio(
     // As with landmark extraction, do not let cancellation race a cache publication.
     check_cancelled(cancel_flag)?;
     let artifact = V2MediaArtifact {
-        pcm: landmark_artifact.pcm.clone(),
+        pcm: Some(pcm.clone()),
         landmarks: landmark_artifact.landmarks.clone(),
         fine_features: Some(fine_features.clone()),
+        spectral_backend: landmark_artifact.spectral_backend.clone(),
     };
     let insertion = v2_landmark_cache()
         .lock()
@@ -5778,10 +5962,219 @@ fn decode_v2_audio(
     if insertion.stored && insertion.new_entry {
         benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write);
     }
-    Ok(DecodedV2Audio {
-        pcm: landmark_artifact.pcm.clone(),
-        fine_features,
-    })
+    Ok(DecodedV2Audio { pcm, fine_features })
+}
+
+struct V2S16LeLandmarkStream {
+    extractor: StreamingLandmarkExtractor,
+    pending_low_byte: Option<u8>,
+    sample_buffer: Vec<i16>,
+    decoded_samples: u64,
+}
+
+impl V2S16LeLandmarkStream {
+    fn new(config: LandmarkConfig) -> Result<Self, String> {
+        let mut sample_buffer = Vec::new();
+        sample_buffer
+            .try_reserve_exact(ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES / 2 + 1)
+            .map_err(|_| "blocked:resource-limit：无法为流式 PCM 小块保留工作内存。".to_string())?;
+        Ok(Self {
+            extractor: StreamingLandmarkExtractor::new(config)?,
+            pending_low_byte: None,
+            sample_buffer,
+            decoded_samples: 0,
+        })
+    }
+
+    fn consume_chunk(
+        &mut self,
+        bytes: &[u8],
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        check_cancelled(cancel_flag)?;
+        if bytes.len() > ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES {
+            return Err(
+                "blocked:resource-limit：流式 PCM reader 返回了超过约定上限的数据块。".to_string(),
+            );
+        }
+        self.sample_buffer.clear();
+        let mut offset = 0usize;
+        if let Some(low) = self.pending_low_byte.take() {
+            let Some(high) = bytes.first().copied() else {
+                self.pending_low_byte = Some(low);
+                return Ok(());
+            };
+            self.sample_buffer.push(i16::from_le_bytes([low, high]));
+            offset = 1;
+        }
+        let paired_end = offset + (bytes.len() - offset) / 2 * 2;
+        self.sample_buffer.extend(
+            bytes[offset..paired_end]
+                .chunks_exact(2)
+                .map(|sample| i16::from_le_bytes([sample[0], sample[1]])),
+        );
+        if paired_end < bytes.len() {
+            self.pending_low_byte = Some(bytes[paired_end]);
+        }
+        if self.sample_buffer.is_empty() {
+            return Ok(());
+        }
+        self.decoded_samples = self
+            .decoded_samples
+            .checked_add(self.sample_buffer.len() as u64)
+            .ok_or_else(|| "blocked:resource-limit：流式 PCM 样本计数溢出。".to_string())?;
+        self.extractor
+            .push_pcm_with_cancel(&self.sample_buffer, cancel_flag)
+            .map_err(map_v2_streaming_algorithm_error)
+    }
+
+    fn finish(
+        self,
+        stdout_bytes: usize,
+        label: &str,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<MediaCoarseIndexResult, String> {
+        check_cancelled(cancel_flag)?;
+        if self.pending_low_byte.is_some() {
+            return Err(format!(
+                "blocked:decode-format：{label}流式 V2 PCM 在 EOF 留下未配对字节。"
+            ));
+        }
+        let decoded_bytes = self
+            .decoded_samples
+            .checked_mul(2)
+            .ok_or_else(|| "blocked:resource-limit：流式 PCM 字节计数溢出。".to_string())?;
+        let observed_bytes = u64::try_from(stdout_bytes)
+            .map_err(|_| "blocked:resource-limit：流式 stdout 字节计数无法表示。".to_string())?;
+        if decoded_bytes != observed_bytes {
+            return Err(format!(
+                "blocked:decode-format：{label}流式 V2 PCM 样本数与 stdout 字节数不一致。"
+            ));
+        }
+        self.extractor
+            .finish_with_cancel(cancel_flag)
+            .map_err(map_v2_streaming_algorithm_error)
+    }
+}
+
+fn map_v2_streaming_algorithm_error(error: String) -> String {
+    if error.contains("已取消") {
+        AUDIO_ALIGNMENT_CANCELLED.to_string()
+    } else if error.contains("上限") || error.contains("保留内存") || error.contains("溢出")
+    {
+        format!("blocked:resource-limit：流式粗定位算法拒绝了不可控工作量：{error}")
+    } else {
+        format!("流式粗定位算法失败：{error}")
+    }
+}
+
+fn decode_v2_coarse_landmarks_streaming(
+    media_path: &str,
+    label: &str,
+    options: &AudioAlignmentOptions,
+    input: &AlignmentAudioInput,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<MediaCoarseIndexResult, String> {
+    check_cancelled(cancel_flag)?;
+    verify_media_content_identity_before_tool_input(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 流式粗定位解码",
+    )?;
+    let stdout_duration_budget_ms = v2_coarse_stdout_duration_budget_ms(input)?;
+    let stdout_hard_limit = v2_pcm_bytes_for_duration_ms(stdout_duration_budget_ms)
+        .ok_or_else(|| "blocked:resource-limit：流式粗定位 stdout 上限无法表示。".to_string())?;
+    let presentation_offset_ms = input
+        .decode_timeline
+        .as_ref()
+        .map(|item| item.normalized_pcm_origin_ms)
+        .unwrap_or(0);
+    let mut consumer = V2S16LeLandmarkStream::new(LandmarkConfig {
+        sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+        presentation_offset_ms,
+        window_ms: 50,
+        hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
+        max_hash_occurrences: 64,
+        ..LandmarkConfig::default()
+    })?;
+    let mut consumer_error = None;
+    let output_result = run_supervised_ffmpeg_streaming(
+        &options.ffmpeg_path,
+        create_v2_coarse_audio_decode_args(media_path, input),
+        "FFmpeg V2 流式粗定位解码",
+        stdout_hard_limit,
+        cancel_flag,
+        |chunk| match consumer.consume_chunk(chunk, cancel_flag) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                consumer_error = Some(error);
+                Err("streaming PCM consumer rejected a chunk".to_string())
+            }
+        },
+    );
+    // Recheck even when the tool or consumer failed. Identity/cleanup failures invalidate every
+    // byte already consumed and take precedence over an ordinary decode error.
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 流式粗定位解码",
+    )?;
+    if let Some(error) = consumer_error {
+        return Err(error);
+    }
+    let output = output_result?;
+    if !output.status.success() {
+        return Err(format_media_tool_nonzero_exit(
+            &format!("FFmpeg 提取 {label} V2 流式粗定位 PCM"),
+            output.status.code(),
+            &output.stderr,
+        ));
+    }
+    consumer.finish(output.stdout_bytes, label, cancel_flag)
+}
+
+fn v2_coarse_stdout_duration_budget_ms(input: &AlignmentAudioInput) -> Result<u64, String> {
+    let Some(media_duration_ms) = input.media_duration_ms else {
+        // Unknown-duration media are decoded through EOF with no FFmpeg `-t`; the stdout hard
+        // limit becomes the fail-closed 24-hour boundary instead of silently truncating success.
+        return Ok(ALIGNMENT_V2_COARSE_MAX_DURATION_MS);
+    };
+    if media_duration_ms > ALIGNMENT_V2_COARSE_MAX_DURATION_MS {
+        return Err(format!(
+            "blocked:resource-limit：流式粗定位当前最多接受 {} 小时媒体。",
+            ALIGNMENT_V2_COARSE_MAX_DURATION_MS / (60 * 60 * 1_000)
+        ));
+    }
+    media_duration_ms
+        .checked_add(ALIGNMENT_V2_COARSE_DURATION_SLACK_MS)
+        .ok_or_else(|| "blocked:resource-limit：流式粗定位时长上限溢出。".to_string())
+}
+
+fn create_v2_coarse_audio_decode_args(
+    media_path: &str,
+    input: &AlignmentAudioInput,
+) -> Vec<String> {
+    vec![
+        "-nostdin".to_string(),
+        "-v".to_string(),
+        "error".to_string(),
+        "-copyts".to_string(),
+        "-start_at_zero".to_string(),
+        "-i".to_string(),
+        media_path.to_string(),
+        "-map".to_string(),
+        format!("0:{}", input.stream.stream_index),
+        "-vn".to_string(),
+        "-ac".to_string(),
+        "1".to_string(),
+        "-af".to_string(),
+        format!("aresample={ALIGNMENT_V2_SAMPLE_RATE}:async=1:first_pts=0"),
+        "-f".to_string(),
+        "s16le".to_string(),
+        "pipe:1".to_string(),
+    ]
 }
 
 fn decode_v2_pcm(
@@ -6663,7 +7056,7 @@ fn create_v2_alignment_proposal(
     let anchors =
         create_v2_compatibility_anchors(&alignment.spans, pair.hypothesis.p95_residual_ms, blocked);
     let cut_candidates = create_v2_compatibility_cut_candidates(&alignment.spans, blocked);
-    let parameters_hash = create_v2_parameters_hash(&pair.source_input, &pair.target_input);
+    let parameters_hash = create_v2_parameters_hash(&pair);
     let time_map = AudioAlignmentTimeMapDto {
         source_start_ms,
         source_end_ms,
@@ -6950,7 +7343,7 @@ fn create_blocked_v2_affine_proposal(
         target_identity: pair.target_input.content_identity.clone(),
         engine_version: ALIGNMENT_V2_ENGINE_VERSION,
         feature_version: ALIGNMENT_V2_FEATURE_VERSION,
-        parameters_hash: create_v2_parameters_hash(&pair.source_input, &pair.target_input),
+        parameters_hash: create_v2_parameters_hash(pair),
     };
     proposal.match_range = Some(AlignmentMatchRange {
         source_start_ms,
@@ -7859,16 +8252,23 @@ fn find_nearest_visual_frame_binary(
     }
 }
 
-fn create_v2_parameters_hash(source: &AlignmentAudioInput, target: &AlignmentAudioInput) -> String {
-    create_v2_optional_parameters_hash(Some(source), Some(target))
+fn create_v2_parameters_hash(pair: &V2TrackPairCandidate) -> String {
+    create_v2_optional_parameters_hash(
+        Some(&pair.source_input),
+        Some(&pair.target_input),
+        Some(&pair.source_spectral_backend_id),
+        Some(&pair.target_spectral_backend_id),
+    )
 }
 
 fn create_v2_optional_parameters_hash(
     source: Option<&AlignmentAudioInput>,
     target: Option<&AlignmentAudioInput>,
+    source_spectral_backend_id: Option<&str>,
+    target_spectral_backend_id: Option<&str>,
 ) -> String {
     let parameters = format!(
-        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|sampleRate={ALIGNMENT_V2_SAMPLE_RATE}|landmarkHop={ALIGNMENT_V2_LANDMARK_HOP_MS}|fineHop={ALIGNMENT_V2_FINE_HOP_MS}|chunk={ALIGNMENT_V2_DP_CHUNK_MS}|band={ALIGNMENT_V2_DP_BAND_RADIUS_MS}|source={:?}|target={:?}",
+        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|sampleRate={ALIGNMENT_V2_SAMPLE_RATE}|landmarkHop={ALIGNMENT_V2_LANDMARK_HOP_MS}|fineHop={ALIGNMENT_V2_FINE_HOP_MS}|chunk={ALIGNMENT_V2_DP_CHUNK_MS}|band={ALIGNMENT_V2_DP_BAND_RADIUS_MS}|sourceSpectralBackend={source_spectral_backend_id:?}|targetSpectralBackend={target_spectral_backend_id:?}|source={:?}|target={:?}",
         source.map(|input| (
             input.stream.stream_index,
             input.presentation_origin_ms,
@@ -9704,6 +10104,37 @@ fn probe_alignment_run_expected_identity(
     Ok(identity)
 }
 
+fn verify_media_content_identity_before_tool_input(
+    media_path: &str,
+    expected_identity: Option<&MediaContentIdentity>,
+    cancel_flag: Option<&AtomicBool>,
+    operation: &str,
+) -> Result<(), String> {
+    check_cancelled(cancel_flag)?;
+    ensure_alignment_process_supervision_clean()?;
+    let expected_identity = require_full_file_media_content_identity(expected_identity)?;
+    let current_identity = probe_media_content_identity_cancellable(Path::new(media_path), cancel_flag)
+        .map_err(|error| {
+            if error.starts_with("cancelled：") {
+                AUDIO_ALIGNMENT_CANCELLED.to_string()
+            } else {
+                format!(
+                    "blocked:media-identity-recheck：{operation}前无法重新核验媒体身份；路径与探测错误已隐藏。"
+                )
+            }
+        })?;
+    check_cancelled(cancel_flag)?;
+    require_full_file_media_content_identity(Some(&current_identity)).map_err(|_| {
+        format!("blocked:media-identity-recheck：{operation}前的媒体身份格式无效。")
+    })?;
+    if &current_identity != expected_identity {
+        return Err(format!(
+            "blocked:media-identity-changed：媒体文件在{operation}开始前发生变化；未启动工具。"
+        ));
+    }
+    Ok(())
+}
+
 fn verify_media_content_identity_after_tool_output(
     media_path: &str,
     expected_identity: Option<&MediaContentIdentity>,
@@ -9845,6 +10276,60 @@ where
             }
             SupervisedProcessErrorKind::Cleanup => error.to_string(),
             _ => format!("{context} 失败：{error}"),
+        })
+}
+
+fn run_supervised_ffmpeg_streaming<I, S, C>(
+    executable: &str,
+    args: I,
+    context: &str,
+    stdout_hard_limit: usize,
+    cancel_flag: Option<&AtomicBool>,
+    consume_stdout: C,
+) -> Result<SupervisedStreamingOutput, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+    C: FnMut(&[u8]) -> Result<(), String>,
+{
+    let mut command = SupervisedCommand::new(executable);
+    command.args(args);
+    if let Ok(current_dir) = std::env::current_dir() {
+        command.current_dir(current_dir);
+    }
+    command
+        .stream_stdout(
+            SupervisedStreamingLimits {
+                process: SupervisedOutputLimits {
+                    execution_timeout: Duration::from_millis(MEDIA_TOOL_EXECUTION_TIMEOUT_MS),
+                    output_drain_timeout: Duration::from_millis(CHILD_OUTPUT_DRAIN_TIMEOUT_MS),
+                    termination_timeout: Duration::from_millis(
+                        CHILD_PROCESS_TREE_TERMINATION_TIMEOUT_MS,
+                    ),
+                    poll_interval: Duration::from_millis(20),
+                    stdout_hard_limit,
+                    stderr_hard_limit: ALIGNMENT_V2_MAX_STDERR_BYTES,
+                },
+                stdout_chunk_size: ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES,
+                stdout_buffered_chunks: ALIGNMENT_V2_COARSE_STDOUT_BUFFERED_CHUNKS,
+            },
+            || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)),
+            consume_stdout,
+        )
+        .map_err(|error| match error.kind() {
+            SupervisedProcessErrorKind::Cancelled => AUDIO_ALIGNMENT_CANCELLED.to_string(),
+            SupervisedProcessErrorKind::StdoutOverflow => format!(
+                "blocked:resource-limit：{context} stdout 超过 {} MiB 硬上限。",
+                stdout_hard_limit.div_ceil(1024 * 1024)
+            ),
+            SupervisedProcessErrorKind::StderrOverflow => {
+                format!("blocked:resource-limit：{context} stderr 超过硬上限。")
+            }
+            SupervisedProcessErrorKind::Timeout => {
+                format!("blocked:tool-timeout：{context} 超过执行时限。")
+            }
+            SupervisedProcessErrorKind::Cleanup => error.to_string(),
+            _ => format!("{context} 失败；本地路径与工具输出已隐藏。"),
         })
 }
 
@@ -12101,6 +12586,8 @@ mod tests {
             observation_count: 64,
             source_landmark_count: 80,
             target_landmark_count: 72,
+            source_spectral_backend_id: "test-cpu-spectral-v1".to_string(),
+            target_spectral_backend_id: "test-cpu-spectral-v1".to_string(),
         }
     }
 
@@ -12693,6 +13180,14 @@ mod tests {
         let v2_error = parse_v2_pcm_output(&[0, 0], "测试", Some(&cancelled)).unwrap_err();
         assert_eq!(v2_error, AUDIO_ALIGNMENT_CANCELLED);
 
+        let mut stream = V2S16LeLandmarkStream::new(LandmarkConfig {
+            sample_rate: 8_000,
+            ..LandmarkConfig::default()
+        })
+        .unwrap();
+        let streaming_error = stream.consume_chunk(&[0, 0], Some(&cancelled)).unwrap_err();
+        assert_eq!(streaming_error, AUDIO_ALIGNMENT_CANCELLED);
+
         let options = test_options();
         let legacy_bytes = vec![0_u8; options.sample_rate as usize * 4];
         let legacy_error =
@@ -12703,6 +13198,50 @@ mod tests {
         let visual_error =
             raw_visual_frames_to_features(&visual_bytes, 1_000, Some(&cancelled)).unwrap_err();
         assert_eq!(visual_error, AUDIO_ALIGNMENT_CANCELLED);
+    }
+
+    #[test]
+    fn streaming_s16le_adapter_is_invariant_to_odd_byte_chunks_and_rejects_odd_eof() {
+        let config = LandmarkConfig {
+            sample_rate: 8_000,
+            max_hash_occurrences: 10_000,
+            ..LandmarkConfig::default()
+        };
+        let mut pcm = Vec::new();
+        for sample_index in 0..config.sample_rate as usize * 3 {
+            let segment = sample_index / (config.sample_rate as usize / 4);
+            let frequency = 260.0 + segment as f64 * 73.0;
+            let phase = sample_index as f64 / config.sample_rate as f64;
+            pcm.push(((2.0 * std::f64::consts::PI * frequency * phase).sin() * 24_000.0) as i16);
+        }
+        let bytes = pcm
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        let collect = |chunk_sizes: &[usize]| {
+            let mut stream = V2S16LeLandmarkStream::new(config.clone()).unwrap();
+            let mut offset = 0usize;
+            let mut chunk_index = 0usize;
+            while offset < bytes.len() {
+                let size = chunk_sizes[chunk_index % chunk_sizes.len()].max(1);
+                let end = offset.saturating_add(size).min(bytes.len());
+                stream.consume_chunk(&bytes[offset..end], None).unwrap();
+                offset = end;
+                chunk_index += 1;
+            }
+            stream.finish(bytes.len(), "测试", None).unwrap()
+        };
+        let aligned = collect(&[16 * 1024]);
+        let odd_chunks = collect(&[1, 3, 5, 7, 11, 13, 17]);
+        assert!(!aligned.landmarks.is_empty());
+        assert_eq!(odd_chunks, aligned);
+
+        let mut truncated = V2S16LeLandmarkStream::new(config).unwrap();
+        truncated.consume_chunk(&[0x34], None).unwrap();
+        let error = truncated.finish(1, "私有路径不应出现", None).unwrap_err();
+        assert!(error.starts_with("blocked:decode-format"));
+        assert!(!error.contains("C:\\"));
     }
 
     #[test]
@@ -12767,6 +13306,18 @@ mod tests {
     }
 
     #[test]
+    fn streaming_coarse_args_never_silently_truncate_with_ffmpeg_t() {
+        let args =
+            create_v2_coarse_audio_decode_args("long-episode.mkv", &test_audio_input(4, 125));
+        assert_eq!(
+            args.iter().filter(|value| value.as_str() == "-map").count(),
+            1
+        );
+        assert!(!args.iter().any(|value| value == "-t"));
+        assert!(args.iter().any(|value| value == "s16le"));
+    }
+
+    #[test]
     fn v2_cache_key_includes_engine_feature_stream_and_pts_identity() {
         let path = temp_audio_cache_path("v2-cache-key");
         std::fs::write(&path, b"media").unwrap();
@@ -12792,11 +13343,22 @@ mod tests {
             "landmark",
         )
         .unwrap();
+        let cuda_key = create_v2_audio_cache_key_for_backend(
+            &path_text,
+            &test_options(),
+            &test_audio_input(1, 80),
+            "landmark",
+            crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID,
+        )
+        .unwrap();
 
         assert!(first.contains(ALIGNMENT_V2_ENGINE_VERSION));
         assert!(first.contains(ALIGNMENT_V2_FEATURE_VERSION));
         assert!(first.contains("ptsOrigin=-80"));
         assert!(first.contains("streamPtsOffset=80"));
+        assert!(first.contains(crate::alignment_v2::CPU_SPECTRAL_BACKEND_ID));
+        assert!(cuda_key.contains(crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID));
+        assert_ne!(first, cuda_key);
         assert_ne!(first, other_stream);
         assert_ne!(first, other_pts);
         std::fs::remove_file(path).unwrap();
@@ -13068,6 +13630,137 @@ mod tests {
     }
 
     #[test]
+    fn supervised_ffmpeg_streaming_coarse_uses_real_media_and_identity_gates() {
+        if !ffmpeg_test_tools_available() {
+            eprintln!("跳过 V2 流式 coarse 集成测试：ffmpeg/ffprobe 不可用。");
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "alignment-v2-streaming-coarse-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let media_path = directory.join("streaming-coarse.mka");
+        generate_v2_ffmpeg_fixture(&media_path, "[0:a]anull[main]", "0", "440");
+        let path_text = media_path.to_string_lossy().to_string();
+        let snapshot = probe_media_timeline_with_ffprobe(&path_text, Path::new("ffprobe")).unwrap();
+        let timelines =
+            probe_audio_decode_timelines_with_ffprobe(&path_text, Path::new("ffprobe")).unwrap();
+        let stream = snapshot.audio_streams[0].clone();
+        let timeline = timelines.get(&stream.stream_index).cloned();
+        let input = alignment_audio_input_from_snapshot(&snapshot, stream, true, timeline);
+
+        let coarse = decode_v2_coarse_landmarks_streaming(
+            &path_text,
+            "真实 fixture",
+            &test_options(),
+            &input,
+            None,
+        )
+        .unwrap();
+        assert!(!coarse.landmarks.is_empty());
+        assert!(coarse.observed_landmark_count >= coarse.retained_landmark_count as u64);
+        assert!(coarse.retained_landmark_count <= ALIGNMENT_V2_COARSE_MAX_LANDMARKS);
+
+        let mut synthetic_long_input = input.clone();
+        synthetic_long_input.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS + 1);
+        let coarse_artifact = get_v2_landmarks(
+            &path_text,
+            "真实 fixture",
+            &test_options(),
+            &synthetic_long_input,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(coarse_artifact.pcm.is_none());
+        assert!(coarse_artifact.fine_features.is_none());
+        assert!(coarse_artifact
+            .cache_key
+            .contains("artifact=landmark-streaming-coarse"));
+        let fine_error = decode_v2_audio(
+            &path_text,
+            "真实 fixture",
+            &test_options(),
+            &synthetic_long_input,
+            &coarse_artifact,
+            None,
+        )
+        .unwrap_err();
+        assert!(fine_error.starts_with("blocked:resource-limit"));
+
+        let mut stale = input.clone();
+        let mut stale_identity = stale.content_identity.clone().unwrap();
+        stale_identity.first_sample_digest = "b".repeat(64);
+        stale_identity.middle_sample_digest = stale_identity.first_sample_digest.clone();
+        stale_identity.last_sample_digest = stale_identity.first_sample_digest.clone();
+        stale.content_identity = Some(stale_identity);
+        let mut must_not_spawn = test_options();
+        must_not_spawn.ffmpeg_path = r"C:\Users\alice\private\must-not-run.exe".to_string();
+        let identity_error = decode_v2_coarse_landmarks_streaming(
+            &path_text,
+            "真实 fixture",
+            &must_not_spawn,
+            &stale,
+            None,
+        )
+        .unwrap_err();
+        assert!(identity_error.starts_with("blocked:media-identity-changed"));
+        assert!(!identity_error.contains("alice"));
+        assert!(!identity_error.contains("must-not-run"));
+
+        let cancelled = AtomicBool::new(true);
+        let cancel_error = decode_v2_coarse_landmarks_streaming(
+            &path_text,
+            "真实 fixture",
+            &test_options(),
+            &input,
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert_eq!(cancel_error, AUDIO_ALIGNMENT_CANCELLED);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn supervised_ffmpeg_streaming_propagates_live_cancellation() {
+        if !ffmpeg_test_tools_available() {
+            eprintln!("跳过 V2 流式取消测试：ffmpeg/ffprobe 不可用。");
+            return;
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut chunk_count = 0usize;
+        let error = run_supervised_ffmpeg_streaming(
+            "ffmpeg",
+            [
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=16000:cl=mono",
+                "-f",
+                "s16le",
+                "pipe:1",
+            ],
+            "FFmpeg V2 流式取消测试",
+            v2_pcm_bytes_for_duration_ms(ALIGNMENT_V2_COARSE_MAX_DURATION_MS).unwrap(),
+            Some(&cancelled),
+            |_| {
+                chunk_count += 1;
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);
+        assert!(chunk_count > 0);
+    }
+
+    #[test]
     fn ffmpeg_v2_integration_keeps_pts_avoids_commentary_and_models_bilateral_edits() {
         if !ffmpeg_test_tools_available() {
             eprintln!("跳过 Alignment V2 FFmpeg 集成测试：ffmpeg/ffprobe 不可用。");
@@ -13093,8 +13786,7 @@ mod tests {
             "0.5",
             "660",
         );
-        reset_test_v2_pcm_decode_invocations();
-        let proposal = align_audio_files_inner(AudioAlignmentRequest {
+        let request = || AudioAlignmentRequest {
             complete_path: target_path.to_string_lossy().to_string(),
             source_path: source_path.to_string_lossy().to_string(),
             ffmpeg_path: Some("ffmpeg".to_string()),
@@ -13111,8 +13803,9 @@ mod tests {
             enable_visual_evidence: Some(false),
             visual_sample_interval_ms: None,
             localization_mode: Some(true),
-        })
-        .unwrap();
+        };
+        reset_test_v2_pcm_decode_invocations();
+        let proposal = align_audio_files_inner(request()).unwrap();
         assert_eq!(
             test_v2_pcm_decode_invocations(),
             2,
@@ -13143,6 +13836,24 @@ mod tests {
         assert_v2_bilateral_edit_gold(time_map);
         assert!(time_map.evidence.selected_track_reason.contains("音轨 #0"));
         assert!((time_map.evidence.alternative_track_scores[0].scale - 1.02).abs() < 0.01);
+        let expected_backend = if std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1")
+            || std::env::var("C137_SPECTRAL_BACKEND").as_deref() == Ok("cuda")
+        {
+            crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
+        } else {
+            crate::alignment_v2::CPU_SPECTRAL_BACKEND_ID
+        };
+        assert!(proposal.diagnostics.join("\n").contains(expected_backend));
+
+        let cached_proposal = align_audio_files_inner(request()).unwrap();
+        assert_eq!(
+            test_v2_pcm_decode_invocations(),
+            2,
+            "第二次对齐必须复用按实际声谱后端隔离的制品"
+        );
+        let cached_diagnostics = cached_proposal.diagnostics.join("\n");
+        assert!(cached_diagnostics.contains("缓存命中"));
+        assert!(cached_diagnostics.contains(expected_backend));
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -13871,13 +14582,19 @@ mod tests {
 
     fn test_v2_media_artifact(pcm_samples: usize, marker: u64) -> V2MediaArtifact {
         V2MediaArtifact {
-            pcm: Arc::new(vec![marker as i16; pcm_samples]),
+            pcm: Some(Arc::new(vec![marker as i16; pcm_samples])),
             landmarks: Arc::new(vec![SpectralLandmark {
                 hash: marker,
                 time_ms: marker as i64,
                 strength_milli: 1_000,
             }]),
             fine_features: None,
+            spectral_backend: SpectralBackendExecution {
+                backend_id: crate::alignment_v2::CPU_SPECTRAL_BACKEND_ID.to_string(),
+                requested_backend: "cpu".to_string(),
+                backend_detail: "CPU radix-2 f64 FFT".to_string(),
+                fallback_reason: None,
+            },
         }
     }
 
@@ -13991,7 +14708,7 @@ mod tests {
                 input
             })
             .collect::<Vec<_>>();
-        let target_inputs = source_inputs.split_off(6);
+        let mut target_inputs = source_inputs.split_off(6);
         reset_test_v2_pcm_decode_invocations();
 
         let error = ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)
@@ -13999,6 +14716,47 @@ mod tests {
 
         assert!(error.starts_with("blocked:resource-limit"));
         assert_eq!(test_v2_pcm_decode_invocations(), 0);
+
+        for input in source_inputs.iter_mut().chain(target_inputs.iter_mut()) {
+            input.media_duration_ms = Some(2 * ALIGNMENT_V2_MAX_DURATION_MS);
+            assert!(should_stream_v2_coarse_only(input));
+            assert_eq!(
+                v2_landmark_artifact_kind(input),
+                "landmark-streaming-coarse"
+            );
+        }
+        ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)
+            .expect("long candidates retain only bounded coarse landmarks");
+        assert_eq!(test_v2_pcm_decode_invocations(), 0);
+
+        let mut unknown_duration = test_audio_input(99, 0);
+        unknown_duration.media_duration_ms = None;
+        assert!(should_stream_v2_coarse_only(&unknown_duration));
+        assert_eq!(
+            v2_landmark_artifact_kind(&unknown_duration),
+            "landmark-streaming-coarse"
+        );
+        let error = check_v2_duration_limit(&unknown_duration, "未知时长参考").unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("时长未知"));
+    }
+
+    #[test]
+    fn production_probe_admits_long_media_to_streaming_coarse_but_keeps_24h_cap() {
+        check_v2_coarse_probe_duration(Some(ALIGNMENT_V2_MAX_DURATION_MS + 1), "长参考")
+            .expect("超过一小时的媒体必须能进入 bounded streaming coarse");
+        check_v2_coarse_probe_duration(Some(ALIGNMENT_V2_COARSE_MAX_DURATION_MS), "长参考")
+            .expect("24 小时边界仍在显式 coarse 上限内");
+        check_v2_coarse_probe_duration(None, "未知时长参考")
+            .expect("未知时长由 streaming stdout hard limit 继续约束");
+
+        let error = check_v2_coarse_probe_duration(
+            Some(ALIGNMENT_V2_COARSE_MAX_DURATION_MS + 1),
+            "超长参考",
+        )
+        .unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("24 小时"));
     }
 
     #[test]
@@ -14204,6 +14962,27 @@ mod tests {
         assert!(!error.contains("alice"));
         assert!(!error.contains("episode.mkv"));
         assert!(!error.contains("secret-token"));
+    }
+
+    #[test]
+    fn supervised_streaming_spawn_error_never_echoes_executable_or_arguments() {
+        let executable = r"C:\Users\alice\private\ffmpeg-secret.exe";
+        let argument = r"C:\Users\alice\private\episode.mkv?token=secret-value";
+        let error = run_supervised_ffmpeg_streaming(
+            executable,
+            [argument],
+            "FFmpeg V2 流式粗定位解码",
+            1024,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("本地路径与工具输出已隐藏"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("ffmpeg-secret"));
+        assert!(!error.contains("episode.mkv"));
+        assert!(!error.contains("secret-value"));
     }
 
     #[test]

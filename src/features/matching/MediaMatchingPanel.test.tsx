@@ -30,8 +30,13 @@ import {
   createManualMediaTimeMapVerificationRequest
 } from "../../domain/alignment/mediaTimeMap";
 import {
+  cancelTauriAudioAlignmentBatchJob,
   cancelTauriAudioAlignmentJob,
+  getTauriAudioAlignmentBatchJob,
+  getTauriAudioAlignmentJob,
+  startTauriAudioAlignmentBatchJob,
   startTauriAudioAlignmentJob,
+  type AudioAlignmentBatchJobSnapshot,
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
@@ -48,7 +53,10 @@ vi.mock("../../infrastructure/alignment/tauriAudioAlignment", async () => {
     ...actual,
     startTauriAudioAlignmentJob: vi.fn(),
     getTauriAudioAlignmentJob: vi.fn(),
-    cancelTauriAudioAlignmentJob: vi.fn()
+    cancelTauriAudioAlignmentJob: vi.fn(),
+    startTauriAudioAlignmentBatchJob: vi.fn(),
+    getTauriAudioAlignmentBatchJob: vi.fn(),
+    cancelTauriAudioAlignmentBatchJob: vi.fn()
   };
 });
 
@@ -66,6 +74,176 @@ const defaultIssueManualVerification =
   useEditorStore.getState().issueManualMediaTimeMapVerification;
 const defaultRevokeManualVerification =
   useEditorStore.getState().revokeManualMediaTimeMapVerification;
+
+interface LegacyBatchPairState {
+  sourceMediaId: string;
+  targetMediaId: string;
+  snapshot: AudioAlignmentJobSnapshot;
+}
+
+const legacyBatchJobs = new Map<string, LegacyBatchPairState[]>();
+let legacyBatchSequence = 0;
+
+function installLegacyPairwiseBatchAdapter(): void {
+  vi.mocked(startTauriAudioAlignmentBatchJob).mockImplementation(async (request) => {
+    const jobId = `native-batch-${++legacyBatchSequence}`;
+    const sources = new Map(request.sources.map((media) => [media.mediaId, media]));
+    const targets = new Map(request.targets.map((media) => [media.mediaId, media]));
+    const requestedPairs =
+      request.pairs ??
+      request.sources.flatMap((source) =>
+        request.targets.map((target) => ({
+          sourceMediaId: source.mediaId,
+          targetMediaId: target.mediaId
+        }))
+      );
+    const pairs: LegacyBatchPairState[] = [];
+    for (const pair of requestedPairs) {
+      const source = sources.get(pair.sourceMediaId);
+      const target = targets.get(pair.targetMediaId);
+      if (!source || !target) {
+        throw new Error("测试批次引用了不存在的媒体");
+      }
+      try {
+        const snapshot = await startTauriAudioAlignmentJob({
+          sourcePath: source.path,
+          completePath: target.path,
+          ffmpegPath: request.ffmpegPath,
+          ffprobePath: request.ffprobePath,
+          windowMs: request.windowMs,
+          minGapMs: request.minGapMs,
+          matchThreshold: request.matchThreshold,
+          localizationMode: request.localizationMode
+        });
+        pairs.push({
+          sourceMediaId: pair.sourceMediaId,
+          targetMediaId: pair.targetMediaId,
+          snapshot
+        });
+      } catch (error) {
+        pairs.push({
+          sourceMediaId: pair.sourceMediaId,
+          targetMediaId: pair.targetMediaId,
+          snapshot: {
+            jobId: `${jobId}-failed-${pairs.length + 1}`,
+            status: "failed",
+            progress: 1,
+            message: "这组素材未能完成分析",
+            logs: [],
+            proposal: null,
+            error: error instanceof Error ? error.message : "分析失败",
+            updatedAtMs: 1
+          }
+        });
+      }
+    }
+    legacyBatchJobs.set(jobId, pairs);
+    return createLegacyBatchSnapshot(jobId, pairs);
+  });
+  vi.mocked(getTauriAudioAlignmentBatchJob).mockImplementation(async (jobId) => {
+    const pairs = legacyBatchJobs.get(jobId);
+    if (!pairs) {
+      throw new Error("测试批任务不存在");
+    }
+    for (const pair of pairs) {
+      if (pair.snapshot.status === "queued" || pair.snapshot.status === "running") {
+        const next = await getTauriAudioAlignmentJob(pair.snapshot.jobId);
+        if (next) {
+          pair.snapshot = next;
+        }
+      }
+    }
+    return createLegacyBatchSnapshot(jobId, pairs);
+  });
+  vi.mocked(cancelTauriAudioAlignmentBatchJob).mockImplementation(async (jobId) => {
+    const pairs = legacyBatchJobs.get(jobId);
+    if (!pairs) {
+      throw new Error("测试批任务不存在");
+    }
+    for (const pair of pairs) {
+      if (pair.snapshot.status === "queued" || pair.snapshot.status === "running") {
+        const cancelled = await cancelTauriAudioAlignmentJob(pair.snapshot.jobId);
+        pair.snapshot =
+          cancelled ??
+          ({
+            ...pair.snapshot,
+            status: "cancelled",
+            progress: 1,
+            message: "已取消",
+            proposal: null,
+            error: null
+          } satisfies AudioAlignmentJobSnapshot);
+      }
+    }
+    return createLegacyBatchSnapshot(jobId, pairs);
+  });
+}
+
+function createLegacyBatchSnapshot(
+  jobId: string,
+  pairs: readonly LegacyBatchPairState[]
+): AudioAlignmentBatchJobSnapshot {
+  const hasActivePair = pairs.some(
+    (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
+  );
+  const cancelled = !hasActivePair && pairs.some((pair) => pair.snapshot.status === "cancelled");
+  const status = hasActivePair ? "running" : cancelled ? "cancelled" : "completed";
+  const processedPairCount = pairs.filter(
+    (pair) => pair.snapshot.status === "completed" || pair.snapshot.status === "failed"
+  ).length;
+  return {
+    schemaVersion: 1,
+    jobId,
+    status,
+    progress:
+      status === "running"
+        ? pairs.reduce((sum, pair) => sum + pair.snapshot.progress, 0) / Math.max(1, pairs.length)
+        : 1,
+    message: status === "cancelled" ? "批次已取消" : status === "completed" ? "批次已完成" : "批次执行中",
+    totalPairCount: pairs.length,
+    processedPairCount: status === "cancelled" ? pairs.length : processedPairCount,
+    failedPairCount: pairs.filter((pair) => pair.snapshot.status === "failed").length,
+    currentPairOrdinal:
+      pairs.findIndex(
+        (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
+      ) + 1 || null,
+    pairs: pairs.map((pair, index) => ({
+      pairOrdinal: index + 1,
+      sourceMediaId: pair.sourceMediaId,
+      targetMediaId: pair.targetMediaId,
+      status: pair.snapshot.status,
+      progress: pair.snapshot.progress,
+      message: pair.snapshot.message,
+      proposal: pair.snapshot.proposal,
+      error: pair.snapshot.error
+    })),
+    error: null,
+    updatedAtMs: Math.max(1, ...pairs.map((pair) => pair.snapshot.updatedAtMs))
+  };
+}
+
+function createTestBatchPair(
+  sourceMediaId: string,
+  targetMediaId: string,
+  status: AudioAlignmentJobSnapshot["status"],
+  proposal: AlignmentProposal | null = null,
+  message: string = status
+): LegacyBatchPairState {
+  return {
+    sourceMediaId,
+    targetMediaId,
+    snapshot: {
+      jobId: `pair-${sourceMediaId}-${targetMediaId}`,
+      status,
+      progress: status === "queued" ? 0 : status === "running" ? 0.35 : 1,
+      message,
+      logs: [],
+      proposal,
+      error: status === "failed" ? message : null,
+      updatedAtMs: 1
+    }
+  };
+}
 
 describe("多媒体自动匹配工作台", () => {
   beforeEach(() => {
@@ -98,7 +276,10 @@ describe("多媒体自动匹配工作台", () => {
         updatedAtMs: 1
       })
     );
+    vi.mocked(getTauriAudioAlignmentJob).mockReset();
     vi.mocked(cancelTauriAudioAlignmentJob).mockReset();
+    legacyBatchJobs.clear();
+    installLegacyPairwiseBatchAdapter();
   });
 
   afterEach(() => {
@@ -118,18 +299,24 @@ describe("多媒体自动匹配工作台", () => {
     await waitFor(() =>
       expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(2)
     );
-    expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(2);
-    expect(startTauriAudioAlignmentJob).toHaveBeenNthCalledWith(
-      1,
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
       expect.objectContaining({
-        sourcePath: "D:\\video\\collection.mkv",
-        completePath: "D:\\video\\ep1.mkv",
+        sources: [{ mediaId: "source-long", path: "D:\\video\\collection.mkv" }],
+        targets: [
+          { mediaId: "target-ep1", path: "D:\\video\\ep1.mkv" },
+          { mediaId: "target-ep2", path: "D:\\video\\ep2.mkv" }
+        ],
+        pairs: [
+          { sourceMediaId: "source-long", targetMediaId: "target-ep1" },
+          { sourceMediaId: "source-long", targetMediaId: "target-ep2" }
+        ],
         localizationMode: true
       })
     );
     expect(screen.getAllByTestId("media-match-candidate")).toHaveLength(2);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：pairwise 找到 2、全局采用 2、阻断备选 0。"
+      "批量匹配完成：找到 2 组可能对应片段，其中 2 组建议优先复核，0 组需要额外复核。"
     );
     expect(
       useEditorStore
@@ -170,6 +357,100 @@ describe("多媒体自动匹配工作台", () => {
         .project.mediaMatchCandidates.map((candidate) => candidate.state)
         .sort()
     ).toEqual(["accepted", "pending"]);
+  });
+
+  it("只启动一个原生批次并用同一 jobId 轮询一对多结果", async () => {
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-poll-once", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "正在检查第一组"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
+    vi.mocked(getTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-poll-once", [
+        createTestBatchPair(
+          "source-long",
+          "target-ep1",
+          "completed",
+          createProposal(0),
+          "完成"
+        ),
+        createTestBatchPair(
+          "source-long",
+          "target-ep2",
+          "completed",
+          createProposal(60_000),
+          "完成"
+        )
+      ])
+    );
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(2)
+    );
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
+    expect(getTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
+    expect(getTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-poll-once");
+    expect(startTauriAudioAlignmentJob).not.toHaveBeenCalled();
+  });
+
+  it("轮询异常时先停止仍在运行的原生批次，再释放前端任务引用", async () => {
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-poll-error", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "正在分析"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
+    vi.mocked(getTauriAudioAlignmentBatchJob).mockRejectedValueOnce(new Error("状态读取失败"));
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-poll-error", [
+        createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已停止"),
+        createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已停止")
+      ])
+    );
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() =>
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-poll-error")
+    );
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("批量匹配已取消")
+    );
+    expect(screen.getByRole("button", { name: "继续剩余任务" })).toBeEnabled();
+  });
+
+  it("原生批次清理未确认时保留任务引用，并阻止新的批次覆盖它", async () => {
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-cleanup-uncertain", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "正在分析"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
+    vi.mocked(getTauriAudioAlignmentBatchJob).mockRejectedValueOnce(new Error("状态读取失败"));
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockRejectedValue(
+      new Error("无法确认原生任务已停止")
+    );
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("清理状态不确定")
+    );
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("已拒绝启动新任务")
+    );
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
+    expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(2);
   });
 
   it("缺少本地路径的素材会禁用并提示回素材页重连", async () => {
@@ -214,25 +495,25 @@ describe("多媒体自动匹配工作台", () => {
     await waitFor(() => expect(screen.getByText(/共 4 组/)).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
 
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
     await waitFor(() =>
       expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(3)
     );
-    expect(
-      vi
-        .mocked(startTauriAudioAlignmentJob)
-        .mock.calls.map(([request]) => [request.sourcePath, request.completePath])
-    ).toEqual([
-      ["D:\\video\\collection.mkv", "D:\\video\\ep1.mkv"],
-      ["D:\\video\\collection.mkv", "D:\\video\\ep2.mkv"],
-      ["D:\\video\\collection-b.mkv", "D:\\video\\ep1.mkv"],
-      ["D:\\video\\collection-b.mkv", "D:\\video\\ep2.mkv"]
-    ]);
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pairs: [
+          { sourceMediaId: "source-long", targetMediaId: "target-ep1" },
+          { sourceMediaId: "source-long", targetMediaId: "target-ep2" },
+          { sourceMediaId: "source-long-b", targetMediaId: "target-ep1" },
+          { sourceMediaId: "source-long-b", targetMediaId: "target-ep2" }
+        ]
+      })
+    );
     expect(
       within(screen.getByLabelText("批量匹配任务")).getByText("第一组音轨不可用")
     ).toBeInTheDocument();
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：pairwise 找到 3、全局采用 1、阻断备选 2，1 组失败。"
+      "批量匹配完成：找到 3 组可能对应片段，其中 1 组建议优先复核，2 组需要额外复核，1 组未能完成分析。"
     );
     expect(
       useEditorStore
@@ -284,11 +565,11 @@ describe("多媒体自动匹配工作台", () => {
     });
     expect(weak?.proposal.timeMap?.quality.reasons.join(" ")).toContain("同一原片时间范围冲突");
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：pairwise 找到 2、全局采用 1、阻断备选 1。"
+      "批量匹配完成：找到 2 组可能对应片段，其中 1 组建议优先复核，1 组需要额外复核。"
     );
     const taskList = screen.getByLabelText("批量匹配任务");
-    expect(within(taskList).getByText(/全局采用/)).toBeInTheDocument();
-    expect(within(taskList).getByText(/全局阻断备选/)).toBeInTheDocument();
+    expect(within(taskList).getByText(/建议优先复核/)).toBeInTheDocument();
+    expect(within(taskList).getByText(/作为备选保留/)).toBeInTheDocument();
     const weakCard = screen
       .getAllByTestId("media-match-candidate")
       .find((card) => card.textContent?.includes("source-long-b"));
@@ -349,7 +630,7 @@ describe("多媒体自动匹配工作台", () => {
       )
     ).toBe(true);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：pairwise 找到 4、全局采用 2、阻断备选 2。"
+      "批量匹配完成：找到 4 组可能对应片段，其中 2 组建议优先复核，2 组需要额外复核。"
     );
   });
 
@@ -386,15 +667,15 @@ describe("多媒体自动匹配工作台", () => {
           candidate.proposal.timeMap?.quality.level === "blocked" &&
           candidate.proposal.timeMap.quality.probability === null &&
           candidate.proposal.timeMap.quality.reasons.some((reason) =>
-            reason.includes("全局 Top1/Top2")
+            reason.includes("两套可行组合")
           )
       )
     ).toBe(true);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：pairwise 找到 2、全局采用 0、阻断备选 2。"
+      "批量匹配完成：找到 2 组可能对应片段，其中 0 组建议优先复核，2 组需要额外复核。"
     );
     expect(
-      within(screen.getByLabelText("批量匹配任务")).getAllByText(/全局 Top1\/Top2/)
+      within(screen.getByLabelText("批量匹配任务")).getAllByText(/两套可行组合/)
     ).toHaveLength(2);
     screen.getAllByRole("button", { name: "此候选不能确认" }).forEach((button) => {
       expect(button).toBeDisabled();
@@ -407,37 +688,38 @@ describe("多媒体自动匹配工作台", () => {
       createMedia("target-ep3", "targetOriginal", "D:\\video\\ep3.mkv", 60_000)
     );
     useEditorStore.setState({ project });
-    vi.mocked(startTauriAudioAlignmentJob)
-      .mockResolvedValueOnce({
-        jobId: "job-completed",
-        status: "completed",
-        progress: 1,
-        message: "完成",
-        logs: [],
-        proposal: createProposal(0),
-        error: null,
-        updatedAtMs: 1
-      })
-      .mockResolvedValueOnce({
-        jobId: "job-cancel",
-        status: "running",
-        progress: 0.4,
-        message: "正在分析第二组",
-        logs: [],
-        proposal: null,
-        error: null,
-        updatedAtMs: 2
-      });
-    vi.mocked(cancelTauriAudioAlignmentJob).mockResolvedValue({
-      jobId: "job-cancel",
-      status: "cancelled",
-      progress: 0.4,
-      message: "已取消",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 3
-    });
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("native-batch-cancel", [
+        createTestBatchPair(
+          "source-long",
+          "target-ep1",
+          "completed",
+          createProposal(0),
+          "第一组已完成"
+        ),
+        createTestBatchPair(
+          "source-long",
+          "target-ep2",
+          "running",
+          null,
+          "正在分析第二组"
+        ),
+        createTestBatchPair("source-long", "target-ep3", "queued", null, "等待执行")
+      ])
+    );
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("native-batch-cancel", [
+        createTestBatchPair(
+          "source-long",
+          "target-ep1",
+          "completed",
+          createProposal(0),
+          "第一组已完成"
+        ),
+        createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已取消"),
+        createTestBatchPair("source-long", "target-ep3", "cancelled", null, "已取消")
+      ])
+    );
 
     render(<MatchingHarness />);
 
@@ -448,19 +730,18 @@ describe("多媒体自动匹配工作台", () => {
     fireEvent.click(screen.getByRole("button", { name: "取消剩余任务" }));
 
     await waitFor(() =>
-      expect(cancelTauriAudioAlignmentJob).toHaveBeenCalledWith("job-cancel")
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("native-batch-cancel")
     );
     await waitFor(() =>
       expect(useEditorStore.getState().status.message).toContain("批量匹配已取消")
     );
     expect(useEditorStore.getState().status.message).toContain(
-      "pairwise 找到 1、全局采用 1、阻断备选 0"
+      "找到 1 组可能对应片段，其中 1 组建议优先复核，0 组需要额外复核"
     );
-    expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(2);
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
     expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(1);
     const taskList = screen.getByLabelText("批量匹配任务");
-    expect(within(taskList).getByText("批次已取消")).toBeInTheDocument();
-    expect(within(taskList).getAllByText("已取消").length).toBeGreaterThanOrEqual(2);
+    expect(within(taskList).getAllByText("未完成，已停止")).toHaveLength(2);
 
     const continueButton = await screen.findByRole("button", { name: "继续剩余任务" });
     vi.mocked(startTauriAudioAlignmentJob).mockImplementation((request) =>
@@ -481,15 +762,15 @@ describe("多媒体自动匹配工作台", () => {
     await waitFor(() =>
       expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(3)
     );
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(4));
-    expect(
-      vi.mocked(startTauriAudioAlignmentJob).mock.calls.map(([request]) => request.completePath)
-    ).toEqual([
-      "D:\\video\\ep1.mkv",
-      "D:\\video\\ep2.mkv",
-      "D:\\video\\ep2.mkv",
-      "D:\\video\\ep3.mkv"
-    ]);
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(2));
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        pairs: [
+          { sourceMediaId: "source-long", targetMediaId: "target-ep2" },
+          { sourceMediaId: "source-long", targetMediaId: "target-ep3" }
+        ]
+      })
+    );
     expect(screen.getByRole("button", { name: "开始批量匹配" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
@@ -499,7 +780,7 @@ describe("多媒体自动匹配工作台", () => {
         "所选 3 组素材已有候选或已保存关系，无需重复分析。"
       )
     );
-    expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(4);
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(2);
     expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(3);
   });
 
@@ -529,9 +810,11 @@ describe("多媒体自动匹配工作台", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
 
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(1));
-    expect(startTauriAudioAlignmentJob).toHaveBeenCalledWith(
-      expect.objectContaining({ completePath: "D:\\video\\ep2.mkv" })
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pairs: [{ sourceMediaId: "source-long", targetMediaId: "target-ep2" }]
+      })
     );
     expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(1);
     expect(useEditorStore.getState().project.mediaMatchCandidates[0].targetMediaId).toBe(
@@ -1247,39 +1530,33 @@ describe("多媒体自动匹配工作台", () => {
   });
 
   it("在启动接口返回 jobId 前取消，拿到 jobId 后仍会取消后端任务且不落候选", async () => {
-    const startDeferred = createDeferred<AudioAlignmentJobSnapshot>();
-    vi.mocked(startTauriAudioAlignmentJob).mockReturnValue(startDeferred.promise);
-    vi.mocked(cancelTauriAudioAlignmentJob).mockResolvedValue({
-      jobId: "job-returned-after-cancel",
-      status: "cancelled",
-      progress: 0,
-      message: "已取消",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 2
-    });
+    const startDeferred = createDeferred<AudioAlignmentBatchJobSnapshot>();
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockReturnValueOnce(startDeferred.promise);
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-returned-after-cancel", [
+        createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已取消"),
+        createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已取消")
+      ])
+    );
     render(<MatchingHarness />);
 
     await waitFor(() => expect(screen.getByText(/共 2 组/)).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole("button", { name: "取消剩余任务" }));
-    expect(cancelTauriAudioAlignmentJob).not.toHaveBeenCalled();
+    expect(cancelTauriAudioAlignmentBatchJob).not.toHaveBeenCalled();
 
-    startDeferred.resolve({
-      jobId: "job-returned-after-cancel",
-      status: "running",
-      progress: 0,
-      message: "后端任务刚刚启动",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 1
-    });
+    startDeferred.resolve(
+      createLegacyBatchSnapshot("batch-returned-after-cancel", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "刚刚开始"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
 
     await waitFor(() =>
-      expect(cancelTauriAudioAlignmentJob).toHaveBeenCalledWith("job-returned-after-cancel")
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+        "batch-returned-after-cancel"
+      )
     );
     await waitFor(() =>
       expect(useEditorStore.getState().status.message).toContain("批量匹配已取消")
@@ -1288,81 +1565,79 @@ describe("多媒体自动匹配工作台", () => {
   });
 
   it("组件卸载会取消活动中的后端任务，并阻止迟到候选写入项目", async () => {
-    vi.mocked(startTauriAudioAlignmentJob).mockResolvedValue({
-      jobId: "job-active-on-unmount",
-      status: "running",
-      progress: 0.25,
-      message: "后端任务运行中",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 1
-    });
-    vi.mocked(cancelTauriAudioAlignmentJob).mockResolvedValue({
-      jobId: "job-active-on-unmount",
-      status: "cancelled",
-      progress: 0.25,
-      message: "已取消",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 2
-    });
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-active-on-unmount", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "批次运行中"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
+      createLegacyBatchSnapshot("batch-active-on-unmount", [
+        createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已取消"),
+        createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已取消")
+      ])
+    );
     const { unmount } = render(<MatchingHarness />);
 
     await waitFor(() => expect(screen.getByText(/共 2 组/)).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
-    await screen.findByText("后端任务运行中");
+    await screen.findByText("批次运行中");
 
     unmount();
 
     await waitFor(() =>
-      expect(cancelTauriAudioAlignmentJob).toHaveBeenCalledWith("job-active-on-unmount")
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-active-on-unmount")
     );
     await new Promise((resolve) => window.setTimeout(resolve, 400));
     expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
   });
 
   it("组件卸载后即使迟到任务已经完成也不会写入全局候选", async () => {
-    const startDeferred = createDeferred<AudioAlignmentJobSnapshot>();
-    vi.mocked(startTauriAudioAlignmentJob).mockReturnValue(startDeferred.promise);
+    const startDeferred = createDeferred<AudioAlignmentBatchJobSnapshot>();
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockReturnValueOnce(startDeferred.promise);
     const { unmount } = render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
     unmount();
-    startDeferred.resolve({
-      jobId: "job-completed-after-unmount",
-      status: "completed",
-      progress: 1,
-      message: "完成",
-      logs: [],
-      proposal: createProposal(0),
-      error: null,
-      updatedAtMs: 1
-    });
+    startDeferred.resolve(
+      createLegacyBatchSnapshot("batch-completed-after-unmount", [
+        createTestBatchPair(
+          "source-long",
+          "target-ep1",
+          "completed",
+          createProposal(0),
+          "完成"
+        ),
+        createTestBatchPair(
+          "source-long",
+          "target-ep2",
+          "completed",
+          createProposal(60_000),
+          "完成"
+        )
+      ])
+    );
 
     await new Promise((resolve) => window.setTimeout(resolve, 50));
     expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
   });
 
   it("运行中打开同 ID 的另一项目版本会取消旧任务且不跨项目写入候选或状态", async () => {
-    const startDeferred = createDeferred<AudioAlignmentJobSnapshot>();
-    vi.mocked(startTauriAudioAlignmentJob).mockReturnValue(startDeferred.promise);
-    vi.mocked(cancelTauriAudioAlignmentJob).mockResolvedValue({
-      jobId: "job-from-old-project",
-      status: "cancelled",
-      progress: 0,
-      message: "已取消",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 2
-    });
+    const startDeferred = createDeferred<AudioAlignmentBatchJobSnapshot>();
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockReturnValueOnce(startDeferred.promise);
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockImplementation((jobId) =>
+      Promise.resolve(
+        createLegacyBatchSnapshot(jobId, [
+          createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已取消"),
+          createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已取消")
+        ])
+      )
+    );
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
 
     const previousProject = useEditorStore.getState().project;
     const replacement = createMatchingProject();
@@ -1377,19 +1652,15 @@ describe("多媒体自动匹配工作台", () => {
         .openProjectFromText(serializeProject(replacement), "replacement.json")
     );
 
-    startDeferred.resolve({
-      jobId: "job-from-old-project",
-      status: "running",
-      progress: 0.3,
-      message: "旧项目任务迟到",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 1
-    });
+    startDeferred.resolve(
+      createLegacyBatchSnapshot("batch-from-old-project", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "旧项目任务迟到"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
 
     await waitFor(() =>
-      expect(cancelTauriAudioAlignmentJob).toHaveBeenCalledWith("job-from-old-project")
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-from-old-project")
     );
     await new Promise((resolve) => window.setTimeout(resolve, 400));
     expect(useEditorStore.getState().project.name).toBe("同 ID 的重开版本");
@@ -1398,35 +1669,33 @@ describe("多媒体自动匹配工作台", () => {
   });
 
   it("旧项目 start 迟到时不会覆盖新批次活动 job，取消仍终止新任务", async () => {
-    const oldStartDeferred = createDeferred<AudioAlignmentJobSnapshot>();
-    vi.mocked(startTauriAudioAlignmentJob)
+    const oldStartDeferred = createDeferred<AudioAlignmentBatchJobSnapshot>();
+    vi.mocked(startTauriAudioAlignmentBatchJob)
       .mockReturnValueOnce(oldStartDeferred.promise)
-      .mockResolvedValueOnce({
-        jobId: "job-new-project",
-        status: "running",
-        progress: 0.2,
-        message: "新项目任务运行中",
-        logs: [],
-        proposal: null,
-        error: null,
-        updatedAtMs: 2
-      });
-    vi.mocked(cancelTauriAudioAlignmentJob).mockImplementation((jobId) =>
-      Promise.resolve({
-        jobId,
-        status: "cancelled",
-        progress: 0.2,
-        message: "已取消",
-        logs: [],
-        proposal: null,
-        error: null,
-        updatedAtMs: 3
-      })
+      .mockResolvedValueOnce(
+        createLegacyBatchSnapshot("batch-new-project", [
+          createTestBatchPair(
+            "source-long",
+            "target-ep1",
+            "running",
+            null,
+            "新项目任务运行中"
+          ),
+          createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+        ])
+      );
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockImplementation((jobId) =>
+      Promise.resolve(
+        createLegacyBatchSnapshot(jobId, [
+          createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已取消"),
+          createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已取消")
+        ])
+      )
     );
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() => expect(startTauriAudioAlignmentJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
 
     const replacement = createMatchingProject();
     replacement.id = useEditorStore.getState().project.id;
@@ -1439,24 +1708,20 @@ describe("多媒体自动匹配工作台", () => {
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
     await screen.findByText("新项目任务运行中");
 
-    oldStartDeferred.resolve({
-      jobId: "job-old-project",
-      status: "running",
-      progress: 0.8,
-      message: "旧项目任务迟到",
-      logs: [],
-      proposal: null,
-      error: null,
-      updatedAtMs: 1
-    });
+    oldStartDeferred.resolve(
+      createLegacyBatchSnapshot("batch-old-project", [
+        createTestBatchPair("source-long", "target-ep1", "running", null, "旧项目任务迟到"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ])
+    );
     await waitFor(() =>
-      expect(cancelTauriAudioAlignmentJob).toHaveBeenCalledWith("job-old-project")
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-old-project")
     );
     expect(screen.queryByText("旧项目任务迟到")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "取消剩余任务" }));
     await waitFor(() =>
-      expect(cancelTauriAudioAlignmentJob).toHaveBeenCalledWith("job-new-project")
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-new-project")
     );
     expect(useEditorStore.getState().project.name).toBe("并发切换后的项目");
     expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);

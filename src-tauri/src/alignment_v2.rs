@@ -4,6 +4,10 @@
 //! 或细粒度特征，并根据真实素材基准决定是否采用结果。本模块的测试只验证合成信号下的
 //! 数学性质，不代表真实媒体已经达到产品精度门槛。
 
+use crate::cuda_fft_backend::{
+    probe_cuda_fft_capability, CudaFftBatchErrorCode, CudaFftR2c512Session, CUDA_FFT_BACKEND_ID,
+    CUDA_FFT_BINS_PER_FRAME, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -26,6 +30,122 @@ const STATE_SOURCE_ONLY: u8 = 1;
 const STATE_TARGET_ONLY: u8 = 2;
 const STATE_NONE: u8 = u8::MAX;
 const ALIGNMENT_V2_CANCELLED: &str = "Alignment V2 算法已取消。";
+pub const CPU_SPECTRAL_BACKEND_ID: &str = "cpu-radix2-f64-r2c-512-v1";
+pub const STREAMING_CPU_SPECTRAL_BACKEND_ID: &str = "cpu-streaming-radix2-f64-r2c-512-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpectralBackendPreference {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl SpectralBackendPreference {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+/// A resolved backend request is created before cache lookup. `planned_backend_id` is safe to
+/// use for that lookup; the extraction result still reports the backend that actually completed
+/// the work, so an auto-mode CUDA runtime failure can publish only under the CPU cache key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpectralBackendRequest {
+    preference: SpectralBackendPreference,
+    pub planned_backend_id: String,
+    pub requested_backend: String,
+    pub backend_detail: String,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpectralBackendExecution {
+    pub backend_id: String,
+    pub requested_backend: String,
+    pub backend_detail: String,
+    pub fallback_reason: Option<String>,
+}
+
+/// Resolves the process-level production policy without claiming that a transform has run.
+/// Tests default to CPU for determinism. Production defaults to auto and uses CUDA only after a
+/// real context + cuFFT smoke transform succeeds. Explicit CUDA is fail-closed.
+pub fn resolve_spectral_backend_request() -> Result<SpectralBackendRequest, String> {
+    let preference = spectral_backend_preference_from_environment()?;
+    resolve_spectral_backend_preference(preference)
+}
+
+fn spectral_backend_preference_from_environment() -> Result<SpectralBackendPreference, String> {
+    if std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1") {
+        return Ok(SpectralBackendPreference::Cuda);
+    }
+    if let Ok(value) = std::env::var("C137_SPECTRAL_BACKEND") {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(SpectralBackendPreference::Auto),
+            "cpu" => Ok(SpectralBackendPreference::Cpu),
+            "cuda" => Ok(SpectralBackendPreference::Cuda),
+            _ => Err(format!(
+                "blocked:spectral-backend-config：C137_SPECTRAL_BACKEND 仅支持 auto、cpu 或 cuda，当前值为 {value:?}。"
+            )),
+        };
+    }
+    if cfg!(test) {
+        Ok(SpectralBackendPreference::Cpu)
+    } else {
+        Ok(SpectralBackendPreference::Auto)
+    }
+}
+
+fn resolve_spectral_backend_preference(
+    preference: SpectralBackendPreference,
+) -> Result<SpectralBackendRequest, String> {
+    match preference {
+        SpectralBackendPreference::Cpu => Ok(SpectralBackendRequest {
+            preference,
+            planned_backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+            requested_backend: preference.label().to_string(),
+            backend_detail: "CPU radix-2 f64 FFT".to_string(),
+            fallback_reason: None,
+        }),
+        SpectralBackendPreference::Auto | SpectralBackendPreference::Cuda => {
+            let capability = probe_cuda_fft_capability(0);
+            if capability.available {
+                Ok(SpectralBackendRequest {
+                    preference,
+                    planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+                    requested_backend: preference.label().to_string(),
+                    backend_detail: format!(
+                        "CUDA/cuFFT device #0 {}",
+                        capability
+                            .selected_device_name
+                            .as_deref()
+                            .unwrap_or("未命名 NVIDIA GPU")
+                    ),
+                    fallback_reason: None,
+                })
+            } else if preference == SpectralBackendPreference::Cuda {
+                Err(format!(
+                    "blocked:cuda-fft-unavailable：已强制 CUDA 声谱后端，但能力探测失败：{}",
+                    capability.reason
+                ))
+            } else {
+                Ok(SpectralBackendRequest {
+                    preference,
+                    planned_backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+                    requested_backend: preference.label().to_string(),
+                    backend_detail: "CPU radix-2 f64 FFT".to_string(),
+                    fallback_reason: Some(format!(
+                        "CUDA 能力探测未就绪，自动回退 CPU：{}",
+                        capability.reason
+                    )),
+                })
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -532,12 +652,31 @@ pub fn extract_landmarks_with_cancel(
     extract_landmarks_from_spectral_analysis(&analysis, config, cancel_flag)
 }
 
+#[cfg(test)]
 fn analyze_landmark_spectral_frames(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
     fine_config: Option<&FineFeatureConfig>,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Option<LandmarkSpectralAnalysis>, String> {
+    let backend_request = resolve_spectral_backend_request()?;
+    analyze_landmark_spectral_frames_with_backend(
+        pcm,
+        landmark_config,
+        fine_config,
+        cancel_flag,
+        &backend_request,
+    )
+    .map(|(analysis, _)| analysis)
+}
+
+fn analyze_landmark_spectral_frames_with_backend(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: Option<&FineFeatureConfig>,
+    cancel_flag: Option<&AtomicBool>,
+    backend_request: &SpectralBackendRequest,
+) -> Result<(Option<LandmarkSpectralAnalysis>, SpectralBackendExecution), String> {
     let window_samples = milliseconds_to_samples(
         landmark_config.window_ms as i64,
         landmark_config.sample_rate,
@@ -545,10 +684,104 @@ fn analyze_landmark_spectral_frames(
     let hop_samples =
         milliseconds_to_samples(landmark_config.hop_ms as i64, landmark_config.sample_rate)?;
     if pcm.len() < window_samples || window_samples < 8 || hop_samples == 0 {
-        return Ok(None);
+        return Ok((
+            None,
+            SpectralBackendExecution {
+                backend_id: backend_request.planned_backend_id.clone(),
+                requested_backend: backend_request.requested_backend.clone(),
+                backend_detail: backend_request.backend_detail.clone(),
+                fallback_reason: backend_request.fallback_reason.clone(),
+            },
+        ));
     }
 
     let frame_count = 1 + (pcm.len() - window_samples) / hop_samples;
+    if backend_request.planned_backend_id == CUDA_FFT_BACKEND_ID {
+        match analyze_landmark_spectral_frames_cuda(
+            pcm,
+            landmark_config,
+            fine_config,
+            cancel_flag,
+            window_samples,
+            hop_samples,
+            frame_count,
+        ) {
+            Ok(analysis) => {
+                return Ok((
+                    Some(analysis),
+                    SpectralBackendExecution {
+                        backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+                        requested_backend: backend_request.requested_backend.clone(),
+                        backend_detail: backend_request.backend_detail.clone(),
+                        fallback_reason: backend_request.fallback_reason.clone(),
+                    },
+                ));
+            }
+            Err(CudaSpectralAnalysisError::Cancelled) => {
+                return Err(ALIGNMENT_V2_CANCELLED.to_string());
+            }
+            Err(error) if backend_request.preference == SpectralBackendPreference::Cuda => {
+                return Err(format!(
+                    "blocked:cuda-fft-runtime：已强制 CUDA 声谱后端，但批量 FFT 失败：{}",
+                    error.message()
+                ));
+            }
+            Err(error) => {
+                let fallback_reason = format!(
+                    "CUDA 批量 FFT 运行失败，本次制品按 CPU 身份重算：{}",
+                    error.message()
+                );
+                let analysis = analyze_landmark_spectral_frames_cpu(
+                    pcm,
+                    landmark_config,
+                    fine_config,
+                    cancel_flag,
+                    window_samples,
+                    hop_samples,
+                    frame_count,
+                )?;
+                return Ok((
+                    Some(analysis),
+                    SpectralBackendExecution {
+                        backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+                        requested_backend: backend_request.requested_backend.clone(),
+                        backend_detail: "CPU radix-2 f64 FFT".to_string(),
+                        fallback_reason: Some(fallback_reason),
+                    },
+                ));
+            }
+        }
+    }
+
+    let analysis = analyze_landmark_spectral_frames_cpu(
+        pcm,
+        landmark_config,
+        fine_config,
+        cancel_flag,
+        window_samples,
+        hop_samples,
+        frame_count,
+    )?;
+    Ok((
+        Some(analysis),
+        SpectralBackendExecution {
+            backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+            requested_backend: backend_request.requested_backend.clone(),
+            backend_detail: backend_request.backend_detail.clone(),
+            fallback_reason: backend_request.fallback_reason.clone(),
+        },
+    ))
+}
+
+fn analyze_landmark_spectral_frames_cpu(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: Option<&FineFeatureConfig>,
+    cancel_flag: Option<&AtomicBool>,
+    window_samples: usize,
+    hop_samples: usize,
+    frame_count: usize,
+) -> Result<LandmarkSpectralAnalysis, String> {
     let mut spectra = Vec::with_capacity(frame_count);
     let mut active_frames = Vec::with_capacity(frame_count);
     let mut fine_features = Vec::with_capacity(if fine_config.is_some() {
@@ -577,13 +810,171 @@ fn analyze_landmark_spectral_frames(
         }
         spectra.push(spectrum);
     }
-    Ok(Some(LandmarkSpectralAnalysis {
+    Ok(LandmarkSpectralAnalysis {
         spectra,
         active_frames,
         fine_features,
         window_samples,
         hop_samples,
-    }))
+    })
+}
+
+#[derive(Debug)]
+enum CudaSpectralAnalysisError {
+    Unsupported(String),
+    Cancelled,
+    Runtime(String),
+}
+
+impl CudaSpectralAnalysisError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Unsupported(message) | Self::Runtime(message) => message,
+            Self::Cancelled => "Alignment V2 算法已取消。",
+        }
+    }
+}
+
+fn analyze_landmark_spectral_frames_cuda(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: Option<&FineFeatureConfig>,
+    cancel_flag: Option<&AtomicBool>,
+    window_samples: usize,
+    hop_samples: usize,
+    frame_count: usize,
+) -> Result<LandmarkSpectralAnalysis, CudaSpectralAnalysisError> {
+    let decimation = spectral_decimation(landmark_config.sample_rate);
+    let decimated_len = window_samples.div_ceil(decimation);
+    let fft_len = decimated_len.max(8).next_power_of_two();
+    if fft_len != CUDA_FFT_FRAME_LEN {
+        return Err(CudaSpectralAnalysisError::Unsupported(format!(
+            "当前声谱网格需要 {fft_len} 点 FFT，CUDA 后端只实现 {CUDA_FFT_FRAME_LEN} 点 R2C"
+        )));
+    }
+    let mut active_frames = Vec::new();
+    active_frames
+        .try_reserve_exact(frame_count)
+        .map_err(|error| {
+            CudaSpectralAnalysisError::Runtime(format!(
+                "CUDA 声谱 active frame 内存预留失败：{error}"
+            ))
+        })?;
+    let mut spectra = Vec::new();
+    spectra.try_reserve_exact(frame_count).map_err(|error| {
+        CudaSpectralAnalysisError::Runtime(format!("CUDA 声谱输出内存预留失败：{error}"))
+    })?;
+    let mut fine_features = Vec::with_capacity(if fine_config.is_some() {
+        frame_count
+    } else {
+        0
+    });
+    let denominator = decimated_len.saturating_sub(1).max(1) as f64;
+    let local_cancellation = AtomicBool::new(false);
+    let cancellation = cancel_flag.unwrap_or(&local_cancellation);
+    let mut cuda_session = CudaFftR2c512Session::new(0).map_err(|error| {
+        if error.code == CudaFftBatchErrorCode::Cancelled {
+            CudaSpectralAnalysisError::Cancelled
+        } else {
+            CudaSpectralAnalysisError::Runtime(format!("{:?}: {}", error.code, error.message))
+        }
+    })?;
+    let selected_bins = spectral_fft_bins(landmark_config.sample_rate, decimation, fft_len);
+    // Build, transform and immediately reduce one bounded GPU batch. This keeps temporary host
+    // memory independent of media duration: at most 4096 * 512 f32 input plus
+    // 4096 * 257 complex output are resident before the 48-bin spectra are retained.
+    for batch_start in (0..frame_count).step_by(CUDA_FFT_DEFAULT_BATCH_FRAMES) {
+        check_algorithm_cancelled(cancel_flag).map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+        let batch_frame_count = (frame_count - batch_start).min(CUDA_FFT_DEFAULT_BATCH_FRAMES);
+        let input_len = batch_frame_count
+            .checked_mul(CUDA_FFT_FRAME_LEN)
+            .ok_or_else(|| {
+                CudaSpectralAnalysisError::Runtime("CUDA FFT 批次输入长度溢出".to_string())
+            })?;
+        let mut input_frames = Vec::new();
+        input_frames.try_reserve_exact(input_len).map_err(|error| {
+            CudaSpectralAnalysisError::Runtime(format!("CUDA FFT 批次输入内存预留失败：{error}"))
+        })?;
+        input_frames.resize(input_len, 0.0f32);
+        let mut batch_rms = Vec::new();
+        batch_rms
+            .try_reserve_exact(batch_frame_count)
+            .map_err(|error| {
+                CudaSpectralAnalysisError::Runtime(format!(
+                    "CUDA 声谱批次 RMS 内存预留失败：{error}"
+                ))
+            })?;
+        for batch_index in 0..batch_frame_count {
+            if batch_index.is_multiple_of(64) {
+                check_algorithm_cancelled(cancel_flag)
+                    .map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+            }
+            let frame_index = batch_start + batch_index;
+            let start = frame_index * hop_samples;
+            let frame = &pcm[start..start + window_samples];
+            let rms = normalized_rms(frame);
+            batch_rms.push(rms);
+            active_frames.push(rms >= landmark_config.silence_rms);
+            let input_offset = batch_index * CUDA_FFT_FRAME_LEN;
+            for (index, sample) in frame.iter().step_by(decimation).enumerate() {
+                let window =
+                    0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / denominator).cos();
+                input_frames[input_offset + index] =
+                    (*sample as f64 / i16::MAX as f64 * window) as f32;
+            }
+        }
+        let output = cuda_session
+            .transform_batch(&input_frames, cancellation)
+            .map_err(|error| {
+                if error.code == CudaFftBatchErrorCode::Cancelled {
+                    CudaSpectralAnalysisError::Cancelled
+                } else {
+                    CudaSpectralAnalysisError::Runtime(format!(
+                        "{:?}: {}",
+                        error.code, error.message
+                    ))
+                }
+            })?;
+        check_algorithm_cancelled(cancel_flag).map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+        if output.frame_count != batch_frame_count
+            || output.bins_per_frame != CUDA_FFT_BINS_PER_FRAME
+        {
+            return Err(CudaSpectralAnalysisError::Runtime(
+                "CUDA FFT 批次输出形状与请求不一致".to_string(),
+            ));
+        }
+        for (batch_index, rms) in batch_rms.iter().copied().enumerate() {
+            let frame_index = batch_start + batch_index;
+            let output_offset = batch_index * output.bins_per_frame;
+            let spectrum = selected_bins
+                .iter()
+                .map(|bin| {
+                    let value = output.spectra[output_offset + *bin];
+                    f64::from(value.real).hypot(f64::from(value.imaginary))
+                })
+                .collect::<Vec<_>>();
+            if let Some(fine_config) = fine_config {
+                let start = frame_index * hop_samples;
+                let frame = &pcm[start..start + window_samples];
+                fine_features.push(create_fine_feature_frame(
+                    frame,
+                    &spectrum,
+                    rms,
+                    start,
+                    window_samples,
+                    fine_config,
+                ));
+            }
+            spectra.push(spectrum);
+        }
+    }
+    Ok(LandmarkSpectralAnalysis {
+        spectra,
+        active_frames,
+        fine_features,
+        window_samples,
+        hop_samples,
+    })
 }
 
 fn extract_landmarks_from_spectral_analysis(
@@ -699,6 +1090,122 @@ pub struct AffineHypothesis {
     pub p50_residual_ms: i64,
     pub p95_residual_ms: i64,
     pub max_residual_ms: i64,
+}
+
+// This window contract is staged ahead of the windowed FFmpeg decoder. Keeping it in production
+// code now lets the next C137 stage integrate against a reviewed axis-safe API; the temporary
+// dead-code allowances must disappear when that decoder is connected.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationRangeMs {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffineFineWindowRequest {
+    pub source_bounds: PresentationRangeMs,
+    pub target_bounds: PresentationRangeMs,
+    pub target_query: PresentationRangeMs,
+    pub source_guard_ms: i64,
+    pub target_guard_ms: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffineFineDecodeWindows {
+    pub source: PresentationRangeMs,
+    pub target: PresentationRangeMs,
+}
+
+/// Derives bounded absolute-presentation decode windows from a coarse affine hypothesis.
+///
+/// Alignment V2 models `target_ms = scale * source_ms + offset_ms`. Fine alignment must cover
+/// the requested target interval and inverse-project that whole interval onto the source axis;
+/// using only the coarse inlier support would silently miss source-only or target-only edits at
+/// the episode edges. The returned ranges remain on the original absolute presentation axes.
+#[allow(dead_code)]
+pub fn derive_affine_fine_decode_windows(
+    hypothesis: &AffineHypothesis,
+    request: &AffineFineWindowRequest,
+) -> Result<AffineFineDecodeWindows, String> {
+    validate_presentation_range(request.source_bounds, "来源媒体边界")?;
+    validate_presentation_range(request.target_bounds, "目标媒体边界")?;
+    validate_presentation_range(request.target_query, "目标候选区间")?;
+    if request.source_guard_ms < 0 || request.target_guard_ms < 0 {
+        return Err("精解码窗口 guard 必须是非负整数毫秒。".to_string());
+    }
+    if !hypothesis.scale.is_finite() || hypothesis.scale <= 0.0 {
+        return Err("粗定位 affine scale 必须是有限正数。".to_string());
+    }
+
+    let query_start = request
+        .target_query
+        .start_ms
+        .max(request.target_bounds.start_ms);
+    let query_end = request
+        .target_query
+        .end_ms
+        .min(request.target_bounds.end_ms);
+    if query_end <= query_start {
+        return Err("目标候选区间与目标媒体展示边界没有交集。".to_string());
+    }
+    let target_start = query_start
+        .saturating_sub(request.target_guard_ms)
+        .max(request.target_bounds.start_ms);
+    let target_end = query_end
+        .saturating_add(request.target_guard_ms)
+        .min(request.target_bounds.end_ms);
+
+    let inverse =
+        |target_ms: i64| (target_ms as f64 - hypothesis.offset_ms as f64) / hypothesis.scale;
+    let projected_start = inverse(target_start);
+    let projected_end = inverse(target_end);
+    if !projected_start.is_finite() || !projected_end.is_finite() {
+        return Err("粗定位 affine 反投影产生了非有限时间。".to_string());
+    }
+    let source_start = f64_milliseconds_to_i64(
+        projected_start.min(projected_end) - request.source_guard_ms as f64,
+        f64::floor,
+    )?
+    .max(request.source_bounds.start_ms);
+    let source_end = f64_milliseconds_to_i64(
+        projected_start.max(projected_end) + request.source_guard_ms as f64,
+        f64::ceil,
+    )?
+    .min(request.source_bounds.end_ms);
+    if source_end <= source_start {
+        return Err("反投影来源窗口与来源媒体展示边界没有交集。".to_string());
+    }
+
+    Ok(AffineFineDecodeWindows {
+        source: PresentationRangeMs {
+            start_ms: source_start,
+            end_ms: source_end,
+        },
+        target: PresentationRangeMs {
+            start_ms: target_start,
+            end_ms: target_end,
+        },
+    })
+}
+
+#[allow(dead_code)]
+fn validate_presentation_range(range: PresentationRangeMs, label: &str) -> Result<(), String> {
+    if range.end_ms <= range.start_ms {
+        return Err(format!("{label}必须是非空半开毫秒区间。"));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn f64_milliseconds_to_i64(value: f64, round: fn(f64) -> f64) -> Result<i64, String> {
+    let rounded = round(value);
+    if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+        return Err("精解码窗口毫秒值超出 i64 范围。".to_string());
+    }
+    Ok(rounded as i64)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -841,6 +1348,12 @@ pub struct LandmarkFineFeatureBundle {
     pub fine_features: Vec<FineFeatureFrame>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandmarkFineFeatureExtraction {
+    pub bundle: LandmarkFineFeatureBundle,
+    pub spectral_backend: SpectralBackendExecution,
+}
+
 #[cfg(test)]
 pub fn extract_landmarks_and_fine_features(
     pcm: &[i16],
@@ -852,30 +1365,60 @@ pub fn extract_landmarks_and_fine_features(
 
 /// 在一次声谱 FFT 遍历中同时生成 landmark 与细粒度特征。峰值跨帧判定、common-family
 /// 抑制和最终排序仍复用独立 landmark 路径，因此结果与两个独立入口逐项等价。
+#[cfg(test)]
 pub fn extract_landmarks_and_fine_features_with_cancel(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
     fine_config: &FineFeatureConfig,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<LandmarkFineFeatureBundle, String> {
+    let backend_request = resolve_spectral_backend_request()?;
+    extract_landmarks_and_fine_features_with_backend_request(
+        pcm,
+        landmark_config,
+        fine_config,
+        cancel_flag,
+        &backend_request,
+    )
+    .map(|extraction| extraction.bundle)
+}
+
+pub fn extract_landmarks_and_fine_features_with_backend_request(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: &FineFeatureConfig,
+    cancel_flag: Option<&AtomicBool>,
+    backend_request: &SpectralBackendRequest,
+) -> Result<LandmarkFineFeatureExtraction, String> {
     check_algorithm_cancelled(cancel_flag)?;
     validate_landmark_config(landmark_config)?;
     validate_fine_feature_config(fine_config)?;
     validate_shared_spectral_grid(landmark_config, fine_config)?;
-    let Some(analysis) =
-        analyze_landmark_spectral_frames(pcm, landmark_config, Some(fine_config), cancel_flag)?
-    else {
-        return Ok(LandmarkFineFeatureBundle {
-            landmarks: Vec::new(),
-            fine_features: Vec::new(),
+    let (analysis, spectral_backend) = analyze_landmark_spectral_frames_with_backend(
+        pcm,
+        landmark_config,
+        Some(fine_config),
+        cancel_flag,
+        backend_request,
+    )?;
+    let Some(analysis) = analysis else {
+        return Ok(LandmarkFineFeatureExtraction {
+            bundle: LandmarkFineFeatureBundle {
+                landmarks: Vec::new(),
+                fine_features: Vec::new(),
+            },
+            spectral_backend,
         });
     };
     let landmarks =
         extract_landmarks_from_spectral_analysis(&analysis, landmark_config, cancel_flag)?;
     check_algorithm_cancelled(cancel_flag)?;
-    Ok(LandmarkFineFeatureBundle {
-        landmarks,
-        fine_features: analysis.fine_features,
+    Ok(LandmarkFineFeatureExtraction {
+        bundle: LandmarkFineFeatureBundle {
+            landmarks,
+            fine_features: analysis.fine_features,
+        },
+        spectral_backend,
     })
 }
 
@@ -1556,8 +2099,7 @@ fn calculate_spectrum(frame: &[i16], sample_rate: u32) -> Vec<f64> {
     TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     // 16 kHz 输入先做 2:1 抽取，再以 radix-2 FFT 复用一份窗谱。旧实现为每个
     // 频率桶各扫一遍窗口（48 次 Goertzel），长媒体会出现数十亿次样本迭代。
-    let decimation = if sample_rate >= 8_000 { 2 } else { 1 };
-    let effective_sample_rate = sample_rate as f64 / decimation as f64;
+    let decimation = spectral_decimation(sample_rate);
     let decimated_len = frame.len().div_ceil(decimation);
     let fft_len = decimated_len.max(8).next_power_of_two();
     let mut spectrum = vec![(0.0f64, 0.0f64); fft_len];
@@ -1568,15 +2110,29 @@ fn calculate_spectrum(frame: &[i16], sample_rate: u32) -> Vec<f64> {
     }
     radix2_fft(&mut spectrum);
 
+    spectral_fft_bins(sample_rate, decimation, fft_len)
+        .into_iter()
+        .map(|fft_bin| spectrum[fft_bin].0.hypot(spectrum[fft_bin].1))
+        .collect()
+}
+
+fn spectral_decimation(sample_rate: u32) -> usize {
+    if sample_rate >= 8_000 {
+        2
+    } else {
+        1
+    }
+}
+
+fn spectral_fft_bins(sample_rate: u32, decimation: usize, fft_len: usize) -> Vec<usize> {
+    let effective_sample_rate = sample_rate as f64 / decimation as f64;
     let min_frequency = 80.0;
     let max_frequency = (effective_sample_rate * 0.45).min(3_600.0);
     (0..SPECTRAL_BIN_COUNT)
         .map(|bin| {
             let ratio = bin as f64 / (SPECTRAL_BIN_COUNT - 1) as f64;
             let frequency = min_frequency * (max_frequency / min_frequency).powf(ratio);
-            let fft_bin = ((frequency * fft_len as f64 / effective_sample_rate).round() as usize)
-                .min(fft_len / 2);
-            spectrum[fft_bin].0.hypot(spectrum[fft_bin].1)
+            ((frequency * fft_len as f64 / effective_sample_rate).round() as usize).min(fft_len / 2)
         })
         .collect()
 }
@@ -2772,6 +3328,139 @@ mod tests {
     }
 
     #[test]
+    fn fine_decode_windows_inverse_project_the_complete_target_episode() {
+        let hypothesis = AffineHypothesis {
+            scale: 1.0,
+            offset_ms: -300_000,
+            inlier_count: 20,
+            unique_source_count: 20,
+            unique_source_coverage: 0.8,
+            unique_target_count: 20,
+            unique_target_coverage: 0.8,
+            source_start_ms: 315_000,
+            source_end_ms: 405_000,
+            p50_residual_ms: 5,
+            p95_residual_ms: 10,
+            max_residual_ms: 20,
+        };
+        let windows = derive_affine_fine_decode_windows(
+            &hypothesis,
+            &AffineFineWindowRequest {
+                source_bounds: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 600_000,
+                },
+                target_bounds: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 120_000,
+                },
+                target_query: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 120_000,
+                },
+                source_guard_ms: 30_800,
+                target_guard_ms: 800,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            windows.source,
+            PresentationRangeMs {
+                start_ms: 269_200,
+                end_ms: 450_800,
+            }
+        );
+        assert_eq!(
+            windows.target,
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            }
+        );
+        assert!(windows.source.start_ms < hypothesis.source_start_ms);
+        assert!(windows.source.end_ms > hypothesis.source_end_ms);
+    }
+
+    #[test]
+    fn fine_decode_windows_round_outward_for_speed_drift_and_clamp_bounds() {
+        let hypothesis = AffineHypothesis {
+            scale: 1.02,
+            offset_ms: -10_000,
+            inlier_count: 10,
+            unique_source_count: 10,
+            unique_source_coverage: 1.0,
+            unique_target_count: 10,
+            unique_target_coverage: 1.0,
+            source_start_ms: 10_000,
+            source_end_ms: 80_000,
+            p50_residual_ms: 0,
+            p95_residual_ms: 0,
+            max_residual_ms: 0,
+        };
+        let windows = derive_affine_fine_decode_windows(
+            &hypothesis,
+            &AffineFineWindowRequest {
+                source_bounds: PresentationRangeMs {
+                    start_ms: 5_000,
+                    end_ms: 100_000,
+                },
+                target_bounds: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 90_000,
+                },
+                target_query: PresentationRangeMs {
+                    start_ms: 20_000,
+                    end_ms: 80_000,
+                },
+                source_guard_ms: 1_000,
+                target_guard_ms: 500,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            windows.target,
+            PresentationRangeMs {
+                start_ms: 19_500,
+                end_ms: 80_500,
+            }
+        );
+        assert_eq!(windows.source.start_ms, 27_921);
+        assert_eq!(windows.source.end_ms, 89_726);
+    }
+
+    #[test]
+    fn fine_decode_windows_reject_invalid_or_disjoint_requests() {
+        let mut hypothesis = test_affine_hypothesis();
+        hypothesis.scale = 0.0;
+        let request = AffineFineWindowRequest {
+            source_bounds: PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 10_000,
+            },
+            target_bounds: PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 10_000,
+            },
+            target_query: PresentationRangeMs {
+                start_ms: 20_000,
+                end_ms: 30_000,
+            },
+            source_guard_ms: 0,
+            target_guard_ms: 0,
+        };
+        assert!(derive_affine_fine_decode_windows(&hypothesis, &request)
+            .unwrap_err()
+            .contains("scale"));
+
+        hypothesis.scale = 1.0;
+        assert!(derive_affine_fine_decode_windows(&hypothesis, &request)
+            .unwrap_err()
+            .contains("没有交集"));
+    }
+
+    #[test]
     fn fine_features_keep_presentation_timeline_and_requested_hop() {
         let pcm = synth_tone_bursts(16_000, &[330, 510, 770, 1_130]);
         let frames = extract_fine_features(
@@ -2827,6 +3516,171 @@ mod tests {
         assert_eq!(shared.fine_features, independent_fine);
         assert_eq!(shared_spectrum_count, expected_frame_count);
         assert_eq!(independent_spectrum_count, expected_frame_count * 2);
+    }
+
+    #[test]
+    fn cuda_spectra_match_cpu_spectra_on_the_production_grid() {
+        let require_cuda = std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1")
+            || std::env::var("C137_SPECTRAL_BACKEND").as_deref() == Ok("cuda");
+        let cuda_request =
+            match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+                Ok(request) => request,
+                Err(error) if !require_cuda => {
+                    eprintln!("skip CUDA spectral equivalence: {error}");
+                    return;
+                }
+                Err(error) => panic!("CUDA was required for spectral equivalence: {error}"),
+            };
+        let cpu_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        let pcm = synth_tone_bursts(16_000, &[173, 331, 719, 1_237, 2_411]);
+        let config = LandmarkConfig {
+            window_ms: 50,
+            hop_ms: 25,
+            ..LandmarkConfig::default()
+        };
+        let window_samples = milliseconds_to_samples(50, 16_000).unwrap();
+        let hop_samples = milliseconds_to_samples(25, 16_000).unwrap();
+        let frame_count = 1 + (pcm.len() - window_samples) / hop_samples;
+        let (cpu, cpu_backend) =
+            analyze_landmark_spectral_frames_with_backend(&pcm, &config, None, None, &cpu_request)
+                .unwrap();
+        let (cuda, cuda_backend) =
+            analyze_landmark_spectral_frames_with_backend(&pcm, &config, None, None, &cuda_request)
+                .unwrap();
+        let cpu = cpu.unwrap();
+        let cuda = cuda.unwrap();
+
+        assert_eq!(cpu_backend.backend_id, CPU_SPECTRAL_BACKEND_ID);
+        assert_eq!(cuda_backend.backend_id, CUDA_FFT_BACKEND_ID);
+        assert_eq!(cpu.spectra.len(), frame_count);
+        assert_eq!(cuda.spectra.len(), frame_count);
+        assert_eq!(cpu.active_frames, cuda.active_frames);
+        for (frame_index, (cpu_frame, cuda_frame)) in
+            cpu.spectra.iter().zip(&cuda.spectra).enumerate()
+        {
+            for (bin, (cpu_value, cuda_value)) in cpu_frame.iter().zip(cuda_frame).enumerate() {
+                let tolerance = 1.0e-3 + 5.0e-5 * cpu_value.abs();
+                assert!(
+                    (cpu_value - cuda_value).abs() <= tolerance,
+                    "frame {frame_index} bin {bin}: cpu={cpu_value}, cuda={cuda_value}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_landmark_and_fine_bundle_is_semantically_equivalent_to_cpu() {
+        let require_cuda = std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1")
+            || std::env::var("C137_SPECTRAL_BACKEND").as_deref() == Ok("cuda");
+        let cuda_request =
+            match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+                Ok(request) => request,
+                Err(error) if !require_cuda => {
+                    eprintln!("skip CUDA bundle equivalence: {error}");
+                    return;
+                }
+                Err(error) => panic!("CUDA was required for bundle equivalence: {error}"),
+            };
+        let cpu_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        let pcm = synth_tone_bursts(16_000, &[211, 347, 613, 997, 1_541, 2_303]);
+        let landmark_config = LandmarkConfig {
+            sample_rate: 16_000,
+            window_ms: 50,
+            hop_ms: 50,
+            max_hash_occurrences: 64,
+            ..LandmarkConfig::default()
+        };
+        let fine_config = FineFeatureConfig {
+            sample_rate: 16_000,
+            window_ms: 50,
+            hop_ms: 50,
+            ..FineFeatureConfig::default()
+        };
+        let cpu = extract_landmarks_and_fine_features_with_backend_request(
+            &pcm,
+            &landmark_config,
+            &fine_config,
+            None,
+            &cpu_request,
+        )
+        .unwrap();
+        let cuda = extract_landmarks_and_fine_features_with_backend_request(
+            &pcm,
+            &landmark_config,
+            &fine_config,
+            None,
+            &cuda_request,
+        )
+        .unwrap();
+
+        assert_eq!(cpu.spectral_backend.backend_id, CPU_SPECTRAL_BACKEND_ID);
+        assert_eq!(cuda.spectral_backend.backend_id, CUDA_FFT_BACKEND_ID);
+        assert_eq!(cpu.bundle.landmarks, cuda.bundle.landmarks);
+        assert_eq!(
+            cpu.bundle.fine_features.len(),
+            cuda.bundle.fine_features.len()
+        );
+        for (cpu_frame, cuda_frame) in cpu
+            .bundle
+            .fine_features
+            .iter()
+            .zip(&cuda.bundle.fine_features)
+        {
+            assert_eq!(cpu_frame.time_ms, cuda_frame.time_ms);
+            assert_eq!(cpu_frame.values.len(), cuda_frame.values.len());
+            for (cpu_value, cuda_value) in cpu_frame.values.iter().zip(&cuda_frame.values) {
+                assert!((cpu_value - cuda_value).abs() <= 2.0e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn auto_cuda_runtime_fallback_reports_cpu_identity() {
+        let request = SpectralBackendRequest {
+            preference: SpectralBackendPreference::Auto,
+            planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: "test CUDA device".to_string(),
+            fallback_reason: None,
+        };
+        let pcm = synth_tone_bursts(4_000, &[173, 331, 719, 1_237]);
+        let landmark_config = LandmarkConfig {
+            sample_rate: 4_000,
+            window_ms: 50,
+            hop_ms: 50,
+            ..LandmarkConfig::default()
+        };
+        let fine_config = FineFeatureConfig {
+            sample_rate: 4_000,
+            window_ms: 50,
+            hop_ms: 50,
+            ..FineFeatureConfig::default()
+        };
+
+        let extraction = extract_landmarks_and_fine_features_with_backend_request(
+            &pcm,
+            &landmark_config,
+            &fine_config,
+            None,
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extraction.spectral_backend.backend_id,
+            CPU_SPECTRAL_BACKEND_ID
+        );
+        assert_eq!(
+            extraction.spectral_backend.backend_detail,
+            "CPU radix-2 f64 FFT"
+        );
+        assert!(extraction
+            .spectral_backend
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("512 点 R2C")));
     }
 
     #[test]
@@ -3164,6 +4018,23 @@ mod tests {
             hash,
             time_ms,
             strength_milli: 1_000,
+        }
+    }
+
+    fn test_affine_hypothesis() -> AffineHypothesis {
+        AffineHypothesis {
+            scale: 1.0,
+            offset_ms: 0,
+            inlier_count: 10,
+            unique_source_count: 10,
+            unique_source_coverage: 1.0,
+            unique_target_count: 10,
+            unique_target_coverage: 1.0,
+            source_start_ms: 0,
+            source_end_ms: 10_000,
+            p50_residual_ms: 0,
+            p95_residual_ms: 0,
+            max_residual_ms: 0,
         }
     }
 

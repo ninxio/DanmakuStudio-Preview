@@ -1,6 +1,6 @@
 use crate::process_supervision::{
     SupervisedCommand, SupervisedOutput, SupervisedOutputLimits, SupervisedProcessError,
-    SupervisedProcessErrorKind,
+    SupervisedProcessErrorKind, SupervisedStreamingLimits, SupervisedStreamingOutput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,15 +28,21 @@ const SHA256_ROUND_CONSTANTS: [u32; 64] = [
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
-const AUDIO_TIMELINE_PROBE_MAX_BYTES: usize = 128 * 1024 * 1024;
+// This is a total-workload limit, not a resident buffer. 8 GiB covers compact frame+packet
+// records for the product's bounded set of audio candidates across a 24-hour local recording,
+// while rejecting pathological files long before they can emit tens of GiB for two hours. The
+// streaming supervisor retains only a few 32 KiB chunks at any instant.
+const AUDIO_TIMELINE_PROBE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const AUDIO_TIMELINE_PROBE_MAX_STDERR_BYTES: usize = 1024 * 1024;
 const AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES: usize = 1024 * 1024;
+const AUDIO_TIMELINE_PROBE_STDOUT_CHUNK_BYTES: usize = 32 * 1024;
+const AUDIO_TIMELINE_PROBE_STDOUT_BUFFERED_CHUNKS: usize = 2;
 const AUDIO_TIMELINE_PROBE_MAX_STREAMS: usize = 256;
 const AUDIO_PTS_DISCONTINUITY_TOLERANCE_MS: i64 = 5;
 const MEDIA_TIMELINE_PROBE_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MEDIA_TIMELINE_PROBE_MAX_STDERR_BYTES: usize = 256 * 1024;
 const MEDIA_TIMELINE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const AUDIO_TIMELINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const AUDIO_TIMELINE_PROBE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const PROBE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -144,6 +150,96 @@ pub(crate) struct AudioDecodeTimelineProbe {
 struct AudioTimelineAccumulator {
     evidence: AudioDecodeTimelineProbe,
     previous_frame_end_ms: Option<i64>,
+}
+
+#[derive(Debug)]
+struct AudioTimelineCompactStreamParser {
+    accumulators: HashMap<u32, AudioTimelineAccumulator>,
+    carry: Vec<u8>,
+    record_hard_limit: usize,
+}
+
+impl AudioTimelineCompactStreamParser {
+    fn new(record_hard_limit: usize) -> Self {
+        Self {
+            accumulators: HashMap::new(),
+            carry: Vec::new(),
+            record_hard_limit,
+        }
+    }
+
+    fn consume_chunk(
+        &mut self,
+        chunk: &[u8],
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
+        let mut remaining = chunk;
+        while let Some(newline_offset) = remaining.iter().position(|byte| *byte == b'\n') {
+            self.extend_carry(&remaining[..newline_offset])?;
+            self.consume_complete_record(cancel_flag)?;
+            remaining = &remaining[newline_offset + 1..];
+        }
+        self.extend_carry(remaining)
+    }
+
+    fn finish(
+        mut self,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
+        ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
+        if !self.carry.is_empty() {
+            self.consume_complete_record(cancel_flag)?;
+        }
+        Ok(self
+            .accumulators
+            .into_iter()
+            .filter_map(|(stream_index, accumulator)| {
+                (accumulator.evidence.decoded_frame_count > 0)
+                    .then_some((stream_index, accumulator.evidence))
+            })
+            .collect())
+    }
+
+    fn extend_carry(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // The legacy whole-buffer parser removes one CR before applying the record limit. Keep
+        // that exact behavior across chunk boundaries without ever allowing an unbounded carry.
+        let Some(next_len) = self.carry.len().checked_add(bytes.len()) else {
+            return Err(audio_timeline_record_limit_error(self.record_hard_limit));
+        };
+        let valid_crlf_allowance =
+            self.record_hard_limit
+                .checked_add(1)
+                .is_some_and(|crlf_limit| {
+                    next_len == crlf_limit
+                        && bytes.last().or_else(|| self.carry.last()) == Some(&b'\r')
+                });
+        if next_len > self.record_hard_limit && !valid_crlf_allowance {
+            return Err(audio_timeline_record_limit_error(self.record_hard_limit));
+        }
+        self.carry.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn consume_complete_record(&mut self, cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
+        ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
+        let mut record = std::mem::take(&mut self.carry);
+        if record.last() == Some(&b'\r') {
+            record.pop();
+        }
+        if record.len() > self.record_hard_limit {
+            return Err(audio_timeline_record_limit_error(self.record_hard_limit));
+        }
+        let record = String::from_utf8_lossy(&record);
+        apply_audio_timeline_compact_record(record.trim(), &mut self.accumulators)
+    }
+}
+
+fn audio_timeline_record_limit_error(record_hard_limit: usize) -> String {
+    format!(
+        "blocked:resource-limit：FFprobe 音频逐帧时间戳单条记录超过 {} KiB 硬上限。",
+        record_hard_limit / 1024
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,9 +374,9 @@ pub(crate) fn probe_media_timeline_with_ffprobe_cancellable(
 
 /// Scans decoded audio frame PTS and packet skip-sample metadata under a bounded process owner.
 ///
-/// The supervisor retains at most 128 MiB of compact stdout so it can enforce timeout,
-/// cancellation and whole-process-tree cleanup without an unbounded reader join. Parsing happens
-/// only after the Job has exited and additionally rejects any compact record over 1 MiB.
+/// Compact records are aggregated incrementally through a two-slot bounded queue. The supervisor
+/// still enforces a large but finite total-workload cap, timeout, cancellation and whole-process-
+/// tree cleanup, while resident stdout stays bounded to small chunks plus one 1 MiB record carry.
 #[cfg(test)]
 pub(crate) fn probe_audio_decode_timelines_with_ffprobe(
     path: &str,
@@ -318,23 +414,41 @@ pub(crate) fn probe_audio_decode_timelines_with_ffprobe_cancellable(
         "compact=p=1:nk=0",
         path,
     ]);
-    let output = run_supervised_ffprobe(
-        &command,
-        audio_timeline_probe_limits(),
-        || alignment_probe_cancelled(cancel_flag),
-        "FFprobe 音频逐帧时间戳探测",
-    )?;
-    // Frame/packet stdout stays unparsed until the path has been re-hashed after every process in
-    // the supervised Job exits. This binds the compact PTS evidence to the same full-file
-    // identity as the stream snapshot consumed by Alignment V2.
+    let limits = audio_timeline_probe_streaming_limits();
+    let mut parser = AudioTimelineCompactStreamParser::new(AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES);
+    let mut consumer_error = None;
+    let output = command
+        .stream_stdout(
+            limits,
+            || alignment_probe_cancelled(cancel_flag),
+            |chunk| match parser.consume_chunk(chunk, cancel_flag) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    consumer_error = Some(error.clone());
+                    Err(error)
+                }
+            },
+        )
+        .map_err(|error| {
+            if error.kind() == SupervisedProcessErrorKind::Reader {
+                if let Some(error) = consumer_error.take() {
+                    return error;
+                }
+            }
+            format_supervised_ffprobe_error(
+                "FFprobe 音频逐帧时间戳探测",
+                error,
+                limits.process.stdout_hard_limit,
+                limits.process.stderr_hard_limit,
+            )
+        })?;
+    ensure_supervised_ffprobe_streaming_success(&output, "FFprobe 音频逐帧时间戳探测")?;
+    // Aggregation starts while stdout is flowing, but the result remains local and unusable until
+    // every process in the supervised Job exits and the full file identity is re-verified.
     let content_identity_after = probe_audio_timeline_guard_identity(path, cancel_flag)?;
     ensure_strict_audio_timeline_identity_match(&content_identity_before, &content_identity_after)?;
     ensure_strict_audio_timeline_identity_match(expected_identity, &content_identity_after)?;
-    parse_audio_timeline_compact_output_cancellable(
-        &output.stdout,
-        AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES,
-        cancel_flag,
-    )
+    parser.finish(cancel_flag)
 }
 
 fn probe_audio_timeline_guard_identity(
@@ -388,31 +502,15 @@ fn parse_audio_timeline_compact_output(
     parse_audio_timeline_compact_output_cancellable(output, record_hard_limit, None)
 }
 
+#[cfg(test)]
 fn parse_audio_timeline_compact_output_cancellable(
     output: &[u8],
     record_hard_limit: usize,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
-    let mut accumulators = HashMap::<u32, AudioTimelineAccumulator>::new();
-    for line in output.split(|byte| *byte == b'\n') {
-        ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
-        let record = line.strip_suffix(b"\r").unwrap_or(line);
-        if record.len() > record_hard_limit {
-            return Err(format!(
-                "blocked:resource-limit：FFprobe 音频逐帧时间戳单条记录超过 {} KiB 硬上限。",
-                record_hard_limit / 1024
-            ));
-        }
-        let record = String::from_utf8_lossy(record);
-        apply_audio_timeline_compact_record(record.trim(), &mut accumulators)?;
-    }
-    Ok(accumulators
-        .into_iter()
-        .filter_map(|(stream_index, accumulator)| {
-            (accumulator.evidence.decoded_frame_count > 0)
-                .then_some((stream_index, accumulator.evidence))
-        })
-        .collect())
+    let mut parser = AudioTimelineCompactStreamParser::new(record_hard_limit);
+    parser.consume_chunk(output, cancel_flag)?;
+    parser.finish(cancel_flag)
 }
 
 fn media_timeline_probe_limits() -> SupervisedOutputLimits {
@@ -426,14 +524,37 @@ fn media_timeline_probe_limits() -> SupervisedOutputLimits {
     }
 }
 
-fn audio_timeline_probe_limits() -> SupervisedOutputLimits {
-    SupervisedOutputLimits {
-        execution_timeout: AUDIO_TIMELINE_PROBE_TIMEOUT,
-        output_drain_timeout: PROBE_OUTPUT_DRAIN_TIMEOUT,
-        termination_timeout: PROBE_TERMINATION_TIMEOUT,
-        poll_interval: PROBE_POLL_INTERVAL,
-        stdout_hard_limit: AUDIO_TIMELINE_PROBE_MAX_BYTES,
-        stderr_hard_limit: AUDIO_TIMELINE_PROBE_MAX_STDERR_BYTES,
+fn audio_timeline_probe_streaming_limits() -> SupervisedStreamingLimits {
+    SupervisedStreamingLimits {
+        process: SupervisedOutputLimits {
+            execution_timeout: AUDIO_TIMELINE_PROBE_TIMEOUT,
+            output_drain_timeout: PROBE_OUTPUT_DRAIN_TIMEOUT,
+            termination_timeout: PROBE_TERMINATION_TIMEOUT,
+            poll_interval: PROBE_POLL_INTERVAL,
+            stdout_hard_limit: usize::try_from(AUDIO_TIMELINE_PROBE_MAX_TOTAL_BYTES)
+                .unwrap_or(usize::MAX),
+            stderr_hard_limit: AUDIO_TIMELINE_PROBE_MAX_STDERR_BYTES,
+        },
+        stdout_chunk_size: AUDIO_TIMELINE_PROBE_STDOUT_CHUNK_BYTES,
+        stdout_buffered_chunks: AUDIO_TIMELINE_PROBE_STDOUT_BUFFERED_CHUNKS,
+    }
+}
+
+fn ensure_supervised_ffprobe_streaming_success(
+    output: &SupervisedStreamingOutput,
+    context: &str,
+) -> Result<(), String> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        let exit = output
+            .status
+            .code()
+            .map(|code| format!("退出码 {code}"))
+            .unwrap_or_else(|| "无退出码".to_string());
+        Err(format!(
+            "{context}失败（{exit}）；为保护本地路径与访问凭据，未回显媒体工具错误输出。"
+        ))
     }
 }
 
@@ -1332,6 +1453,165 @@ mod tests {
         .unwrap_err();
         assert!(error.starts_with("blocked:resource-limit"));
         assert!(error.contains("音频流硬上限"));
+    }
+
+    fn legacy_reference_audio_timeline_parse(
+        output: &[u8],
+        record_hard_limit: usize,
+    ) -> Result<HashMap<u32, AudioDecodeTimelineProbe>, String> {
+        let mut accumulators = HashMap::<u32, AudioTimelineAccumulator>::new();
+        for line in output.split(|byte| *byte == b'\n') {
+            let record = line.strip_suffix(b"\r").unwrap_or(line);
+            if record.len() > record_hard_limit {
+                return Err(audio_timeline_record_limit_error(record_hard_limit));
+            }
+            let record = String::from_utf8_lossy(record);
+            apply_audio_timeline_compact_record(record.trim(), &mut accumulators)?;
+        }
+        Ok(accumulators
+            .into_iter()
+            .filter_map(|(stream_index, accumulator)| {
+                (accumulator.evidence.decoded_frame_count > 0)
+                    .then_some((stream_index, accumulator.evidence))
+            })
+            .collect())
+    }
+
+    #[test]
+    fn streaming_compact_parser_matches_legacy_across_deterministic_random_chunk_boundaries() {
+        let mut output = Vec::new();
+        for frame_index in 0..257u32 {
+            let stream_index = frame_index % 3;
+            let pts_seconds = f64::from(frame_index) * 0.021_333;
+            let ending: &[u8] = if frame_index % 2 == 0 { b"\r\n" } else { b"\n" };
+            output.extend_from_slice(
+                format!(
+                    "frame|stream_index={stream_index}|best_effort_timestamp_time={pts_seconds:.6}|pkt_duration_time=0.021333|nb_samples=1024"
+                )
+                .as_bytes(),
+            );
+            output.extend_from_slice(ending);
+            if frame_index % 31 == 0 {
+                output.extend_from_slice(
+                    format!(
+                        "packet|stream_index={stream_index}|pts_time={pts_seconds:.6}|duration_time=0.021333|side_data_type=Skip Samples|skip_samples={frame_index}|discard_padding=0\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        // Exercise String::from_utf8_lossy compatibility on a record that is otherwise ignored.
+        output.extend_from_slice(b"ignored|stream_index=9|tag=");
+        output.extend_from_slice(&[0xff, 0xfe, b' ']);
+
+        let expected =
+            legacy_reference_audio_timeline_parse(&output, AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES)
+                .unwrap();
+        for seed in 1..=64u64 {
+            let mut parser =
+                AudioTimelineCompactStreamParser::new(AUDIO_TIMELINE_PROBE_MAX_RECORD_BYTES);
+            let mut state = seed;
+            let mut offset = 0usize;
+            while offset < output.len() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let chunk_len = ((state as usize) % 4_093).saturating_add(1);
+                let end = offset.saturating_add(chunk_len).min(output.len());
+                parser.consume_chunk(&output[offset..end], None).unwrap();
+                offset = end;
+            }
+            assert_eq!(parser.finish(None).unwrap(), expected, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn streaming_compact_parser_enforces_bounded_carry_with_crlf_compatibility() {
+        let mut parser = AudioTimelineCompactStreamParser::new(8);
+        parser.consume_chunk(b"12345678", None).unwrap();
+        let error = parser.consume_chunk(b"9", None).unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+
+        let mut crlf_parser = AudioTimelineCompactStreamParser::new(8);
+        crlf_parser.consume_chunk(b"12345678\r", None).unwrap();
+        crlf_parser.consume_chunk(b"\n", None).unwrap();
+        assert!(crlf_parser.finish(None).unwrap().is_empty());
+
+        let mut cr_not_at_eol = AudioTimelineCompactStreamParser::new(8);
+        cr_not_at_eol.consume_chunk(b"12345678\r", None).unwrap();
+        let error = cr_not_at_eol.consume_chunk(b"x", None).unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+    }
+
+    #[test]
+    fn streaming_compact_parser_consumes_eof_residual_and_observes_cancellation() {
+        let record =
+            b"frame|stream_index=7|best_effort_timestamp_time=1.250|pkt_duration_time=0.020";
+        let mut parser = AudioTimelineCompactStreamParser::new(1_024);
+        parser.consume_chunk(&record[..17], None).unwrap();
+        parser.consume_chunk(&record[17..], None).unwrap();
+        let parsed = parser.finish(None).unwrap();
+        assert_eq!(parsed[&7].first_decoded_pts_ms, Some(1_250));
+        assert_eq!(parsed[&7].decoded_frame_count, 1);
+
+        let cancelled = AtomicBool::new(false);
+        let mut parser = AudioTimelineCompactStreamParser::new(1_024);
+        parser
+            .consume_chunk(&record[..17], Some(&cancelled))
+            .unwrap();
+        cancelled.store(true, Ordering::Release);
+        let error = parser
+            .consume_chunk(&record[17..], Some(&cancelled))
+            .unwrap_err();
+        assert!(error.starts_with("cancelled"));
+    }
+
+    #[test]
+    fn installed_ffprobe_streaming_audio_timeline_smoke() {
+        let Ok(ffprobe_path) = crate::process_supervision::resolve_supervised_executable("ffprobe")
+        else {
+            return;
+        };
+        let path = std::env::temp_dir().join(format!(
+            "media-probe-streaming-smoke-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sample_rate = 8_000u32;
+        let sample_count = sample_rate / 5;
+        let data_bytes = sample_count * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.resize(44 + data_bytes as usize, 0);
+        std::fs::write(&path, wav).unwrap();
+
+        let identity = probe_media_content_identity(&path).unwrap();
+        let parsed = probe_audio_decode_timelines_with_ffprobe_cancellable(
+            &path.to_string_lossy(),
+            &ffprobe_path,
+            &identity,
+            None,
+        )
+        .unwrap();
+        let evidence = parsed.values().next().expect("one WAV audio stream");
+        assert_eq!(evidence.first_decoded_pts_ms, Some(0));
+        assert!(evidence.decoded_frame_count > 0);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[cfg(windows)]
