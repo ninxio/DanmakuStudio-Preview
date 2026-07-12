@@ -1,7 +1,7 @@
 use crate::{
     alignment_v2::{
         align_features_edit_aware_with_cancel, extract_fine_features_with_cancel,
-        extract_landmarks_with_cancel, match_landmarks_affine_with_cancel,
+        extract_landmarks_and_fine_features_with_cancel, match_landmarks_affine_with_cancel,
         refine_boundary_by_correlation_with_cancel,
         refine_boundary_by_one_sided_correlation_with_cancel, AffineHypothesis, AffineMatchConfig,
         BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig, EditAlignmentMode,
@@ -91,9 +91,9 @@ const OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER: usize = 3;
 const OFFSET_PATH_STABLE_SUPPORT_RATIO: f64 = 0.7;
 const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
-const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.0-rust";
+const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.1-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-async-landmark48-fine50-dual-boundary-v3";
+    "pcm-s16le-16k-pts-shared-spectrum-artifact-cache-dual-boundary-v4";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -108,12 +108,25 @@ const ALIGNMENT_V2_MAX_STDERR_BYTES: usize = 1024 * 1024;
 const ALIGNMENT_V2_MIN_TRACK_MARGIN: f64 = 0.10;
 const ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE: f64 = 0.20;
 const ALIGNMENT_V2_MAX_UNSELECTED_STREAMS: usize = 12;
-const MAX_V2_LANDMARK_CACHE_ENTRIES: usize = 16;
+// The V2 cache owns decoded mono PCM as well as landmarks/fine features. Bound it by
+// resident artifact bytes instead of entry count: one hour of 16 kHz mono i16 PCM is
+// about 110 MiB, while a 20-minute episode is about 37 MiB. 768 MiB retains the common
+// one-long-reference + episode-batch working set without granting the process an
+// unbounded media cache; larger sets degrade by per-entry LRU eviction.
+const MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES: usize = 768 * 1024 * 1024;
+// Candidate PCM must remain alive until track-pair selection finishes, otherwise the
+// winning cold-path track would have to be decoded a second time. Fail closed before a
+// pathological multi-track input can make that transient working set unbounded.
+const MAX_V2_ACTIVE_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
+// Product orchestration is deliberately sequential today. Enforce the same boundary in native
+// code so multiple callers cannot each reserve the per-run 1 GiB artifact budget and exhaust the
+// machine. A future batch engine may replace this with one global byte reservation ledger.
+const MAX_ORDINARY_ALIGNMENT_RUNS: usize = 1;
 const DEFAULT_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 20;
 const MIN_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 10;
 const MAX_BENCHMARK_SAMPLE_INTERVAL_MS: u64 = 1_000;
 const BENCHMARK_RESIDUAL_GRACE_MS: u64 = 2_000;
-const BENCHMARK_TELEMETRY_VERSION: &str = "alignment-benchmark-native-v2";
+const BENCHMARK_TELEMETRY_VERSION: &str = "alignment-benchmark-native-v2-artifact-cache-v1";
 const ALIGNMENT_BENCHMARK_MAX_CASES: usize = 1_000;
 const ALIGNMENT_BENCHMARK_MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const ALIGNMENT_BENCHMARK_MAX_ID_BYTES: usize = 512;
@@ -693,13 +706,128 @@ struct CachedAudioFeatures {
 #[derive(Debug, Clone)]
 struct CachedV2Landmarks {
     landmarks: Arc<Vec<SpectralLandmark>>,
+    pcm: Arc<Vec<i16>>,
+    fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
+    cache_key: String,
     cache_hit: bool,
 }
 
 #[derive(Debug)]
 struct DecodedV2Audio {
-    pcm: Vec<i16>,
-    fine_features: Vec<FineFeatureFrame>,
+    pcm: Arc<Vec<i16>>,
+    fine_features: Arc<Vec<FineFeatureFrame>>,
+}
+
+#[derive(Debug, Clone)]
+struct V2MediaArtifact {
+    pcm: Arc<Vec<i16>>,
+    landmarks: Arc<Vec<SpectralLandmark>>,
+    fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
+}
+
+#[derive(Debug, Clone)]
+struct V2MediaArtifactCacheEntry {
+    artifact: V2MediaArtifact,
+    resident_bytes: usize,
+    last_access: u64,
+}
+
+#[derive(Debug)]
+struct V2MediaArtifactCache {
+    entries: HashMap<String, V2MediaArtifactCacheEntry>,
+    resident_bytes: usize,
+    access_clock: u64,
+    max_resident_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2MediaArtifactCacheInsert {
+    stored: bool,
+    new_entry: bool,
+    eviction_count: usize,
+}
+
+impl V2MediaArtifactCache {
+    fn new(max_resident_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            resident_bytes: 0,
+            access_clock: 0,
+            max_resident_bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.resident_bytes = 0;
+        self.access_clock = 0;
+    }
+
+    fn get(&mut self, cache_key: &str) -> Option<V2MediaArtifact> {
+        self.access_clock = self.access_clock.saturating_add(1);
+        let entry = self.entries.get_mut(cache_key)?;
+        entry.last_access = self.access_clock;
+        Some(entry.artifact.clone())
+    }
+
+    fn insert(
+        &mut self,
+        cache_key: String,
+        artifact: V2MediaArtifact,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<V2MediaArtifactCacheInsert, String> {
+        check_cancelled(cancel_flag)?;
+        let previous = self.entries.remove(&cache_key);
+        let new_entry = previous.is_none();
+        if let Some(previous) = previous {
+            self.resident_bytes = self.resident_bytes.saturating_sub(previous.resident_bytes);
+        }
+
+        let resident_bytes = v2_media_artifact_resident_bytes(&cache_key, &artifact);
+        if resident_bytes > self.max_resident_bytes {
+            return Ok(V2MediaArtifactCacheInsert {
+                stored: false,
+                new_entry,
+                eviction_count: 0,
+            });
+        }
+
+        let mut eviction_count = 0;
+        while self.resident_bytes.saturating_add(resident_bytes) > self.max_resident_bytes {
+            let Some(lru_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&lru_key) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(evicted.resident_bytes);
+                eviction_count += 1;
+            }
+        }
+
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.resident_bytes = self.resident_bytes.saturating_add(resident_bytes);
+        self.entries.insert(
+            cache_key,
+            V2MediaArtifactCacheEntry {
+                artifact,
+                resident_bytes,
+                last_access: self.access_clock,
+            },
+        );
+        Ok(V2MediaArtifactCacheInsert {
+            stored: true,
+            new_entry,
+            eviction_count,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1030,6 +1158,8 @@ struct ProcessTreeMemorySample {
 
 thread_local! {
     static ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY: RefCell<Option<Arc<AlignmentBenchmarkRunTelemetry>>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static TEST_V2_PCM_DECODE_INVOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 static AUDIO_ALIGNMENT_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentJobEntry>>> =
@@ -1037,8 +1167,10 @@ static AUDIO_ALIGNMENT_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentJobEnt
 static AUDIO_ALIGNMENT_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static AUDIO_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<AudioFeatureFrame>>>> =
     OnceLock::new();
-static V2_LANDMARK_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<SpectralLandmark>>>>> =
-    OnceLock::new();
+// This remains the benchmark's `landmarks` cache slot for schema compatibility, but the
+// entry is the complete V2 media/track artifact. Consequently a cold reset cannot leave
+// hidden decoded PCM or fine features behind.
+static V2_LANDMARK_CACHE: OnceLock<Mutex<V2MediaArtifactCache>> = OnceLock::new();
 static VISUAL_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<VisualFeatureFrame>>>> =
     OnceLock::new();
 static ALIGNMENT_BENCHMARK_COORDINATOR: OnceLock<Mutex<AlignmentBenchmarkCoordinator>> =
@@ -1242,11 +1374,30 @@ fn acquire_ordinary_alignment_run() -> Result<OrdinaryAlignmentRunPermit, String
     let mut coordinator = alignment_benchmark_coordinator()
         .lock()
         .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
-    if coordinator.initializing || coordinator.session.is_some() {
+    validate_ordinary_alignment_run_availability(
+        coordinator.initializing,
+        coordinator.session.is_some(),
+        coordinator.ordinary_active_runs,
+    )?;
+    coordinator.ordinary_active_runs = coordinator
+        .ordinary_active_runs
+        .checked_add(1)
+        .ok_or_else(|| "普通音频对齐任务计数溢出。".to_string())?;
+    Ok(OrdinaryAlignmentRunPermit)
+}
+
+fn validate_ordinary_alignment_run_availability(
+    initializing: bool,
+    has_benchmark_session: bool,
+    ordinary_active_runs: usize,
+) -> Result<(), String> {
+    if initializing || has_benchmark_session {
         return Err("原生性能独占会话正在运行；结束该会话后才能启动普通音频对齐任务。".to_string());
     }
-    coordinator.ordinary_active_runs = coordinator.ordinary_active_runs.saturating_add(1);
-    Ok(OrdinaryAlignmentRunPermit)
+    if ordinary_active_runs >= MAX_ORDINARY_ALIGNMENT_RUNS {
+        return Err("已有一个媒体对齐任务正在运行；请等待它完成或取消后再启动下一批。".to_string());
+    }
+    Ok(())
 }
 
 fn acquire_alignment_benchmark_initialization_lease(
@@ -4568,11 +4719,16 @@ where
             cancel_flag,
         );
     }
+    // Reserve the worst-case candidate payload before the first FFmpeg decode. This makes
+    // the auto-track path transactional with respect to the active-memory guard: an input
+    // with too many long tracks is rejected without leaving a partially warmed artifact set.
+    ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)?;
     check_cancelled(cancel_flag)?;
 
     benchmark_stage("extracting-source", "提取参考音轨 landmark");
     update_progress(0.12, "正在为 B 站参考候选音轨提取 16 kHz landmark。")?;
     let mut extraction_notes = Vec::new();
+    let mut retained_artifact_bytes = 0_usize;
     let source_landmarks = extract_v2_landmark_candidates(
         &request.source_path,
         "B 站参考",
@@ -4580,6 +4736,7 @@ where
         &source_inputs,
         cancel_flag,
         &mut extraction_notes,
+        &mut retained_artifact_bytes,
     )?;
     benchmark_stage("extracting-complete", "提取目标原片 landmark");
     update_progress(0.40, "正在为目标原片候选音轨提取 16 kHz landmark。")?;
@@ -4590,6 +4747,7 @@ where
         &target_inputs,
         cancel_flag,
         &mut extraction_notes,
+        &mut retained_artifact_bytes,
     )?;
     check_cancelled(cancel_flag)?;
     if source_landmarks.is_empty() || target_landmarks.is_empty() {
@@ -4806,6 +4964,11 @@ where
         "B 站参考",
         options,
         &best_pair.source_input,
+        source_landmarks
+            .get(&best_pair.source_input.stream.stream_index)
+            .ok_or_else(|| {
+                "blocked:artifact-missing：所选 B 站参考音轨的粗定位制品已丢失。".to_string()
+            })?,
         cancel_flag,
     ) {
         Ok(audio) => audio,
@@ -4830,6 +4993,11 @@ where
         "目标原片",
         options,
         &best_pair.target_input,
+        target_landmarks
+            .get(&best_pair.target_input.stream.stream_index)
+            .ok_or_else(|| {
+                "blocked:artifact-missing：所选目标原片音轨的粗定位制品已丢失。".to_string()
+            })?,
         cancel_flag,
     ) {
         Ok(audio) => audio,
@@ -5102,6 +5270,7 @@ fn extract_v2_landmark_candidates(
     inputs: &[AlignmentAudioInput],
     cancel_flag: Option<&AtomicBool>,
     notes: &mut Vec<String>,
+    retained_artifact_bytes: &mut usize,
 ) -> Result<HashMap<u32, CachedV2Landmarks>, String> {
     let mut output = HashMap::new();
     for input in inputs {
@@ -5109,8 +5278,17 @@ fn extract_v2_landmark_candidates(
             notes.push(error);
             continue;
         }
+        let estimated_pcm_bytes = input
+            .media_duration_ms
+            .and_then(v2_pcm_bytes_for_duration_ms)
+            .unwrap_or(0);
+        ensure_v2_active_artifact_budget(*retained_artifact_bytes, estimated_pcm_bytes)?;
         match get_v2_landmarks(media_path, label, options, input, cancel_flag) {
             Ok(artifact) if !artifact.landmarks.is_empty() => {
+                let artifact_bytes = cached_v2_landmark_retained_bytes(&artifact);
+                let next_retained_bytes =
+                    ensure_v2_active_artifact_budget(*retained_artifact_bytes, artifact_bytes)?;
+                *retained_artifact_bytes = next_retained_bytes;
                 notes.push(format!(
                     "{label}音轨 #{} landmark {}：{} 个。",
                     input.stream.stream_index,
@@ -5129,7 +5307,10 @@ fn extract_v2_landmark_candidates(
             )),
             Err(error) => {
                 propagate_alignment_process_cleanup(&error)?;
-                if is_media_identity_guard_error(&error) || error == AUDIO_ALIGNMENT_CANCELLED {
+                if is_media_identity_guard_error(&error)
+                    || error == AUDIO_ALIGNMENT_CANCELLED
+                    || error.starts_with("blocked:resource-limit")
+                {
                     return Err(error);
                 }
                 notes.push(format!(
@@ -5155,8 +5336,121 @@ fn check_v2_duration_limit(input: &AlignmentAudioInput, label: &str) -> Result<(
     Ok(())
 }
 
-fn v2_landmark_cache() -> &'static Mutex<HashMap<String, Arc<Vec<SpectralLandmark>>>> {
-    V2_LANDMARK_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn v2_pcm_bytes_for_duration_ms(duration_ms: u64) -> Option<usize> {
+    let samples = (duration_ms as u128)
+        .checked_mul(ALIGNMENT_V2_SAMPLE_RATE as u128)?
+        .checked_add(999)?
+        / 1_000;
+    let bytes = samples.checked_mul(std::mem::size_of::<i16>() as u128)?;
+    usize::try_from(bytes).ok()
+}
+
+fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usize, String> {
+    let duration_ms = input
+        .media_duration_ms
+        .unwrap_or(ALIGNMENT_V2_MAX_DURATION_MS);
+    let pcm_bytes = v2_pcm_bytes_for_duration_ms(duration_ms)
+        .ok_or_else(|| "blocked:resource-limit：候选音轨 PCM 上界无法表示。".to_string())?;
+    let frame_count = usize::try_from(
+        (duration_ms as u128)
+            .checked_add(ALIGNMENT_V2_LANDMARK_HOP_MS as u128 - 1)
+            .ok_or_else(|| "blocked:resource-limit：候选帧数溢出。".to_string())?
+            / ALIGNMENT_V2_LANDMARK_HOP_MS as u128,
+    )
+    .map_err(|_| "blocked:resource-limit：候选帧数无法表示。".to_string())?;
+    // LandmarkConfig below emits at most 4 anchors * 5 fanout landmarks per frame.
+    let landmark_bytes = frame_count
+        .checked_mul(20)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<SpectralLandmark>()))
+        .ok_or_else(|| "blocked:resource-limit：landmark 驻留上界溢出。".to_string())?;
+    // FineFeatureConfig currently stores time + Vec metadata + 14 f32 values per frame.
+    let fine_bytes_per_frame =
+        std::mem::size_of::<FineFeatureFrame>().saturating_add(14 * std::mem::size_of::<f32>());
+    let fine_bytes = frame_count
+        .checked_mul(fine_bytes_per_frame)
+        .ok_or_else(|| "blocked:resource-limit：细特征驻留上界溢出。".to_string())?;
+    pcm_bytes
+        .checked_add(landmark_bytes)
+        .and_then(|value| value.checked_add(fine_bytes))
+        .ok_or_else(|| "blocked:resource-limit：候选音轨制品驻留上界溢出。".to_string())
+}
+
+fn ensure_v2_candidate_set_active_budget(
+    source_inputs: &[AlignmentAudioInput],
+    target_inputs: &[AlignmentAudioInput],
+) -> Result<(), String> {
+    let mut retained = 0_usize;
+    for input in source_inputs.iter().chain(target_inputs) {
+        retained =
+            ensure_v2_active_artifact_budget(retained, v2_candidate_artifact_upper_bound(input)?)?;
+    }
+    Ok(())
+}
+
+fn ensure_v2_active_artifact_budget(
+    retained_bytes: usize,
+    additional_bytes: usize,
+) -> Result<usize, String> {
+    let next = retained_bytes
+        .checked_add(additional_bytes)
+        .ok_or_else(|| "blocked:resource-limit：候选音轨制品驻留字节溢出。".to_string())?;
+    if next > MAX_V2_ACTIVE_ARTIFACT_BYTES {
+        return Err(format!(
+            "blocked:resource-limit：候选音轨制品的单次驻留预算超过 {} MiB；请显式选择需要比较的音轨。",
+            MAX_V2_ACTIVE_ARTIFACT_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(next)
+}
+
+fn cached_v2_landmark_retained_bytes(artifact: &CachedV2Landmarks) -> usize {
+    v2_media_artifact_payload_bytes(&V2MediaArtifact {
+        pcm: artifact.pcm.clone(),
+        landmarks: artifact.landmarks.clone(),
+        fine_features: artifact.fine_features.clone(),
+    })
+}
+
+fn v2_media_artifact_payload_bytes(artifact: &V2MediaArtifact) -> usize {
+    let pcm_bytes = artifact
+        .pcm
+        .capacity()
+        .saturating_mul(std::mem::size_of::<i16>());
+    let landmark_bytes = artifact
+        .landmarks
+        .capacity()
+        .saturating_mul(std::mem::size_of::<SpectralLandmark>());
+    let fine_bytes = artifact
+        .fine_features
+        .as_ref()
+        .map(|frames| {
+            frames
+                .capacity()
+                .saturating_mul(std::mem::size_of::<FineFeatureFrame>())
+                .saturating_add(frames.iter().fold(0_usize, |total, frame| {
+                    total.saturating_add(
+                        frame
+                            .values
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<f32>()),
+                    )
+                }))
+        })
+        .unwrap_or(0);
+    pcm_bytes
+        .saturating_add(landmark_bytes)
+        .saturating_add(fine_bytes)
+}
+
+fn v2_media_artifact_resident_bytes(cache_key: &str, artifact: &V2MediaArtifact) -> usize {
+    v2_media_artifact_payload_bytes(artifact)
+        .saturating_add(cache_key.len())
+        .saturating_add(std::mem::size_of::<V2MediaArtifactCacheEntry>())
+}
+
+fn v2_landmark_cache() -> &'static Mutex<V2MediaArtifactCache> {
+    V2_LANDMARK_CACHE
+        .get_or_init(|| Mutex::new(V2MediaArtifactCache::new(MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES)))
 }
 
 fn get_v2_landmarks(
@@ -5168,50 +5462,78 @@ fn get_v2_landmarks(
 ) -> Result<CachedV2Landmarks, String> {
     check_cancelled(cancel_flag)?;
     let cache_key = create_v2_audio_cache_key(media_path, options, input, "landmark")?;
-    if let Some(landmarks) = v2_landmark_cache()
+    if let Some(artifact) = v2_landmark_cache()
         .lock()
         .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?
         .get(&cache_key)
-        .cloned()
     {
         benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
         return Ok(CachedV2Landmarks {
-            landmarks,
+            landmarks: artifact.landmarks,
+            pcm: artifact.pcm,
+            fine_features: artifact.fine_features,
+            cache_key,
             cache_hit: true,
         });
     }
     benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
-    let pcm = decode_v2_pcm(media_path, label, options, input, cancel_flag)?;
-    let landmarks = Arc::new(extract_landmarks_with_cancel(
+    let pcm = Arc::new(decode_v2_pcm(
+        media_path,
+        label,
+        options,
+        input,
+        cancel_flag,
+    )?);
+    let presentation_offset_ms = input
+        .decode_timeline
+        .as_ref()
+        .map(|item| item.normalized_pcm_origin_ms)
+        .unwrap_or(0);
+    let extracted = extract_landmarks_and_fine_features_with_cancel(
         &pcm,
         &LandmarkConfig {
             sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-            presentation_offset_ms: input
-                .decode_timeline
-                .as_ref()
-                .map(|item| item.normalized_pcm_origin_ms)
-                .unwrap_or(0),
+            presentation_offset_ms,
             window_ms: 50,
             hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
             max_hash_occurrences: 64,
             ..LandmarkConfig::default()
         },
+        &FineFeatureConfig {
+            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+            presentation_offset_ms,
+            window_ms: 50,
+            hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
+        },
         cancel_flag,
-    )?);
+    )?;
+    let landmarks = Arc::new(extracted.landmarks);
+    let fine_features = Arc::new(extracted.fine_features);
+    // Cancellation after extraction must never publish a partially trusted warm artifact.
+    check_cancelled(cancel_flag)?;
+    let artifact = V2MediaArtifact {
+        pcm: pcm.clone(),
+        landmarks: landmarks.clone(),
+        fine_features: Some(fine_features.clone()),
+    };
     let mut cache = v2_landmark_cache()
         .lock()
         .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
-    if !cache.contains_key(&cache_key) && cache.len() >= MAX_V2_LANDMARK_CACHE_ENTRIES {
-        cache.clear();
+    let insertion = cache.insert(cache_key.clone(), artifact, cancel_flag)?;
+    for _ in 0..insertion.eviction_count {
         benchmark_cache_event(
             BenchmarkCacheKind::V2Landmarks,
             BenchmarkCacheEvent::Eviction,
         );
     }
-    cache.insert(cache_key, landmarks.clone());
-    benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write);
+    if insertion.stored && insertion.new_entry {
+        benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write);
+    }
     Ok(CachedV2Landmarks {
         landmarks,
+        pcm,
+        fine_features: Some(fine_features),
+        cache_key,
         cache_hit: false,
     })
 }
@@ -5244,13 +5566,37 @@ fn decode_v2_audio(
     label: &str,
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
+    landmark_artifact: &CachedV2Landmarks,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<DecodedV2Audio, String> {
     check_v2_duration_limit(input, label)?;
-    let pcm = decode_v2_pcm(media_path, label, options, input, cancel_flag)?;
     check_cancelled(cancel_flag)?;
-    let fine_features = extract_fine_features_with_cancel(
-        &pcm,
+    let expected_cache_key = create_v2_audio_cache_key(media_path, options, input, "landmark")?;
+    if landmark_artifact.cache_key != expected_cache_key {
+        return Err(format!(
+            "blocked:media-identity-changed：{label}粗定位制品与当前内容身份、音轨、PTS 或算法参数不一致。"
+        ));
+    }
+    // Cache hits never replace the run-level final identity gate. Recheck before the
+    // retained PCM is consumed so stale bytes cannot drive expensive DP work.
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 PCM/细特征复用",
+    )?;
+    if let Some(fine_features) = landmark_artifact.fine_features.clone() {
+        if fine_features.is_empty() {
+            return Err(format!("{label}没有可用的 50 ms 细粒度音频特征。"));
+        }
+        return Ok(DecodedV2Audio {
+            pcm: landmark_artifact.pcm.clone(),
+            fine_features,
+        });
+    }
+
+    let fine_features = Arc::new(extract_fine_features_with_cancel(
+        &landmark_artifact.pcm,
         &FineFeatureConfig {
             sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
             presentation_offset_ms: input
@@ -5262,11 +5608,37 @@ fn decode_v2_audio(
             hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
         },
         cancel_flag,
-    )?;
+    )?);
     if fine_features.is_empty() {
         return Err(format!("{label}没有可用的 50 ms 细粒度音频特征。"));
     }
-    Ok(DecodedV2Audio { pcm, fine_features })
+    // As with landmark extraction, do not let cancellation race a cache publication.
+    check_cancelled(cancel_flag)?;
+    let artifact = V2MediaArtifact {
+        pcm: landmark_artifact.pcm.clone(),
+        landmarks: landmark_artifact.landmarks.clone(),
+        fine_features: Some(fine_features.clone()),
+    };
+    let insertion = v2_landmark_cache()
+        .lock()
+        .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?
+        .insert(expected_cache_key, artifact, cancel_flag)?;
+    for _ in 0..insertion.eviction_count {
+        benchmark_cache_event(
+            BenchmarkCacheKind::V2Landmarks,
+            BenchmarkCacheEvent::Eviction,
+        );
+    }
+    // Enriching an existing landmark/PCM entry with fine features is an in-place cache
+    // upgrade, not another benchmark write. If the entry was evicted meanwhile, its
+    // reintroduction is correctly observable as a new write.
+    if insertion.stored && insertion.new_entry {
+        benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write);
+    }
+    Ok(DecodedV2Audio {
+        pcm: landmark_artifact.pcm.clone(),
+        fine_features,
+    })
 }
 
 fn decode_v2_pcm(
@@ -5277,6 +5649,8 @@ fn decode_v2_pcm(
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<i16>, String> {
     check_cancelled(cancel_flag)?;
+    #[cfg(test)]
+    TEST_V2_PCM_DECODE_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
     let output = run_supervised_ffmpeg_output(
         &options.ffmpeg_path,
         create_v2_audio_decode_args(media_path, input),
@@ -5298,6 +5672,16 @@ fn decode_v2_pcm(
         "V2 音频解码",
     )?;
     parse_v2_pcm_output(&output.stdout, label, cancel_flag)
+}
+
+#[cfg(test)]
+fn reset_test_v2_pcm_decode_invocations() {
+    TEST_V2_PCM_DECODE_INVOCATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn test_v2_pcm_decode_invocations() -> u64 {
+    TEST_V2_PCM_DECODE_INVOCATIONS.with(std::cell::Cell::get)
 }
 
 fn parse_v2_pcm_output(
@@ -11973,6 +12357,7 @@ mod tests {
             "0.5",
             "660",
         );
+        reset_test_v2_pcm_decode_invocations();
         let proposal = align_audio_files_inner(AudioAlignmentRequest {
             complete_path: target_path.to_string_lossy().to_string(),
             source_path: source_path.to_string_lossy().to_string(),
@@ -11992,6 +12377,11 @@ mod tests {
             localization_mode: Some(true),
         })
         .unwrap();
+        assert_eq!(
+            test_v2_pcm_decode_invocations(),
+            2,
+            "两个所选主音轨应各只解码一次；粗定位后不得为细对齐再次调用 FFmpeg"
+        );
         let time_map = proposal.time_map.as_ref().unwrap_or_else(|| {
             panic!(
                 "V2 应输出合法时间图；diagnostics={:?}",
@@ -12743,6 +13133,138 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn test_v2_media_artifact(pcm_samples: usize, marker: u64) -> V2MediaArtifact {
+        V2MediaArtifact {
+            pcm: Arc::new(vec![marker as i16; pcm_samples]),
+            landmarks: Arc::new(vec![SpectralLandmark {
+                hash: marker,
+                time_ms: marker as i64,
+                strength_milli: 1_000,
+            }]),
+            fine_features: None,
+        }
+    }
+
+    #[test]
+    fn v2_media_artifact_cache_evicts_one_lru_entry_by_resident_bytes() {
+        let first = test_v2_media_artifact(256, 1);
+        let second = test_v2_media_artifact(256, 2);
+        let third = test_v2_media_artifact(256, 3);
+        let entry_bytes = v2_media_artifact_resident_bytes("a", &first);
+        let mut cache = V2MediaArtifactCache::new(entry_bytes * 2);
+
+        assert_eq!(
+            cache.insert("a".to_string(), first, None).unwrap(),
+            V2MediaArtifactCacheInsert {
+                stored: true,
+                new_entry: true,
+                eviction_count: 0,
+            }
+        );
+        assert_eq!(
+            cache.insert("b".to_string(), second, None).unwrap(),
+            V2MediaArtifactCacheInsert {
+                stored: true,
+                new_entry: true,
+                eviction_count: 0,
+            }
+        );
+        assert!(cache.get("a").is_some(), "a must become most recently used");
+        assert_eq!(
+            cache.insert("c".to_string(), third, None).unwrap(),
+            V2MediaArtifactCacheInsert {
+                stored: true,
+                new_entry: true,
+                eviction_count: 1,
+            }
+        );
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.entries.contains_key("a"));
+        assert!(!cache.entries.contains_key("b"));
+        assert!(cache.entries.contains_key("c"));
+        assert!(cache.resident_bytes <= cache.max_resident_bytes);
+    }
+
+    #[test]
+    fn v2_media_artifact_cache_clear_removes_pcm_landmarks_and_fine_features() {
+        let mut artifact = test_v2_media_artifact(512, 7);
+        artifact.fine_features = Some(Arc::new(vec![FineFeatureFrame {
+            time_ms: 0,
+            values: vec![0.1, 0.2, 0.3],
+        }]));
+        let mut cache = V2MediaArtifactCache::new(1024 * 1024);
+        assert_eq!(
+            cache
+                .insert("complete-artifact".to_string(), artifact, None)
+                .unwrap(),
+            V2MediaArtifactCacheInsert {
+                stored: true,
+                new_entry: true,
+                eviction_count: 0,
+            }
+        );
+        assert!(cache.resident_bytes > 0);
+
+        let mut upgraded = test_v2_media_artifact(512, 7);
+        upgraded.fine_features = Some(Arc::new(vec![FineFeatureFrame {
+            time_ms: 0,
+            values: vec![0.4, 0.5, 0.6],
+        }]));
+        let upgrade = cache
+            .insert("complete-artifact".to_string(), upgraded, None)
+            .unwrap();
+        assert!(upgrade.stored);
+        assert!(
+            !upgrade.new_entry,
+            "same-key fine enrichment is not a new write"
+        );
+        assert_eq!(upgrade.eviction_count, 0);
+        assert_eq!(cache.len(), 1);
+
+        cache.clear();
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes, 0);
+        assert_eq!(cache.access_clock, 0);
+    }
+
+    #[test]
+    fn v2_media_artifact_cache_cancellation_never_publishes_an_entry() {
+        let cancelled = AtomicBool::new(true);
+        let mut cache = V2MediaArtifactCache::new(1024 * 1024);
+        let error = cache
+            .insert(
+                "cancelled".to_string(),
+                test_v2_media_artifact(256, 9),
+                Some(&cancelled),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes, 0);
+    }
+
+    #[test]
+    fn v2_auto_track_budget_blocks_before_any_pcm_decode() {
+        let mut source_inputs = (0..12)
+            .map(|stream_index| {
+                let mut input = test_audio_input(stream_index, 0);
+                input.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+                input
+            })
+            .collect::<Vec<_>>();
+        let target_inputs = source_inputs.split_off(6);
+        reset_test_v2_pcm_decode_invocations();
+
+        let error = ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)
+            .expect_err("twelve one-hour tracks must exceed the active artifact budget");
+
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert_eq!(test_v2_pcm_decode_invocations(), 0);
+    }
+
     #[test]
     fn audio_cache_keys_reject_missing_or_non_full_file_identity() {
         let path = temp_audio_cache_path("audio-cache-identity-missing");
@@ -13082,6 +13604,17 @@ mod tests {
         assert!(validate_alignment_benchmark_lease_availability(false, true, 0, false).is_err());
         assert!(validate_alignment_benchmark_lease_availability(false, false, 1, false).is_err());
         assert!(validate_alignment_benchmark_lease_availability(false, false, 0, true).is_err());
+    }
+
+    #[test]
+    fn ordinary_alignment_allows_only_one_native_heavy_run() {
+        assert!(validate_ordinary_alignment_run_availability(false, false, 0).is_ok());
+        let concurrent =
+            validate_ordinary_alignment_run_availability(false, false, MAX_ORDINARY_ALIGNMENT_RUNS)
+                .unwrap_err();
+        assert!(concurrent.contains("已有一个媒体对齐任务"));
+        assert!(validate_ordinary_alignment_run_availability(true, false, 0).is_err());
+        assert!(validate_ordinary_alignment_run_availability(false, true, 0).is_err());
     }
 
     fn benchmark_test_blind_manifest() -> AlignmentBenchmarkBlindRunManifest {

@@ -157,9 +157,11 @@ C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 go
 
 产品中的自动媒体分析只有匹配页一个入口。它直接消费素材页已经导入并保存真实本地路径的 B 站参考素材与原片，按 1×N、N×1 或 N×M 建立任务，再通过 `src/infrastructure/alignment/tauriAudioAlignment.ts` 调用与真实 benchmark 共用的 Rust Alignment V2 job API。匹配页不会再次弹出文件选择器，也不会把 Emby 临时播放 URL 交给 FFmpeg；只有本地路径已连接、媒体身份可核验的项目素材才能进入自动分析。`AlignmentProvider` 与 `ManualAlignmentProvider` 仍作为领域兼容和测试扩展保留，但不代表当前产品只有手工匹配。
 
-当前 UI 编排把所选 source×target 展开为笛卡尔积，并用单个 `for...of` 依次等待每个 pair；全部 pair 完成后才运行项目级全局 assignment。单 pair 内部的 Top-K 目前用于选择最佳仿射位置、歧义诊断和降级，产品层送入全局求解的是每个 pair 的最佳持久候选，而不是所有 pair-local Top-K 的联合优化。后端虽然会缓存 landmark，但细 PCM、50ms 特征、edit-aware DP 和边界相关仍按进入精对齐的 pair 工作；V2 还会在探测阶段拒绝任一超过 60 分钟的媒体。因此“支持 N×M 编排”不能解释为已经具备高吞吐长合集批处理。
+当前 UI 编排把所选 source×target 展开为笛卡尔积，并用单个 `for...of` 依次等待每个 pair；全部 pair 完成后才运行项目级全局 assignment。单 pair 内部的 Top-K 目前用于选择最佳仿射位置、歧义诊断和降级，产品层送入全局求解的是每个 pair 的最佳持久候选，而不是所有 pair-local Top-K 的联合优化。V2.1 已把同一音轨的 PCM、landmark 与 50ms fine features 组成一个内容身份/流/PTS/引擎参数绑定的制品：冷路径只解码一次，landmark 与 fine 共用一次声谱 FFT，进程内 768 MiB 字节 LRU 可跨 pair 复用；同键 fine 富化不虚增 benchmark write，cold reset 和 session release 仍清同一 `landmarks` 槽。单任务候选制品按最坏上界限制为 1 GiB，native 普通重任务并发固定为 1，防止 per-run 上限被并发放大。
 
-当前 release 是 CPU-only matching：FFmpeg 以 `-vn` 解码单声道 PCM，Rust 自实现 radix-2 FFT 并在 CPU 上完成 landmark、DP 和相关精修；仓库和安装包都没有 CUDA/cuFFT backend 或 GPU 设置。目标流水线是先为每个媒体建立一次可版本化、可取消、受内容身份约束的流式 PTS/landmark/粗特征索引，再对 N×M 做低成本 Top-K 粗筛，只让候选 pair 进入精对齐；之后才增加可选 CUDA/cuFFT 声谱与批量相关后端，并逐 case 与 CPU 基线做容差内等价校验，初始化失败、显存不足或结果越界时自动回退 CPU。NVDEC 只能优化独立视觉回退的帧解码，不能替代音频匹配计算。
+这一中间优化没有把产品变成真正的媒体级 batch：每个 pair 仍重新取得 run lease、计算/复核全文件身份并 FFprobe，整个笛卡尔积仍会进入 pair-local 匹配和后续精对齐；普通制品缓存的 FFmpeg 绑定目前仍依赖进程内路径/参数和 V2 feature version，而正式 benchmark 另有全二进制摘要与固定句柄。V2 也仍在探测阶段拒绝任一超过 60 分钟的媒体。因此“支持 N×M 编排”不能解释为已经具备高吞吐长合集批处理；下一阶段仍需一个持有整批 media pins/tool pins 的原生 batch job、流式长参考 coarse index、pair-local Top-K 联合全局分配和候选窗口精解码。
+
+当前 release 是 CPU-only matching：FFmpeg 以 `-vn` 解码单声道 PCM，Rust 自实现 radix-2 FFT 并在 CPU 上完成 landmark、DP 和相关精修；仓库和安装包都没有 CUDA/cuFFT backend 或 GPU 设置。共享声谱 API 已用 exact 回归证明输出等于原 landmark+fine 两次独立遍历，同时每帧 FFT 从 2 次降为 1 次；它也成为未来 GPU provider 的单一替换边界。目标流水线仍是先为每个媒体建立一次可版本化、可取消、受内容身份约束的流式 PTS/landmark/粗特征索引，再对 N×M 做低成本 Top-K 粗筛，只让候选 pair 进入精对齐；之后才增加可选 CUDA/cuFFT 声谱与批量相关后端，并逐 case 与 CPU 基线做容差内等价校验，初始化失败、显存不足或结果越界时自动回退 CPU。NVDEC 只能优化独立视觉回退的帧解码，不能替代音频匹配计算。
 
 Alignment V2 从显式音视频流的 frame/packet PTS 开始，经过多音轨候选、声谱 landmark、全局仿射 offset/scale、edit-aware 分块对齐和局部边界精修，生成带 `matched/sourceOnly/targetOnly/ambiguous` 分段的 `MediaTimeMap`。无共同音轨时可以使用绑定视频流身份的独立视觉回退。项目级全局分配负责处理多素材竞争与区间冲突；所有自动结果先进入候选，关系保存后仍须 A/B 复核、差异分类和质量闸门验证，不能因“已保存”被视为可导出。
 

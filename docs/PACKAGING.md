@@ -82,3 +82,4 @@ corepack pnpm build
 - release 不打包真实媒体 benchmark。仓库中的 manifest v2 文件是 `isExample=true` 的 placeholder；实际数据集路径、全文件身份和授权说明由评测者保留在本机，运行前通过 Tauri preflight 重新核对媒体身份和显式流索引。
 - 当前真实媒体关系数仍为 0，尚未完成统计校准、规定硬件性能报告、20 套北极星长合集验收。A/B v2 token 已要求共同内容和单侧差异达到 2000/1500 ms 有效/覆盖时长、边界达到 1500/1000 ms，但这些门槛也尚未在授权真实冻结集上完成充分性校准。因此现阶段安装包是 fail-closed 的工程预览，不能作为准确率、性能或人工观看充分性的验收证明。
 - 当前 N×M 匹配逐 pair 串行运行，且 V2 对单个媒体仍有 60 分钟 PCM 上限；本 release 不适合直接处理超过 60 分钟的单文件长合集，也不能把 4090 视为已启用的加速器。
+- V2.1 CPU 路径会在进程内保留最多 768 MiB 的 PCM/landmark/fine 制品 LRU，用于避免同 pair 二次解码并复用后续 pair；自动候选的单任务最坏驻留上限为 1 GiB，native 同时只运行一个普通重型对齐任务。结束应用会释放这些内存；benchmark 的 cold reset 与 session release 也会清空同一缓存槽。该缓存不代表已经完成媒体级 batch，重复全文件身份和 FFprobe 仍待后续整批 pin/index 方案移除。

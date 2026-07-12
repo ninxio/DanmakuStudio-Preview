@@ -23,6 +23,11 @@ const STATE_TARGET_ONLY: u8 = 2;
 const STATE_NONE: u8 = u8::MAX;
 const ALIGNMENT_V2_CANCELLED: &str = "Alignment V2 算法已取消。";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SPECTRUM_CALCULATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn check_algorithm_cancelled(cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
     if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         Err(ALIGNMENT_V2_CANCELLED.to_string())
@@ -79,6 +84,15 @@ struct SpectralPeak {
     magnitude: f64,
 }
 
+#[derive(Debug)]
+struct LandmarkSpectralAnalysis {
+    spectra: Vec<Vec<f64>>,
+    active_frames: Vec<bool>,
+    fine_features: Vec<FineFeatureFrame>,
+    window_samples: usize,
+    hop_samples: usize,
+}
+
 /// 从单声道 PCM i16 提取局部声谱峰值对。hash 的低 8 位是粗时间差桶，其余位是
 /// 两个频率 bin；匹配时允许相邻时间差桶，从而给轻微速度差保留候选。
 #[cfg(test)]
@@ -89,6 +103,7 @@ pub fn extract_landmarks(
     extract_landmarks_with_cancel(pcm, config, None)
 }
 
+#[cfg(test)]
 pub fn extract_landmarks_with_cancel(
     pcm: &[i16],
     config: &LandmarkConfig,
@@ -96,15 +111,36 @@ pub fn extract_landmarks_with_cancel(
 ) -> Result<Vec<SpectralLandmark>, String> {
     check_algorithm_cancelled(cancel_flag)?;
     validate_landmark_config(config)?;
-    let window_samples = milliseconds_to_samples(config.window_ms as i64, config.sample_rate)?;
-    let hop_samples = milliseconds_to_samples(config.hop_ms as i64, config.sample_rate)?;
-    if pcm.len() < window_samples || window_samples < 8 || hop_samples == 0 {
+    let Some(analysis) = analyze_landmark_spectral_frames(pcm, config, None, cancel_flag)? else {
         return Ok(Vec::new());
+    };
+    extract_landmarks_from_spectral_analysis(&analysis, config, cancel_flag)
+}
+
+fn analyze_landmark_spectral_frames(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: Option<&FineFeatureConfig>,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Option<LandmarkSpectralAnalysis>, String> {
+    let window_samples = milliseconds_to_samples(
+        landmark_config.window_ms as i64,
+        landmark_config.sample_rate,
+    )?;
+    let hop_samples =
+        milliseconds_to_samples(landmark_config.hop_ms as i64, landmark_config.sample_rate)?;
+    if pcm.len() < window_samples || window_samples < 8 || hop_samples == 0 {
+        return Ok(None);
     }
 
     let frame_count = 1 + (pcm.len() - window_samples) / hop_samples;
     let mut spectra = Vec::with_capacity(frame_count);
     let mut active_frames = Vec::with_capacity(frame_count);
+    let mut fine_features = Vec::with_capacity(if fine_config.is_some() {
+        frame_count
+    } else {
+        0
+    });
     for frame_index in 0..frame_count {
         if frame_index % 64 == 0 {
             check_algorithm_cancelled(cancel_flag)?;
@@ -112,28 +148,55 @@ pub fn extract_landmarks_with_cancel(
         let start = frame_index * hop_samples;
         let frame = &pcm[start..start + window_samples];
         let rms = normalized_rms(frame);
-        active_frames.push(rms >= config.silence_rms);
-        spectra.push(calculate_spectrum(frame, config.sample_rate));
+        let spectrum = calculate_spectrum(frame, landmark_config.sample_rate);
+        active_frames.push(rms >= landmark_config.silence_rms);
+        if let Some(fine_config) = fine_config {
+            fine_features.push(create_fine_feature_frame(
+                frame,
+                &spectrum,
+                rms,
+                start,
+                window_samples,
+                fine_config,
+            ));
+        }
+        spectra.push(spectrum);
     }
+    Ok(Some(LandmarkSpectralAnalysis {
+        spectra,
+        active_frames,
+        fine_features,
+        window_samples,
+        hop_samples,
+    }))
+}
+
+fn extract_landmarks_from_spectral_analysis(
+    analysis: &LandmarkSpectralAnalysis,
+    config: &LandmarkConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<SpectralLandmark>, String> {
+    let frame_count = analysis.spectra.len();
 
     let mut peaks_by_frame = vec![Vec::<SpectralPeak>::new(); frame_count];
-    for frame_index in 0..frame_count {
+    for (frame_index, frame_peaks) in peaks_by_frame.iter_mut().enumerate() {
         if frame_index % 64 == 0 {
             check_algorithm_cancelled(cancel_flag)?;
         }
-        if !active_frames[frame_index] {
+        if !analysis.active_frames[frame_index] {
             continue;
         }
-        let spectrum = &spectra[frame_index];
+        let spectrum = &analysis.spectra[frame_index];
         let frame_mean = spectrum.iter().sum::<f64>() / spectrum.len().max(1) as f64;
         let mut peaks = Vec::new();
         for bin in 1..SPECTRAL_BIN_COUNT - 1 {
             let magnitude = spectrum[bin];
             let previous_time = frame_index
                 .checked_sub(1)
-                .map(|index| spectra[index][bin])
+                .map(|index| analysis.spectra[index][bin])
                 .unwrap_or(0.0);
-            let next_time = spectra
+            let next_time = analysis
+                .spectra
                 .get(frame_index + 1)
                 .map(|values| values[bin])
                 .unwrap_or(0.0);
@@ -154,13 +217,13 @@ pub fn extract_landmarks_with_cancel(
                 .then_with(|| left.bin.cmp(&right.bin))
         });
         peaks.truncate(config.max_peaks_per_frame);
-        peaks_by_frame[frame_index] = peaks;
+        *frame_peaks = peaks;
     }
 
     let frame_time_ms = |frame_index: usize| -> i64 {
         config.presentation_offset_ms
             + samples_to_milliseconds(
-                frame_index * hop_samples + window_samples / 2,
+                frame_index * analysis.hop_samples + analysis.window_samples / 2,
                 config.sample_rate,
             )
     };
@@ -381,6 +444,54 @@ pub struct FineFeatureFrame {
     pub values: Vec<f32>,
 }
 
+/// Landmark 与细粒度特征共享同一组声谱帧的纯算法结果。
+///
+/// 调用方只有在两套配置使用相同 sample rate、window 和 hop 时才能共享遍历；两者的
+/// presentation offset 可以不同，并会分别写入各自输出的时间戳。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandmarkFineFeatureBundle {
+    pub landmarks: Vec<SpectralLandmark>,
+    pub fine_features: Vec<FineFeatureFrame>,
+}
+
+#[cfg(test)]
+pub fn extract_landmarks_and_fine_features(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: &FineFeatureConfig,
+) -> Result<LandmarkFineFeatureBundle, String> {
+    extract_landmarks_and_fine_features_with_cancel(pcm, landmark_config, fine_config, None)
+}
+
+/// 在一次声谱 FFT 遍历中同时生成 landmark 与细粒度特征。峰值跨帧判定、common-family
+/// 抑制和最终排序仍复用独立 landmark 路径，因此结果与两个独立入口逐项等价。
+pub fn extract_landmarks_and_fine_features_with_cancel(
+    pcm: &[i16],
+    landmark_config: &LandmarkConfig,
+    fine_config: &FineFeatureConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<LandmarkFineFeatureBundle, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    validate_landmark_config(landmark_config)?;
+    validate_fine_feature_config(fine_config)?;
+    validate_shared_spectral_grid(landmark_config, fine_config)?;
+    let Some(analysis) =
+        analyze_landmark_spectral_frames(pcm, landmark_config, Some(fine_config), cancel_flag)?
+    else {
+        return Ok(LandmarkFineFeatureBundle {
+            landmarks: Vec::new(),
+            fine_features: Vec::new(),
+        });
+    };
+    let landmarks =
+        extract_landmarks_from_spectral_analysis(&analysis, landmark_config, cancel_flag)?;
+    check_algorithm_cancelled(cancel_flag)?;
+    Ok(LandmarkFineFeatureBundle {
+        landmarks,
+        fine_features: analysis.fine_features,
+    })
+}
+
 /// 从同一份 16-bit PCM 生成细粒度、定长、归一化声谱特征。生产调用方可将 hop
 /// 设为 20–50ms；时间戳始终位于媒体 presentation timeline。
 #[cfg(test)]
@@ -412,37 +523,55 @@ pub fn extract_fine_features_with_cancel(
         let start = frame_index * hop_samples;
         let frame = &pcm[start..start + window_samples];
         let spectrum = calculate_spectrum(frame, config.sample_rate);
-        let mut values = Vec::with_capacity(FINE_SPECTRAL_BAND_COUNT + 2);
         let rms = normalized_rms(frame);
-        values.push((((rms + 1.0e-6).log10() + 6.0).clamp(0.0, 6.0) / 6.0) as f32);
-        let zero_crossings = frame
-            .windows(2)
-            .filter(|pair| (pair[0] >= 0) != (pair[1] >= 0))
-            .count();
-        values.push((zero_crossings as f64 / frame.len().max(1) as f64) as f32);
-        for band in 0..FINE_SPECTRAL_BAND_COUNT {
-            let start_bin = band * SPECTRAL_BIN_COUNT / FINE_SPECTRAL_BAND_COUNT;
-            let end_bin = (band + 1) * SPECTRAL_BIN_COUNT / FINE_SPECTRAL_BAND_COUNT;
-            let energy = spectrum[start_bin..end_bin].iter().sum::<f64>();
-            values.push((energy + 1.0).ln() as f32);
-        }
-        let norm = values
-            .iter()
-            .map(|value| f64::from(*value).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        if norm > f64::EPSILON {
-            for value in &mut values {
-                *value = (f64::from(*value) / norm) as f32;
-            }
-        }
-        frames.push(FineFeatureFrame {
-            time_ms: config.presentation_offset_ms
-                + samples_to_milliseconds(start + window_samples / 2, config.sample_rate),
-            values,
-        });
+        frames.push(create_fine_feature_frame(
+            frame,
+            &spectrum,
+            rms,
+            start,
+            window_samples,
+            config,
+        ));
     }
     Ok(frames)
+}
+
+fn create_fine_feature_frame(
+    frame: &[i16],
+    spectrum: &[f64],
+    rms: f64,
+    start: usize,
+    window_samples: usize,
+    config: &FineFeatureConfig,
+) -> FineFeatureFrame {
+    let mut values = Vec::with_capacity(FINE_SPECTRAL_BAND_COUNT + 2);
+    values.push((((rms + 1.0e-6).log10() + 6.0).clamp(0.0, 6.0) / 6.0) as f32);
+    let zero_crossings = frame
+        .windows(2)
+        .filter(|pair| (pair[0] >= 0) != (pair[1] >= 0))
+        .count();
+    values.push((zero_crossings as f64 / frame.len().max(1) as f64) as f32);
+    for band in 0..FINE_SPECTRAL_BAND_COUNT {
+        let start_bin = band * SPECTRAL_BIN_COUNT / FINE_SPECTRAL_BAND_COUNT;
+        let end_bin = (band + 1) * SPECTRAL_BIN_COUNT / FINE_SPECTRAL_BAND_COUNT;
+        let energy = spectrum[start_bin..end_bin].iter().sum::<f64>();
+        values.push((energy + 1.0).ln() as f32);
+    }
+    let norm = values
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if norm > f64::EPSILON {
+        for value in &mut values {
+            *value = (f64::from(*value) / norm) as f32;
+        }
+    }
+    FineFeatureFrame {
+        time_ms: config.presentation_offset_ms
+            + samples_to_milliseconds(start + window_samples / 2, config.sample_rate),
+        values,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1019,7 +1148,25 @@ fn validate_fine_feature_config(config: &FineFeatureConfig) -> Result<(), String
     Ok(())
 }
 
+fn validate_shared_spectral_grid(
+    landmark_config: &LandmarkConfig,
+    fine_config: &FineFeatureConfig,
+) -> Result<(), String> {
+    if landmark_config.sample_rate != fine_config.sample_rate
+        || landmark_config.window_ms != fine_config.window_ms
+        || landmark_config.hop_ms != fine_config.hop_ms
+    {
+        return Err(
+            "共享声谱提取要求 landmark 与 fine feature 使用相同 sample rate、window 和 hop。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn calculate_spectrum(frame: &[i16], sample_rate: u32) -> Vec<f64> {
+    #[cfg(test)]
+    TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     // 16 kHz 输入先做 2:1 抽取，再以 radix-2 FFT 复用一份窗谱。旧实现为每个
     // 频率桶各扫一遍窗口（48 次 Goertzel），长媒体会出现数十亿次样本迭代。
     let decimation = if sample_rate >= 8_000 { 2 } else { 1 };
@@ -1904,6 +2051,70 @@ mod tests {
     }
 
     #[test]
+    fn shared_spectral_extraction_is_exactly_equivalent_and_runs_one_fft_per_frame() {
+        let pcm = synth_tone_bursts(16_000, &[310, 470, 690, 930, 1_270, 1_610]);
+        let landmark_config = LandmarkConfig {
+            presentation_offset_ms: 375,
+            window_ms: 50,
+            hop_ms: 50,
+            max_hash_occurrences: 64,
+            ..LandmarkConfig::default()
+        };
+        let fine_config = FineFeatureConfig {
+            presentation_offset_ms: 375,
+            window_ms: 50,
+            hop_ms: 50,
+            ..FineFeatureConfig::default()
+        };
+        let window_samples = milliseconds_to_samples(50, 16_000).unwrap();
+        let hop_samples = milliseconds_to_samples(50, 16_000).unwrap();
+        let expected_frame_count = 1 + (pcm.len() - window_samples) / hop_samples;
+
+        TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(0));
+        let shared =
+            extract_landmarks_and_fine_features(&pcm, &landmark_config, &fine_config).unwrap();
+        let shared_spectrum_count = TEST_SPECTRUM_CALCULATION_COUNT.with(std::cell::Cell::get);
+
+        TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(0));
+        let independent_landmarks = extract_landmarks(&pcm, &landmark_config).unwrap();
+        let independent_fine = extract_fine_features(&pcm, &fine_config).unwrap();
+        let independent_spectrum_count = TEST_SPECTRUM_CALCULATION_COUNT.with(std::cell::Cell::get);
+
+        assert!(!shared.landmarks.is_empty());
+        assert_eq!(shared.landmarks, independent_landmarks);
+        assert_eq!(shared.fine_features, independent_fine);
+        assert_eq!(shared_spectrum_count, expected_frame_count);
+        assert_eq!(independent_spectrum_count, expected_frame_count * 2);
+    }
+
+    #[test]
+    fn shared_spectral_extraction_rejects_mismatched_frame_grids_before_fft() {
+        let pcm = synth_tone_bursts(16_000, &[330, 510, 770, 1_130]);
+        TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(0));
+
+        let error = extract_landmarks_and_fine_features(
+            &pcm,
+            &LandmarkConfig {
+                window_ms: 50,
+                hop_ms: 50,
+                ..LandmarkConfig::default()
+            },
+            &FineFeatureConfig {
+                window_ms: 50,
+                hop_ms: 25,
+                ..FineFeatureConfig::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("相同 sample rate、window 和 hop"));
+        assert_eq!(
+            TEST_SPECTRUM_CALCULATION_COUNT.with(std::cell::Cell::get),
+            0
+        );
+    }
+
+    #[test]
     fn edit_dp_models_source_and_target_deletions_symmetrically() {
         let source = feature_sequence(&[0, 1, 2, 3, 4, 5, 6], 0, 100);
         let target = feature_sequence(&[0, 1, 3, 7, 4, 5, 6], 0, 100);
@@ -2113,6 +2324,20 @@ mod tests {
         assert_eq!(
             extract_fine_features_with_cancel(
                 &pcm,
+                &FineFeatureConfig::default(),
+                Some(&cancelled),
+            )
+            .unwrap_err(),
+            ALIGNMENT_V2_CANCELLED
+        );
+        assert_eq!(
+            extract_landmarks_and_fine_features_with_cancel(
+                &pcm,
+                &LandmarkConfig {
+                    window_ms: 50,
+                    hop_ms: 50,
+                    ..LandmarkConfig::default()
+                },
                 &FineFeatureConfig::default(),
                 Some(&cancelled),
             )

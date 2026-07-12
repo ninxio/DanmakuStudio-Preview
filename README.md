@@ -7,6 +7,7 @@ Danmaku Studio 是一个把 B 站 XML 弹幕对齐到本地视频、处理不同
 - 在素材页一次多选导入多个 B 站参考视频、多个目标原片和一个或多个 Bilibili XML，并把每个 XML 绑定到对应参考素材。
 - 匹配页直接对项目素材运行 1×N、N×1 或 N×M 批量匹配；项目级全局分配会阻止参考/原片区间冲突，并保留重复内容的竞争候选。
 - 当前这条 N×M 主链会先展开所选参考素材与原片的笛卡尔积，逐 pair 串行运行 Alignment V2，再对每个 pair 的最佳候选做项目级全局分配；它不是并行任务，也不是 GPU 批处理。Alignment V2 对单个媒体仍有 60 分钟 PCM 硬上限，所以超过 60 分钟的单文件长合集尚不能作为完整参考直接进入当前 V2。
+- Alignment V2.1 已把 PCM、landmark 和 50ms 细特征合并为同一媒体/音轨制品：冷 pair 的每个主音轨只调用一次 FFmpeg，landmark 与细特征共用一次声谱 FFT 遍历；进程内以 768 MiB 按字节 LRU 跨 pair 复用制品，自动多音轨超过 1 GiB 单任务预算会在首个解码前阻断，native 同时只允许一个重型普通对齐任务。这减少了重复解码和重复 FFT，但每个 pair 的全文件身份/FFprobe、笛卡尔积粗匹配、DP 与 60 分钟上限仍待 batch/流式索引阶段解决。
 - 匹配评分：基于目标绑定、片名/季集、时长差、弹幕密度、同步线索和已有音频/视觉提案诊断，给出“很可能匹配 / 需要确认 / 看起来不是同一集”的可解释结论。
 - 把 XML 弹幕素材放入时间轴，支持按顺序自动排列。
 - 看视频预览和时间轴，移动片段、微调弹幕、禁用弹幕或调整全局偏移。
@@ -124,7 +125,7 @@ corepack prepare pnpm@9.15.4 --activate
 - mpv 后端当前以桌面 sidecar 方式运行，不把 mpv 画面嵌入 React 预览区；未配置 mpv 或没有真实本地路径时，界面不会假装支持 MKV。HTML Video 播放失败时会明确提示改用 MP4/WebM 或启用 mpv 播放器。
 - V2 媒体分析依赖用户主动导入且合法拥有/授权读取的本地媒体，以及本机 FFmpeg/FFprobe。网页模式不伪装为可执行高精度媒体分析或写盘前身份核验。
 - 当前 V2 已有 PTS、多音轨、声谱 landmark、速度漂移、双向编辑、局部边界和独立视觉回退的工程实现，但真实冻结集样本数仍为 **0**，benchmark manifest v2 示例只有 placeholder。尚未完成统计概率校准、规定硬件性能报告或 20 套北极星长合集 5/5 验收。自动结果最高为 `review`；正式按原片分集导出只接受带可信验证来源的 `verified` 时间图。因此本阶段 release 是安全预览，不代表准确率或性能验收完成。
-- 当前媒体匹配主链为 FFmpeg `-vn` 音频解码加 Rust CPU radix-2 FFT、landmark、edit-aware DP 与相关精修；安装包没有 CUDA/cuFFT 计算后端，NVIDIA GPU 不会参与主匹配。下一步先把 PTS、PCM 粗特征和 landmark 改为每媒体一次的流式预处理/索引，用 Top-K 粗筛减少进入精对齐的 pair，再接入带 CPU 等价校验和自动回退的可选 CUDA/cuFFT 后端；NVDEC 只适合视觉回退的解码阶段，不能替代音频计算后端。
+- 当前媒体匹配主链仍为 FFmpeg `-vn` 音频解码加 Rust CPU radix-2 FFT、landmark、edit-aware DP 与相关精修；上述共享声谱与制品 LRU 只是在 CPU 路径消除确定性的重复工作，安装包依然没有 CUDA/cuFFT 计算后端，NVIDIA GPU 不会参与主匹配。下一步把 PTS、粗特征和 landmark 改为每媒体一次的流式索引，用 Top-K 粗筛减少进入精对齐的 pair，再接入带 CPU 等价校验和自动回退的可选 CUDA/cuFFT 后端；NVDEC 只适合视觉回退的解码阶段，不能替代音频计算后端。
 - 视觉回退目前只建立粗粒度全局仿射关系，不负责宣称局部删减边界；大幅裁切、极端调色、长静态或黑场会保守阻断。
 - A/B 播放证据 v2 已累计最小时长与唯一覆盖，但它只证明完成了规定的有效试听过程，不能单独证明人工判断正确。签发仍同时要求逐段分类、无 ambiguous、媒体身份和中央质量门槛。
 - 完整 C137 acceptance 还要求 `real-frozen` 证据包、固定协议、全部原始报告、UI/性能/release 回执及独立信任根。当前 `trustContext` 只是调用方提供的摘要快照，可发现内容变化但不能证明签发者身份；release 默认不内置审批白名单，`external-trust-authority` 会保持未完成，直到存在可独立验证的签名或受信封装。因此当前结果必为 `incomplete-evidence`、`verifiedEligible=false`，不能通过完整验收。

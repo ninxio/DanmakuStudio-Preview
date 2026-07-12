@@ -513,13 +513,14 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 
 当前剩余限制：双侧证据、不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷回执和 fail-closed acceptance v3 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；实测校准、批准的 production protocol / trust root、Job working-set/terminal cleanup/native attestation 正式证据和 20 套北极星长合集均未完成，不能据此宣称准确率或性能达标。
 
-性能执行也仍未成熟：当前匹配页把 source×target 全量展开后逐 pair 串行运行 CPU Alignment V2，单个媒体超过 60 分钟会在探测阶段失败；虽然 landmark 有进程内缓存，细 PCM/特征、DP 和边界相关仍随进入精对齐的 pair 重复工作。当前仓库没有 CUDA/cuFFT backend，4090 不会参与匹配。下一阶段必须先落地“每媒体一次流式索引 → N×M Top-K 粗筛 → 候选 pair 精对齐”，再增加可选 CUDA/cuFFT 声谱与批量相关后端；CPU 继续作为确定性基线和自动回退，GPU 结果必须在固定样本上满足容差内等价且不能改变 fail-closed 质量门槛。视觉 NVDEC 只作为视觉帧解码优化，不得冒充音频计算加速。
+性能执行也仍未成熟：当前匹配页把 source×target 全量展开后逐 pair 串行运行 CPU Alignment V2，单个媒体超过 60 分钟会在探测阶段失败。V2.1 已先消除单 pair 的二次 PCM 解码与 landmark/fine 重复 FFT，并以 768 MiB 字节 LRU 跨 pair 复用完整制品；1 GiB 单任务预检、实际容量 guard 和 native 并发 1 保证这项优化不会把内存放大为无界。它仍没有消除每 pair 的 run identity/FFprobe、笛卡尔积匹配、DP 和边界工作，普通缓存的 FFmpeg 身份也还未升级为整批 tool pin。当前仓库没有 CUDA/cuFFT backend，4090 不会参与匹配。下一阶段必须落地“整批 media/tool pins → 每媒体一次流式索引 → N×M Top-K 粗筛 → 候选窗口精对齐”，再增加可选 CUDA/cuFFT 声谱与批量相关后端；CPU 继续作为确定性基线和自动回退，GPU 结果必须在固定样本上满足容差内等价且不能改变 fail-closed 质量门槛。视觉 NVDEC 只作为视觉帧解码优化，不得冒充音频计算加速。
 
 ### 真实准确率与发布
 
 - [ ] 真实媒体基准规模、双人标注和冻结集达到要求。
 - [ ] 正式批准 versioned 验收协议、校准/取消阈值、数据审批 receipts 与独立 production trust root。
 - [x] 工程性能 raw v2 可在原生独占 session 中输出硬件/工具链、实际 workload media volumes、阶段耗时、冷/热缓存、ToolHelp 进程树峰值内存、取消响应和一致性证据，并保持不可晋级状态。
+- [x] V2.1 中间性能层将 PCM/landmark/fine 合并为 768 MiB 字节 LRU 制品，同一主音轨冷路径只解码一次、landmark/fine 每帧只做一次 FFT；以 1 GiB 单任务预算和 native 并发 1 保持总资源有界，并用 exact/FFmpeg 回归证明语义不变。
 - [ ] 将 N×M 产品执行改为每媒体一次流式 PTS/landmark/粗特征索引、全局 Top-K 粗筛和候选 pair 精对齐，移除长参考对整段 PCM 与 60 分钟上限的依赖。
 - [ ] 实现可选 CUDA/cuFFT 声谱和批量相关后端、4090 能力/显存诊断、CPU 容差等价校验与失败自动回退；安装包不得在后端或 runtime 不存在时显示 GPU 已启用。
 - [ ] 正式性能采集在现有 lifecycle Job 之上实现诚实限定覆盖范围的 Job working-set receipt、终态 cleanup receipt 与独立 attestation；在规定 4 核目标机按获批协议重复运行并形成受信原始报告。
