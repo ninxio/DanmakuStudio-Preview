@@ -399,6 +399,77 @@ pub struct AudioAlignmentJobSnapshot {
     updated_at_ms: u64,
 }
 
+const AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION: u8 = 1;
+const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE: usize = 64;
+const MAX_AUDIO_ALIGNMENT_BATCH_PAIRS: usize = 256;
+const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_ID_BYTES: usize = 512;
+const MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS: usize = 16;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AudioAlignmentBatchMediaRequest {
+    media_id: String,
+    path: String,
+    audio_stream_index: Option<u32>,
+    video_stream_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AudioAlignmentBatchPairRequest {
+    source_media_id: String,
+    target_media_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchRequest {
+    schema_version: u8,
+    sources: Vec<AudioAlignmentBatchMediaRequest>,
+    targets: Vec<AudioAlignmentBatchMediaRequest>,
+    pairs: Option<Vec<AudioAlignmentBatchPairRequest>>,
+    ffmpeg_path: Option<String>,
+    ffprobe_path: Option<String>,
+    sample_rate: Option<u32>,
+    window_ms: Option<u64>,
+    match_threshold: Option<f64>,
+    min_gap_ms: Option<u64>,
+    max_cells: Option<usize>,
+    enable_visual_evidence: Option<bool>,
+    visual_sample_interval_ms: Option<u64>,
+    localization_mode: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioAlignmentBatchPairSnapshot {
+    pair_ordinal: usize,
+    source_media_id: String,
+    target_media_id: String,
+    status: AudioAlignmentJobStatus,
+    progress: f64,
+    message: String,
+    proposal: Option<AudioAlignmentProposal>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioAlignmentBatchJobSnapshot {
+    schema_version: u8,
+    job_id: String,
+    status: AudioAlignmentJobStatus,
+    progress: f64,
+    message: String,
+    total_pair_count: usize,
+    processed_pair_count: usize,
+    failed_pair_count: usize,
+    current_pair_ordinal: Option<usize>,
+    pairs: Vec<AudioAlignmentBatchPairSnapshot>,
+    error: Option<String>,
+    updated_at_ms: u64,
+}
+
 const ALIGNMENT_BENCHMARK_SCHEMA_VERSION: u8 = 2;
 const ALIGNMENT_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION: u8 = 1;
 
@@ -1000,6 +1071,23 @@ struct AudioAlignmentJobEntry {
     cancel_flag: Arc<AtomicBool>,
 }
 
+struct PlannedAudioAlignmentBatchPair {
+    pair_ordinal: usize,
+    source_media_id: String,
+    target_media_id: String,
+    request: AudioAlignmentRequest,
+}
+
+struct PlannedAudioAlignmentBatch {
+    pairs: Vec<PlannedAudioAlignmentBatchPair>,
+}
+
+struct AudioAlignmentBatchJobEntry {
+    snapshot: AudioAlignmentBatchJobSnapshot,
+    cancel_flag: Arc<AtomicBool>,
+    terminal_sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BenchmarkCacheKind {
     AudioFeatures,
@@ -1165,6 +1253,10 @@ thread_local! {
 static AUDIO_ALIGNMENT_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentJobEntry>>> =
     OnceLock::new();
 static AUDIO_ALIGNMENT_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static AUDIO_ALIGNMENT_BATCH_JOBS: OnceLock<Mutex<HashMap<String, AudioAlignmentBatchJobEntry>>> =
+    OnceLock::new();
+static AUDIO_ALIGNMENT_BATCH_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static AUDIO_ALIGNMENT_BATCH_TERMINAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static AUDIO_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<AudioFeatureFrame>>>> =
     OnceLock::new();
 // This remains the benchmark's `landmarks` cache slot for schema compatibility, but the
@@ -1232,6 +1324,57 @@ pub fn cancel_audio_alignment_job(job_id: String) -> Result<AudioAlignmentJobSna
         // The worker changes it to Cancelled after observing the token.
         entry.snapshot.message = "正在取消音频对齐任务，等待当前算法安全退出。".to_string();
         append_audio_alignment_log(&mut entry.snapshot.logs, "已请求取消；任务仍在退出中。");
+        entry.snapshot.updated_at_ms = current_time_ms();
+    }
+    Ok(entry.snapshot.clone())
+}
+
+#[tauri::command]
+pub async fn start_audio_alignment_batch_job(
+    request: AudioAlignmentBatchRequest,
+) -> Result<AudioAlignmentBatchJobSnapshot, String> {
+    let plan = plan_audio_alignment_batch(request)?;
+    let permit = acquire_ordinary_alignment_run()?;
+    let job_id = next_audio_alignment_batch_job_id();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone())?;
+    let worker_job_id = job_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        run_audio_alignment_batch_job(worker_job_id, cancel_flag, plan);
+    });
+    get_audio_alignment_batch_job(job_id)
+}
+
+#[tauri::command]
+pub fn get_audio_alignment_batch_job(
+    job_id: String,
+) -> Result<AudioAlignmentBatchJobSnapshot, String> {
+    let jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    jobs.get(&job_id)
+        .map(|entry| entry.snapshot.clone())
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())
+}
+
+#[tauri::command]
+pub fn cancel_audio_alignment_batch_job(
+    job_id: String,
+) -> Result<AudioAlignmentBatchJobSnapshot, String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(&job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    if matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) {
+        entry.cancel_flag.store(true, Ordering::Release);
+        entry.snapshot.message =
+            "正在取消整批音频对齐，等待当前媒体工具和算法安全退出。".to_string();
         entry.snapshot.updated_at_ms = current_time_ms();
     }
     Ok(entry.snapshot.clone())
@@ -7816,6 +7959,599 @@ fn run_audio_alignment_job(
     }
 }
 
+fn plan_audio_alignment_batch(
+    request: AudioAlignmentBatchRequest,
+) -> Result<PlannedAudioAlignmentBatch, String> {
+    if request.schema_version != AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION {
+        return Err(format!(
+            "批量音频对齐 schemaVersion 必须为 {AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION}。"
+        ));
+    }
+    validate_audio_alignment_batch_side_count("参考素材", request.sources.len())?;
+    validate_audio_alignment_batch_side_count("目标原片", request.targets.len())?;
+    let pair_count = if let Some(pairs) = &request.pairs {
+        if pairs.is_empty() {
+            return Err("显式批量 pair 列表不能为空。".to_string());
+        }
+        pairs.len()
+    } else {
+        request
+            .sources
+            .len()
+            .checked_mul(request.targets.len())
+            .ok_or_else(|| "批量音频对齐 pair 数溢出。".to_string())?
+    };
+    if pair_count > MAX_AUDIO_ALIGNMENT_BATCH_PAIRS {
+        return Err(format!(
+            "批量音频对齐一次最多允许 {MAX_AUDIO_ALIGNMENT_BATCH_PAIRS} 个 pair；请缩小选择范围。"
+        ));
+    }
+    if request.max_cells == Some(0) {
+        return Err("批量音频对齐 maxCells 必须大于 0。".to_string());
+    }
+
+    let mut media_ids = HashSet::new();
+    let sources = request
+        .sources
+        .iter()
+        .map(|media| normalize_audio_alignment_batch_media(media, &mut media_ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    let targets = request
+        .targets
+        .iter()
+        .map(|media| normalize_audio_alignment_batch_media(media, &mut media_ids))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut pairs = Vec::with_capacity(pair_count);
+    if let Some(pair_selection) = &request.pairs {
+        let sources_by_id = sources
+            .iter()
+            .map(|media| (media.media_id.as_str(), media))
+            .collect::<HashMap<_, _>>();
+        let targets_by_id = targets
+            .iter()
+            .map(|media| (media.media_id.as_str(), media))
+            .collect::<HashMap<_, _>>();
+        let mut selected_pairs = HashSet::new();
+        for selected in pair_selection {
+            let source_id = selected.source_media_id.trim();
+            let target_id = selected.target_media_id.trim();
+            let Some(source) = sources_by_id.get(source_id).copied() else {
+                return Err("显式 pair 引用了不存在的 sourceMediaId。".to_string());
+            };
+            let Some(target) = targets_by_id.get(target_id).copied() else {
+                return Err("显式 pair 引用了不存在的 targetMediaId。".to_string());
+            };
+            if !selected_pairs.insert((source_id.to_string(), target_id.to_string())) {
+                return Err("显式批量 pair 不允许重复。".to_string());
+            }
+            pairs.push(create_planned_audio_alignment_batch_pair(
+                pairs.len() + 1,
+                source,
+                target,
+                &request,
+            ));
+        }
+    } else {
+        for source in &sources {
+            for target in &targets {
+                pairs.push(create_planned_audio_alignment_batch_pair(
+                    pairs.len() + 1,
+                    source,
+                    target,
+                    &request,
+                ));
+            }
+        }
+    }
+    let first = pairs
+        .first()
+        .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())?;
+    create_options(&first.request)?;
+    Ok(PlannedAudioAlignmentBatch { pairs })
+}
+
+fn create_planned_audio_alignment_batch_pair(
+    pair_ordinal: usize,
+    source: &AudioAlignmentBatchMediaRequest,
+    target: &AudioAlignmentBatchMediaRequest,
+    batch: &AudioAlignmentBatchRequest,
+) -> PlannedAudioAlignmentBatchPair {
+    PlannedAudioAlignmentBatchPair {
+        pair_ordinal,
+        source_media_id: source.media_id.clone(),
+        target_media_id: target.media_id.clone(),
+        request: AudioAlignmentRequest {
+            complete_path: target.path.clone(),
+            source_path: source.path.clone(),
+            ffmpeg_path: batch.ffmpeg_path.clone(),
+            ffprobe_path: batch.ffprobe_path.clone(),
+            complete_audio_stream_index: target.audio_stream_index,
+            source_audio_stream_index: source.audio_stream_index,
+            complete_video_stream_index: target.video_stream_index,
+            source_video_stream_index: source.video_stream_index,
+            sample_rate: batch.sample_rate,
+            window_ms: batch.window_ms,
+            match_threshold: batch.match_threshold,
+            min_gap_ms: batch.min_gap_ms,
+            max_cells: batch.max_cells,
+            enable_visual_evidence: batch.enable_visual_evidence,
+            visual_sample_interval_ms: batch.visual_sample_interval_ms,
+            localization_mode: batch.localization_mode,
+        },
+    }
+}
+
+fn validate_audio_alignment_batch_side_count(label: &str, count: usize) -> Result<(), String> {
+    if count == 0 || count > MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE {
+        return Err(format!(
+            "{label}数量必须位于 1–{MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE}。"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_audio_alignment_batch_media(
+    media: &AudioAlignmentBatchMediaRequest,
+    media_ids: &mut HashSet<String>,
+) -> Result<AudioAlignmentBatchMediaRequest, String> {
+    let media_id = media.media_id.trim();
+    if media_id.is_empty()
+        || media_id.len() > MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_ID_BYTES
+        || media_id.chars().any(char::is_control)
+        || media_id.contains(['/', '\\'])
+    {
+        return Err("批量音频对齐 mediaId 必须是无路径分隔符的非空有界标识。".to_string());
+    }
+    if !media_ids.insert(media_id.to_string()) {
+        return Err("批量音频对齐 mediaId 必须在两侧素材中全局唯一。".to_string());
+    }
+    let path = media.path.trim();
+    if path.is_empty() || is_remote_media_input(path) {
+        return Err("批量音频对齐只接受非空本地媒体路径。".to_string());
+    }
+    Ok(AudioAlignmentBatchMediaRequest {
+        media_id: media_id.to_string(),
+        path: path.to_string(),
+        audio_stream_index: media.audio_stream_index,
+        video_stream_index: media.video_stream_index,
+    })
+}
+
+fn audio_alignment_batch_jobs() -> &'static Mutex<HashMap<String, AudioAlignmentBatchJobEntry>> {
+    AUDIO_ALIGNMENT_BATCH_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_audio_alignment_batch_job_id() -> String {
+    let next = AUDIO_ALIGNMENT_BATCH_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("audio-align-batch-{next}")
+}
+
+fn insert_audio_alignment_batch_job(
+    job_id: &str,
+    plan: &PlannedAudioAlignmentBatch,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let pairs = plan
+        .pairs
+        .iter()
+        .map(|pair| AudioAlignmentBatchPairSnapshot {
+            pair_ordinal: pair.pair_ordinal,
+            source_media_id: pair.source_media_id.clone(),
+            target_media_id: pair.target_media_id.clone(),
+            status: AudioAlignmentJobStatus::Queued,
+            progress: 0.0,
+            message: "等待执行。".to_string(),
+            proposal: None,
+            error: None,
+        })
+        .collect::<Vec<_>>();
+    let total_pair_count = pairs.len();
+    let snapshot = AudioAlignmentBatchJobSnapshot {
+        schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+        job_id: job_id.to_string(),
+        status: AudioAlignmentJobStatus::Queued,
+        progress: 0.0,
+        message: "批量音频对齐任务已加入队列。".to_string(),
+        total_pair_count,
+        processed_pair_count: 0,
+        failed_pair_count: 0,
+        current_pair_ordinal: None,
+        pairs,
+        error: None,
+        updated_at_ms: current_time_ms(),
+    };
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    if jobs.contains_key(job_id) {
+        return Err("批量音频对齐任务 ID 冲突。".to_string());
+    }
+    jobs.insert(
+        job_id.to_string(),
+        AudioAlignmentBatchJobEntry {
+            snapshot,
+            cancel_flag,
+            terminal_sequence: None,
+        },
+    );
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, None);
+    Ok(())
+}
+
+fn run_audio_alignment_batch_job(
+    job_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    plan: PlannedAudioAlignmentBatch,
+) {
+    run_audio_alignment_batch_job_with_pair_executor(
+        job_id,
+        cancel_flag,
+        plan,
+        |job_id, pair_index, request, cancel_flag| {
+            let mut update = |progress: f64, message: &str| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
+                }
+                update_audio_alignment_batch_pair_progress(job_id, pair_index, progress, message)
+            };
+            align_audio_files_with_progress(request, &mut update, Some(cancel_flag))
+        },
+    );
+}
+
+fn run_audio_alignment_batch_job_with_pair_executor<F>(
+    job_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    plan: PlannedAudioAlignmentBatch,
+    mut execute_pair: F,
+) where
+    F: FnMut(
+        &str,
+        usize,
+        AudioAlignmentRequest,
+        &AtomicBool,
+    ) -> Result<AudioAlignmentProposal, String>,
+{
+    for (pair_index, pair) in plan.pairs.into_iter().enumerate() {
+        if cancel_flag.load(Ordering::Acquire) {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        if update_audio_alignment_batch_pair_progress(
+            &job_id,
+            pair_index,
+            0.0,
+            "正在启动当前 pair。",
+        )
+        .is_err()
+        {
+            return;
+        }
+        let result = execute_pair(&job_id, pair_index, pair.request, cancel_flag.as_ref());
+        if cancel_flag.load(Ordering::Acquire)
+            || result
+                .as_ref()
+                .is_err_and(|error| error == AUDIO_ALIGNMENT_CANCELLED)
+        {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        match result {
+            Ok(proposal) => {
+                let _ =
+                    complete_audio_alignment_batch_pair(&job_id, pair_index, Some(proposal), None);
+            }
+            Err(error) => {
+                if process_supervision_cleanup_faulted()
+                    || error.starts_with("blocked:process-cleanup")
+                {
+                    let _ = fail_audio_alignment_batch_worker(&job_id, pair_index);
+                    return;
+                }
+                let _ = complete_audio_alignment_batch_pair(&job_id, pair_index, None, Some(error));
+            }
+        }
+    }
+    // The terminal decision is made while holding the registry lock. A cancellation request
+    // accepted after this worker's last atomic load must not be overwritten by Completed.
+    let _ = finalize_audio_alignment_batch_job(&job_id);
+}
+
+fn update_audio_alignment_batch_pair_progress(
+    job_id: &str,
+    pair_index: usize,
+    pair_progress: f64,
+    message: &str,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    if !matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) {
+        return Ok(());
+    }
+    let clamped = pair_progress.clamp(0.0, 1.0);
+    let pair_ordinal = {
+        let pair = entry
+            .snapshot
+            .pairs
+            .get_mut(pair_index)
+            .ok_or_else(|| "批量音频对齐 pair 索引越界。".to_string())?;
+        pair.status = AudioAlignmentJobStatus::Running;
+        pair.progress = clamped;
+        pair.message = message.to_string();
+        pair.pair_ordinal
+    };
+    entry.snapshot.status = AudioAlignmentJobStatus::Running;
+    entry.snapshot.current_pair_ordinal = Some(pair_ordinal);
+    entry.snapshot.progress =
+        (pair_index as f64 + clamped) / entry.snapshot.total_pair_count.max(1) as f64;
+    entry.snapshot.message = format!(
+        "正在执行第 {pair_ordinal}/{} 个 pair：{message}",
+        entry.snapshot.total_pair_count
+    );
+    entry.snapshot.updated_at_ms = current_time_ms();
+    Ok(())
+}
+
+fn complete_audio_alignment_batch_pair(
+    job_id: &str,
+    pair_index: usize,
+    proposal: Option<AudioAlignmentProposal>,
+    error: Option<String>,
+) -> Result<(), String> {
+    if proposal.is_some() == error.is_some() {
+        return Err(
+            "批量音频对齐 pair 完成结果必须且只能包含 proposal 或 error 之一。".to_string(),
+        );
+    }
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    let failed = error.is_some();
+    let pair = entry
+        .snapshot
+        .pairs
+        .get_mut(pair_index)
+        .ok_or_else(|| "批量音频对齐 pair 索引越界。".to_string())?;
+    pair.status = if failed {
+        AudioAlignmentJobStatus::Failed
+    } else {
+        AudioAlignmentJobStatus::Completed
+    };
+    pair.progress = 1.0;
+    pair.message = if failed {
+        "当前 pair 执行失败。".to_string()
+    } else {
+        "当前 pair 已完成。".to_string()
+    };
+    pair.proposal = proposal;
+    pair.error = error;
+    entry.snapshot.processed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| {
+            matches!(
+                pair.status,
+                AudioAlignmentJobStatus::Completed | AudioAlignmentJobStatus::Failed
+            )
+        })
+        .count();
+    entry.snapshot.failed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
+        .count();
+    entry.snapshot.progress =
+        entry.snapshot.processed_pair_count as f64 / entry.snapshot.total_pair_count.max(1) as f64;
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.updated_at_ms = current_time_ms();
+    Ok(())
+}
+
+fn finalize_audio_alignment_batch_job(job_id: &str) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    if entry.cancel_flag.load(Ordering::Acquire) {
+        mark_audio_alignment_batch_cancelled(entry);
+    } else if !matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) {
+        return Ok(());
+    } else {
+        entry.snapshot.current_pair_ordinal = None;
+        entry.snapshot.progress = 1.0;
+        entry.snapshot.processed_pair_count = entry.snapshot.total_pair_count;
+        entry.snapshot.status = AudioAlignmentJobStatus::Completed;
+        entry.snapshot.message = if entry.snapshot.failed_pair_count == 0 {
+            format!(
+                "批量音频对齐完成：{} 个 pair 均已真实执行。",
+                entry.snapshot.total_pair_count
+            )
+        } else {
+            format!(
+                "批量音频对齐完成：{} 个成功，{} 个失败；成功结果已保留。",
+                entry
+                    .snapshot
+                    .total_pair_count
+                    .saturating_sub(entry.snapshot.failed_pair_count),
+                entry.snapshot.failed_pair_count
+            )
+        };
+        entry.snapshot.error = None;
+        entry.snapshot.updated_at_ms = current_time_ms();
+    }
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
+}
+
+fn cancel_audio_alignment_batch_worker(job_id: &str) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    mark_audio_alignment_batch_cancelled(entry);
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
+}
+
+fn mark_audio_alignment_batch_cancelled(entry: &mut AudioAlignmentBatchJobEntry) {
+    for pair in &mut entry.snapshot.pairs {
+        if matches!(
+            pair.status,
+            AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+        ) {
+            pair.status = AudioAlignmentJobStatus::Cancelled;
+            pair.progress = 1.0;
+            pair.message = "批次已取消；当前或未开始的 pair 未产生结果。".to_string();
+            pair.proposal = None;
+            pair.error = None;
+        }
+    }
+    entry.snapshot.status = AudioAlignmentJobStatus::Cancelled;
+    entry.snapshot.progress = 1.0;
+    entry.snapshot.message = "批量音频对齐已取消；此前已完成的 pair 结果已保留。".to_string();
+    entry.snapshot.processed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| {
+            matches!(
+                pair.status,
+                AudioAlignmentJobStatus::Completed | AudioAlignmentJobStatus::Failed
+            )
+        })
+        .count();
+    entry.snapshot.failed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
+        .count();
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.error = None;
+    entry.snapshot.updated_at_ms = current_time_ms();
+}
+
+fn mark_audio_alignment_batch_terminal(entry: &mut AudioAlignmentBatchJobEntry) {
+    if entry.terminal_sequence.is_none() {
+        entry.terminal_sequence =
+            Some(AUDIO_ALIGNMENT_BATCH_TERMINAL_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    }
+}
+
+fn prune_audio_alignment_batch_terminal_jobs(
+    jobs: &mut HashMap<String, AudioAlignmentBatchJobEntry>,
+    protected_job_id: Option<&str>,
+) {
+    let mut terminal_jobs = jobs
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry.snapshot.status,
+                AudioAlignmentJobStatus::Completed
+                    | AudioAlignmentJobStatus::Failed
+                    | AudioAlignmentJobStatus::Cancelled
+            )
+        })
+        .map(|(job_id, entry)| (entry.terminal_sequence.unwrap_or(u64::MAX), job_id.clone()))
+        .collect::<Vec<_>>();
+    let mut remove_count = terminal_jobs
+        .len()
+        .saturating_sub(MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS);
+    if remove_count == 0 {
+        return;
+    }
+    terminal_jobs.sort_unstable();
+    for (_, job_id) in terminal_jobs {
+        if remove_count == 0 {
+            break;
+        }
+        if protected_job_id == Some(job_id.as_str()) {
+            continue;
+        }
+        jobs.remove(&job_id);
+        remove_count -= 1;
+    }
+}
+
+fn fail_audio_alignment_batch_worker(
+    job_id: &str,
+    current_pair_index: usize,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    for (index, pair) in entry.snapshot.pairs.iter_mut().enumerate() {
+        if index == current_pair_index
+            && matches!(
+                pair.status,
+                AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+            )
+        {
+            pair.status = AudioAlignmentJobStatus::Failed;
+            pair.progress = 1.0;
+            pair.message = "底层媒体进程未能可信收尾；当前 pair 已失败。".to_string();
+            pair.proposal = None;
+            pair.error = Some("受监督媒体进程清理状态不可信。".to_string());
+        } else if pair.status == AudioAlignmentJobStatus::Queued {
+            pair.status = AudioAlignmentJobStatus::Cancelled;
+            pair.progress = 1.0;
+            pair.message = "批次生命周期失败；该 pair 未执行。".to_string();
+        }
+    }
+    entry.snapshot.status = AudioAlignmentJobStatus::Failed;
+    entry.snapshot.progress = 1.0;
+    entry.snapshot.message = "批量音频对齐因底层进程清理状态不可信而终止。".to_string();
+    entry.snapshot.processed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| {
+            matches!(
+                pair.status,
+                AudioAlignmentJobStatus::Completed | AudioAlignmentJobStatus::Failed
+            )
+        })
+        .count();
+    entry.snapshot.failed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
+        .count();
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.error =
+        Some("批量任务生命周期失败；后续普通对齐将保持 fail-closed。".to_string());
+    entry.snapshot.updated_at_ms = current_time_ms();
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
+}
+
 fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptions, String> {
     let sample_rate = request.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
     let window_ms = request.window_ms.unwrap_or(DEFAULT_WINDOW_MS);
@@ -13580,6 +14316,455 @@ mod tests {
         assert_eq!(snapshot.status, AudioAlignmentJobStatus::Cancelled);
         assert_eq!(snapshot.message, AUDIO_ALIGNMENT_CANCELLED);
         assert!(snapshot.logs.iter().any(|line| line.contains("仍在退出中")));
+    }
+
+    #[test]
+    fn audio_alignment_batch_planner_preserves_explicit_pair_order_and_cartesian_fallback() {
+        let cartesian = plan_audio_alignment_batch(test_audio_alignment_batch_request(None))
+            .expect("省略 pairs 时应规划笛卡尔积");
+        assert_eq!(cartesian.pairs.len(), 4);
+        assert_eq!(
+            cartesian
+                .pairs
+                .iter()
+                .map(|pair| (
+                    pair.pair_ordinal,
+                    pair.source_media_id.as_str(),
+                    pair.target_media_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "source-1", "target-1"),
+                (2, "source-1", "target-2"),
+                (3, "source-2", "target-1"),
+                (4, "source-2", "target-2"),
+            ]
+        );
+
+        let explicit = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-2", "target-1"),
+            ("source-1", "target-2"),
+        ])))
+        .expect("显式 pairs 应按请求顺序规划");
+        assert_eq!(explicit.pairs.len(), 2);
+        assert_eq!(explicit.pairs[0].pair_ordinal, 1);
+        assert_eq!(explicit.pairs[0].source_media_id, "source-2");
+        assert_eq!(explicit.pairs[0].target_media_id, "target-1");
+        assert_eq!(explicit.pairs[0].request.source_audio_stream_index, Some(2));
+        assert_eq!(
+            explicit.pairs[0].request.complete_audio_stream_index,
+            Some(11)
+        );
+        assert_eq!(explicit.pairs[1].pair_ordinal, 2);
+        assert_eq!(explicit.pairs[1].source_media_id, "source-1");
+        assert_eq!(explicit.pairs[1].target_media_id, "target-2");
+    }
+
+    #[test]
+    fn audio_alignment_batch_planner_rejects_invalid_schema_references_and_duplicates() {
+        let mut wrong_schema = test_audio_alignment_batch_request(None);
+        wrong_schema.schema_version = 2;
+        assert!(plan_audio_alignment_batch(wrong_schema)
+            .err()
+            .expect("错误 schema 必须失败")
+            .contains("schemaVersion"));
+
+        let missing = test_audio_alignment_batch_request(Some(vec![("missing", "target-1")]));
+        assert!(plan_audio_alignment_batch(missing)
+            .err()
+            .expect("未知 source 引用必须失败")
+            .contains("sourceMediaId"));
+
+        let duplicated = test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-1", "target-1"),
+        ]));
+        assert!(plan_audio_alignment_batch(duplicated)
+            .err()
+            .expect("重复 pair 必须失败")
+            .contains("不允许重复"));
+
+        let empty = test_audio_alignment_batch_request(Some(Vec::new()));
+        assert!(plan_audio_alignment_batch(empty)
+            .err()
+            .expect("空显式 pair 必须失败")
+            .contains("不能为空"));
+    }
+
+    #[test]
+    fn audio_alignment_batch_worker_isolates_missing_paths_and_continues() {
+        let suffix = format!("{}-{}", std::process::id(), current_time_ms());
+        let valid_source = std::env::temp_dir().join(format!("batch-valid-source-{suffix}.mkv"));
+        let valid_target = std::env::temp_dir().join(format!("batch-valid-target-{suffix}.mkv"));
+        let missing_source =
+            std::env::temp_dir().join(format!("batch-missing-source-{suffix}.mkv"));
+        std::fs::write(&valid_source, b"source").unwrap();
+        std::fs::write(&valid_target, b"target").unwrap();
+
+        let mut request = test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ]));
+        request.sources[0].path = missing_source.to_string_lossy().into_owned();
+        request.sources[1].path = valid_source.to_string_lossy().into_owned();
+        request.targets[0].path = valid_target.to_string_lossy().into_owned();
+        request.targets[1].path = valid_target.to_string_lossy().into_owned();
+        let plan = plan_audio_alignment_batch(request)
+            .expect("缺失的本地文件应在 pair worker 内失败，而不是阻止批次规划");
+        let job_id = format!("test-audio-batch-path-isolation-{suffix}");
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+        let mut executed_source_paths = Vec::new();
+
+        run_audio_alignment_batch_job_with_pair_executor(
+            job_id.clone(),
+            cancel_flag,
+            plan,
+            |_job_id, _pair_index, request, _cancel_flag| {
+                executed_source_paths.push(request.source_path.clone());
+                validate_media_input(&request.complete_path, "目标原片")?;
+                validate_media_input(&request.source_path, "B 站参考")?;
+                Ok(test_audio_alignment_batch_proposal("valid-pair"))
+            },
+        );
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(executed_source_paths.len(), 2);
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Completed);
+        assert_eq!(terminal.failed_pair_count, 1);
+        assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Failed);
+        assert!(terminal.pairs[0].proposal.is_none());
+        assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Completed);
+        assert!(terminal.pairs[1].proposal.is_some());
+
+        std::fs::remove_file(valid_source).unwrap();
+        std::fs::remove_file(valid_target).unwrap();
+    }
+
+    #[test]
+    fn audio_alignment_batch_cancel_waits_for_worker_and_preserves_completed_pairs() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-cancel-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+        complete_audio_alignment_batch_pair(
+            &job_id,
+            0,
+            Some(test_audio_alignment_batch_proposal(
+                "completed-before-cancel",
+            )),
+            None,
+        )
+        .unwrap();
+
+        let requested = cancel_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(requested.status, AudioAlignmentJobStatus::Queued);
+        assert!(requested.message.contains("正在取消"));
+        assert!(cancel_flag.load(Ordering::Acquire));
+
+        run_audio_alignment_batch_job(job_id.clone(), cancel_flag, plan);
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Cancelled);
+        assert_eq!(terminal.processed_pair_count, 1);
+        assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Completed);
+        assert!(terminal.pairs[0].proposal.is_some());
+        assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Cancelled);
+        assert!(terminal.pairs[1].proposal.is_none());
+    }
+
+    #[test]
+    fn audio_alignment_batch_finalize_honors_cancel_accepted_after_stale_worker_check() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+            "source-1", "target-1",
+        )])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-finalize-race-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+        complete_audio_alignment_batch_pair(
+            &job_id,
+            0,
+            Some(test_audio_alignment_batch_proposal("completed-before-race")),
+            None,
+        )
+        .unwrap();
+
+        let stale_worker_read = cancel_flag.load(Ordering::Acquire);
+        assert!(!stale_worker_read);
+        let accepted = cancel_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert!(accepted.message.contains("正在取消"));
+        finalize_audio_alignment_batch_job(&job_id).unwrap();
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Cancelled);
+        assert!(terminal.pairs[0].proposal.is_some());
+    }
+
+    #[test]
+    fn audio_alignment_batch_retains_successful_pairs_when_other_pairs_fail() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let failed_job_id = format!("test-audio-batch-failed-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&failed_job_id, &plan, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        complete_audio_alignment_batch_pair(
+            &failed_job_id,
+            0,
+            Some(test_audio_alignment_batch_proposal("first")),
+            None,
+        )
+        .unwrap();
+        complete_audio_alignment_batch_pair(
+            &failed_job_id,
+            1,
+            None,
+            Some("pair failed".to_string()),
+        )
+        .unwrap();
+        finalize_audio_alignment_batch_job(&failed_job_id).unwrap();
+        let failed = get_audio_alignment_batch_job(failed_job_id).unwrap();
+        assert_eq!(failed.status, AudioAlignmentJobStatus::Completed);
+        assert_eq!(failed.failed_pair_count, 1);
+        assert!(failed.pairs[0].proposal.is_some());
+        assert!(failed.pairs[1].proposal.is_none());
+        assert_eq!(failed.pairs[1].status, AudioAlignmentJobStatus::Failed);
+
+        let success_job_id = format!("test-audio-batch-success-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&success_job_id, &plan, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        for index in 0..2 {
+            complete_audio_alignment_batch_pair(
+                &success_job_id,
+                index,
+                Some(test_audio_alignment_batch_proposal(&format!(
+                    "pair-{index}"
+                ))),
+                None,
+            )
+            .unwrap();
+        }
+        finalize_audio_alignment_batch_job(&success_job_id).unwrap();
+        let success = get_audio_alignment_batch_job(success_job_id).unwrap();
+        assert_eq!(success.status, AudioAlignmentJobStatus::Completed);
+        assert!(success.pairs.iter().all(|pair| pair.proposal.is_some()));
+        let json = serde_json::to_string(&success).unwrap();
+        assert!(json.contains("\"schemaVersion\":1"));
+        assert!(json.contains("\"totalPairCount\":2"));
+        assert!(!json.contains("source-1.mkv"));
+        assert!(!json.contains("target-1.mkv"));
+    }
+
+    #[test]
+    fn audio_alignment_batch_pair_completion_requires_exactly_one_outcome() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+            "source-1", "target-1",
+        )])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-outcome-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&job_id, &plan, Arc::new(AtomicBool::new(false))).unwrap();
+
+        assert!(complete_audio_alignment_batch_pair(&job_id, 0, None, None).is_err());
+        assert!(complete_audio_alignment_batch_pair(
+            &job_id,
+            0,
+            Some(test_audio_alignment_batch_proposal("invalid")),
+            Some("invalid".to_string()),
+        )
+        .is_err());
+        let unchanged = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(unchanged.pairs[0].status, AudioAlignmentJobStatus::Queued);
+    }
+
+    #[test]
+    fn audio_alignment_batch_cleanup_failure_is_globally_terminal_but_keeps_prior_results() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-cleanup-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&job_id, &plan, Arc::new(AtomicBool::new(false))).unwrap();
+        complete_audio_alignment_batch_pair(
+            &job_id,
+            0,
+            Some(test_audio_alignment_batch_proposal(
+                "completed-before-cleanup",
+            )),
+            None,
+        )
+        .unwrap();
+        update_audio_alignment_batch_pair_progress(&job_id, 1, 0.5, "running").unwrap();
+
+        fail_audio_alignment_batch_worker(&job_id, 1).unwrap();
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Failed);
+        assert!(terminal.error.is_some());
+        assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Completed);
+        assert!(terminal.pairs[0].proposal.is_some());
+        assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Failed);
+        assert!(terminal.pairs[1].proposal.is_none());
+    }
+
+    #[test]
+    fn audio_alignment_batch_terminal_retention_is_bounded_without_evicting_active_jobs() {
+        let mut jobs = HashMap::new();
+        for index in 0..(MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS + 3) {
+            let job_id = format!("terminal-{index:03}");
+            jobs.insert(
+                job_id.clone(),
+                test_audio_alignment_batch_job_entry(
+                    &job_id,
+                    AudioAlignmentJobStatus::Completed,
+                    Some(index as u64 + 1),
+                ),
+            );
+        }
+        jobs.insert(
+            "queued-active".to_string(),
+            test_audio_alignment_batch_job_entry(
+                "queued-active",
+                AudioAlignmentJobStatus::Queued,
+                None,
+            ),
+        );
+        jobs.insert(
+            "running-active".to_string(),
+            test_audio_alignment_batch_job_entry(
+                "running-active",
+                AudioAlignmentJobStatus::Running,
+                None,
+            ),
+        );
+        let protected = format!(
+            "terminal-{:03}",
+            MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS + 2
+        );
+
+        prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(&protected));
+
+        let retained_terminal_count = jobs
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.snapshot.status,
+                    AudioAlignmentJobStatus::Completed
+                        | AudioAlignmentJobStatus::Failed
+                        | AudioAlignmentJobStatus::Cancelled
+                )
+            })
+            .count();
+        assert_eq!(
+            retained_terminal_count,
+            MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS
+        );
+        assert!(jobs.contains_key("queued-active"));
+        assert!(jobs.contains_key("running-active"));
+        assert!(jobs.contains_key(&protected));
+        assert!(!jobs.contains_key("terminal-000"));
+        assert!(!jobs.contains_key("terminal-001"));
+        assert!(!jobs.contains_key("terminal-002"));
+    }
+
+    fn test_audio_alignment_batch_request(
+        pairs: Option<Vec<(&str, &str)>>,
+    ) -> AudioAlignmentBatchRequest {
+        AudioAlignmentBatchRequest {
+            schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+            sources: vec![
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "source-1".to_string(),
+                    path: "source-1.mkv".to_string(),
+                    audio_stream_index: Some(1),
+                    video_stream_index: Some(3),
+                },
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "source-2".to_string(),
+                    path: "source-2.mkv".to_string(),
+                    audio_stream_index: Some(2),
+                    video_stream_index: Some(4),
+                },
+            ],
+            targets: vec![
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "target-1".to_string(),
+                    path: "target-1.mkv".to_string(),
+                    audio_stream_index: Some(11),
+                    video_stream_index: Some(13),
+                },
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "target-2".to_string(),
+                    path: "target-2.mkv".to_string(),
+                    audio_stream_index: Some(12),
+                    video_stream_index: Some(14),
+                },
+            ],
+            pairs: pairs.map(|pairs| {
+                pairs
+                    .into_iter()
+                    .map(
+                        |(source_media_id, target_media_id)| AudioAlignmentBatchPairRequest {
+                            source_media_id: source_media_id.to_string(),
+                            target_media_id: target_media_id.to_string(),
+                        },
+                    )
+                    .collect()
+            }),
+            ffmpeg_path: None,
+            ffprobe_path: None,
+            sample_rate: None,
+            window_ms: None,
+            match_threshold: None,
+            min_gap_ms: None,
+            max_cells: Some(DEFAULT_MAX_CELLS),
+            enable_visual_evidence: Some(false),
+            visual_sample_interval_ms: None,
+            localization_mode: Some(true),
+        }
+    }
+
+    fn test_audio_alignment_batch_proposal(label: &str) -> AudioAlignmentProposal {
+        AudioAlignmentProposal {
+            anchors: Vec::new(),
+            cut_candidates: Vec::new(),
+            confidence: 0.0,
+            diagnostics: vec![label.to_string()],
+            evidence: None,
+            match_range: None,
+            time_map: None,
+        }
+    }
+
+    fn test_audio_alignment_batch_job_entry(
+        job_id: &str,
+        status: AudioAlignmentJobStatus,
+        terminal_sequence: Option<u64>,
+    ) -> AudioAlignmentBatchJobEntry {
+        AudioAlignmentBatchJobEntry {
+            snapshot: AudioAlignmentBatchJobSnapshot {
+                schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+                job_id: job_id.to_string(),
+                status,
+                progress: 0.0,
+                message: String::new(),
+                total_pair_count: 0,
+                processed_pair_count: 0,
+                failed_pair_count: 0,
+                current_pair_ordinal: None,
+                pairs: Vec::new(),
+                error: None,
+                updated_at_ms: 0,
+            },
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            terminal_sequence,
+        }
     }
 
     #[test]

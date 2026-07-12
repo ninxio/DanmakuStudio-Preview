@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -16,6 +16,10 @@ const LANDMARK_DELTA_QUANTUM_MS: i64 = 50;
 const LANDMARK_DELTA_MASK: u64 = 0xff;
 const MAX_MODEL_SEEDS: usize = 768;
 const MAX_OBSERVATIONS: usize = 40_000;
+const MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY: usize = 16_384;
+const MAX_STREAMING_RETAINED_LANDMARKS: usize = 262_144;
+const MAX_STREAMING_WINDOW_SAMPLES: usize = 65_536;
+const MAX_STREAMING_PENDING_ANCHOR_FRAMES: usize = 4_096;
 const COST_INFINITY: i64 = i64::MAX / 16;
 const STATE_MATCHED: u8 = 0;
 const STATE_SOURCE_ONLY: u8 = 1;
@@ -82,6 +86,417 @@ pub struct SpectralLandmark {
 struct SpectralPeak {
     bin: usize,
     magnitude: f64,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Pure streaming foundation; production FFmpeg wiring is a later slice.
+struct StreamingSpectralFrame {
+    frame_index: usize,
+    spectrum: Vec<f64>,
+    active: bool,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Pure streaming foundation; production FFmpeg wiring is a later slice.
+struct StreamingAnchorPeak {
+    bin: usize,
+    magnitude: f64,
+    emitted: usize,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Pure streaming foundation; production FFmpeg wiring is a later slice.
+struct StreamingAnchorFrame {
+    time_ms: i64,
+    peaks: Vec<StreamingAnchorPeak>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Owned by the not-yet-wired MediaCoarseIndex foundation.
+struct CoarseFamilySample {
+    seen: u64,
+    retained: Vec<RankedLandmark>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Owned by the not-yet-wired MediaCoarseIndex foundation.
+struct RankedLandmark {
+    priority: u64,
+    ordinal: u64,
+    landmark: SpectralLandmark,
+}
+
+/// `MediaCoarseIndex` 的确定性、有界 common-family 抑制结果。
+///
+/// 当 `capped_family_count == 0` 时，结果与 one-shot extractor 逐项等价。一个 family
+/// 超过 `max_hash_occurrences` 后，流式索引保留确定性 priority 最小的 M 个真实候选；
+/// 因而每个超限 family 的输出数仍严格等于 M、不会合成候选，且与 one-shot 均匀抽样
+/// 的对称差严格不超过 `2 * M`。该退化规范换取与媒体时长无关的常量内存。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Public contract for the later production streaming adapter.
+pub struct MediaCoarseIndexResult {
+    pub landmarks: Vec<SpectralLandmark>,
+    pub observed_landmark_count: u64,
+    pub retained_landmark_count: usize,
+    pub capped_family_count: usize,
+    pub exact_one_shot_equivalent: bool,
+    pub max_symmetric_difference_per_capped_family: usize,
+}
+
+/// 按 landmark family 建立的有界粗索引。合法 landmark 只有 48×48 个 family，
+/// 每个 family 最多驻留 `max_hash_occurrences` 个候选。
+#[derive(Debug)]
+#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
+pub struct MediaCoarseIndex {
+    max_hash_occurrences: usize,
+    observed_landmark_count: u64,
+    retained_landmark_count: usize,
+    families: HashMap<u64, CoarseFamilySample>,
+}
+
+#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
+impl MediaCoarseIndex {
+    pub fn new(max_hash_occurrences: usize) -> Result<Self, String> {
+        if !(1..=MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY).contains(&max_hash_occurrences) {
+            return Err(format!(
+                "MediaCoarseIndex 的 family 保留上限必须位于 1–{MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY}。"
+            ));
+        }
+        Ok(Self {
+            max_hash_occurrences,
+            observed_landmark_count: 0,
+            retained_landmark_count: 0,
+            families: HashMap::new(),
+        })
+    }
+
+    pub fn push(&mut self, landmark: SpectralLandmark) -> Result<(), String> {
+        validate_streaming_landmark_hash(landmark.hash)?;
+        self.observed_landmark_count = self
+            .observed_landmark_count
+            .checked_add(1)
+            .ok_or_else(|| "MediaCoarseIndex landmark 计数溢出。".to_string())?;
+        let family = landmark_family(landmark.hash);
+        if !self.families.contains_key(&family) {
+            self.families
+                .try_reserve(1)
+                .map_err(|error| format!("MediaCoarseIndex 无法为新 family 保留内存：{error}"))?;
+            self.families.insert(
+                family,
+                CoarseFamilySample {
+                    seen: 0,
+                    retained: Vec::new(),
+                },
+            );
+        }
+        let sample = self
+            .families
+            .get_mut(&family)
+            .ok_or_else(|| "MediaCoarseIndex family 创建后丢失。".to_string())?;
+        let ordinal = sample.seen;
+        sample.seen = sample
+            .seen
+            .checked_add(1)
+            .ok_or_else(|| "MediaCoarseIndex family 计数溢出。".to_string())?;
+        let ranked = RankedLandmark {
+            priority: streaming_landmark_priority(family, ordinal),
+            ordinal,
+            landmark,
+        };
+        if sample.retained.len() < self.max_hash_occurrences {
+            if self.retained_landmark_count >= MAX_STREAMING_RETAINED_LANDMARKS {
+                return Err(format!(
+                    "MediaCoarseIndex 驻留 landmark 超过全局上限 {MAX_STREAMING_RETAINED_LANDMARKS}。"
+                ));
+            }
+            sample
+                .retained
+                .try_reserve(1)
+                .map_err(|error| format!("MediaCoarseIndex 无法为 landmark 保留内存：{error}"))?;
+            sample.retained.push(ranked);
+            self.retained_landmark_count = self
+                .retained_landmark_count
+                .checked_add(1)
+                .ok_or_else(|| "MediaCoarseIndex 驻留 landmark 计数溢出。".to_string())?;
+            return Ok(());
+        }
+        let replace = sample
+            .retained
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, item)| (item.priority, item.ordinal))
+            .and_then(|(index, item)| {
+                ((ranked.priority, ranked.ordinal) < (item.priority, item.ordinal)).then_some(index)
+            });
+        if let Some(index) = replace {
+            sample.retained[index] = ranked;
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<MediaCoarseIndexResult, String> {
+        let capped_family_count = self
+            .families
+            .values()
+            .filter(|sample| sample.seen > self.max_hash_occurrences as u64)
+            .count();
+        let mut landmarks = Vec::new();
+        landmarks
+            .try_reserve_exact(self.retained_landmark_count)
+            .map_err(|error| format!("MediaCoarseIndex 无法为结果保留内存：{error}"))?;
+        for sample in self.families.into_values() {
+            landmarks.extend(sample.retained.into_iter().map(|item| item.landmark));
+        }
+        sort_landmarks_canonically(&mut landmarks);
+        Ok(MediaCoarseIndexResult {
+            retained_landmark_count: landmarks.len(),
+            landmarks,
+            observed_landmark_count: self.observed_landmark_count,
+            capped_family_count,
+            exact_one_shot_equivalent: capped_family_count == 0,
+            max_symmetric_difference_per_capped_family: if capped_family_count == 0 {
+                0
+            } else {
+                self.max_hash_occurrences.saturating_mul(2)
+            },
+        })
+    }
+
+    fn retained_landmark_count(&self) -> usize {
+        self.retained_landmark_count
+    }
+}
+
+/// 流式 extractor 当前驻留状态，供长媒体调用方和测试验证内存边界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Public contract for the later production streaming adapter.
+pub struct StreamingLandmarkStateUsage {
+    pub stft_tail_samples: usize,
+    pub temporal_spectrum_count: usize,
+    pub pending_anchor_frames: usize,
+    pub pending_anchor_peaks: usize,
+    pub coarse_family_count: usize,
+    pub retained_coarse_landmarks: usize,
+}
+
+/// 真正增量的 landmark extractor：PCM chunk 不需要与 STFT window/hop 对齐。
+///
+/// 状态只保留不足一个 window 的 PCM tail、temporal local maximum 所需的前一帧谱、
+/// `max_pair_delta_ms` 窗口内尚未完成 fanout 的 anchors，以及有界 `MediaCoarseIndex`。
+#[derive(Debug)]
+#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
+pub struct StreamingLandmarkExtractor {
+    config: LandmarkConfig,
+    window_samples: usize,
+    hop_samples: usize,
+    stft_tail: Vec<i16>,
+    next_frame_index: usize,
+    previous_spectrum: Option<Vec<f64>>,
+    pending_frame: Option<StreamingSpectralFrame>,
+    pending_anchors: VecDeque<StreamingAnchorFrame>,
+    coarse_index: MediaCoarseIndex,
+}
+
+#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
+impl StreamingLandmarkExtractor {
+    pub fn new(config: LandmarkConfig) -> Result<Self, String> {
+        validate_landmark_config(&config)?;
+        let window_samples = milliseconds_to_samples(config.window_ms as i64, config.sample_rate)?;
+        let hop_samples = milliseconds_to_samples(config.hop_ms as i64, config.sample_rate)?;
+        if window_samples < 8 || hop_samples == 0 || window_samples < hop_samples {
+            return Err("StreamingLandmarkExtractor 的 STFT 网格无效。".to_string());
+        }
+        if window_samples > MAX_STREAMING_WINDOW_SAMPLES {
+            return Err(format!(
+                "StreamingLandmarkExtractor 的 STFT window 超过 {MAX_STREAMING_WINDOW_SAMPLES} 个样本的驻留上限。"
+            ));
+        }
+        let max_pending_anchor_frames = usize::try_from(config.max_pair_delta_ms)
+            .map_err(|_| "StreamingLandmarkExtractor 配对窗口无法表示。".to_string())?
+            .div_ceil(config.hop_ms as usize)
+            .checked_add(2)
+            .ok_or_else(|| "StreamingLandmarkExtractor pending anchor 上限溢出。".to_string())?;
+        if max_pending_anchor_frames > MAX_STREAMING_PENDING_ANCHOR_FRAMES {
+            return Err(format!(
+                "StreamingLandmarkExtractor pending anchor frame 上限超过 {MAX_STREAMING_PENDING_ANCHOR_FRAMES}。"
+            ));
+        }
+        let coarse_index = MediaCoarseIndex::new(config.max_hash_occurrences)?;
+        let mut stft_tail = Vec::new();
+        stft_tail
+            .try_reserve_exact(window_samples)
+            .map_err(|error| {
+                format!("StreamingLandmarkExtractor 无法为 STFT tail 保留内存：{error}")
+            })?;
+        Ok(Self {
+            config,
+            window_samples,
+            hop_samples,
+            stft_tail,
+            next_frame_index: 0,
+            previous_spectrum: None,
+            pending_frame: None,
+            pending_anchors: VecDeque::new(),
+            coarse_index,
+        })
+    }
+
+    pub fn push_pcm(&mut self, pcm: &[i16]) -> Result<(), String> {
+        self.push_pcm_with_cancel(pcm, None)
+    }
+
+    pub fn push_pcm_with_cancel(
+        &mut self,
+        pcm: &[i16],
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        check_algorithm_cancelled(cancel_flag)?;
+        let mut offset = 0usize;
+        let mut processed_frames = 0usize;
+        while offset < pcm.len() {
+            let needed = self.window_samples.saturating_sub(self.stft_tail.len());
+            let take = needed.min(pcm.len() - offset);
+            self.stft_tail
+                .extend_from_slice(&pcm[offset..offset + take]);
+            offset += take;
+            if self.stft_tail.len() == self.window_samples {
+                self.process_complete_stft_frame()?;
+                self.stft_tail.drain(..self.hop_samples);
+                processed_frames += 1;
+                if processed_frames.is_multiple_of(64) {
+                    check_algorithm_cancelled(cancel_flag)?;
+                }
+            }
+        }
+        check_algorithm_cancelled(cancel_flag)
+    }
+
+    pub fn finish(self) -> Result<MediaCoarseIndexResult, String> {
+        self.finish_with_cancel(None)
+    }
+
+    pub fn finish_with_cancel(
+        mut self,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<MediaCoarseIndexResult, String> {
+        check_algorithm_cancelled(cancel_flag)?;
+        if let Some(pending) = self.pending_frame.take() {
+            let peaks = extract_spectral_peaks(
+                &pending.spectrum,
+                pending.active,
+                self.previous_spectrum.as_deref(),
+                None,
+                &self.config,
+            );
+            self.consume_finalized_peaks(pending.frame_index, peaks)?;
+        }
+        check_algorithm_cancelled(cancel_flag)?;
+        self.coarse_index.finish()
+    }
+
+    pub fn state_usage(&self) -> StreamingLandmarkStateUsage {
+        StreamingLandmarkStateUsage {
+            stft_tail_samples: self.stft_tail.len(),
+            temporal_spectrum_count: usize::from(self.previous_spectrum.is_some())
+                + usize::from(self.pending_frame.is_some()),
+            pending_anchor_frames: self.pending_anchors.len(),
+            pending_anchor_peaks: self
+                .pending_anchors
+                .iter()
+                .map(|frame| frame.peaks.len())
+                .sum(),
+            coarse_family_count: self.coarse_index.families.len(),
+            retained_coarse_landmarks: self.coarse_index.retained_landmark_count(),
+        }
+    }
+
+    fn process_complete_stft_frame(&mut self) -> Result<(), String> {
+        let frame_index = self.next_frame_index;
+        self.next_frame_index = self
+            .next_frame_index
+            .checked_add(1)
+            .ok_or_else(|| "StreamingLandmarkExtractor frame 计数溢出。".to_string())?;
+        let rms = normalized_rms(&self.stft_tail);
+        let current = StreamingSpectralFrame {
+            frame_index,
+            spectrum: calculate_spectrum(&self.stft_tail, self.config.sample_rate),
+            active: rms >= self.config.silence_rms,
+        };
+        if let Some(pending) = self.pending_frame.take() {
+            let peaks = extract_spectral_peaks(
+                &pending.spectrum,
+                pending.active,
+                self.previous_spectrum.as_deref(),
+                Some(&current.spectrum),
+                &self.config,
+            );
+            self.consume_finalized_peaks(pending.frame_index, peaks)?;
+            self.previous_spectrum = Some(pending.spectrum);
+        }
+        self.pending_frame = Some(current);
+        Ok(())
+    }
+
+    fn consume_finalized_peaks(
+        &mut self,
+        frame_index: usize,
+        peaks: Vec<SpectralPeak>,
+    ) -> Result<(), String> {
+        let target_time_ms = landmark_frame_time_ms(
+            frame_index,
+            self.hop_samples,
+            self.window_samples,
+            &self.config,
+        )?;
+        for anchor_frame in &mut self.pending_anchors {
+            let delta_ms = target_time_ms
+                .checked_sub(anchor_frame.time_ms)
+                .ok_or_else(|| "StreamingLandmarkExtractor 时间差溢出。".to_string())?;
+            if delta_ms < self.config.min_pair_delta_ms || delta_ms > self.config.max_pair_delta_ms
+            {
+                continue;
+            }
+            for anchor in &mut anchor_frame.peaks {
+                if anchor.emitted >= self.config.fanout {
+                    continue;
+                }
+                for target in &peaks {
+                    self.coarse_index.push(SpectralLandmark {
+                        hash: create_landmark_hash(anchor.bin, target.bin, delta_ms),
+                        time_ms: anchor_frame.time_ms,
+                        strength_milli: peak_strength_milli(anchor.magnitude, target.magnitude),
+                    })?;
+                    anchor.emitted += 1;
+                    if anchor.emitted >= self.config.fanout {
+                        break;
+                    }
+                }
+            }
+        }
+        while self.pending_anchors.front().is_some_and(|anchor_frame| {
+            target_time_ms.saturating_sub(anchor_frame.time_ms) >= self.config.max_pair_delta_ms
+                || anchor_frame
+                    .peaks
+                    .iter()
+                    .all(|peak| peak.emitted >= self.config.fanout)
+        }) {
+            self.pending_anchors.pop_front();
+        }
+        if !peaks.is_empty() {
+            self.pending_anchors.push_back(StreamingAnchorFrame {
+                time_ms: target_time_ms,
+                peaks: peaks
+                    .into_iter()
+                    .map(|peak| StreamingAnchorPeak {
+                        bin: peak.bin,
+                        magnitude: peak.magnitude,
+                        emitted: 0,
+                    })
+                    .collect(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -183,50 +598,27 @@ fn extract_landmarks_from_spectral_analysis(
         if frame_index % 64 == 0 {
             check_algorithm_cancelled(cancel_flag)?;
         }
-        if !analysis.active_frames[frame_index] {
-            continue;
-        }
-        let spectrum = &analysis.spectra[frame_index];
-        let frame_mean = spectrum.iter().sum::<f64>() / spectrum.len().max(1) as f64;
-        let mut peaks = Vec::new();
-        for bin in 1..SPECTRAL_BIN_COUNT - 1 {
-            let magnitude = spectrum[bin];
-            let previous_time = frame_index
+        *frame_peaks = extract_spectral_peaks(
+            &analysis.spectra[frame_index],
+            analysis.active_frames[frame_index],
+            frame_index
                 .checked_sub(1)
-                .map(|index| analysis.spectra[index][bin])
-                .unwrap_or(0.0);
-            let next_time = analysis
-                .spectra
-                .get(frame_index + 1)
-                .map(|values| values[bin])
-                .unwrap_or(0.0);
-            if magnitude <= spectrum[bin - 1]
-                || magnitude < spectrum[bin + 1]
-                || magnitude < previous_time
-                || magnitude <= next_time
-                || magnitude < frame_mean * config.min_peak_ratio
-            {
-                continue;
-            }
-            peaks.push(SpectralPeak { bin, magnitude });
-        }
-        peaks.sort_by(|left, right| {
-            right
-                .magnitude
-                .total_cmp(&left.magnitude)
-                .then_with(|| left.bin.cmp(&right.bin))
-        });
-        peaks.truncate(config.max_peaks_per_frame);
-        *frame_peaks = peaks;
+                .map(|index| analysis.spectra[index].as_slice()),
+            analysis.spectra.get(frame_index + 1).map(Vec::as_slice),
+            config,
+        );
     }
 
-    let frame_time_ms = |frame_index: usize| -> i64 {
-        config.presentation_offset_ms
-            + samples_to_milliseconds(
-                frame_index * analysis.hop_samples + analysis.window_samples / 2,
-                config.sample_rate,
+    let frame_times = (0..frame_count)
+        .map(|frame_index| {
+            landmark_frame_time_ms(
+                frame_index,
+                analysis.hop_samples,
+                analysis.window_samples,
+                config,
             )
-    };
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut landmarks = Vec::new();
     for anchor_frame in 0..frame_count {
         if anchor_frame % 64 == 0 {
@@ -237,7 +629,7 @@ fn extract_landmarks_from_spectral_analysis(
             for (target_frame, target_peaks) in
                 peaks_by_frame.iter().enumerate().skip(anchor_frame + 1)
             {
-                let delta_ms = frame_time_ms(target_frame) - frame_time_ms(anchor_frame);
+                let delta_ms = frame_times[target_frame] - frame_times[anchor_frame];
                 if delta_ms < config.min_pair_delta_ms {
                     continue;
                 }
@@ -247,7 +639,7 @@ fn extract_landmarks_from_spectral_analysis(
                 for target in target_peaks {
                     landmarks.push(SpectralLandmark {
                         hash: create_landmark_hash(anchor.bin, target.bin, delta_ms),
-                        time_ms: frame_time_ms(anchor_frame),
+                        time_ms: frame_times[anchor_frame],
                         strength_milli: peak_strength_milli(anchor.magnitude, target.magnitude),
                     });
                     emitted += 1;
@@ -264,12 +656,7 @@ fn extract_landmarks_from_spectral_analysis(
 
     suppress_common_landmarks(&mut landmarks, config.max_hash_occurrences);
     check_algorithm_cancelled(cancel_flag)?;
-    landmarks.sort_by(|left, right| {
-        left.time_ms
-            .cmp(&right.time_ms)
-            .then_with(|| left.hash.cmp(&right.hash))
-            .then_with(|| right.strength_milli.cmp(&left.strength_milli))
-    });
+    sort_landmarks_canonically(&mut landmarks);
     Ok(landmarks)
 }
 
@@ -1246,6 +1633,89 @@ fn normalized_rms(frame: &[i16]) -> f64 {
     (square_sum / frame.len().max(1) as f64).sqrt()
 }
 
+fn extract_spectral_peaks(
+    spectrum: &[f64],
+    active: bool,
+    previous_spectrum: Option<&[f64]>,
+    next_spectrum: Option<&[f64]>,
+    config: &LandmarkConfig,
+) -> Vec<SpectralPeak> {
+    if !active {
+        return Vec::new();
+    }
+    let frame_mean = spectrum.iter().sum::<f64>() / spectrum.len().max(1) as f64;
+    let mut peaks = Vec::new();
+    for bin in 1..SPECTRAL_BIN_COUNT - 1 {
+        let magnitude = spectrum[bin];
+        let previous_time = previous_spectrum.map(|values| values[bin]).unwrap_or(0.0);
+        let next_time = next_spectrum.map(|values| values[bin]).unwrap_or(0.0);
+        if magnitude <= spectrum[bin - 1]
+            || magnitude < spectrum[bin + 1]
+            || magnitude < previous_time
+            || magnitude <= next_time
+            || magnitude < frame_mean * config.min_peak_ratio
+        {
+            continue;
+        }
+        peaks.push(SpectralPeak { bin, magnitude });
+    }
+    peaks.sort_by(|left, right| {
+        right
+            .magnitude
+            .total_cmp(&left.magnitude)
+            .then_with(|| left.bin.cmp(&right.bin))
+    });
+    peaks.truncate(config.max_peaks_per_frame);
+    peaks
+}
+
+fn landmark_frame_time_ms(
+    frame_index: usize,
+    hop_samples: usize,
+    window_samples: usize,
+    config: &LandmarkConfig,
+) -> Result<i64, String> {
+    let center_sample = frame_index
+        .checked_mul(hop_samples)
+        .and_then(|start| start.checked_add(window_samples / 2))
+        .ok_or_else(|| "landmark frame 样本位置溢出。".to_string())?;
+    config
+        .presentation_offset_ms
+        .checked_add(samples_to_milliseconds(center_sample, config.sample_rate))
+        .ok_or_else(|| "landmark presentation 时间溢出。".to_string())
+}
+
+#[allow(dead_code)] // Used by the pure streaming foundation before production wiring.
+fn validate_streaming_landmark_hash(hash: u64) -> Result<(), String> {
+    let anchor_bin = hash >> 16;
+    let target_bin = (hash >> 8) & 0xff;
+    if anchor_bin >= SPECTRAL_BIN_COUNT as u64 || target_bin >= SPECTRAL_BIN_COUNT as u64 {
+        return Err("MediaCoarseIndex 收到超出声谱 bin 范围的 landmark hash。".to_string());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Used by the pure streaming foundation before production wiring.
+fn streaming_landmark_priority(family: u64, ordinal: u64) -> u64 {
+    // Sampling must depend only on the family-local ordinal. Absolute PTS, strength and the
+    // delta bucket can all differ between two otherwise corresponding encodes; mixing any of
+    // them here would make source and target retain unrelated repetitive landmarks.
+    let mut value = family ^ ordinal.rotate_left(17);
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn sort_landmarks_canonically(landmarks: &mut [SpectralLandmark]) {
+    landmarks.sort_unstable_by(|left, right| {
+        left.time_ms
+            .cmp(&right.time_ms)
+            .then_with(|| left.hash.cmp(&right.hash))
+            .then_with(|| right.strength_milli.cmp(&left.strength_milli))
+    });
+}
+
 fn create_landmark_hash(anchor_bin: usize, target_bin: usize, delta_ms: i64) -> u64 {
     let delta_bucket = ((delta_ms + LANDMARK_DELTA_QUANTUM_MS / 2) / LANDMARK_DELTA_QUANTUM_MS)
         .clamp(0, LANDMARK_DELTA_MASK as i64) as u64;
@@ -1999,6 +2469,278 @@ mod tests {
     }
 
     #[test]
+    fn streaming_landmarks_match_one_shot_across_stft_and_temporal_seams() {
+        let config = LandmarkConfig {
+            sample_rate: 8_000,
+            presentation_offset_ms: 913,
+            window_ms: 40,
+            hop_ms: 25,
+            max_hash_occurrences: 10_000,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(
+            config.sample_rate,
+            &[310, 470, 690, 930, 1_270, 1_610, 430, 770],
+        );
+        let expected = extract_landmarks(&pcm, &config).unwrap();
+        assert!(!expected.is_empty());
+
+        let seam_chunks = [1, 318, 1, 1, 199, 1, 200, 319, 7, 401, 23, 809];
+        let actual = stream_landmarks_with_chunks(&pcm, &config, &seam_chunks);
+
+        assert!(actual.exact_one_shot_equivalent);
+        assert_eq!(actual.capped_family_count, 0);
+        assert_eq!(actual.landmarks, expected);
+    }
+
+    #[test]
+    fn streaming_landmarks_are_chunk_invariant_for_random_partitions() {
+        let config = LandmarkConfig {
+            sample_rate: 16_000,
+            presentation_offset_ms: -275,
+            window_ms: 50,
+            hop_ms: 50,
+            max_hash_occurrences: 10_000,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(
+            config.sample_rate,
+            &[280, 390, 540, 720, 980, 1_310, 1_760, 2_230],
+        );
+        let expected = extract_landmarks(&pcm, &config).unwrap();
+        for seed in 1..=12u64 {
+            let chunks = pseudo_random_chunk_sizes(seed, pcm.len());
+            let actual = stream_landmarks_with_chunks(&pcm, &config, &chunks);
+            assert!(actual.exact_one_shot_equivalent, "seed={seed}");
+            assert_eq!(actual.landmarks, expected, "seed={seed}");
+        }
+    }
+
+    #[test]
+    fn streaming_landmark_state_stays_within_declared_bounds() {
+        let config = LandmarkConfig {
+            sample_rate: 8_000,
+            window_ms: 50,
+            hop_ms: 20,
+            max_pair_delta_ms: 600,
+            max_hash_occurrences: 7,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(
+            config.sample_rate,
+            &[300, 410, 560, 730, 950, 1_220, 1_570, 1_990, 2_430, 2_810],
+        );
+        let window_samples =
+            milliseconds_to_samples(config.window_ms as i64, config.sample_rate).unwrap();
+        let max_pending_frames =
+            (config.max_pair_delta_ms as usize).div_ceil(config.hop_ms as usize) + 2;
+        let mut extractor = StreamingLandmarkExtractor::new(config.clone()).unwrap();
+        for chunk in pcm.chunks(37) {
+            extractor.push_pcm(chunk).unwrap();
+            let usage = extractor.state_usage();
+            assert!(usage.stft_tail_samples < window_samples);
+            assert!(usage.temporal_spectrum_count <= 2);
+            assert!(usage.pending_anchor_frames <= max_pending_frames);
+            assert!(
+                usage.pending_anchor_peaks
+                    <= max_pending_frames.saturating_mul(config.max_peaks_per_frame)
+            );
+            assert!(usage.coarse_family_count <= SPECTRAL_BIN_COUNT * SPECTRAL_BIN_COUNT);
+            assert!(
+                usage.retained_coarse_landmarks
+                    <= SPECTRAL_BIN_COUNT * SPECTRAL_BIN_COUNT * config.max_hash_occurrences
+            );
+        }
+        let result = extractor.finish().unwrap();
+        assert_eq!(result.retained_landmark_count, result.landmarks.len());
+    }
+
+    #[test]
+    fn media_coarse_index_reports_strict_capped_family_error_contract() {
+        let mut index = MediaCoarseIndex::new(3).unwrap();
+        let mut candidates = Vec::new();
+        for ordinal in 0..11i64 {
+            let landmark = SpectralLandmark {
+                hash: create_landmark_hash(7, 13, 150),
+                time_ms: ordinal * 250,
+                strength_milli: 500 + ordinal as u32,
+            };
+            candidates.push(landmark.clone());
+            index.push(landmark).unwrap();
+        }
+        let result = index.finish().unwrap();
+
+        assert!(!result.exact_one_shot_equivalent);
+        assert_eq!(result.observed_landmark_count, 11);
+        assert_eq!(result.retained_landmark_count, 3);
+        assert_eq!(result.capped_family_count, 1);
+        assert_eq!(result.max_symmetric_difference_per_capped_family, 6);
+        assert!(result
+            .landmarks
+            .iter()
+            .all(|landmark| candidates.contains(landmark)));
+    }
+
+    #[test]
+    fn streaming_capped_sampling_is_chunk_invariant() {
+        let config = LandmarkConfig {
+            sample_rate: 8_000,
+            window_ms: 40,
+            hop_ms: 25,
+            max_hash_occurrences: 2,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(
+            config.sample_rate,
+            &[430, 430, 430, 430, 430, 430, 770, 770, 770, 770, 770, 770],
+        );
+        let single = stream_landmarks_with_chunks(&pcm, &config, &[pcm.len()]);
+        let random =
+            stream_landmarks_with_chunks(&pcm, &config, &pseudo_random_chunk_sizes(77, pcm.len()));
+
+        assert_eq!(single, random);
+        assert!(single
+            .landmarks
+            .iter()
+            .all(|landmark| validate_streaming_landmark_hash(landmark.hash).is_ok()));
+    }
+
+    #[test]
+    fn capped_sampling_retains_the_same_ordinals_across_pts_and_codec_perturbations() {
+        let mut source = MediaCoarseIndex::new(5).unwrap();
+        let mut target = MediaCoarseIndex::new(5).unwrap();
+        for ordinal in 0..64i64 {
+            source
+                .push(SpectralLandmark {
+                    hash: create_landmark_hash(7, 13, 150),
+                    time_ms: ordinal * 250,
+                    strength_milli: 500 + ordinal as u32,
+                })
+                .unwrap();
+            target
+                .push(SpectralLandmark {
+                    hash: create_landmark_hash(7, 13, 175),
+                    time_ms: ordinal * 250 + 12_345,
+                    strength_milli: 900 + (63 - ordinal) as u32,
+                })
+                .unwrap();
+        }
+
+        let source = source.finish().unwrap();
+        let target = target.finish().unwrap();
+        assert_eq!(source.capped_family_count, 1);
+        assert_eq!(target.capped_family_count, 1);
+        let retained_positions = |items: &[SpectralLandmark], offset_ms: i64| {
+            items
+                .iter()
+                .map(|item| item.time_ms - offset_ms)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            retained_positions(&source.landmarks, 0),
+            retained_positions(&target.landmarks, 12_345)
+        );
+    }
+
+    #[test]
+    fn media_coarse_index_rejects_unbounded_family_limits_without_allocating() {
+        let error = MediaCoarseIndex::new(usize::MAX).unwrap_err();
+        assert!(error.contains("family 保留上限"));
+
+        let config = LandmarkConfig {
+            max_hash_occurrences: usize::MAX,
+            ..LandmarkConfig::default()
+        };
+        assert!(StreamingLandmarkExtractor::new(config)
+            .unwrap_err()
+            .contains("family 保留上限"));
+    }
+
+    #[test]
+    fn streaming_landmark_constructor_rejects_unbounded_window_and_pending_state() {
+        let oversized_window = LandmarkConfig {
+            sample_rate: u32::MAX,
+            window_ms: 100,
+            hop_ms: 50,
+            ..LandmarkConfig::default()
+        };
+        assert!(StreamingLandmarkExtractor::new(oversized_window)
+            .unwrap_err()
+            .contains("STFT window"));
+
+        let oversized_pending_window = LandmarkConfig {
+            hop_ms: 20,
+            min_pair_delta_ms: 20,
+            max_pair_delta_ms: 100_000,
+            ..LandmarkConfig::default()
+        };
+        assert!(StreamingLandmarkExtractor::new(oversized_pending_window)
+            .unwrap_err()
+            .contains("pending anchor frame"));
+    }
+
+    #[test]
+    fn media_coarse_index_enforces_global_retained_landmark_budget() {
+        let mut index = MediaCoarseIndex::new(MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY).unwrap();
+        let complete_families =
+            MAX_STREAMING_RETAINED_LANDMARKS / MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY;
+        assert!(complete_families < SPECTRAL_BIN_COUNT);
+        for anchor_bin in 0..complete_families {
+            for ordinal in 0..MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY {
+                index
+                    .push(SpectralLandmark {
+                        hash: create_landmark_hash(anchor_bin, 3, 150),
+                        time_ms: ordinal as i64,
+                        strength_milli: 1_000,
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            index.retained_landmark_count(),
+            MAX_STREAMING_RETAINED_LANDMARKS
+        );
+        let error = index
+            .push(SpectralLandmark {
+                hash: create_landmark_hash(complete_families, 3, 150),
+                time_ms: 0,
+                strength_milli: 1_000,
+            })
+            .unwrap_err();
+        assert!(error.contains("全局上限"));
+        assert_eq!(
+            index.retained_landmark_count(),
+            MAX_STREAMING_RETAINED_LANDMARKS
+        );
+    }
+
+    #[test]
+    fn streaming_landmark_push_and_finish_observe_cancellation() {
+        let config = LandmarkConfig {
+            sample_rate: 8_000,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(config.sample_rate, &[310, 470, 690, 930]);
+        let cancelled = AtomicBool::new(true);
+        let mut push_extractor = StreamingLandmarkExtractor::new(config.clone()).unwrap();
+        assert_eq!(
+            push_extractor
+                .push_pcm_with_cancel(&pcm, Some(&cancelled))
+                .unwrap_err(),
+            ALIGNMENT_V2_CANCELLED
+        );
+
+        let mut finish_extractor = StreamingLandmarkExtractor::new(config).unwrap();
+        finish_extractor.push_pcm(&pcm).unwrap();
+        assert_eq!(
+            finish_extractor
+                .finish_with_cancel(Some(&cancelled))
+                .unwrap_err(),
+            ALIGNMENT_V2_CANCELLED
+        );
+    }
+
+    #[test]
     fn affine_matching_recovers_speed_drift_and_ignores_repeated_intro_decoy() {
         let mut source = Vec::new();
         let mut target = Vec::new();
@@ -2379,6 +3121,42 @@ mod tests {
             }
         }
         output
+    }
+
+    fn stream_landmarks_with_chunks(
+        pcm: &[i16],
+        config: &LandmarkConfig,
+        chunk_sizes: &[usize],
+    ) -> MediaCoarseIndexResult {
+        let mut extractor = StreamingLandmarkExtractor::new(config.clone()).unwrap();
+        let mut offset = 0usize;
+        let mut chunk_index = 0usize;
+        while offset < pcm.len() {
+            let requested = chunk_sizes
+                .get(chunk_index % chunk_sizes.len().max(1))
+                .copied()
+                .unwrap_or(pcm.len())
+                .max(1);
+            let end = offset.saturating_add(requested).min(pcm.len());
+            extractor.push_pcm(&pcm[offset..end]).unwrap();
+            offset = end;
+            chunk_index += 1;
+        }
+        extractor.finish().unwrap()
+    }
+
+    fn pseudo_random_chunk_sizes(mut state: u64, total_samples: usize) -> Vec<usize> {
+        let mut chunks = Vec::new();
+        let mut covered = 0usize;
+        while covered < total_samples {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let size = (state as usize % 1_531).saturating_add(1);
+            chunks.push(size);
+            covered = covered.saturating_add(size);
+        }
+        chunks
     }
 
     fn test_landmark(hash: u64, time_ms: i64) -> SpectralLandmark {

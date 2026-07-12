@@ -42,6 +42,35 @@ describe("项目级多媒体全局分配", () => {
     expect(result.selectedIds).toHaveLength(1);
   });
 
+  it("同一素材 pair 的 Top-K 区间即使不重叠也只能采用一个", () => {
+    const result = assignGlobalMediaMatches([
+      {
+        ...hypothesis("pair-top-1", "source", "target", 0, 60_000, 0, 60_000, 0.95),
+        alternativeGroupId: "source:target"
+      },
+      {
+        ...hypothesis(
+          "pair-top-2",
+          "source",
+          "target",
+          120_000,
+          180_000,
+          120_000,
+          180_000,
+          0.8
+        ),
+        alternativeGroupId: "source:target"
+      }
+    ]);
+
+    expect(result.selectedIds).toEqual(["pair-top-1"]);
+    expect(result.rejected).toContainEqual({
+      id: "pair-top-2",
+      reason: "samePairAlternative",
+      conflictsWith: ["pair-top-1"]
+    });
+  });
+
   it("重复内容和已阻断候选不会挤掉独特内容证据", () => {
     const result = assignGlobalMediaMatches([
       {

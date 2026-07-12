@@ -1,5 +1,7 @@
 export interface GlobalMatchHypothesis {
   id: string;
+  /** Top-K hypotheses produced for one logical media pair are mutually exclusive. */
+  alternativeGroupId?: string | null;
   sourceMediaId: string;
   targetMediaId: string;
   sourceStartMs: number;
@@ -25,6 +27,7 @@ export interface GlobalAssignmentOptions {
 
 export type GlobalAssignmentRejectionReason =
   | "blocked"
+  | "samePairAlternative"
   | "sourceOverlap"
   | "targetOverlap"
   | "notInBestCombination";
@@ -303,6 +306,13 @@ function hardConflict(
   if (left.id === right.id) {
     return true;
   }
+  if (
+    left.alternativeGroupId !== null &&
+    left.alternativeGroupId !== undefined &&
+    left.alternativeGroupId === right.alternativeGroupId
+  ) {
+    return true;
+  }
   const sourceConflict =
     left.sourceMediaId === right.sourceMediaId &&
     overlapDuration(
@@ -366,6 +376,19 @@ function createRejection(
     return { id: hypothesis.id, reason: "blocked", conflictsWith: [] };
   }
   const selectedHypotheses = all.filter((item) => selected.has(item.id));
+  const samePairAlternatives = selectedHypotheses.filter(
+    (item) =>
+      hypothesis.alternativeGroupId !== null &&
+      hypothesis.alternativeGroupId !== undefined &&
+      item.alternativeGroupId === hypothesis.alternativeGroupId
+  );
+  if (samePairAlternatives.length > 0) {
+    return {
+      id: hypothesis.id,
+      reason: "samePairAlternative",
+      conflictsWith: samePairAlternatives.map((item) => item.id).sort()
+    };
+  }
   const sourceConflicts = selectedHypotheses.filter(
     (item) =>
       item.sourceMediaId === hypothesis.sourceMediaId &&
@@ -417,6 +440,10 @@ function validateAndNormalizeHypothesis(
   return {
     ...hypothesis,
     id: hypothesis.id.trim(),
+    alternativeGroupId:
+      hypothesis.alternativeGroupId === null || hypothesis.alternativeGroupId === undefined
+        ? null
+        : requireText(hypothesis.alternativeGroupId, "候选互斥组 ID"),
     sourceMediaId: requireText(hypothesis.sourceMediaId, "来源媒体 ID"),
     targetMediaId: requireText(hypothesis.targetMediaId, "目标媒体 ID")
   };

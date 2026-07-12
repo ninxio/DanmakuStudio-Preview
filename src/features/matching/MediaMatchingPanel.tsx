@@ -715,6 +715,7 @@ function createGlobalMatchHypothesis(staged: StagedPairwiseCandidate): GlobalMat
   const quality = timeMap?.quality;
   return {
     id: candidate.id,
+    alternativeGroupId: createMediaPairKey(candidate.sourceMediaId, candidate.targetMediaId),
     sourceMediaId: candidate.sourceMediaId,
     targetMediaId: candidate.targetMediaId,
     sourceStartMs: timeMap?.sourceStartMs ?? candidate.sourceStartMs,
@@ -742,6 +743,9 @@ function describeGlobalRejection(
   reason: GlobalAssignmentRejectionReason,
   conflictCount: number
 ): string {
+  if (reason === "samePairAlternative") {
+    return `同一素材组合只能采用一个定位答案；此项与 ${conflictCount} 个已采用答案互斥，已保留供复核。`;
+  }
   if (reason === "sourceOverlap") {
     return `全局分配发现同一参考时间范围冲突（与 ${conflictCount} 个已采用结果冲突），未采用此备选。`;
   }

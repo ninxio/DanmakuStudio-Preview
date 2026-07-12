@@ -90,6 +90,33 @@ impl SupervisedCommand {
         }
         platform::run_supervised_output(self, limits, is_cancelled)
     }
+
+    /// Streams stdout through a small bounded queue while retaining only bounded stderr.
+    ///
+    /// The consumer runs on the supervising thread and must return promptly.  Backpressure is
+    /// intentional: once `stdout_buffered_chunks` are waiting, the stdout reader stops draining
+    /// the anonymous pipe until the consumer catches up.  Cancellation, timeout and consumer
+    /// failures still terminate the owned Windows Job Object and settle both reader threads.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stream_stdout<F, C>(
+        &self,
+        limits: SupervisedStreamingLimits,
+        is_cancelled: F,
+        consume_stdout: C,
+    ) -> Result<SupervisedStreamingOutput, SupervisedProcessError>
+    where
+        F: Fn() -> bool,
+        C: FnMut(&[u8]) -> Result<(), String>,
+    {
+        limits.validate()?;
+        if process_supervision_cleanup_faulted() {
+            return Err(SupervisedProcessError::new(
+                SupervisedProcessErrorKind::Cleanup,
+                "blocked:process-cleanup：先前的受监督进程未能可信收尾；本进程已 fail-closed。",
+            ));
+        }
+        platform::run_supervised_streaming(self, limits, is_cancelled, consume_stdout)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,10 +145,54 @@ impl SupervisedOutputLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SupervisedStreamingLimits {
+    pub process: SupervisedOutputLimits,
+    pub stdout_chunk_size: usize,
+    pub stdout_buffered_chunks: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SupervisedStreamingLimits {
+    fn validate(self) -> Result<(), SupervisedProcessError> {
+        self.process.validate()?;
+        if self.stdout_chunk_size == 0 || self.stdout_buffered_chunks == 0 {
+            return Err(SupervisedProcessError::new(
+                SupervisedProcessErrorKind::Spawn,
+                "streaming stdout chunk size and buffered chunk count must be non-zero",
+            ));
+        }
+        let retained_chunks = self.stdout_buffered_chunks.checked_add(1).ok_or_else(|| {
+            SupervisedProcessError::new(
+                SupervisedProcessErrorKind::Spawn,
+                "streaming stdout buffered chunk count overflowed usize",
+            )
+        })?;
+        self.stdout_chunk_size
+            .checked_mul(retained_chunks)
+            .ok_or_else(|| {
+                SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Spawn,
+                    "streaming stdout buffer budget overflowed usize",
+                )
+            })?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SupervisedOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SupervisedStreamingOutput {
+    pub status: ExitStatus,
+    pub stdout_bytes: usize,
     pub stderr: Vec<u8>,
 }
 
@@ -195,7 +266,10 @@ mod platform {
         },
         path::{Component, Prefix},
         ptr::{null, null_mut},
-        sync::mpsc::{self, Receiver, TryRecvError},
+        sync::{
+            mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+            Arc,
+        },
         thread,
         time::Instant,
     };
@@ -478,6 +552,22 @@ mod platform {
         result: ReaderResult,
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    enum StreamingReaderMessage {
+        Chunk(Vec<u8>),
+        Complete,
+        Overflow,
+        Failed(String),
+    }
+
+    #[derive(Default)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    struct StreamingOutputState {
+        stdout_complete: bool,
+        stdout_bytes: usize,
+        stderr: Option<Vec<u8>>,
+    }
+
     #[derive(Default)]
     struct ReaderThreads {
         stdout: Option<thread::JoinHandle<()>>,
@@ -570,6 +660,130 @@ mod platform {
     {
         let executable = resolve_executable(&command.program)?;
         run_supervised_output_at(command, &executable, limits, is_cancelled)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn run_supervised_streaming<F, C>(
+        command: &SupervisedCommand,
+        limits: SupervisedStreamingLimits,
+        is_cancelled: F,
+        consume_stdout: C,
+    ) -> Result<SupervisedStreamingOutput, SupervisedProcessError>
+    where
+        F: Fn() -> bool,
+        C: FnMut(&[u8]) -> Result<(), String>,
+    {
+        let executable = resolve_executable(&command.program)?;
+        run_supervised_streaming_at(command, &executable, limits, is_cancelled, consume_stdout)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn run_supervised_streaming_at<F, C>(
+        command: &SupervisedCommand,
+        executable: &Path,
+        limits: SupervisedStreamingLimits,
+        is_cancelled: F,
+        consume_stdout: C,
+    ) -> Result<SupervisedStreamingOutput, SupervisedProcessError>
+    where
+        F: Fn() -> bool,
+        C: FnMut(&[u8]) -> Result<(), String>,
+    {
+        let (mut child, stdout, stderr) = spawn_suspended_in_job(command, executable)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (stdout_sender, stdout_receiver) = mpsc::sync_channel(limits.stdout_buffered_chunks);
+        let (stderr_sender, stderr_receiver) = mpsc::channel();
+        let stdout_stopped = stopped.clone();
+        let stdout_thread = match thread::Builder::new()
+            .name("supervised-stdout-stream".into())
+            .spawn(move || {
+                read_streaming_stdout(
+                    stdout,
+                    limits.process.stdout_hard_limit,
+                    limits.stdout_chunk_size,
+                    stdout_sender,
+                    &stdout_stopped,
+                );
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Spawn,
+                    format!("start supervised streaming stdout reader: {error}"),
+                )
+                .with_cleanup(child.terminate_tree(limits.process.termination_timeout)));
+            }
+        };
+        let stderr_thread = match thread::Builder::new()
+            .name("supervised-stderr".into())
+            .spawn(move || {
+                let result = read_bounded(stderr, limits.process.stderr_hard_limit);
+                let _ = stderr_sender.send(result);
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                stopped.store(true, Ordering::Release);
+                let mut readers = ReaderThreads {
+                    stdout: Some(stdout_thread),
+                    stderr: None,
+                };
+                let cleanup = combine_cleanup_results(
+                    child.terminate_tree(limits.process.termination_timeout),
+                    readers.settle(
+                        limits.process.output_drain_timeout,
+                        limits.process.termination_timeout,
+                    ),
+                );
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Spawn,
+                    format!("start supervised stderr reader: {error}"),
+                )
+                .with_cleanup(cleanup));
+            }
+        };
+        let mut readers = ReaderThreads {
+            stdout: Some(stdout_thread),
+            stderr: Some(stderr_thread),
+        };
+
+        match supervise_streaming_output(
+            &mut child,
+            stdout_receiver,
+            stderr_receiver,
+            limits,
+            is_cancelled,
+            consume_stdout,
+        ) {
+            Ok(output) => {
+                stopped.store(true, Ordering::Release);
+                if let Err(reader_error) = readers.settle(
+                    limits.process.output_drain_timeout,
+                    limits.process.termination_timeout,
+                ) {
+                    let cleanup = combine_cleanup_results(
+                        child.terminate_tree(limits.process.termination_timeout),
+                        Err(reader_error),
+                    );
+                    return Err(SupervisedProcessError::new(
+                        SupervisedProcessErrorKind::Cleanup,
+                        "supervised streaming output completed but reader cleanup failed",
+                    )
+                    .with_cleanup(cleanup));
+                }
+                Ok(output)
+            }
+            Err(error) => {
+                stopped.store(true, Ordering::Release);
+                let cleanup = combine_cleanup_results(
+                    child.terminate_tree(limits.process.termination_timeout),
+                    readers.settle(
+                        limits.process.output_drain_timeout,
+                        limits.process.termination_timeout,
+                    ),
+                );
+                Err(error.with_cleanup(cleanup))
+            }
+        }
     }
 
     fn run_supervised_output_at<F>(
@@ -733,6 +947,87 @@ mod platform {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn supervise_streaming_output<F, C>(
+        child: &mut WindowsChild,
+        stdout_receiver: Receiver<StreamingReaderMessage>,
+        stderr_receiver: Receiver<ReaderResult>,
+        limits: SupervisedStreamingLimits,
+        is_cancelled: F,
+        mut consume_stdout: C,
+    ) -> Result<SupervisedStreamingOutput, SupervisedProcessError>
+    where
+        F: Fn() -> bool,
+        C: FnMut(&[u8]) -> Result<(), String>,
+    {
+        let execution_deadline = Instant::now() + limits.process.execution_timeout;
+        let mut output_deadline = None;
+        let mut root_exit_code = None;
+        let mut output = StreamingOutputState::default();
+
+        loop {
+            drain_streaming_reader_messages(
+                &stdout_receiver,
+                &stderr_receiver,
+                &mut output,
+                limits.process.stdout_hard_limit,
+                limits.stdout_buffered_chunks.clamp(1, 64),
+                &mut consume_stdout,
+            )?;
+
+            if is_cancelled() {
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Cancelled,
+                    "supervised process was cancelled",
+                ));
+            }
+
+            root_exit_code = root_exit_code.or(child.exit_code()?);
+            let active_processes = child.active_processes()?;
+            if active_processes == 0 && output_deadline.is_none() {
+                output_deadline = Some(Instant::now() + limits.process.output_drain_timeout);
+            }
+
+            if active_processes == 0
+                && root_exit_code.is_some()
+                && output.stdout_complete
+                && output.stderr.is_some()
+            {
+                let Some(exit_code) = root_exit_code.take() else {
+                    unreachable!("streaming root-exit readiness was checked");
+                };
+                let Some(stderr) = output.stderr.take() else {
+                    unreachable!("streaming stderr readiness was checked");
+                };
+                return Ok(SupervisedStreamingOutput {
+                    status: ExitStatus::from_raw(exit_code),
+                    stdout_bytes: output.stdout_bytes,
+                    stderr,
+                });
+            }
+
+            let now = Instant::now();
+            if now >= execution_deadline {
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Timeout,
+                    format!(
+                        "supervised process tree exceeded its execution deadline (rootExited={}, activeProcesses={active_processes}, stdoutComplete={}, stderrComplete={})",
+                        root_exit_code.is_some(),
+                        output.stdout_complete,
+                        output.stderr.is_some()
+                    ),
+                ));
+            }
+            if output_deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Timeout,
+                    "supervised streaming readers exceeded their drain deadline",
+                ));
+            }
+            thread::sleep(limits.process.poll_interval.min(Duration::from_millis(20)));
+        }
+    }
+
     fn combine_cleanup_results(
         first: Result<(), String>,
         second: Result<(), String>,
@@ -799,6 +1094,125 @@ mod platform {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn drain_streaming_reader_messages<C>(
+        stdout_receiver: &Receiver<StreamingReaderMessage>,
+        stderr_receiver: &Receiver<ReaderResult>,
+        output: &mut StreamingOutputState,
+        stdout_hard_limit: usize,
+        message_budget: usize,
+        consume_stdout: &mut C,
+    ) -> Result<(), SupervisedProcessError>
+    where
+        C: FnMut(&[u8]) -> Result<(), String>,
+    {
+        match stderr_receiver.try_recv() {
+            Ok(result) => {
+                if output.stderr.is_some() {
+                    return Err(SupervisedProcessError::new(
+                        SupervisedProcessErrorKind::Reader,
+                        "supervised stderr reader returned a duplicate result",
+                    ));
+                }
+                match result {
+                    ReaderResult::Complete(bytes) => output.stderr = Some(bytes),
+                    ReaderResult::Overflow => {
+                        return Err(SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::StderrOverflow,
+                            "supervised stderr exceeded its hard byte limit",
+                        ));
+                    }
+                    ReaderResult::Failed(error) => {
+                        return Err(SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::Reader,
+                            format!("supervised stderr read failed: {error}"),
+                        ));
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) if output.stderr.is_some() => {}
+            Err(TryRecvError::Disconnected) => {
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::Reader,
+                    "supervised stderr reader disconnected without a result",
+                ));
+            }
+        }
+
+        for _ in 0..message_budget {
+            let message = match stdout_receiver.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    if !output.stdout_complete {
+                        return Err(SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::Reader,
+                            "supervised streaming stdout reader disconnected without completion",
+                        ));
+                    }
+                    return Ok(());
+                }
+            };
+            match message {
+                StreamingReaderMessage::Chunk(chunk) => {
+                    if output.stdout_complete {
+                        return Err(SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::Reader,
+                            "supervised streaming stdout produced bytes after completion",
+                        ));
+                    }
+                    let next_total =
+                        output
+                            .stdout_bytes
+                            .checked_add(chunk.len())
+                            .ok_or_else(|| {
+                                SupervisedProcessError::new(
+                                    SupervisedProcessErrorKind::StdoutOverflow,
+                                    "supervised streaming stdout byte count overflowed usize",
+                                )
+                            })?;
+                    if next_total > stdout_hard_limit {
+                        return Err(SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::StdoutOverflow,
+                            "supervised streaming stdout exceeded its hard byte limit",
+                        ));
+                    }
+                    consume_stdout(&chunk).map_err(|error| {
+                        SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::Reader,
+                            format!("supervised stdout consumer failed: {error}"),
+                        )
+                    })?;
+                    output.stdout_bytes = next_total;
+                }
+                StreamingReaderMessage::Complete => {
+                    if std::mem::replace(&mut output.stdout_complete, true) {
+                        return Err(SupervisedProcessError::new(
+                            SupervisedProcessErrorKind::Reader,
+                            "supervised streaming stdout returned duplicate completion",
+                        ));
+                    }
+                }
+                StreamingReaderMessage::Overflow => {
+                    return Err(SupervisedProcessError::new(
+                        SupervisedProcessErrorKind::StdoutOverflow,
+                        "supervised streaming stdout exceeded its hard byte limit",
+                    ));
+                }
+                StreamingReaderMessage::Failed(error) => {
+                    return Err(SupervisedProcessError::new(
+                        SupervisedProcessErrorKind::Reader,
+                        format!("supervised streaming stdout read failed: {error}"),
+                    ));
+                }
+            }
+        }
+        // A producer may refill the bounded queue as quickly as it is drained. Yield after a
+        // finite batch so sustained output cannot starve cancellation, timeout or Job polling.
+        Ok(())
+    }
+
     fn read_bounded(mut reader: File, hard_limit: usize) -> ReaderResult {
         let mut output = Vec::with_capacity(hard_limit.min(64 * 1024));
         let mut buffer = [0u8; 16 * 1024];
@@ -817,6 +1231,97 @@ mod platform {
                     return ReaderResult::Complete(output);
                 }
                 Err(error) => return ReaderResult::Failed(error.to_string()),
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn read_streaming_stdout(
+        mut reader: File,
+        hard_limit: usize,
+        chunk_size: usize,
+        sender: SyncSender<StreamingReaderMessage>,
+        stopped: &AtomicBool,
+    ) {
+        let mut total = 0usize;
+        let mut buffer = vec![0u8; chunk_size];
+        loop {
+            if stopped.load(Ordering::Acquire) {
+                return;
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = send_streaming_reader_message(
+                        &sender,
+                        StreamingReaderMessage::Complete,
+                        stopped,
+                    );
+                    return;
+                }
+                Ok(read) => {
+                    let Some(next_total) = total.checked_add(read) else {
+                        let _ = send_streaming_reader_message(
+                            &sender,
+                            StreamingReaderMessage::Overflow,
+                            stopped,
+                        );
+                        return;
+                    };
+                    if next_total > hard_limit {
+                        let _ = send_streaming_reader_message(
+                            &sender,
+                            StreamingReaderMessage::Overflow,
+                            stopped,
+                        );
+                        return;
+                    }
+                    total = next_total;
+                    if !send_streaming_reader_message(
+                        &sender,
+                        StreamingReaderMessage::Chunk(buffer[..read].to_vec()),
+                        stopped,
+                    ) {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    let _ = send_streaming_reader_message(
+                        &sender,
+                        StreamingReaderMessage::Complete,
+                        stopped,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = send_streaming_reader_message(
+                        &sender,
+                        StreamingReaderMessage::Failed(error.to_string()),
+                        stopped,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn send_streaming_reader_message(
+        sender: &SyncSender<StreamingReaderMessage>,
+        mut message: StreamingReaderMessage,
+        stopped: &AtomicBool,
+    ) -> bool {
+        loop {
+            if stopped.load(Ordering::Acquire) {
+                return false;
+            }
+            match sender.try_send(message) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(returned)) => {
+                    message = returned;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
     }
@@ -2097,6 +2602,248 @@ mod platform {
             assert!(status.success());
         }
 
+        const STREAMING_TEST_PAYLOAD_BYTES: usize = 512 * 1024;
+
+        fn supervised_streaming_helper_command(test_name: &str) -> SupervisedCommand {
+            let mut command = SupervisedCommand::new(
+                env::current_exe().expect("current test executable for streaming helper"),
+            );
+            command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+            command
+        }
+
+        fn supervised_streaming_test_limits(
+            stdout_hard_limit: usize,
+            stderr_hard_limit: usize,
+        ) -> SupervisedStreamingLimits {
+            SupervisedStreamingLimits {
+                process: SupervisedOutputLimits {
+                    execution_timeout: Duration::from_secs(5),
+                    output_drain_timeout: Duration::from_secs(2),
+                    termination_timeout: Duration::from_secs(2),
+                    poll_interval: Duration::from_millis(2),
+                    stdout_hard_limit,
+                    stderr_hard_limit,
+                },
+                stdout_chunk_size: 4 * 1024,
+                stdout_buffered_chunks: 1,
+            }
+        }
+
+        #[test]
+        #[ignore = "supervised streaming stdout payload helper"]
+        fn streaming_stdout_payload_helper() {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let block = [0xA5u8; 4096];
+            for _ in 0..STREAMING_TEST_PAYLOAD_BYTES / block.len() {
+                stdout.write_all(&block).expect("write streaming payload");
+            }
+            stdout.flush().expect("flush streaming payload");
+            eprintln!("streaming-stderr-marker");
+        }
+
+        #[test]
+        #[ignore = "supervised streaming stderr overflow helper"]
+        fn streaming_stderr_overflow_helper() {
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
+            let block = [0xB6u8; 4096];
+            for _ in 0..64 {
+                stderr.write_all(&block).expect("write oversized stderr");
+            }
+            stderr.flush().expect("flush oversized stderr");
+            println!("stdout-remains-streamed");
+        }
+
+        #[test]
+        fn streaming_stdout_is_chunked_with_bounded_backpressure_and_bounded_stderr() {
+            let command = supervised_streaming_helper_command(
+                "process_supervision::platform::tests::streaming_stdout_payload_helper",
+            );
+            let mut payload_bytes = 0usize;
+            let mut maximum_chunk = 0usize;
+            let mut chunk_count = 0usize;
+            let output = command
+                .stream_stdout(
+                    supervised_streaming_test_limits(2 * 1024 * 1024, 64 * 1024),
+                    || false,
+                    |chunk| {
+                        maximum_chunk = maximum_chunk.max(chunk.len());
+                        payload_bytes += chunk.iter().filter(|byte| **byte == 0xA5).count();
+                        chunk_count += 1;
+                        // A one-slot queue plus a deliberately slower consumer exercises actual
+                        // reader/pipe backpressure without retaining the complete payload.
+                        thread::sleep(Duration::from_millis(1));
+                        Ok(())
+                    },
+                )
+                .expect("streaming process must complete");
+
+            assert!(output.status.success());
+            assert_eq!(payload_bytes, STREAMING_TEST_PAYLOAD_BYTES);
+            assert!(output.stdout_bytes >= STREAMING_TEST_PAYLOAD_BYTES);
+            assert!(chunk_count > 32);
+            assert!(maximum_chunk <= 4 * 1024);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("streaming-stderr-marker"));
+        }
+
+        #[test]
+        fn streaming_stdout_total_hard_limit_still_terminates_the_owned_process() {
+            let command = supervised_streaming_helper_command(
+                "process_supervision::platform::tests::streaming_stdout_payload_helper",
+            );
+            let error = command
+                .stream_stdout(
+                    supervised_streaming_test_limits(32 * 1024, 64 * 1024),
+                    || false,
+                    |_| Ok(()),
+                )
+                .expect_err("streaming stdout must retain a total hard limit");
+            assert_eq!(error.kind(), SupervisedProcessErrorKind::StdoutOverflow);
+        }
+
+        #[test]
+        fn streaming_stderr_hard_limit_is_enforced_while_stdout_is_streamed() {
+            let command = supervised_streaming_helper_command(
+                "process_supervision::platform::tests::streaming_stderr_overflow_helper",
+            );
+            let error = command
+                .stream_stdout(
+                    supervised_streaming_test_limits(64 * 1024, 4 * 1024),
+                    || false,
+                    |_| Ok(()),
+                )
+                .expect_err("streaming stderr must remain bounded");
+            assert_eq!(error.kind(), SupervisedProcessErrorKind::StderrOverflow);
+        }
+
+        #[test]
+        fn streaming_consumer_failure_terminates_instead_of_leaking_a_blocked_writer() {
+            let command = supervised_streaming_helper_command(
+                "process_supervision::platform::tests::streaming_stdout_payload_helper",
+            );
+            let error = command
+                .stream_stdout(
+                    supervised_streaming_test_limits(2 * 1024 * 1024, 64 * 1024),
+                    || false,
+                    |chunk| {
+                        if chunk.contains(&0xA5) {
+                            Err("fixture consumer rejected a chunk".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .expect_err("consumer failure must abort the owned process tree");
+            assert_eq!(error.kind(), SupervisedProcessErrorKind::Reader);
+        }
+
+        #[test]
+        #[ignore = "supervised streaming cancellation descendant helper"]
+        fn streaming_cancellation_descendant_helper() {
+            let descendant = Command::new("ping.exe")
+                .args(["-t", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn streaming descendant");
+            fs::write("streaming-descendant.pid", descendant.id().to_string())
+                .expect("record streaming descendant pid");
+            let ack_deadline = Instant::now() + Duration::from_secs(2);
+            while !Path::new("streaming-descendant.ack").is_file() && Instant::now() < ack_deadline
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                Path::new("streaming-descendant.ack").is_file(),
+                "parent did not bind streaming descendant handle"
+            );
+            std::mem::forget(descendant);
+
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let block = [0xF3u8; 4096];
+            loop {
+                stdout.write_all(&block).expect("write cancellable stream");
+                stdout.flush().expect("flush cancellable stream");
+            }
+        }
+
+        #[test]
+        fn streaming_cancellation_kills_the_owned_job_descendant() {
+            let fixture_directory = FixtureDirectory(env::temp_dir().join(format!(
+                "c137-process-streaming-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+            fs::create_dir(&fixture_directory.0).expect("create streaming fixture directory");
+            let marker_path = fixture_directory.0.join("streaming-descendant.pid");
+            let ack_path = fixture_directory.0.join("streaming-descendant.ack");
+            let descendant_monitor = thread::spawn(move || -> Result<usize, String> {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Ok(pid_text) = fs::read_to_string(&marker_path) {
+                        let pid = pid_text
+                            .parse::<u32>()
+                            .map_err(|error| format!("parse streaming descendant pid: {error}"))?;
+                        // SAFETY: the helper waits for the ack before it emits the cancellation
+                        // marker, so this handle binds the just-created descendant before teardown.
+                        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+                        if !handle.is_null() {
+                            fs::write(&ack_path, b"bound")
+                                .map_err(|error| format!("write streaming ack: {error}"))?;
+                            return Ok(handle as usize);
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(
+                            "streaming descendant marker did not yield a live handle".into()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+
+            let mut command = supervised_streaming_helper_command(
+                "process_supervision::platform::tests::streaming_cancellation_descendant_helper",
+            );
+            command.current_dir(&fixture_directory.0);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancellation_check = cancelled.clone();
+            let cancellation_signal = cancelled.clone();
+            let started = Instant::now();
+            let error = command
+                .stream_stdout(
+                    supervised_streaming_test_limits(8 * 1024 * 1024, 64 * 1024),
+                    move || cancellation_check.load(Ordering::Acquire),
+                    move |chunk| {
+                        if chunk.contains(&0xF3) {
+                            cancellation_signal.store(true, Ordering::Release);
+                        }
+                        Ok(())
+                    },
+                )
+                .expect_err("streaming cancellation must stop the process tree");
+            assert_eq!(error.kind(), SupervisedProcessErrorKind::Cancelled);
+            assert!(started.elapsed() < Duration::from_secs(4));
+
+            let descendant_handle = descendant_monitor
+                .join()
+                .expect("streaming descendant monitor panicked")
+                .expect("bind streaming descendant handle")
+                as HANDLE;
+            let descendant_wait = unsafe { WaitForSingleObject(descendant_handle, 0) };
+            unsafe { CloseHandle(descendant_handle) };
+            assert_eq!(
+                descendant_wait, WAIT_OBJECT_0,
+                "streaming Job descendant survived bounded cancellation cleanup"
+            );
+        }
+
         #[test]
         #[ignore = "staggered supervised stderr descendant helper"]
         fn staggered_stderr_descendant_helper() {
@@ -2319,6 +3066,33 @@ mod platform {
             command,
             limits,
             is_cancelled,
+            Command::new(""),
+            Instant::now(),
+        );
+        Err(SupervisedProcessError::new(
+            SupervisedProcessErrorKind::Spawn,
+            "safe process-tree supervision is currently supported only on Windows",
+        ))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn run_supervised_streaming<F, C>(
+        command: &SupervisedCommand,
+        limits: SupervisedStreamingLimits,
+        is_cancelled: F,
+        consume_stdout: C,
+    ) -> Result<SupervisedStreamingOutput, SupervisedProcessError>
+    where
+        F: Fn() -> bool,
+        C: FnMut(&[u8]) -> Result<(), String>,
+    {
+        // Keep the streaming API under the same fail-closed Windows Job Object contract as the
+        // collecting API; do not silently degrade to root-process-only supervision elsewhere.
+        let _ = (
+            command,
+            limits,
+            is_cancelled,
+            consume_stdout,
             Command::new(""),
             Instant::now(),
         );

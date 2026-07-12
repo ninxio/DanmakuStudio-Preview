@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AlignmentProposal } from "../../domain/alignment/types";
 import {
+  cancelTauriAudioAlignmentBatchJob,
   cancelTauriAudioAlignmentJob,
+  getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
   isAudioAlignmentJobFinished,
   runTauriAudioAlignment,
+  startTauriAudioAlignmentBatchJob,
   startTauriAudioAlignmentJob,
+  type AudioAlignmentBatchJobInvoker,
   type AudioAlignmentInvoker,
   type AudioAlignmentJobInvoker,
   type NormalizedTauriAudioAlignmentRequest,
@@ -313,4 +317,268 @@ describe("Tauri 音频对齐调用", () => {
     expect(isAudioAlignmentJobFinished("completed")).toBe(true);
     expect(isAudioAlignmentJobFinished("running")).toBe(false);
   });
+
+  it("批任务一次发送全部媒体并规范化流索引", async () => {
+    tauriMocks.invoke.mockResolvedValue({
+      schemaVersion: 1,
+      jobId: "batch-1",
+      status: "queued",
+      progress: 0,
+      message: "已排队",
+      totalPairCount: 2,
+      processedPairCount: 0,
+      failedPairCount: 0,
+      currentPairOrdinal: null,
+      pairs: [
+        batchPairSnapshot(1, "source", "target-1", "queued"),
+        batchPairSnapshot(2, "source", "target-2", "queued")
+      ],
+      error: null,
+      updatedAtMs: 1
+    });
+
+    await startTauriAudioAlignmentBatchJob({
+      sources: [{ mediaId: "source", path: "D:\\media\\source.mkv" }],
+      targets: [
+        { mediaId: "target-1", path: "D:\\media\\ep1.mkv", audioStreamIndex: 2 },
+        { mediaId: "target-2", path: "D:\\media\\ep2.mkv", videoStreamIndex: 4 }
+      ],
+      ffmpegPath: null,
+      localizationMode: true
+    });
+
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("start_audio_alignment_batch_job", {
+      request: {
+        schemaVersion: 1,
+        sources: [
+          {
+            mediaId: "source",
+            path: "D:\\media\\source.mkv",
+            audioStreamIndex: null,
+            videoStreamIndex: null
+          }
+        ],
+        targets: [
+          {
+            mediaId: "target-1",
+            path: "D:\\media\\ep1.mkv",
+            audioStreamIndex: 2,
+            videoStreamIndex: null
+          },
+          {
+            mediaId: "target-2",
+            path: "D:\\media\\ep2.mkv",
+            audioStreamIndex: null,
+            videoStreamIndex: 4
+          }
+        ],
+        ffmpegPath: null,
+        ffprobePath: null,
+        localizationMode: true
+      }
+    });
+  });
+
+  it("批任务限制空集合、重复媒体和 256 个组合上限", async () => {
+    const invoker = vi.fn<AudioAlignmentBatchJobInvoker["start"]>();
+    const jobInvoker: AudioAlignmentBatchJobInvoker = {
+      start: invoker,
+      get: vi.fn(),
+      cancel: vi.fn()
+    };
+
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        { sources: [], targets: [{ mediaId: "target", path: "target.mkv" }], ffmpegPath: null },
+        jobInvoker
+      )
+    ).rejects.toThrow("B 站参考素材不能为空");
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [
+            { mediaId: "source", path: "a.mkv" },
+            { mediaId: " source ", path: "b.mkv" }
+          ],
+          targets: [{ mediaId: "target", path: "target.mkv" }],
+          ffmpegPath: null
+        },
+        jobInvoker
+      )
+    ).rejects.toThrow("包含重复媒体 ID");
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [{ mediaId: "shared", path: "source.mkv" }],
+          targets: [{ mediaId: "shared", path: "target.mkv" }],
+          ffmpegPath: null
+        },
+        jobInvoker
+      )
+    ).rejects.toThrow("媒体 ID 必须全局唯一");
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: Array.from({ length: 17 }, (_, index) => ({
+            mediaId: `source-${index}`,
+            path: `${index}.mkv`
+          })),
+          targets: Array.from({ length: 16 }, (_, index) => ({
+            mediaId: `target-${index}`,
+            path: `${index}.mkv`
+          })),
+          ffmpegPath: null
+        },
+        jobInvoker
+      )
+    ).rejects.toThrow("最多分析 256 个素材组合");
+    expect(invoker).not.toHaveBeenCalled();
+  });
+
+  it("批任务可显式指定未完成 pair，并拒绝重复或越界引用", async () => {
+    const snapshot = {
+      schemaVersion: 1 as const,
+      jobId: "batch-explicit",
+      status: "queued" as const,
+      progress: 0,
+      message: "已排队",
+      totalPairCount: 1,
+      processedPairCount: 0,
+      failedPairCount: 0,
+      currentPairOrdinal: null,
+      pairs: [batchPairSnapshot(1, "source", "target", "queued")],
+      error: null,
+      updatedAtMs: 1
+    };
+    const start = vi.fn<AudioAlignmentBatchJobInvoker["start"]>(() =>
+      Promise.resolve(snapshot)
+    );
+    const invoker: AudioAlignmentBatchJobInvoker = {
+      start,
+      get: vi.fn(),
+      cancel: vi.fn()
+    };
+    const base = {
+      sources: [{ mediaId: "source", path: "source.mkv" }],
+      targets: [{ mediaId: "target", path: "target.mkv" }],
+      ffmpegPath: null
+    };
+
+    await startTauriAudioAlignmentBatchJob(
+      {
+        ...base,
+        pairs: [{ sourceMediaId: "source", targetMediaId: "target" }]
+      },
+      invoker
+    );
+    expect(start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pairs: [{ sourceMediaId: "source", targetMediaId: "target" }]
+      })
+    );
+
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          ...base,
+          pairs: [{ sourceMediaId: "missing", targetMediaId: "target" }]
+        },
+        invoker
+      )
+    ).rejects.toThrow("引用了未纳入批次的媒体");
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          ...base,
+          pairs: [
+            { sourceMediaId: "source", targetMediaId: "target" },
+            { sourceMediaId: "source", targetMediaId: "target" }
+          ]
+        },
+        invoker
+      )
+    ).rejects.toThrow("包含重复素材组合");
+  });
+
+  it("支持读取和取消原生批任务", async () => {
+    const snapshot = {
+      schemaVersion: 1 as const,
+      jobId: "batch-2",
+      status: "cancelled" as const,
+      progress: 1,
+      message: "已取消",
+      totalPairCount: 2,
+      processedPairCount: 1,
+      failedPairCount: 0,
+      currentPairOrdinal: null,
+      pairs: [
+        batchPairSnapshot(1, "source", "target-1", "completed"),
+        batchPairSnapshot(2, "source", "target-2", "cancelled")
+      ],
+      error: null,
+      updatedAtMs: 2
+    };
+    const invoker: AudioAlignmentBatchJobInvoker = {
+      start: () => Promise.resolve(snapshot),
+      get: () => Promise.resolve(snapshot),
+      cancel: () => Promise.resolve(snapshot)
+    };
+
+    await expect(getTauriAudioAlignmentBatchJob("batch-2", invoker)).resolves.toBe(snapshot);
+    await expect(cancelTauriAudioAlignmentBatchJob("batch-2", invoker)).resolves.toBe(snapshot);
+  });
+
+  it("拒绝计数矛盾或 jobId 不匹配的原生批任务响应", async () => {
+    const invalidSnapshot = {
+      schemaVersion: 1 as const,
+      jobId: "wrong-job",
+      status: "running" as const,
+      progress: 0.5,
+      message: "运行中",
+      totalPairCount: 1,
+      processedPairCount: 1,
+      failedPairCount: 0,
+      currentPairOrdinal: 1,
+      pairs: [batchPairSnapshot(1, "source", "target", "running")],
+      error: null,
+      updatedAtMs: 3
+    };
+    const invoker: AudioAlignmentBatchJobInvoker = {
+      start: () => Promise.resolve(invalidSnapshot),
+      get: () => Promise.resolve(invalidSnapshot),
+      cancel: () => Promise.resolve(invalidSnapshot)
+    };
+
+    await expect(getTauriAudioAlignmentBatchJob("expected-job", invoker)).rejects.toThrow(
+      "jobId 与请求不一致"
+    );
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [{ mediaId: "source", path: "source.mkv" }],
+          targets: [{ mediaId: "target", path: "target.mkv" }],
+          ffmpegPath: null
+        },
+        invoker
+      )
+    ).rejects.toThrow("processed/failed 计数与 pair 状态不一致");
+  });
 });
+
+function batchPairSnapshot(
+  pairOrdinal: number,
+  sourceMediaId: string,
+  targetMediaId: string,
+  status: "queued" | "running" | "completed" | "failed" | "cancelled"
+) {
+  return {
+    pairOrdinal,
+    sourceMediaId,
+    targetMediaId,
+    status,
+    progress: status === "queued" ? 0 : status === "running" ? 0.5 : 1,
+    message: status,
+    proposal: status === "completed" ? emptyProposal : null,
+    error: status === "failed" ? "pair failed" : null
+  };
+}
