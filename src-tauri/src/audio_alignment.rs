@@ -14,8 +14,8 @@ use crate::{
         EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
         MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
         SpectralBackendPreference, SpectralBackendRequest, SpectralLandmark,
-        StreamingLandmarkExtractor, CPU_SPECTRAL_BACKEND_ID, STREAMING_CPU_SPECTRAL_BACKEND_ID,
-        STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
+        StreamingLandmarkExtractor, AFFINE_HOLDOUT_TIME_BLOCK_MS, CPU_SPECTRAL_BACKEND_ID,
+        STREAMING_CPU_SPECTRAL_BACKEND_ID, STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
     },
     cuda_fft_backend::{
         CudaFftMemoryBudget, CUDA_FFT_BACKEND_ID, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -151,6 +151,17 @@ const ALIGNMENT_V2_TEMPO_EDGE_SUPPORT_MIN_MS: u64 = 5_000;
 const ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE: f64 = 0.03;
 const ALIGNMENT_V2_TEMPO_CADENCE_SCALE_TOLERANCE: f64 = 0.005;
 const ALIGNMENT_V2_TEMPO_EDGE_DIRECTION_EPSILON: f64 = 0.0025;
+// Global residual percentiles can hide a short nonlinear excursion. Re-evaluate every distinct
+// 30 s source-time window, falling back to the nearest same-span anchor when a window is sparse.
+const ALIGNMENT_V2_LOCAL_HELD_OUT_WINDOW_MS: u64 = 30_000;
+const ALIGNMENT_V2_LOCAL_HELD_OUT_MIN_ANCHORS: usize = 2;
+const ALIGNMENT_V2_LOCAL_HELD_OUT_P95_MAX_MS: u64 = 200;
+// Held-out blocks are distributed across the source timeline. Start with a 20% gap allowance and
+// practical bounds, but never require denser evidence than the matched span's distinct 1 s
+// holdout-block count can provide under uniform placement.
+const ALIGNMENT_V2_UNVALIDATED_GAP_DURATION_DIVISOR: u64 = 5;
+const ALIGNMENT_V2_UNVALIDATED_GAP_FLOOR_MS: u64 = 5_000;
+const ALIGNMENT_V2_UNVALIDATED_GAP_CEILING_MS: u64 = 120_000;
 const ALIGNMENT_V2_MAX_DP_CELLS: usize = 4_000_000;
 // The edit-aware solver retains three full u8 parent planes for exact traceback, while its three
 // i64 cost states use previous/current rolling rows. Charge both explicitly; the rolling width is
@@ -12413,13 +12424,83 @@ fn finalize_v2_span_evidence(
     final_summary
 }
 
+#[derive(Debug, Clone, Copy)]
+struct V2TimedAnchorResidual {
+    source_time_ms: u64,
+    residual_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2FinalMapLocalValidation {
+    worst_local_p95_residual_ms: Option<u64>,
+    max_unvalidated_gap_ms: u64,
+    allowed_unvalidated_gap_ms: u64,
+    unvalidated_gap_blocked: bool,
+}
+
 #[derive(Debug, Default)]
 struct V2FinalMapAnchorSummary {
     training_residuals: Vec<u64>,
     held_out_residuals: Vec<u64>,
+    held_out_timed_residuals: Vec<V2TimedAnchorResidual>,
     training_unmapped_count: usize,
     held_out_unmapped_count: usize,
     held_out_within_tolerance_count: usize,
+}
+
+#[derive(Debug)]
+struct V2ResidualRankIndex {
+    tree: Vec<usize>,
+}
+
+impl V2ResidualRankIndex {
+    fn new(coordinate_count: usize) -> Self {
+        Self {
+            tree: vec![0; coordinate_count.saturating_add(1)],
+        }
+    }
+
+    fn insert(&mut self, coordinate: usize) {
+        self.update(coordinate, true);
+    }
+
+    fn remove(&mut self, coordinate: usize) {
+        self.update(coordinate, false);
+    }
+
+    fn update(&mut self, coordinate: usize, insert: bool) {
+        let mut index = coordinate.saturating_add(1);
+        while index < self.tree.len() {
+            if insert {
+                self.tree[index] = self.tree[index].saturating_add(1);
+            } else {
+                debug_assert!(self.tree[index] > 0);
+                self.tree[index] = self.tree[index].saturating_sub(1);
+            }
+            index = index.saturating_add(index & (!index + 1));
+        }
+    }
+
+    fn coordinate_at_rank(&self, mut rank: usize) -> Option<usize> {
+        let coordinate_count = self.tree.len().checked_sub(1)?;
+        if coordinate_count == 0 || rank == 0 {
+            return None;
+        }
+        let mut bit = 1_usize;
+        while bit <= coordinate_count / 2 {
+            bit *= 2;
+        }
+        let mut index = 0_usize;
+        while bit > 0 {
+            let next = index.saturating_add(bit);
+            if next <= coordinate_count && self.tree[next] < rank {
+                rank -= self.tree[next];
+                index = next;
+            }
+            bit /= 2;
+        }
+        (index < coordinate_count).then_some(index)
+    }
 }
 
 fn v2_recompute_final_map_anchor_summary(
@@ -12431,10 +12512,19 @@ fn v2_recompute_final_map_anchor_summary(
         .iter()
         .filter_map(|anchor| v2_final_map_anchor_residual(spans, anchor))
         .collect::<Vec<_>>();
-    let held_out_residuals = hypothesis
+    let held_out_timed_residuals = hypothesis
         .held_out_anchors
         .iter()
-        .filter_map(|anchor| v2_final_map_anchor_residual(spans, anchor))
+        .filter_map(|anchor| {
+            Some(V2TimedAnchorResidual {
+                source_time_ms: u64::try_from(anchor.source_time_ms).ok()?,
+                residual_ms: v2_final_map_anchor_residual(spans, anchor)?,
+            })
+        })
+        .collect::<Vec<_>>();
+    let held_out_residuals = held_out_timed_residuals
+        .iter()
+        .map(|anchor| anchor.residual_ms)
         .collect::<Vec<_>>();
     let held_out_within_tolerance_count = held_out_residuals
         .iter()
@@ -12451,7 +12541,241 @@ fn v2_recompute_final_map_anchor_summary(
             .saturating_sub(held_out_residuals.len()),
         training_residuals,
         held_out_residuals,
+        held_out_timed_residuals,
         held_out_within_tolerance_count,
+    }
+}
+
+fn v2_allowed_unvalidated_gap_ms(source_duration_ms: u64, held_out_time_block_count: usize) -> u64 {
+    let bounded_gap_ms = source_duration_ms
+        .div_ceil(ALIGNMENT_V2_UNVALIDATED_GAP_DURATION_DIVISOR)
+        .clamp(
+            ALIGNMENT_V2_UNVALIDATED_GAP_FLOOR_MS,
+            ALIGNMENT_V2_UNVALIDATED_GAP_CEILING_MS,
+        );
+    let sampling_capacity = u64::try_from(held_out_time_block_count)
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let capacity_floor_ms = source_duration_ms.div_ceil(sampling_capacity);
+    bounded_gap_ms
+        .max(capacity_floor_ms)
+        .min(source_duration_ms)
+}
+
+fn v2_distinct_holdout_time_block_count(held_out: &[V2TimedAnchorResidual]) -> usize {
+    let block_width_ms = u64::try_from(AFFINE_HOLDOUT_TIME_BLOCK_MS)
+        .expect("affine holdout time blocks must use a positive millisecond width");
+    let mut previous_block = None::<u64>;
+    let mut block_count = 0_usize;
+    for anchor in held_out {
+        let block = anchor.source_time_ms.div_euclid(block_width_ms);
+        if previous_block != Some(block) {
+            block_count = block_count.saturating_add(1);
+            previous_block = Some(block);
+        }
+    }
+    block_count
+}
+
+fn v2_max_unvalidated_gap_ms(
+    held_out: &[V2TimedAnchorResidual],
+    source_start_ms: u64,
+    source_end_ms: u64,
+) -> u64 {
+    let mut previous_time_ms = source_start_ms;
+    let mut max_unvalidated_gap_ms = 0;
+    for source_time_ms in held_out.iter().map(|anchor| anchor.source_time_ms) {
+        if source_time_ms == previous_time_ms {
+            continue;
+        }
+        max_unvalidated_gap_ms =
+            max_unvalidated_gap_ms.max(source_time_ms.saturating_sub(previous_time_ms));
+        previous_time_ms = source_time_ms;
+    }
+    max_unvalidated_gap_ms.max(source_end_ms.saturating_sub(previous_time_ms))
+}
+
+fn v2_active_window_local_p95(
+    anchors: &[V2TimedAnchorResidual],
+    active_indices: &BTreeSet<usize>,
+    residual_values: &[u64],
+    residual_rank_index: &V2ResidualRankIndex,
+) -> Option<u64> {
+    if active_indices.len() >= ALIGNMENT_V2_LOCAL_HELD_OUT_MIN_ANCHORS {
+        let zero_based_index = active_indices
+            .len()
+            .saturating_sub(1)
+            .saturating_mul(95)
+            .div_ceil(100);
+        let coordinate = residual_rank_index.coordinate_at_rank(zero_based_index + 1)?;
+        return residual_values.get(coordinate).copied();
+    }
+    let active_index = active_indices.first().copied()?;
+    let active_anchor = anchors.get(active_index)?;
+    let mut nearest = None::<(u64, u64)>;
+    for neighbor_index in [
+        active_index.checked_sub(1),
+        active_index
+            .checked_add(1)
+            .filter(|index| *index < anchors.len()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let neighbor = anchors.get(neighbor_index)?;
+        let candidate = (
+            active_anchor
+                .source_time_ms
+                .abs_diff(neighbor.source_time_ms),
+            neighbor.residual_ms,
+        );
+        if nearest.is_none_or(|best| {
+            candidate.0 < best.0 || (candidate.0 == best.0 && candidate.1 > best.1)
+        }) {
+            nearest = Some(candidate);
+        }
+    }
+    Some(
+        nearest
+            .map(|(_, residual_ms)| active_anchor.residual_ms.max(residual_ms))
+            .unwrap_or(active_anchor.residual_ms),
+    )
+}
+
+fn v2_worst_sliding_local_p95(held_out: &[V2TimedAnchorResidual]) -> Option<u64> {
+    if held_out.is_empty() {
+        return None;
+    }
+    let mut anchors = held_out.to_vec();
+    anchors.sort_unstable_by_key(|anchor| (anchor.source_time_ms, anchor.residual_ms));
+    let mut residual_values = anchors
+        .iter()
+        .map(|anchor| anchor.residual_ms)
+        .collect::<Vec<_>>();
+    residual_values.sort_unstable();
+    residual_values.dedup();
+    let residual_coordinates = anchors
+        .iter()
+        .map(|anchor| {
+            residual_values
+                .binary_search(&anchor.residual_ms)
+                .expect("a compressed residual must retain every anchor value")
+        })
+        .collect::<Vec<_>>();
+
+    // For a closed window [start, start + width], an anchor enters the active set at
+    // source_time-width and leaves immediately after source_time. Sweeping both event boundaries
+    // enumerates every distinct membership set of a truly sliding window without quadratic scans.
+    let mut events = Vec::<(i128, u8, usize)>::with_capacity(anchors.len().saturating_mul(2));
+    for (index, anchor) in anchors.iter().enumerate() {
+        let source_time_ms = i128::from(anchor.source_time_ms);
+        events.push((
+            source_time_ms - i128::from(ALIGNMENT_V2_LOCAL_HELD_OUT_WINDOW_MS),
+            0,
+            index,
+        ));
+        events.push((source_time_ms, 1, index));
+    }
+    events.sort_unstable();
+
+    let mut active_indices = BTreeSet::<usize>::new();
+    let mut residual_rank_index = V2ResidualRankIndex::new(residual_values.len());
+    let mut worst_local_p95_residual_ms = None::<u64>;
+    let mut cursor = 0_usize;
+    while cursor < events.len() {
+        let position = events[cursor].0;
+        let mut group_end = cursor + 1;
+        while group_end < events.len() && events[group_end].0 == position {
+            group_end += 1;
+        }
+        for &(_, event_kind, anchor_index) in &events[cursor..group_end] {
+            if event_kind == 0 && active_indices.insert(anchor_index) {
+                residual_rank_index.insert(residual_coordinates[anchor_index]);
+            }
+        }
+        if let Some(candidate) = v2_active_window_local_p95(
+            &anchors,
+            &active_indices,
+            &residual_values,
+            &residual_rank_index,
+        ) {
+            worst_local_p95_residual_ms =
+                Some(worst_local_p95_residual_ms.map_or(candidate, |worst| worst.max(candidate)));
+        }
+        for &(_, event_kind, anchor_index) in &events[cursor..group_end] {
+            if event_kind == 1 && active_indices.remove(&anchor_index) {
+                residual_rank_index.remove(residual_coordinates[anchor_index]);
+            }
+        }
+        if let Some(candidate) = v2_active_window_local_p95(
+            &anchors,
+            &active_indices,
+            &residual_values,
+            &residual_rank_index,
+        ) {
+            worst_local_p95_residual_ms =
+                Some(worst_local_p95_residual_ms.map_or(candidate, |worst| worst.max(candidate)));
+        }
+        cursor = group_end;
+    }
+    worst_local_p95_residual_ms
+}
+
+fn v2_final_map_local_validation(
+    spans: &[AudioTimeMapSpanDto],
+    held_out: &[V2TimedAnchorResidual],
+) -> V2FinalMapLocalValidation {
+    let mut ordered_held_out = held_out.to_vec();
+    ordered_held_out.sort_unstable_by_key(|anchor| (anchor.source_time_ms, anchor.residual_ms));
+    let mut worst_local_p95_residual_ms = None::<u64>;
+    let mut diagnostic_gap = None::<(u64, u64)>;
+    let mut unvalidated_gap_blocked = false;
+
+    for span in spans
+        .iter()
+        .filter(|span| span.kind == AudioTimeMapSpanKind::Matched)
+    {
+        let held_out_start =
+            ordered_held_out.partition_point(|anchor| anchor.source_time_ms < span.source_start_ms);
+        let held_out_end =
+            ordered_held_out.partition_point(|anchor| anchor.source_time_ms < span.source_end_ms);
+        let span_held_out = &ordered_held_out[held_out_start..held_out_end];
+        let source_duration_ms = span.source_end_ms.saturating_sub(span.source_start_ms);
+        let held_out_time_block_count = v2_distinct_holdout_time_block_count(span_held_out);
+        let allowed_gap_ms =
+            v2_allowed_unvalidated_gap_ms(source_duration_ms, held_out_time_block_count);
+        let max_gap_ms =
+            v2_max_unvalidated_gap_ms(span_held_out, span.source_start_ms, span.source_end_ms);
+        let span_gap_blocked = max_gap_ms > allowed_gap_ms;
+        if span_gap_blocked {
+            if !unvalidated_gap_blocked
+                || diagnostic_gap.is_none_or(|(reported_gap_ms, reported_allowed_ms)| {
+                    max_gap_ms > reported_gap_ms
+                        || (max_gap_ms == reported_gap_ms && allowed_gap_ms < reported_allowed_ms)
+                })
+            {
+                diagnostic_gap = Some((max_gap_ms, allowed_gap_ms));
+            }
+            unvalidated_gap_blocked = true;
+        } else if !unvalidated_gap_blocked
+            && diagnostic_gap.is_none_or(|(reported_gap_ms, _)| max_gap_ms > reported_gap_ms)
+        {
+            diagnostic_gap = Some((max_gap_ms, allowed_gap_ms));
+        }
+
+        if let Some(candidate) = v2_worst_sliding_local_p95(span_held_out) {
+            worst_local_p95_residual_ms =
+                Some(worst_local_p95_residual_ms.map_or(candidate, |worst| worst.max(candidate)));
+        }
+    }
+
+    let (max_unvalidated_gap_ms, allowed_unvalidated_gap_ms) = diagnostic_gap.unwrap_or((0, 0));
+
+    V2FinalMapLocalValidation {
+        worst_local_p95_residual_ms,
+        max_unvalidated_gap_ms,
+        allowed_unvalidated_gap_ms,
+        unvalidated_gap_blocked,
     }
 }
 
@@ -12697,6 +13021,14 @@ fn create_v2_alignment_proposal(
         graph_p99_residual_ms,
         graph_max_residual_ms,
     ) = v2_residual_statistics(&final_anchor_summary.held_out_residuals);
+    let local_validation = v2_final_map_local_validation(
+        &alignment.spans,
+        &final_anchor_summary.held_out_timed_residuals,
+    );
+    let local_residual_blocked = local_validation
+        .worst_local_p95_residual_ms
+        .is_some_and(|value| value > ALIGNMENT_V2_LOCAL_HELD_OUT_P95_MAX_MS);
+    let unvalidated_gap_blocked = local_validation.unvalidated_gap_blocked;
     let held_out_validation_coverage = if pair.hypothesis.held_out_anchors.is_empty() {
         None
     } else {
@@ -12711,7 +13043,9 @@ fn create_v2_alignment_proposal(
         || graph_p95_residual_ms.is_none_or(|value| value > 400)
         || graph_p99_residual_ms.is_none_or(|value| value > 500)
         || graph_max_residual_ms.is_none_or(|value| value > 1_000)
-        || held_out_validation_coverage.is_some_and(|value| value < 0.50);
+        || held_out_validation_coverage.is_some_and(|value| value < 0.50)
+        || local_residual_blocked
+        || unvalidated_gap_blocked;
     let blocked_span_count = alignment
         .spans
         .iter()
@@ -12748,6 +13082,20 @@ fn create_v2_alignment_proposal(
             validation_coverage * 100.0,
             final_anchor_summary.held_out_within_tolerance_count,
             pair.hypothesis.held_out_anchors.len()
+        ));
+    }
+    if local_residual_blocked {
+        quality_reasons.push(format!(
+            "局部留出残差门控失败：重叠 {} ms 时间窗的最坏 P95 为 {:?} ms，高于 {} ms。",
+            ALIGNMENT_V2_LOCAL_HELD_OUT_WINDOW_MS,
+            local_validation.worst_local_p95_residual_ms,
+            ALIGNMENT_V2_LOCAL_HELD_OUT_P95_MAX_MS
+        ));
+    }
+    if unvalidated_gap_blocked {
+        quality_reasons.push(format!(
+            "留出锚点时间覆盖门控失败：最大无验证锚跨度 {} ms，高于当前 TimeMap 允许的 {} ms。",
+            local_validation.max_unvalidated_gap_ms, local_validation.allowed_unvalidated_gap_ms
         ));
     }
     if blocked_span_count > 0 {
@@ -12801,6 +13149,13 @@ fn create_v2_alignment_proposal(
         graph_p95_residual_ms,
         graph_p99_residual_ms,
         graph_max_residual_ms
+    ));
+    diagnostics.push(format!(
+        "Final TimeMap 局部门控：{} ms 重叠时间窗最坏 P95={:?} ms；最大无验证锚跨度 {}/{} ms（实际/允许）。",
+        ALIGNMENT_V2_LOCAL_HELD_OUT_WINDOW_MS,
+        local_validation.worst_local_p95_residual_ms,
+        local_validation.max_unvalidated_gap_ms,
+        local_validation.allowed_unvalidated_gap_ms
     ));
     diagnostics.extend(quality_reasons.clone());
     let compatibility_p95 = graph_p95_residual_ms
@@ -21499,17 +21854,28 @@ mod tests {
     }
 
     fn v2_test_final_map_hypothesis(scale: f64, stored_residual_ms: i64) -> AffineHypothesis {
+        v2_test_final_map_hypothesis_for_duration(scale, stored_residual_ms, 50_000)
+    }
+
+    fn v2_test_final_map_hypothesis_for_duration(
+        scale: f64,
+        stored_residual_ms: i64,
+        source_end_ms: i64,
+    ) -> AffineHypothesis {
         let create_anchor = |source_time_ms: i64| AffineAnchorEvidence {
             source_time_ms,
             target_time_ms: (scale * source_time_ms as f64).round() as i64,
             residual_ms: stored_residual_ms,
         };
-        let training_anchors = [1_000, 10_000, 20_000, 30_000, 40_000, 49_000]
+        let at_fraction = |numerator: i64| source_end_ms * numerator / 50;
+        let training_anchors = [1, 10, 20, 30, 40, 49]
             .into_iter()
+            .map(at_fraction)
             .map(create_anchor)
             .collect::<Vec<_>>();
-        let held_out_anchors = [5_000, 15_000, 25_000, 35_000, 45_000]
+        let held_out_anchors = [5, 15, 25, 35, 45]
             .into_iter()
+            .map(at_fraction)
             .map(create_anchor)
             .collect::<Vec<_>>();
         AffineHypothesis {
@@ -21521,7 +21887,7 @@ mod tests {
             unique_target_count: training_anchors.len(),
             unique_target_coverage: 0.96,
             source_start_ms: 0,
-            source_end_ms: 50_000,
+            source_end_ms,
             p50_residual_ms: stored_residual_ms,
             p95_residual_ms: stored_residual_ms,
             max_residual_ms: stored_residual_ms,
@@ -24570,6 +24936,398 @@ mod tests {
     }
 
     #[test]
+    fn v2_final_map_local_holdout_gate_blocks_mid_timeline_hump_with_correct_endpoints() {
+        let mut pair = v2_test_pair_candidate();
+        let mut hypothesis = v2_test_final_map_hypothesis(1.0, 0);
+        for anchor in &mut hypothesis.held_out_anchors {
+            if matches!(anchor.source_time_ms, 25_000 | 35_000) {
+                anchor.target_time_ms += 300;
+            }
+        }
+        pair.hypothesis = hypothesis;
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    50_000,
+                    0,
+                    50_000,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "local held-out residual test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.source_start_ms, 0);
+        assert_eq!(time_map.source_end_ms, 50_000);
+        assert_eq!(time_map.target_start_ms, 0);
+        assert_eq!(time_map.target_end_ms, 50_000);
+        assert_eq!(time_map.quality.level, "blocked");
+        assert_eq!(time_map.quality.p95_residual_ms, Some(300));
+        assert_eq!(time_map.quality.max_residual_ms, Some(300));
+        assert_eq!(
+            time_map.spans[0].quality.level, "review",
+            "the old whole-span residual gate alone must remain below its 400 ms P95 threshold"
+        );
+        assert!(proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("局部留出残差门控失败") && line.contains("300")));
+    }
+
+    #[test]
+    fn v2_final_map_blocks_excessive_gap_between_held_out_anchors() {
+        let mut pair = v2_test_pair_candidate();
+        let mut hypothesis = v2_test_final_map_hypothesis(1.0, 0);
+        hypothesis
+            .held_out_anchors
+            .retain(|anchor| matches!(anchor.source_time_ms, 5_000 | 45_000));
+        hypothesis.held_out_within_tolerance_count = hypothesis.held_out_anchors.len();
+        pair.hypothesis = hypothesis;
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    50_000,
+                    0,
+                    50_000,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "held-out gap test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.quality.level, "blocked");
+        assert_eq!(time_map.quality.p95_residual_ms, Some(0));
+        assert!(proposal.diagnostics.iter().any(|line| {
+            line.contains("最大无验证锚跨度 40000 ms") && line.contains("25000 ms")
+        }));
+    }
+
+    #[test]
+    fn v2_final_map_source_only_span_does_not_inflate_matched_validation_gaps() {
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 35_000, 0, 35_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::SourceOnly,
+                35_000,
+                65_000,
+                35_000,
+                35_000,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                65_000,
+                100_000,
+                35_000,
+                70_000,
+            ),
+        ];
+        let edit_span = &mut spans[1];
+        for boundary in [
+            &mut edit_span.boundaries.start,
+            &mut edit_span.boundaries.end,
+        ] {
+            boundary.status = AudioTimeMapBoundaryStatus::Refined;
+            boundary.support_duration_ms = 5_000;
+            boundary.refined_ms = boundary.coarse_ms;
+            boundary.reason = "test boundary evidence".to_string();
+        }
+        let anchor = |source_time_ms, target_time_ms| AffineAnchorEvidence {
+            source_time_ms,
+            target_time_ms,
+            residual_ms: 0,
+        };
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, 100_000);
+        hypothesis.training_anchors = vec![
+            anchor(1_000, 1_000),
+            anchor(18_000, 18_000),
+            anchor(33_000, 33_000),
+            anchor(67_000, 37_000),
+            anchor(82_000, 52_000),
+            anchor(98_000, 68_000),
+        ];
+        hypothesis.held_out_anchors = vec![
+            anchor(5_000, 5_000),
+            anchor(10_000, 10_000),
+            anchor(15_000, 15_000),
+            anchor(20_000, 20_000),
+            anchor(25_000, 25_000),
+            anchor(30_000, 30_000),
+            anchor(34_000, 34_000),
+            anchor(66_000, 36_000),
+            anchor(70_000, 40_000),
+            anchor(75_000, 45_000),
+            anchor(80_000, 50_000),
+            anchor(85_000, 55_000),
+            anchor(90_000, 60_000),
+            anchor(95_000, 65_000),
+            anchor(99_000, 69_000),
+        ];
+        hypothesis.inlier_count = hypothesis.training_anchors.len();
+        hypothesis.unique_source_count = hypothesis.training_anchors.len();
+        hypothesis.unique_target_count = hypothesis.training_anchors.len();
+        hypothesis.held_out_within_tolerance_count = hypothesis.held_out_anchors.len();
+        let mut pair = v2_test_pair_candidate();
+        pair.hypothesis = hypothesis;
+
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans,
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "source-only validation-gap test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(proposal.time_map.unwrap().quality.level, "review");
+        assert!(!proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("留出锚点时间覆盖门控失败")));
+    }
+
+    #[test]
+    fn v2_final_map_sparse_hour_single_bad_holdout_blocks_locally() {
+        const SOURCE_DURATION_MS: i64 = 3_600_000;
+        let mut pair = v2_test_pair_candidate();
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, SOURCE_DURATION_MS);
+        hypothesis.held_out_anchors = (0..32)
+            .map(|index| {
+                let source_time_ms = (i64::from(index) * 2 + 1) * SOURCE_DURATION_MS / (2 * 32);
+                AffineAnchorEvidence {
+                    source_time_ms,
+                    target_time_ms: source_time_ms + if index == 16 { 300 } else { 0 },
+                    residual_ms: 0,
+                }
+            })
+            .collect();
+        hypothesis.held_out_within_tolerance_count = 31;
+        pair.hypothesis = hypothesis;
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    SOURCE_DURATION_MS as u64,
+                    0,
+                    SOURCE_DURATION_MS as u64,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "sparse one-hour local residual test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.quality.level, "blocked");
+        assert_eq!(time_map.quality.p95_residual_ms, Some(0));
+        assert_eq!(time_map.quality.p99_residual_ms, Some(300));
+        assert!(proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("局部留出残差门控失败") && line.contains("300")));
+        assert!(!proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("留出锚点时间覆盖门控失败")));
+    }
+
+    #[test]
+    fn v2_final_map_ninety_minute_uniform_thirty_two_holdout_blocks_stays_review() {
+        const SOURCE_DURATION_MS: i64 = 5_400_000;
+        let mut pair = v2_test_pair_candidate();
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, SOURCE_DURATION_MS);
+        hypothesis.held_out_anchors = (0..32)
+            .flat_map(|index| {
+                let nominal_time_ms = (i64::from(index) * 2 + 1) * SOURCE_DURATION_MS / (2 * 32);
+                let block_start_ms = nominal_time_ms.div_euclid(AFFINE_HOLDOUT_TIME_BLOCK_MS)
+                    * AFFINE_HOLDOUT_TIME_BLOCK_MS;
+                [100, 400, 700].map(move |offset_ms| {
+                    let source_time_ms = block_start_ms + offset_ms;
+                    AffineAnchorEvidence {
+                        source_time_ms,
+                        target_time_ms: source_time_ms,
+                        residual_ms: 0,
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(hypothesis.held_out_anchors.len(), 32 * 3);
+        hypothesis.held_out_within_tolerance_count = hypothesis.held_out_anchors.len();
+        pair.hypothesis = hypothesis;
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    SOURCE_DURATION_MS as u64,
+                    0,
+                    SOURCE_DURATION_MS as u64,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "ninety-minute uniform held-out capacity test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(proposal.time_map.unwrap().quality.level, "review");
+        assert!(!proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("留出锚点时间覆盖门控失败")));
+        assert!(proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("Final TimeMap 局部门控") && line.contains("/168750 ms")));
+    }
+
+    #[test]
+    fn v2_final_map_ninety_minute_nonuniform_holdout_hole_remains_blocked() {
+        const SOURCE_DURATION_MS: i64 = 5_400_000;
+        const QUARTER_DURATION_MS: i64 = SOURCE_DURATION_MS / 4;
+        let mut pair = v2_test_pair_candidate();
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, SOURCE_DURATION_MS);
+        hypothesis.held_out_anchors = (0..32)
+            .flat_map(|index| {
+                let local_index = i64::from(index % 16);
+                let nominal_time_ms = if index < 16 {
+                    (local_index * 2 + 1) * QUARTER_DURATION_MS / (2 * 16)
+                } else {
+                    3 * QUARTER_DURATION_MS + (local_index * 2 + 1) * QUARTER_DURATION_MS / (2 * 16)
+                };
+                let block_start_ms = nominal_time_ms.div_euclid(AFFINE_HOLDOUT_TIME_BLOCK_MS)
+                    * AFFINE_HOLDOUT_TIME_BLOCK_MS;
+                [100, 400, 700].map(move |offset_ms| {
+                    let source_time_ms = block_start_ms + offset_ms;
+                    AffineAnchorEvidence {
+                        source_time_ms,
+                        target_time_ms: source_time_ms,
+                        residual_ms: 0,
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(hypothesis.held_out_anchors.len(), 32 * 3);
+        hypothesis.held_out_within_tolerance_count = hypothesis.held_out_anchors.len();
+        pair.hypothesis = hypothesis;
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    SOURCE_DURATION_MS as u64,
+                    0,
+                    SOURCE_DURATION_MS as u64,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "ninety-minute nonuniform held-out gap test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(proposal.time_map.unwrap().quality.level, "blocked");
+        assert!(proposal.diagnostics.iter().any(|line| {
+            line.contains("留出锚点时间覆盖门控失败") && line.contains("168750 ms")
+        }));
+    }
+
+    #[test]
+    fn v2_final_map_local_residual_between_ransac_and_goal_limit_stays_review() {
+        let mut pair = v2_test_pair_candidate();
+        let mut hypothesis = v2_test_final_map_hypothesis(1.0, 0);
+        hypothesis.held_out_anchors[2].target_time_ms += 180;
+        hypothesis.held_out_within_tolerance_count = 4;
+        pair.hypothesis = hypothesis;
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    50_000,
+                    0,
+                    50_000,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "dedicated local residual threshold test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.quality.level, "review");
+        assert_eq!(time_map.quality.p95_residual_ms, Some(180));
+        assert!(!proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("局部留出残差门控失败")));
+    }
+
+    #[test]
+    fn v2_sliding_local_window_covers_fourteen_and_thirty_one_second_alias() {
+        let held_out = [
+            V2TimedAnchorResidual {
+                source_time_ms: 14_000,
+                residual_ms: 0,
+            },
+            V2TimedAnchorResidual {
+                source_time_ms: 31_000,
+                residual_ms: 300,
+            },
+        ];
+
+        assert_eq!(v2_worst_sliding_local_p95(&held_out), Some(300));
+    }
+
+    #[test]
     fn v2_final_map_anchor_residual_matches_export_half_open_endpoint_rounding() {
         let contracted = create_v2_span(AudioTimeMapSpanKind::Matched, 0, 3, 100, 101);
         let contracted_endpoint = AffineAnchorEvidence {
@@ -25684,6 +26442,8 @@ mod tests {
         assert_eq!(summary.supported_observations, 0);
         assert!(v2_visual_summary_is_conflict(&summary));
 
+        let mut pair = v2_test_pair_candidate();
+        pair.hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, 120_000);
         let mut proposal = create_v2_alignment_proposal(
             V2ChunkAlignment {
                 spans: vec![create_v2_span(
@@ -25697,7 +26457,7 @@ mod tests {
                 ambiguous_step_count: 0,
             },
             V2BoundarySummary::default(),
-            v2_test_pair_candidate(),
+            pair,
             0.5,
             ALIGNMENT_V2_MIN_TRACK_MARGIN,
             "test audio".to_string(),

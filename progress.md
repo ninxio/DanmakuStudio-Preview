@@ -1,3 +1,16 @@
+- 2026-07-14：C137 完成第六阶段第十七个切片“局部留出漂移门禁、development Gold 治理候选与 formal frozen 失败关闭”，完整验证并重新打包；Goal 继续进行。
+  - 最终 TimeMap 新增真实局部漂移闸门：按每个 matched span 独立计算 30 秒滑动窗口 held-out P95，超过 200 ms 即 blocked；sourceOnly、targetOnly 与 ambiguous 编辑段不参与漂移窗口，最大无验证间隙也按 matched span 约束，不再由全片平均值掩盖局部错位。
+  - 长片稀疏证据不再按原始 anchor 数误判：验证容量统一使用 1 秒离散 held-out 时间块，90 分钟、32 个均匀时间块且每块多 anchor 可进入 review；同样容量若中央出现未验证大洞仍 blocked。1 小时 32 点、局部 300 ms 漂移会阻断，180 ms 保持 review；30 秒 source-only 不制造假阻断。
+  - 新增真实媒体 Gold 的 development 治理候选：只能从当前项目中已确认、已人工复核、签名仍有效且媒体身份/修订/核心摘要完全闭合的 TimeMap 导出标注；双人标注要求 reviewer、verification、review evidence 三重独立，分歧时必须提供完整第三份裁决标注。连续、单调、跨类型重叠、编辑段内 anchor 与边界矛盾均严格校验。
+  - 新增单 case 治理 bundle 与本机运行包：固定携带两份标注、可选裁决、治理 receipt、manifest 与明确的本机路径警告；场景标签只由 Gold 结构、媒体身份和时长确定性派生，不允许操作员勾选不存在的多音轨、视觉、重复片段或 PTS 证据。音轨必须显式绑定，绝不猜测默认/第一视频流。
+  - 信任边界失败关闭：当前 HMAC 只能证明本机材料自洽，不能跨机器认证具体标注者，也没有外部签名、撤销 authority 与挑战新鲜度。因此 bundle 固定 `releaseEligible:false` / `untrusted-self-consistent-gold-governance`；界面和底层 runner 都拒绝任何真实 `frozen-test`，只允许 development。当前获授权正式冻结 Gold 仍为 **0**，不会用 raw manifest 或本机 bundle 冒充正式准确率证据。
+  - benchmark 去敏统一为单一实现：错误、报告与下载前泄漏检查覆盖大小写 Windows 盘符、正反斜杠、`\\?\\`、JSON 转义、UNC、extended UNC 与 slash UNC；发现本地绝对路径即阻断发布，避免 development 包路径进入可分享证据。
+  - CPU/GPU 用户开关继续包含在本阶段安装包：`设置 → 播放器与工具 → 声谱计算策略` 提供“自动推荐 / 强制 GPU / 强制 CPU”。设置统一传入单次、N×M 批量、精度和性能 benchmark；强制 GPU 失败即停止且不静默回退，强制 CPU 不探测 CUDA。RTX 4090（24564 MiB、driver 610.74、compute 8.9）配合 CUDA Toolkit 13.3 强制 CUDA/cuFFT 回归 **26/26** 实际通过。
+  - 自动验收：Rust 串行全量 **395 passed / 18 ignored / 0 failed**，Rustfmt、strict Clippy `-D warnings` 与 `git diff --check` 通过；`corepack pnpm verify:release` 完整通过源码审计、ESLint、Vitest **88 files / 899 tests**、TypeScript/Vite production build、Chromium 四页北极星 **6/6** 和 Tauri NSIS release。
+  - 本阶段安装器：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `4163999` 字节，时间 `2026-07-14 01:52:06 +08:00`，SHA-256 `EBD66C20C5D42100BC2198658DEE380B70668CC0649DC90D6EA2CC1B78859548`。
+  - 本阶段便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `16274944` 字节，时间 `2026-07-14 01:52:06 +08:00`，SHA-256 `F37EC3F6A44B0547C46C94E8C131EA9F5784B1F3BD01B5B60D029D155FC66969`。
+  - 诚实限制：本切片建立了局部误差门禁、可复核的 Gold 候选生产与治理结构，但还没有外部标注 authority、获授权真实冻结集、用户影片整体匹配准确率、删减双边界 P95、概率校准或 20 套真实北极星长合集。因此 C137 继续 active，不能开放正式 `verified`，也不能声称实际错位和删减检测已在真实影片上达标。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-local-drift-gold-governance-v1-20260714`。
 - 2026-07-14：C137 完成第六阶段第十六个切片“最终 TimeMap 变速闭环、CPU/GPU 请求级策略与候选 lineage 加固”，完整验证并重新打包；Goal 继续进行。
   - 非 1.0 变速不再被伪装成删减：fine frame 拆分为公共 DP 坐标与真实 presentation 坐标，参考特征先按 coarse affine 投影到公共网格，traceback 与最终 TimeMap 仍使用真实媒体时间；feature 升级到 v15，使旧缓存和旧 execution evidence 自动失效。1.02 等速变速回归恢复约 1.02 的最终斜率且片尾漂移为 0，不再因两侧原始 50 ms hop 相同而强制输出 slope=1。
   - 短 gap 只按证据吸收：单个 50/100 ms gap 只有左右 matched 均呈同方向非单位斜率且合并显著改善 coarse tempo 残差时才可吸收；尚未形成局部斜率时，必须至少 3 个同方向、固定 cadence、每段 scale 误差不超过 0.005 的 lattice gap 才构成变速证书。真实 50/100/101 ms 编辑、前后缀与重复微删减均有保留回归；正式 ≥1 s 双向编辑继续保持。

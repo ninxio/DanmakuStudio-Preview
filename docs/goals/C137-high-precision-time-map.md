@@ -15,6 +15,8 @@
 
 当前生产工程模型已升级为 schema v13 / `media-time-map-core-v2`：每个 span 保存稳定 ID、独立训练/真实留出锚点统计、p50/p95/p99/max 残差、独特内容覆盖、左右支持、结构化边界不确定区间、失败原因和备选路径。留出观测在 seed、拟合、排序和 refit 前分区，逐段证据缺失或 blocked 时投影与 verified export 失败关闭；旧项目只会保守补成 `legacy-unverified`，不会从图级平均值伪造逐段测量。桌面 XML 导入同时由 native 固定并读取精确字节、独立解析、写入内容寻址存储并签发安装级 HMAC 收据；`verified-export-manifest-v3` 会绑定收据、完整投影 derivation、项目投影摘要和输出摘要，native 在写盘前重读 CAS 并重算不可变弹幕库存。普通原生 writer 只接受有界 `.txt` 报告，投影 `.xml/.zip` 只能走 verified writer。
 
+最终 TimeMap 的真实留出门禁还会在每个 matched span 的来源时间轴上计算真实滑动 30 秒窗口局部 P95，并检查 span 首尾及相邻 held-out anchor 的最大无验证跨度；edit span 不会被误算成证据空洞，允许跨度同时按实际 held-out 数量扩展，避免 90 分钟以上长片因 32 块采样上限被结构性误阻断。端点正确但中段形成局部非线性弯曲、或 matched 区大段没有验证观测时仍会明确 blocked。真实 Gold 建立工具已进入匹配页高级区：只有已确认且通过受信 A/B 人工签发的 TimeMap 才能生成路径无关 annotation；live UI 核对本机签发/撤销状态，annotation 记录 verifier、verification ID、签名与 review evidence digest，治理比较覆盖全部 anchors、映射 offset 和三类差异的连续单调结构。receipt/bundle 固定 `releaseEligible=false` 和 `untrusted-self-consistent-gold-governance`；导出 HMAC 无法跨机证明 annotation-specific Gold 和现实人员身份，所以工具只生成 development 候选，React 与底层 runner 都拒绝 formal `frozen-test`。场景标签仅从 Gold、身份和时长派生，缺少签名 probe evidence 的多音轨/视觉/重复/PTS 标签不计覆盖。当前实际获授权并完成冻结的关系仍为 0。
+
 `projectSnapshotDigest` 当前是 native 可重算的 canonical 投影摘要，不是带单调 revision/head 的 native 项目意图签名。它和 XML 收据足以阻止“修改原始弹幕并同步重算输出/manifest”的项目 JSON 伪造，但仍不能把已完全控制 Tauri invoke 的 renderer 所提交的 routes、ignored、disabled 或 adjustment 证明为用户原始意图；该更强边界仍需 native project snapshot authority、单调 head 和明确 user-gesture capability，不能在当前阶段冒充已解决。
 
 这些能力解决的是“怎样盲跑生产算法、怎样安全拥有和清理媒体进程树、怎样把实际媒体卷绑定到性能记录、怎样防止改字符串/自摘要/跨 workload 复用冒充完整验收”，不代表真实准确率或正式性能验收已经通过。实际 `workload-media-volumes` 回执已经完成，但 lifecycle Job 只负责执行与清理；当前 raw v2 仍如实声明 `windows-toolhelp-working-set-v1`，`assurance` 中的 Job memory、terminal cleanup 与 native attestation 仍为空。故该产物继续固定为 `releaseEligible=false` 的 engineering raw。当前获授权且完成运行的真实冻结关系数仍为 0；实测校准、批准协议与外部信任根、规定目标机的正式性能测量、20 套北极星长合集和真实媒体回归均未完成。
@@ -494,6 +496,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] 局部精修输出双侧证据和边界不确定范围。
 - [x] 音画冲突会降级或阻塞，不会被平均 confidence 掩盖。
 - [x] 生产 landmark 在拟合前做确定性真实留出，并按 span 输出 p50/p95/p99/max、覆盖、边界支持、原因和 alternatives；同一时间帧不得跨训练/留出分区。
+- [x] 最终 TimeMap 以重叠局部窗口残差和最大无验证锚跨度补充图级 held-out 统计；局部中段弯曲与长时间证据空洞会失败关闭。
 
 ### 质量、UX 与导出
 
@@ -518,6 +521,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] acceptance bundle v3 / protocol v5 与 performance report v3 只接受对应 formal schema；性能链独立检查当前 manifest、storage、Job memory、terminal cleanup 与 attestation，blind matrix 链直接重算 plan/projection/execution/native receipt v2/raw/global decision；改字符串、自摘要、选择性漏报、重复 cell、local Top-K、自建 trustContext 或跨 workload 重签均不能通过。
 - [x] native benchmark v2 在任何工具探测前会话级固定全部 workload media、distinct 文件只完整哈希一次、支持 mounted-folder 实际卷去重，并拒绝未注册/跨 case/流错配 job。
 - [x] 匹配页高级诊断提供工程性能采集与取消入口，复用同一 manifest、二次校验 workload/case binding，并在下载前执行路径与媒体秘密扫描。
+- [x] 匹配页高级诊断可从受信人工复核关系生成路径无关 Gold annotation 候选；本机治理校验复核元数据、连续单调结构并只允许显式共识或第三份仲裁。由于尚无 annotation-specific 外部签名/撤销 authority，该链固定为 development、非 release，任何 formal `frozen-test` 都失败关闭，实际冻结关系仍为 0。
 - [x] 原生 N×M batch evidence v1 固定完整 source-major 笛卡尔积、候选数/Top-10/决策候选和原子终态；blind compiler 用显式关系轴、实际视觉模式、两侧独立 salted commitment、严格 `candidateCount > K` 与 projection digest 阻断 gold 编号泄漏、伪候选和跨 manifest 重放，并让公开报告只保留纯聚合指标。
 - [x] formal acceptance 直接消费并重算私有 exhaustive query×candidate matrix plan/projection/execution/native-receipt-v2/raw provenance，并从全部 cell 重算 global Top-K 后逐条绑定 relationship report；调用方或局部 shard 自报 Top-K 不能形成内容闭环。
 - [ ] 为 formal blind plan 和 native execution 增加独立 authority 签名、一次性 challenge、有效期与防重放账本，并把 modality/calibration 纳入冻结审批；在此之前 `native-blind-ranking-provenance` 仍因 `self-consistent-no-native-authority` incomplete。

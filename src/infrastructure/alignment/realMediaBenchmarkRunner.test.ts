@@ -26,6 +26,22 @@ import {
 } from "./realMediaBenchmarkRunner";
 
 describe("C137 manifest v2 生产 benchmark runner", () => {
+  it("底层 runner 直接拒绝 raw frozen-test，不能绕过 React 门禁", async () => {
+    const manifest = createManifest(1);
+    if (!manifest.cases[0]) throw new Error("runner 冻结阻断测试缺少 case。");
+    manifest.cases[0].split = "frozen-test";
+    const bridge: AudioAlignmentJobInvoker = {
+      start: vi.fn(),
+      get: vi.fn(),
+      cancel: vi.fn()
+    };
+
+    await expect(
+      runRealMediaBenchmarkManifest(manifest, { alignmentInvoker: bridge })
+    ).rejects.toThrow("仅接受 development");
+    expect(bridge.start).not.toHaveBeenCalled();
+  });
+
   it("以 blind manifest 调生产 V2 job，显式绑定音视频流并输出可分享报告", async () => {
     const manifest = createManifest(1);
     const received: NormalizedTauriAudioAlignmentRequest[] = [];
@@ -74,10 +90,19 @@ describe("C137 manifest v2 生产 benchmark runner", () => {
     });
 
     const runManifest = projectRealMediaBenchmarkRunManifest(manifest);
-    expect(JSON.stringify(runManifest)).not.toMatch(/gold|reviewer|adjudication|split|scenario/i);
-    expect(validateRealMediaBenchmarkRunManifest(runManifest)).toEqual({ valid: true, issues: [] });
-    expect(validateRealMediaBenchmarkRunManifest({ ...runManifest, gold: {} }).valid).toBe(false);
-    expect(report.runManifestDigest).toBe(createRealMediaBenchmarkRunManifestDigest(runManifest));
+    expect(JSON.stringify(runManifest)).not.toMatch(
+      /gold|reviewer|adjudication|split|scenario/i
+    );
+    expect(validateRealMediaBenchmarkRunManifest(runManifest)).toEqual({
+      valid: true,
+      issues: []
+    });
+    expect(validateRealMediaBenchmarkRunManifest({ ...runManifest, gold: {} }).valid).toBe(
+      false
+    );
+    expect(report.runManifestDigest).toBe(
+      createRealMediaBenchmarkRunManifestDigest(runManifest)
+    );
 
     const serialized = serializeRealMediaBenchmarkRunReport(report);
     expect(serializeRealMediaBenchmarkRunReport(report)).toBe(serialized);
@@ -363,7 +388,14 @@ describe("C137 manifest v2 生产 benchmark runner", () => {
       cancellationGraceMs: 20
     });
 
-    expect(events).toEqual(["start-1", "get-1", "cancel-1", "get-cancelled-1", "start-2", "get-2"]);
+    expect(events).toEqual([
+      "start-1",
+      "get-1",
+      "cancel-1",
+      "get-cancelled-1",
+      "start-2",
+      "get-2"
+    ]);
     expect(report.cases[0]).toMatchObject({
       status: "failed",
       failure: { code: "job-timeout" }
@@ -461,7 +493,7 @@ function createManifest(
       id: `${mediaKind}-case-${index + 1}`,
       title: `关系 ${index + 1}`,
       mediaKind,
-      split: "frozen-test" as const,
+      split: "development" as const,
       scenarios: ["global-offset" as const],
       source: createMedia(`case-${index + 1}-source`, index % 10, 1, 2, real),
       target: createMedia(`case-${index + 1}-target`, (index + 5) % 10, 4, 3, real),
@@ -603,7 +635,10 @@ function createProbeResult(
   };
 }
 
-function createProposal(manifest: RealMediaBenchmarkManifest, index: number): AlignmentProposal {
+function createProposal(
+  manifest: RealMediaBenchmarkManifest,
+  index: number
+): AlignmentProposal {
   const benchmarkCase = manifest.cases[index];
   const sourceIdentity = benchmarkCase.source.contentIdentity;
   const targetIdentity = benchmarkCase.target.contentIdentity;

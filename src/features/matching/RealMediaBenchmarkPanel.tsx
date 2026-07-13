@@ -2,11 +2,17 @@ import { isTauri } from "@tauri-apps/api/core";
 import { Cpu, Download, FileJson, Gauge, Play, Square } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
+import type { EditorProject } from "../../domain/project/types";
 import {
   parseRealMediaBenchmarkManifestJson,
   type C137BenchmarkGateCheck,
   type RealMediaBenchmarkManifest
 } from "../../domain/alignment/realMediaBenchmark";
+import {
+  REAL_MEDIA_GOLD_BENCHMARK_BUNDLE_KIND,
+  parseRealMediaGoldBenchmarkBundleJson,
+  type RealMediaGoldBenchmarkBundle
+} from "../../domain/alignment/realMediaGoldBenchmarkBundle";
 import {
   getC137PerformanceMeasuredRuns,
   getC137PerformancePeakRss,
@@ -33,9 +39,11 @@ import {
   type RealMediaPerformancePhase
 } from "../../infrastructure/alignment/realMediaPerformanceRunner";
 import {
-  loadAppSettings,
-  type AppSettings
-} from "../../infrastructure/settings/appSettings";
+  containsSensitiveText,
+  redactSensitiveText
+} from "../../infrastructure/alignment/sensitiveTextRedaction";
+import { loadAppSettings, type AppSettings } from "../../infrastructure/settings/appSettings";
+import { RealMediaGoldGovernancePanel } from "./RealMediaGoldGovernancePanel";
 
 export type RealMediaBenchmarkPanelRunner = (
   manifest: RealMediaBenchmarkManifest,
@@ -58,6 +66,7 @@ interface RealMediaBenchmarkPanelProps {
   runner?: RealMediaBenchmarkPanelRunner;
   performanceRunner?: RealMediaPerformancePanelRunner;
   desktopAvailable?: boolean;
+  project?: EditorProject | null;
 }
 
 type RunPhase = "idle" | "running" | "cancelling";
@@ -65,12 +74,16 @@ type RunPhase = "idle" | "running" | "cancelling";
 export function RealMediaBenchmarkPanel({
   runner = runRealMediaBenchmarkManifest,
   performanceRunner = defaultPerformancePanelRunner,
-  desktopAvailable: desktopAvailableOverride
+  desktopAvailable: desktopAvailableOverride,
+  project = null
 }: RealMediaBenchmarkPanelProps) {
   const desktopAvailable = desktopAvailableOverride ?? isTauri();
   const [open, setOpen] = useState(false);
   const [manifestFileName, setManifestFileName] = useState<string | null>(null);
   const [manifest, setManifest] = useState<RealMediaBenchmarkManifest | null>(null);
+  const [governedBundle, setGovernedBundle] = useState<RealMediaGoldBenchmarkBundle | null>(
+    null
+  );
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [report, setReport] = useState<RealMediaBenchmarkRunReport | null>(null);
   const [runPhase, setRunPhase] = useState<RunPhase>("idle");
@@ -100,14 +113,21 @@ export function RealMediaBenchmarkPanel({
     operationRef.current = operation;
     setManifestFileName(file.name);
     setManifest(null);
+    setGovernedBundle(null);
     setManifestError(null);
     setReport(null);
     setRunError(null);
     setDownloadStatus(null);
     try {
       const text = await readTextFile(file);
-      const parsed = parseRealMediaBenchmarkManifestJson(text);
+      const parsedJson = parseJson(text);
+      const bundle =
+        isRecord(parsedJson) && parsedJson.kind === REAL_MEDIA_GOLD_BENCHMARK_BUNDLE_KIND
+          ? parseRealMediaGoldBenchmarkBundleJson(text)
+          : null;
+      const parsed = bundle?.manifest ?? parseRealMediaBenchmarkManifestJson(text);
       if (operationRef.current !== operation) return;
+      setGovernedBundle(bundle);
       setManifest(parsed);
     } catch (error: unknown) {
       if (operationRef.current !== operation) return;
@@ -140,11 +160,7 @@ export function RealMediaBenchmarkPanel({
       if (!validation.valid) {
         throw new Error(`runner 返回的报告无效：${validation.issues.join("；")}`);
       }
-      assertBenchmarkReportMatchesManifest(
-        nextReport,
-        manifest,
-        settings.spectralBackend
-      );
+      assertBenchmarkReportMatchesManifest(nextReport, manifest, settings.spectralBackend);
       assertReportContainsNoManifestSecrets(
         serializeRealMediaBenchmarkRunReport(nextReport),
         manifest
@@ -180,6 +196,7 @@ export function RealMediaBenchmarkPanel({
     operationRef.current += 1;
     setManifestFileName(null);
     setManifest(null);
+    setGovernedBundle(null);
     setManifestError(null);
     setReport(null);
     setRunError(null);
@@ -233,16 +250,21 @@ export function RealMediaBenchmarkPanel({
           <div className="rounded border border-amber-400/35 bg-amber-400/10 p-2 leading-5 text-amber-100">
             <p className="font-medium">这是 TimeMap 组件级开发验收，不是普通项目操作。</p>
             <p className="mt-1">
-              它只读取一份受治理的 manifest
-              JSON；媒体路径、身份和流选择必须已写在清单中，本页不会再次选择视频，也不会写入当前项目。
+              当前本机治理 bundle 只能用于 development；formal frozen-test
+              仍缺可验证的外部签名与撤销
+              authority，任何入口都会失败关闭。媒体路径、身份和流选择必须已写在清单中，本页不会再次选择视频，也不会写入当前项目。
             </p>
             <p className="mt-1 font-medium">
               即使组件子闸门显示通过，也绝不代表 release 通过，更不会授予 verified 资格。
             </p>
           </div>
 
+          <RealMediaGoldGovernancePanel project={project} desktopAvailable={desktopAvailable} />
+
           <label className="grid gap-1.5 text-slate-400">
-            <span className="font-medium text-slate-300">选择 benchmark manifest JSON</span>
+            <span className="font-medium text-slate-300">
+              选择治理 bundle JSON（development 可用 raw manifest）
+            </span>
             <input
               type="file"
               accept=".json,application/json"
@@ -275,6 +297,7 @@ export function RealMediaBenchmarkPanel({
             <ManifestGovernanceSummary
               manifest={manifest}
               fileName={manifestFileName ?? "manifest.json"}
+              governedBundle={governedBundle}
             />
           ) : null}
 
@@ -440,11 +463,7 @@ function PerformanceEvidencePanel({
       if (!validation.valid) {
         throw new Error(`raw evidence 严格校验失败：${validation.issues.join("；")}`);
       }
-      assertPerformanceEvidenceMatchesManifest(
-        rawEvidence,
-        manifest,
-        settings.spectralBackend
-      );
+      assertPerformanceEvidenceMatchesManifest(rawEvidence, manifest, settings.spectralBackend);
       const serialized = serializeC137PerformanceEvidence(rawEvidence);
       assertReportContainsNoManifestSecrets(serialized, manifest);
       setEvidence(rawEvidence);
@@ -664,10 +683,12 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
 
 function ManifestGovernanceSummary({
   manifest,
-  fileName
+  fileName,
+  governedBundle
 }: {
   manifest: RealMediaBenchmarkManifest;
   fileName: string;
+  governedBundle: RealMediaGoldBenchmarkBundle | null;
 }) {
   const realCases = manifest.cases.filter(
     (benchmarkCase) => benchmarkCase.mediaKind === "real"
@@ -720,8 +741,20 @@ function ManifestGovernanceSummary({
         </div>
         <div>
           <dt className="inline text-slate-500">清单类型：</dt>
-          <dd className="inline">{manifest.isExample ? "示例清单" : "受治理清单"}</dd>
+          <dd className="inline">
+            {manifest.isExample
+              ? "示例清单"
+              : governedBundle
+                ? "完整治理 bundle（内部自洽，非发布授权）"
+                : "raw development manifest（未验证冻结治理）"}
+          </dd>
         </div>
+        {governedBundle ? (
+          <div className="sm:col-span-2">
+            <dt className="inline text-slate-500">bundle 摘要：</dt>
+            <dd className="inline break-all">{governedBundle.bundleDigest}</dd>
+          </div>
+        ) : null}
       </dl>
     </section>
   );
@@ -860,34 +893,38 @@ function createRunBlockers(
   if (realCaseCount === 0) {
     blockers.push("清单包含 0 个 mediaKind=real 关系，不能运行真实媒体精度基准。");
   }
+  if (
+    manifest.cases.some(
+      (benchmarkCase) =>
+        benchmarkCase.mediaKind === "real" && benchmarkCase.split === "frozen-test"
+    )
+  ) {
+    blockers.push(
+      "formal frozen-test 仍缺外部签名与撤销 authority；raw manifest 和本机自洽 bundle 都只能用于 development，不能运行冻结验收。"
+    );
+  }
   return blockers;
+}
+
+function parseJson(text: string): unknown {
+  return JSON.parse(text) as unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function assertReportContainsNoManifestSecrets(
   reportText: string,
   manifest: RealMediaBenchmarkManifest
 ): void {
-  const leaked = collectManifestSecrets(manifest).some((secret) =>
-    createSerializedSecretVariants(secret).some((variant) => reportText.includes(variant))
-  );
-  if (leaked) {
+  if (containsSensitiveText(reportText, collectManifestSecrets(manifest))) {
     throw new Error("报告仍含本地媒体路径或身份摘要，已阻止下载。");
   }
 }
 
-function createSerializedSecretVariants(secret: string): string[] {
-  const jsonEscaped = JSON.stringify(secret).slice(1, -1);
-  return jsonEscaped === secret ? [secret] : [secret, jsonEscaped];
-}
-
 function sanitizeManifestSecrets(text: string, manifest: RealMediaBenchmarkManifest): string {
-  let sanitized = text;
-  for (const secret of collectManifestSecrets(manifest)) {
-    for (const variant of createSerializedSecretVariants(secret)) {
-      sanitized = sanitized.split(variant).join("[已隐藏本地媒体]");
-    }
-  }
-  return sanitized.replace(/\b[a-f0-9]{64}\b/giu, "[已隐藏 SHA-256]");
+  return redactSensitiveText(text, collectManifestSecrets(manifest));
 }
 
 function collectManifestSecrets(manifest: RealMediaBenchmarkManifest): string[] {
@@ -1030,8 +1067,7 @@ function assertBenchmarkReportMatchesManifest(
   if (
     expectedSpectralBackend !== undefined &&
     report.cases.some(
-      (benchmarkCase) =>
-        benchmarkCase.parameters.spectralBackend !== expectedSpectralBackend
+      (benchmarkCase) => benchmarkCase.parameters.spectralBackend !== expectedSpectralBackend
     )
   ) {
     throw new Error("runner 返回的报告声谱计算策略与本次运行请求不一致。");

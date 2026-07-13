@@ -15,6 +15,15 @@ import {
   type RealMediaBenchmarkManifest
 } from "../../domain/alignment/realMediaBenchmark";
 import {
+  createRealMediaGoldBenchmarkBundle,
+  serializeRealMediaGoldBenchmarkBundle
+} from "../../domain/alignment/realMediaGoldBenchmarkBundle";
+import {
+  createRealMediaGoldAnnotationEnvelope,
+  freezeRealMediaGoldCase,
+  type RealMediaGoldReviewVerification
+} from "../../domain/alignment/realMediaGoldGovernance";
+import {
   computeC137PerformanceEvidenceDigestV2,
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceWorkloadStorageReceiptDigest,
@@ -27,7 +36,10 @@ import {
   createCompleteC137PerformanceEvidenceV2Fixture
 } from "../../test/c137PerformanceEvidence";
 import { createRealMediaPerformanceWorkloadDigest } from "../../infrastructure/alignment/realMediaPerformanceRunner";
-import { DEFAULT_APP_SETTINGS, saveAppSettings } from "../../infrastructure/settings/appSettings";
+import {
+  DEFAULT_APP_SETTINGS,
+  saveAppSettings
+} from "../../infrastructure/settings/appSettings";
 import {
   REAL_MEDIA_BENCHMARK_RUNNER_VERSION,
   createRealMediaBenchmarkRunManifestDigest,
@@ -73,6 +85,15 @@ describe("C137 真实媒体 benchmark 面板", () => {
       ".json,application/json"
     );
     expect(screen.getByText(/不会再次选择视频，也不会写入当前项目/)).toBeInTheDocument();
+    const goldToggle = screen.getByRole("button", {
+      name: /建立真实 Gold：双人独立标注与冻结/
+    });
+    await user.click(goldToggle);
+    expect(
+      screen.getByText(/这里不会重新选择视频。标注始终绑定素材页已导入路径/)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/当前没有已确认且仍连接本地媒体的时间关系/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "下载独立标注 JSON" })).toBeDisabled();
     expect(screen.getByText(/浏览器预览不能运行真实媒体基准/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "采集工程性能原始证据" })).toBeDisabled();
@@ -109,7 +130,9 @@ describe("C137 真实媒体 benchmark 面板", () => {
       Promise.resolve(createCompletedReport(input, options.spectralBackend ?? "auto"))
     );
     const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>((input, options) =>
-      Promise.resolve(bindPerformanceEvidenceToManifest(input, options.spectralBackend ?? "auto"))
+      Promise.resolve(
+        bindPerformanceEvidenceToManifest(input, options.spectralBackend ?? "auto")
+      )
     );
     render(
       <RealMediaBenchmarkPanel
@@ -178,14 +201,74 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(performanceRunner).not.toHaveBeenCalled();
   });
 
+  it("raw manifest 不能绕过 formal frozen-test authority 门禁", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    if (!manifest.cases[0]) throw new Error("冻结阻断测试缺少 case。");
+    manifest.cases[0].split = "frozen-test";
+    const runner = vi.fn<RealMediaBenchmarkPanelRunner>();
+    render(<RealMediaBenchmarkPanel desktopAvailable runner={runner} />);
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+
+    expect(
+      screen.getByText(/formal frozen-test 仍缺外部签名与撤销 authority/)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/raw development manifest/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("完整治理 bundle 验证 receipt 后允许运行 development", async () => {
+    const user = userEvent.setup();
+    const bundle = createGovernedBundle();
+    render(<RealMediaBenchmarkPanel desktopAvailable />);
+    await openPanel(user);
+    await user.upload(
+      screen.getByLabelText("选择 C137 benchmark manifest JSON"),
+      new File([serializeRealMediaGoldBenchmarkBundle(bundle)], "governed-bundle.json", {
+        type: "application/json"
+      })
+    );
+
+    const summary = await screen.findByLabelText("清单治理摘要");
+    expect(summary).toHaveTextContent("完整治理 bundle（内部自洽，非发布授权）");
+    expect(summary).toHaveTextContent(bundle.bundleDigest);
+    expect(
+      screen.queryByText(/formal frozen-test 仍缺外部签名与撤销 authority/)
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeEnabled();
+  });
+
+  it("本机自洽 bundle 也不能把 formal frozen-test 提升为可运行", async () => {
+    const user = userEvent.setup();
+    const bundle = createGovernedBundle("frozen-test");
+    render(<RealMediaBenchmarkPanel desktopAvailable />);
+    await openPanel(user);
+    await user.upload(
+      screen.getByLabelText("选择 C137 benchmark manifest JSON"),
+      new File([serializeRealMediaGoldBenchmarkBundle(bundle)], "local-frozen-bundle.json", {
+        type: "application/json"
+      })
+    );
+
+    expect(
+      await screen.findByText(/formal frozen-test 仍缺外部签名与撤销 authority/)
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
+  });
+
   it("runner 异常会去除本地路径和身份摘要，并恢复可重试状态", async () => {
     const user = userEvent.setup();
     const manifest = createRealManifest(1);
     const source = manifest.cases[0]?.source;
     if (!source?.contentIdentity) throw new Error("异常去敏测试缺少媒体身份");
+    const equivalentForwardPath = source.path.replace(/\\/gu, "/").toUpperCase();
     const runner = vi.fn<RealMediaBenchmarkPanelRunner>(() =>
       Promise.reject(
-        new Error(`无法分析 ${source.path}，摘要 ${source.contentIdentity?.digest}`)
+        new Error(
+          `无法分析 //?/${equivalentForwardPath}，摘要 ${source.contentIdentity?.digest}`
+        )
       )
     );
     render(<RealMediaBenchmarkPanel desktopAvailable runner={runner} />);
@@ -197,6 +280,7 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(alert).toHaveTextContent("运行失败");
     expect(alert).toHaveTextContent("[已隐藏本地媒体]");
     expect(alert).not.toHaveTextContent(source.path);
+    expect(alert).not.toHaveTextContent(equivalentForwardPath);
     expect(alert).not.toHaveTextContent(source.contentIdentity.digest);
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeEnabled();
   });
@@ -555,6 +639,96 @@ function createRealManifest(count: number): RealMediaBenchmarkManifest {
   };
 }
 
+function createGovernedBundle(split: "development" | "frozen-test" = "development") {
+  const draftCase = createRealCase(0);
+  draftCase.split = split;
+  const sourceIdentity = draftCase.source.contentIdentity;
+  const targetIdentity = draftCase.target.contentIdentity;
+  if (!sourceIdentity || !targetIdentity) {
+    throw new Error("治理 bundle 测试缺少媒体身份。");
+  }
+  const source = {
+    contentIdentity: { ...sourceIdentity },
+    audioStreamIndex: draftCase.source.audioStreamIndex,
+    videoStreamIndex: draftCase.source.videoStreamIndex
+  };
+  const target = {
+    contentIdentity: { ...targetIdentity },
+    audioStreamIndex: draftCase.target.audioStreamIndex,
+    videoStreamIndex: draftCase.target.videoStreamIndex
+  };
+  const annotations = [
+    createRealMediaGoldAnnotationEnvelope({
+      caseId: draftCase.id,
+      source,
+      target,
+      boundaryToleranceMs: draftCase.boundaryToleranceMs,
+      reviewerId: "reviewer-a",
+      reviewVerification: createReviewVerification("a", "reviewer-a"),
+      gold: cloneGold(draftCase.gold)
+    }),
+    createRealMediaGoldAnnotationEnvelope({
+      caseId: draftCase.id,
+      source,
+      target,
+      boundaryToleranceMs: draftCase.boundaryToleranceMs,
+      reviewerId: "reviewer-b",
+      reviewVerification: createReviewVerification("b", "reviewer-b"),
+      gold: cloneGold(draftCase.gold)
+    })
+  ] as const;
+  const frozen = freezeRealMediaGoldCase({
+    annotations,
+    caseInput: {
+      id: draftCase.id,
+      title: draftCase.title,
+      split,
+      scenarios: [...draftCase.scenarios],
+      source: structuredClone(draftCase.source),
+      target: structuredClone(draftCase.target),
+      boundaryToleranceMs: draftCase.boundaryToleranceMs,
+      versionNotes: [...draftCase.versionNotes],
+      licenseNotes: [...draftCase.licenseNotes]
+    },
+    resolution: {
+      kind: "consensus",
+      selectedAnnotationDigest: annotations[0].annotationDigest,
+      note: "测试中两份独立标注完全一致，并显式选择第一份。"
+    }
+  });
+  const manifest: RealMediaBenchmarkManifest = {
+    ...createRealManifest(0),
+    id: `ui-governed-${split}`,
+    datasetVersion: `ui-governed-${split}-v1`,
+    cases: [frozen.manifestCase]
+  };
+  return createRealMediaGoldBenchmarkBundle({
+    manifest,
+    annotations,
+    adjudicationAnnotation: null,
+    receipt: frozen.receipt
+  });
+}
+
+function createReviewVerification(
+  seed: "a" | "b",
+  verifier: string
+): RealMediaGoldReviewVerification {
+  const digit = seed === "a" ? "1" : "2";
+  return {
+    recordVersion: 2,
+    method: "manual-review",
+    verificationId: `verification-${seed}`,
+    issuerKeyId: "install-key-ui-test",
+    issuerSequence: seed === "a" ? 1 : 2,
+    signatureAlgorithm: "hmac-sha256-v1",
+    signature: digit.repeat(64),
+    requestDigest: `sha256:${digit.repeat(64)}`,
+    reviewEvidenceDigest: `sha256:${seed.repeat(64)}`,
+    verifier
+  };
+}
+
 function createNonRealManifest(isExample: boolean): RealMediaBenchmarkManifest {
   const benchmarkCase = createRealCase(0);
   return {
@@ -582,7 +756,7 @@ function createRealCase(index: number): RealMediaBenchmarkManifest["cases"][numb
     id: `ui-real-${index + 1}`,
     title: `真实关系 ${index + 1}`,
     mediaKind: "real",
-    split: "frozen-test",
+    split: "development",
     scenarios: ["global-offset"],
     source: {
       path: `C:\\private-c137\\source-${index + 1}.mkv`,
@@ -773,7 +947,9 @@ function createReport(
 function createCaseRunResult(
   caseId: string,
   status: RealMediaBenchmarkCaseRunResult["status"],
-  failureCode: NonNullable<RealMediaBenchmarkCaseRunResult["failure"]>["code"] = "run-cancelled",
+  failureCode: NonNullable<
+    RealMediaBenchmarkCaseRunResult["failure"]
+  >["code"] = "run-cancelled",
   spectralBackend: "auto" | "cuda" | "cpu" = "auto"
 ): RealMediaBenchmarkCaseRunResult {
   const success = status === "success";

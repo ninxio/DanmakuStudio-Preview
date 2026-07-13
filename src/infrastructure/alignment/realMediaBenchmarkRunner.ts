@@ -31,6 +31,7 @@ import {
   type TauriAudioAlignmentRequest
 } from "./tauriAudioAlignment";
 import { discloseKnownAlignmentFailure } from "./safeAlignmentFailureDisclosure";
+import { containsSensitiveText, redactSensitiveText } from "./sensitiveTextRedaction";
 
 export const REAL_MEDIA_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION = 1 as const;
 export const REAL_MEDIA_BENCHMARK_RUN_REPORT_SCHEMA_VERSION = 1 as const;
@@ -256,6 +257,16 @@ export async function runRealMediaBenchmarkManifest(
   manifest: RealMediaBenchmarkManifest,
   options: RealMediaBenchmarkRunnerOptions = {}
 ): Promise<RealMediaBenchmarkRunReport> {
+  if (
+    manifest.cases.some(
+      (benchmarkCase) =>
+        benchmarkCase.mediaKind === "real" && benchmarkCase.split === "frozen-test"
+    )
+  ) {
+    throw new Error(
+      "formal frozen-test 缺少可验证的外部签名与撤销 authority；当前 runner 仅接受 development。"
+    );
+  }
   const now = options.now ?? defaultNow;
   const wait = options.wait ?? defaultWait;
   const startedAt = now();
@@ -321,9 +332,7 @@ export async function runRealMediaBenchmarkManifest(
         preflight,
         cases: [],
         evaluation: null,
-        reasons: [
-          "manifest 未包含任何 mediaKind=real 关系；未启动分析，也没有生成质量结论。"
-        ]
+        reasons: ["manifest 未包含任何 mediaKind=real 关系；未启动分析，也没有生成质量结论。"]
       }),
       manifest
     );
@@ -357,9 +366,7 @@ export async function runRealMediaBenchmarkManifest(
       : null;
   const reasons =
     status === "completed"
-      ? [
-          "全部真实关系完成生产 Alignment V2 分析与组件级评估；该报告不代表 release 验收通过。"
-        ]
+      ? ["全部真实关系完成生产 Alignment V2 分析与组件级评估；该报告不代表 release 验收通过。"]
       : status === "cancelled"
         ? ["运行被取消；部分或全部关系没有质量结果，evaluation 保持 null。"]
         : ["至少一个生产分析任务失败；失败未伪装成 missing prediction，evaluation 保持 null。"];
@@ -429,7 +436,9 @@ export function evaluateRealMediaBenchmarkBlindRunReceipt(
     receipt.cases.some((item) => item.status !== "success") ||
     receipt.predictions.length !== runManifest.cases.length
   ) {
-    throw new Error("blind run 未全部成功；失败或取消不得作为 missing prediction 参与质量评估。");
+    throw new Error(
+      "blind run 未全部成功；失败或取消不得作为 missing prediction 参与质量评估。"
+    );
   }
   const expectedCaseIds = runManifest.cases.map((item) => item.caseId);
   if (
@@ -506,8 +515,7 @@ async function executeBlindCase(
       benchmarkCase,
       elapsedMs(startedAt, now()),
       "job-start-failed",
-      disclosure?.message ??
-        "生产 Alignment V2 任务启动失败；原始工具错误已从可分享报告移除。",
+      disclosure?.message ?? "生产 Alignment V2 任务启动失败；原始工具错误已从可分享报告移除。",
       options
     );
   }
@@ -665,8 +673,7 @@ function finalizeTerminalSnapshot(
       benchmarkCase,
       wallElapsedMs,
       "job-reported-failure",
-      disclosure?.message ??
-        "生产 Alignment V2 任务报告失败；原始工具错误已从可分享报告移除。",
+      disclosure?.message ?? "生产 Alignment V2 任务报告失败；原始工具错误已从可分享报告移除。",
       dependencies.options
     );
   }
@@ -716,7 +723,10 @@ function finalizeTerminalSnapshot(
       parameters: createParameterSummary(benchmarkCase, dependencies.options),
       failure: null
     },
-    prediction: { caseId: benchmarkCase.caseId, spans: timeMap.spans.map((span) => ({ ...span })) }
+    prediction: {
+      caseId: benchmarkCase.caseId,
+      spans: timeMap.spans.map((span) => ({ ...span }))
+    }
   };
 }
 
@@ -945,10 +955,7 @@ function finalizeReport(
     throw new Error(`内部生成的真实媒体运行报告无效：${validation.issues.join("；")}`);
   }
   const serialized = JSON.stringify(report);
-  const leakedSecret = collectManifestSecrets(manifest).find((secret) =>
-    serialized.includes(secret)
-  );
-  if (leakedSecret) {
+  if (containsSensitiveText(serialized, collectManifestSecrets(manifest))) {
     throw new Error("真实媒体运行报告包含本地路径或媒体身份，拒绝输出。 ");
   }
   return report;
@@ -976,7 +983,10 @@ export function validateRealMediaBenchmarkRunReport(
   if (!isNonEmptyString(value.manifestId) || !isNonEmptyString(value.datasetVersion)) {
     issues.push("report manifestId/datasetVersion 必须是非空字符串。");
   }
-  if (typeof value.runManifestDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.runManifestDigest)) {
+  if (
+    typeof value.runManifestDigest !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(value.runManifestDigest)
+  ) {
     issues.push("report.runManifestDigest 必须是规范 SHA-256。");
   }
   if (!isRunStatus(value.status)) issues.push("report.status 不受支持。");
@@ -990,9 +1000,11 @@ export function validateRealMediaBenchmarkRunReport(
   }
   if (value.evaluation !== null) {
     const validation = validateRealMediaBenchmarkResult(value.evaluation);
-    if (!validation.valid) issues.push(...validation.issues.map((issue) => `evaluation: ${issue}`));
+    if (!validation.valid)
+      issues.push(...validation.issues.map((issue) => `evaluation: ${issue}`));
   }
-  if (!isNonEmptyStringArray(value.reasons)) issues.push("report.reasons 必须是非空字符串数组。");
+  if (!isNonEmptyStringArray(value.reasons))
+    issues.push("report.reasons 必须是非空字符串数组。");
 
   if (Array.isArray(value.cases) && isRunStatus(value.status)) {
     const statuses = value.cases
@@ -1068,7 +1080,9 @@ export function serializeRealMediaBenchmarkRunReport(
   return `${JSON.stringify(report, null, 2)}\n`;
 }
 
-export function parseRealMediaBenchmarkRunReportJson(json: string): RealMediaBenchmarkRunReport {
+export function parseRealMediaBenchmarkRunReportJson(
+  json: string
+): RealMediaBenchmarkRunReport {
   const parsed = JSON.parse(json) as unknown;
   const validation = validateRealMediaBenchmarkRunReport(parsed);
   if (!validation.valid) {
@@ -1087,13 +1101,11 @@ function sanitizePreflight(
   };
 }
 
-function createManifestSanitizer(manifest: RealMediaBenchmarkManifest): (text: string) => string {
+function createManifestSanitizer(
+  manifest: RealMediaBenchmarkManifest
+): (text: string) => string {
   const secrets = collectManifestSecrets(manifest);
-  return (text) => {
-    let sanitized = text;
-    for (const secret of secrets) sanitized = sanitized.split(secret).join("[已隐藏本地媒体]");
-    return sanitized.replace(/\b[a-f0-9]{64}\b/gi, "[已隐藏 SHA-256]");
-  };
+  return (text) => redactSensitiveText(text, secrets);
 }
 
 function collectManifestSecrets(manifest: RealMediaBenchmarkManifest): string[] {

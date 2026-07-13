@@ -957,7 +957,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 </section>
               }
             >
-              <RealMediaBenchmarkPanel />
+              <RealMediaBenchmarkPanel project={project} />
             </Suspense>
           </div>
         ) : null}
