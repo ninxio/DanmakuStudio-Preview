@@ -9,12 +9,22 @@ import {
   type C137PerformanceRawEvidenceV1,
   type C137PerformanceRawEvidenceV2
 } from "./c137PerformanceEvidence";
+import {
+  computeC137FormalBlindGoldDigest,
+  computeC137FormalBlindManifestDigest,
+  computeC137FormalBlindMediaBindingsDigest,
+  computeC137FormalBlindParametersDigest,
+  evaluateC137FormalBlindProvenance,
+  validateC137FormalBlindProvenance,
+  type C137FormalBlindProvenanceV1
+} from "./c137FormalBlindProvenance";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_ACCEPTANCE_SCHEMA_VERSION = 1 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 3 as const;
+export const C137_ACCEPTANCE_SCHEMA_VERSION = 2 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 4 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
+export const C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION = 2 as const;
 export const C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION = 3 as const;
 export const C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION = 2 as const;
 
@@ -78,6 +88,10 @@ export interface C137AcceptanceProtocol {
   requiredHotRuns: number;
   requiredCancellationRuns: number;
   performancePlanDigest: C137Digest;
+  blindRankingPlanDigest: C137Digest;
+  requiredBlindProjectionSchemaVersion: 1;
+  requiredNativeEvidenceVersion: 1;
+  requiredBlindPairingMode: "fullCartesian";
   requiredPerformanceRawSchemaVersion: typeof C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION;
   maximumMemorySampleIntervalMs: number;
   requiredMonotonicClock: "rust-std-instant-session-relative-v1";
@@ -194,6 +208,8 @@ export interface C137DatasetReport {
 
 export interface C137RelationshipDecisionEvidence {
   decisionId: string;
+  /** Null marks legacy/self-reported evidence; formal evidence must bind this to native derivation. */
+  provenanceRef: C137Digest | null;
   caseId: string;
   mediaKind: RealMediaBenchmarkMediaKind;
   split: C137DatasetSplit;
@@ -204,7 +220,7 @@ export interface C137RelationshipDecisionEvidence {
 }
 
 export interface C137RelationshipRankingReport {
-  schemaVersion: typeof C137_ACCEPTANCE_REPORT_SCHEMA_VERSION;
+  schemaVersion: typeof C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION;
   binding: C137EvidenceBinding;
   decisions: C137RelationshipDecisionEvidence[];
 }
@@ -343,6 +359,11 @@ export interface C137AcceptanceReports {
   releaseVerification: C137ReleaseVerificationReceipt | null;
 }
 
+export interface C137AcceptanceFormalEvidence {
+  /** Private evidence: it contains frozen gold bindings and execution paths; never share it. */
+  blindRelationship: C137FormalBlindProvenanceV1 | null;
+}
+
 export interface C137AcceptanceBundle {
   schemaVersion: typeof C137_ACCEPTANCE_SCHEMA_VERSION;
   kind: "c137-acceptance-bundle";
@@ -357,6 +378,7 @@ export interface C137AcceptanceBundle {
     preflight: C137PreflightReceipt | null;
     predictionRun: C137PredictionRunReceipt | null;
   };
+  formalEvidence: C137AcceptanceFormalEvidence;
   reports: C137AcceptanceReports;
 }
 
@@ -524,12 +546,7 @@ function evaluateEvidenceCompleteness(
 ): C137AcceptanceCheck[] {
   const checks: C137AcceptanceCheck[] = [
     ...evaluateExternalTrust(bundle, trustContext),
-    createCheck(
-      "native-blind-ranking-provenance",
-      "incomplete",
-      "not-verifiable-in-acceptance-v1",
-      "当前 acceptance v1 的关系 Top-K 仍是调用方报告，尚未严格绑定完整 blind projection、实际关系轴/视觉模式、native full-Cartesian receipt 与候选全集；在升级 schema 并由独立 authority 验证前不得放行"
-    ),
+    ...evaluateFormalBlindRankingEvidence(bundle),
     createCheck(
       "certification-class",
       bundle.certificationClass === "real-frozen" ? "pass" : "incomplete",
@@ -695,6 +712,237 @@ function evaluateEvidenceCompleteness(
 
   checks.push(...evaluateRawEvidenceCompleteness(bundle));
   return checks;
+}
+
+function evaluateFormalBlindRankingEvidence(
+  bundle: C137AcceptanceBundle
+): C137AcceptanceCheck[] {
+  const provenance = bundle.formalEvidence.blindRelationship;
+  if (provenance === null) {
+    return [
+      createCheck(
+        "native-blind-envelope-integrity",
+        "incomplete",
+        "missing",
+        "必须提交私有 formal blind envelope，包含预注册计划、完整候选全集、execution suite、native full-Cartesian receipt、确定性 raw 与 gold 重算 evidence"
+      ),
+      createCheck(
+        "native-blind-decision-coverage",
+        "incomplete",
+        "missing",
+        "formal blind 计划必须按序覆盖全部冻结关系，且不得用重复 easy case 或裁剪候选池凑决策数"
+      ),
+      createCheck(
+        "native-blind-ranking-binding",
+        "incomplete",
+        "missing",
+        "relationship report 必须逐条等于由 native receipt 确定性派生的 gold-free ranking"
+      ),
+      createCheck(
+        "native-blind-ranking-provenance",
+        "incomplete",
+        "missing-private-provenance",
+        "acceptance v2 不再信任调用方自报 Top-K；缺少 private full-Cartesian provenance 时不得放行"
+      ),
+      ...createPendingBlindAuthorityChecks("missing-private-provenance")
+    ];
+  }
+
+  const evaluation = evaluateC137FormalBlindProvenance(provenance, {
+    manifestDigest: bundle.manifestDigest,
+    datasetVersion: bundle.datasetVersion,
+    planDigest: bundle.protocol.blindRankingPlanDigest,
+    topK: bundle.protocol.topK,
+    parametersDigest: bundle.runner.parametersDigest
+  });
+  const integrityValid = evaluation.valid;
+  const coverageValid = integrityValid && evaluation.coverageValid;
+  const manifestDigest = integrityValid
+    ? computeC137FormalBlindManifestDigest(provenance.manifest)
+    : null;
+  const goldDigest = integrityValid
+    ? computeC137FormalBlindGoldDigest(provenance.manifest)
+    : null;
+  const mediaBindingsDigest = integrityValid
+    ? computeC137FormalBlindMediaBindingsDigest(provenance.manifest)
+    : null;
+  const parametersDigest = integrityValid
+    ? computeC137FormalBlindParametersDigest(provenance)
+    : null;
+  const datasetApproval = bundle.receipts.datasetApproval;
+  const preflight = bundle.receipts.preflight;
+  const predictionRun = bundle.receipts.predictionRun;
+  const manifestBound =
+    integrityValid && manifestDigest === bundle.manifestDigest;
+  const goldBound =
+    integrityValid && datasetApproval !== null && goldDigest === datasetApproval.goldDigest;
+  const mediaBound =
+    integrityValid && preflight !== null && mediaBindingsDigest === preflight.mediaBindingsDigest;
+  const predictionRootBound =
+    integrityValid &&
+    predictionRun !== null &&
+    predictionRun.predictionsDigest === provenance.provenanceDigest;
+  const parametersBound =
+    integrityValid && parametersDigest === bundle.runner.parametersDigest;
+  const rankingBound =
+    integrityValid &&
+    coverageValid &&
+    formalDecisionsMatchRelationshipReport(
+      evaluation.decisions,
+      bundle.reports.relationshipRanking
+    );
+
+  const structuralClosure =
+    integrityValid &&
+    coverageValid &&
+    manifestBound &&
+    goldBound &&
+    mediaBound &&
+    parametersBound &&
+    predictionRootBound &&
+    rankingBound;
+  const issueSummary = evaluation.issues.join("；") || "valid";
+  return [
+    createCheck(
+      "native-blind-envelope-integrity",
+      integrityValid ? "pass" : "incomplete",
+      integrityValid ? provenance.provenanceDigest : issueSummary,
+      "每个 formal batch 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt、raw ranking 与 aggregate evidence"
+    ),
+    createCheck(
+      "native-blind-plan-binding",
+      integrityValid && provenance.plan.planDigest === bundle.protocol.blindRankingPlanDigest
+        ? "pass"
+        : "incomplete",
+      provenance.plan.planDigest,
+      "预运行计划摘要必须由 protocol v4 锁定 axis、visual、K、query shards 与完整 candidate universe"
+    ),
+    createCheck(
+      "native-blind-decision-coverage",
+      coverageValid ? "pass" : "incomplete",
+      coverageValid ? evaluation.decisions.length : issueSummary,
+      "计划与 native 派生决策必须对全部 frozen case 严格一一对应；同一 case 即使换 shard、axis 或 visual 模式也不能重复计数"
+    ),
+    createCheck(
+      "native-blind-manifest-binding",
+      manifestBound ? "pass" : "incomplete",
+      manifestDigest ?? "unavailable",
+      "私有完整 manifest 的 domain-separated 摘要必须等于当前 acceptance bundle.manifestDigest"
+    ),
+    createCheck(
+      "native-blind-gold-binding",
+      goldBound ? "pass" : "incomplete",
+      goldDigest ?? "unavailable",
+      "逐 case gold、独立标注与裁决摘要必须等于 dataset approval 的冻结 goldDigest"
+    ),
+    createCheck(
+      "native-blind-media-binding",
+      mediaBound ? "pass" : "incomplete",
+      mediaBindingsDigest ?? "unavailable",
+      "候选路径、全文件身份与显式音视频流摘要必须等于 preflight mediaBindingsDigest"
+    ),
+    createCheck(
+      "native-blind-provenance-root-binding",
+      predictionRootBound ? "pass" : "incomplete",
+      provenance.provenanceDigest,
+      "prediction receipt 必须绑定 formal provenance root，禁止跨运行、跨计划或跨候选全集复用"
+    ),
+    createCheck(
+      "native-blind-parameters-binding",
+      parametersBound ? "pass" : "incomplete",
+      parametersDigest ?? "unavailable",
+      "所有 formal batch 的 execution parameters 必须按序绑定 runner.parametersDigest，禁止事后更换工具、采样或视觉参数"
+    ),
+    createCheck(
+      "native-blind-ranking-binding",
+      rankingBound ? "pass" : "incomplete",
+      rankingBound,
+      "relationship report 的 decisionId/provenanceRef/case/gold/Top-K/verified policy 必须逐条等于 native receipt 派生结果"
+    ),
+    createCheck(
+      "native-blind-ranking-provenance",
+      "incomplete",
+      structuralClosure
+        ? "self-consistent-no-native-authority"
+        : "private-provenance-not-closed",
+      "内容闭环不能证明签发者或 native job 真实存在；必须再验证独立 plan authority、native execution attestation、challenge freshness 与防重放账本"
+    ),
+    ...createPendingBlindAuthorityChecks(
+      structuralClosure
+        ? "not-implemented-in-formal-provenance-v1"
+        : "private-provenance-not-closed"
+    )
+  ];
+}
+
+function formalDecisionsMatchRelationshipReport(
+  decisions: readonly {
+    provenanceRef: C137Digest;
+    caseId: string;
+    goldPairId: string;
+    rankedPairIds: string[];
+  }[],
+  report: C137RelationshipRankingReport | null
+): boolean {
+  if (report === null || report.decisions.length !== decisions.length) {
+    return false;
+  }
+  return report.decisions.every((reported, index) => {
+    const derived = decisions[index];
+    return (
+      derived !== undefined &&
+      reported.decisionId === derived.provenanceRef &&
+      reported.provenanceRef === derived.provenanceRef &&
+      reported.caseId === derived.caseId &&
+      reported.mediaKind === "real" &&
+      reported.split === "frozen-test" &&
+      reported.goldCandidateId === derived.goldPairId &&
+      reported.verifiedCandidateId === null &&
+      equalOrderedStrings(reported.rankedCandidateIds, derived.rankedPairIds)
+    );
+  });
+}
+
+function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[] {
+  return [
+    createCheck(
+      "native-blind-plan-authority",
+      "incomplete",
+      actual,
+      "blind plan 必须在运行前由 bundle 外部信任根签发，禁止看完结果后挑选 batch"
+    ),
+    createCheck(
+      "native-blind-native-attestation",
+      "incomplete",
+      actual,
+      "native attestation 必须覆盖 challenge、plan/projection/execution/receipt/provenance、runner build 和参数"
+    ),
+    createCheck(
+      "native-blind-challenge-freshness",
+      "incomplete",
+      actual,
+      "必须由有状态 authority 核验一次性 challenge、有效期与 receipt 防重放"
+    ),
+    createCheck(
+      "native-blind-modality-provenance",
+      "incomplete",
+      "not-represented-in-frozen-gold-v1",
+      "same-audio/visual/mixed modality 必须进入冻结审批数据后才能作为准确率分母，禁止调用方事后改写"
+    ),
+    createCheck(
+      "native-blind-calibration-provenance",
+      "incomplete",
+      "probability-not-native-bound",
+      "calibration probability 仍未绑定 native score 与冻结校准协议，不能仅凭调用方 correct/probability 放行"
+    )
+  ];
+}
+
+function equalOrderedStrings(
+  left: readonly string[],
+  right: readonly string[]
+): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function evaluateExternalTrust(
@@ -1769,6 +2017,7 @@ export function validateC137AcceptanceBundle(
       "environment",
       "runner",
       "receipts",
+      "formalEvidence",
       "reports"
     ],
     issues
@@ -1790,8 +2039,27 @@ export function validateC137AcceptanceBundle(
   validateEnvironment(bundle.environment, issues);
   validateRunner(bundle.runner, issues);
   validateReceipts(bundle.receipts, issues);
+  validateFormalEvidence(bundle.formalEvidence, issues);
   validateReports(bundle.reports, issues);
   return { valid: issues.length === 0, issues };
+}
+
+function validateFormalEvidence(value: unknown, issues: string[]): void {
+  const record = strictRecord(
+    value,
+    "bundle.formalEvidence",
+    ["blindRelationship"],
+    issues
+  );
+  if (record === null || record.blindRelationship === null) {
+    return;
+  }
+  const validation = validateC137FormalBlindProvenance(record.blindRelationship);
+  if (!validation.valid) {
+    for (const issue of validation.issues) {
+      issues.push(`bundle.formalEvidence.blindRelationship: ${issue}`);
+    }
+  }
 }
 
 export function validateC137AcceptanceTrustContext(
@@ -1859,6 +2127,10 @@ function validateProtocol(value: unknown, issues: string[]): void {
       "requiredHotRuns",
       "requiredCancellationRuns",
       "performancePlanDigest",
+      "blindRankingPlanDigest",
+      "requiredBlindProjectionSchemaVersion",
+      "requiredNativeEvidenceVersion",
+      "requiredBlindPairingMode",
       "requiredPerformanceRawSchemaVersion",
       "maximumMemorySampleIntervalMs",
       "requiredMonotonicClock",
@@ -1886,6 +2158,12 @@ function validateProtocol(value: unknown, issues: string[]): void {
   requireString(record.id, "bundle.protocol.id", issues);
   requireString(record.version, "bundle.protocol.version", issues);
   requirePositiveInteger(record.topK, "bundle.protocol.topK", issues);
+  if (
+    Number.isSafeInteger(record.topK) &&
+    ((record.topK as number) < 2 || (record.topK as number) > 20)
+  ) {
+    issues.push("bundle.protocol.topK 必须位于 2..20，与 formal blind 协议一致。");
+  }
   requirePositiveInteger(
     record.calibrationBinCount,
     "bundle.protocol.calibrationBinCount",
@@ -1899,6 +2177,25 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   requireDigest(record.performancePlanDigest, "bundle.protocol.performancePlanDigest", issues);
+  requireDigest(record.blindRankingPlanDigest, "bundle.protocol.blindRankingPlanDigest", issues);
+  requireLiteral(
+    record.requiredBlindProjectionSchemaVersion,
+    1,
+    "bundle.protocol.requiredBlindProjectionSchemaVersion",
+    issues
+  );
+  requireLiteral(
+    record.requiredNativeEvidenceVersion,
+    1,
+    "bundle.protocol.requiredNativeEvidenceVersion",
+    issues
+  );
+  requireLiteral(
+    record.requiredBlindPairingMode,
+    "fullCartesian",
+    "bundle.protocol.requiredBlindPairingMode",
+    issues
+  );
   requireLiteral(
     record.requiredPerformanceRawSchemaVersion,
     C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION,
@@ -2247,12 +2544,21 @@ function validateDatasetReport(value: unknown, issues: string[]): void {
 
 function validateRelationshipRankingReport(value: unknown, issues: string[]): void {
   const path = "bundle.reports.relationshipRanking";
-  const record = validateReportHeader(value, path, ["decisions"], issues);
+  const record = validateReportHeader(
+    value,
+    path,
+    ["decisions"],
+    issues,
+    C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION
+  );
   if (record === null) return;
   validateArray(record.decisions, `${path}.decisions`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["decisionId", "caseId", "mediaKind", "split", "modality", "goldCandidateId", "rankedCandidateIds", "verifiedCandidateId"], issues);
+    const entry = strictRecord(item, itemPath, ["decisionId", "provenanceRef", "caseId", "mediaKind", "split", "modality", "goldCandidateId", "rankedCandidateIds", "verifiedCandidateId"], issues);
     if (entry === null) return;
     requireString(entry.decisionId, `${itemPath}.decisionId`, issues);
+    if (entry.provenanceRef !== null) {
+      requireDigest(entry.provenanceRef, `${itemPath}.provenanceRef`, issues);
+    }
     requireString(entry.caseId, `${itemPath}.caseId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
@@ -2262,6 +2568,7 @@ function validateRelationshipRankingReport(value: unknown, issues: string[]): vo
     requireNullableString(entry.verifiedCandidateId, `${itemPath}.verifiedCandidateId`, issues);
   });
   validateUniqueStringField(record.decisions, "decisionId", `${path}.decisions`, issues);
+  validateUniqueStringField(record.decisions, "provenanceRef", `${path}.decisions`, issues);
 }
 
 function validateTimeMapReport(value: unknown, issues: string[]): void {
@@ -2414,7 +2721,8 @@ function validateReportHeader(
   value: unknown,
   path: string,
   additionalKeys: readonly string[],
-  issues: string[]
+  issues: string[],
+  schemaVersion: number = C137_ACCEPTANCE_REPORT_SCHEMA_VERSION
 ): Record<string, unknown> | null {
   const record = strictRecord(
     value,
@@ -2423,7 +2731,7 @@ function validateReportHeader(
     issues
   );
   if (record === null) return null;
-  requireLiteral(record.schemaVersion, C137_ACCEPTANCE_REPORT_SCHEMA_VERSION, `${path}.schemaVersion`, issues);
+  requireLiteral(record.schemaVersion, schemaVersion, `${path}.schemaVersion`, issues);
   validateEvidenceBinding(record.binding, `${path}.binding`, issues);
   return record;
 }

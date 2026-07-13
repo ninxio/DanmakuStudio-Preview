@@ -2,12 +2,11 @@ import {
   compileC137BlindBatchBenchmarkEvidence,
   createC137BlindBatchMediaBindingCommitment,
   createC137BlindBatchExecutionProjection,
+  deriveC137BlindBatchRawPredictionFromNativeReceipt,
   orderC137BlindBatchMediaInputs,
-  sealC137BlindBatchRawPrediction,
   type C137BlindBatchBenchmarkEvidence,
   type C137BlindBatchExecutionProjection,
-  type C137BlindBatchProjectionOptions,
-  type C137BlindBatchRawPredictionDraft
+  type C137BlindBatchProjectionOptions
 } from "../../domain/alignment/c137BlindBatchEvidence";
 import type {
   RealMediaBenchmarkCase,
@@ -120,17 +119,27 @@ export async function runC137BlindBatchBenchmark(
     relationshipAxis: options.relationshipAxis,
     visualEvidenceEnabled: options.visualEvidenceEnabled,
     topK: options.topK,
-    ...(options.caseIds === undefined ? {} : { caseIds: options.caseIds })
+    ...(options.caseIds === undefined ? {} : { caseIds: options.caseIds }),
+    ...(options.candidateCaseIds === undefined
+      ? {}
+      : { candidateCaseIds: options.candidateCaseIds })
   };
   const projection = createC137BlindBatchExecutionProjection(
     manifest,
     projectionOptions
   );
-  const selectedCases = selectFrozenCases(manifest, options.caseIds);
+  const decisionCases = selectFrozenCases(manifest, options.caseIds);
+  const candidateCases = selectFrozenCases(
+    manifest,
+    options.candidateCaseIds ?? options.caseIds
+  );
   const selectedManifest: RealMediaBenchmarkManifest = {
     ...structuredClone(manifest),
-    cases: selectedCases.map((benchmarkCase) =>
-      normalizePreflightCase(benchmarkCase, options.visualEvidenceEnabled)
+    cases: createPreflightCases(
+      decisionCases,
+      candidateCases,
+      options.relationshipAxis,
+      options.visualEvidenceEnabled
     )
   };
   const capturedProbes = createCapturedProbeState(options.preflightOptions?.probe);
@@ -144,11 +153,11 @@ export async function runC137BlindBatchBenchmark(
       signal: options.preflightOptions?.signal ?? options.runnerOptions?.signal
     });
   } catch {
-    preflight = createExceptionalPreflight(selectedCases.length);
+    preflight = createExceptionalPreflight(candidateCases.length);
   }
 
   if (!preflight.ok) {
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "preflight-failed",
       preflight,
       reasons: ["运行前路径、全文件身份或显式流核验未通过；native batch 未启动。"]
@@ -161,14 +170,15 @@ export async function runC137BlindBatchBenchmark(
       createExecutionSuite(
         manifest.id,
         manifest.datasetVersion,
-        selectedCases,
+        decisionCases,
+        candidateCases,
         projection,
         capturedProbes.byPath,
         options.parameters
       )
     );
   } catch {
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "execution-invalid",
       preflight,
       reasons: ["预检捕获结果无法形成与 blind projection 一致的执行计划。"]
@@ -183,7 +193,7 @@ export async function runC137BlindBatchBenchmark(
       options.runnerOptions ?? {}
     );
   } catch {
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "runner-failed",
       preflight,
       reasons: ["native blind batch 执行异常；原始工具错误已从可分享结果移除。"]
@@ -194,7 +204,7 @@ export async function runC137BlindBatchBenchmark(
   try {
     receipt = validateRealMediaBlindBatchRunReceipt(receiptValue, executionSuite);
   } catch {
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "receipt-invalid",
       preflight,
       reasons: ["native blind batch 回执未通过严格 digest、顺序或内容闭合校验。"]
@@ -205,7 +215,7 @@ export async function runC137BlindBatchBenchmark(
     receipt.status !== "completed" ||
     receipt.pairOutcomes.some((outcome) => outcome.nativeStatus !== "completed")
   ) {
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "incomplete-run",
       preflight,
       nativeRunStatus: receipt.status,
@@ -214,8 +224,10 @@ export async function runC137BlindBatchBenchmark(
   }
 
   try {
-    const rawPrediction = sealC137BlindBatchRawPrediction(
-      normalizeReceipt(projection, receipt)
+    const rawPrediction = deriveC137BlindBatchRawPredictionFromNativeReceipt(
+      projection,
+      executionSuite,
+      receipt
     );
     const evidence = compileC137BlindBatchBenchmarkEvidence(
       manifest,
@@ -223,7 +235,7 @@ export async function runC137BlindBatchBenchmark(
       projection,
       rawPrediction
     );
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "completed",
       preflight,
       nativeRunStatus: receipt.status,
@@ -231,7 +243,7 @@ export async function runC137BlindBatchBenchmark(
       reasons: []
     });
   } catch {
-    return finalizeShareableReport(selectedCases, projection, {
+    return finalizeShareableReport(candidateCases, projection, {
       status: "compilation-failed",
       preflight,
       nativeRunStatus: receipt.status,
@@ -287,10 +299,45 @@ function normalizePreflightCase(
   return normalized;
 }
 
+function createPreflightCases(
+  decisionCases: readonly RealMediaBenchmarkCase[],
+  candidateCases: readonly RealMediaBenchmarkCase[],
+  relationshipAxis: C137BlindBatchProjectionOptions["relationshipAxis"],
+  visualEvidenceEnabled: boolean
+): RealMediaBenchmarkCase[] {
+  const fallbackDecision = decisionCases[0];
+  if (fallbackDecision === undefined) {
+    throw new Error("blind batch preflight 缺少 decision case。");
+  }
+  const decisionById = new Map(
+    decisionCases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase])
+  );
+  return candidateCases.map((candidateCase) => {
+    const normalized = normalizePreflightCase(
+      candidateCase,
+      visualEvidenceEnabled
+    );
+    const decisionCase = decisionById.get(candidateCase.id) ?? fallbackDecision;
+    if (relationshipAxis === "source") {
+      normalized.source = normalizePreflightCase(
+        decisionCase,
+        visualEvidenceEnabled
+      ).source;
+    } else {
+      normalized.target = normalizePreflightCase(
+        decisionCase,
+        visualEvidenceEnabled
+      ).target;
+    }
+    return normalized;
+  });
+}
+
 function createExecutionSuite(
   manifestId: string,
   datasetVersion: string,
-  selectedCases: readonly RealMediaBenchmarkCase[],
+  decisionCases: readonly RealMediaBenchmarkCase[],
+  candidateCases: readonly RealMediaBenchmarkCase[],
   projection: C137BlindBatchExecutionProjection,
   probesByPath: ReadonlyMap<string, MediaTimelineProbeResult>,
   parameters: RealMediaBlindBatchAlignmentParameters
@@ -298,14 +345,14 @@ function createExecutionSuite(
   const sourceBindings = collectUniqueMedia(
     manifestId,
     datasetVersion,
-    selectedCases,
+    projection.relationshipAxis === "source" ? decisionCases : candidateCases,
     projection.visualEvidenceEnabled,
     "source"
   );
   const targetBindings = collectUniqueMedia(
     manifestId,
     datasetVersion,
-    selectedCases,
+    projection.relationshipAxis === "target" ? decisionCases : candidateCases,
     projection.visualEvidenceEnabled,
     "target"
   );
@@ -410,73 +457,6 @@ function cloneIdentity(identity: MediaContentIdentity): MediaContentIdentity {
     firstSampleDigest: identity.firstSampleDigest,
     middleSampleDigest: identity.middleSampleDigest,
     lastSampleDigest: identity.lastSampleDigest
-  };
-}
-
-function normalizeReceipt(
-  projection: C137BlindBatchExecutionProjection,
-  receipt: RealMediaBlindBatchRunReceipt
-): C137BlindBatchRawPredictionDraft {
-  const pairIdByOrdinal = new Map<number, string>();
-  projection.pairs.forEach((pair, index) => pairIdByOrdinal.set(index + 1, pair.pairId));
-  const pairId = (ordinal: number): string => {
-    const value = pairIdByOrdinal.get(ordinal);
-    if (value === undefined) throw new Error(`receipt pairOrdinal ${ordinal} 无 projection pair。`);
-    return value;
-  };
-  const shortlisted = new Set(
-    receipt.pairOutcomes
-      .filter((outcome) => outcome.globalSelected)
-      .map((outcome) => pairId(outcome.pairOrdinal))
-  );
-  return {
-    schemaVersion: 1,
-    kind: "c137-blind-batch-raw-prediction",
-    suiteId: projection.suiteId,
-    projectionDigest: projection.projectionDigest,
-    executionDigest: receipt.executionDigest,
-    nativeReceiptDigest: receipt.receiptDigest,
-    topK: projection.topK,
-    pairOutcomes: receipt.pairOutcomes.map((outcome, index) => {
-      const projectedPair = projection.pairs[index];
-      if (projectedPair === undefined) throw new Error("receipt pair 数量超过 projection。");
-      const proposal = outcome.proposalTimeMap;
-      const candidate =
-        outcome.globalSelected &&
-        proposal !== null &&
-        (proposal.quality.level === "review" || proposal.quality.level === "verified") &&
-        proposal.spans.some((span) => span.kind === "matched");
-      return {
-        pairId: pairId(outcome.pairOrdinal),
-        sourceMediaId: projectedPair.sourceMediaId,
-        targetMediaId: projectedPair.targetMediaId,
-        status: candidate ? "candidate" : "blocked",
-        proposalTimeMapSpans:
-          proposal?.spans.map((span) => ({
-            kind: span.kind,
-            sourceStartMs: span.sourceStartMs,
-            sourceEndMs: span.sourceEndMs,
-            targetStartMs: span.targetStartMs,
-            targetEndMs: span.targetEndMs
-          })) ?? []
-      };
-    }),
-    sourceRankings: receipt.sourceRankings.map((ranking) => ({
-      sourceMediaId: ranking.sourceMediaId,
-      rankedPairIds: ranking.candidates.map((candidate) => pairId(candidate.pairOrdinal))
-    })),
-    targetRankings: receipt.targetRankings.map((ranking) => ({
-      targetMediaId: ranking.targetMediaId,
-      rankedPairIds: ranking.candidates.map((candidate) => pairId(candidate.pairOrdinal))
-    })),
-    nativeShortlist: {
-      shortlistedPairIds: projection.pairs
-        .map((pair) => pair.pairId)
-        .filter((id) => shortlisted.has(id)),
-      nonShortlistedPairIds: projection.pairs
-        .map((pair) => pair.pairId)
-        .filter((id) => !shortlisted.has(id))
-    }
   };
 }
 

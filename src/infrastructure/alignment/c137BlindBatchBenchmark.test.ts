@@ -8,6 +8,7 @@ import type {
 } from "../../domain/alignment/realMediaBenchmark";
 import {
   createC137BlindBatchExecutionProjection,
+  deriveC137BlindBatchRawPredictionFromNativeReceipt,
   orderC137BlindBatchMediaInputs
 } from "../../domain/alignment/c137BlindBatchEvidence";
 import type { AlignmentProposal, AlignmentTimeMapProposal } from "../../domain/alignment/types";
@@ -28,7 +29,8 @@ import {
   runRealMediaBlindBatchSuite,
   type RealMediaBlindBatchAlignmentParameters,
   type RealMediaBlindBatchExecutionMedia,
-  type RealMediaBlindBatchExecutionSuite
+  type RealMediaBlindBatchExecutionSuite,
+  type RealMediaBlindBatchRunReceipt
 } from "./realMediaBlindBatchRunner";
 import {
   runC137BlindBatchBenchmark,
@@ -53,6 +55,146 @@ const VISUAL_PARAMETERS: RealMediaBlindBatchAlignmentParameters = {
 };
 
 describe("C137 blind batch benchmark coordinator", () => {
+  it("strictly derives raw prediction from the bound full-Cartesian native receipt", async () => {
+    const manifest = createManifest();
+    const projection = createC137BlindBatchExecutionProjection(manifest, {
+      relationshipAxis: "target",
+      visualEvidenceEnabled: false,
+      topK: 2
+    });
+    let capturedSuite: RealMediaBlindBatchExecutionSuite | undefined;
+    let capturedReceipt: RealMediaBlindBatchRunReceipt | undefined;
+    const runner = vi.fn<C137BlindBatchSuiteRunner>(async (suite) => {
+      const receipt = await runRealMediaBlindBatchSuite(suite, {
+        alignmentInvoker: createInvoker(createCompletedSnapshot(suite)),
+        now: () => 100
+      });
+      capturedSuite = structuredClone(suite);
+      capturedReceipt = structuredClone(receipt);
+      return receipt;
+    });
+
+    const report = await runC137BlindBatchBenchmark(manifest, {
+      relationshipAxis: "target",
+      visualEvidenceEnabled: false,
+      topK: 2,
+      parameters: PARAMETERS,
+      preflightOptions: { probe: createProbeInvoker(manifest) },
+      runner
+    });
+    expect(report.status).toBe("completed");
+    if (capturedSuite === undefined || capturedReceipt === undefined) {
+      throw new Error("fixture failed to capture native envelope");
+    }
+
+    const raw = deriveC137BlindBatchRawPredictionFromNativeReceipt(
+      projection,
+      capturedSuite,
+      capturedReceipt
+    );
+    expect(raw).toMatchObject({
+      suiteId: projection.suiteId,
+      projectionDigest: projection.projectionDigest,
+      executionDigest: capturedReceipt.executionDigest,
+      nativeReceiptDigest: capturedReceipt.receiptDigest,
+      topK: 2
+    });
+    expect(raw.pairOutcomes).toHaveLength(projection.pairs.length);
+
+    const rankingTamper = structuredClone(capturedReceipt);
+    const rankingCandidates = rankingTamper.sourceRankings[0]?.candidates;
+    if (rankingCandidates === undefined || rankingCandidates.length < 2) {
+      throw new Error("fixture source ranking too small");
+    }
+    [rankingCandidates[0], rankingCandidates[1]] = [
+      rankingCandidates[1],
+      rankingCandidates[0]
+    ];
+    expect(() =>
+      deriveC137BlindBatchRawPredictionFromNativeReceipt(
+        projection,
+        capturedSuite,
+        rankingTamper
+      )
+    ).toThrow(/sourceRankings/);
+
+    const topKMismatch = structuredClone(capturedSuite);
+    topKMismatch.topK = 1;
+    expect(() =>
+      deriveC137BlindBatchRawPredictionFromNativeReceipt(
+        projection,
+        topKMismatch,
+        capturedReceipt
+      )
+    ).toThrow(/suiteId\/topK/);
+
+    const streamMismatch = structuredClone(capturedSuite);
+    const firstSource = streamMismatch.sources[0];
+    if (firstSource === undefined) throw new Error("fixture source missing");
+    firstSource.audioStreamIndex += 100;
+    expect(() =>
+      deriveC137BlindBatchRawPredictionFromNativeReceipt(
+        projection,
+        streamMismatch,
+        capturedReceipt
+      )
+    ).toThrow(/mediaId\/stream/);
+
+    const pairMismatch = structuredClone(capturedSuite);
+    [pairMismatch.pairs[0], pairMismatch.pairs[1]] = [
+      pairMismatch.pairs[1],
+      pairMismatch.pairs[0]
+    ];
+    expect(() =>
+      deriveC137BlindBatchRawPredictionFromNativeReceipt(
+        projection,
+        pairMismatch,
+        capturedReceipt
+      )
+    ).toThrow(/source-major/);
+
+    const partialReceipt = await runRealMediaBlindBatchSuite(capturedSuite, {
+      alignmentInvoker: createInvoker(createPartialSnapshot(capturedSuite)),
+      now: () => 100
+    });
+    expect(() =>
+      deriveC137BlindBatchRawPredictionFromNativeReceipt(
+        projection,
+        capturedSuite,
+        partialReceipt
+      )
+    ).toThrow(/只允许从整批 completed/);
+  });
+
+  it("runs a sliced query axis against the complete declared candidate universe", async () => {
+    const manifest = createManifest();
+    const runner = createCompletedRunner();
+    const decisionCaseIds = [manifest.cases[0].id];
+    const candidateCaseIds = manifest.cases.map((benchmarkCase) => benchmarkCase.id);
+
+    const result = await runC137BlindBatchBenchmark(manifest, {
+      relationshipAxis: "target",
+      visualEvidenceEnabled: false,
+      topK: 2,
+      caseIds: decisionCaseIds,
+      candidateCaseIds,
+      parameters: PARAMETERS,
+      preflightOptions: { probe: createProbeInvoker(manifest) },
+      runner
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.evidence).toMatchObject({
+      decisionCount: 1,
+      top1HitCount: 1,
+      topKHitCount: 1
+    });
+    const executionSuite = runner.mock.calls[0]?.[0];
+    expect(executionSuite?.sources).toHaveLength(3);
+    expect(executionSuite?.targets).toHaveLength(1);
+    expect(executionSuite?.pairs).toHaveLength(3);
+  });
+
   it("preflights each path once, runs one pathful batch and returns only shareable evidence", async () => {
     const manifest = createManifest();
     const privateProjection = createC137BlindBatchExecutionProjection(manifest, {

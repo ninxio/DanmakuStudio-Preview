@@ -6,6 +6,11 @@ import {
   type RealMediaBenchmarkManifest,
   type RealMediaBenchmarkMediaInput
 } from "./realMediaBenchmark";
+import {
+  validateRealMediaBlindBatchExecutionSuite,
+  validateRealMediaBlindBatchRunReceipt,
+  type RealMediaBlindBatchExecutionSuite
+} from "./realMediaBlindBatchContract";
 import { mapSourceTime, validateTimeMap, type TimeMapSpan } from "./timeMap";
 import { sha256Hex } from "../shared/sha256";
 
@@ -14,6 +19,8 @@ export const C137_BLIND_BATCH_EVIDENCE_SCHEMA_VERSION = 1 as const;
 const PROJECTION_DOMAIN = "c137-blind-batch-execution-projection-v1";
 const RAW_PREDICTION_DOMAIN = "c137-blind-batch-raw-prediction-v1";
 const EVIDENCE_DOMAIN = "c137-blind-batch-benchmark-evidence-v1";
+const DERIVED_RELATIONSHIP_DECISION_DOMAIN =
+  "c137-blind-batch-derived-relationship-decision-v1";
 const SUITE_DOMAIN = "c137-blind-batch-suite-v1";
 const MEDIA_BINDING_COMMITMENT_DOMAIN = "c137-blind-batch-media-binding-v1";
 const MINIMUM_TOP_K = 2;
@@ -38,10 +45,15 @@ export interface C137BlindBatchProjectionOptions {
    */
   topK: number;
   /**
-   * Optional frozen case subset for one bounded native batch. When present it must be unique and
-   * preserve manifest order; the identifiers never enter the gold-free execution projection.
+   * Optional frozen decision/query subset for one bounded native batch. When present it must be
+   * unique and preserve manifest order; the identifiers never enter the gold-free projection.
    */
   caseIds?: readonly string[];
+  /**
+   * Optional frozen candidate-universe subset. It must contain every decision case, be unique and
+   * preserve manifest order. Omission retains the legacy behavior: candidates equal decisions.
+   */
+  candidateCaseIds?: readonly string[];
 }
 
 export interface C137BlindBatchMediaProjection {
@@ -123,6 +135,15 @@ export interface C137BlindBatchRawPredictionDraft {
 /** Path-free normalized prediction, bound to both the execution and native runner receipt. */
 export interface C137BlindBatchRawPrediction extends C137BlindBatchRawPredictionDraft {
   receiptDigest: C137Digest;
+}
+
+/** Private, gold-revealing decision. It must never enter the aggregate shareable DTO. */
+export interface C137BlindBatchDerivedRelationshipDecision {
+  suiteId: string;
+  caseId: string;
+  provenanceRef: C137Digest;
+  goldPairId: string;
+  rankedPairIds: string[];
 }
 
 interface C137BlindBatchCaseMeasurement {
@@ -273,6 +294,178 @@ export function sealC137BlindBatchRawPrediction(
   };
 }
 
+/**
+ * Strictly bind a gold-free projection to one full-Cartesian native execution and derive the only
+ * accepted path-free raw prediction. Serialized ranking arrays are validated and recomputed by
+ * the native receipt contract before they are normalized here.
+ */
+export function deriveC137BlindBatchRawPredictionFromNativeReceipt(
+  projectionValue: unknown,
+  executionSuiteValue: unknown,
+  nativeReceiptValue: unknown
+): C137BlindBatchRawPrediction {
+  const projection = assertExecutionProjectionShape(projectionValue);
+  const executionSuite = validateRealMediaBlindBatchExecutionSuite(
+    executionSuiteValue
+  );
+  validateProjectionExecutionSuiteBinding(projection, executionSuite);
+  const receipt = validateRealMediaBlindBatchRunReceipt(
+    nativeReceiptValue,
+    executionSuite
+  );
+  if (
+    receipt.status !== "completed" ||
+    receipt.pairOutcomes.some((outcome) => outcome.nativeStatus !== "completed")
+  ) {
+    throw new Error(
+      "blind batch raw prediction 只允许从整批 completed 且每个 pair completed 的 native receipt 派生。"
+    );
+  }
+
+  const pairIdByOrdinal = new Map<number, string>();
+  executionSuite.pairs.forEach((pair, index) => {
+    const projectedPair = projection.pairs[index];
+    if (projectedPair === undefined) {
+      throw new Error("blind batch execution pair 数量超过 projection。");
+    }
+    pairIdByOrdinal.set(pair.pairOrdinal, projectedPair.pairId);
+  });
+  const requirePairId = (ordinal: number): string => {
+    const pairId = pairIdByOrdinal.get(ordinal);
+    if (pairId === undefined) {
+      throw new Error(`native receipt pairOrdinal ${ordinal} 无 projection pair。`);
+    }
+    return pairId;
+  };
+  const shortlistedPairIds = new Set(
+    receipt.pairOutcomes
+      .filter((outcome) => outcome.globalSelected)
+      .map((outcome) => requirePairId(outcome.pairOrdinal))
+  );
+
+  const rawPrediction = sealC137BlindBatchRawPrediction({
+    schemaVersion: C137_BLIND_BATCH_EVIDENCE_SCHEMA_VERSION,
+    kind: "c137-blind-batch-raw-prediction",
+    suiteId: projection.suiteId,
+    projectionDigest: projection.projectionDigest,
+    executionDigest: receipt.executionDigest,
+    nativeReceiptDigest: receipt.receiptDigest,
+    topK: projection.topK,
+    pairOutcomes: receipt.pairOutcomes.map((outcome, index) => {
+      const projectedPair = projection.pairs[index];
+      if (projectedPair === undefined) {
+        throw new Error("native receipt pair 数量超过 projection。");
+      }
+      const proposal = outcome.proposalTimeMap;
+      const candidate =
+        outcome.globalSelected &&
+        proposal !== null &&
+        (proposal.quality.level === "review" ||
+          proposal.quality.level === "verified") &&
+        proposal.spans.some((span) => span.kind === "matched");
+      return {
+        pairId: requirePairId(outcome.pairOrdinal),
+        sourceMediaId: projectedPair.sourceMediaId,
+        targetMediaId: projectedPair.targetMediaId,
+        status: candidate ? "candidate" : "blocked",
+        proposalTimeMapSpans:
+          proposal?.spans.map((span) => ({
+            kind: span.kind,
+            sourceStartMs: span.sourceStartMs,
+            sourceEndMs: span.sourceEndMs,
+            targetStartMs: span.targetStartMs,
+            targetEndMs: span.targetEndMs
+          })) ?? []
+      };
+    }),
+    sourceRankings: receipt.sourceRankings.map((ranking) => ({
+      sourceMediaId: ranking.sourceMediaId,
+      rankedPairIds: ranking.candidates.map((candidate) =>
+        requirePairId(candidate.pairOrdinal)
+      )
+    })),
+    targetRankings: receipt.targetRankings.map((ranking) => ({
+      targetMediaId: ranking.targetMediaId,
+      rankedPairIds: ranking.candidates.map((candidate) =>
+        requirePairId(candidate.pairOrdinal)
+      )
+    })),
+    nativeShortlist: {
+      shortlistedPairIds: projection.pairs
+        .map((pair) => pair.pairId)
+        .filter((pairId) => shortlistedPairIds.has(pairId)),
+      nonShortlistedPairIds: projection.pairs
+        .map((pair) => pair.pairId)
+        .filter((pairId) => !shortlistedPairIds.has(pairId))
+    }
+  });
+  validateRawPredictionBinding(projection, rawPrediction);
+  return rawPrediction;
+}
+
+/**
+ * Reveal only the private relationship decisions deterministically implied by frozen gold and a
+ * strictly bound raw prediction. Callers cannot submit hit flags, gold pairs or rankings here.
+ */
+export function deriveC137BlindBatchRelationshipDecisions(
+  manifest: RealMediaBenchmarkManifest,
+  options: C137BlindBatchProjectionOptions,
+  projectionValue: unknown,
+  rawPredictionValue: unknown
+): C137BlindBatchDerivedRelationshipDecision[] {
+  const model = buildManifestModel(manifest, options);
+  const projection = assertExecutionProjectionShape(projectionValue);
+  assertProjectionMatchesManifestModel(projection, model);
+  const rawPrediction = assertRawPredictionShape(rawPredictionValue);
+  validateRawPredictionBinding(projection, rawPrediction);
+
+  const sourceRankingsByMediaId = new Map(
+    rawPrediction.sourceRankings.map((ranking) => [ranking.sourceMediaId, ranking])
+  );
+  const targetRankingsByMediaId = new Map(
+    rawPrediction.targetRankings.map((ranking) => [ranking.targetMediaId, ranking])
+  );
+  return model.selectedCases.map((benchmarkCase) => {
+    const sourceMediaId = requireMapValue(
+      model.sourceMediaIdByCaseId,
+      benchmarkCase.id,
+      "source media"
+    );
+    const targetMediaId = requireMapValue(
+      model.targetMediaIdByCaseId,
+      benchmarkCase.id,
+      "target media"
+    );
+    const goldPairId = requireMapValue(
+      model.pairIdByMediaIds,
+      pairKey(sourceMediaId, targetMediaId),
+      "gold pair"
+    );
+    const ranking =
+      projection.relationshipAxis === "target"
+        ? requireMapValue(
+            targetRankingsByMediaId,
+            targetMediaId,
+            "target ranking"
+          )
+        : requireMapValue(
+            sourceRankingsByMediaId,
+            sourceMediaId,
+            "source ranking"
+          );
+    return {
+      suiteId: projection.suiteId,
+      caseId: benchmarkCase.id,
+      provenanceRef: digest(
+        DERIVED_RELATIONSHIP_DECISION_DOMAIN,
+        JSON.stringify([projection.suiteId, benchmarkCase.id])
+      ),
+      goldPairId,
+      rankedPairIds: ranking.rankedPairIds.slice(0, projection.topK)
+    };
+  });
+}
+
 export function computeC137BlindBatchRawPredictionDigest(
   prediction: C137BlindBatchRawPredictionDraft
 ): C137Digest {
@@ -298,14 +491,7 @@ export function compileC137BlindBatchBenchmarkEvidence(
 ): C137BlindBatchBenchmarkEvidence {
   const model = buildManifestModel(manifest, options);
   const projection = assertExecutionProjectionShape(projectionValue);
-  if (
-    canonicalProjectionPayload(projection) !== canonicalProjectionPayload(model.projection) ||
-    projection.projectionDigest !== model.projection.projectionDigest
-  ) {
-    throw new Error(
-      "blind batch execution projection 与冻结 manifest 的唯一 gold-free 投影不一致。"
-    );
-  }
+  assertProjectionMatchesManifestModel(projection, model);
 
   const rawPrediction = assertRawPredictionShape(rawPredictionValue);
   validateRawPredictionBinding(projection, rawPrediction);
@@ -465,17 +651,32 @@ function buildManifestModel(
     (benchmarkCase) =>
       benchmarkCase.mediaKind === "real" && benchmarkCase.split === "frozen-test"
   );
-  const selectedCases = selectFrozenCases(frozenCases, options.caseIds);
-  if (selectedCases.length < 2) {
-    throw new Error("blind batch 至少需要两个 frozen real gold 关系；单 pair 不能冒充 batch。 ");
+  const selectedCases = selectFrozenCases(
+    frozenCases,
+    options.caseIds,
+    "caseIds"
+  );
+  const candidateCases = selectFrozenCases(
+    frozenCases,
+    options.candidateCaseIds ?? options.caseIds,
+    "candidateCaseIds"
+  );
+  const candidateCaseIds = new Set(candidateCases.map((benchmarkCase) => benchmarkCase.id));
+  if (selectedCases.some((benchmarkCase) => !candidateCaseIds.has(benchmarkCase.id))) {
+    throw new Error("blind batch candidateCaseIds 必须包含全部 decision caseIds。 ");
   }
+  const sourceCases =
+    options.relationshipAxis === "source" ? selectedCases : candidateCases;
+  const targetCases =
+    options.relationshipAxis === "target" ? selectedCases : candidateCases;
   if (
     options.visualEvidenceEnabled &&
-    selectedCases.some(
-      (benchmarkCase) =>
-        benchmarkCase.source.videoStreamIndex === null ||
-        benchmarkCase.target.videoStreamIndex === null
-    )
+    (sourceCases.some(
+      (benchmarkCase) => benchmarkCase.source.videoStreamIndex === null
+    ) ||
+      targetCases.some(
+        (benchmarkCase) => benchmarkCase.target.videoStreamIndex === null
+      ))
   ) {
     throw new Error(
       "formal blind visual benchmark 要求每个 selected source/target 显式指定 videoStreamIndex；禁止 null/auto。"
@@ -486,14 +687,14 @@ function buildManifestModel(
     manifest.id,
     manifest.datasetVersion,
     options.visualEvidenceEnabled,
-    selectedCases.map((benchmarkCase) => benchmarkCase.source),
+    sourceCases.map((benchmarkCase) => benchmarkCase.source),
     "source"
   );
   const targets = createMediaProjection(
     manifest.id,
     manifest.datasetVersion,
     options.visualEvidenceEnabled,
-    selectedCases.map((benchmarkCase) => benchmarkCase.target),
+    targetCases.map((benchmarkCase) => benchmarkCase.target),
     "target"
   );
   if (sources.entries.length > MAXIMUM_MEDIA_PER_SIDE || targets.entries.length > MAXIMUM_MEDIA_PER_SIDE) {
@@ -501,7 +702,9 @@ function buildManifestModel(
   }
   const pairCount = sources.entries.length * targets.entries.length;
   if (pairCount < 2 || (sources.entries.length === 1 && targets.entries.length === 1)) {
-    throw new Error("blind batch 必须形成至少两个不同 source/target pair。 ");
+    throw new Error(
+      "blind batch 必须形成至少两个不同 source/target pair；单 pair 不能冒充 batch。 "
+    );
   }
   if (pairCount > MAXIMUM_PAIR_COUNT) {
     throw new Error(`blind batch 笛卡尔积超过 ${MAXIMUM_PAIR_COUNT} pair，请拆分冻结 suite。`);
@@ -568,6 +771,7 @@ function buildManifestModel(
       manifest.id,
       manifest.datasetVersion,
       selectedCases.map((benchmarkCase) => benchmarkCase.id),
+      candidateCases.map((benchmarkCase) => benchmarkCase.id),
       options.topK,
       relationshipAxis,
       options.visualEvidenceEnabled
@@ -597,24 +801,108 @@ function buildManifestModel(
   };
 }
 
+function assertProjectionMatchesManifestModel(
+  projection: C137BlindBatchExecutionProjection,
+  model: C137BlindBatchManifestModel
+): void {
+  if (
+    canonicalProjectionPayload(projection) !==
+      canonicalProjectionPayload(model.projection) ||
+    projection.projectionDigest !== model.projection.projectionDigest
+  ) {
+    throw new Error(
+      "blind batch execution projection 与冻结 manifest 的唯一 gold-free 投影不一致。"
+    );
+  }
+}
+
+function validateProjectionExecutionSuiteBinding(
+  projection: C137BlindBatchExecutionProjection,
+  suite: RealMediaBlindBatchExecutionSuite
+): void {
+  if (suite.suiteId !== projection.suiteId || suite.topK !== projection.topK) {
+    throw new Error("blind batch execution suite 未绑定同一 projection suiteId/topK。");
+  }
+  if (
+    suite.parameters.enableVisualEvidence !== projection.visualEvidenceEnabled
+  ) {
+    throw new Error(
+      "blind batch execution suite visual evidence 设置与 projection 不一致。"
+    );
+  }
+  const candidateMediaCount =
+    projection.relationshipAxis === "target"
+      ? projection.sources.length
+      : projection.targets.length;
+  if (projection.topK >= candidateMediaCount) {
+    throw new Error(
+      "blind batch projection 声明轴的 distinct 候选数必须严格大于 topK。"
+    );
+  }
+
+  for (const [label, projectedMedia, executionMedia] of [
+    ["source", projection.sources, suite.sources],
+    ["target", projection.targets, suite.targets]
+  ] as const) {
+    if (projectedMedia.length !== executionMedia.length) {
+      throw new Error(`blind batch ${label} media 数量与 projection 不一致。`);
+    }
+    projectedMedia.forEach((projected, index) => {
+      const execution = executionMedia[index];
+      if (
+        execution === undefined ||
+        execution.mediaId !== projected.mediaId ||
+        execution.audioStreamIndex !== projected.audioStreamIndex ||
+        execution.videoStreamIndex !== projected.videoStreamIndex ||
+        (projection.visualEvidenceEnabled && projected.videoStreamIndex === null) ||
+        (!projection.visualEvidenceEnabled && projected.videoStreamIndex !== null)
+      ) {
+        throw new Error(
+          `blind batch ${label} mediaId/stream 与 projection 有序绑定不一致。`
+        );
+      }
+    });
+  }
+
+  if (suite.pairs.length !== projection.pairs.length) {
+    throw new Error("blind batch fullCartesian pair 数量与 projection 不一致。");
+  }
+  suite.pairs.forEach((executionPair, index) => {
+    const projectedPair = projection.pairs[index];
+    if (
+      projectedPair === undefined ||
+      executionPair.pairOrdinal !== index + 1 ||
+      executionPair.sourceMediaId !== projectedPair.sourceMediaId ||
+      executionPair.targetMediaId !== projectedPair.targetMediaId
+    ) {
+      throw new Error(
+        "blind batch fullCartesian pair 必须与 projection source-major 顺序逐项一致。"
+      );
+    }
+  });
+}
+
 function selectFrozenCases(
   frozenCases: readonly RealMediaBenchmarkCase[],
-  requestedIds: readonly string[] | undefined
+  requestedIds: readonly string[] | undefined,
+  fieldName: "caseIds" | "candidateCaseIds"
 ): RealMediaBenchmarkCase[] {
   if (requestedIds === undefined) {
     return frozenCases.map((benchmarkCase) => structuredClone(benchmarkCase));
   }
   if (requestedIds.length === 0 || new Set(requestedIds).size !== requestedIds.length) {
-    throw new Error("blind batch caseIds 必须非空且不重复。 ");
+    throw new Error(`blind batch ${fieldName} 必须非空且不重复。 `);
   }
-  requestedIds.forEach((caseId) => assertNonemptyString(caseId, "caseId"));
+  requestedIds.forEach((caseId) => assertNonemptyString(caseId, fieldName));
   const requested = new Set(requestedIds);
   const selected = frozenCases.filter((benchmarkCase) => requested.has(benchmarkCase.id));
   if (selected.length !== requestedIds.length) {
-    throw new Error("blind batch caseIds 含不存在、非 real 或非 frozen-test 的关系。 ");
+    throw new Error(
+      `blind batch ${fieldName} 含不存在、非 real 或非 frozen-test 的关系。 `
+    );
   }
   if (selected.some((benchmarkCase, index) => benchmarkCase.id !== requestedIds[index])) {
-    throw new Error("blind batch caseIds 必须保持冻结 manifest 顺序。 ");
+    throw new Error(`blind batch ${fieldName} 必须保持冻结 manifest 顺序。 `);
   }
   return selected.map((benchmarkCase) => structuredClone(benchmarkCase));
 }

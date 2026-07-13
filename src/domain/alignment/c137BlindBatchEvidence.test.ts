@@ -6,6 +6,7 @@ import {
   computeC137BlindBatchProjectionDigest,
   createC137BlindBatchExecutionProjection,
   createC137BlindBatchMediaBindingCommitment,
+  deriveC137BlindBatchRelationshipDecisions,
   sealC137BlindBatchRawPrediction,
   validateC137BlindBatchBenchmarkEvidence,
   type C137BlindBatchBenchmarkEvidence,
@@ -30,6 +31,57 @@ const EXECUTION_DIGEST = `sha256:${"e".repeat(64)}` as const;
 const NATIVE_RECEIPT_DIGEST = `sha256:${"f".repeat(64)}` as const;
 
 describe("C137 blind cross-media relationship evidence", () => {
+  it("slices only the query axis while retaining a predeclared candidate universe", () => {
+    const manifest = createManifestWithCaseCount(5);
+    const decisionCaseIds = [manifest.cases[0].id];
+    const candidateCaseIds = manifest.cases.map((benchmarkCase) => benchmarkCase.id);
+
+    const sourceAxis = createC137BlindBatchExecutionProjection(manifest, {
+      relationshipAxis: "source",
+      visualEvidenceEnabled: false,
+      topK: 2,
+      caseIds: decisionCaseIds,
+      candidateCaseIds
+    });
+    expect(sourceAxis.sources).toHaveLength(1);
+    expect(sourceAxis.targets).toHaveLength(5);
+    expect(sourceAxis.pairs).toHaveLength(5);
+
+    const targetAxis = createC137BlindBatchExecutionProjection(manifest, {
+      relationshipAxis: "target",
+      visualEvidenceEnabled: false,
+      topK: 2,
+      caseIds: decisionCaseIds,
+      candidateCaseIds
+    });
+    expect(targetAxis.sources).toHaveLength(5);
+    expect(targetAxis.targets).toHaveLength(1);
+    expect(targetAxis.pairs).toHaveLength(5);
+    expect(targetAxis.suiteId).not.toBe(sourceAxis.suiteId);
+
+    const legacySubset = createC137BlindBatchExecutionProjection(manifest, {
+      ...OPTIONS,
+      caseIds: candidateCaseIds.slice(0, 3)
+    });
+    expect(legacySubset.sources).toHaveLength(3);
+    expect(legacySubset.targets).toHaveLength(3);
+
+    expect(() =>
+      createC137BlindBatchExecutionProjection(manifest, {
+        ...OPTIONS,
+        caseIds: decisionCaseIds,
+        candidateCaseIds: candidateCaseIds.slice(1)
+      })
+    ).toThrow(/必须包含全部 decision caseIds/);
+    expect(() =>
+      createC137BlindBatchExecutionProjection(manifest, {
+        ...OPTIONS,
+        caseIds: decisionCaseIds,
+        candidateCaseIds: [...candidateCaseIds].reverse()
+      })
+    ).toThrow(/必须保持冻结 manifest 顺序/);
+  });
+
   it("projects a 3×3 path-free batch and labels self-consistent component evidence honestly", () => {
     const manifest = createManifest();
     const projection = createC137BlindBatchExecutionProjection(manifest, OPTIONS);
@@ -119,6 +171,55 @@ describe("C137 blind cross-media relationship evidence", () => {
         evidence
       )
     ).toEqual({ valid: true, issues: [] });
+  });
+
+  it("derives private per-case gold and declared-axis Top-K without caller hit fields", () => {
+    const manifest = createManifest();
+    const projection = createC137BlindBatchExecutionProjection(manifest, OPTIONS);
+    const raw = createPerfectRawPrediction(manifest, projection);
+
+    const decisions = deriveC137BlindBatchRelationshipDecisions(
+      manifest,
+      OPTIONS,
+      projection,
+      raw
+    );
+
+    expect(decisions).toHaveLength(manifest.cases.length);
+    expect(new Set(decisions.map((decision) => decision.provenanceRef)).size).toBe(
+      manifest.cases.length
+    );
+    decisions.forEach((decision, index) => {
+      const benchmarkCase = manifest.cases[index];
+      const goldPair = goldPairForCase(manifest, projection, benchmarkCase);
+      const ranking = raw.targetRankings.find(
+        (item) => item.targetMediaId === goldPair.targetMediaId
+      );
+      const { provenanceRef, ...decisionWithoutProvenanceRef } = decision;
+      expect(provenanceRef).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(decisionWithoutProvenanceRef).toEqual({
+        suiteId: projection.suiteId,
+        caseId: benchmarkCase.id,
+        goldPairId: goldPair.pairId,
+        rankedPairIds: ranking?.rankedPairIds.slice(0, OPTIONS.topK)
+      });
+    });
+    expect(
+      deriveC137BlindBatchRelationshipDecisions(
+        manifest,
+        OPTIONS,
+        projection,
+        raw
+      )
+    ).toEqual(decisions);
+    expect(() =>
+      deriveC137BlindBatchRelationshipDecisions(
+        manifest,
+        { ...OPTIONS, relationshipAxis: "source" },
+        projection,
+        raw
+      )
+    ).toThrow(/唯一 gold-free 投影不一致/);
   });
 
   it("does not encode manifest order or gold pair diagonal in media IDs", () => {
