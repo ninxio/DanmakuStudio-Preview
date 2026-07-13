@@ -1,3 +1,13 @@
+- 2026-07-13：C137 完成第六阶段第十三个切片“穷举式仿射粗候选全集、有界窗口分组与双向编辑恢复证书”，完整验证并重新打包；Goal 继续进行。
+  - 粗候选不再被旧 Top-K 静默截断：原生 feature 升级到 v12，生产链先生成确定性、受资源上限约束的 anchor-free 仿射 hypothesis 全集，只有最终选中的候选才物化 anchors；保留旧 Top-K API 仅作兼容。新增重复位置回归明确证明第六、第七个合法候选会留在生产候选全集，而不是在 legacy Top-5 后消失。
+  - 资源边界闭环：候选全集硬上限为 32768，超过即显式资源失败，禁止截断后继续；粗候选按 4 KiB/项保守计费，matcher/materializer 临时工作区、物化 anchor Vec、fine window、DP 三份 `i64` 成本面、三份父状态面、回溯路径和安全余量全部在分配前纳入 1 GiB 活跃内存账本。资源不足或取消不会伪造成低置信或无匹配。
+  - 分组复杂度收敛：temporal-window group 改为保存 candidate index，不再深拷贝候选；按几何排序后，每个候选只探测最近最多 64 个可行组，并使用 source/target 交集核心作为 complete-link 证书。实现复杂度从最坏 O(n²) 降为 O(n log n + 64n)，允许安全过分组但不删除候选；1000 候选回归验证探测上限和完整、无重复 index partition。
+  - 双向编辑恢复更严格：递归 edit-aware DP 始终执行有界对齐；没有可靠匹配的 chunk 先延迟判定并冻结 source cursor，只有同一 cursor 后续出现连续可靠 common content 才提交 pending `targetOnly`。生产长片要求最多 5 秒连续恢复证据，短片要求至少 `max(500ms, 20% chunk)`；一帧或亚秒偶然岛、低信息双轴跳跃均失败关闭，同时保留 45 秒 source-only、120 秒 target-only 和 chunk 边界 source-only 的正确恢复。
+  - 自动验收：仿射全集、第六候选、分组、递归双向编辑、恢复证书、DP 预分配与生产候选物化定向回归全部通过；Rust 串行全量 **313 passed / 18 ignored / 0 failed**，strict Clippy `-D warnings` 与 `git diff --check` 通过。默认并行全量仅有既存 Windows Job Object 进程监督测试在高并发下偶发 descendant code 258，单独运行与串行全量均通过。`corepack pnpm verify:release` 完整通过：源码审计、ESLint、Vitest **82 files / 823 tests**、TypeScript/Vite production build、Chromium 四页北极星 **5/5** 与 Tauri NSIS release。
+  - 本阶段安装器：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `4025671` 字节，时间 `2026-07-13 18:58:29 +08:00`，SHA-256 `66266BB4B67A613266B532B51BA76BB2102A0B49631A2EFB63D61645187458DF`。
+  - 本阶段便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `15793152` 字节，时间 `2026-07-13 18:58:29 +08:00`，SHA-256 `1BC1BD9BAB56C58E9891D0E00A42EC6DD2B6C912E6D1DC4C05C575C5A178608E`。
+  - 诚实限制：候选全集仍受 768 个 model seed 与 32768 总候选的显式硬上限约束，不等于数学无限枚举；本切片尚未把 versioned multi-candidate fine frontier、fine interval occupancy 与第二次 exact assignment 接入生产 evidence。4090 环境已存在且无需重装，但当前仍只加速部分声谱 FFT；长窗口 fine FFT、14 维距离、Gotoh DP、边界精修和 assignment 仍在 CPU。获授权真实冻结集、删减双边界金标准和外部信任根尚未闭环，C137 继续 active。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-exhaustive-coarse-universe-v1-20260713`。
 - 2026-07-13：C137 完成第六阶段第十二个切片“pair-local temporal-window grouping 基础与 4090 release 复核”，完整验证并重新打包；Goal 继续进行。
   - 安全窗口分组基础：coarse 全候选继续完整进入 eligibility、global margin、exact non-conflict assignment、fine budget 和既有 evidence v2；新增的内部 temporal-window groups 只保存候选副本，不删除同窗口的音轨变体。组内代表按既有 `v2_global_candidate_weight` 选择并确定性破同分，避免 raw score 更高但全局权重较低的候选遮蔽真正优胜者。
   - 窗口等价约束：scale 差不超过 0.002，且 source/target 的交叠均必须达到各自较长窗口的 80%；使用 complete-link，待加入候选必须与组内每个成员都满足等价，防止 12 分钟窗口被 24 分钟嵌套窗口吞并，也防止 A~B、B~C、A!~C 的桥接误合并。新增 5 个回归覆盖跨音轨保留、不同窗口分离、输入顺序无关、嵌套窗口与桥接窗口。

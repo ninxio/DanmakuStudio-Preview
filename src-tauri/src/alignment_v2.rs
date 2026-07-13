@@ -18,7 +18,8 @@ const SPECTRAL_BIN_COUNT: usize = 48;
 const FINE_SPECTRAL_BAND_COUNT: usize = 12;
 const LANDMARK_DELTA_QUANTUM_MS: i64 = 50;
 const LANDMARK_DELTA_MASK: u64 = 0xff;
-const MAX_MODEL_SEEDS: usize = 768;
+pub const AFFINE_COARSE_MAX_MODEL_SEEDS: usize = 768;
+const MAX_MODEL_SEEDS: usize = AFFINE_COARSE_MAX_MODEL_SEEDS;
 const MAX_OBSERVATIONS: usize = 40_000;
 const AFFINE_HOLDOUT_TIME_BLOCK_MS: i64 = 1_000;
 const MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY: usize = 16_384;
@@ -1512,6 +1513,68 @@ pub struct AffineHypothesis {
     pub held_out_within_tolerance_count: usize,
 }
 
+/// Anchor-free affine model produced by the complete deterministic seed universe.
+///
+/// This type is deliberately coarse-only: it contains every scalar needed for candidate
+/// ranking and bounded fine-window planning, but it does not retain training or held-out
+/// anchors for every fitted seed. Call [`materialize_affine_hypothesis_with_cancel`] with the
+/// original landmark inputs and config before publishing detailed evidence or entering fine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoarseAffineHypothesis {
+    pub scale: f64,
+    pub offset_ms: i64,
+    pub inlier_count: usize,
+    pub unique_source_count: usize,
+    pub unique_source_coverage: f64,
+    pub unique_target_count: usize,
+    pub unique_target_coverage: f64,
+    pub source_start_ms: i64,
+    pub source_end_ms: i64,
+    pub p50_residual_ms: i64,
+    pub p95_residual_ms: i64,
+    pub max_residual_ms: i64,
+    // Training residuals were originally measured against the unrounded least-squares offset.
+    // Preserve that exact value privately so later materialization remains bit-for-bit compatible
+    // with the legacy Top-K result without exposing it as a second public timeline coordinate.
+    fitted_offset_ms: f64,
+}
+
+impl CoarseAffineHypothesis {
+    /// Returns an anchor-free compatibility view for coarse scoring and fine-window planning.
+    ///
+    /// The empty anchor vectors are intentional. This view must not be published as evidence or
+    /// passed into fine alignment; retain this [`CoarseAffineHypothesis`] and call
+    /// [`materialize_affine_hypothesis_with_cancel`] with the original landmarks and config first.
+    pub fn to_anchor_free_affine_hypothesis(&self) -> AffineHypothesis {
+        self.materialize(Vec::new(), Vec::new(), 0)
+    }
+
+    fn materialize(
+        &self,
+        training_anchors: Vec<AffineAnchorEvidence>,
+        held_out_anchors: Vec<AffineAnchorEvidence>,
+        held_out_within_tolerance_count: usize,
+    ) -> AffineHypothesis {
+        AffineHypothesis {
+            scale: self.scale,
+            offset_ms: self.offset_ms,
+            inlier_count: self.inlier_count,
+            unique_source_count: self.unique_source_count,
+            unique_source_coverage: self.unique_source_coverage,
+            unique_target_count: self.unique_target_count,
+            unique_target_coverage: self.unique_target_coverage,
+            source_start_ms: self.source_start_ms,
+            source_end_ms: self.source_end_ms,
+            p50_residual_ms: self.p50_residual_ms,
+            p95_residual_ms: self.p95_residual_ms,
+            max_residual_ms: self.max_residual_ms,
+            training_anchors,
+            held_out_anchors,
+            held_out_within_tolerance_count,
+        }
+    }
+}
+
 // Production callers use this axis-safe contract to bind windowed FFmpeg PCM back to the
 // absolute presentation timeline. It must remain independent of FFmpeg seek coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1639,8 +1702,24 @@ fn f64_milliseconds_to_i64(value: f64, round: fn(f64) -> f64) -> Result<i64, Str
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Retained as the compatibility payload for legacy Top-K callers and tests.
 pub struct AffineMatchResult {
     pub hypotheses: Vec<AffineHypothesis>,
+    pub observation_count: usize,
+    pub source_landmark_count: usize,
+    pub target_landmark_count: usize,
+    pub top1_top2_margin: f64,
+}
+
+/// Complete anchor-free result for the bounded deterministic affine seed universe.
+///
+/// Unlike [`AffineMatchResult`], this result never applies `AffineMatchConfig::top_k`; every
+/// successfully fitted and deduplicated model from at most
+/// [`AFFINE_COARSE_MAX_MODEL_SEEDS`] seeds is returned in canonical ranking order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffineCoarseUniverseResult {
+    pub hypotheses: Vec<CoarseAffineHypothesis>,
+    pub seed_count: usize,
     pub observation_count: usize,
     pub source_landmark_count: usize,
     pub target_landmark_count: usize,
@@ -1664,6 +1743,13 @@ struct ModelInlier {
     residual_ms: i64,
 }
 
+#[derive(Debug)]
+struct AffineMatchPartition {
+    observations: Vec<LandmarkObservation>,
+    fitting_observations: Vec<LandmarkObservation>,
+    held_out_time_blocks: HashSet<i64>,
+}
+
 /// 通过 hash 倒排表建立候选，再用确定性模型采样和稳健重拟合输出 Top-K 仿射假设。
 #[cfg(test)]
 pub fn match_landmarks_affine(
@@ -1674,6 +1760,7 @@ pub fn match_landmarks_affine(
     match_landmarks_affine_with_cancel(source, target, config, None)
 }
 
+#[allow(dead_code)] // Release uses the exhaustive coarse API; keep legacy Top-K behavior callable.
 pub fn match_landmarks_affine_with_cancel(
     source: &[SpectralLandmark],
     target: &[SpectralLandmark],
@@ -1682,93 +1769,83 @@ pub fn match_landmarks_affine_with_cancel(
 ) -> Result<AffineMatchResult, String> {
     check_algorithm_cancelled(cancel_flag)?;
     validate_affine_config(config)?;
-    if source.is_empty() || target.is_empty() {
-        return Ok(AffineMatchResult {
-            hypotheses: Vec::new(),
-            observation_count: 0,
-            source_landmark_count: source.len(),
-            target_landmark_count: target.len(),
-            top1_top2_margin: 0.0,
-        });
-    }
-
-    let observations = create_landmark_observations(source, target, config, cancel_flag)?;
-    let unique_source_total = source.len();
-    let unique_target_total = target.len();
-    if observations.is_empty() || unique_source_total == 0 {
-        return Ok(AffineMatchResult {
-            hypotheses: Vec::new(),
-            observation_count: observations.len(),
-            source_landmark_count: source.len(),
-            target_landmark_count: target.len(),
-            top1_top2_margin: 0.0,
-        });
-    }
-
-    let held_out_time_blocks =
-        select_distributed_holdout_time_blocks(&observations, config.min_inliers);
-    let training_observations = observations
-        .iter()
-        .filter(|item| {
-            !held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let (fitting_observations, held_out_time_blocks) =
-        if training_observations.len() >= config.min_inliers {
-            (training_observations.as_slice(), held_out_time_blocks)
-        } else {
-            (observations.as_slice(), HashSet::new())
-        };
-    // The validation partition is fixed before seed generation. Every source landmark in a
-    // selected time block stays together, so alternate frequencies from the same spectral frame
-    // cannot leak into seeds, candidate ranking or least-squares refitting.
-    let seeds = create_model_seeds(fitting_observations, config, cancel_flag)?;
-    let mut hypotheses = Vec::new();
-    for (seed_index, (seed_scale, seed_offset)) in seeds.into_iter().enumerate() {
-        if seed_index % 4 == 0 {
-            check_algorithm_cancelled(cancel_flag)?;
-        }
-        if let Some(hypothesis) = fit_hypothesis(
-            fitting_observations,
-            seed_scale,
-            seed_offset,
-            unique_source_total,
-            unique_target_total,
+    let partition = prepare_affine_match_partition(source, target, config, cancel_flag)?;
+    let coarse =
+        fit_affine_coarse_universe(&partition, source.len(), target.len(), config, cancel_flag)?;
+    let mut hypotheses = Vec::with_capacity(coarse.hypotheses.len().min(config.top_k));
+    for coarse_hypothesis in coarse.hypotheses.iter().take(config.top_k) {
+        hypotheses.push(materialize_affine_hypothesis_from_partition(
+            &partition,
+            source.len(),
+            target.len(),
             config,
-        ) {
-            if hypotheses.iter().any(|existing: &AffineHypothesis| {
-                (existing.scale - hypothesis.scale).abs() < 0.000_5
-                    && existing.offset_ms.abs_diff(hypothesis.offset_ms) < 40
-            }) {
-                continue;
-            }
-            hypotheses.push(hypothesis);
-        }
-    }
-    hypotheses.sort_by(compare_hypotheses);
-    hypotheses.truncate(config.top_k);
-    for hypothesis in &mut hypotheses {
-        hypothesis.held_out_anchors = evaluate_affine_holdout(
-            &observations,
-            &held_out_time_blocks,
-            hypothesis.scale,
-            hypothesis.offset_ms as f64,
-        );
-        hypothesis.held_out_within_tolerance_count = hypothesis
-            .held_out_anchors
-            .iter()
-            .filter(|item| item.residual_ms <= config.residual_tolerance_ms)
-            .count();
+            coarse_hypothesis,
+            cancel_flag,
+        )?);
     }
     let top1_top2_margin = calculate_hypothesis_margin(&hypotheses, config);
     Ok(AffineMatchResult {
         hypotheses,
-        observation_count: observations.len(),
+        observation_count: coarse.observation_count,
         source_landmark_count: source.len(),
         target_landmark_count: target.len(),
         top1_top2_margin,
     })
+}
+
+/// Fits the complete deterministic affine seed universe without retaining anchor vectors.
+#[allow(dead_code)] // Convenience wrapper retained for non-cancellable callers.
+pub fn match_landmarks_affine_coarse_universe(
+    source: &[SpectralLandmark],
+    target: &[SpectralLandmark],
+    config: &AffineMatchConfig,
+) -> Result<AffineCoarseUniverseResult, String> {
+    match_landmarks_affine_coarse_universe_with_cancel(source, target, config, None)
+}
+
+/// Cancellation-aware form of [`match_landmarks_affine_coarse_universe`].
+pub fn match_landmarks_affine_coarse_universe_with_cancel(
+    source: &[SpectralLandmark],
+    target: &[SpectralLandmark],
+    config: &AffineMatchConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AffineCoarseUniverseResult, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    validate_affine_config(config)?;
+    let partition = prepare_affine_match_partition(source, target, config, cancel_flag)?;
+    fit_affine_coarse_universe(&partition, source.len(), target.len(), config, cancel_flag)
+}
+
+/// Deterministically reconstructs full training and held-out evidence for one coarse hypothesis.
+#[allow(dead_code)] // Convenience wrapper retained for non-cancellable callers.
+pub fn materialize_affine_hypothesis(
+    source: &[SpectralLandmark],
+    target: &[SpectralLandmark],
+    config: &AffineMatchConfig,
+    hypothesis: &CoarseAffineHypothesis,
+) -> Result<AffineHypothesis, String> {
+    materialize_affine_hypothesis_with_cancel(source, target, config, hypothesis, None)
+}
+
+/// Cancellation-aware form of [`materialize_affine_hypothesis`].
+pub fn materialize_affine_hypothesis_with_cancel(
+    source: &[SpectralLandmark],
+    target: &[SpectralLandmark],
+    config: &AffineMatchConfig,
+    hypothesis: &CoarseAffineHypothesis,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AffineHypothesis, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    validate_affine_config(config)?;
+    let partition = prepare_affine_match_partition(source, target, config, cancel_flag)?;
+    materialize_affine_hypothesis_from_partition(
+        &partition,
+        source.len(),
+        target.len(),
+        config,
+        hypothesis,
+        cancel_flag,
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2892,14 +2969,121 @@ fn create_model_seeds(
     Ok(seeds)
 }
 
-fn fit_hypothesis(
+fn prepare_affine_match_partition(
+    source: &[SpectralLandmark],
+    target: &[SpectralLandmark],
+    config: &AffineMatchConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AffineMatchPartition, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    let observations = create_landmark_observations(source, target, config, cancel_flag)?;
+    if observations.len() > MAX_OBSERVATIONS {
+        return Err(format!(
+            "仿射观测数 {} 超过硬上限 {MAX_OBSERVATIONS}。",
+            observations.len()
+        ));
+    }
+    let held_out_time_blocks =
+        select_distributed_holdout_time_blocks(&observations, config.min_inliers);
+    let training_observations = observations
+        .iter()
+        .filter(|item| {
+            !held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    check_algorithm_cancelled(cancel_flag)?;
+    let (fitting_observations, held_out_time_blocks) =
+        if training_observations.len() >= config.min_inliers {
+            (training_observations, held_out_time_blocks)
+        } else {
+            (observations.clone(), HashSet::new())
+        };
+    Ok(AffineMatchPartition {
+        observations,
+        fitting_observations,
+        held_out_time_blocks,
+    })
+}
+
+fn fit_affine_coarse_universe(
+    partition: &AffineMatchPartition,
+    unique_source_total: usize,
+    unique_target_total: usize,
+    config: &AffineMatchConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AffineCoarseUniverseResult, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    if partition.observations.is_empty() || unique_source_total == 0 || unique_target_total == 0 {
+        return Ok(AffineCoarseUniverseResult {
+            hypotheses: Vec::new(),
+            seed_count: 0,
+            observation_count: partition.observations.len(),
+            source_landmark_count: unique_source_total,
+            target_landmark_count: unique_target_total,
+            top1_top2_margin: 0.0,
+        });
+    }
+
+    // The validation partition is fixed before seed generation. Every source landmark in a
+    // selected time block stays together, so alternate frequencies from the same spectral frame
+    // cannot leak into seeds, candidate ranking or least-squares refitting.
+    let seeds = create_model_seeds(&partition.fitting_observations, config, cancel_flag)?;
+    if seeds.len() > AFFINE_COARSE_MAX_MODEL_SEEDS {
+        return Err(format!(
+            "仿射模型 seed 数 {} 超过硬上限 {AFFINE_COARSE_MAX_MODEL_SEEDS}。",
+            seeds.len()
+        ));
+    }
+    let seed_count = seeds.len();
+    let mut hypotheses = Vec::<CoarseAffineHypothesis>::with_capacity(seed_count);
+    for (seed_index, (seed_scale, seed_offset)) in seeds.into_iter().enumerate() {
+        if seed_index % 4 == 0 {
+            check_algorithm_cancelled(cancel_flag)?;
+        }
+        if let Some(hypothesis) = fit_coarse_hypothesis(
+            &partition.fitting_observations,
+            seed_scale,
+            seed_offset,
+            unique_source_total,
+            unique_target_total,
+            config,
+        ) {
+            if hypotheses.iter().any(|existing: &CoarseAffineHypothesis| {
+                (existing.scale - hypothesis.scale).abs() < 0.000_5
+                    && existing.offset_ms.abs_diff(hypothesis.offset_ms) < 40
+            }) {
+                continue;
+            }
+            if hypotheses.len() >= AFFINE_COARSE_MAX_MODEL_SEEDS {
+                return Err(format!(
+                    "去重仿射假设数超过硬上限 {AFFINE_COARSE_MAX_MODEL_SEEDS}。"
+                ));
+            }
+            hypotheses.push(hypothesis);
+        }
+    }
+    check_algorithm_cancelled(cancel_flag)?;
+    hypotheses.sort_by(compare_coarse_hypotheses);
+    let top1_top2_margin = calculate_coarse_hypothesis_margin(&hypotheses, config);
+    Ok(AffineCoarseUniverseResult {
+        hypotheses,
+        seed_count,
+        observation_count: partition.observations.len(),
+        source_landmark_count: unique_source_total,
+        target_landmark_count: unique_target_total,
+        top1_top2_margin,
+    })
+}
+
+fn fit_coarse_hypothesis(
     observations: &[LandmarkObservation],
     seed_scale: f64,
     seed_offset: f64,
     unique_source_total: usize,
     unique_target_total: usize,
     config: &AffineMatchConfig,
-) -> Option<AffineHypothesis> {
+) -> Option<CoarseAffineHypothesis> {
     let mut scale = seed_scale;
     let mut offset = seed_offset;
     let mut inliers =
@@ -2924,13 +3108,60 @@ fn fit_hypothesis(
     if inliers.len() < config.min_inliers {
         return None;
     }
-    let mut residuals = inliers
-        .iter()
-        .map(|item| item.residual_ms)
-        .collect::<Vec<_>>();
-    residuals.sort_unstable();
-    let source_start_ms = inliers.iter().map(|item| item.source_time_ms).min()?;
-    let source_end_ms = inliers.iter().map(|item| item.source_time_ms).max()?;
+    create_coarse_hypothesis_from_inliers(
+        scale,
+        offset,
+        &inliers,
+        unique_source_total,
+        unique_target_total,
+    )
+}
+
+fn materialize_affine_hypothesis_from_partition(
+    partition: &AffineMatchPartition,
+    unique_source_total: usize,
+    unique_target_total: usize,
+    config: &AffineMatchConfig,
+    hypothesis: &CoarseAffineHypothesis,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AffineHypothesis, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    if !hypothesis.scale.is_finite()
+        || !hypothesis.fitted_offset_ms.is_finite()
+        || hypothesis.scale < config.min_scale
+        || hypothesis.scale > config.max_scale
+    {
+        return Err("coarse affine hypothesis 含非有限或越界模型参数。".to_string());
+    }
+    let inliers = select_unique_monotonic_inliers(
+        &partition.fitting_observations,
+        hypothesis.scale,
+        hypothesis.fitted_offset_ms,
+        config.residual_tolerance_ms,
+    );
+    if inliers.len() < config.min_inliers {
+        return Err(
+            "coarse affine hypothesis 无法在原始 landmark 上重建最小训练内点。".to_string(),
+        );
+    }
+    let rebuilt = create_coarse_hypothesis_from_inliers(
+        hypothesis.scale,
+        hypothesis.fitted_offset_ms,
+        &inliers,
+        unique_source_total,
+        unique_target_total,
+    )
+    .ok_or_else(|| "coarse affine hypothesis 无法重建标量。".to_string())?;
+    if rebuilt != *hypothesis {
+        return Err(
+            "coarse affine hypothesis 与当前 landmark/config 的确定性重建结果不一致。".to_string(),
+        );
+    }
+    if inliers.len() > MAX_OBSERVATIONS {
+        return Err(format!(
+            "materialized training anchor 数超过硬上限 {MAX_OBSERVATIONS}。"
+        ));
+    }
     let training_anchors = inliers
         .iter()
         .map(|item| AffineAnchorEvidence {
@@ -2939,22 +3170,59 @@ fn fit_hypothesis(
             residual_ms: item.residual_ms,
         })
         .collect::<Vec<_>>();
-    Some(AffineHypothesis {
+    check_algorithm_cancelled(cancel_flag)?;
+    let held_out_anchors = evaluate_affine_holdout(
+        &partition.observations,
+        &partition.held_out_time_blocks,
+        hypothesis.scale,
+        hypothesis.offset_ms as f64,
+    );
+    if held_out_anchors.len() > MAX_OBSERVATIONS {
+        return Err(format!(
+            "materialized held-out anchor 数超过硬上限 {MAX_OBSERVATIONS}。"
+        ));
+    }
+    let held_out_within_tolerance_count = held_out_anchors
+        .iter()
+        .filter(|item| item.residual_ms <= config.residual_tolerance_ms)
+        .count();
+    check_algorithm_cancelled(cancel_flag)?;
+    Ok(hypothesis.materialize(
+        training_anchors,
+        held_out_anchors,
+        held_out_within_tolerance_count,
+    ))
+}
+
+fn create_coarse_hypothesis_from_inliers(
+    scale: f64,
+    fitted_offset_ms: f64,
+    inliers: &[ModelInlier],
+    unique_source_total: usize,
+    unique_target_total: usize,
+) -> Option<CoarseAffineHypothesis> {
+    if inliers.is_empty() {
+        return None;
+    }
+    let mut residuals = inliers
+        .iter()
+        .map(|item| item.residual_ms)
+        .collect::<Vec<_>>();
+    residuals.sort_unstable();
+    Some(CoarseAffineHypothesis {
         scale,
-        offset_ms: offset.round() as i64,
+        offset_ms: fitted_offset_ms.round() as i64,
         inlier_count: inliers.len(),
         unique_source_count: inliers.len(),
         unique_source_coverage: inliers.len() as f64 / unique_source_total.max(1) as f64,
         unique_target_count: inliers.len(),
         unique_target_coverage: inliers.len() as f64 / unique_target_total.max(1) as f64,
-        source_start_ms,
-        source_end_ms,
+        source_start_ms: inliers.iter().map(|item| item.source_time_ms).min()?,
+        source_end_ms: inliers.iter().map(|item| item.source_time_ms).max()?,
         p50_residual_ms: percentile(&residuals, 0.50),
         p95_residual_ms: percentile(&residuals, 0.95),
         max_residual_ms: *residuals.last().unwrap_or(&0),
-        training_anchors,
-        held_out_anchors: Vec::new(),
-        held_out_within_tolerance_count: 0,
+        fitted_offset_ms,
     })
 }
 
@@ -3153,7 +3421,10 @@ fn least_squares_affine(inliers: &[ModelInlier]) -> Option<(f64, f64)> {
     Some((scale, target_mean - scale * source_mean))
 }
 
-fn compare_hypotheses(left: &AffineHypothesis, right: &AffineHypothesis) -> std::cmp::Ordering {
+fn compare_coarse_hypotheses(
+    left: &CoarseAffineHypothesis,
+    right: &CoarseAffineHypothesis,
+) -> std::cmp::Ordering {
     right
         .inlier_count
         .cmp(&left.inlier_count)
@@ -3172,11 +3443,28 @@ fn compare_hypotheses(left: &AffineHypothesis, right: &AffineHypothesis) -> std:
         .then_with(|| left.scale.total_cmp(&right.scale))
 }
 
+#[allow(dead_code)] // Used by the retained legacy Top-K compatibility path.
 fn calculate_hypothesis_margin(hypotheses: &[AffineHypothesis], config: &AffineMatchConfig) -> f64 {
     let Some(first) = hypotheses.first() else {
         return 0.0;
     };
     let score = |item: &AffineHypothesis| {
+        item.inlier_count as f64
+            - item.p95_residual_ms as f64 / (config.residual_tolerance_ms as f64 * 2.0)
+    };
+    let first_score = score(first).max(0.001);
+    let second_score = hypotheses.get(1).map(score).unwrap_or(0.0);
+    ((first_score - second_score) / first_score).clamp(0.0, 1.0)
+}
+
+fn calculate_coarse_hypothesis_margin(
+    hypotheses: &[CoarseAffineHypothesis],
+    config: &AffineMatchConfig,
+) -> f64 {
+    let Some(first) = hypotheses.first() else {
+        return 0.0;
+    };
+    let score = |item: &CoarseAffineHypothesis| {
         item.inlier_count as f64
             - item.p95_residual_ms as f64 / (config.residual_tolerance_ms as f64 * 2.0)
     };
@@ -4103,6 +4391,193 @@ mod tests {
     }
 
     #[test]
+    fn affine_coarse_universe_preserves_legacy_top_k_and_full_evidence() {
+        let (source, target) = affine_repeated_episode_fixture();
+        let config = AffineMatchConfig {
+            min_inliers: 6,
+            top_k: 2,
+            ..AffineMatchConfig::default()
+        };
+
+        let universe = match_landmarks_affine_coarse_universe(&source, &target, &config).unwrap();
+        let legacy = match_landmarks_affine(&source, &target, &config).unwrap();
+        let materialized = universe
+            .hypotheses
+            .iter()
+            .take(config.top_k)
+            .map(|hypothesis| {
+                materialize_affine_hypothesis(&source, &target, &config, hypothesis).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(legacy.hypotheses, materialized);
+        assert_eq!(legacy.hypotheses.len(), config.top_k);
+        assert_eq!(legacy.observation_count, universe.observation_count);
+        assert_eq!(legacy.source_landmark_count, universe.source_landmark_count);
+        assert_eq!(legacy.target_landmark_count, universe.target_landmark_count);
+        assert_eq!(legacy.top1_top2_margin, universe.top1_top2_margin);
+        assert!(legacy.hypotheses.iter().all(|hypothesis| {
+            !hypothesis.training_anchors.is_empty() && !hypothesis.held_out_anchors.is_empty()
+        }));
+    }
+
+    #[test]
+    fn affine_coarse_universe_retains_candidates_beyond_legacy_top_k() {
+        let (source, target) = affine_repeated_episode_fixture();
+        let config = AffineMatchConfig {
+            min_inliers: 6,
+            top_k: 1,
+            ..AffineMatchConfig::default()
+        };
+
+        let universe = match_landmarks_affine_coarse_universe(&source, &target, &config).unwrap();
+        let legacy = match_landmarks_affine(&source, &target, &config).unwrap();
+
+        assert_eq!(legacy.hypotheses.len(), 1);
+        assert!(universe.hypotheses.len() > legacy.hypotheses.len());
+        assert_eq!(
+            legacy.hypotheses[0].offset_ms,
+            universe.hypotheses[0].offset_ms
+        );
+        assert!(universe
+            .hypotheses
+            .iter()
+            .any(|hypothesis| hypothesis.offset_ms.abs_diff(5_000) <= 2));
+        assert!(universe
+            .hypotheses
+            .iter()
+            .any(|hypothesis| hypothesis.offset_ms.abs_diff(-55_000) <= 2));
+    }
+
+    #[test]
+    fn affine_coarse_universe_retains_sixth_candidate_beyond_legacy_top_five() {
+        let mut source = Vec::new();
+        let mut target = Vec::new();
+        for index in 0..25usize {
+            let hash = (((20_000 + index) as u64) << 8) | 4;
+            let episode_time_ms = index as i64 * 1_000;
+            for episode in 0..7_i64 {
+                source.push(test_landmark(hash, episode * 60_000 + episode_time_ms));
+            }
+            target.push(test_landmark(hash, 5_000 + episode_time_ms));
+        }
+        source.sort_by_key(|item| item.time_ms);
+        let config = AffineMatchConfig {
+            min_inliers: 6,
+            top_k: 5,
+            ..AffineMatchConfig::default()
+        };
+
+        let universe = match_landmarks_affine_coarse_universe(&source, &target, &config).unwrap();
+        let legacy = match_landmarks_affine(&source, &target, &config).unwrap();
+
+        assert_eq!(legacy.hypotheses.len(), 5);
+        assert!(
+            universe.hypotheses.len() >= 7,
+            "complete universe must retain all seven repeated locations: {:?}",
+            universe
+                .hypotheses
+                .iter()
+                .map(|hypothesis| hypothesis.offset_ms)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            legacy
+                .hypotheses
+                .iter()
+                .map(|hypothesis| hypothesis.offset_ms)
+                .collect::<Vec<_>>(),
+            universe
+                .hypotheses
+                .iter()
+                .take(5)
+                .map(|hypothesis| hypothesis.offset_ms)
+                .collect::<Vec<_>>()
+        );
+        assert!(universe.hypotheses[5..].iter().any(|hypothesis| {
+            !legacy.hypotheses.iter().any(|legacy| {
+                legacy.scale.to_bits() == hypothesis.scale.to_bits()
+                    && legacy.offset_ms == hypothesis.offset_ms
+            })
+        }));
+    }
+
+    #[test]
+    fn affine_coarse_materialization_matches_legacy_scalars_and_anchors() {
+        let (source, target) = affine_speed_drift_fixture();
+        let config = AffineMatchConfig::default();
+        let universe = match_landmarks_affine_coarse_universe(&source, &target, &config).unwrap();
+        let coarse = universe.hypotheses.first().expect("coarse hypothesis");
+        let anchor_free = coarse.to_anchor_free_affine_hypothesis();
+        let materialized =
+            materialize_affine_hypothesis(&source, &target, &config, coarse).unwrap();
+        let legacy = match_landmarks_affine(&source, &target, &config)
+            .unwrap()
+            .hypotheses
+            .into_iter()
+            .next()
+            .expect("legacy hypothesis");
+
+        assert_eq!(materialized, legacy);
+        assert_eq!(anchor_free.scale, legacy.scale);
+        assert_eq!(anchor_free.offset_ms, legacy.offset_ms);
+        assert_eq!(anchor_free.inlier_count, legacy.inlier_count);
+        assert_eq!(anchor_free.unique_source_count, legacy.unique_source_count);
+        assert_eq!(anchor_free.unique_target_count, legacy.unique_target_count);
+        assert_eq!(anchor_free.p95_residual_ms, legacy.p95_residual_ms);
+        assert!(anchor_free.training_anchors.is_empty());
+        assert!(anchor_free.held_out_anchors.is_empty());
+        assert_eq!(anchor_free.held_out_within_tolerance_count, 0);
+        assert!(!materialized.training_anchors.is_empty());
+        assert!(!materialized.held_out_anchors.is_empty());
+    }
+
+    #[test]
+    fn affine_coarse_universe_candidate_order_is_stable() {
+        let (source, target) = affine_repeated_episode_fixture();
+        let config = AffineMatchConfig {
+            min_inliers: 6,
+            top_k: 1,
+            ..AffineMatchConfig::default()
+        };
+
+        let first = match_landmarks_affine_coarse_universe(&source, &target, &config).unwrap();
+        let second = match_landmarks_affine_coarse_universe(&source, &target, &config).unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.seed_count > 0);
+        assert!(first.seed_count <= AFFINE_COARSE_MAX_MODEL_SEEDS);
+        assert!(first.hypotheses.len() <= first.seed_count);
+        assert!(first
+            .hypotheses
+            .windows(2)
+            .all(|pair| !compare_coarse_hypotheses(&pair[0], &pair[1]).is_gt()));
+
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            match_landmarks_affine_coarse_universe_with_cancel(
+                &source,
+                &target,
+                &config,
+                Some(&cancelled),
+            )
+            .unwrap_err(),
+            ALIGNMENT_V2_CANCELLED
+        );
+        assert_eq!(
+            materialize_affine_hypothesis_with_cancel(
+                &source,
+                &target,
+                &config,
+                &first.hypotheses[0],
+                Some(&cancelled),
+            )
+            .unwrap_err(),
+            ALIGNMENT_V2_CANCELLED
+        );
+    }
+
+    #[test]
     fn affine_holdout_keeps_all_frequencies_from_one_time_frame_in_one_partition() {
         let mut source = Vec::new();
         let mut target = Vec::new();
@@ -4961,6 +5436,40 @@ mod tests {
             covered = covered.saturating_add(size);
         }
         chunks
+    }
+
+    fn affine_speed_drift_fixture() -> (Vec<SpectralLandmark>, Vec<SpectralLandmark>) {
+        let mut source = Vec::new();
+        let mut target = Vec::new();
+        for index in 0..12usize {
+            let hash = (((100 + index) as u64) << 8) | 5;
+            let source_time_ms = index as i64 * 1_000;
+            source.push(test_landmark(hash, source_time_ms));
+            target.push(test_landmark(
+                hash,
+                (source_time_ms as f64 * 1.02).round() as i64 + 5_000,
+            ));
+            if index < 3 {
+                target.push(test_landmark(hash, source_time_ms));
+            }
+        }
+        source.push(test_landmark((999u64 << 8) | 5, 12_000));
+        target.sort_by_key(|item| item.time_ms);
+        (source, target)
+    }
+
+    fn affine_repeated_episode_fixture() -> (Vec<SpectralLandmark>, Vec<SpectralLandmark>) {
+        let mut source = Vec::new();
+        let mut target = Vec::new();
+        for index in 0..25usize {
+            let hash = (((10_000 + index) as u64) << 8) | 4;
+            let episode_time_ms = index as i64 * 1_000;
+            source.push(test_landmark(hash, episode_time_ms));
+            source.push(test_landmark(hash, 60_000 + episode_time_ms));
+            target.push(test_landmark(hash, 5_000 + episode_time_ms));
+        }
+        source.sort_by_key(|item| item.time_ms);
+        (source, target)
     }
 
     fn test_landmark(hash: u64, time_ms: i64) -> SpectralLandmark {

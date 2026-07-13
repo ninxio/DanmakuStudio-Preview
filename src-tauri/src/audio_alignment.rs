@@ -1,16 +1,19 @@
+#[cfg(test)]
+use crate::alignment_v2::match_landmarks_affine_with_cancel;
 use crate::{
     alignment_v2::{
         align_features_edit_aware_with_cancel, derive_affine_fine_decode_windows,
         extract_fine_features_with_cancel,
         extract_landmarks_and_fine_features_with_backend_request,
-        match_landmarks_affine_with_cancel, refine_boundary_by_correlation_with_cancel,
+        match_landmarks_affine_coarse_universe_with_cancel,
+        materialize_affine_hypothesis_with_cancel, refine_boundary_by_correlation_with_cancel,
         refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_request,
         AffineAnchorEvidence, AffineFineDecodeWindows, AffineFineWindowRequest, AffineHypothesis,
-        AffineMatchConfig, BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig,
-        EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame,
-        LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
-        SpectralBackendRequest, SpectralLandmark, StreamingLandmarkExtractor,
-        STREAMING_CPU_SPECTRAL_BACKEND_ID,
+        AffineMatchConfig, BoundaryContextSide, BoundaryRefinementConfig, CoarseAffineHypothesis,
+        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
+        FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs,
+        SpectralBackendExecution, SpectralBackendRequest, SpectralLandmark,
+        StreamingLandmarkExtractor, STREAMING_CPU_SPECTRAL_BACKEND_ID,
     },
     media_probe::{
         probe_audio_decode_timelines_with_ffprobe_cancellable,
@@ -100,12 +103,13 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.2-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-v11";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-v12";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_TEMPORAL_WINDOW_SCALE_TOLERANCE: f64 = 0.002;
 const ALIGNMENT_V2_TEMPORAL_WINDOW_MIN_OVERLAP: f64 = 0.80;
+const ALIGNMENT_V2_TEMPORAL_GROUP_MAX_RECENT_PROBES: usize = 64;
 const ALIGNMENT_V2_DP_CHUNK_MS: i64 = 45_000;
 const ALIGNMENT_V2_DP_BAND_RADIUS_MS: i64 = 30_000;
 // The fine window must contain the complete candidate episode plus enough context for the DP
@@ -120,7 +124,18 @@ const ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS: u64 = 50;
 // pushing every later target chunk into a false targetOnly path. At the production 50 ms hop,
 // 45 s target chunks plus 120 s lookahead remain below the 4M-cell DP hard limit.
 const ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS: i64 = 120_000;
+const ALIGNMENT_V2_PENDING_RECOVERY_MIN_MATCH_MS: u64 = 5_000;
+const ALIGNMENT_V2_PENDING_RECOVERY_ABSOLUTE_FLOOR_MS: u64 = 500;
+const ALIGNMENT_V2_PENDING_RECOVERY_CURSOR_TOLERANCE_MS: u64 = 100;
 const ALIGNMENT_V2_MAX_DP_CELLS: usize = 4_000_000;
+// The edit-aware solver owns three i64 cost planes and three u8 parent planes. Charge that
+// workspace, plus a conservative path/span reconstruction allowance, before allocating any DP
+// plane. This closes the previous gap where a nominally 1 GiB fine run could allocate another
+// ~108 MiB at the 4M-cell limit outside the active-artifact ledger.
+const ALIGNMENT_V2_DP_BYTES_PER_CELL: usize =
+    3 * std::mem::size_of::<i64>() + 3 * std::mem::size_of::<u8>();
+const ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP: usize = 128;
+const ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES: usize = 1024 * 1024;
 const ALIGNMENT_V2_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 const ALIGNMENT_V2_MAX_PCM_BYTES: usize =
     ALIGNMENT_V2_SAMPLE_RATE as usize * (ALIGNMENT_V2_MAX_DURATION_MS as usize / 1_000) * 2;
@@ -134,6 +149,14 @@ const ALIGNMENT_V2_MIN_TRACK_MARGIN: f64 = 0.10;
 const ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE: f64 = 0.20;
 const ALIGNMENT_V2_MAX_UNSELECTED_STREAMS: usize = 12;
 const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES: usize = 32_768;
+// A complete coarse candidate deliberately owns no anchor vectors. Reserve a conservative fixed
+// payload for scalar evidence, stream/toolchain strings, interval metadata and Vec/HashMap
+// overhead so the exhaustive universe still participates in the 1 GiB active-artifact ledger.
+const ALIGNMENT_V2_COARSE_CANDIDATE_RESERVED_BYTES: usize = 4 * 1024;
+// Hash-family indexes, the 40k observation partition, repeated inlier vectors and model seeds are
+// transient but coexist with retained media artifacts. This deliberately over-reserves their
+// measured bounded structures before the matcher or selected-candidate materializer can allocate.
+const ALIGNMENT_V2_AFFINE_MATCH_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
 const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_STATES: usize = 500_000;
 const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_EXPANSIONS: usize = 2_000_000;
 const ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS: i64 = 250;
@@ -1285,6 +1308,7 @@ impl V2MediaArtifactCache {
 struct V2TrackPairCandidate {
     source_input: AlignmentAudioInput,
     target_input: AlignmentAudioInput,
+    coarse_hypothesis: Option<CoarseAffineHypothesis>,
     hypothesis: AffineHypothesis,
     score: f64,
     temporal_coverage: f64,
@@ -1308,9 +1332,32 @@ struct V2PairCoarseCandidates {
     diagnostics: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+struct V2CoarseCandidateCollectionContext<'a> {
+    toolchain_cache_identity: &'a str,
+    has_explicit_selection: bool,
+    coarse_resident_baseline_bytes: usize,
+    cancel_flag: Option<&'a AtomicBool>,
+}
+
 #[derive(Debug, Clone)]
 struct V2TemporalWindowGroup {
-    members: Vec<V2TrackPairCandidate>,
+    // Indices deliberately point into the frozen pair candidate universe. A candidate owns
+    // training/held-out anchor evidence, so cloning every member here could duplicate hundreds
+    // of MiB outside the active-artifact ledger. Indices also guarantee that a future fine
+    // frontier cannot accidentally consume a stale pre-margin candidate clone.
+    member_indices: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct V2TemporalWindowGroupBuilder {
+    member_indices: Vec<usize>,
+    min_scale: f64,
+    max_scale: f64,
+    source_intersection: PresentationRangeMs,
+    target_intersection: PresentationRangeMs,
+    max_source_length_ms: i64,
+    max_target_length_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -5489,15 +5536,18 @@ where
                 &target_inputs,
                 &source_landmarks,
                 &target_landmarks,
-                audio_alignment_toolchain_cache_identity(options)?,
-                request.source_audio_stream_index.is_some()
-                    || request.complete_audio_stream_index.is_some(),
-                cancel_flag,
+                V2CoarseCandidateCollectionContext {
+                    toolchain_cache_identity: audio_alignment_toolchain_cache_identity(options)?,
+                    has_explicit_selection: request.source_audio_stream_index.is_some()
+                        || request.complete_audio_stream_index.is_some(),
+                    coarse_resident_baseline_bytes: retained_artifact_bytes,
+                    cancel_flag,
+                },
             )?;
             extraction_notes.extend(coarse.diagnostics);
             (coarse.candidates, coarse.alternatives, None)
         };
-    let Some(best_pair) = pair_candidates.first().cloned() else {
+    let Some(mut best_pair) = pair_candidates.first().cloned() else {
         let reason = "合理的非 commentary 音轨组合之间没有共同音频证据。";
         extraction_notes.push(format!(
             "音频组合保留了 {} 个未形成主定位的候选分数。",
@@ -5512,6 +5562,13 @@ where
             ((best_pair.score - second.score) / best_pair.score.max(0.001)).clamp(0.0, 1.0)
         })
         .unwrap_or(1.0);
+    drop(pair_candidates);
+    if prepared.is_none() {
+        retained_artifact_bytes = ensure_v2_active_artifact_budget(
+            retained_artifact_bytes,
+            v2_coarse_candidate_reserved_bytes(1_usize.saturating_add(alternatives.len()))?,
+        )?;
+    }
     let top1_top2_margin = v2_effective_alternative_margin(
         forced_global_margin,
         pair_margin,
@@ -5546,6 +5603,28 @@ where
                 .to_string(),
         );
     }
+    let source_landmark_artifact = source_landmarks
+        .get(&best_pair.source_input.stream.stream_index)
+        .ok_or_else(|| {
+            "blocked:artifact-missing：所选 B 站参考音轨的粗定位制品已丢失。".to_string()
+        })?;
+    let target_landmark_artifact = target_landmarks
+        .get(&best_pair.target_input.stream.stream_index)
+        .ok_or_else(|| {
+            "blocked:artifact-missing：所选目标原片音轨的粗定位制品已丢失。".to_string()
+        })?;
+    best_pair = materialize_v2_candidate_hypothesis(
+        best_pair,
+        source_landmark_artifact,
+        target_landmark_artifact,
+        &affine_config,
+        retained_artifact_bytes,
+        cancel_flag,
+    )?;
+    retained_artifact_bytes = ensure_v2_active_artifact_budget(
+        retained_artifact_bytes,
+        v2_materialized_anchor_resident_bytes(&best_pair.hypothesis)?,
+    )?;
     if best_pair.temporal_coverage < ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE
         || best_pair.hypothesis.inlier_count < affine_config.min_inliers
     {
@@ -5557,17 +5636,6 @@ where
             extraction_notes,
         ));
     }
-
-    let source_landmark_artifact = source_landmarks
-        .get(&best_pair.source_input.stream.stream_index)
-        .ok_or_else(|| {
-            "blocked:artifact-missing：所选 B 站参考音轨的粗定位制品已丢失。".to_string()
-        })?;
-    let target_landmark_artifact = target_landmarks
-        .get(&best_pair.target_input.stream.stream_index)
-        .ok_or_else(|| {
-            "blocked:artifact-missing：所选目标原片音轨的粗定位制品已丢失。".to_string()
-        })?;
     let fine_decode_plan = match plan_v2_selected_fine_decode(
         &best_pair,
         source_landmark_artifact,
@@ -5585,8 +5653,8 @@ where
             ));
         }
     };
+    let mut fine_active_artifact_bytes = retained_artifact_bytes;
     if let Some(plan) = fine_decode_plan {
-        let mut fine_working_set_bytes = retained_artifact_bytes;
         for (input, window) in [
             (&best_pair.source_input, plan.windows.source),
             (&best_pair.target_input, plan.windows.target),
@@ -5605,20 +5673,22 @@ where
                         ));
                     }
                 };
-                fine_working_set_bytes =
-                    match ensure_v2_active_artifact_budget(fine_working_set_bytes, window_bytes) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            extraction_notes.push(error);
-                            return Ok(create_blocked_v2_affine_proposal(
-                                "所选 affine 精解码窗口超过单次活动内存预算。",
-                                &best_pair,
-                                top1_top2_margin,
-                                alternatives,
-                                extraction_notes,
-                            ));
-                        }
-                    };
+                fine_active_artifact_bytes = match ensure_v2_active_artifact_budget(
+                    fine_active_artifact_bytes,
+                    window_bytes,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        extraction_notes.push(error);
+                        return Ok(create_blocked_v2_affine_proposal(
+                            "所选 affine 精解码窗口超过单次活动内存预算。",
+                            &best_pair,
+                            top1_top2_margin,
+                            alternatives,
+                            extraction_notes,
+                        ));
+                    }
+                };
             }
         }
         extraction_notes.push(format!(
@@ -5628,7 +5698,7 @@ where
             plan.windows.target.start_ms,
             plan.windows.target.end_ms,
             plan.adaptive_guard_ms,
-            fine_working_set_bytes.div_ceil(1024 * 1024)
+            fine_active_artifact_bytes.div_ceil(1024 * 1024)
         ));
     }
 
@@ -5696,6 +5766,7 @@ where
         &target_audio.fine_features,
         &best_pair.hypothesis,
         options,
+        fine_active_artifact_bytes,
         cancel_flag,
     ) {
         Ok(result) => result,
@@ -5763,10 +5834,14 @@ fn collect_v2_pair_coarse_candidates(
     target_inputs: &[AlignmentAudioInput],
     source_landmarks: &HashMap<u32, CachedV2Landmarks>,
     target_landmarks: &HashMap<u32, CachedV2Landmarks>,
-    toolchain_cache_identity: &str,
-    has_explicit_selection: bool,
-    cancel_flag: Option<&AtomicBool>,
+    context: V2CoarseCandidateCollectionContext<'_>,
 ) -> Result<V2PairCoarseCandidates, String> {
+    let V2CoarseCandidateCollectionContext {
+        toolchain_cache_identity,
+        has_explicit_selection,
+        coarse_resident_baseline_bytes,
+        cancel_flag,
+    } = context;
     let affine_config = v2_affine_match_config();
     let mut candidates = Vec::<V2TrackPairCandidate>::new();
     let mut alternatives = Vec::new();
@@ -5787,7 +5862,16 @@ fn collect_v2_pair_coarse_candidates(
             else {
                 continue;
             };
-            let result = match match_landmarks_affine_with_cancel(
+            let current_candidate_bytes = v2_coarse_candidate_reserved_bytes(candidates.len())?;
+            let current_active_bytes = ensure_v2_active_artifact_budget(
+                coarse_resident_baseline_bytes,
+                current_candidate_bytes,
+            )?;
+            ensure_v2_active_artifact_budget(
+                current_active_bytes,
+                ALIGNMENT_V2_AFFINE_MATCH_WORKSPACE_BYTES,
+            )?;
+            let result = match match_landmarks_affine_coarse_universe_with_cancel(
                 &source_artifact.landmarks,
                 &target_artifact.landmarks,
                 &affine_config,
@@ -5809,13 +5893,32 @@ fn collect_v2_pair_coarse_candidates(
                 ));
                 continue;
             }
+            let projected_candidate_count = candidates
+                .len()
+                .checked_add(result.hypotheses.len())
+                .ok_or_else(|| {
+                "blocked:resource-limit：完整 coarse affine candidate 数量溢出。".to_string()
+            })?;
+            if projected_candidate_count > ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES {
+                return Err(format!(
+                    "blocked:resource-limit：完整 coarse affine universe 需要 {} 个 candidate，超过硬上限 {}；为保留 omitted-candidate 正确性，本次不会静默截断。",
+                    projected_candidate_count, ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES
+                ));
+            }
+            ensure_v2_active_artifact_budget(
+                coarse_resident_baseline_bytes,
+                v2_coarse_candidate_reserved_bytes(projected_candidate_count)?,
+            )?;
             diagnostics.push(format!(
-                "音轨 #{} → #{} Top-K affine：{}。",
+                "音轨 #{} → #{} 完整 coarse affine universe：{} 个 seed、{} 个去重 candidate；预览：{}。",
                 source_input.stream.stream_index,
                 target_input.stream.stream_index,
+                result.seed_count,
+                result.hypotheses.len(),
                 result
                     .hypotheses
                     .iter()
+                    .take(10)
                     .map(|item| format!(
                         "scale={:.6},offset={:+},inliers={},range={}-{}",
                         item.scale,
@@ -5827,11 +5930,18 @@ fn collect_v2_pair_coarse_candidates(
                     .collect::<Vec<_>>()
                     .join("；")
             ));
+            let anchor_free_hypotheses = result
+                .hypotheses
+                .iter()
+                .map(CoarseAffineHypothesis::to_anchor_free_affine_hypothesis)
+                .collect::<Vec<_>>();
             let repeated_content_only = v2_affine_has_competing_repeated_location(
-                &result.hypotheses,
+                &anchor_free_hypotheses,
                 result.top1_top2_margin,
             );
-            for hypothesis in &result.hypotheses {
+            for (coarse_hypothesis, hypothesis) in
+                result.hypotheses.iter().zip(&anchor_free_hypotheses)
+            {
                 let temporal_coverage = affine_temporal_coverage(
                     hypothesis,
                     &target_artifact.landmarks,
@@ -5853,6 +5963,7 @@ fn collect_v2_pair_coarse_candidates(
                 let mut candidate = V2TrackPairCandidate {
                     source_input: source_input.clone(),
                     target_input: target_input.clone(),
+                    coarse_hypothesis: Some(coarse_hypothesis.clone()),
                     hypothesis: hypothesis.clone(),
                     score,
                     temporal_coverage,
@@ -5890,12 +6001,6 @@ fn collect_v2_pair_coarse_candidates(
         }
     }
     candidates.sort_by(compare_v2_track_pair_candidates);
-    let temporal_window_groups = group_v2_pair_coarse_temporal_windows(&candidates);
-    diagnostics.push(format!(
-        "pair coarse temporal-window grouping：完整保留 {} 个跨音轨 affine candidate，并以 complete-link 归入 {} 个不同位置组；当前 native evidence v2 仍按 candidate 计数，尚未把 coarse 分组冒充 fine Top-K。",
-        candidates.len(),
-        temporal_window_groups.len()
-    ));
     alternatives.sort_by(|left, right| {
         right
             .score
@@ -5915,6 +6020,17 @@ fn collect_v2_pair_coarse_candidates(
             best.intrinsic_margin = margin.min(best.intrinsic_margin);
         }
     }
+    // Group only after every candidate field that contributes to the admissible global weight is
+    // frozen. The groups keep indices rather than deep candidate clones, so representative order
+    // and later fine-frontier identities always refer to this exact executable universe.
+    let (temporal_window_groups, temporal_window_group_probe_count) =
+        group_v2_pair_coarse_temporal_windows_with_probe_count(&candidates);
+    diagnostics.push(format!(
+        "pair coarse temporal-window grouping：完整保留 {} 个跨音轨 affine candidate，以 bounded intersection-core 归入 {} 个调度组，共执行 {} 次 O(1) group probe；分组只保存冻结候选索引，不复制 anchor 证据，且允许安全过拆分；当前 native evidence v2 仍按 candidate 计数，尚未把 coarse 分组冒充 fine Top-K。",
+        candidates.len(),
+        temporal_window_groups.len(),
+        temporal_window_group_probe_count
+    ));
     Ok(V2PairCoarseCandidates {
         candidates,
         alternatives,
@@ -5946,6 +6062,18 @@ fn bind_v2_candidate_global_intervals(
             }
         }
     }
+    let maximum_fine_frames = usize::try_from(
+        u128::from(ALIGNMENT_V2_MAX_DURATION_MS).div_ceil(u128::from(ALIGNMENT_V2_FINE_HOP_MS)),
+    )
+    .map_err(|_| "blocked:resource-limit：candidate DP 帧数上界无法表示。".to_string())?;
+    let dp_workspace_bytes = v2_dp_workspace_upper_bound(
+        ALIGNMENT_V2_MAX_DP_CELLS,
+        maximum_fine_frames,
+        maximum_fine_frames,
+    )?;
+    fine_working_set_bytes = fine_working_set_bytes
+        .checked_add(dp_workspace_bytes)
+        .ok_or_else(|| "blocked:resource-limit：candidate DP workspace 上界溢出。".to_string())?;
     let content_intervals = derive_v2_selected_candidate_content_intervals(
         &candidate,
         source_artifact,
@@ -5954,6 +6082,37 @@ fn bind_v2_candidate_global_intervals(
     candidate.global_source_interval = content_intervals.source;
     candidate.global_target_interval = content_intervals.target;
     candidate.fine_working_set_bytes = fine_working_set_bytes;
+    Ok(candidate)
+}
+
+fn materialize_v2_candidate_hypothesis(
+    mut candidate: V2TrackPairCandidate,
+    source_artifact: &CachedV2Landmarks,
+    target_artifact: &CachedV2Landmarks,
+    affine_config: &AffineMatchConfig,
+    active_artifact_bytes: usize,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<V2TrackPairCandidate, String> {
+    let Some(coarse_hypothesis) = candidate.coarse_hypothesis.as_ref() else {
+        // Synthetic tests and legacy in-memory callers may already own full evidence.
+        return Ok(candidate);
+    };
+    ensure_v2_active_artifact_budget(
+        active_artifact_bytes,
+        ALIGNMENT_V2_AFFINE_MATCH_WORKSPACE_BYTES,
+    )?;
+    candidate.hypothesis = materialize_affine_hypothesis_with_cancel(
+        &source_artifact.landmarks,
+        &target_artifact.landmarks,
+        affine_config,
+        coarse_hypothesis,
+        cancel_flag,
+    )
+    .map_err(|error| {
+        format!(
+            "blocked:coarse-evidence-materialization：所选 affine candidate 无法重建完整 anchor 证据：{error}"
+        )
+    })?;
     Ok(candidate)
 }
 
@@ -6023,35 +6182,203 @@ fn compare_v2_track_pair_candidates(
                 .cmp(&right.hypothesis.source_end_ms)
         })
         .then_with(|| left.hypothesis.scale.total_cmp(&right.hypothesis.scale))
+        .then_with(|| left.temporal_coverage.total_cmp(&right.temporal_coverage))
+        .then_with(|| left.intrinsic_margin.total_cmp(&right.intrinsic_margin))
+        .then_with(|| left.repeated_content_only.cmp(&right.repeated_content_only))
+        .then_with(|| left.observation_count.cmp(&right.observation_count))
+        .then_with(|| left.source_landmark_count.cmp(&right.source_landmark_count))
+        .then_with(|| left.target_landmark_count.cmp(&right.target_landmark_count))
+        .then_with(|| {
+            left.source_spectral_backend_id
+                .cmp(&right.source_spectral_backend_id)
+        })
+        .then_with(|| {
+            left.target_spectral_backend_id
+                .cmp(&right.target_spectral_backend_id)
+        })
+        .then_with(|| {
+            left.toolchain_cache_identity
+                .cmp(&right.toolchain_cache_identity)
+        })
+        .then_with(|| {
+            left.fine_working_set_bytes
+                .cmp(&right.fine_working_set_bytes)
+        })
 }
 
+#[cfg(test)]
 fn group_v2_pair_coarse_temporal_windows(
     candidates: &[V2TrackPairCandidate],
 ) -> Vec<V2TemporalWindowGroup> {
-    let mut ordered = candidates.to_vec();
-    ordered.sort_by(compare_v2_temporal_window_members);
-    let mut groups = Vec::<V2TemporalWindowGroup>::new();
-    for candidate in ordered {
-        // Complete-link membership is deliberate. If A~B and B~C but A!~C, a high-scoring B
-        // cannot bridge two genuinely different locations into one group. Every raw candidate
-        // remains in exactly one group and in the original executable candidate universe.
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group
-                .members
-                .iter()
-                .all(|member| v2_pair_coarse_candidates_same_temporal_window(member, &candidate))
-        }) {
-            group.members.push(candidate);
+    group_v2_pair_coarse_temporal_windows_with_probe_count(candidates).0
+}
+
+fn group_v2_pair_coarse_temporal_windows_with_probe_count(
+    candidates: &[V2TrackPairCandidate],
+) -> (Vec<V2TemporalWindowGroup>, usize) {
+    let mut ordered = (0..candidates.len()).collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        compare_v2_temporal_window_geometry(&candidates[*left], &candidates[*right])
+            .then_with(|| left.cmp(right))
+    });
+    let mut builders = Vec::<V2TemporalWindowGroupBuilder>::new();
+    let mut probe_count = 0_usize;
+    for candidate_index in ordered {
+        let candidate = &candidates[candidate_index];
+        // Geometry sorting makes plausible co-located windows adjacent. Probe only a bounded
+        // recent frontier, then use an O(1) intersection-core certificate that is stronger than
+        // pairwise complete-link: every accepted member shares at least 80% of the group's
+        // longest interval on both axes and the whole scale range fits the tolerance. Missing a
+        // far-away compatible group can only over-split scheduling groups; it never drops or
+        // merges executable candidates, while eliminating the previous Θ(n²) diagnostic path.
+        let first_builder = builders
+            .len()
+            .saturating_sub(ALIGNMENT_V2_TEMPORAL_GROUP_MAX_RECENT_PROBES);
+        let mut accepted_builder = None;
+        for builder_index in (first_builder..builders.len()).rev() {
+            probe_count = probe_count.saturating_add(1);
+            if builders[builder_index].can_accept(candidate) {
+                accepted_builder = Some(builder_index);
+                break;
+            }
+        }
+        if let Some(builder_index) = accepted_builder {
+            builders[builder_index].accept(candidate_index, candidate);
         } else {
-            groups.push(V2TemporalWindowGroup {
-                members: vec![candidate],
-            });
+            builders.push(V2TemporalWindowGroupBuilder::new(
+                candidate_index,
+                candidate,
+            ));
         }
     }
+    let mut groups = builders
+        .into_iter()
+        .map(|mut builder| {
+            builder.member_indices.sort_by(|left, right| {
+                compare_v2_temporal_window_members(&candidates[*left], &candidates[*right])
+                    .then_with(|| left.cmp(right))
+            });
+            V2TemporalWindowGroup {
+                member_indices: builder.member_indices,
+            }
+        })
+        .collect::<Vec<_>>();
     groups.sort_by(|left, right| {
-        compare_v2_track_pair_candidates(&left.members[0], &right.members[0])
+        compare_v2_temporal_window_members(
+            &candidates[left.member_indices[0]],
+            &candidates[right.member_indices[0]],
+        )
+        .then_with(|| left.member_indices[0].cmp(&right.member_indices[0]))
     });
-    groups
+    (groups, probe_count)
+}
+
+impl V2TemporalWindowGroupBuilder {
+    fn new(candidate_index: usize, candidate: &V2TrackPairCandidate) -> Self {
+        Self {
+            member_indices: vec![candidate_index],
+            min_scale: candidate.hypothesis.scale,
+            max_scale: candidate.hypothesis.scale,
+            source_intersection: candidate.global_source_interval,
+            target_intersection: candidate.global_target_interval,
+            max_source_length_ms: v2_presentation_range_length(candidate.global_source_interval),
+            max_target_length_ms: v2_presentation_range_length(candidate.global_target_interval),
+        }
+    }
+
+    fn can_accept(&self, candidate: &V2TrackPairCandidate) -> bool {
+        let min_scale = self.min_scale.min(candidate.hypothesis.scale);
+        let max_scale = self.max_scale.max(candidate.hypothesis.scale);
+        if max_scale - min_scale > ALIGNMENT_V2_TEMPORAL_WINDOW_SCALE_TOLERANCE + f64::EPSILON * 4.0
+        {
+            return false;
+        }
+        let source_intersection = v2_intersect_presentation_ranges(
+            self.source_intersection,
+            candidate.global_source_interval,
+        );
+        let target_intersection = v2_intersect_presentation_ranges(
+            self.target_intersection,
+            candidate.global_target_interval,
+        );
+        let max_source_length_ms = self.max_source_length_ms.max(v2_presentation_range_length(
+            candidate.global_source_interval,
+        ));
+        let max_target_length_ms = self.max_target_length_ms.max(v2_presentation_range_length(
+            candidate.global_target_interval,
+        ));
+        v2_group_intersection_has_required_overlap(source_intersection, max_source_length_ms)
+            && v2_group_intersection_has_required_overlap(target_intersection, max_target_length_ms)
+    }
+
+    fn accept(&mut self, candidate_index: usize, candidate: &V2TrackPairCandidate) {
+        self.member_indices.push(candidate_index);
+        self.min_scale = self.min_scale.min(candidate.hypothesis.scale);
+        self.max_scale = self.max_scale.max(candidate.hypothesis.scale);
+        self.source_intersection = v2_intersect_presentation_ranges(
+            self.source_intersection,
+            candidate.global_source_interval,
+        );
+        self.target_intersection = v2_intersect_presentation_ranges(
+            self.target_intersection,
+            candidate.global_target_interval,
+        );
+        self.max_source_length_ms = self.max_source_length_ms.max(v2_presentation_range_length(
+            candidate.global_source_interval,
+        ));
+        self.max_target_length_ms = self.max_target_length_ms.max(v2_presentation_range_length(
+            candidate.global_target_interval,
+        ));
+    }
+}
+
+fn compare_v2_temporal_window_geometry(
+    left: &V2TrackPairCandidate,
+    right: &V2TrackPairCandidate,
+) -> std::cmp::Ordering {
+    left.global_source_interval
+        .start_ms
+        .cmp(&right.global_source_interval.start_ms)
+        .then_with(|| {
+            left.global_target_interval
+                .start_ms
+                .cmp(&right.global_target_interval.start_ms)
+        })
+        .then_with(|| {
+            left.global_source_interval
+                .end_ms
+                .cmp(&right.global_source_interval.end_ms)
+        })
+        .then_with(|| {
+            left.global_target_interval
+                .end_ms
+                .cmp(&right.global_target_interval.end_ms)
+        })
+        .then_with(|| left.hypothesis.scale.total_cmp(&right.hypothesis.scale))
+        .then_with(|| compare_v2_track_pair_candidates(left, right))
+}
+
+fn v2_presentation_range_length(range: PresentationRangeMs) -> i64 {
+    range.end_ms.saturating_sub(range.start_ms).max(0)
+}
+
+fn v2_intersect_presentation_ranges(
+    left: PresentationRangeMs,
+    right: PresentationRangeMs,
+) -> PresentationRangeMs {
+    PresentationRangeMs {
+        start_ms: left.start_ms.max(right.start_ms),
+        end_ms: left.end_ms.min(right.end_ms),
+    }
+}
+
+fn v2_group_intersection_has_required_overlap(
+    intersection: PresentationRangeMs,
+    longest_member_ms: i64,
+) -> bool {
+    let intersection_ms = v2_presentation_range_length(intersection);
+    intersection_ms as f64 / longest_member_ms.max(1) as f64
+        >= ALIGNMENT_V2_TEMPORAL_WINDOW_MIN_OVERLAP
 }
 
 fn compare_v2_temporal_window_members(
@@ -6063,6 +6390,7 @@ fn compare_v2_temporal_window_members(
         .then_with(|| compare_v2_track_pair_candidates(left, right))
 }
 
+#[cfg(test)]
 fn v2_pair_coarse_candidates_same_temporal_window(
     left: &V2TrackPairCandidate,
     right: &V2TrackPairCandidate,
@@ -6077,6 +6405,7 @@ fn v2_pair_coarse_candidates_same_temporal_window(
     )
 }
 
+#[cfg(test)]
 fn v2_temporal_windows_same_location(
     left_scale: f64,
     left_source: PresentationRangeMs,
@@ -7548,6 +7877,27 @@ fn ensure_v2_active_artifact_budget(
     Ok(next)
 }
 
+fn v2_coarse_candidate_reserved_bytes(candidate_count: usize) -> Result<usize, String> {
+    candidate_count
+        .checked_mul(ALIGNMENT_V2_COARSE_CANDIDATE_RESERVED_BYTES)
+        .ok_or_else(|| {
+            "blocked:resource-limit：coarse affine candidate 驻留字节上界溢出。".to_string()
+        })
+}
+
+fn v2_materialized_anchor_resident_bytes(hypothesis: &AffineHypothesis) -> Result<usize, String> {
+    hypothesis
+        .training_anchors
+        .capacity()
+        .checked_add(hypothesis.held_out_anchors.capacity())
+        .and_then(|anchor_count| {
+            anchor_count.checked_mul(std::mem::size_of::<AffineAnchorEvidence>())
+        })
+        .ok_or_else(|| {
+            "blocked:resource-limit：materialized affine anchor 驻留字节溢出。".to_string()
+        })
+}
+
 fn cached_v2_landmark_retained_bytes(artifact: &CachedV2Landmarks) -> usize {
     v2_media_artifact_payload_bytes(&V2MediaArtifact {
         pcm: artifact.pcm.clone(),
@@ -8790,6 +9140,7 @@ fn align_v2_feature_chunks(
     target_frames: &[FineFeatureFrame],
     coarse: &AffineHypothesis,
     options: &AudioAlignmentOptions,
+    active_artifact_bytes: usize,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<V2ChunkAlignment, String> {
     if source_frames.is_empty() || target_frames.is_empty() || coarse.scale <= 0.0 {
@@ -8804,6 +9155,8 @@ fn align_v2_feature_chunks(
     let mut ambiguous_step_count = 0usize;
     let mut target_start_index = 0usize;
     let mut previous_source_end_ms: Option<i64> = None;
+    let mut pending_target_only_start_ms: Option<i64> = None;
+    let mut pending_has_unreliable_common_content = false;
     while target_start_index < target_frames.len() {
         check_cancelled(cancel_flag)?;
         let target_end_index = (target_start_index + chunk_frame_count).min(target_frames.len());
@@ -8868,27 +9221,6 @@ fn align_v2_feature_chunks(
             ));
         }
         let source_window = &source_frames[source_start_index..source_end_index];
-        if previous_source_end_ms.is_some()
-            && v2_chunk_content_support(target_chunk, source_window, &chunk_inverse) < 0.10
-        {
-            let source_cursor = previous_source_end_ms.unwrap_or(source_lower_ms).max(0) as u64;
-            let target_span_start = spans
-                .last()
-                .map(|span| span.target_end_ms)
-                .unwrap_or_else(|| target_start_ms.max(0) as u64);
-            append_or_merge_v2_span(
-                &mut spans,
-                create_v2_span(
-                    AudioTimeMapSpanKind::TargetOnly,
-                    source_cursor,
-                    source_cursor,
-                    target_span_start,
-                    target_end_ms.max(0) as u64,
-                ),
-            );
-            target_start_index = target_end_index;
-            continue;
-        }
         let required_cells = (target_chunk.len() + 1)
             .checked_mul(source_window.len() + 1)
             .ok_or_else(|| "V2 分块 DP 单元数溢出。".to_string())?;
@@ -8897,6 +9229,13 @@ fn align_v2_feature_chunks(
                 "blocked:resource-limit：V2 分块需要 {required_cells} 个 DP 单元，硬上限为 {allowed_cells}。"
             ));
         }
+        let dp_workspace_bytes =
+            v2_dp_workspace_upper_bound(required_cells, source_window.len(), target_chunk.len())?;
+        ensure_v2_active_artifact_budget(active_artifact_bytes, dp_workspace_bytes).map_err(
+            |error| {
+                format!("blocked:resource-limit：V2 分块 DP workspace 未纳入活动内存预算：{error}")
+            },
+        )?;
         // 反向调用：完整消费目标原片块，并在较宽的参考窗内 semi-global 定位。
         // 返回后交换两条轴，恢复 B 站参考 -> 目标原片的正式 TimeMap 方向。
         let result = align_features_edit_aware_with_cancel(
@@ -8926,11 +9265,77 @@ fn align_v2_feature_chunks(
             .iter()
             .map(swap_v2_edit_span_axes)
             .collect::<Result<Vec<_>, _>>()?;
+        let target_chunk_duration_ms = u64::try_from(target_end_ms - target_start_ms)
+            .map_err(|_| "V2 target chunk 时长无法表示为非负毫秒。".to_string())?;
+        let required_recovery_match_ms = ALIGNMENT_V2_PENDING_RECOVERY_MIN_MATCH_MS.min(
+            (target_chunk_duration_ms / 5).max(ALIGNMENT_V2_PENDING_RECOVERY_ABSOLUTE_FLOOR_MS),
+        );
+        let recovery_source_start_ms =
+            v2_reliable_recovery_source_start_ms(&chunk_spans, required_recovery_match_ms);
+        if recovery_source_start_ms.is_none() {
+            let Some(source_cursor_ms) = previous_source_end_ms else {
+                return Err(
+                    format!(
+                        "V2 首个细对齐块没有至少 {} ms 连续共同内容锚点，无法判定是参考侧片段还是目标侧片段。",
+                        required_recovery_match_ms
+                    ),
+                );
+            };
+            // A full semi-global DP with no reliable match cannot safely choose its otherwise
+            // arbitrary free-prefix endpoint as the next source cursor. Hold the source axis and
+            // defer the direction decision until a later chunk recovers common content. This is
+            // symmetric with a source-only insert: if the bounded source lookahead contains the
+            // later common content, DP will consume the insert and report SourceOnly instead.
+            pending_target_only_start_ms.get_or_insert(target_start_ms);
+            pending_has_unreliable_common_content |=
+                result.matched_step_count > 0 || result.ambiguous_step_count > 0;
+            previous_source_end_ms = Some(source_cursor_ms);
+            target_start_index = target_end_index;
+            continue;
+        }
+        if let Some(pending_start_ms) = pending_target_only_start_ms.take() {
+            let source_cursor_ms = previous_source_end_ms
+                .ok_or_else(|| "V2 待确认目标侧片段缺少已确认参考轴游标。".to_string())?;
+            if pending_has_unreliable_common_content {
+                return Err(format!(
+                    "V2 在 {} ms 起的待确认片段中只发现零散或歧义共同内容，不能据此提交 targetOnly。",
+                    pending_start_ms
+                ));
+            }
+            let source_cursor_ms_u64 = checked_v2_milliseconds(source_cursor_ms)?;
+            let recovered_source_start_ms =
+                recovery_source_start_ms.expect("recovery certificate checked above");
+            if recovered_source_start_ms.abs_diff(source_cursor_ms_u64)
+                > ALIGNMENT_V2_PENDING_RECOVERY_CURSOR_TOLERANCE_MS
+            {
+                return Err(format!(
+                    "V2 待确认片段后两轴同时跳进：参考游标 {} ms，可靠恢复点 {} ms；无法区分双方低信息内容与双向增删。",
+                    source_cursor_ms_u64, recovered_source_start_ms
+                ));
+            }
+            append_or_merge_v2_span(
+                &mut spans,
+                create_v2_span(
+                    AudioTimeMapSpanKind::TargetOnly,
+                    checked_v2_milliseconds(source_cursor_ms)?,
+                    checked_v2_milliseconds(source_cursor_ms)?,
+                    checked_v2_milliseconds(pending_start_ms)?,
+                    checked_v2_milliseconds(target_start_ms)?,
+                ),
+            );
+            pending_has_unreliable_common_content = false;
+        }
         append_v2_chunk_spans(&mut spans, chunk_spans)?;
         previous_source_end_ms = spans.last().map(|span| span.source_end_ms as i64);
         matched_step_count += result.matched_step_count;
         ambiguous_step_count += result.ambiguous_step_count;
         target_start_index = target_end_index;
+    }
+    if let Some(pending_start_ms) = pending_target_only_start_ms {
+        return Err(format!(
+            "V2 尾部 {} ms 起连续细对齐块没有后续共同内容锚点，无法可靠区分目标侧新增与参考侧删减。",
+            pending_start_ms
+        ));
     }
     if spans.is_empty() {
         return Err("V2 分块 DP 没有输出 span。".to_string());
@@ -8952,60 +9357,39 @@ fn align_v2_feature_chunks(
     })
 }
 
-fn v2_chunk_content_support(
-    target_chunk: &[FineFeatureFrame],
-    source_window: &[FineFeatureFrame],
-    target_to_source: &AffineHypothesis,
-) -> f64 {
-    if target_chunk.is_empty() || source_window.is_empty() {
-        return 0.0;
-    }
-    let step = target_chunk.len().div_ceil(32).max(1);
-    let mut observations = 0usize;
-    let mut supported = 0usize;
-    for target in target_chunk.iter().step_by(step) {
-        let predicted =
-            target_to_source.scale * target.time_ms as f64 + target_to_source.offset_ms as f64;
-        let index = source_window.partition_point(|frame| frame.time_ms < predicted.round() as i64);
-        let candidate = [index.checked_sub(1), Some(index)]
-            .into_iter()
-            .flatten()
-            .filter_map(|index| source_window.get(index))
-            .min_by_key(|frame| frame.time_ms.abs_diff(predicted.round() as i64));
-        if let Some(source) = candidate {
-            observations += 1;
-            if v2_fine_feature_distance(&target.values, &source.values) < 0.5 {
-                supported += 1;
-            }
-        }
-    }
-    supported as f64 / observations.max(1) as f64
+fn v2_reliable_recovery_source_start_ms(
+    spans: &[AudioTimeMapSpanDto],
+    required_match_ms: u64,
+) -> Option<u64> {
+    spans
+        .iter()
+        .find(|span| {
+            span.kind == AudioTimeMapSpanKind::Matched
+                && span.source_end_ms.saturating_sub(span.source_start_ms) >= required_match_ms
+                && span.target_end_ms.saturating_sub(span.target_start_ms) >= required_match_ms
+        })
+        .map(|span| span.source_start_ms)
 }
 
-fn v2_fine_feature_distance(left: &[f32], right: &[f32]) -> f64 {
-    if left.len() != right.len() || left.is_empty() {
-        return 2.0;
-    }
-    let dot = left
-        .iter()
-        .zip(right)
-        .map(|(left, right)| f64::from(*left) * f64::from(*right))
-        .sum::<f64>();
-    let left_norm = left
-        .iter()
-        .map(|value| f64::from(*value).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let right_norm = right
-        .iter()
-        .map(|value| f64::from(*value).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
-        2.0
-    } else {
-        (1.0 - dot / (left_norm * right_norm)).clamp(0.0, 2.0)
-    }
+fn v2_dp_workspace_upper_bound(
+    cell_count: usize,
+    source_frame_count: usize,
+    target_frame_count: usize,
+) -> Result<usize, String> {
+    let planes = cell_count
+        .checked_mul(ALIGNMENT_V2_DP_BYTES_PER_CELL)
+        .ok_or_else(|| "blocked:resource-limit：V2 DP plane workspace 上界溢出。".to_string())?;
+    let path_steps = source_frame_count
+        .checked_add(target_frame_count)
+        .and_then(|value| value.checked_add(2))
+        .ok_or_else(|| "blocked:resource-limit：V2 DP path step 上界溢出。".to_string())?;
+    let path = path_steps
+        .checked_mul(ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP)
+        .ok_or_else(|| "blocked:resource-limit：V2 DP path workspace 上界溢出。".to_string())?;
+    planes
+        .checked_add(path)
+        .and_then(|value| value.checked_add(ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES))
+        .ok_or_else(|| "blocked:resource-limit：V2 DP 总 workspace 上界溢出。".to_string())
 }
 
 fn estimate_v2_hop_ms(frames: &[FineFeatureFrame]) -> i64 {
@@ -11904,6 +12288,7 @@ fn prepared_audio_alignment_batch_media<'a>(
 fn score_prepared_audio_alignment_batch_pair_coarse(
     pair: &PlannedAudioAlignmentBatchPair,
     prepared: &[PreparedAudioAlignmentBatchMediaState],
+    coarse_resident_baseline_bytes: usize,
     cancel_flag: &AtomicBool,
 ) -> Result<V2PairCoarseCandidates, String> {
     check_cancelled(Some(cancel_flag))?;
@@ -11922,10 +12307,13 @@ fn score_prepared_audio_alignment_batch_pair_coarse(
         &target.evidence.inputs,
         &source.evidence.landmarks,
         &target.evidence.landmarks,
-        &source.evidence.toolchain_cache_identity,
-        pair.request.source_audio_stream_index.is_some()
-            || pair.request.complete_audio_stream_index.is_some(),
-        Some(cancel_flag),
+        V2CoarseCandidateCollectionContext {
+            toolchain_cache_identity: &source.evidence.toolchain_cache_identity,
+            has_explicit_selection: pair.request.source_audio_stream_index.is_some()
+                || pair.request.complete_audio_stream_index.is_some(),
+            coarse_resident_baseline_bytes,
+            cancel_flag: Some(cancel_flag),
+        },
     )
 }
 
@@ -12170,6 +12558,8 @@ fn run_audio_alignment_batch_job(
     // shared long reference. Failed preparation remains visible as an incomplete coarse batch;
     // in that case no otherwise valid pair may claim a project-level optimum or enter fine.
     let mut coarse_by_pair = Vec::with_capacity(plan.pairs.len());
+    let mut batch_coarse_active_bytes = batch_retained_artifact_bytes;
+    let mut batch_coarse_candidate_count = 0_usize;
     for (pair_index, pair) in plan.pairs.iter().enumerate() {
         if cancel_flag.load(Ordering::Acquire) {
             let _ = cancel_audio_alignment_batch_worker(&job_id);
@@ -12181,8 +12571,49 @@ fn run_audio_alignment_batch_job(
             0.08,
             "正在完成全批项目级 Top-K coarse scoring；尚未执行 fine。",
         );
-        let coarse =
-            score_prepared_audio_alignment_batch_pair_coarse(pair, &prepared, cancel_flag.as_ref());
+        let coarse = score_prepared_audio_alignment_batch_pair_coarse(
+            pair,
+            &prepared,
+            batch_coarse_active_bytes,
+            cancel_flag.as_ref(),
+        );
+        let coarse = match coarse {
+            Ok(coarse) => {
+                let projected_count = batch_coarse_candidate_count
+                    .checked_add(coarse.candidates.len())
+                    .ok_or_else(|| {
+                        "blocked:resource-limit：批次完整 coarse candidate 总数溢出。".to_string()
+                    });
+                match projected_count {
+                    Ok(projected_count)
+                        if projected_count
+                            <= ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES =>
+                    {
+                        match v2_coarse_candidate_reserved_bytes(coarse.candidates.len()).and_then(
+                            |candidate_bytes| {
+                                ensure_v2_active_artifact_budget(
+                                    batch_coarse_active_bytes,
+                                    candidate_bytes,
+                                )
+                            },
+                        ) {
+                            Ok(active_bytes) => {
+                                batch_coarse_candidate_count = projected_count;
+                                batch_coarse_active_bytes = active_bytes;
+                                Ok(coarse)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Ok(projected_count) => Err(format!(
+                        "blocked:resource-limit：批次完整 coarse affine universe 需要 {projected_count} 个 candidate，超过硬上限 {}；本次不会静默截断。",
+                        ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
         if coarse
             .as_ref()
             .is_err_and(|error| error == AUDIO_ALIGNMENT_CANCELLED)
@@ -12259,6 +12690,24 @@ fn run_audio_alignment_batch_job(
         };
         plan.pairs[pair_index].global_selection = evidence;
     }
+    let shortlist_evidence_units =
+        plan.pairs.len().checked_mul(11).ok_or_else(|| {
+            "blocked:resource-limit：批次 shortlist evidence 计数溢出。".to_string()
+        });
+    let batch_fine_active_baseline_bytes = match shortlist_evidence_units
+        .and_then(v2_coarse_candidate_reserved_bytes)
+        .and_then(|bytes| ensure_v2_active_artifact_budget(batch_retained_artifact_bytes, bytes))
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
+            return;
+        }
+    };
+    // The exact coarse universe is no longer needed after the shortlist decisions and their
+    // evidence have been frozen. Release it before fine decode so the ledger models the actual
+    // peak phases instead of permanently charging mutually exclusive working sets.
+    drop(coarse_by_pair);
     let media_indices_by_pair = plan
         .pairs
         .iter()
@@ -12286,7 +12735,7 @@ fn run_audio_alignment_batch_job(
                     &pair,
                     &prepared,
                     &options,
-                    batch_retained_artifact_bytes,
+                    batch_fine_active_baseline_bytes,
                     selected_coarse,
                     &mut update,
                     cancel_flag,
@@ -16951,6 +17400,7 @@ mod tests {
         V2TrackPairCandidate {
             source_input,
             target_input,
+            coarse_hypothesis: None,
             hypothesis: v2_test_hypothesis(1.02, 500),
             score: 0.8,
             temporal_coverage: 0.75,
@@ -17434,9 +17884,10 @@ mod tests {
         let groups = group_v2_pair_coarse_temporal_windows(&candidates);
 
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].members.len(), 2);
-        assert_eq!(groups[0].members[0].source_input.stream.stream_index, 1);
-        assert_eq!(groups[0].members[0].target_input.stream.stream_index, 3);
+        assert_eq!(groups[0].member_indices.len(), 2);
+        let representative = &candidates[groups[0].member_indices[0]];
+        assert_eq!(representative.source_input.stream.stream_index, 1);
+        assert_eq!(representative.target_input.stream.stream_index, 3);
         assert_eq!(
             candidates.len(),
             2,
@@ -17497,14 +17948,15 @@ mod tests {
             &first,
             &different_tracks_different_source,
         ));
-        let groups = group_v2_pair_coarse_temporal_windows(&[
+        let candidates = [
             different_tracks_different_source,
             first,
             same_tracks_different_target,
-        ]);
+        ];
+        let groups = group_v2_pair_coarse_temporal_windows(&candidates);
 
         assert_eq!(groups.len(), 3);
-        assert!(groups.iter().all(|group| group.members.len() == 1));
+        assert!(groups.iter().all(|group| group.member_indices.len() == 1));
     }
 
     #[test]
@@ -17532,12 +17984,10 @@ mod tests {
             1.0,
             0.85,
         );
-        let forward = group_v2_pair_coarse_temporal_windows(&[
-            duplicate.clone(),
-            distinct.clone(),
-            canonical.clone(),
-        ]);
-        let reverse = group_v2_pair_coarse_temporal_windows(&[canonical, distinct, duplicate]);
+        let forward_candidates = [duplicate.clone(), distinct.clone(), canonical.clone()];
+        let reverse_candidates = [canonical, distinct, duplicate];
+        let forward = group_v2_pair_coarse_temporal_windows(&forward_candidates);
+        let reverse = group_v2_pair_coarse_temporal_windows(&reverse_candidates);
         let signature = |candidate: &V2TrackPairCandidate| {
             (
                 candidate.source_input.stream.stream_index,
@@ -17547,22 +17997,29 @@ mod tests {
                 candidate.score.to_bits(),
             )
         };
+        let group_signatures =
+            |groups: &[V2TemporalWindowGroup], candidates: &[V2TrackPairCandidate]| {
+                groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .member_indices
+                            .iter()
+                            .map(|index| signature(&candidates[*index]))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
 
         assert_eq!(
-            forward
-                .iter()
-                .map(|group| group.members.iter().map(signature).collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-            reverse
-                .iter()
-                .map(|group| group.members.iter().map(signature).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
+            group_signatures(&forward, &forward_candidates),
+            group_signatures(&reverse, &reverse_candidates)
         );
         assert_eq!(forward.len(), 2);
         assert_eq!(
             forward
                 .iter()
-                .map(|group| group.members.len())
+                .map(|group| group.member_indices.len())
                 .sum::<usize>(),
             3
         );
@@ -17639,15 +18096,154 @@ mod tests {
             &left, &right
         ));
 
-        let groups = group_v2_pair_coarse_temporal_windows(&[left, bridge, right]);
+        let candidates = [left, bridge, right];
+        let groups = group_v2_pair_coarse_temporal_windows(&candidates);
         assert_eq!(groups.len(), 2);
         assert_eq!(
             groups
                 .iter()
-                .map(|group| group.members.len())
+                .map(|group| group.member_indices.len())
                 .sum::<usize>(),
             3
         );
+        for group in &groups {
+            for (position, left) in group.member_indices.iter().enumerate() {
+                for right in group.member_indices.iter().skip(position + 1) {
+                    assert!(v2_pair_coarse_candidates_same_temporal_window(
+                        &candidates[*left],
+                        &candidates[*right]
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pair_coarse_grouping_probe_count_is_linear_bounded_and_partitions_all_indices() {
+        let candidates = (0..1_000_i64)
+            .map(|index| {
+                let start_ms = index * 200_000;
+                v2_test_temporal_window_candidate(
+                    1,
+                    2,
+                    PresentationRangeMs {
+                        start_ms,
+                        end_ms: start_ms + 60_000,
+                    },
+                    PresentationRangeMs {
+                        start_ms,
+                        end_ms: start_ms + 60_000,
+                    },
+                    1.0,
+                    0.9,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let (groups, probe_count) =
+            group_v2_pair_coarse_temporal_windows_with_probe_count(&candidates);
+        let mut flattened = groups
+            .iter()
+            .flat_map(|group| group.member_indices.iter().copied())
+            .collect::<Vec<_>>();
+        flattened.sort_unstable();
+
+        assert_eq!(groups.len(), candidates.len());
+        assert_eq!(flattened, (0..candidates.len()).collect::<Vec<_>>());
+        assert!(
+            probe_count <= candidates.len() * ALIGNMENT_V2_TEMPORAL_GROUP_MAX_RECENT_PROBES,
+            "probe_count={probe_count}"
+        );
+    }
+
+    #[test]
+    fn production_coarse_collect_retains_sixth_window_and_materializes_only_selected_anchors() {
+        let mut source_landmarks = Vec::new();
+        let mut target_landmarks = Vec::new();
+        for index in 0..25usize {
+            let hash = (((30_000 + index) as u64) << 8) | 4;
+            let episode_time_ms = index as i64 * 1_000;
+            for episode in 0..7_i64 {
+                source_landmarks.push(SpectralLandmark {
+                    hash,
+                    time_ms: episode * 60_000 + episode_time_ms,
+                    strength_milli: 1_000,
+                });
+            }
+            target_landmarks.push(SpectralLandmark {
+                hash,
+                time_ms: 5_000 + episode_time_ms,
+                strength_milli: 1_000,
+            });
+        }
+        source_landmarks.sort_by_key(|landmark| landmark.time_ms);
+        let source_bounds = PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 420_000,
+        };
+        let target_bounds = PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 40_000,
+        };
+        let mut source_artifact = v2_test_cached_landmarks(source_bounds);
+        source_artifact.landmarks = Arc::new(source_landmarks);
+        let mut target_artifact = v2_test_cached_landmarks(target_bounds);
+        target_artifact.landmarks = Arc::new(target_landmarks);
+        let mut source_input = test_audio_input(1, 0);
+        source_input.presentation_origin_ms = 0;
+        source_input.media_duration_ms = Some(420_000);
+        source_input.stream.start_time_ms = 0;
+        source_input.stream.duration_ms = Some(420_000);
+        let mut target_input = test_audio_input(2, 0);
+        target_input.presentation_origin_ms = 0;
+        target_input.media_duration_ms = Some(40_000);
+        target_input.stream.start_time_ms = 0;
+        target_input.stream.duration_ms = Some(40_000);
+        let source_by_stream = HashMap::from([(1_u32, source_artifact.clone())]);
+        let target_by_stream = HashMap::from([(2_u32, target_artifact.clone())]);
+
+        let coarse = collect_v2_pair_coarse_candidates(
+            &[source_input],
+            &[target_input],
+            &source_by_stream,
+            &target_by_stream,
+            V2CoarseCandidateCollectionContext {
+                toolchain_cache_identity: "toolchain=test-exhaustive-production-v1",
+                has_explicit_selection: true,
+                coarse_resident_baseline_bytes: 0,
+                cancel_flag: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            coarse.candidates.len() >= 7,
+            "candidate offsets={:?}",
+            coarse
+                .candidates
+                .iter()
+                .map(|candidate| candidate.hypothesis.offset_ms)
+                .collect::<Vec<_>>()
+        );
+        assert!(coarse.candidates.iter().all(|candidate| {
+            candidate.coarse_hypothesis.is_some()
+                && candidate.hypothesis.training_anchors.is_empty()
+                && candidate.hypothesis.held_out_anchors.is_empty()
+        }));
+        let selected = materialize_v2_candidate_hypothesis(
+            coarse.candidates[5].clone(),
+            &source_artifact,
+            &target_artifact,
+            &v2_affine_match_config(),
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(selected.coarse_hypothesis.is_some());
+        assert!(!selected.hypothesis.training_anchors.is_empty());
+        assert!(!selected.hypothesis.held_out_anchors.is_empty());
+        assert!(coarse.candidates[5].hypothesis.training_anchors.is_empty());
     }
 
     #[test]
@@ -18246,7 +18842,7 @@ mod tests {
         let target = v2_labeled_features(&target_labels, 500, 102);
         let coarse = v2_test_hypothesis(1.02, 500);
         let result =
-            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), None).unwrap();
+            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None).unwrap();
         let kinds = result
             .spans
             .iter()
@@ -18269,7 +18865,7 @@ mod tests {
         let target = v2_distinct_features(&target_ids, 0, 1_000);
         let coarse = v2_test_hypothesis(1.0, 0);
         let result =
-            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), None).unwrap();
+            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None).unwrap();
         let target_only_ms = result
             .spans
             .iter()
@@ -18301,7 +18897,7 @@ mod tests {
         let coarse = v2_test_hypothesis(1.0, 0);
 
         let result =
-            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), None).unwrap();
+            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None).unwrap();
         let source_only_ms = result
             .spans
             .iter()
@@ -18328,6 +18924,145 @@ mod tests {
             result.spans
         );
         validate_v2_time_map_spans(&result.spans).unwrap();
+    }
+
+    #[test]
+    fn v2_recursive_corridor_does_not_invert_source_only_insert_at_chunk_boundary() {
+        let target_ids = (0..180usize).collect::<Vec<_>>();
+        let mut source_ids = target_ids[..45].to_vec();
+        source_ids.extend(10_000..10_045);
+        source_ids.extend_from_slice(&target_ids[45..]);
+        let source = v2_distinct_features(&source_ids, 0, 1_000);
+        let target = v2_distinct_features(&target_ids, 0, 1_000);
+        let coarse = v2_test_hypothesis(1.0, 0);
+
+        let result =
+            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None).unwrap();
+        let source_only_ms = result
+            .spans
+            .iter()
+            .filter(|span| span.kind == AudioTimeMapSpanKind::SourceOnly)
+            .map(|span| span.source_end_ms.saturating_sub(span.source_start_ms))
+            .sum::<u64>();
+        let target_only_ms = result
+            .spans
+            .iter()
+            .filter(|span| span.kind == AudioTimeMapSpanKind::TargetOnly)
+            .map(|span| span.target_end_ms.saturating_sub(span.target_start_ms))
+            .sum::<u64>();
+        let recovered_tail_ms = result
+            .spans
+            .iter()
+            .filter(|span| {
+                span.kind == AudioTimeMapSpanKind::Matched && span.target_end_ms > 135_000
+            })
+            .map(|span| span.target_end_ms.saturating_sub(span.target_start_ms))
+            .sum::<u64>();
+
+        assert!(
+            source_only_ms >= 40_000,
+            "sourceOnly={source_only_ms}, spans={:?}",
+            result.spans
+        );
+        assert!(
+            target_only_ms < 10_000,
+            "chunk-boundary source insert must not become targetOnly: {target_only_ms}, spans={:?}",
+            result.spans
+        );
+        assert!(
+            recovered_tail_ms >= 30_000,
+            "tail={recovered_tail_ms}, spans={:?}",
+            result.spans
+        );
+        validate_v2_time_map_spans(&result.spans).unwrap();
+    }
+
+    #[test]
+    fn v2_recursive_corridor_blocks_shared_low_information_segment_instead_of_opposite_gaps() {
+        let ids = (0..135usize).collect::<Vec<_>>();
+        let mut source = v2_distinct_features(&ids, 0, 1_000);
+        let mut target = source.clone();
+        for frame in &mut source[45..90] {
+            frame.values.fill(0.0);
+        }
+        for frame in &mut target[45..90] {
+            frame.values.fill(0.0);
+        }
+        let coarse = v2_test_hypothesis(1.0, 0);
+
+        let error = align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None)
+            .expect_err("shared low-information content must remain ambiguous");
+
+        assert!(error.contains("两轴同时跳进"), "error={error}");
+    }
+
+    #[test]
+    fn v2_recursive_corridor_short_accidental_island_cannot_certify_pending_target_only() {
+        let source_ids = (0..1_350usize).collect::<Vec<_>>();
+        let mut inserted = (10_000..10_450).collect::<Vec<_>>();
+        for (index, id) in inserted[200..207].iter_mut().enumerate() {
+            *id = 450 + index;
+        }
+        let mut target_ids = source_ids[..450].to_vec();
+        target_ids.extend(inserted);
+        target_ids.extend_from_slice(&source_ids[450..]);
+        let source = v2_distinct_features(&source_ids, 0, 100);
+        let target = v2_distinct_features(&target_ids, 0, 100);
+        let coarse = v2_test_hypothesis(1.0, 0);
+
+        let error = align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None)
+            .expect_err(
+                "a sub-second accidental matched island must not certify the pending direction",
+            );
+
+        assert!(error.contains("零散或歧义共同内容"), "error={error}");
+    }
+
+    #[test]
+    fn v2_pending_recovery_certificate_rejects_one_matched_frame() {
+        let one_frame = vec![create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            45_000,
+            45_050,
+            90_000,
+            90_050,
+        )];
+        let five_seconds = vec![create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            45_000,
+            50_000,
+            90_000,
+            95_000,
+        )];
+
+        assert_eq!(
+            v2_reliable_recovery_source_start_ms(&one_frame, 5_000),
+            None
+        );
+        assert_eq!(
+            v2_reliable_recovery_source_start_ms(&five_seconds, 5_000),
+            Some(45_000)
+        );
+    }
+
+    #[test]
+    fn v2_dp_workspace_is_charged_before_plane_allocation() {
+        let ids = (0..12usize).collect::<Vec<_>>();
+        let source = v2_distinct_features(&ids, 0, 1_000);
+        let target = source.clone();
+        let coarse = v2_test_hypothesis(1.0, 0);
+
+        let error = align_v2_feature_chunks(
+            &source,
+            &target,
+            &coarse,
+            &test_options(),
+            MAX_V2_ACTIVE_ARTIFACT_BYTES,
+            None,
+        )
+        .expect_err("DP workspace above the active ledger must fail before allocation");
+        assert!(error.contains("DP workspace"), "error={error}");
+        assert!(error.contains("resource-limit"), "error={error}");
     }
 
     #[test]
