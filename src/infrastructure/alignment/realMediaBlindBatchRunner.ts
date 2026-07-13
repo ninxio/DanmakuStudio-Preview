@@ -1,7 +1,6 @@
 import { isAlignmentTimeMapProposal } from "../../domain/alignment/timeMapProposal";
 import type { AlignmentTimeMapProposal } from "../../domain/alignment/types";
 import {
-  assertRealMediaBlindBatchDecisionCandidateMatchesTimeMap,
   assertRealMediaBlindBatchReceiptIsPathFree,
   createRealMediaBlindBatchExecutionDigest,
   createRealMediaBlindBatchRunReceiptDigest,
@@ -14,11 +13,14 @@ import {
   validateRealMediaBlindBatchExecutionSuite,
   validateRealMediaBlindBatchGlobalSelectionEvidence,
   validateRealMediaBlindBatchRelationRankingEvidence,
-  validateRealMediaBlindBatchProposalBinding
+  validateRealMediaBlindBatchProposalBinding,
+  validateRealMediaBlindBatchRunReceipt
 } from "../../domain/alignment/realMediaBlindBatchContract";
 import type {
   NativeBatchGlobalSelectionEvidence,
   NativeBatchExecutionIdentity,
+  NativeBatchFineExecutionEvidence,
+  NativeBatchFineFrontierReceipt,
   NativeBatchPairingMode,
   NativeBatchRelationRankingEvidence,
   RealMediaBlindBatchExecutionSuite,
@@ -87,7 +89,7 @@ export interface RealMediaBlindBatchRunnerOptions {
 }
 
 interface NativeBatchEvidenceSnapshot extends AudioAlignmentBatchJobSnapshot {
-  evidenceVersion: 2;
+  evidenceVersion: 3;
   pairingMode: NativeBatchPairingMode;
   sourceMediaIds: string[];
   targetMediaIds: string[];
@@ -158,7 +160,7 @@ export async function runRealMediaBlindBatchSuite(
       receiptDigest: createRealMediaBlindBatchRunReceiptDigest(withoutDigest)
     };
     assertRealMediaBlindBatchReceiptIsPathFree(receipt, suite);
-    return receipt;
+    return validateRealMediaBlindBatchRunReceipt(receipt, suite);
   } catch (error: unknown) {
     if (
       startedSnapshot !== null &&
@@ -277,7 +279,9 @@ function validateNativeBatchEvidenceSnapshot(
 ): NativeBatchEvidenceSnapshot {
   const snapshot = value as unknown as Record<string, unknown>;
   if (snapshot.evidenceVersion !== NATIVE_BATCH_EVIDENCE_VERSION) {
-    throw new Error("native batch 缺少受支持的 evidenceVersion=1 结构化证据。");
+    throw new Error(
+      `native batch 缺少受支持的 evidenceVersion=${NATIVE_BATCH_EVIDENCE_VERSION} 结构化证据。`
+    );
   }
   if (snapshot.pairingMode !== "fullCartesian") {
     throw new Error("native batch pairingMode 不是 fullCartesian，拒绝 blind receipt。");
@@ -352,28 +356,45 @@ function validateNativePairEvidence(
     `native pair #${expected.pairOrdinal}`
   );
   if (value.status === "completed") {
-    const proposal = value.proposal;
-    if (!proposal?.timeMap || !isAlignmentTimeMapProposal(proposal.timeMap, true)) {
+    const frontier = value.fineFrontier;
+    if (frontier === null || !frontier.componentPairOrdinals.includes(expected.pairOrdinal)) {
       throw new Error(
-        `native pair #${expected.pairOrdinal} 返回了非完整 V2 proposal TimeMap。`
+        `native pair #${expected.pairOrdinal} completed 但缺少绑定当前 pair 的 fineFrontier。`
       );
     }
-    validateRealMediaBlindBatchProposalBinding(
-      proposal.timeMap,
-      source,
-      target,
-      suite.parameters,
-      expected.pairOrdinal
+    const selectedForPair = frontier.selectedCandidateIds.filter(
+      (candidate) => candidate.pairOrdinal === expected.pairOrdinal
     );
-    if (globalSelection.state !== "selected" && globalSelection.state !== "blocked") {
-      throw new Error("completed native pair 的 globalSelection 必须为 selected 或 blocked。");
+    if (selectedForPair.length > 1) {
+      throw new Error(`native pair #${expected.pairOrdinal} 的第二次 assignment 对同一 pair 多选。`);
     }
-    if (globalSelection.decisionCandidate) {
-      assertRealMediaBlindBatchDecisionCandidateMatchesTimeMap(
-        globalSelection.decisionCandidate,
+    const proposal = value.proposal;
+    if (selectedForPair.length === 0) {
+      if (value.fineExecutionEvidence !== null || proposal?.timeMap != null) {
+        throw new Error(
+          `native pair #${expected.pairOrdinal} 未被 fine 最终选择却夹带 execution 或 TimeMap。`
+        );
+      }
+    } else {
+      if (!proposal?.timeMap || !isAlignmentTimeMapProposal(proposal.timeMap, true)) {
+        throw new Error(
+          `native pair #${expected.pairOrdinal} 被 fine 最终选择后缺少完整 V2 proposal TimeMap。`
+        );
+      }
+      validateRealMediaBlindBatchProposalBinding(
         proposal.timeMap,
+        source,
+        target,
+        suite.parameters,
         expected.pairOrdinal
       );
+    }
+    if (
+      globalSelection.state !== "selected" &&
+      globalSelection.state !== "blocked" &&
+      globalSelection.state !== "failed"
+    ) {
+      throw new Error("completed native pair 的 globalSelection 必须为 terminal coarse 诊断。");
     }
   } else if (value.status === "failed") {
     if (globalSelection.state !== "failed") {
@@ -462,6 +483,10 @@ function createPairOutcome(
     relationRanking: cloneRelationRanking(pair.relationRanking),
     globalSelected: pair.globalSelection.selected,
     globalSelection: cloneGlobalSelection(pair.globalSelection),
+    fineFrontier: pair.fineFrontier ? cloneFineFrontier(pair.fineFrontier) : null,
+    fineExecutionEvidence: pair.fineExecutionEvidence
+      ? cloneFineExecutionEvidence(pair.fineExecutionEvidence)
+      : null,
     proposalTimeMap: pair.proposal?.timeMap ? cloneTimeMap(pair.proposal.timeMap) : null
   };
 }
@@ -533,6 +558,18 @@ function cloneExecutionIdentity(
     sourceSpectralBackends: identity.sourceSpectralBackends.map((backend) => ({ ...backend })),
     targetSpectralBackends: identity.targetSpectralBackends.map((backend) => ({ ...backend }))
   };
+}
+
+function cloneFineFrontier(
+  frontier: NativeBatchFineFrontierReceipt
+): NativeBatchFineFrontierReceipt {
+  return structuredClone(frontier);
+}
+
+function cloneFineExecutionEvidence(
+  evidence: NativeBatchFineExecutionEvidence
+): NativeBatchFineExecutionEvidence {
+  return structuredClone(evidence);
 }
 
 function cloneTimeMap(timeMap: AlignmentTimeMapProposal): AlignmentTimeMapProposal {

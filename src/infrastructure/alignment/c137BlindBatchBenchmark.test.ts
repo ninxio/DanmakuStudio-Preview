@@ -24,6 +24,10 @@ import {
   type NativeBatchExecutionIdentity
 } from "../../domain/alignment/realMediaBlindBatchContract";
 import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
+import {
+  createTestFineExecutionEvidence,
+  createTestFineFrontierReceipt
+} from "../../test/audioAlignmentBatchEvidenceV3";
 import type {
   MediaTimelineProbeInvoker,
   MediaTimelineProbeResult
@@ -960,11 +964,24 @@ function createVideoStream(index: number) {
 function createCompletedSnapshot(
   suite: RealMediaBlindBatchExecutionSuite
 ): AudioAlignmentBatchJobSnapshot {
+  const selectedCandidateIds = suite.pairs
+    .filter((pair) => {
+      const source = requireExecutionMedia(suite.sources, pair.sourceMediaId);
+      const target = requireExecutionMedia(suite.targets, pair.targetMediaId);
+      return mediaEpisode(source.path) === mediaEpisode(target.path);
+    })
+    .map((pair) => ({ pairOrdinal: pair.pairOrdinal, candidateOrdinal: 1 }));
+  const fineFrontier = createTestFineFrontierReceipt(
+    suite.pairs.map((pair) => pair.pairOrdinal),
+    selectedCandidateIds
+  );
+  const coarseBackend = TEST_EXECUTION_IDENTITY.sourceSpectralBackends[0];
   const pairs = suite.pairs.map((pair, pairIndex): AudioAlignmentBatchPairSnapshot => {
     const source = requireExecutionMedia(suite.sources, pair.sourceMediaId);
     const target = requireExecutionMedia(suite.targets, pair.targetMediaId);
     const selected = mediaEpisode(source.path) === mediaEpisode(target.path);
     const score = selected ? 0.95 : 0.5 - (pairIndex % 20) / 100;
+    const proposal = createProposal(source, target, selected ? "review" : "blocked");
     return {
       pairIndex,
       pairOrdinal: pair.pairOrdinal,
@@ -975,7 +992,20 @@ function createCompletedSnapshot(
       message: "completed",
       relationRanking: createRelationRanking(source, target, score),
       globalSelection: createSelection(source, target, score, selected),
-      proposal: createProposal(source, target, selected ? "review" : "blocked"),
+      fineFrontier: structuredClone(fineFrontier),
+      fineExecutionEvidence:
+        selected && proposal.timeMap
+          ? createTestFineExecutionEvidence(proposal.timeMap, {
+              pairOrdinal: pair.pairOrdinal,
+              sourceStreamIndex: source.audioStreamIndex,
+              targetStreamIndex: target.audioStreamIndex,
+              engineVersion: TEST_EXECUTION_IDENTITY.engineVersion,
+              featureVersion: TEST_EXECUTION_IDENTITY.featureVersion,
+              coarseBackend,
+              fineBackend: coarseBackend
+            })
+          : null,
+      proposal,
       error: null
     };
   });
@@ -992,7 +1022,10 @@ function createPartialSnapshot(
   suite: RealMediaBlindBatchExecutionSuite
 ): AudioAlignmentBatchJobSnapshot {
   const completed = createCompletedSnapshot(suite);
-  const failedPair = completed.pairs[1];
+  const failedPairIndex = completed.pairs.findIndex(
+    (pair) => pair.fineExecutionEvidence === null
+  );
+  const failedPair = completed.pairs[failedPairIndex];
   if (!failedPair) throw new Error("fixture pair missing");
   const failedSelection: AudioAlignmentBatchGlobalSelectionSnapshot = {
     ...failedPair.globalSelection,
@@ -1012,7 +1045,7 @@ function createPartialSnapshot(
             globalSelected: false
           }
   };
-  completed.pairs[1] = {
+  completed.pairs[failedPairIndex] = {
     ...failedPair,
     status: "failed",
     progress: 1,
@@ -1033,7 +1066,7 @@ function createTerminalSnapshot(
 ): AudioAlignmentBatchJobSnapshot {
   return {
     schemaVersion: 1,
-    evidenceVersion: 2,
+    evidenceVersion: 3,
     jobId: "coordinator-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -1233,7 +1266,7 @@ function createProposal(
       targetEndMs: 60_000,
       coverage: 0.95
     },
-    timeMap
+    ...(level === "review" ? { timeMap } : {})
   };
 }
 

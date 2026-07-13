@@ -19,6 +19,13 @@ use crate::{
     cuda_fft_backend::{
         CudaFftMemoryBudget, CUDA_FFT_BACKEND_ID, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
     },
+    fine_frontier::{
+        analyze_fine_frontier_with_cancel, ExactAssignment, ExactSearchStats, FineCandidate,
+        FineCandidateId, FineCandidateInventory, FineEvaluationState, FineFrontierConfig,
+        FineFrontierError, FineFrontierOutcome, FineFrontierState as CoreFineFrontierState,
+        OptimisticOmittedAssignment, PairPhysicalOccupancy, PhysicalAxisOccupancy,
+        PhysicalInterval, ScoreMicros, FINE_FRONTIER_CONTRACT_VERSION, SCORE_MICROS_ONE,
+    },
     media_probe::{
         probe_audio_decode_timelines_with_ffprobe_cancellable,
         probe_media_content_identity_cancellable, probe_media_timeline_with_ffprobe_cancellable,
@@ -105,9 +112,9 @@ const OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER: usize = 3;
 const OFFSET_PATH_STABLE_SUPPORT_RATIO: f64 = 0.7;
 const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
-const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.2-rust";
+const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.3-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-exhaustive-coarse-cuda-fine-v13";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-frontier-second-assignment-v14";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -582,11 +589,36 @@ pub struct AudioAlignmentJobSnapshot {
 }
 
 const AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION: u8 = 1;
-const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 2;
+const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 3;
 const AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K: usize = 10;
 const AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION: &str =
     "alignment-v2-pair-intrinsic-global-weight-v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION: &str =
+    "alignment-v2-coarse-upper-times-confidence-v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN: &str =
+    "audio-alignment-v3/fine-frontier-inventory/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_OCCUPANCY_DIGEST_DOMAIN: &str =
+    "audio-alignment-v3/fine-occupancy/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN: &str =
+    "audio-alignment-v3/proposal-time-map/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN: &str =
+    "audio-alignment-v3/fine-parameters/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN: &str =
+    "audio-alignment-v3/fine-execution-evidence/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN: &str =
+    "audio-alignment-v3/fine-frontier-receipt/v1";
 const AUDIO_ALIGNMENT_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION: u8 = 1;
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS: u64 = 1;
+// Conservative component cap; the resolver also clamps this to the mutable inventory size.
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_REFINEMENT_ROUNDS: usize = 512;
+// Conservative component cap, kept below FineFrontierConfig::max_candidates (32_768).
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_MEMBER_EXECUTIONS: usize = 1_024;
+// A single temporal group may consume only a subset of the component member budget.
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_GROUP_MEMBER_EXECUTIONS: usize = 64;
+// Last-resort wall-clock guard only; elapsed time is intentionally excluded from evidence.
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_ELAPSED_MS: u64 = 2 * 60 * 60 * 1_000;
+const AUDIO_ALIGNMENT_BATCH_GLOBAL_WEIGHT_MAX: f64 = 1.2;
+const AUDIO_ALIGNMENT_BATCH_V3_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_PAIRS: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_ID_BYTES: usize = 512;
@@ -679,6 +711,150 @@ pub struct AudioAlignmentBatchGlobalSelectionSnapshot {
     eligible_candidate_count: usize,
     top_k: Vec<AudioAlignmentBatchGlobalCandidateSnapshot>,
     decision_candidate: Option<AudioAlignmentBatchGlobalCandidateSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineCandidateIdSnapshot {
+    pair_ordinal: u32,
+    candidate_ordinal: u32,
+}
+
+impl From<FineCandidateId> for AudioAlignmentBatchFineCandidateIdSnapshot {
+    fn from(id: FineCandidateId) -> Self {
+        Self {
+            pair_ordinal: id.pair_ordinal,
+            candidate_ordinal: id.candidate_ordinal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineStateCountsSnapshot {
+    unresolved: usize,
+    scored: usize,
+    evaluated_ineligible: usize,
+    evidence_blocked: usize,
+    resource_blocked: usize,
+    infrastructure_failed: usize,
+    cancelled: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineAssignmentSnapshot {
+    candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+    total_score_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineOmittedAssignmentSnapshot {
+    candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+    total_upper_bound_micros: u64,
+    open_candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+    unresolved_candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+    blocked_candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineResolutionProofSnapshot {
+    beats_runner_up_with_margin: bool,
+    beats_optimistic_omitted_with_margin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineSearchSnapshot {
+    states_visited: u64,
+    expansions_considered: u64,
+    interval_comparisons: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineLimitsSnapshot {
+    max_candidates: usize,
+    max_search_states: u64,
+    max_search_expansions: u64,
+    max_interval_comparisons: u64,
+    max_intervals_per_axis: usize,
+    max_total_intervals: usize,
+    refinement_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum AudioAlignmentBatchFineFrontierStateSnapshot {
+    Resolved,
+    NoEligibleCandidate,
+    Unresolved,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineFrontierReceiptSnapshot {
+    contract_version: &'static str,
+    score_version: &'static str,
+    inventory_digest: String,
+    receipt_digest: String,
+    component_ordinal: usize,
+    component_pair_ordinals: Vec<usize>,
+    inventory_candidate_count: usize,
+    resolution_margin_micros: u64,
+    overlap_tolerance_ms: u64,
+    limits: AudioAlignmentBatchFineLimitsSnapshot,
+    inventory_state_counts: AudioAlignmentBatchFineStateCountsSnapshot,
+    refinement_round_count: usize,
+    evaluated_candidate_count: usize,
+    final_state: AudioAlignmentBatchFineFrontierStateSnapshot,
+    resolved: bool,
+    selected_candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+    selected_total_score_micros: Option<u64>,
+    best_completed: AudioAlignmentBatchFineAssignmentSnapshot,
+    runner_up_completed: Option<AudioAlignmentBatchFineAssignmentSnapshot>,
+    optimistic_omitted: Option<AudioAlignmentBatchFineOmittedAssignmentSnapshot>,
+    next_refinement_candidate_ids: Vec<AudioAlignmentBatchFineCandidateIdSnapshot>,
+    deferred_candidate_count: usize,
+    proof: AudioAlignmentBatchFineResolutionProofSnapshot,
+    search: AudioAlignmentBatchFineSearchSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineDecodeWindowSnapshot {
+    start_ms: i64,
+    end_ms: i64,
+    presentation_offset_ms: i64,
+    sample_rate: u32,
+    expected_sample_count: u64,
+    actual_decoded_sample_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineExecutionEvidenceSnapshot {
+    candidate_id: AudioAlignmentBatchFineCandidateIdSnapshot,
+    selected_member_rank: usize,
+    group_member_ranks: Vec<usize>,
+    source_stream_index: u32,
+    target_stream_index: u32,
+    source_coarse_backend: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+    target_coarse_backend: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+    source_fine_backend: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+    target_fine_backend: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+    source_requested_window: AudioAlignmentBatchFineDecodeWindowSnapshot,
+    target_requested_window: AudioAlignmentBatchFineDecodeWindowSnapshot,
+    source_effective_window: AudioAlignmentBatchFineDecodeWindowSnapshot,
+    target_effective_window: AudioAlignmentBatchFineDecodeWindowSnapshot,
+    parameters_hash: String,
+    occupancy_digest: String,
+    proposal_time_map_digest: String,
+    score_micros: u64,
+    evidence_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -850,6 +1026,8 @@ pub struct AudioAlignmentBatchPairSnapshot {
     message: String,
     relation_ranking: AudioAlignmentBatchRelationRankingSnapshot,
     global_selection: AudioAlignmentBatchGlobalSelectionSnapshot,
+    fine_frontier: Option<AudioAlignmentBatchFineFrontierReceiptSnapshot>,
+    fine_execution_evidence: Option<AudioAlignmentBatchFineExecutionEvidenceSnapshot>,
     proposal: Option<AudioAlignmentProposal>,
     error: Option<String>,
 }
@@ -1376,6 +1554,7 @@ struct V2TrackPairCandidate {
 #[derive(Debug, Clone)]
 struct V2PairCoarseCandidates {
     candidates: Vec<V2TrackPairCandidate>,
+    temporal_window_groups: Vec<V2TemporalWindowGroup>,
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     diagnostics: Vec<String>,
 }
@@ -1649,6 +1828,127 @@ struct PreparedV2PairEvidence {
     target: PreparedV2BatchMediaEvidence,
     batch_retained_artifact_bytes: usize,
     selected_coarse: PreparedV2SelectedCandidate,
+    fine_frontier_evaluation: bool,
+    fine_execution_capture: Option<Arc<Mutex<Option<V2FineExecutionRuntimeCapture>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct V2FineExecutionRuntimeCapture {
+    source_fine_backend: SpectralBackendExecution,
+    target_fine_backend: SpectralBackendExecution,
+    source_presentation_offset_ms: i64,
+    target_presentation_offset_ms: i64,
+    source_decoded_sample_count: u64,
+    target_decoded_sample_count: u64,
+    decode_plan: Option<V2SelectedFineDecodePlan>,
+}
+
+struct V2FineEvaluationContext<'a> {
+    plan: &'a PlannedAudioAlignmentBatch,
+    coarse_by_pair: &'a [Result<V2PairCoarseCandidates, String>],
+    prepared: &'a [PreparedAudioAlignmentBatchMediaState],
+    options: &'a AudioAlignmentOptions,
+    batch_retained_artifact_bytes: usize,
+    cancel_flag: &'a AtomicBool,
+}
+
+struct V2FineExecutionEvidenceInput<'a> {
+    id: FineCandidateId,
+    binding: &'a V2FineFrontierGroupBinding,
+    selected_member_index: usize,
+    candidate: &'a V2TrackPairCandidate,
+    source_artifact: &'a CachedV2Landmarks,
+    target_artifact: &'a CachedV2Landmarks,
+    runtime: &'a V2FineExecutionRuntimeCapture,
+    proposal: &'a AudioAlignmentProposal,
+    score: ScoreMicros,
+    occupancy: &'a PairPhysicalOccupancy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2FineFrontierFailureProgress {
+    refinement_round_count: usize,
+    evaluated_candidate_count: usize,
+    search: ExactSearchStats,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2FineComponentBudget {
+    max_refinement_rounds: usize,
+    max_member_executions: usize,
+    max_elapsed: Duration,
+}
+
+impl Default for V2FineComponentBudget {
+    fn default() -> Self {
+        Self {
+            max_refinement_rounds: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_REFINEMENT_ROUNDS,
+            max_member_executions: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_MEMBER_EXECUTIONS,
+            max_elapsed: Duration::from_millis(AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_ELAPSED_MS),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2FineComponentExecutionLimits {
+    frontier: FineFrontierConfig,
+    component: V2FineComponentBudget,
+}
+
+#[derive(Debug, Clone)]
+struct V2FineFrontierGroupBinding {
+    id: FineCandidateId,
+    pair_index: usize,
+    member_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct V2FineGroupEvaluationRecord {
+    score: ScoreMicros,
+    occupancy: PairPhysicalOccupancy,
+    execution_evidence: AudioAlignmentBatchFineExecutionEvidenceSnapshot,
+    proposal: Box<AudioAlignmentProposal>,
+}
+
+struct V2FineGroupEvaluationOutcome {
+    state: FineEvaluationState,
+    record: Option<V2FineGroupEvaluationRecord>,
+    member_execution_count: usize,
+}
+
+struct V2FineMemberEvaluation {
+    state: FineEvaluationState,
+    score: Option<ScoreMicros>,
+    occupancy: Option<PairPhysicalOccupancy>,
+    execution_evidence: Option<AudioAlignmentBatchFineExecutionEvidenceSnapshot>,
+    proposal: Option<AudioAlignmentProposal>,
+}
+
+#[derive(Debug)]
+struct V2FineComponentResolution {
+    pair_indices: Vec<usize>,
+    inventory: FineCandidateInventory,
+    inventory_digest: String,
+    config: FineFrontierConfig,
+    outcome: FineFrontierOutcome,
+    refinement_round_count: usize,
+    evaluated_candidate_count: usize,
+    records: HashMap<FineCandidateId, V2FineGroupEvaluationRecord>,
+}
+
+#[derive(Debug)]
+struct V2FineComponentFailure {
+    error: String,
+    inventory: FineCandidateInventory,
+    progress: V2FineFrontierFailureProgress,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V2FineInventoryDigestEntry {
+    id: AudioAlignmentBatchFineCandidateIdSnapshot,
+    coarse_upper_bound_micros: u32,
+    members: Vec<AudioAlignmentBatchRelationCandidateSnapshot>,
 }
 
 enum StagedAudioAlignmentBatchPairOutcome {
@@ -1660,6 +1960,8 @@ struct StagedAudioAlignmentBatchPairResult {
     pair_index: usize,
     relation_ranking: AudioAlignmentBatchRelationRankingSnapshot,
     global_selection: AudioAlignmentBatchGlobalSelectionSnapshot,
+    fine_frontier: Option<AudioAlignmentBatchFineFrontierReceiptSnapshot>,
+    fine_execution_evidence: Option<AudioAlignmentBatchFineExecutionEvidenceSnapshot>,
     outcome: StagedAudioAlignmentBatchPairOutcome,
 }
 
@@ -5647,7 +5949,14 @@ where
     );
     // Batch selection cannot weaken the pair-local ambiguity gate. In particular, a 1x1 batch
     // must have exactly the same intrinsic-margin blocked semantics as ordinary single-pair V2.
-    let minimum_alternative_margin = ALIGNMENT_V2_MIN_TRACK_MARGIN;
+    let minimum_alternative_margin = if prepared
+        .as_ref()
+        .is_some_and(|prepared| prepared.fine_frontier_evaluation)
+    {
+        0.0
+    } else {
+        ALIGNMENT_V2_MIN_TRACK_MARGIN
+    };
     let selected_track_reason = format!(
         "landmark 内容评分选择 B 站参考音轨 #{} 与目标原片音轨 #{}；{} margin {:.3}。",
         best_pair.source_input.stream.stream_index,
@@ -5887,6 +6196,27 @@ where
         if let Some(reason) = &fine_backend.fallback_reason {
             extraction_notes.push(format!("{label} fine 声谱后端说明：{reason}"));
         }
+    }
+    if let Some(capture) = prepared
+        .as_ref()
+        .and_then(|prepared| prepared.fine_execution_capture.as_ref())
+    {
+        let source_decoded_sample_count = u64::try_from(source_audio.pcm.len())
+            .map_err(|_| "source fine decoded sample count 无法表示。".to_string())?;
+        let target_decoded_sample_count = u64::try_from(target_audio.pcm.len())
+            .map_err(|_| "target fine decoded sample count 无法表示。".to_string())?;
+        let mut capture = capture
+            .lock()
+            .map_err(|_| "fine execution runtime capture 锁已损坏。".to_string())?;
+        *capture = Some(V2FineExecutionRuntimeCapture {
+            source_fine_backend: source_audio.fine_spectral_backend.clone(),
+            target_fine_backend: target_audio.fine_spectral_backend.clone(),
+            source_presentation_offset_ms: source_audio.presentation_offset_ms,
+            target_presentation_offset_ms: target_audio.presentation_offset_ms,
+            source_decoded_sample_count,
+            target_decoded_sample_count,
+            decode_plan: fine_decode_plan,
+        });
     }
 
     benchmark_stage("fitting", "执行分块 edit-aware DP");
@@ -6159,13 +6489,14 @@ fn collect_v2_pair_coarse_candidates(
     let (temporal_window_groups, temporal_window_group_probe_count) =
         group_v2_pair_coarse_temporal_windows_with_probe_count(&candidates);
     diagnostics.push(format!(
-        "pair coarse temporal-window grouping：完整保留 {} 个跨音轨 affine candidate，以 bounded intersection-core 归入 {} 个调度组，共执行 {} 次 O(1) group probe；分组只保存冻结候选索引，不复制 anchor 证据，且允许安全过拆分；当前 native evidence v2 仍按 candidate 计数，尚未把 coarse 分组冒充 fine Top-K。",
+        "pair coarse temporal-window grouping：完整保留 {} 个跨音轨 affine raw candidate，以 bounded intersection-core 归入 {} 个稳定时间候选组，共执行 {} 次 O(1) group probe；raw candidate 仍逐个计入完整证据集，temporal group 作为 pair-level relation alternative 进入 evidence v3 完整 fine frontier，不是展示用 Top-K。",
         candidates.len(),
         temporal_window_groups.len(),
         temporal_window_group_probe_count
     ));
     Ok(V2PairCoarseCandidates {
         candidates,
+        temporal_window_groups,
         alternatives,
         diagnostics,
     })
@@ -7338,6 +7669,24 @@ fn create_audio_alignment_batch_global_selection_evidence(
             "批次级 Top-K evidence 含有非有限数值；拒绝发布不可序列化的 blind 结果。".to_string(),
         );
     }
+    match decision {
+        V2GlobalShortlistDecision::Blocked {
+            alternatives,
+            reason,
+            ..
+        } if reason.trim().is_empty()
+            || alternatives.len() > 10
+            || alternatives.iter().any(|alternative| {
+                !alternative.score.is_finite() || !alternative.scale.is_finite()
+            }) =>
+        {
+            return Err("批次级 Top-K blocked 诊断不完整或含非有限备选分数。".to_string());
+        }
+        V2GlobalShortlistDecision::Failed(error) if error.trim().is_empty() => {
+            return Err("批次级 Top-K failed 诊断不能为空。".to_string());
+        }
+        _ => {}
+    }
     let affine_config = v2_affine_match_config();
     let eligible = coarse
         .candidates
@@ -7496,6 +7845,802 @@ fn v2_global_candidate_weight(candidate: &V2TrackPairCandidate) -> f64 {
         0.0
     };
     candidate.score.clamp(0.0, 1.0) * uniqueness_factor + alternative_bonus - repeated_penalty
+}
+
+fn v2_fine_coarse_upper_bound(candidate: &V2TrackPairCandidate) -> Result<ScoreMicros, String> {
+    let weight = v2_global_candidate_weight(candidate);
+    if !weight.is_finite() {
+        return Err(
+            "fine frontier coarse upper bound 不能由非有限 global weight 构造。".to_string(),
+        );
+    }
+    let normalized = (weight.max(0.0) / AUDIO_ALIGNMENT_BATCH_GLOBAL_WEIGHT_MAX).clamp(0.0, 1.0);
+    let micros = (normalized * f64::from(SCORE_MICROS_ONE))
+        .ceil()
+        .clamp(0.0, f64::from(SCORE_MICROS_ONE)) as u32;
+    ScoreMicros::new(micros)
+        .map_err(|error| format!("fine frontier coarse upper bound 越界：{error:?}"))
+}
+
+fn v2_fine_score_from_proposal(
+    coarse_upper_bound: ScoreMicros,
+    proposal: &AudioAlignmentProposal,
+) -> Result<ScoreMicros, String> {
+    if !proposal.confidence.is_finite() || proposal.confidence <= 0.0 {
+        return Err("fine proposal 没有正的有限 confidence，不能标记为 Scored。".to_string());
+    }
+    let quality_micros =
+        (proposal.confidence.clamp(0.0, 1.0) * f64::from(SCORE_MICROS_ONE)).floor() as u64;
+    let score =
+        (u64::from(coarse_upper_bound.get()) * quality_micros) / u64::from(SCORE_MICROS_ONE);
+    let score = u32::try_from(score).map_err(|_| "fine score micros 无法表示。".to_string())?;
+    if score == 0 {
+        return Err("fine proposal 的版本化质量因子量化后为零。".to_string());
+    }
+    let score =
+        ScoreMicros::new(score).map_err(|error| format!("fine score micros 越界：{error:?}"))?;
+    if score > coarse_upper_bound {
+        return Err("fine score 超过 coarse upper bound。".to_string());
+    }
+    Ok(score)
+}
+
+fn canonicalize_v2_physical_intervals(
+    mut intervals: Vec<PhysicalInterval>,
+) -> Vec<PhysicalInterval> {
+    intervals.sort_by_key(|interval| (interval.start_ms, interval.end_ms));
+    let mut canonical = Vec::<PhysicalInterval>::with_capacity(intervals.len());
+    for interval in intervals {
+        if interval.end_ms <= interval.start_ms {
+            continue;
+        }
+        if let Some(previous) = canonical.last_mut() {
+            if interval.start_ms <= previous.end_ms {
+                previous.end_ms = previous.end_ms.max(interval.end_ms);
+                continue;
+            }
+        }
+        canonical.push(interval);
+    }
+    canonical
+}
+
+fn v2_fine_physical_occupancy_from_proposal(
+    pair: &PlannedAudioAlignmentBatchPair,
+    proposal: &AudioAlignmentProposal,
+) -> Result<PairPhysicalOccupancy, String> {
+    let time_map = proposal
+        .time_map
+        .as_ref()
+        .ok_or_else(|| "fine proposal 缺少最终 TimeMap。".to_string())?;
+    let source = canonicalize_v2_physical_intervals(
+        time_map
+            .spans
+            .iter()
+            .filter_map(|span| {
+                (span.source_end_ms > span.source_start_ms).then_some(PhysicalInterval {
+                    start_ms: span.source_start_ms,
+                    end_ms: span.source_end_ms,
+                })
+            })
+            .collect(),
+    );
+    let target = canonicalize_v2_physical_intervals(
+        time_map
+            .spans
+            .iter()
+            .filter_map(|span| {
+                (span.target_end_ms > span.target_start_ms).then_some(PhysicalInterval {
+                    start_ms: span.target_start_ms,
+                    end_ms: span.target_end_ms,
+                })
+            })
+            .collect(),
+    );
+    if source.is_empty() || target.is_empty() {
+        return Err("fine proposal 的最终 TimeMap 没有双轴非空物理占用。".to_string());
+    }
+    Ok(PairPhysicalOccupancy {
+        source: PhysicalAxisOccupancy {
+            space_ordinal: u32::try_from(pair.source_physical_media_index)
+                .map_err(|_| "source physical group ordinal 无法表示为 u32。".to_string())?,
+            intervals: source,
+        },
+        target: PhysicalAxisOccupancy {
+            space_ordinal: u32::try_from(pair.target_physical_media_index)
+                .map_err(|_| "target physical group ordinal 无法表示为 u32。".to_string())?,
+            intervals: target,
+        },
+    })
+}
+
+fn v2_fine_pair_components(plan: &PlannedAudioAlignmentBatch) -> Vec<Vec<usize>> {
+    let mut assigned = vec![false; plan.pairs.len()];
+    let mut components = Vec::<Vec<usize>>::new();
+    for seed in 0..plan.pairs.len() {
+        if assigned[seed] {
+            continue;
+        }
+        assigned[seed] = true;
+        let mut component = vec![seed];
+        let mut cursor = 0_usize;
+        while cursor < component.len() {
+            let current = &plan.pairs[component[cursor]];
+            for (candidate_index, candidate_assigned) in assigned.iter_mut().enumerate() {
+                if *candidate_assigned {
+                    continue;
+                }
+                let candidate = &plan.pairs[candidate_index];
+                if current.source_physical_media_index == candidate.source_physical_media_index
+                    || current.target_physical_media_index == candidate.target_physical_media_index
+                {
+                    *candidate_assigned = true;
+                    component.push(candidate_index);
+                }
+            }
+            cursor += 1;
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+    components
+}
+
+fn create_v2_fine_frontier_inventory(
+    plan: &PlannedAudioAlignmentBatch,
+    coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
+    pair_indices: &[usize],
+) -> Result<
+    (
+        FineCandidateInventory,
+        Vec<V2FineFrontierGroupBinding>,
+        String,
+        FineFrontierConfig,
+    ),
+    String,
+> {
+    let mut candidates = Vec::<FineCandidate>::new();
+    let mut bindings = Vec::<V2FineFrontierGroupBinding>::new();
+    let mut digest_entries = Vec::<V2FineInventoryDigestEntry>::new();
+    for pair_index in pair_indices {
+        let pair = plan
+            .pairs
+            .get(*pair_index)
+            .ok_or_else(|| "fine frontier component pair 索引越界。".to_string())?;
+        let coarse = coarse_by_pair
+            .get(*pair_index)
+            .ok_or_else(|| "fine frontier coarse pair 索引越界。".to_string())?
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let pair_ordinal = u32::try_from(pair.pair_ordinal)
+            .map_err(|_| "fine frontier pair ordinal 无法表示为 u32。".to_string())?;
+        let mut seen = vec![false; coarse.candidates.len()];
+        for (group_index, group) in coarse.temporal_window_groups.iter().enumerate() {
+            if group.member_indices.is_empty() {
+                return Err("fine frontier temporal group 不能为空。".to_string());
+            }
+            let id = FineCandidateId {
+                pair_ordinal,
+                candidate_ordinal: u32::try_from(group_index + 1)
+                    .map_err(|_| "fine frontier candidate ordinal 无法表示为 u32。".to_string())?,
+            };
+            let mut upper = ScoreMicros::ZERO;
+            let mut intrinsically_eligible = false;
+            let mut members = Vec::with_capacity(group.member_indices.len());
+            for member_index in &group.member_indices {
+                let candidate = coarse
+                    .candidates
+                    .get(*member_index)
+                    .ok_or_else(|| "fine frontier temporal group member 索引越界。".to_string())?;
+                if std::mem::replace(
+                    seen.get_mut(*member_index).ok_or_else(|| {
+                        "fine frontier temporal group seen 索引越界。".to_string()
+                    })?,
+                    true,
+                ) {
+                    return Err("同一 raw coarse candidate 被重复放入 fine group。".to_string());
+                }
+                upper = upper.max(v2_fine_coarse_upper_bound(candidate)?);
+                intrinsically_eligible |=
+                    v2_relation_candidate_is_intrinsically_eligible(candidate);
+                members.push(create_audio_alignment_batch_relation_candidate_snapshot(
+                    member_index + 1,
+                    candidate,
+                ));
+            }
+            candidates.push(FineCandidate {
+                id,
+                coarse_upper_bound: upper,
+                physical_occupancy: None,
+                state: if intrinsically_eligible {
+                    FineEvaluationState::Unresolved
+                } else {
+                    FineEvaluationState::EvaluatedIneligible
+                },
+            });
+            bindings.push(V2FineFrontierGroupBinding {
+                id,
+                pair_index: *pair_index,
+                member_indices: group.member_indices.clone(),
+            });
+            digest_entries.push(V2FineInventoryDigestEntry {
+                id: id.into(),
+                coarse_upper_bound_micros: upper.get(),
+                members,
+            });
+        }
+        if seen.iter().any(|seen| !*seen) {
+            return Err(
+                "fine frontier temporal groups 未完整覆盖 raw coarse candidate universe。"
+                    .to_string(),
+            );
+        }
+    }
+    let canonical = canonicalize_v2_cross_language_json(
+        &serde_json::to_value(&digest_entries)
+            .map_err(|_| "fine frontier inventory 无法序列化。".to_string())?,
+    )?;
+    let inventory_digest = v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
+        &canonical,
+    );
+    let inventory = FineCandidateInventory { candidates };
+    let mut max_upper_by_pair = HashMap::<u32, u32>::new();
+    for candidate in &inventory.candidates {
+        max_upper_by_pair
+            .entry(candidate.id.pair_ordinal)
+            .and_modify(|upper| *upper = (*upper).max(candidate.coarse_upper_bound.get()))
+            .or_insert(candidate.coarse_upper_bound.get());
+    }
+    let component_upper_sum = max_upper_by_pair.values().try_fold(0_u64, |sum, upper| {
+        sum.checked_add(u64::from(*upper))
+            .ok_or_else(|| "fine frontier component upper sum 溢出。".to_string())
+    })?;
+    let resolution_margin_micros = ((component_upper_sum as f64)
+        * ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN)
+        .ceil()
+        .max(AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS as f64)
+        as u64;
+    let overlap_tolerance_ms = u64::try_from(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+        .map_err(|_| "fine frontier overlap tolerance 不能为负数。".to_string())?;
+    let config = FineFrontierConfig {
+        resolution_margin_micros,
+        overlap_tolerance_ms,
+        ..FineFrontierConfig::default()
+    };
+    Ok((inventory, bindings, inventory_digest, config))
+}
+
+fn audio_alignment_batch_fine_assignment_snapshot(
+    assignment: &ExactAssignment,
+) -> AudioAlignmentBatchFineAssignmentSnapshot {
+    AudioAlignmentBatchFineAssignmentSnapshot {
+        candidate_ids: assignment
+            .candidate_ids
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        total_score_micros: assignment.total_score_micros,
+    }
+}
+
+fn audio_alignment_batch_fine_omitted_snapshot(
+    assignment: &OptimisticOmittedAssignment,
+) -> AudioAlignmentBatchFineOmittedAssignmentSnapshot {
+    AudioAlignmentBatchFineOmittedAssignmentSnapshot {
+        candidate_ids: assignment
+            .candidate_ids
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        total_upper_bound_micros: assignment.total_upper_bound_micros,
+        open_candidate_ids: assignment
+            .open_candidate_ids
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        unresolved_candidate_ids: assignment
+            .unresolved_candidate_ids
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        blocked_candidate_ids: assignment
+            .blocked_candidate_ids
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+    }
+}
+
+fn audio_alignment_batch_fine_state_counts(
+    inventory: &FineCandidateInventory,
+) -> AudioAlignmentBatchFineStateCountsSnapshot {
+    let mut counts = AudioAlignmentBatchFineStateCountsSnapshot::default();
+    for candidate in &inventory.candidates {
+        match candidate.state {
+            FineEvaluationState::Unresolved => counts.unresolved += 1,
+            FineEvaluationState::Scored { .. } => counts.scored += 1,
+            FineEvaluationState::EvaluatedIneligible => counts.evaluated_ineligible += 1,
+            FineEvaluationState::EvidenceBlocked => counts.evidence_blocked += 1,
+            FineEvaluationState::ResourceBlocked => counts.resource_blocked += 1,
+            FineEvaluationState::InfrastructureFailed => counts.infrastructure_failed += 1,
+            FineEvaluationState::Cancelled => counts.cancelled += 1,
+        }
+    }
+    counts
+}
+
+fn audio_alignment_batch_fine_limits_snapshot(
+    config: FineFrontierConfig,
+) -> AudioAlignmentBatchFineLimitsSnapshot {
+    AudioAlignmentBatchFineLimitsSnapshot {
+        max_candidates: config.limits.max_candidates,
+        max_search_states: config.limits.max_search_states,
+        max_search_expansions: config.limits.max_search_expansions,
+        max_interval_comparisons: config.limits.max_interval_comparisons,
+        max_intervals_per_axis: config.limits.max_intervals_per_axis,
+        max_total_intervals: config.limits.max_total_intervals,
+        refinement_batch_size: config.limits.refinement_batch_size,
+    }
+}
+
+fn v2_domain_separated_canonical_digest(domain: &str, canonical_json: &str) -> String {
+    let mut bytes = Vec::with_capacity(domain.len() + 1 + canonical_json.len());
+    bytes.extend_from_slice(domain.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(canonical_json.as_bytes());
+    format!("sha256:{}", sha256_alignment_benchmark_bytes(&bytes))
+}
+
+fn canonicalize_v2_cross_language_json(value: &serde_json::Value) -> Result<String, String> {
+    fn normalize(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::String(_) => {
+                Ok(value.clone())
+            }
+            serde_json::Value::Number(number) => {
+                if number
+                    .as_u64()
+                    .is_some_and(|value| value > AUDIO_ALIGNMENT_BATCH_V3_MAX_SAFE_INTEGER)
+                    || number.as_i64().is_some_and(|value| {
+                        value.unsigned_abs() > AUDIO_ALIGNMENT_BATCH_V3_MAX_SAFE_INTEGER
+                    })
+                {
+                    return Err(
+                        "alignment evidence v3 JSON integer 超过 JavaScript MAX_SAFE_INTEGER。"
+                            .to_string(),
+                    );
+                }
+                let value = number
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| {
+                        "alignment evidence v3 JSON number 不是有限 f64。".to_string()
+                    })?;
+                if value.fract() == 0.0
+                    && value.abs() > AUDIO_ALIGNMENT_BATCH_V3_MAX_SAFE_INTEGER as f64
+                {
+                    return Err(
+                        "alignment evidence v3 整数型 f64 超过 JavaScript MAX_SAFE_INTEGER。"
+                            .to_string(),
+                    );
+                }
+                Ok(serde_json::Value::String(format!(
+                    "f64:{:016x}",
+                    value.to_bits()
+                )))
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(normalize)
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array),
+            serde_json::Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), normalize(value)?)))
+                .collect::<Result<serde_json::Map<_, _>, String>>()
+                .map(serde_json::Value::Object),
+        }
+    }
+    canonicalize_alignment_benchmark_json(&normalize(value)?)
+}
+
+fn seal_audio_alignment_batch_fine_frontier_receipt(
+    mut receipt: AudioAlignmentBatchFineFrontierReceiptSnapshot,
+) -> Result<AudioAlignmentBatchFineFrontierReceiptSnapshot, String> {
+    receipt.receipt_digest.clear();
+    let canonical = canonicalize_v2_cross_language_json(
+        &serde_json::to_value(&receipt)
+            .map_err(|_| "fine frontier receipt 无法序列化。".to_string())?,
+    )?;
+    receipt.receipt_digest = v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN,
+        &canonical,
+    );
+    Ok(receipt)
+}
+
+fn create_audio_alignment_batch_fine_frontier_receipt(
+    component_ordinal: usize,
+    plan: &PlannedAudioAlignmentBatch,
+    resolution: &V2FineComponentResolution,
+) -> Result<AudioAlignmentBatchFineFrontierReceiptSnapshot, String> {
+    let final_state = match resolution.outcome.state {
+        CoreFineFrontierState::Resolved => AudioAlignmentBatchFineFrontierStateSnapshot::Resolved,
+        CoreFineFrontierState::NoEligibleCandidate => {
+            AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate
+        }
+        CoreFineFrontierState::Pending | CoreFineFrontierState::Unresolved => {
+            AudioAlignmentBatchFineFrontierStateSnapshot::Unresolved
+        }
+    };
+    let resolved = resolution.outcome.state == CoreFineFrontierState::Resolved;
+    let selected_candidate_ids = if resolved {
+        resolution
+            .outcome
+            .best_completed
+            .candidate_ids
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let component_pair_ordinals = resolution
+        .pair_indices
+        .iter()
+        .map(|pair_index| {
+            plan.pairs
+                .get(*pair_index)
+                .map(|pair| pair.pair_ordinal)
+                .ok_or_else(|| "fine frontier receipt pair 索引越界。".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    seal_audio_alignment_batch_fine_frontier_receipt(
+        AudioAlignmentBatchFineFrontierReceiptSnapshot {
+            contract_version: FINE_FRONTIER_CONTRACT_VERSION,
+            score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+            inventory_digest: resolution.inventory_digest.clone(),
+            receipt_digest: String::new(),
+            component_ordinal,
+            component_pair_ordinals,
+            inventory_candidate_count: resolution.inventory.candidates.len(),
+            resolution_margin_micros: resolution.config.resolution_margin_micros,
+            overlap_tolerance_ms: resolution.config.overlap_tolerance_ms,
+            limits: audio_alignment_batch_fine_limits_snapshot(resolution.config),
+            inventory_state_counts: audio_alignment_batch_fine_state_counts(&resolution.inventory),
+            refinement_round_count: resolution.refinement_round_count,
+            evaluated_candidate_count: resolution.evaluated_candidate_count,
+            final_state,
+            resolved,
+            selected_total_score_micros: resolved
+                .then_some(resolution.outcome.best_completed.total_score_micros),
+            selected_candidate_ids,
+            best_completed: audio_alignment_batch_fine_assignment_snapshot(
+                &resolution.outcome.best_completed,
+            ),
+            runner_up_completed: resolution
+                .outcome
+                .runner_up_completed
+                .as_ref()
+                .map(audio_alignment_batch_fine_assignment_snapshot),
+            optimistic_omitted: resolution
+                .outcome
+                .optimistic_omitted
+                .as_ref()
+                .map(audio_alignment_batch_fine_omitted_snapshot),
+            // A terminal adapter receipt never publishes speculative scheduler work. The core
+            // computes the batch before deciding that an already-completed assignment proves
+            // resolution, so its internal terminal outcome may still carry now-unneeded IDs.
+            next_refinement_candidate_ids: Vec::new(),
+            deferred_candidate_count: 0,
+            proof: AudioAlignmentBatchFineResolutionProofSnapshot {
+                beats_runner_up_with_margin: resolution.outcome.proof.beats_runner_up_with_margin,
+                beats_optimistic_omitted_with_margin: resolution
+                    .outcome
+                    .proof
+                    .beats_optimistic_omitted_with_margin,
+            },
+            search: AudioAlignmentBatchFineSearchSnapshot {
+                states_visited: resolution.outcome.search.states_visited,
+                expansions_considered: resolution.outcome.search.expansions_considered,
+                interval_comparisons: resolution.outcome.search.interval_comparisons,
+            },
+        },
+    )
+}
+
+fn create_failed_audio_alignment_batch_fine_frontier_receipt(
+    component_ordinal: usize,
+    plan: &PlannedAudioAlignmentBatch,
+    pair_indices: &[usize],
+    inventory: &FineCandidateInventory,
+    inventory_digest: String,
+    config: FineFrontierConfig,
+    progress: V2FineFrontierFailureProgress,
+) -> Result<AudioAlignmentBatchFineFrontierReceiptSnapshot, String> {
+    let component_pair_ordinals = pair_indices
+        .iter()
+        .map(|pair_index| {
+            plan.pairs
+                .get(*pair_index)
+                .map(|pair| pair.pair_ordinal)
+                .ok_or_else(|| "failed fine receipt pair 索引越界。".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    seal_audio_alignment_batch_fine_frontier_receipt(
+        AudioAlignmentBatchFineFrontierReceiptSnapshot {
+            contract_version: FINE_FRONTIER_CONTRACT_VERSION,
+            score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+            inventory_digest,
+            receipt_digest: String::new(),
+            component_ordinal,
+            component_pair_ordinals,
+            inventory_candidate_count: inventory.candidates.len(),
+            resolution_margin_micros: config.resolution_margin_micros,
+            overlap_tolerance_ms: config.overlap_tolerance_ms,
+            limits: audio_alignment_batch_fine_limits_snapshot(config),
+            inventory_state_counts: audio_alignment_batch_fine_state_counts(inventory),
+            refinement_round_count: progress.refinement_round_count,
+            evaluated_candidate_count: progress.evaluated_candidate_count,
+            final_state: AudioAlignmentBatchFineFrontierStateSnapshot::Failed,
+            resolved: false,
+            selected_candidate_ids: Vec::new(),
+            selected_total_score_micros: None,
+            best_completed: AudioAlignmentBatchFineAssignmentSnapshot {
+                candidate_ids: Vec::new(),
+                total_score_micros: 0,
+            },
+            runner_up_completed: None,
+            optimistic_omitted: None,
+            next_refinement_candidate_ids: Vec::new(),
+            deferred_candidate_count: 0,
+            proof: AudioAlignmentBatchFineResolutionProofSnapshot {
+                beats_runner_up_with_margin: false,
+                beats_optimistic_omitted_with_margin: false,
+            },
+            search: AudioAlignmentBatchFineSearchSnapshot {
+                states_visited: progress.search.states_visited,
+                expansions_considered: progress.search.expansions_considered,
+                interval_comparisons: progress.search.interval_comparisons,
+            },
+        },
+    )
+}
+
+fn create_v2_failed_component_inventory_digest(
+    plan: &PlannedAudioAlignmentBatch,
+    coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
+    pair_indices: &[usize],
+) -> Result<String, String> {
+    let entries = pair_indices
+        .iter()
+        .map(|pair_index| {
+            let pair = plan
+                .pairs
+                .get(*pair_index)
+                .ok_or_else(|| "failed component digest pair 索引越界。".to_string())?;
+            let coarse_complete = coarse_by_pair
+                .get(*pair_index)
+                .ok_or_else(|| "failed component digest coarse 索引越界。".to_string())?
+                .is_ok();
+            Ok(serde_json::json!({
+                "pairOrdinal": pair.pair_ordinal,
+                "coarseComplete": coarse_complete,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let canonical = canonicalize_v2_cross_language_json(&serde_json::Value::Array(entries))?;
+    Ok(v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
+        &canonical,
+    ))
+}
+
+fn audio_alignment_batch_spectral_backend_identity(
+    backend: &SpectralBackendExecution,
+) -> AudioAlignmentBatchSpectralBackendIdentitySnapshot {
+    AudioAlignmentBatchSpectralBackendIdentitySnapshot {
+        backend_id: backend.backend_id.clone(),
+        requested_backend: backend.requested_backend.clone(),
+        backend_detail: backend.backend_detail.clone(),
+        fallback_reason: backend.fallback_reason.clone(),
+    }
+}
+
+fn v2_fine_decode_window_snapshot(
+    range: PresentationRangeMs,
+) -> Result<AudioAlignmentBatchFineDecodeWindowSnapshot, String> {
+    if range.end_ms <= range.start_ms {
+        return Err("fine execution decode window 不能为空。".to_string());
+    }
+    let duration_ms = u64::try_from(range.end_ms - range.start_ms)
+        .map_err(|_| "fine execution decode window 时长无法表示。".to_string())?;
+    let expected_sample_count = duration_ms
+        .checked_mul(u64::from(ALIGNMENT_V2_SAMPLE_RATE))
+        .ok_or_else(|| "fine execution expected sample count 溢出。".to_string())?
+        .div_ceil(1_000);
+    Ok(AudioAlignmentBatchFineDecodeWindowSnapshot {
+        start_ms: range.start_ms,
+        end_ms: range.end_ms,
+        presentation_offset_ms: range.start_ms,
+        sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+        expected_sample_count,
+        actual_decoded_sample_count: None,
+    })
+}
+
+fn v2_fine_effective_decode_window_snapshot(
+    requested_range: PresentationRangeMs,
+    presentation_offset_ms: i64,
+    actual_decoded_sample_count: u64,
+) -> Result<AudioAlignmentBatchFineDecodeWindowSnapshot, String> {
+    let mut snapshot = v2_fine_decode_window_snapshot(requested_range)?;
+    let decoded_duration_ms = actual_decoded_sample_count
+        .checked_mul(1_000)
+        .ok_or_else(|| "fine effective decoded duration 溢出。".to_string())?
+        .div_ceil(u64::from(ALIGNMENT_V2_SAMPLE_RATE));
+    let decoded_duration_ms = i64::try_from(decoded_duration_ms)
+        .map_err(|_| "fine effective decoded duration 无法表示。".to_string())?;
+    snapshot.start_ms = presentation_offset_ms;
+    snapshot.end_ms = presentation_offset_ms
+        .checked_add(decoded_duration_ms)
+        .ok_or_else(|| "fine effective decoded end 溢出。".to_string())?;
+    snapshot.presentation_offset_ms = presentation_offset_ms;
+    snapshot.expected_sample_count = u64::try_from(decoded_duration_ms)
+        .map_err(|_| "fine effective rounded duration 不能为负数。".to_string())?
+        .checked_mul(u64::from(ALIGNMENT_V2_SAMPLE_RATE))
+        .ok_or_else(|| "fine effective expected sample count 溢出。".to_string())?
+        .div_ceil(1_000);
+    snapshot.actual_decoded_sample_count = Some(actual_decoded_sample_count);
+    Ok(snapshot)
+}
+
+fn v2_fine_occupancy_digest(occupancy: &PairPhysicalOccupancy) -> Result<String, String> {
+    let value = serde_json::json!({
+        "source": {
+            "spaceOrdinal": occupancy.source.space_ordinal,
+            "intervals": occupancy.source.intervals.iter().map(|interval| {
+                serde_json::json!({"startMs": interval.start_ms, "endMs": interval.end_ms})
+            }).collect::<Vec<_>>()
+        },
+        "target": {
+            "spaceOrdinal": occupancy.target.space_ordinal,
+            "intervals": occupancy.target.intervals.iter().map(|interval| {
+                serde_json::json!({"startMs": interval.start_ms, "endMs": interval.end_ms})
+            }).collect::<Vec<_>>()
+        }
+    });
+    let canonical = canonicalize_v2_cross_language_json(&value)?;
+    Ok(v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_OCCUPANCY_DIGEST_DOMAIN,
+        &canonical,
+    ))
+}
+
+fn v2_fine_time_map_digest(proposal: &AudioAlignmentProposal) -> Result<String, String> {
+    let time_map = proposal
+        .time_map
+        .as_ref()
+        .ok_or_else(|| "fine execution evidence 缺少 proposal TimeMap。".to_string())?;
+    let canonical = canonicalize_v2_cross_language_json(
+        &serde_json::to_value(time_map)
+            .map_err(|_| "fine proposal TimeMap 无法序列化。".to_string())?,
+    )?;
+    Ok(v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN,
+        &canonical,
+    ))
+}
+
+fn v2_fine_parameters_digest(time_map: &AudioAlignmentTimeMapDto) -> Result<String, String> {
+    let value = serde_json::json!({
+        "engineVersion": ALIGNMENT_V2_ENGINE_VERSION,
+        "featureVersion": ALIGNMENT_V2_FEATURE_VERSION,
+        "fineScoreVersion": AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+        "legacyParametersHash": time_map.parameters_hash,
+    });
+    let canonical = canonicalize_v2_cross_language_json(&value)?;
+    Ok(v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN,
+        &canonical,
+    ))
+}
+
+fn seal_audio_alignment_batch_fine_execution_evidence(
+    mut evidence: AudioAlignmentBatchFineExecutionEvidenceSnapshot,
+) -> Result<AudioAlignmentBatchFineExecutionEvidenceSnapshot, String> {
+    evidence.evidence_digest.clear();
+    let canonical = canonicalize_v2_cross_language_json(
+        &serde_json::to_value(&evidence)
+            .map_err(|_| "fine execution evidence 无法序列化。".to_string())?,
+    )?;
+    evidence.evidence_digest = v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN,
+        &canonical,
+    );
+    Ok(evidence)
+}
+
+fn create_audio_alignment_batch_fine_execution_evidence(
+    input: V2FineExecutionEvidenceInput<'_>,
+) -> Result<AudioAlignmentBatchFineExecutionEvidenceSnapshot, String> {
+    let V2FineExecutionEvidenceInput {
+        id,
+        binding,
+        selected_member_index,
+        candidate,
+        source_artifact,
+        target_artifact,
+        runtime,
+        proposal,
+        score,
+        occupancy,
+    } = input;
+    let source_requested_range = runtime
+        .decode_plan
+        .map(|plan| plan.windows.source)
+        .unwrap_or(source_artifact.presentation_bounds);
+    let target_requested_range = runtime
+        .decode_plan
+        .map(|plan| plan.windows.target)
+        .unwrap_or(target_artifact.presentation_bounds);
+    let source_requested_window = v2_fine_decode_window_snapshot(source_requested_range)?;
+    let target_requested_window = v2_fine_decode_window_snapshot(target_requested_range)?;
+    let source_effective_window = v2_fine_effective_decode_window_snapshot(
+        source_requested_range,
+        runtime.source_presentation_offset_ms,
+        runtime.source_decoded_sample_count,
+    )?;
+    let target_effective_window = v2_fine_effective_decode_window_snapshot(
+        target_requested_range,
+        runtime.target_presentation_offset_ms,
+        runtime.target_decoded_sample_count,
+    )?;
+    let time_map = proposal
+        .time_map
+        .as_ref()
+        .ok_or_else(|| "fine execution evidence 缺少 proposal TimeMap。".to_string())?;
+    seal_audio_alignment_batch_fine_execution_evidence(
+        AudioAlignmentBatchFineExecutionEvidenceSnapshot {
+            candidate_id: id.into(),
+            selected_member_rank: selected_member_index + 1,
+            group_member_ranks: binding
+                .member_indices
+                .iter()
+                .map(|index| index + 1)
+                .collect(),
+            source_stream_index: candidate.source_input.stream.stream_index,
+            target_stream_index: candidate.target_input.stream.stream_index,
+            source_coarse_backend: audio_alignment_batch_spectral_backend_identity(
+                &source_artifact.spectral_backend,
+            ),
+            target_coarse_backend: audio_alignment_batch_spectral_backend_identity(
+                &target_artifact.spectral_backend,
+            ),
+            source_fine_backend: audio_alignment_batch_spectral_backend_identity(
+                &runtime.source_fine_backend,
+            ),
+            target_fine_backend: audio_alignment_batch_spectral_backend_identity(
+                &runtime.target_fine_backend,
+            ),
+            source_requested_window,
+            target_requested_window,
+            source_effective_window,
+            target_effective_window,
+            parameters_hash: v2_fine_parameters_digest(time_map)?,
+            occupancy_digest: v2_fine_occupancy_digest(occupancy)?,
+            proposal_time_map_digest: v2_fine_time_map_digest(proposal)?,
+            score_micros: u64::from(score.get()),
+            evidence_digest: String::new(),
+        },
+    )
 }
 
 fn v2_global_candidate_conflicts_with_state(
@@ -8910,10 +10055,20 @@ fn decode_v2_audio(
         let pcm = landmark_artifact.pcm.clone().ok_or_else(|| {
             "blocked:artifact-missing：细特征制品缺少对应的完整 PCM。".to_string()
         })?;
+        // Short-media preparation computes coarse landmarks and fine features in one physical
+        // extraction. The fine execution receipt still uses the same canonical lock identity as
+        // separately materialized fine windows, so evidence is independent of this cache shape.
+        let fine_backend_request =
+            lock_fine_spectral_backend_request(&landmark_artifact.spectral_backend)?;
         return Ok(DecodedV2Audio {
             pcm,
             fine_features,
-            fine_spectral_backend: landmark_artifact.spectral_backend.clone(),
+            fine_spectral_backend: SpectralBackendExecution {
+                backend_id: fine_backend_request.planned_backend_id,
+                requested_backend: fine_backend_request.requested_backend,
+                backend_detail: fine_backend_request.backend_detail,
+                fallback_reason: fine_backend_request.fallback_reason,
+            },
             presentation_offset_ms: landmark_artifact.presentation_bounds.start_ms,
         });
     }
@@ -12753,6 +13908,8 @@ fn insert_audio_alignment_batch_job(
             message: "等待执行。".to_string(),
             relation_ranking: AudioAlignmentBatchRelationRankingSnapshot::pending(),
             global_selection: AudioAlignmentBatchGlobalSelectionSnapshot::pending(),
+            fine_frontier: None,
+            fine_execution_evidence: None,
             proposal: None,
             error: None,
         })
@@ -13055,34 +14212,40 @@ fn score_prepared_audio_alignment_batch_pair_coarse(
 }
 
 fn align_prepared_audio_alignment_batch_pair<F>(
+    context: &V2FineEvaluationContext<'_>,
     pair: &PlannedAudioAlignmentBatchPair,
-    prepared: &[PreparedAudioAlignmentBatchMediaState],
-    options: &AudioAlignmentOptions,
-    batch_retained_artifact_bytes: usize,
     selected_coarse: PreparedV2SelectedCandidate,
+    fine_execution_capture: Option<Arc<Mutex<Option<V2FineExecutionRuntimeCapture>>>>,
     update_progress: &mut F,
-    cancel_flag: &AtomicBool,
 ) -> Result<AudioAlignmentProposal, String>
 where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
-    check_cancelled(Some(cancel_flag))?;
+    check_cancelled(Some(context.cancel_flag))?;
     ensure_alignment_process_supervision_clean()?;
-    let source =
-        prepared_audio_alignment_batch_media(prepared, pair.source_media_index, "B 站参考")?;
-    let target =
-        prepared_audio_alignment_batch_media(prepared, pair.target_media_index, "目标原片")?;
+    let source = prepared_audio_alignment_batch_media(
+        context.prepared,
+        pair.source_media_index,
+        "B 站参考",
+    )?;
+    let target = prepared_audio_alignment_batch_media(
+        context.prepared,
+        pair.target_media_index,
+        "目标原片",
+    )?;
     let stable_request = create_prepared_audio_alignment_batch_pair_request(pair, source, target);
     let result = align_audio_files_v2_with_progress(
         &stable_request,
-        options,
+        context.options,
         update_progress,
-        Some(cancel_flag),
+        Some(context.cancel_flag),
         Some(PreparedV2PairEvidence {
             source: source.evidence.clone(),
             target: target.evidence.clone(),
-            batch_retained_artifact_bytes,
+            batch_retained_artifact_bytes: context.batch_retained_artifact_bytes,
             selected_coarse,
+            fine_frontier_evaluation: true,
+            fine_execution_capture,
         }),
     );
     ensure_alignment_process_supervision_clean()?;
@@ -13090,13 +14253,13 @@ where
         verify_media_content_identity_after_tool_output(
             &source.path,
             Some(&source.expected_identity),
-            Some(cancel_flag),
+            Some(context.cancel_flag),
             "批次 pair 结果最终复核",
         )?;
         verify_media_content_identity_after_tool_output(
             &target.path,
             Some(&target.expected_identity),
-            Some(cancel_flag),
+            Some(context.cancel_flag),
             "批次 pair 结果最终复核",
         )?;
         verify_proposal_time_map_identities_match_run(
@@ -13106,6 +14269,818 @@ where
         )?;
     }
     result
+}
+
+fn v2_fine_proposal_has_diagnostic_prefix(proposal: &AudioAlignmentProposal, prefix: &str) -> bool {
+    proposal
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.starts_with(prefix))
+}
+
+fn evaluate_v2_fine_frontier_member<F>(
+    context: &V2FineEvaluationContext<'_>,
+    pair: &PlannedAudioAlignmentBatchPair,
+    coarse: &V2PairCoarseCandidates,
+    binding: &V2FineFrontierGroupBinding,
+    member_index: usize,
+    coarse_upper_bound: ScoreMicros,
+    update_progress: &mut F,
+) -> Result<V2FineMemberEvaluation, String>
+where
+    F: FnMut(f64, &str) -> Result<(), String>,
+{
+    check_cancelled(Some(context.cancel_flag))?;
+    let candidate = coarse
+        .candidates
+        .get(member_index)
+        .ok_or_else(|| "fine frontier raw member 索引越界。".to_string())?;
+    if !v2_relation_candidate_is_intrinsically_eligible(candidate) {
+        return Ok(V2FineMemberEvaluation {
+            state: FineEvaluationState::EvaluatedIneligible,
+            score: None,
+            occupancy: None,
+            execution_evidence: None,
+            proposal: None,
+        });
+    }
+    let source = prepared_audio_alignment_batch_media(
+        context.prepared,
+        pair.source_media_index,
+        "B 站参考",
+    )?;
+    let target = prepared_audio_alignment_batch_media(
+        context.prepared,
+        pair.target_media_index,
+        "目标原片",
+    )?;
+    let source_artifact = source
+        .evidence
+        .landmarks
+        .get(&candidate.source_input.stream.stream_index)
+        .ok_or_else(|| {
+            "blocked:artifact-missing：fine source landmark artifact 已丢失。".to_string()
+        })?;
+    let target_artifact = target
+        .evidence
+        .landmarks
+        .get(&candidate.target_input.stream.stream_index)
+        .ok_or_else(|| {
+            "blocked:artifact-missing：fine target landmark artifact 已丢失。".to_string()
+        })?;
+    let capture = Arc::new(Mutex::new(None::<V2FineExecutionRuntimeCapture>));
+    let selected_coarse = PreparedV2SelectedCandidate {
+        candidate: candidate.clone(),
+        alternatives: coarse.alternatives.clone(),
+        global_margin: 1.0,
+        global_diagnostic: format!(
+            "fine frontier {:?} 正在执行 raw member rank {}；第一次 coarse shortlist 仅保留为诊断。",
+            binding.id,
+            member_index + 1
+        ),
+    };
+    let result = align_prepared_audio_alignment_batch_pair(
+        context,
+        pair,
+        selected_coarse,
+        Some(Arc::clone(&capture)),
+        update_progress,
+    );
+    let proposal = match result {
+        Ok(proposal) => proposal,
+        Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => return Err(error),
+        Err(error)
+            if process_supervision_cleanup_faulted()
+                || error.starts_with("blocked:process-cleanup")
+                || is_media_identity_guard_error(&error) =>
+        {
+            return Err(error)
+        }
+        Err(error) if error.starts_with("blocked:resource-limit") => {
+            return Ok(V2FineMemberEvaluation {
+                state: FineEvaluationState::ResourceBlocked,
+                score: None,
+                occupancy: None,
+                execution_evidence: None,
+                proposal: None,
+            })
+        }
+        Err(_) => {
+            return Ok(V2FineMemberEvaluation {
+                state: FineEvaluationState::InfrastructureFailed,
+                score: None,
+                occupancy: None,
+                execution_evidence: None,
+                proposal: None,
+            })
+        }
+    };
+    if v2_fine_proposal_has_diagnostic_prefix(&proposal, "blocked:resource-limit") {
+        return Ok(V2FineMemberEvaluation {
+            state: FineEvaluationState::ResourceBlocked,
+            score: None,
+            occupancy: None,
+            execution_evidence: None,
+            proposal: None,
+        });
+    }
+    if v2_fine_proposal_has_diagnostic_prefix(&proposal, "blocked:artifact-missing") {
+        return Ok(V2FineMemberEvaluation {
+            state: FineEvaluationState::InfrastructureFailed,
+            score: None,
+            occupancy: None,
+            execution_evidence: None,
+            proposal: None,
+        });
+    }
+    let runtime = capture
+        .lock()
+        .map_err(|_| "fine execution runtime capture 锁已损坏。".to_string())?
+        .clone();
+    let Some(runtime) = runtime else {
+        return Ok(V2FineMemberEvaluation {
+            state: FineEvaluationState::EvidenceBlocked,
+            score: None,
+            occupancy: None,
+            execution_evidence: None,
+            proposal: None,
+        });
+    };
+    if proposal.time_map.is_none() {
+        return Ok(V2FineMemberEvaluation {
+            state: FineEvaluationState::EvidenceBlocked,
+            score: None,
+            occupancy: None,
+            execution_evidence: None,
+            proposal: None,
+        });
+    }
+    if proposal.confidence.is_finite() && proposal.confidence <= 0.0 {
+        return Ok(V2FineMemberEvaluation {
+            state: FineEvaluationState::EvaluatedIneligible,
+            score: None,
+            occupancy: None,
+            execution_evidence: None,
+            proposal: None,
+        });
+    }
+    let score = match v2_fine_score_from_proposal(coarse_upper_bound, &proposal) {
+        Ok(score) => score,
+        Err(_) => {
+            return Ok(V2FineMemberEvaluation {
+                state: FineEvaluationState::EvidenceBlocked,
+                score: None,
+                occupancy: None,
+                execution_evidence: None,
+                proposal: None,
+            })
+        }
+    };
+    let occupancy = match v2_fine_physical_occupancy_from_proposal(pair, &proposal) {
+        Ok(occupancy) => occupancy,
+        Err(_) => {
+            return Ok(V2FineMemberEvaluation {
+                state: FineEvaluationState::EvidenceBlocked,
+                score: None,
+                occupancy: None,
+                execution_evidence: None,
+                proposal: None,
+            })
+        }
+    };
+    let execution_evidence =
+        create_audio_alignment_batch_fine_execution_evidence(V2FineExecutionEvidenceInput {
+            id: binding.id,
+            binding,
+            selected_member_index: member_index,
+            candidate,
+            source_artifact,
+            target_artifact,
+            runtime: &runtime,
+            proposal: &proposal,
+            score,
+            occupancy: &occupancy,
+        })?;
+    Ok(V2FineMemberEvaluation {
+        state: FineEvaluationState::Scored { score },
+        score: Some(score),
+        occupancy: Some(occupancy),
+        execution_evidence: Some(execution_evidence),
+        proposal: Some(proposal),
+    })
+}
+
+fn v2_fine_group_blocked_state(
+    current: Option<FineEvaluationState>,
+    next: FineEvaluationState,
+) -> Option<FineEvaluationState> {
+    let priority = |state: FineEvaluationState| match state {
+        FineEvaluationState::ResourceBlocked => 3,
+        FineEvaluationState::InfrastructureFailed => 2,
+        FineEvaluationState::EvidenceBlocked => 1,
+        _ => 0,
+    };
+    if priority(next) == 0 {
+        current
+    } else if current.is_none_or(|current| priority(next) > priority(current)) {
+        Some(next)
+    } else {
+        current
+    }
+}
+
+fn evaluate_v2_fine_frontier_group<F>(
+    context: &V2FineEvaluationContext<'_>,
+    binding: &V2FineFrontierGroupBinding,
+    remaining_component_member_executions: usize,
+    update_progress: &mut F,
+) -> Result<V2FineGroupEvaluationOutcome, String>
+where
+    F: FnMut(f64, &str) -> Result<(), String>,
+{
+    let pair = context
+        .plan
+        .pairs
+        .get(binding.pair_index)
+        .ok_or_else(|| "fine frontier group pair 索引越界。".to_string())?;
+    let coarse = context
+        .coarse_by_pair
+        .get(binding.pair_index)
+        .ok_or_else(|| "fine frontier group coarse 索引越界。".to_string())?
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let eligible_member_indices = binding
+        .member_indices
+        .iter()
+        .copied()
+        .map(|member_index| {
+            let candidate = coarse
+                .candidates
+                .get(member_index)
+                .ok_or_else(|| "fine frontier raw member 索引越界。".to_string())?;
+            Ok(v2_relation_candidate_is_intrinsically_eligible(candidate).then_some(member_index))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if eligible_member_indices.is_empty() {
+        return Ok(V2FineGroupEvaluationOutcome {
+            state: FineEvaluationState::EvaluatedIneligible,
+            record: None,
+            member_execution_count: 0,
+        });
+    }
+    let allowed_member_executions = remaining_component_member_executions
+        .min(AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MAX_GROUP_MEMBER_EXECUTIONS);
+    if eligible_member_indices.len() > allowed_member_executions {
+        // A temporal group is one candidate in the outer frontier, but it may aggregate many raw
+        // track/affine members. Refuse the whole group before its first fine decode so a co-located
+        // group cannot bypass either the per-group or component execution budget.
+        return Ok(V2FineGroupEvaluationOutcome {
+            state: FineEvaluationState::ResourceBlocked,
+            record: None,
+            member_execution_count: 0,
+        });
+    }
+    let mut blocked_state = None;
+    let mut best = None::<(usize, V2FineMemberEvaluation)>;
+    let mut member_execution_count = 0_usize;
+    for member_index in eligible_member_indices {
+        check_cancelled(Some(context.cancel_flag))?;
+        member_execution_count = member_execution_count
+            .checked_add(1)
+            .ok_or_else(|| "fine frontier member execution count 溢出。".to_string())?;
+        let evaluated = evaluate_v2_fine_frontier_member(
+            context,
+            pair,
+            coarse,
+            binding,
+            member_index,
+            v2_fine_coarse_upper_bound(
+                coarse
+                    .candidates
+                    .get(member_index)
+                    .ok_or_else(|| "fine frontier raw member 索引越界。".to_string())?,
+            )?,
+            update_progress,
+        )?;
+        blocked_state = v2_fine_group_blocked_state(blocked_state, evaluated.state);
+        if matches!(evaluated.state, FineEvaluationState::Scored { .. }) {
+            let replace = best.as_ref().is_none_or(|(best_index, best)| {
+                evaluated.score > best.score
+                    || evaluated.score == best.score && member_index < *best_index
+            });
+            if replace {
+                best = Some((member_index, evaluated));
+            }
+        }
+    }
+    if let Some(blocked_state) = blocked_state {
+        return Ok(V2FineGroupEvaluationOutcome {
+            state: blocked_state,
+            record: None,
+            member_execution_count,
+        });
+    }
+    let Some((_selected_member_index, mut best)) = best else {
+        return Ok(V2FineGroupEvaluationOutcome {
+            state: FineEvaluationState::EvaluatedIneligible,
+            record: None,
+            member_execution_count,
+        });
+    };
+    let score = best
+        .score
+        .ok_or_else(|| "Scored fine member 缺少 score。".to_string())?;
+    let occupancy = best
+        .occupancy
+        .ok_or_else(|| "Scored fine member 缺少 occupancy。".to_string())?;
+    let execution_evidence = best
+        .execution_evidence
+        .ok_or_else(|| "Scored fine member 缺少 execution evidence。".to_string())?;
+    let proposal = best
+        .proposal
+        .take()
+        .ok_or_else(|| "Scored fine member 缺少 proposal。".to_string())?;
+    Ok(V2FineGroupEvaluationOutcome {
+        state: FineEvaluationState::Scored { score },
+        record: Some(V2FineGroupEvaluationRecord {
+            score,
+            occupancy,
+            execution_evidence,
+            proposal: Box::new(proposal),
+        }),
+        member_execution_count,
+    })
+}
+
+fn map_v2_fine_frontier_error(error: FineFrontierError) -> String {
+    match error {
+        FineFrontierError::Cancelled => AUDIO_ALIGNMENT_CANCELLED.to_string(),
+        error => {
+            format!("blocked:resource-limit：fine frontier exact assignment fail-closed：{error:?}")
+        }
+    }
+}
+
+fn zero_v2_fine_search_stats() -> ExactSearchStats {
+    ExactSearchStats {
+        states_visited: 0,
+        expansions_considered: 0,
+        interval_comparisons: 0,
+    }
+}
+
+fn accumulate_v2_fine_search_stats(
+    total: &mut ExactSearchStats,
+    delta: ExactSearchStats,
+    config: FineFrontierConfig,
+) -> Result<(), String> {
+    total.states_visited = total
+        .states_visited
+        .checked_add(delta.states_visited)
+        .filter(|value| *value <= config.limits.max_search_states)
+        .ok_or_else(|| {
+            "blocked:resource-limit：fine frontier component 累计 search states 超限。".to_string()
+        })?;
+    total.expansions_considered = total
+        .expansions_considered
+        .checked_add(delta.expansions_considered)
+        .filter(|value| *value <= config.limits.max_search_expansions)
+        .ok_or_else(|| {
+            "blocked:resource-limit：fine frontier component 累计 search expansions 超限。"
+                .to_string()
+        })?;
+    total.interval_comparisons = total
+        .interval_comparisons
+        .checked_add(delta.interval_comparisons)
+        .filter(|value| *value <= config.limits.max_interval_comparisons)
+        .ok_or_else(|| {
+            "blocked:resource-limit：fine frontier component 累计 interval comparisons 超限。"
+                .to_string()
+        })?;
+    Ok(())
+}
+
+fn remaining_v2_fine_search_config(
+    config: FineFrontierConfig,
+    total: ExactSearchStats,
+) -> Result<FineFrontierConfig, String> {
+    let mut remaining = config;
+    remaining.limits.max_search_states = config
+        .limits
+        .max_search_states
+        .checked_sub(total.states_visited)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "blocked:resource-limit：fine frontier component 已耗尽累计 search states。".to_string()
+        })?;
+    remaining.limits.max_search_expansions = config
+        .limits
+        .max_search_expansions
+        .checked_sub(total.expansions_considered)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "blocked:resource-limit：fine frontier component 已耗尽累计 search expansions。"
+                .to_string()
+        })?;
+    remaining.limits.max_interval_comparisons = config
+        .limits
+        .max_interval_comparisons
+        .checked_sub(total.interval_comparisons)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "blocked:resource-limit：fine frontier component 已耗尽累计 interval comparisons。"
+                .to_string()
+        })?;
+    Ok(remaining)
+}
+
+fn create_v2_fine_component_failure(
+    error: String,
+    inventory: &FineCandidateInventory,
+    refinement_round_count: usize,
+    evaluated_candidate_count: usize,
+    search: ExactSearchStats,
+) -> V2FineComponentFailure {
+    V2FineComponentFailure {
+        error,
+        inventory: inventory.clone(),
+        progress: V2FineFrontierFailureProgress {
+            refinement_round_count,
+            evaluated_candidate_count,
+            search,
+        },
+    }
+}
+
+fn resolve_v2_fine_frontier_component_with<E>(
+    pair_indices: Vec<usize>,
+    mut inventory: FineCandidateInventory,
+    inventory_digest: String,
+    limits: V2FineComponentExecutionLimits,
+    bindings: &[V2FineFrontierGroupBinding],
+    cancel_flag: Option<&AtomicBool>,
+    mut evaluate_group: E,
+) -> Result<V2FineComponentResolution, V2FineComponentFailure>
+where
+    E: FnMut(
+        &V2FineFrontierGroupBinding,
+        ScoreMicros,
+        usize,
+    ) -> Result<V2FineGroupEvaluationOutcome, String>,
+{
+    let config = limits.frontier;
+    let budget = limits.component;
+    let started_at = Instant::now();
+    let mut refinement_round_count = 0_usize;
+    let mut evaluated_candidate_count = 0_usize;
+    let mut member_execution_count = 0_usize;
+    let mut cumulative_search = zero_v2_fine_search_stats();
+    let mut records = HashMap::<FineCandidateId, V2FineGroupEvaluationRecord>::new();
+    let mut candidate_index_by_id = HashMap::<FineCandidateId, usize>::new();
+    for (index, candidate) in inventory.candidates.iter().enumerate() {
+        if candidate_index_by_id.insert(candidate.id, index).is_some() {
+            return Err(create_v2_fine_component_failure(
+                "fine frontier inventory 含重复 candidate ID。".to_string(),
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+    }
+    let mut binding_index_by_id = HashMap::<FineCandidateId, usize>::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        if binding_index_by_id.insert(binding.id, index).is_some() {
+            return Err(create_v2_fine_component_failure(
+                "fine frontier group bindings 含重复 candidate ID。".to_string(),
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+    }
+    if candidate_index_by_id.len() != binding_index_by_id.len()
+        || candidate_index_by_id
+            .keys()
+            .any(|id| !binding_index_by_id.contains_key(id))
+    {
+        return Err(create_v2_fine_component_failure(
+            "fine frontier inventory 与 group bindings 不闭合。".to_string(),
+            &inventory,
+            refinement_round_count,
+            evaluated_candidate_count,
+            cumulative_search,
+        ));
+    }
+    let max_refinement_rounds = budget.max_refinement_rounds.min(inventory.candidates.len());
+    let max_member_executions = budget
+        .max_member_executions
+        .min(config.limits.max_candidates);
+    loop {
+        if let Err(error) = check_cancelled(cancel_flag) {
+            return Err(create_v2_fine_component_failure(
+                error,
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+        if started_at.elapsed() >= budget.max_elapsed {
+            return Err(create_v2_fine_component_failure(
+                "blocked:resource-limit：fine frontier component 已超过累计 wall-time 预算。"
+                    .to_string(),
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+        let round_config = match remaining_v2_fine_search_config(config, cumulative_search) {
+            Ok(config) => config,
+            Err(error) => {
+                return Err(create_v2_fine_component_failure(
+                    error,
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ))
+            }
+        };
+        let mut outcome =
+            match analyze_fine_frontier_with_cancel(&inventory, round_config, cancel_flag) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if let FineFrontierError::SearchLimitExceeded { search, .. } = &error {
+                        if let Err(accumulation_error) =
+                            accumulate_v2_fine_search_stats(&mut cumulative_search, *search, config)
+                        {
+                            return Err(create_v2_fine_component_failure(
+                                accumulation_error,
+                                &inventory,
+                                refinement_round_count,
+                                evaluated_candidate_count,
+                                cumulative_search,
+                            ));
+                        }
+                    }
+                    return Err(create_v2_fine_component_failure(
+                        map_v2_fine_frontier_error(error),
+                        &inventory,
+                        refinement_round_count,
+                        evaluated_candidate_count,
+                        cumulative_search,
+                    ));
+                }
+            };
+        if let Err(error) =
+            accumulate_v2_fine_search_stats(&mut cumulative_search, outcome.search, config)
+        {
+            return Err(create_v2_fine_component_failure(
+                error,
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+        outcome.search = cumulative_search;
+        if outcome.state != CoreFineFrontierState::Pending {
+            return Ok(V2FineComponentResolution {
+                pair_indices,
+                inventory,
+                inventory_digest,
+                config,
+                outcome,
+                refinement_round_count,
+                evaluated_candidate_count,
+                records,
+            });
+        }
+        if outcome.next_refinement.candidate_ids.is_empty() {
+            return Err(create_v2_fine_component_failure(
+                "fine frontier Pending 状态缺少 next refinement。".to_string(),
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+        if refinement_round_count >= max_refinement_rounds {
+            return Err(create_v2_fine_component_failure(
+                "blocked:resource-limit：fine frontier component 已耗尽累计 refinement rounds。"
+                    .to_string(),
+                &inventory,
+                refinement_round_count,
+                evaluated_candidate_count,
+                cumulative_search,
+            ));
+        }
+        refinement_round_count += 1;
+        for id in &outcome.next_refinement.candidate_ids {
+            if let Err(error) = check_cancelled(cancel_flag) {
+                return Err(create_v2_fine_component_failure(
+                    error,
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            let Some(candidate_index) = candidate_index_by_id.get(id).copied() else {
+                return Err(create_v2_fine_component_failure(
+                    "fine frontier refinement candidate 不在完整 inventory 中。".to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            };
+            if inventory.candidates[candidate_index].state != FineEvaluationState::Unresolved {
+                return Err(create_v2_fine_component_failure(
+                    "fine frontier 重复调度非 Unresolved candidate。".to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            let Some(binding) = binding_index_by_id
+                .get(id)
+                .and_then(|index| bindings.get(*index))
+            else {
+                return Err(create_v2_fine_component_failure(
+                    "fine frontier refinement candidate 缺少 group binding。".to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            };
+            let Some(remaining_member_executions) =
+                max_member_executions.checked_sub(member_execution_count)
+            else {
+                return Err(create_v2_fine_component_failure(
+                    "blocked:resource-limit：fine frontier component member execution 计数无效。"
+                        .to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            };
+            if remaining_member_executions == 0 {
+                return Err(create_v2_fine_component_failure(
+                    "blocked:resource-limit：fine frontier component 已耗尽累计 fine member executions。"
+                        .to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            let coarse_upper_bound = inventory.candidates[candidate_index].coarse_upper_bound;
+            let evaluation =
+                match evaluate_group(binding, coarse_upper_bound, remaining_member_executions) {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        return Err(create_v2_fine_component_failure(
+                            error,
+                            &inventory,
+                            refinement_round_count,
+                            evaluated_candidate_count,
+                            cumulative_search,
+                        ))
+                    }
+                };
+            if evaluation.member_execution_count > remaining_member_executions {
+                return Err(create_v2_fine_component_failure(
+                    "blocked:resource-limit：fine group 超报 component member execution budget。"
+                        .to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            member_execution_count = member_execution_count
+                .checked_add(evaluation.member_execution_count)
+                .expect("remaining member execution budget already proved checked addition");
+            let state = evaluation.state;
+            let record = evaluation.record;
+            if matches!(
+                state,
+                FineEvaluationState::Unresolved | FineEvaluationState::Cancelled
+            ) {
+                return Err(create_v2_fine_component_failure(
+                    "fine frontier evaluator 返回了非终态 candidate。".to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            match state {
+                FineEvaluationState::Scored { score } => {
+                    let Some(record) = record else {
+                        return Err(create_v2_fine_component_failure(
+                            "Scored fine group 缺少 compact record。".to_string(),
+                            &inventory,
+                            refinement_round_count,
+                            evaluated_candidate_count,
+                            cumulative_search,
+                        ));
+                    };
+                    if record.score != score || score > coarse_upper_bound {
+                        return Err(create_v2_fine_component_failure(
+                            "fine group compact score 与 inventory 状态不一致。".to_string(),
+                            &inventory,
+                            refinement_round_count,
+                            evaluated_candidate_count,
+                            cumulative_search,
+                        ));
+                    }
+                    inventory.candidates[candidate_index].physical_occupancy =
+                        Some(record.occupancy.clone());
+                    records.insert(*id, record);
+                }
+                _ => {
+                    if record.is_some() {
+                        return Err(create_v2_fine_component_failure(
+                            "非 Scored fine group 不得保留 compact proposal record。".to_string(),
+                            &inventory,
+                            refinement_round_count,
+                            evaluated_candidate_count,
+                            cumulative_search,
+                        ));
+                    }
+                    inventory.candidates[candidate_index].physical_occupancy = None;
+                }
+            }
+            inventory.candidates[candidate_index].state = state;
+            evaluated_candidate_count = evaluated_candidate_count
+                .checked_add(1)
+                .expect("evaluated candidates cannot exceed the admitted inventory");
+            let blocked_error = match state {
+                FineEvaluationState::ResourceBlocked => Some(
+                    "blocked:resource-limit：fine frontier group 在累计或单组 fine member budget 内无法完整执行。",
+                ),
+                FineEvaluationState::InfrastructureFailed => Some(
+                    "blocked:infrastructure-failed：fine frontier group 的执行基础设施失败。",
+                ),
+                _ => None,
+            };
+            if let Some(error) = blocked_error {
+                return Err(create_v2_fine_component_failure(
+                    error.to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            if started_at.elapsed() >= budget.max_elapsed {
+                return Err(create_v2_fine_component_failure(
+                    "blocked:resource-limit：fine frontier component 已超过累计 wall-time 预算。"
+                        .to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+        }
+    }
+}
+
+fn create_v2_fine_frontier_blocked_proposal(
+    coarse: &Result<V2PairCoarseCandidates, String>,
+    reason: &str,
+) -> AudioAlignmentProposal {
+    match coarse {
+        Ok(coarse) => create_blocked_v2_proposal(
+            reason,
+            coarse
+                .candidates
+                .first()
+                .map(|candidate| &candidate.source_input),
+            coarse
+                .candidates
+                .first()
+                .map(|candidate| &candidate.target_input),
+            Some(0.0),
+            coarse.alternatives.clone(),
+            coarse.diagnostics.clone(),
+        ),
+        Err(error) => {
+            create_blocked_v2_proposal(reason, None, None, None, Vec::new(), vec![error.clone()])
+        }
+    }
 }
 
 fn create_prepared_audio_alignment_batch_pair_request(
@@ -13121,6 +15096,7 @@ fn create_prepared_audio_alignment_batch_pair_request(
     request
 }
 
+#[cfg(test)]
 fn create_v2_global_shortlist_blocked_proposal(
     decision: V2GlobalShortlistDecision,
 ) -> Result<AudioAlignmentProposal, String> {
@@ -13155,6 +15131,7 @@ fn create_v2_global_shortlist_blocked_proposal(
     }
 }
 
+#[cfg(test)]
 fn execute_v2_global_shortlist_decision<F>(
     decision: V2GlobalShortlistDecision,
     execute_selected: F,
@@ -13210,6 +15187,220 @@ fn verify_prepared_audio_alignment_batch_media(
         )?;
     }
     ensure_alignment_process_supervision_clean()
+}
+
+fn execute_v2_fine_frontier_batch(
+    job_id: &str,
+    plan: &PlannedAudioAlignmentBatch,
+    coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
+    prepared: &[PreparedAudioAlignmentBatchMediaState],
+    options: &AudioAlignmentOptions,
+    batch_fine_active_baseline_bytes: usize,
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<StagedAudioAlignmentBatchPairResult>, String> {
+    let components = v2_fine_pair_components(plan);
+    let evaluation_context = V2FineEvaluationContext {
+        plan,
+        coarse_by_pair,
+        prepared,
+        options,
+        batch_retained_artifact_bytes: batch_fine_active_baseline_bytes,
+        cancel_flag,
+    };
+    let mut staged = Vec::<StagedAudioAlignmentBatchPairResult>::with_capacity(plan.pairs.len());
+    for (component_index, pair_indices) in components.into_iter().enumerate() {
+        check_cancelled(Some(cancel_flag))?;
+        let component_ordinal = component_index + 1;
+        if pair_indices
+            .iter()
+            .any(|pair_index| coarse_by_pair.get(*pair_index).is_none_or(Result::is_err))
+        {
+            let inventory = FineCandidateInventory::default();
+            let config = FineFrontierConfig {
+                resolution_margin_micros:
+                    AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS,
+                overlap_tolerance_ms: u64::try_from(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+                    .map_err(|_| "fine frontier overlap tolerance 不能为负数。".to_string())?,
+                ..FineFrontierConfig::default()
+            };
+            let receipt = create_failed_audio_alignment_batch_fine_frontier_receipt(
+                component_ordinal,
+                plan,
+                &pair_indices,
+                &inventory,
+                create_v2_failed_component_inventory_digest(plan, coarse_by_pair, &pair_indices)?,
+                config,
+                V2FineFrontierFailureProgress {
+                    refinement_round_count: 0,
+                    evaluated_candidate_count: 0,
+                    search: zero_v2_fine_search_stats(),
+                },
+            )?;
+            for pair_index in pair_indices {
+                let pair = plan
+                    .pairs
+                    .get(pair_index)
+                    .ok_or_else(|| "failed fine component pair 索引越界。".to_string())?;
+                let error = match coarse_by_pair
+                    .get(pair_index)
+                    .ok_or_else(|| "failed fine component coarse 索引越界。".to_string())?
+                {
+                    Err(error) => error.clone(),
+                    Ok(_) => "同一 physical-media component 内存在未完成 coarse scoring 的 pair；fine frontier 未发布局部 assignment。".to_string(),
+                };
+                staged.push(StagedAudioAlignmentBatchPairResult {
+                    pair_index,
+                    relation_ranking: pair.relation_ranking.clone(),
+                    global_selection: pair.global_selection.clone().mark_failed(),
+                    fine_frontier: Some(receipt.clone()),
+                    fine_execution_evidence: None,
+                    outcome: StagedAudioAlignmentBatchPairOutcome::Failed(error),
+                });
+            }
+            continue;
+        }
+
+        let (inventory, bindings, inventory_digest, config) =
+            create_v2_fine_frontier_inventory(plan, coarse_by_pair, &pair_indices)?;
+        let failure_inventory_digest = inventory_digest.clone();
+        let resolution = resolve_v2_fine_frontier_component_with(
+            pair_indices.clone(),
+            inventory,
+            inventory_digest,
+            V2FineComponentExecutionLimits {
+                frontier: config,
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            Some(cancel_flag),
+            |binding, _coarse_upper_bound, remaining_member_executions| {
+                let mut update = |progress: f64, message: &str| {
+                    if cancel_flag.load(Ordering::Acquire) {
+                        return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
+                    }
+                    update_audio_alignment_batch_pair_progress(
+                        job_id,
+                        binding.pair_index,
+                        progress,
+                        message,
+                    )
+                };
+                evaluate_v2_fine_frontier_group(
+                    &evaluation_context,
+                    binding,
+                    remaining_member_executions,
+                    &mut update,
+                )
+            },
+        );
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            Err(failure) if failure.error == AUDIO_ALIGNMENT_CANCELLED => return Err(failure.error),
+            Err(failure)
+                if process_supervision_cleanup_faulted()
+                    || failure.error.starts_with("blocked:process-cleanup")
+                    || is_media_identity_guard_error(&failure.error) =>
+            {
+                return Err(failure.error)
+            }
+            Err(failure) => {
+                let error = failure.error;
+                let receipt = create_failed_audio_alignment_batch_fine_frontier_receipt(
+                    component_ordinal,
+                    plan,
+                    &pair_indices,
+                    &failure.inventory,
+                    failure_inventory_digest,
+                    config,
+                    failure.progress,
+                )?;
+                for pair_index in pair_indices {
+                    let pair = &plan.pairs[pair_index];
+                    staged.push(StagedAudioAlignmentBatchPairResult {
+                        pair_index,
+                        relation_ranking: pair.relation_ranking.clone(),
+                        global_selection: pair.global_selection.clone().mark_failed(),
+                        fine_frontier: Some(receipt.clone()),
+                        fine_execution_evidence: None,
+                        outcome: StagedAudioAlignmentBatchPairOutcome::Failed(format!(
+                            "fine frontier fail-closed：{error}"
+                        )),
+                    });
+                }
+                continue;
+            }
+        };
+        let receipt = create_audio_alignment_batch_fine_frontier_receipt(
+            component_ordinal,
+            plan,
+            &resolution,
+        )?;
+        let resolved = resolution.outcome.state == CoreFineFrontierState::Resolved;
+        for pair_index in &resolution.pair_indices {
+            let pair = plan
+                .pairs
+                .get(*pair_index)
+                .ok_or_else(|| "fine resolution pair 索引越界。".to_string())?;
+            let pair_ordinal = u32::try_from(pair.pair_ordinal)
+                .map_err(|_| "fine resolution pair ordinal 无法表示为 u32。".to_string())?;
+            let selected_id = if resolved {
+                resolution
+                    .outcome
+                    .best_completed
+                    .candidate_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| id.pair_ordinal == pair_ordinal)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if selected_id.len() > 1 {
+                return Err("fine second assignment 为同一 pair 选择了多个 relation。".to_string());
+            }
+            let (fine_execution_evidence, outcome) = if let Some(selected_id) = selected_id.first()
+            {
+                let expected = resolution
+                    .records
+                    .get(selected_id)
+                    .ok_or_else(|| "fine selected assignment 缺少 compact record。".to_string())?;
+                (
+                    Some(expected.execution_evidence.clone()),
+                    StagedAudioAlignmentBatchPairOutcome::Proposal(expected.proposal.clone()),
+                )
+            } else {
+                let reason = match resolution.outcome.state {
+                    CoreFineFrontierState::Resolved =>
+                        "fine frontier 已完成第二次 exact assignment；当前 pair 因全局物理占用冲突未被选择。",
+                    CoreFineFrontierState::NoEligibleCandidate =>
+                        "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
+                    CoreFineFrontierState::Unresolved | CoreFineFrontierState::Pending =>
+                        "fine frontier 仍有保留 coarse upper bound 的阻断候选；未发布局部可确认结果。",
+                };
+                (
+                    None,
+                    StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(
+                        create_v2_fine_frontier_blocked_proposal(
+                            &coarse_by_pair[*pair_index],
+                            reason,
+                        ),
+                    )),
+                )
+            };
+            staged.push(StagedAudioAlignmentBatchPairResult {
+                pair_index: *pair_index,
+                relation_ranking: pair.relation_ranking.clone(),
+                global_selection: pair.global_selection.clone(),
+                fine_frontier: Some(receipt.clone()),
+                fine_execution_evidence,
+                outcome,
+            });
+        }
+    }
+    if staged.len() != plan.pairs.len() {
+        return Err("fine frontier staged pair 数量与计划不一致。".to_string());
+    }
+    Ok(staged)
 }
 
 fn run_audio_alignment_batch_job(
@@ -13431,9 +15622,16 @@ fn run_audio_alignment_batch_job(
         plan.pairs.len().checked_mul(11).ok_or_else(|| {
             "blocked:resource-limit：批次 shortlist evidence 计数溢出。".to_string()
         });
-    let batch_fine_active_baseline_bytes = match shortlist_evidence_units
+    let frontier_compact_units = shortlist_evidence_units.and_then(|units| {
+        units
+            .checked_add(batch_coarse_candidate_count)
+            .ok_or_else(|| {
+                "blocked:resource-limit：fine frontier compact evidence 计数溢出。".to_string()
+            })
+    });
+    let batch_fine_active_baseline_bytes = match frontier_compact_units
         .and_then(v2_coarse_candidate_reserved_bytes)
-        .and_then(|bytes| ensure_v2_active_artifact_budget(batch_retained_artifact_bytes, bytes))
+        .and_then(|bytes| ensure_v2_active_artifact_budget(batch_coarse_active_bytes, bytes))
     {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -13441,54 +15639,67 @@ fn run_audio_alignment_batch_job(
             return;
         }
     };
-    // The exact coarse universe is no longer needed after the shortlist decisions and their
-    // evidence have been frozen. Release it before fine decode so the ledger models the actual
-    // peak phases instead of permanently charging mutually exclusive working sets.
-    drop(coarse_by_pair);
     let media_indices_by_pair = plan
         .pairs
         .iter()
         .map(|pair| (pair.source_media_index, pair.target_media_index))
         .collect::<Vec<_>>();
-
-    run_audio_alignment_batch_job_with_pair_executor_and_finalizer(
-        job_id,
-        cancel_flag.clone(),
-        plan,
-        |job_id, pair_index, pair, cancel_flag| {
-            let decision = shortlist.get(pair_index).cloned().ok_or_else(|| {
-                "批次级 Top-K shortlist decision 索引与 pair 计划不一致。".to_string()
-            })?;
-            execute_v2_global_shortlist_decision(decision, |selected_coarse| {
-                let mut update = |progress: f64, message: &str| {
-                    if cancel_flag.load(Ordering::Acquire) {
-                        return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
-                    }
-                    update_audio_alignment_batch_pair_progress(
-                        job_id, pair_index, progress, message,
-                    )
-                };
-                align_prepared_audio_alignment_batch_pair(
-                    &pair,
-                    &prepared,
-                    &options,
-                    batch_fine_active_baseline_bytes,
-                    selected_coarse,
-                    &mut update,
-                    cancel_flag,
-                )
-            })
-        },
-        |completed_pair_indices, ignore_cancel| {
-            verify_prepared_audio_alignment_batch_media(
-                &prepared,
-                &media_indices_by_pair,
-                completed_pair_indices,
-                (!ignore_cancel).then_some(cancel_flag.as_ref()),
-            )?;
-            toolchain.verify_at_finalization()
-        },
-    );
+    let staged = match execute_v2_fine_frontier_batch(
+        &job_id,
+        &plan,
+        &coarse_by_pair,
+        &prepared,
+        &options,
+        batch_fine_active_baseline_bytes,
+        cancel_flag.as_ref(),
+    ) {
+        Ok(staged) => staged,
+        Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        Err(error)
+            if process_supervision_cleanup_faulted()
+                || error.starts_with("blocked:process-cleanup") =>
+        {
+            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+            return;
+        }
+        Err(error) => {
+            let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
+            return;
+        }
+    };
+    if cancel_flag.load(Ordering::Acquire) {
+        let _ = cancel_audio_alignment_batch_worker(&job_id);
+        return;
+    }
+    let completed_pair_indices = staged
+        .iter()
+        .map(|result| result.pair_index)
+        .collect::<Vec<_>>();
+    if let Err(error) = verify_prepared_audio_alignment_batch_media(
+        &prepared,
+        &media_indices_by_pair,
+        &completed_pair_indices,
+        Some(cancel_flag.as_ref()),
+    )
+    .and_then(|_| toolchain.verify_at_finalization())
+    {
+        if error == AUDIO_ALIGNMENT_CANCELLED || cancel_flag.load(Ordering::Acquire) {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+        } else {
+            let _ = invalidate_audio_alignment_batch_after_final_identity_failure(&job_id);
+        }
+        return;
+    }
+    if cancel_flag.load(Ordering::Acquire) {
+        let _ = cancel_audio_alignment_batch_worker(&job_id);
+        return;
+    }
+    if commit_staged_audio_alignment_batch_results(&job_id, staged, false).is_err() {
+        let _ = invalidate_audio_alignment_batch_after_final_identity_failure(&job_id);
+    }
 }
 
 #[cfg(test)]
@@ -13514,6 +15725,63 @@ fn run_audio_alignment_batch_job_with_pair_executor<F>(
     );
 }
 
+#[cfg(test)]
+fn create_test_audio_alignment_batch_fine_frontier_receipt(
+    pair: &PlannedAudioAlignmentBatchPair,
+    final_state: AudioAlignmentBatchFineFrontierStateSnapshot,
+) -> AudioAlignmentBatchFineFrontierReceiptSnapshot {
+    let config = FineFrontierConfig {
+        resolution_margin_micros: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS,
+        overlap_tolerance_ms: u64::try_from(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS).unwrap(),
+        ..FineFrontierConfig::default()
+    };
+    let inventory_json = canonicalize_v2_cross_language_json(&serde_json::json!([])).unwrap();
+    let proof = final_state != AudioAlignmentBatchFineFrontierStateSnapshot::Failed;
+    seal_audio_alignment_batch_fine_frontier_receipt(
+        AudioAlignmentBatchFineFrontierReceiptSnapshot {
+            contract_version: FINE_FRONTIER_CONTRACT_VERSION,
+            score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+            inventory_digest: v2_domain_separated_canonical_digest(
+                AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
+                &inventory_json,
+            ),
+            receipt_digest: String::new(),
+            component_ordinal: pair.pair_index + 1,
+            component_pair_ordinals: vec![pair.pair_ordinal],
+            inventory_candidate_count: 0,
+            resolution_margin_micros: config.resolution_margin_micros,
+            overlap_tolerance_ms: config.overlap_tolerance_ms,
+            limits: audio_alignment_batch_fine_limits_snapshot(config),
+            inventory_state_counts: AudioAlignmentBatchFineStateCountsSnapshot::default(),
+            refinement_round_count: 0,
+            evaluated_candidate_count: 0,
+            final_state,
+            resolved: false,
+            selected_candidate_ids: Vec::new(),
+            selected_total_score_micros: None,
+            best_completed: AudioAlignmentBatchFineAssignmentSnapshot {
+                candidate_ids: Vec::new(),
+                total_score_micros: 0,
+            },
+            runner_up_completed: None,
+            optimistic_omitted: None,
+            next_refinement_candidate_ids: Vec::new(),
+            deferred_candidate_count: 0,
+            proof: AudioAlignmentBatchFineResolutionProofSnapshot {
+                beats_runner_up_with_margin: proof,
+                beats_optimistic_omitted_with_margin: proof,
+            },
+            search: AudioAlignmentBatchFineSearchSnapshot {
+                states_visited: 0,
+                expansions_considered: 0,
+                interval_comparisons: 0,
+            },
+        },
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
     job_id: String,
     cancel_flag: Arc<AtomicBool>,
@@ -13551,6 +15819,14 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
         }
         let relation_ranking = pair.relation_ranking.clone();
         let global_selection = pair.global_selection.clone();
+        let completed_fine_frontier = create_test_audio_alignment_batch_fine_frontier_receipt(
+            &pair,
+            AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate,
+        );
+        let failed_fine_frontier = create_test_audio_alignment_batch_fine_frontier_receipt(
+            &pair,
+            AudioAlignmentBatchFineFrontierStateSnapshot::Failed,
+        );
         let result = execute_pair(&job_id, pair_index, pair, cancel_flag.as_ref());
         match result {
             Ok(proposal) => {
@@ -13558,6 +15834,8 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
                     pair_index,
                     relation_ranking,
                     global_selection,
+                    fine_frontier: Some(completed_fine_frontier),
+                    fine_execution_evidence: None,
                     outcome: StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(proposal)),
                 });
             }
@@ -13583,6 +15861,8 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
                     // acceptance still rejects every incomplete tile before consuming scores.
                     relation_ranking,
                     global_selection: global_selection.mark_failed(),
+                    fine_frontier: Some(failed_fine_frontier),
+                    fine_execution_evidence: None,
                     outcome: StagedAudioAlignmentBatchPairOutcome::Failed(error),
                 });
             }
@@ -13629,6 +15909,7 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
     }
 }
 
+#[cfg(test)]
 fn finish_cancelled_audio_alignment_batch_with_staging<G>(
     job_id: &str,
     staged_results: Vec<StagedAudioAlignmentBatchPairResult>,
@@ -13683,6 +15964,7 @@ fn validate_audio_alignment_batch_global_selection_evidence(
             evidence.state,
             AudioAlignmentBatchGlobalSelectionState::Selected
                 | AudioAlignmentBatchGlobalSelectionState::Blocked
+                | AudioAlignmentBatchGlobalSelectionState::Failed
         )
     } else {
         evidence.state == AudioAlignmentBatchGlobalSelectionState::Failed
@@ -13917,6 +16199,378 @@ fn validate_audio_alignment_batch_execution_identity(
     Ok(())
 }
 
+fn validate_audio_alignment_batch_fine_candidate_ids(
+    ids: &[AudioAlignmentBatchFineCandidateIdSnapshot],
+    component_pair_ordinals: &[usize],
+) -> Result<(), String> {
+    if ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || ids.iter().any(|id| {
+            id.candidate_ordinal == 0
+                || !component_pair_ordinals
+                    .iter()
+                    .any(|ordinal| u32::try_from(*ordinal) == Ok(id.pair_ordinal))
+        })
+    {
+        return Err("fine frontier candidate IDs 不是 canonical component 子集。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_audio_alignment_batch_fine_frontier_receipt(
+    receipt: &AudioAlignmentBatchFineFrontierReceiptSnapshot,
+) -> Result<(), String> {
+    if receipt.contract_version != FINE_FRONTIER_CONTRACT_VERSION
+        || receipt.score_version != AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION
+        || !is_canonical_alignment_benchmark_sha256(&receipt.inventory_digest)
+        || !is_canonical_alignment_benchmark_sha256(&receipt.receipt_digest)
+        || receipt.component_ordinal == 0
+        || receipt.component_pair_ordinals.is_empty()
+        || receipt.component_pair_ordinals.contains(&0)
+        || receipt
+            .component_pair_ordinals
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || receipt.resolution_margin_micros
+            < AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS
+        || receipt.overlap_tolerance_ms
+            != u64::try_from(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+                .map_err(|_| "fine overlap tolerance 不能为负数。".to_string())?
+        || receipt.limits
+            != audio_alignment_batch_fine_limits_snapshot(FineFrontierConfig::default())
+        || receipt.evaluated_candidate_count > receipt.inventory_candidate_count
+        || receipt.search.states_visited > receipt.limits.max_search_states
+        || receipt.search.expansions_considered > receipt.limits.max_search_expansions
+        || receipt.search.interval_comparisons > receipt.limits.max_interval_comparisons
+    {
+        return Err("fine frontier receipt 基础字段无效。".to_string());
+    }
+    let state_total = receipt
+        .inventory_state_counts
+        .unresolved
+        .checked_add(receipt.inventory_state_counts.scored)
+        .and_then(|value| value.checked_add(receipt.inventory_state_counts.evaluated_ineligible))
+        .and_then(|value| value.checked_add(receipt.inventory_state_counts.evidence_blocked))
+        .and_then(|value| value.checked_add(receipt.inventory_state_counts.resource_blocked))
+        .and_then(|value| value.checked_add(receipt.inventory_state_counts.infrastructure_failed))
+        .and_then(|value| value.checked_add(receipt.inventory_state_counts.cancelled))
+        .ok_or_else(|| "fine frontier state counts 溢出。".to_string())?;
+    if state_total != receipt.inventory_candidate_count {
+        return Err("fine frontier state counts 与 inventory count 不一致。".to_string());
+    }
+    for ids in [
+        receipt.selected_candidate_ids.as_slice(),
+        receipt.best_completed.candidate_ids.as_slice(),
+        receipt
+            .runner_up_completed
+            .as_ref()
+            .map(|assignment| assignment.candidate_ids.as_slice())
+            .unwrap_or(&[]),
+        receipt
+            .optimistic_omitted
+            .as_ref()
+            .map(|assignment| assignment.candidate_ids.as_slice())
+            .unwrap_or(&[]),
+        receipt
+            .optimistic_omitted
+            .as_ref()
+            .map(|assignment| assignment.open_candidate_ids.as_slice())
+            .unwrap_or(&[]),
+        receipt
+            .optimistic_omitted
+            .as_ref()
+            .map(|assignment| assignment.unresolved_candidate_ids.as_slice())
+            .unwrap_or(&[]),
+        receipt
+            .optimistic_omitted
+            .as_ref()
+            .map(|assignment| assignment.blocked_candidate_ids.as_slice())
+            .unwrap_or(&[]),
+        receipt.next_refinement_candidate_ids.as_slice(),
+    ] {
+        validate_audio_alignment_batch_fine_candidate_ids(ids, &receipt.component_pair_ordinals)?;
+    }
+    let beats_runner = receipt.runner_up_completed.as_ref().is_none_or(|runner| {
+        runner
+            .total_score_micros
+            .checked_add(receipt.resolution_margin_micros)
+            .is_some_and(|threshold| receipt.best_completed.total_score_micros > threshold)
+    });
+    let beats_omitted = receipt.optimistic_omitted.as_ref().is_none_or(|omitted| {
+        omitted
+            .total_upper_bound_micros
+            .checked_add(receipt.resolution_margin_micros)
+            .is_some_and(|threshold| receipt.best_completed.total_score_micros > threshold)
+    });
+    if receipt.final_state != AudioAlignmentBatchFineFrontierStateSnapshot::Failed
+        && (receipt.proof.beats_runner_up_with_margin != beats_runner
+            || receipt.proof.beats_optimistic_omitted_with_margin != beats_omitted)
+    {
+        return Err("fine frontier proof 与 assignment 分数不一致。".to_string());
+    }
+    match receipt.final_state {
+        AudioAlignmentBatchFineFrontierStateSnapshot::Resolved => {
+            if !receipt.resolved
+                || receipt.selected_candidate_ids.is_empty()
+                || receipt.selected_candidate_ids != receipt.best_completed.candidate_ids
+                || receipt.selected_total_score_micros
+                    != Some(receipt.best_completed.total_score_micros)
+                || !receipt.proof.beats_runner_up_with_margin
+                || !receipt.proof.beats_optimistic_omitted_with_margin
+                || !receipt.next_refinement_candidate_ids.is_empty()
+            {
+                return Err("Resolved fine frontier receipt 不闭合。".to_string());
+            }
+        }
+        AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate => {
+            if receipt.resolved
+                || !receipt.selected_candidate_ids.is_empty()
+                || receipt.selected_total_score_micros.is_some()
+                || !receipt.best_completed.candidate_ids.is_empty()
+                || receipt.best_completed.total_score_micros != 0
+                || receipt.inventory_state_counts.evaluated_ineligible
+                    != receipt.inventory_candidate_count
+                || !receipt.next_refinement_candidate_ids.is_empty()
+            {
+                return Err("NoEligibleCandidate fine frontier receipt 不闭合。".to_string());
+            }
+        }
+        AudioAlignmentBatchFineFrontierStateSnapshot::Unresolved => {
+            if receipt.resolved
+                || !receipt.selected_candidate_ids.is_empty()
+                || receipt.selected_total_score_micros.is_some()
+                || !receipt.next_refinement_candidate_ids.is_empty()
+                || receipt.proof.beats_runner_up_with_margin
+                    && receipt.proof.beats_optimistic_omitted_with_margin
+                    && !receipt.best_completed.candidate_ids.is_empty()
+            {
+                return Err("Unresolved fine frontier receipt 不闭合。".to_string());
+            }
+        }
+        AudioAlignmentBatchFineFrontierStateSnapshot::Failed => {
+            if receipt.resolved
+                || !receipt.selected_candidate_ids.is_empty()
+                || receipt.selected_total_score_micros.is_some()
+                || !receipt.best_completed.candidate_ids.is_empty()
+                || receipt.best_completed.total_score_micros != 0
+                || !receipt.next_refinement_candidate_ids.is_empty()
+            {
+                return Err("Failed fine frontier receipt 不闭合。".to_string());
+            }
+        }
+    }
+    let mut expected = receipt.clone();
+    expected.receipt_digest.clear();
+    let expected = seal_audio_alignment_batch_fine_frontier_receipt(expected)?;
+    if expected.receipt_digest != receipt.receipt_digest {
+        return Err("fine frontier receiptDigest 与内容不一致。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_audio_alignment_batch_fine_backend(
+    backend: &AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+) -> Result<(), String> {
+    if backend.backend_id.trim().is_empty()
+        || backend.requested_backend.trim().is_empty()
+        || backend.backend_detail.trim().is_empty()
+        || backend
+            .fallback_reason
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err("fine execution backend identity 无效。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_audio_alignment_batch_fine_backend_continuity(
+    coarse: &AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+    fine: &AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+) -> Result<(), String> {
+    let coarse_execution = SpectralBackendExecution {
+        backend_id: coarse.backend_id.clone(),
+        requested_backend: coarse.requested_backend.clone(),
+        backend_detail: coarse.backend_detail.clone(),
+        fallback_reason: coarse.fallback_reason.clone(),
+    };
+    let locked = lock_fine_spectral_backend_request(&coarse_execution)?;
+    if fine.backend_id != locked.planned_backend_id
+        || fine.requested_backend != locked.requested_backend
+        || fine.backend_detail != locked.backend_detail
+        || fine.fallback_reason != locked.fallback_reason
+    {
+        return Err("fine execution backend 未遵守 coarse 锁定映射。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_audio_alignment_batch_fine_decode_window(
+    window: &AudioAlignmentBatchFineDecodeWindowSnapshot,
+    effective: bool,
+) -> Result<(), String> {
+    if window.end_ms <= window.start_ms
+        || window.sample_rate != ALIGNMENT_V2_SAMPLE_RATE
+        || window.expected_sample_count == 0
+    {
+        return Err("fine execution decode window 基础字段无效。".to_string());
+    }
+    if effective {
+        let actual = window
+            .actual_decoded_sample_count
+            .filter(|count| *count > 0)
+            .ok_or_else(|| "effective fine window 缺少 actualDecodedSampleCount。".to_string())?;
+        let duration_ms = actual
+            .checked_mul(1_000)
+            .ok_or_else(|| "effective fine window duration 溢出。".to_string())?
+            .div_ceil(u64::from(window.sample_rate));
+        let duration_ms = i64::try_from(duration_ms)
+            .map_err(|_| "effective fine window duration 无法表示。".to_string())?;
+        let rounded_expected_sample_count = u64::try_from(duration_ms)
+            .map_err(|_| "effective fine window duration 不能为负数。".to_string())?
+            .checked_mul(u64::from(window.sample_rate))
+            .ok_or_else(|| "effective fine window expected samples 溢出。".to_string())?
+            .div_ceil(1_000);
+        if window.presentation_offset_ms != window.start_ms
+            || window.start_ms.checked_add(duration_ms) != Some(window.end_ms)
+            || window.expected_sample_count != rounded_expected_sample_count
+            || actual > window.expected_sample_count
+        {
+            return Err("effective fine window 与实际 PCM 覆盖不一致。".to_string());
+        }
+    } else if window.actual_decoded_sample_count.is_some()
+        || window.presentation_offset_ms != window.start_ms
+    {
+        return Err("requested fine window 不得声称实际 decoded sample。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_audio_alignment_batch_fine_execution_evidence(
+    receipt: &AudioAlignmentBatchFineFrontierReceiptSnapshot,
+    evidence: &AudioAlignmentBatchFineExecutionEvidenceSnapshot,
+    proposal: &AudioAlignmentProposal,
+) -> Result<(), String> {
+    if receipt.final_state != AudioAlignmentBatchFineFrontierStateSnapshot::Resolved
+        || !receipt
+            .selected_candidate_ids
+            .contains(&evidence.candidate_id)
+        || evidence.selected_member_rank == 0
+        || evidence.group_member_ranks.is_empty()
+        || evidence
+            .group_member_ranks
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || !evidence
+            .group_member_ranks
+            .contains(&evidence.selected_member_rank)
+        || evidence.score_micros == 0
+        || evidence.score_micros > u64::from(SCORE_MICROS_ONE)
+        || receipt
+            .selected_total_score_micros
+            .is_none_or(|total| evidence.score_micros > total)
+        || !is_canonical_alignment_benchmark_sha256(&evidence.parameters_hash)
+        || !is_canonical_alignment_benchmark_sha256(&evidence.occupancy_digest)
+        || !is_canonical_alignment_benchmark_sha256(&evidence.proposal_time_map_digest)
+        || !is_canonical_alignment_benchmark_sha256(&evidence.evidence_digest)
+    {
+        return Err("fine execution evidence 基础字段无效。".to_string());
+    }
+    for backend in [
+        &evidence.source_coarse_backend,
+        &evidence.target_coarse_backend,
+        &evidence.source_fine_backend,
+        &evidence.target_fine_backend,
+    ] {
+        validate_audio_alignment_batch_fine_backend(backend)?;
+    }
+    validate_audio_alignment_batch_fine_backend_continuity(
+        &evidence.source_coarse_backend,
+        &evidence.source_fine_backend,
+    )?;
+    validate_audio_alignment_batch_fine_backend_continuity(
+        &evidence.target_coarse_backend,
+        &evidence.target_fine_backend,
+    )?;
+    for window in [
+        &evidence.source_requested_window,
+        &evidence.target_requested_window,
+    ] {
+        validate_audio_alignment_batch_fine_decode_window(window, false)?;
+    }
+    for window in [
+        &evidence.source_effective_window,
+        &evidence.target_effective_window,
+    ] {
+        validate_audio_alignment_batch_fine_decode_window(window, true)?;
+    }
+    let effective_within_request =
+        |requested: &AudioAlignmentBatchFineDecodeWindowSnapshot,
+         effective: &AudioAlignmentBatchFineDecodeWindowSnapshot| {
+            effective.start_ms == requested.start_ms
+                && effective.end_ms
+                    <= requested.end_ms.saturating_add(
+                        i64::try_from(ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS)
+                            .unwrap_or(i64::MAX),
+                    )
+        };
+    if !effective_within_request(
+        &evidence.source_requested_window,
+        &evidence.source_effective_window,
+    ) || !effective_within_request(
+        &evidence.target_requested_window,
+        &evidence.target_effective_window,
+    ) || v2_fine_time_map_digest(proposal)? != evidence.proposal_time_map_digest
+        || proposal
+            .time_map
+            .as_ref()
+            .map(v2_fine_parameters_digest)
+            .transpose()?
+            .as_deref()
+            != Some(evidence.parameters_hash.as_str())
+    {
+        return Err("fine execution evidence 与最终 proposal 不一致。".to_string());
+    }
+    let mut expected = evidence.clone();
+    expected.evidence_digest.clear();
+    let expected = seal_audio_alignment_batch_fine_execution_evidence(expected)?;
+    if expected.evidence_digest != evidence.evidence_digest {
+        return Err("fine execution evidenceDigest 与内容不一致。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_audio_alignment_batch_fine_staged_evidence(
+    receipt: &AudioAlignmentBatchFineFrontierReceiptSnapshot,
+    execution: Option<&AudioAlignmentBatchFineExecutionEvidenceSnapshot>,
+    outcome: &StagedAudioAlignmentBatchPairOutcome,
+) -> Result<(), String> {
+    validate_audio_alignment_batch_fine_frontier_receipt(receipt)?;
+    match outcome {
+        StagedAudioAlignmentBatchPairOutcome::Proposal(proposal) => {
+            if let Some(execution) = execution {
+                validate_audio_alignment_batch_fine_execution_evidence(
+                    receipt, execution, proposal,
+                )?;
+            } else if proposal.time_map.is_some() {
+                return Err(
+                    "没有 fineExecutionEvidence 的 pair 不得发布可确认 TimeMap。".to_string(),
+                );
+            }
+            if receipt.final_state != AudioAlignmentBatchFineFrontierStateSnapshot::Resolved
+                && execution.is_some()
+            {
+                return Err("未 Resolved 的 fine frontier 不得发布 fine execution。".to_string());
+            }
+        }
+        StagedAudioAlignmentBatchPairOutcome::Failed(_) => {
+            if execution.is_some() {
+                return Err("Failed pair 不得发布 fine execution evidence。".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn commit_staged_audio_alignment_batch_results(
     job_id: &str,
     staged_results: Vec<StagedAudioAlignmentBatchPairResult>,
@@ -13957,9 +16611,71 @@ fn commit_staged_audio_alignment_batch_results(
                 StagedAudioAlignmentBatchPairOutcome::Proposal(_)
             ),
         )?;
+        let fine_frontier = staged
+            .fine_frontier
+            .as_ref()
+            .ok_or_else(|| "evidence v3 staged pair 缺少 fineFrontier receipt。".to_string())?;
+        validate_audio_alignment_batch_fine_staged_evidence(
+            fine_frontier,
+            staged.fine_execution_evidence.as_ref(),
+            &staged.outcome,
+        )?;
+    }
+    let mut component_receipts = HashMap::<usize, (String, Vec<usize>, usize)>::new();
+    for staged in &staged_results {
+        let receipt = staged
+            .fine_frontier
+            .as_ref()
+            .expect("fine frontier receipt validated above");
+        let entry = component_receipts
+            .entry(receipt.component_ordinal)
+            .or_insert_with(|| {
+                (
+                    receipt.receipt_digest.clone(),
+                    receipt.component_pair_ordinals.clone(),
+                    0,
+                )
+            });
+        if entry.0 != receipt.receipt_digest || entry.1 != receipt.component_pair_ordinals {
+            return Err("同一 fine frontier component 的 receipt 内容不一致。".to_string());
+        }
+        entry.2 = entry
+            .2
+            .checked_add(1)
+            .ok_or_else(|| "fine frontier component receipt count 溢出。".to_string())?;
+    }
+    let mut component_ordinals = component_receipts.keys().copied().collect::<Vec<_>>();
+    component_ordinals.sort_unstable();
+    if component_ordinals
+        .iter()
+        .enumerate()
+        .any(|(index, ordinal)| *ordinal != index + 1)
+        || component_receipts
+            .values()
+            .any(|(_, pair_ordinals, count)| pair_ordinals.len() != *count)
+    {
+        return Err(
+            "fine frontier component ordinals 必须从 1 连续编号且覆盖完整 pair。".to_string(),
+        );
+    }
+    let mut all_pair_ordinals = component_receipts
+        .values()
+        .flat_map(|(_, pair_ordinals, _)| pair_ordinals.iter().copied())
+        .collect::<Vec<_>>();
+    all_pair_ordinals.sort_unstable();
+    if all_pair_ordinals.windows(2).any(|pair| pair[0] == pair[1])
+        || all_pair_ordinals.len() != staged_results.len()
+    {
+        return Err("fine frontier component pair ordinals 未形成不重叠完整分区。".to_string());
     }
     let cancelled = force_cancelled || entry.cancel_flag.load(Ordering::Acquire);
-    if !cancelled && committed.iter().any(|committed| !committed) {
+    if cancelled {
+        mark_audio_alignment_batch_cancelled(entry);
+        mark_audio_alignment_batch_terminal(entry);
+        prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+        return Ok(());
+    }
+    if committed.iter().any(|committed| !committed) {
         return Err("批量音频对齐正常完成时缺少 staged pair 结果。".to_string());
     }
     for staged in staged_results {
@@ -13971,6 +16687,8 @@ fn commit_staged_audio_alignment_batch_results(
         pair.progress = 1.0;
         pair.relation_ranking = staged.relation_ranking;
         pair.global_selection = staged.global_selection;
+        pair.fine_frontier = staged.fine_frontier;
+        pair.fine_execution_evidence = staged.fine_execution_evidence;
         match staged.outcome {
             StagedAudioAlignmentBatchPairOutcome::Proposal(proposal) => {
                 pair.status = AudioAlignmentJobStatus::Completed;
@@ -13987,37 +16705,33 @@ fn commit_staged_audio_alignment_batch_results(
         }
     }
 
-    if cancelled {
-        mark_audio_alignment_batch_cancelled(entry);
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.progress = 1.0;
+    entry.snapshot.processed_pair_count = entry.snapshot.total_pair_count;
+    entry.snapshot.failed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
+        .count();
+    entry.snapshot.status = AudioAlignmentJobStatus::Completed;
+    entry.snapshot.message = if entry.snapshot.failed_pair_count == 0 {
+        format!(
+            "批量音频对齐完成：{} 个 pair 均已真实执行。",
+            entry.snapshot.total_pair_count
+        )
     } else {
-        entry.snapshot.current_pair_ordinal = None;
-        entry.snapshot.progress = 1.0;
-        entry.snapshot.processed_pair_count = entry.snapshot.total_pair_count;
-        entry.snapshot.failed_pair_count = entry
-            .snapshot
-            .pairs
-            .iter()
-            .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
-            .count();
-        entry.snapshot.status = AudioAlignmentJobStatus::Completed;
-        entry.snapshot.message = if entry.snapshot.failed_pair_count == 0 {
-            format!(
-                "批量音频对齐完成：{} 个 pair 均已真实执行。",
-                entry.snapshot.total_pair_count
-            )
-        } else {
-            format!(
-                "批量音频对齐完成：{} 个成功，{} 个失败；成功结果已保留。",
-                entry
-                    .snapshot
-                    .total_pair_count
-                    .saturating_sub(entry.snapshot.failed_pair_count),
-                entry.snapshot.failed_pair_count
-            )
-        };
-        entry.snapshot.error = None;
-        entry.snapshot.updated_at_ms = current_time_ms();
-    }
+        format!(
+            "批量音频对齐完成：{} 个成功，{} 个失败；成功结果已保留。",
+            entry
+                .snapshot
+                .total_pair_count
+                .saturating_sub(entry.snapshot.failed_pair_count),
+            entry.snapshot.failed_pair_count
+        )
+    };
+    entry.snapshot.error = None;
+    entry.snapshot.updated_at_ms = current_time_ms();
     mark_audio_alignment_batch_terminal(entry);
     prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
     Ok(())
@@ -18229,6 +20943,691 @@ mod tests {
         }
     }
 
+    fn v2_test_fine_occupancy(
+        source_space: u32,
+        source_start_ms: u64,
+        source_end_ms: u64,
+        target_space: u32,
+        target_start_ms: u64,
+        target_end_ms: u64,
+    ) -> PairPhysicalOccupancy {
+        PairPhysicalOccupancy {
+            source: PhysicalAxisOccupancy {
+                space_ordinal: source_space,
+                intervals: vec![PhysicalInterval {
+                    start_ms: source_start_ms,
+                    end_ms: source_end_ms,
+                }],
+            },
+            target: PhysicalAxisOccupancy {
+                space_ordinal: target_space,
+                intervals: vec![PhysicalInterval {
+                    start_ms: target_start_ms,
+                    end_ms: target_end_ms,
+                }],
+            },
+        }
+    }
+
+    fn v2_test_fine_record(
+        id: FineCandidateId,
+        score: u32,
+        occupancy: PairPhysicalOccupancy,
+    ) -> V2FineGroupEvaluationRecord {
+        let backend = AudioAlignmentBatchSpectralBackendIdentitySnapshot {
+            backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+            requested_backend: "cpu".to_string(),
+            backend_detail: "test CPU".to_string(),
+            fallback_reason: None,
+        };
+        let requested = AudioAlignmentBatchFineDecodeWindowSnapshot {
+            start_ms: 0,
+            end_ms: 1_000,
+            presentation_offset_ms: 0,
+            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+            expected_sample_count: u64::from(ALIGNMENT_V2_SAMPLE_RATE),
+            actual_decoded_sample_count: None,
+        };
+        let effective = AudioAlignmentBatchFineDecodeWindowSnapshot {
+            actual_decoded_sample_count: Some(u64::from(ALIGNMENT_V2_SAMPLE_RATE)),
+            ..requested
+        };
+        let score = ScoreMicros::new(score).unwrap();
+        V2FineGroupEvaluationRecord {
+            score,
+            occupancy,
+            execution_evidence: AudioAlignmentBatchFineExecutionEvidenceSnapshot {
+                candidate_id: id.into(),
+                selected_member_rank: 1,
+                group_member_ranks: vec![1],
+                source_stream_index: 0,
+                target_stream_index: 0,
+                source_coarse_backend: backend.clone(),
+                target_coarse_backend: backend.clone(),
+                source_fine_backend: backend.clone(),
+                target_fine_backend: backend,
+                source_requested_window: requested,
+                target_requested_window: requested,
+                source_effective_window: effective,
+                target_effective_window: effective,
+                parameters_hash: format!("sha256:{}", "0".repeat(64)),
+                occupancy_digest: format!("sha256:{}", "1".repeat(64)),
+                proposal_time_map_digest: format!("sha256:{}", "2".repeat(64)),
+                score_micros: u64::from(score.get()),
+                evidence_digest: format!("sha256:{}", "3".repeat(64)),
+            },
+            proposal: Box::new(test_audio_alignment_batch_proposal(&format!(
+                "fine-{}-{}",
+                id.pair_ordinal, id.candidate_ordinal
+            ))),
+        }
+    }
+
+    fn v2_test_unresolved_fine_candidate(
+        id: FineCandidateId,
+        coarse_upper_bound: u32,
+    ) -> FineCandidate {
+        FineCandidate {
+            id,
+            coarse_upper_bound: ScoreMicros::new(coarse_upper_bound).unwrap(),
+            physical_occupancy: None,
+            state: FineEvaluationState::Unresolved,
+        }
+    }
+
+    fn v2_test_fine_binding(id: FineCandidateId) -> V2FineFrontierGroupBinding {
+        V2FineFrontierGroupBinding {
+            id,
+            pair_index: usize::try_from(id.pair_ordinal.saturating_sub(1)).unwrap(),
+            member_indices: vec![0],
+        }
+    }
+
+    #[test]
+    fn v2_fine_score_uses_each_raw_members_own_upper_bound() {
+        let mut first = test_audio_alignment_batch_proposal("first");
+        first.confidence = 0.60;
+        let mut second = test_audio_alignment_batch_proposal("second");
+        second.confidence = 1.0;
+
+        let first_score =
+            v2_fine_score_from_proposal(ScoreMicros::new(1_000_000).unwrap(), &first).unwrap();
+        let second_score =
+            v2_fine_score_from_proposal(ScoreMicros::new(500_000).unwrap(), &second).unwrap();
+
+        assert_eq!(first_score.get(), 600_000);
+        assert_eq!(second_score.get(), 500_000);
+        assert!(first_score > second_score);
+    }
+
+    #[test]
+    fn v2_fine_frontier_refines_k_plus_one_and_can_replace_same_pair_leader() {
+        let first = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let second = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 2,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![
+                v2_test_unresolved_fine_candidate(first, 900_000),
+                v2_test_unresolved_fine_candidate(second, 800_000),
+            ],
+        };
+        let bindings = vec![v2_test_fine_binding(first), v2_test_fine_binding(second)];
+        let mut config = FineFrontierConfig::default();
+        config.limits.refinement_batch_size = 1;
+        let mut evaluation_order = Vec::new();
+
+        let resolution = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: config,
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            None,
+            |binding, _, _| {
+                evaluation_order.push(binding.id);
+                let score = if binding.id == first {
+                    100_000
+                } else {
+                    700_000
+                };
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::Scored {
+                        score: ScoreMicros::new(score).unwrap(),
+                    },
+                    record: Some(v2_test_fine_record(
+                        binding.id,
+                        score,
+                        v2_test_fine_occupancy(1, 0, 1_000, 2, 0, 1_000),
+                    )),
+                    member_execution_count: 1,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(evaluation_order, vec![first, second]);
+        assert_eq!(resolution.refinement_round_count, 2);
+        assert_eq!(resolution.evaluated_candidate_count, 2);
+        assert_eq!(resolution.outcome.state, CoreFineFrontierState::Resolved);
+        assert_eq!(
+            resolution.outcome.best_completed.candidate_ids,
+            vec![second]
+        );
+        assert_eq!(
+            resolution.outcome.best_completed.total_score_micros,
+            700_000
+        );
+        assert!(resolution.outcome.next_refinement.candidate_ids.is_empty());
+        assert_eq!(
+            resolution.outcome.next_refinement.deferred_candidate_count,
+            0
+        );
+    }
+
+    #[test]
+    fn v2_fine_frontier_resource_blocked_fails_component_without_selection() {
+        let id = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![v2_test_unresolved_fine_candidate(id, 900_000)],
+        };
+        let bindings = vec![v2_test_fine_binding(id)];
+
+        let resolution = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            None,
+            |_, _, _| {
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::ResourceBlocked,
+                    record: None,
+                    member_execution_count: 0,
+                })
+            },
+        )
+        .expect_err("resource blocked group must fail the whole component");
+
+        assert!(resolution.error.starts_with("blocked:resource-limit"));
+        assert_eq!(
+            resolution.inventory.candidates[0].state,
+            FineEvaluationState::ResourceBlocked
+        );
+        assert_eq!(resolution.progress.evaluated_candidate_count, 1);
+    }
+
+    #[test]
+    fn v2_fine_frontier_cumulative_search_budget_blocks_before_next_analysis() {
+        let id = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![v2_test_unresolved_fine_candidate(id, 900_000)],
+        };
+        let bindings = vec![v2_test_fine_binding(id)];
+        let mut config = FineFrontierConfig::default();
+        config.limits.max_search_states = 1;
+        let mut evaluation_calls = 0_usize;
+
+        let failure = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: config,
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            None,
+            |_, _, _| {
+                evaluation_calls += 1;
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::EvidenceBlocked,
+                    record: None,
+                    member_execution_count: 1,
+                })
+            },
+        )
+        .expect_err("exhausted cumulative search budget must block before another analysis");
+
+        assert_eq!(evaluation_calls, 1);
+        assert!(failure.error.starts_with("blocked:resource-limit"));
+        assert_eq!(failure.progress.refinement_round_count, 1);
+        assert_eq!(failure.progress.evaluated_candidate_count, 1);
+        assert_eq!(failure.progress.search.states_visited, 1);
+        assert_eq!(
+            failure.inventory.candidates[0].state,
+            FineEvaluationState::EvidenceBlocked
+        );
+    }
+
+    #[test]
+    fn v2_fine_frontier_component_round_budget_stops_before_next_evaluation() {
+        let first = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let second = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 2,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![
+                v2_test_unresolved_fine_candidate(first, 900_000),
+                v2_test_unresolved_fine_candidate(second, 800_000),
+            ],
+        };
+        let bindings = vec![v2_test_fine_binding(first), v2_test_fine_binding(second)];
+        let mut config = FineFrontierConfig::default();
+        config.limits.refinement_batch_size = 1;
+        let mut evaluation_calls = 0_usize;
+
+        let failure = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: config,
+                component: V2FineComponentBudget {
+                    max_refinement_rounds: 1,
+                    ..V2FineComponentBudget::default()
+                },
+            },
+            &bindings,
+            None,
+            |_, _, _| {
+                evaluation_calls += 1;
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::EvaluatedIneligible,
+                    record: None,
+                    member_execution_count: 1,
+                })
+            },
+        )
+        .expect_err("component round budget must stop the next refinement");
+
+        assert_eq!(evaluation_calls, 1);
+        assert!(failure.error.contains("refinement rounds"));
+        assert_eq!(failure.progress.refinement_round_count, 1);
+        assert_eq!(failure.progress.evaluated_candidate_count, 1);
+        assert_eq!(
+            failure.inventory.candidates[0].state,
+            FineEvaluationState::EvaluatedIneligible
+        );
+        assert_eq!(
+            failure.inventory.candidates[1].state,
+            FineEvaluationState::Unresolved
+        );
+    }
+
+    #[test]
+    fn v2_fine_frontier_component_member_budget_blocks_before_evaluation() {
+        let id = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![v2_test_unresolved_fine_candidate(id, 900_000)],
+        };
+        let bindings = vec![v2_test_fine_binding(id)];
+
+        let failure = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget {
+                    max_member_executions: 0,
+                    ..V2FineComponentBudget::default()
+                },
+            },
+            &bindings,
+            None,
+            |_, _, _| -> Result<_, String> {
+                panic!("exhausted component member budget must block before evaluation")
+            },
+        )
+        .expect_err("component member budget must fail closed");
+
+        assert!(failure.error.contains("fine member executions"));
+        assert_eq!(failure.progress.refinement_round_count, 1);
+        assert_eq!(failure.progress.evaluated_candidate_count, 0);
+        assert_eq!(
+            failure.inventory.candidates[0].state,
+            FineEvaluationState::Unresolved
+        );
+    }
+
+    #[test]
+    fn v2_fine_frontier_component_wall_time_budget_blocks_before_analysis() {
+        let id = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![v2_test_unresolved_fine_candidate(id, 900_000)],
+        };
+        let bindings = vec![v2_test_fine_binding(id)];
+
+        let failure = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget {
+                    max_elapsed: Duration::ZERO,
+                    ..V2FineComponentBudget::default()
+                },
+            },
+            &bindings,
+            None,
+            |_, _, _| -> Result<_, String> {
+                panic!("exhausted wall-time budget must block before evaluation")
+            },
+        )
+        .expect_err("component wall-time budget must fail closed");
+
+        assert!(failure.error.contains("wall-time"));
+        assert_eq!(failure.progress.refinement_round_count, 0);
+        assert_eq!(failure.progress.evaluated_candidate_count, 0);
+        assert_eq!(failure.progress.search, zero_v2_fine_search_stats());
+    }
+
+    #[test]
+    fn v2_fine_frontier_all_ineligible_returns_no_eligible_candidate() {
+        let id = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![FineCandidate {
+                id,
+                coarse_upper_bound: ScoreMicros::new(900_000).unwrap(),
+                physical_occupancy: None,
+                state: FineEvaluationState::EvaluatedIneligible,
+            }],
+        };
+        let bindings = vec![v2_test_fine_binding(id)];
+
+        let resolution = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            None,
+            |_, _, _| -> Result<_, String> { panic!("ineligible candidate must not be evaluated") },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.outcome.state,
+            CoreFineFrontierState::NoEligibleCandidate
+        );
+        assert_eq!(resolution.evaluated_candidate_count, 0);
+        assert!(resolution.records.is_empty());
+    }
+
+    #[test]
+    fn v2_fine_frontier_second_assignment_uses_fine_physical_occupancy() {
+        let first_pair = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let conflicting = FineCandidateId {
+            pair_ordinal: 2,
+            candidate_ordinal: 1,
+        };
+        let compatible = FineCandidateId {
+            pair_ordinal: 2,
+            candidate_ordinal: 2,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![
+                v2_test_unresolved_fine_candidate(first_pair, 800_000),
+                v2_test_unresolved_fine_candidate(conflicting, 750_000),
+                v2_test_unresolved_fine_candidate(compatible, 650_000),
+            ],
+        };
+        let bindings = vec![
+            v2_test_fine_binding(first_pair),
+            v2_test_fine_binding(conflicting),
+            v2_test_fine_binding(compatible),
+        ];
+
+        let resolution = resolve_v2_fine_frontier_component_with(
+            vec![0, 1],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            None,
+            |binding, _, _| {
+                let (score, occupancy) = if binding.id == first_pair {
+                    (800_000, v2_test_fine_occupancy(7, 0, 1_000, 11, 0, 1_000))
+                } else if binding.id == conflicting {
+                    (750_000, v2_test_fine_occupancy(7, 0, 1_000, 12, 0, 1_000))
+                } else {
+                    (
+                        650_000,
+                        v2_test_fine_occupancy(7, 2_000, 3_000, 12, 2_000, 3_000),
+                    )
+                };
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::Scored {
+                        score: ScoreMicros::new(score).unwrap(),
+                    },
+                    record: Some(v2_test_fine_record(binding.id, score, occupancy)),
+                    member_execution_count: 1,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolution.outcome.state, CoreFineFrontierState::Resolved);
+        assert_eq!(
+            resolution.outcome.best_completed.candidate_ids,
+            vec![first_pair, compatible]
+        );
+        assert_eq!(
+            resolution.outcome.best_completed.total_score_micros,
+            1_450_000
+        );
+        assert!(!resolution
+            .outcome
+            .best_completed
+            .candidate_ids
+            .contains(&conflicting));
+    }
+
+    #[test]
+    fn v2_fine_occupancy_comes_from_final_time_map_and_merges_each_axis() {
+        let mut plan = test_one_source_three_target_batch_plan();
+        let mut pair = plan.pairs.remove(0);
+        pair.source_physical_media_index = 41;
+        pair.target_physical_media_index = 52;
+        let spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 100, 0, 100),
+            create_v2_span(AudioTimeMapSpanKind::SourceOnly, 100, 150, 100, 100),
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 150, 150, 100, 160),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 200, 250, 200, 250),
+            create_v2_span(AudioTimeMapSpanKind::Ambiguous, 250, 300, 250, 300),
+        ];
+        let mut time_map = visual_test_time_map(spans[0].clone());
+        time_map.spans = spans;
+        time_map.source_start_ms = 0;
+        time_map.source_end_ms = 300;
+        time_map.target_start_ms = 0;
+        time_map.target_end_ms = 300;
+        let mut proposal = test_audio_alignment_batch_proposal("occupancy");
+        proposal.time_map = Some(time_map);
+
+        let occupancy = v2_fine_physical_occupancy_from_proposal(&pair, &proposal).unwrap();
+
+        assert_eq!(occupancy.source.space_ordinal, 41);
+        assert_eq!(occupancy.target.space_ordinal, 52);
+        assert_eq!(
+            occupancy.source.intervals,
+            vec![
+                PhysicalInterval {
+                    start_ms: 0,
+                    end_ms: 150,
+                },
+                PhysicalInterval {
+                    start_ms: 200,
+                    end_ms: 300,
+                },
+            ]
+        );
+        assert_eq!(
+            occupancy.target.intervals,
+            vec![
+                PhysicalInterval {
+                    start_ms: 0,
+                    end_ms: 160,
+                },
+                PhysicalInterval {
+                    start_ms: 200,
+                    end_ms: 300,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn v2_fine_pair_components_are_transitive_and_isolate_physical_media() {
+        let mut plan = test_one_source_three_target_batch_plan();
+        plan.pairs[0].source_physical_media_index = 1;
+        plan.pairs[0].target_physical_media_index = 10;
+        plan.pairs[1].source_physical_media_index = 1;
+        plan.pairs[1].target_physical_media_index = 11;
+        plan.pairs[2].source_physical_media_index = 2;
+        plan.pairs[2].target_physical_media_index = 12;
+
+        assert_eq!(v2_fine_pair_components(&plan), vec![vec![0, 1], vec![2]]);
+
+        plan.pairs[2].target_physical_media_index = 11;
+        assert_eq!(v2_fine_pair_components(&plan), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn v2_evidence_v3_numbers_match_cross_language_ieee754_vectors() {
+        let canonical = canonicalize_v2_cross_language_json(&serde_json::json!({
+            "z": [1.0, -0.0, 1e-6, 1e-7, 23.976, 0.1, 9_007_199_254_740_991_u64],
+            "a": 1.0,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            canonical,
+            concat!(
+                "{\"a\":\"f64:3ff0000000000000\",\"z\":[",
+                "\"f64:3ff0000000000000\",",
+                "\"f64:8000000000000000\",",
+                "\"f64:3eb0c6f7a0b5ed8d\",",
+                "\"f64:3e7ad7f29abcaf48\",",
+                "\"f64:4037f9db22d0e560\",",
+                "\"f64:3fb999999999999a\",",
+                "\"f64:433fffffffffffff\"]}"
+            )
+        );
+        assert!(canonicalize_v2_cross_language_json(&serde_json::json!(1e16)).is_err());
+    }
+
+    #[test]
+    fn v2_fine_decode_window_records_rounded_pcm_coverage() {
+        let requested = PresentationRangeMs {
+            start_ms: 100,
+            end_ms: 201,
+        };
+        let requested_snapshot = v2_fine_decode_window_snapshot(requested).unwrap();
+        assert_eq!(requested_snapshot.expected_sample_count, 1_616);
+        assert_eq!(requested_snapshot.actual_decoded_sample_count, None);
+
+        let truncated = v2_fine_effective_decode_window_snapshot(requested, 100, 1_599).unwrap();
+        assert_eq!(truncated.start_ms, 100);
+        assert_eq!(truncated.end_ms, 200);
+        assert_eq!(truncated.expected_sample_count, 1_600);
+        assert_eq!(truncated.actual_decoded_sample_count, Some(1_599));
+        validate_audio_alignment_batch_fine_decode_window(&truncated, true).unwrap();
+
+        let rounded_up = v2_fine_effective_decode_window_snapshot(requested, 100, 1_601).unwrap();
+        assert_eq!(rounded_up.end_ms, 201);
+        assert_eq!(rounded_up.expected_sample_count, 1_616);
+        validate_audio_alignment_batch_fine_decode_window(&rounded_up, true).unwrap();
+    }
+
+    #[test]
+    fn v2_fine_backend_continuity_accepts_streaming_hybrid_and_cuda_locks() {
+        for (backend_id, fallback_reason) in [
+            (STREAMING_CPU_SPECTRAL_BACKEND_ID, None),
+            (
+                STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
+                Some("streamed decode with CUDA coarse FFT".to_string()),
+            ),
+            (CUDA_FFT_BACKEND_ID, None),
+        ] {
+            let coarse_execution = SpectralBackendExecution {
+                backend_id: backend_id.to_string(),
+                requested_backend: "cuda".to_string(),
+                backend_detail: format!("test coarse backend {backend_id}"),
+                fallback_reason,
+            };
+            let locked = lock_fine_spectral_backend_request(&coarse_execution).unwrap();
+            let coarse = audio_alignment_batch_spectral_backend_identity(&coarse_execution);
+            let fine = AudioAlignmentBatchSpectralBackendIdentitySnapshot {
+                backend_id: locked.planned_backend_id,
+                requested_backend: locked.requested_backend,
+                backend_detail: locked.backend_detail,
+                fallback_reason: locked.fallback_reason,
+            };
+
+            validate_audio_alignment_batch_fine_backend_continuity(&coarse, &fine).unwrap();
+            let mut tampered = fine;
+            tampered.backend_detail.push_str(" tampered");
+            assert!(
+                validate_audio_alignment_batch_fine_backend_continuity(&coarse, &tampered).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn v2_fine_frontier_receipt_digest_rejects_tampering() {
+        let plan = test_one_source_three_target_batch_plan();
+        let mut receipt = create_test_audio_alignment_batch_fine_frontier_receipt(
+            &plan.pairs[0],
+            AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate,
+        );
+        validate_audio_alignment_batch_fine_frontier_receipt(&receipt).unwrap();
+
+        receipt.inventory_digest = format!("sha256:{}", "f".repeat(64));
+        assert!(validate_audio_alignment_batch_fine_frontier_receipt(&receipt).is_err());
+    }
+
     fn ffmpeg_test_tools_available() -> bool {
         Command::new("ffmpeg")
             .arg("-version")
@@ -20681,12 +24080,46 @@ mod tests {
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
         run_audio_alignment_batch_job(job_id.clone(), cancel_flag, plan);
         let terminal = get_audio_alignment_batch_job(job_id).unwrap();
-        assert_eq!(terminal.status, AudioAlignmentJobStatus::Completed);
+        assert_eq!(
+            terminal.status,
+            AudioAlignmentJobStatus::Completed,
+            "batch error={:?}; pair error={:?}; pair message={}",
+            terminal.error,
+            terminal.pairs[0].error,
+            terminal.pairs[0].message
+        );
         assert_eq!(terminal.failed_pair_count, 0);
         let proposal = terminal.pairs[0]
             .proposal
             .as_ref()
             .expect("普通 batch 必须返回可复核 proposal");
+        let fine_execution = terminal.pairs[0]
+            .fine_execution_evidence
+            .as_ref()
+            .expect("真实短媒体 batch 必须绑定 fine execution evidence");
+        for (coarse, fine) in [
+            (
+                &fine_execution.source_coarse_backend,
+                &fine_execution.source_fine_backend,
+            ),
+            (
+                &fine_execution.target_coarse_backend,
+                &fine_execution.target_fine_backend,
+            ),
+        ] {
+            validate_audio_alignment_batch_fine_backend_continuity(coarse, fine).unwrap();
+            let locked = lock_fine_spectral_backend_request(&SpectralBackendExecution {
+                backend_id: coarse.backend_id.clone(),
+                requested_backend: coarse.requested_backend.clone(),
+                backend_detail: coarse.backend_detail.clone(),
+                fallback_reason: coarse.fallback_reason.clone(),
+            })
+            .unwrap();
+            assert_eq!(fine.backend_id, locked.planned_backend_id);
+            assert_eq!(fine.requested_backend, locked.requested_backend);
+            assert_eq!(fine.backend_detail, locked.backend_detail);
+            assert_eq!(fine.fallback_reason, locked.fallback_reason);
+        }
         let time_map = proposal
             .time_map
             .as_ref()
@@ -22281,6 +25714,7 @@ mod tests {
             .collect::<Vec<_>>();
         let coarse = Ok(V2PairCoarseCandidates {
             candidates: candidates.clone(),
+            temporal_window_groups: Vec::new(),
             alternatives: Vec::new(),
             diagnostics: vec![r"C:\private\source-1.mkv".to_string()],
         });
@@ -22402,11 +25836,13 @@ mod tests {
         );
         let relation_coarse = Ok(V2PairCoarseCandidates {
             candidates: vec![relation_candidate],
+            temporal_window_groups: Vec::new(),
             alternatives: Vec::new(),
             diagnostics: Vec::new(),
         });
         let competing_coarse = Ok(V2PairCoarseCandidates {
             candidates: vec![competing_candidate],
+            temporal_window_groups: Vec::new(),
             alternatives: Vec::new(),
             diagnostics: Vec::new(),
         });
@@ -22480,6 +25916,7 @@ mod tests {
         candidates[11].fine_working_set_bytes = usize::MAX;
         let coarse = Ok(V2PairCoarseCandidates {
             candidates,
+            temporal_window_groups: Vec::new(),
             alternatives: Vec::new(),
             diagnostics: Vec::new(),
         });
@@ -22520,6 +25957,7 @@ mod tests {
         let no_eligible = create_audio_alignment_batch_relation_ranking_evidence(
             &Ok(V2PairCoarseCandidates {
                 candidates: Vec::new(),
+                temporal_window_groups: Vec::new(),
                 alternatives: Vec::new(),
                 diagnostics: Vec::new(),
             }),
@@ -22664,6 +26102,7 @@ mod tests {
             );
             coarse_by_pair.push(Ok(V2PairCoarseCandidates {
                 candidates: vec![repeated_opening, complete_episode],
+                temporal_window_groups: Vec::new(),
                 alternatives: Vec::new(),
                 diagnostics: vec![format!("episode {} coarse complete", episode_index + 1)],
             }));
@@ -22748,6 +26187,7 @@ mod tests {
                         0.9,
                         false,
                     )],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: Vec::new(),
                 })
@@ -22791,11 +26231,13 @@ mod tests {
             &[
                 Ok(V2PairCoarseCandidates {
                     candidates: vec![candidate(0.90), candidate(0.89)],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: Vec::new(),
                 }),
                 Ok(V2PairCoarseCandidates {
                     candidates: vec![candidate(0.001)],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: Vec::new(),
                 }),
@@ -22879,6 +26321,7 @@ mod tests {
             assert_eq!(candidates.len(), 5);
             coarse_by_pair.push(Ok(V2PairCoarseCandidates {
                 candidates,
+                temporal_window_groups: Vec::new(),
                 alternatives: Vec::new(),
                 diagnostics: vec![format!("pair {} coarse complete", pair_index + 1)],
             }));
@@ -22917,6 +26360,7 @@ mod tests {
                 0.9,
                 false,
             )],
+            temporal_window_groups: Vec::new(),
             alternatives: Vec::new(),
             diagnostics: Vec::new(),
         })];
@@ -22982,6 +26426,7 @@ mod tests {
                     0.9,
                     false,
                 )],
+                temporal_window_groups: Vec::new(),
                 alternatives: Vec::new(),
                 diagnostics: Vec::new(),
             })
@@ -23030,6 +26475,7 @@ mod tests {
                         0.9,
                         false,
                     )],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: Vec::new(),
                 }),
@@ -23095,11 +26541,13 @@ mod tests {
             &[
                 Ok(V2PairCoarseCandidates {
                     candidates: vec![first],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: Vec::new(),
                 }),
                 Ok(V2PairCoarseCandidates {
                     candidates: vec![second],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: Vec::new(),
                 }),
@@ -23320,6 +26768,7 @@ mod tests {
             &plan,
             &[Ok(V2PairCoarseCandidates {
                 candidates: vec![over_budget, backup],
+                temporal_window_groups: Vec::new(),
                 alternatives: Vec::new(),
                 diagnostics: Vec::new(),
             })],
@@ -23436,6 +26885,7 @@ mod tests {
                         0.9,
                         false,
                     )],
+                    temporal_window_groups: Vec::new(),
                     alternatives: Vec::new(),
                     diagnostics: vec!["fixture coarse retained".to_string()],
                 })
@@ -23561,6 +27011,8 @@ mod tests {
                 global_margin: 1.0,
                 global_diagnostic: "test shortlist".to_string(),
             },
+            fine_frontier_evaluation: false,
+            fine_execution_capture: None,
         };
         let baseline = v2_prepared_retained_artifact_baseline(Some(&evidence));
         assert_eq!(baseline, MAX_V2_ACTIVE_ARTIFACT_BYTES - 1_024);
@@ -23784,7 +27236,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_alignment_batch_cancel_waits_for_worker_and_preserves_completed_pairs() {
+    fn audio_alignment_batch_cancel_discards_pre_proof_staged_pairs() {
         let plan = test_plan_with_selected_global_evidence(
             plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
                 ("source-1", "target-1"),
@@ -23829,12 +27281,12 @@ mod tests {
         assert!(cancel_flag.load(Ordering::Acquire));
         let terminal = get_audio_alignment_batch_job(job_id).unwrap();
         assert_eq!(terminal.status, AudioAlignmentJobStatus::Cancelled);
-        assert_eq!(terminal.processed_pair_count, 1);
-        assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Completed);
-        assert!(terminal.pairs[0].proposal.is_some());
+        assert_eq!(terminal.processed_pair_count, 0);
+        assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Cancelled);
+        assert!(terminal.pairs[0].proposal.is_none());
         assert_eq!(
             terminal.pairs[0].global_selection.state,
-            AudioAlignmentBatchGlobalSelectionState::Selected
+            AudioAlignmentBatchGlobalSelectionState::Cancelled
         );
         assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Cancelled);
         assert!(terminal.pairs[1].proposal.is_none());

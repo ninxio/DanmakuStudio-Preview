@@ -11,16 +11,16 @@ import {
   createC137FormalBlindMatrixTileLayout,
   evaluateC137FormalBlindProvenance,
   rankC137FormalBlindGlobalScores,
-  sealC137FormalBlindProvenanceV2,
+  sealC137FormalBlindProvenanceV3,
   validateC137FormalBlindProvenance,
-  type C137FormalBlindProvenanceV2
+  type C137FormalBlindProvenanceV3
 } from "./c137FormalBlindProvenance";
 import {
   createNativeBatchExecutionIdentityDigest,
   createRealMediaBlindBatchExecutionDigest
 } from "./realMediaBlindBatchContract";
 
-describe("C137 formal blind exhaustive matrix provenance v2", () => {
+describe("C137 formal blind exhaustive matrix provenance v3", () => {
   it("validates an exhaustive matrix and derives one global decision per query", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
     const validation = validateC137FormalBlindProvenance(fixture.provenance);
@@ -281,7 +281,7 @@ describe("C137 formal blind exhaustive matrix provenance v2", () => {
 
   it("seal is atomic and refuses a non-unique plan", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
-    const sealed = sealC137FormalBlindProvenanceV2({
+    const sealed = sealC137FormalBlindProvenanceV3({
       manifest: fixture.manifest,
       plan: fixture.plan,
       batches: fixture.provenance.batches
@@ -293,7 +293,7 @@ describe("C137 formal blind exhaustive matrix provenance v2", () => {
     badPlan.batches.pop();
     badPlan.planDigest = computeC137FormalBlindMatrixPlanDigest(badPlan);
     expect(() =>
-      sealC137FormalBlindProvenanceV2({
+      sealC137FormalBlindProvenanceV3({
         manifest: fixture.manifest,
         plan: badPlan,
         batches: fixture.provenance.batches.slice(0, -1)
@@ -319,11 +319,11 @@ describe("C137 formal blind exhaustive matrix provenance v2", () => {
 
 function createFormalProvenance(
   options: Parameters<typeof createC137FormalBlindProvenanceFixture>[0] = {}
-): C137FormalBlindProvenanceV2 {
+): C137FormalBlindProvenanceV3 {
   return createC137FormalBlindProvenanceFixture(options).provenance;
 }
 
-function resealPlanDigest(provenance: C137FormalBlindProvenanceV2): void {
+function resealPlanDigest(provenance: C137FormalBlindProvenanceV3): void {
   provenance.plan.planDigest = computeC137FormalBlindMatrixPlanDigest(provenance.plan);
   resealC137FormalBlindProvenanceFixture(provenance);
 }

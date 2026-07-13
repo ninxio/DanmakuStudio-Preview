@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AlignmentProposal } from "../../domain/alignment/types";
+import type { AlignmentProposal, AlignmentTimeMapProposal } from "../../domain/alignment/types";
+import {
+  createTestFineExecutionEvidence,
+  createTestFineFrontierReceipt
+} from "../../test/audioAlignmentBatchEvidenceV3";
 import {
   cancelTauriAudioAlignmentBatchJob,
   cancelTauriAudioAlignmentJob,
+  createAudioAlignmentBatchFineExecutionEvidenceDigest,
+  createAudioAlignmentBatchProposalTimeMapDigest,
   getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
   isAudioAlignmentJobFinished,
@@ -347,7 +353,7 @@ describe("Tauri 音频对齐调用", () => {
   it("批任务一次发送全部媒体并规范化流索引", async () => {
     tauriMocks.invoke.mockResolvedValue({
       schemaVersion: 1,
-      evidenceVersion: 2,
+      evidenceVersion: 3,
       jobId: "batch-1",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
@@ -529,7 +535,7 @@ describe("Tauri 音频对齐调用", () => {
   it("批任务可显式指定未完成 pair，并拒绝重复或越界引用", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 2 as const,
+      evidenceVersion: 3 as const,
       jobId: "batch-explicit",
       pairingMode: "explicit" as const,
       sourceMediaIds: ["source"],
@@ -599,7 +605,7 @@ describe("Tauri 音频对齐调用", () => {
   it("支持读取和取消原生批任务", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 2 as const,
+      evidenceVersion: 3 as const,
       jobId: "batch-2",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
@@ -631,7 +637,7 @@ describe("Tauri 音频对齐调用", () => {
   it("拒绝计数矛盾或 jobId 不匹配的原生批任务响应", async () => {
     const invalidSnapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 2 as const,
+      evidenceVersion: 3 as const,
       jobId: "wrong-job",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
@@ -672,7 +678,7 @@ describe("Tauri 音频对齐调用", () => {
   it("启动响应必须绑定请求 inventory，completed 终态不得夹带 cancelled pair", async () => {
     const wrongInventory = {
       schemaVersion: 1 as const,
-      evidenceVersion: 2 as const,
+      evidenceVersion: 3 as const,
       jobId: "batch-boundary",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["other-source"],
@@ -726,7 +732,7 @@ describe("Tauri 音频对齐调用", () => {
   it("接受 fine 失败后保留的 coarse 证据，并严格校验失败状态与完整 Top-K", async () => {
     const failedSnapshot: AudioAlignmentBatchJobSnapshot = {
       schemaVersion: 1,
-      evidenceVersion: 2,
+      evidenceVersion: 3,
       jobId: "batch-fine-failed",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
@@ -785,7 +791,119 @@ describe("Tauri 音频对齐调用", () => {
     decisionCandidate.offsetMs = 1;
     await expect(read(mismatchedDecision)).rejects.toThrow("与 Top-K 同 rank 候选不一致");
   });
+
+  it("v3 canonical digest 固定向量保持跨语言一致，并拒绝不安全整数", () => {
+    expect(
+      createAudioAlignmentBatchProposalTimeMapDigest({
+        values: [1, -0, 1e-6, 1e-7, 23.976, 0.1, Number.MAX_SAFE_INTEGER]
+      })
+    ).toBe("sha256:717365859677112aa36704edc6f5ea20b52ef7ed1f5b26a76a3aaf07085a730a");
+    expect(() => createAudioAlignmentBatchProposalTimeMapDigest({ value: 1e16 })).toThrow(
+      "安全范围"
+    );
+  });
+
+  it("严格拒绝 legacy v2 外层和 v3 外层夹带的旧 fine contract", async () => {
+    const valid = completedBatchJobSnapshot();
+    const readUnknown = (snapshot: unknown) =>
+      getTauriAudioAlignmentBatchJob("batch-v3", {
+        start: vi.fn(),
+        get: () => Promise.resolve(snapshot as AudioAlignmentBatchJobSnapshot),
+        cancel: vi.fn()
+      });
+
+    const legacyOuter = structuredClone(valid) as unknown as Record<string, unknown>;
+    legacyOuter.evidenceVersion = 2;
+    await expect(readUnknown(legacyOuter)).rejects.toThrow("evidenceVersion");
+
+    const mixedFine = structuredClone(valid);
+    const frontier = mixedFine.pairs[0]?.fineFrontier as unknown as Record<string, unknown>;
+    frontier.contractVersion = "alignment-v2-adaptive-fine-frontier-v0";
+    await expect(readUnknown(mixedFine)).rejects.toThrow("contractVersion");
+  });
+
+  it("v3 fine evidence 校验自摘要与 requested/effective 50ms 解码边界", async () => {
+    const read = (snapshot: AudioAlignmentBatchJobSnapshot) =>
+      getTauriAudioAlignmentBatchJob("batch-v3", {
+        start: vi.fn(),
+        get: () => Promise.resolve(snapshot),
+        cancel: vi.fn()
+      });
+
+    const exactTolerance = completedBatchJobSnapshot();
+    const exactExecution = exactTolerance.pairs[0]?.fineExecutionEvidence;
+    if (exactExecution === null || exactExecution === undefined) {
+      throw new Error("fixture fine execution missing");
+    }
+    exactExecution.sourceEffectiveWindow.endMs += 50;
+    exactExecution.sourceEffectiveWindow.expectedSampleCount += 800;
+    exactExecution.sourceEffectiveWindow.actualDecodedSampleCount =
+      exactExecution.sourceEffectiveWindow.expectedSampleCount;
+    exactExecution.evidenceDigest =
+      createAudioAlignmentBatchFineExecutionEvidenceDigest(exactExecution);
+    await expect(read(exactTolerance)).resolves.toEqual(exactTolerance);
+
+    const beyondTolerance = structuredClone(exactTolerance);
+    const beyondExecution = beyondTolerance.pairs[0]?.fineExecutionEvidence;
+    if (beyondExecution === null || beyondExecution === undefined) {
+      throw new Error("fixture fine execution missing");
+    }
+    beyondExecution.sourceEffectiveWindow.endMs += 1;
+    beyondExecution.sourceEffectiveWindow.expectedSampleCount += 16;
+    beyondExecution.sourceEffectiveWindow.actualDecodedSampleCount =
+      beyondExecution.sourceEffectiveWindow.expectedSampleCount;
+    beyondExecution.evidenceDigest =
+      createAudioAlignmentBatchFineExecutionEvidenceDigest(beyondExecution);
+    await expect(read(beyondTolerance)).rejects.toThrow("最多放宽 50ms");
+
+    const tamperedDigest = completedBatchJobSnapshot();
+    const tamperedExecution = tamperedDigest.pairs[0]?.fineExecutionEvidence;
+    if (tamperedExecution === null || tamperedExecution === undefined) {
+      throw new Error("fixture fine execution missing");
+    }
+    tamperedExecution.scoreMicros -= 1;
+    await expect(read(tamperedDigest)).rejects.toThrow("evidenceDigest");
+  });
+
+  it("v3 fine evidence 即使重签摘要也拒绝篡改 locked backendDetail", async () => {
+    const snapshot = completedBatchJobSnapshot();
+    const execution = snapshot.pairs[0]?.fineExecutionEvidence;
+    if (execution === null || execution === undefined) {
+      throw new Error("fixture fine execution missing");
+    }
+    execution.sourceFineBackend.backendDetail = "caller-forged fine backend detail";
+    execution.evidenceDigest = createAudioAlignmentBatchFineExecutionEvidenceDigest(execution);
+
+    await expect(
+      getTauriAudioAlignmentBatchJob("batch-v3", {
+        start: vi.fn(),
+        get: () => Promise.resolve(snapshot),
+        cancel: vi.fn()
+      })
+    ).rejects.toThrow("coarse→fine backend continuity");
+  });
 });
+
+function completedBatchJobSnapshot(): AudioAlignmentBatchJobSnapshot {
+  return {
+    schemaVersion: 1,
+    evidenceVersion: 3,
+    jobId: "batch-v3",
+    pairingMode: "fullCartesian",
+    sourceMediaIds: ["source"],
+    targetMediaIds: ["target"],
+    status: "completed",
+    progress: 1,
+    message: "completed",
+    totalPairCount: 1,
+    processedPairCount: 1,
+    failedPairCount: 0,
+    currentPairOrdinal: null,
+    pairs: [batchPairSnapshot(1, "source", "target", "completed")],
+    error: null,
+    updatedAtMs: 1
+  };
+}
 
 function batchPairSnapshot(
   pairOrdinal: number,
@@ -793,6 +911,20 @@ function batchPairSnapshot(
   targetMediaId: string,
   status: "queued" | "running" | "completed" | "failed" | "cancelled"
 ) {
+  const proposal = status === "completed" ? batchProposal() : null;
+  const fineFrontier =
+    status === "completed"
+      ? createTestFineFrontierReceipt(
+          [pairOrdinal],
+          [{ pairOrdinal, candidateOrdinal: 1 }],
+          { componentOrdinal: pairOrdinal }
+        )
+      : status === "failed"
+        ? createTestFineFrontierReceipt([pairOrdinal], [], {
+            componentOrdinal: pairOrdinal,
+            finalState: "failed"
+          })
+        : null;
   return {
     pairIndex: pairOrdinal - 1,
     pairOrdinal,
@@ -803,8 +935,89 @@ function batchPairSnapshot(
     message: status,
     relationRanking: batchRelationRanking(status),
     globalSelection: batchGlobalSelection(status),
-    proposal: status === "completed" ? emptyProposal : null,
+    fineFrontier,
+    fineExecutionEvidence:
+      proposal?.timeMap && fineFrontier?.resolved
+        ? createTestFineExecutionEvidence(proposal.timeMap, {
+            pairOrdinal,
+            engineVersion: testExecutionIdentity.engineVersion,
+            featureVersion: testExecutionIdentity.featureVersion,
+            coarseBackend: testExecutionIdentity.sourceSpectralBackends[0]
+          })
+        : null,
+    proposal,
     error: status === "failed" ? "pair failed" : null
+  };
+}
+
+function batchProposal(): AlignmentProposal {
+  const timeMap: AlignmentTimeMapProposal = {
+    sourceStartMs: 0,
+    sourceEndMs: 1_000,
+    targetStartMs: 0,
+    targetEndMs: 1_000,
+    spans: [],
+    quality: {
+      level: "review",
+      probability: 0.9,
+      metricSource: "measured",
+      coverage: 1,
+      uniqueContentCoverage: 1,
+      p50ResidualMs: 0,
+      p95ResidualMs: 0,
+      p99ResidualMs: 0,
+      maxResidualMs: 0,
+      boundaryUncertaintyMs: 0,
+      alternativeMargin: 1,
+      anchorCount: 8,
+      anchorRegionCount: 3,
+      heldOutAnchorCount: 2,
+      reasons: []
+    },
+    evidence: {
+      types: ["audio"],
+      audioAnchorCount: 8,
+      visualAnchorCount: 0,
+      heldOutAnchorCount: 2,
+      top1Top2Margin: 1,
+      uniqueContentCoverage: 1,
+      repeatedContentOnly: false,
+      selectedTrackReason: "v3 fixture",
+      alternativeTrackScores: [],
+      notes: []
+    },
+    sourceStream: testAudioStream(),
+    targetStream: testAudioStream(),
+    sourceVisualStream: null,
+    targetVisualStream: null,
+    sourceIdentity: null,
+    targetIdentity: null,
+    engineVersion: testExecutionIdentity.engineVersion,
+    featureVersion: testExecutionIdentity.featureVersion,
+    parametersHash: "legacy-parameters-v2"
+  };
+  return {
+    anchors: [],
+    cutCandidates: [],
+    confidence: 0.9,
+    diagnostics: [],
+    timeMap
+  };
+}
+
+function testAudioStream() {
+  return {
+    type: "audio" as const,
+    index: 0,
+    codec: "flac",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/16000",
+    sampleRate: 16_000,
+    channels: 1,
+    frameRate: null,
+    language: null,
+    title: null
   };
 }
 

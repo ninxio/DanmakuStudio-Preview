@@ -19,10 +19,10 @@ import {
   computeC137FormalBlindManifestDigest,
   createC137FormalBlindMatrixExecutionProjection,
   createC137FormalBlindMatrixPlan,
-  sealC137FormalBlindProvenanceV2,
+  sealC137FormalBlindProvenanceV3,
   type C137FormalBlindMatrixPlanV2,
-  type C137FormalBlindProvenanceBatchEnvelopeV2,
-  type C137FormalBlindProvenanceV2
+  type C137FormalBlindProvenanceBatchEnvelopeV3,
+  type C137FormalBlindProvenanceV3
 } from "../../domain/alignment/c137FormalBlindProvenance";
 import type { MediaContentIdentity } from "../../domain/project/types";
 import {
@@ -102,7 +102,7 @@ export interface C137FormalBlindMatrixBenchmarkResult {
   preflight: RealMediaBenchmarkPreflightResult;
   completedBatchCount: number;
   totalBatchCount: number;
-  provenance: C137FormalBlindProvenanceV2 | null;
+  provenance: C137FormalBlindProvenanceV3 | null;
   reasons: string[];
 }
 
@@ -144,7 +144,7 @@ interface FormalMatrixResultState {
   status: C137FormalBlindMatrixBenchmarkRunStatus;
   preflight: RealMediaBenchmarkPreflightResult;
   completedBatchCount: number;
-  provenance?: C137FormalBlindProvenanceV2 | null;
+  provenance?: C137FormalBlindProvenanceV3 | null;
   reasons: string[];
 }
 
@@ -354,7 +354,7 @@ export async function runC137FormalBlindMatrixBenchmark(
   }
 
   const runner = options.runner ?? defaultSuiteRunner;
-  const envelopes: C137FormalBlindProvenanceBatchEnvelopeV2[] = [];
+  const envelopes: C137FormalBlindProvenanceBatchEnvelopeV3[] = [];
   let pinnedExecutionIdentityDigest: string | null = null;
   for (const planBatch of canonicalPlan.batches) {
     const queryCases = selectFrozenCases(manifest, planBatch.queryCaseIds);
@@ -483,7 +483,7 @@ export async function runC137FormalBlindMatrixBenchmark(
   }
 
   try {
-    const provenance = sealC137FormalBlindProvenanceV2({
+    const provenance = sealC137FormalBlindProvenanceV3({
       manifest,
       plan: canonicalPlan,
       batches: envelopes

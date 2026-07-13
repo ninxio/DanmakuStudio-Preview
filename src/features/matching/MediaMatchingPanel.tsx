@@ -11,11 +11,6 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import { augmentAlignmentProposalWithDanmakuEvidence } from "../../domain/alignment/danmakuEvidence";
-import {
-  assignGlobalMediaMatches,
-  type GlobalAssignmentRejectionReason,
-  type GlobalMatchHypothesis
-} from "../../domain/alignment/globalAssignment";
 import { createMediaMatchCandidate } from "../../domain/alignment/mediaMatching";
 import {
   assessManualMediaTimeMapVerificationEligibility,
@@ -23,7 +18,6 @@ import {
 } from "../../domain/alignment/mediaTimeMap";
 import {
   isCompleteTimeMapSpanEvidence,
-  normalizeLegacyUnverifiedTimeMapSpanEvidence,
   validateTimeMap,
   type TimeMapSpan,
   type TimeMapSpanKind
@@ -50,10 +44,12 @@ import type {
 import { formatTimecode } from "../../domain/shared/time";
 import {
   cancelTauriAudioAlignmentBatchJob,
+  createAudioAlignmentBatchProposalTimeMapDigest,
   getTauriAudioAlignmentBatchJob,
   isAudioAlignmentJobFinished,
   startTauriAudioAlignmentBatchJob,
   type AudioAlignmentBatchJobSnapshot,
+  type AudioAlignmentBatchFineCandidateIdSnapshot,
   type AudioAlignmentBatchPairSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
@@ -64,7 +60,14 @@ import {
   type TimeMapPlaybackAdapterFactory
 } from "./TimeMapPlaybackReview";
 
-type BatchTaskState = "waiting" | "running" | "found" | "notFound" | "failed" | "cancelled";
+type BatchTaskState =
+  | "waiting"
+  | "running"
+  | "found"
+  | "unresolved"
+  | "notFound"
+  | "failed"
+  | "cancelled";
 
 interface BatchTask {
   id: string;
@@ -82,26 +85,22 @@ interface CandidateAssetSelection {
   touched: boolean;
 }
 
-interface StagedPairwiseCandidate {
-  pairId: string;
-  candidate: MediaMatchCandidate;
-  sourceOrderHint: number | null;
-  targetOrderHint: number | null;
-}
+type NativeFineDispositionKind =
+  | "confirmable"
+  | "alternative"
+  | "unresolved"
+  | "noEligibleCandidate"
+  | "resourceBlocked"
+  | "evidenceBlocked"
+  | "infrastructureFailed"
+  | "cancelled";
 
-interface ResolvedGlobalCandidate extends StagedPairwiseCandidate {
-  adopted: boolean;
-  globalMessage: string;
+interface NativeFineDisposition {
+  kind: NativeFineDispositionKind;
+  taskState: BatchTaskState;
+  message: string;
+  reason: string | null;
 }
-
-interface GlobalBatchResolution {
-  candidates: ResolvedGlobalCandidate[];
-  adoptedCount: number;
-  blockedCount: number;
-}
-
-const INCOMPLETE_GLOBAL_ASSIGNMENT_REASON =
-  "批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。";
 
 export function MediaMatchingPanel({
   project,
@@ -301,12 +300,6 @@ export function MediaMatchingPanel({
     const pendingPairs = pairs.filter(
       (pair) => !existingPairKeys.has(createMediaPairKey(pair.source.id, pair.target.id))
     );
-    const sourceOrderById = new Map(
-      selectedSources.map((media) => [media.id, semanticEpisodeOrderHint(media)] as const)
-    );
-    const targetOrderById = new Map(
-      selectedTargets.map((media) => [media.id, semanticEpisodeOrderHint(media)] as const)
-    );
     const batchId = createId("media_match_batch");
     const initialTasks: BatchTask[] = pairs.map(({ source, target, id }) => ({
       id,
@@ -339,7 +332,6 @@ export function MediaMatchingPanel({
     setRunning(true);
     cancelRequestedRef.current = false;
     const settings = loadAppSettings().alignment;
-    const stagedCandidates: StagedPairwiseCandidate[] = [];
     let contextInvalidated = false;
     const isBatchContextCurrent = () => {
       if (!isRunCurrent()) {
@@ -531,6 +523,9 @@ export function MediaMatchingPanel({
         pairSnapshot
       ])
     );
+    let confirmableCount = 0;
+    let blockedCount = 0;
+    let noEligibleCount = 0;
     let failedCount = 0;
     let cancelledCount = 0;
     for (const pair of pendingPairs) {
@@ -549,36 +544,33 @@ export function MediaMatchingPanel({
         }
         continue;
       }
-      if (pairSnapshot.status === "failed") {
-        failedCount += 1;
-        updateTask(pair.id, batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot.jobId));
-        continue;
-      }
-      if (pairSnapshot.status === "cancelled") {
+      const disposition = describeNativeFineDisposition(pairSnapshot, snapshot.status);
+      if (disposition.kind === "confirmable") {
+        confirmableCount += 1;
+      } else if (disposition.kind === "noEligibleCandidate") {
+        noEligibleCount += 1;
+      } else if (disposition.kind === "cancelled") {
         cancelledCount += 1;
-        updateTask(pair.id, batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot.jobId));
-        continue;
+      } else if (
+        disposition.kind === "resourceBlocked" ||
+        disposition.kind === "infrastructureFailed"
+      ) {
+        failedCount += 1;
+      } else {
+        blockedCount += 1;
       }
-      if (pairSnapshot.status !== "completed") {
-        if (cancelRequestedRef.current) {
-          cancelledCount += 1;
-          updateTask(pair.id, { state: "cancelled", progress: 1, message: "未完成，已停止" });
-        } else {
-          failedCount += 1;
-          updateTask(pair.id, {
-            state: "failed",
-            progress: 1,
-            message: batchFailure ?? "这组素材未能完成分析"
-          });
-        }
-        continue;
-      }
-      if (!pairSnapshot.proposal?.matchRange) {
-        updateTask(pair.id, {
-          state: "notFound",
-          progress: 1,
-          message: "没有找到可信对应片段"
-        });
+      const matchRange = pairSnapshot.proposal?.matchRange ?? null;
+      const taskMessage =
+        disposition.kind === "confirmable" && matchRange
+          ? `${pair.target.name} ← ${pair.source.name} ${formatTimecode(matchRange.sourceStartMs)}–${formatTimecode(matchRange.sourceEndMs)}；已唯一确定，等待逐项确认`
+          : disposition.message;
+      updateTask(pair.id, {
+        state: disposition.taskState,
+        progress: 1,
+        message: taskMessage,
+        jobId: snapshot.jobId
+      });
+      if (disposition.kind !== "confirmable" || !pairSnapshot.proposal?.matchRange) {
         continue;
       }
       const currentProject = useEditorStore.getState().project;
@@ -593,42 +585,28 @@ export function MediaMatchingPanel({
         targetMediaId: pair.target.id,
         proposal
       });
-      stagedCandidates.push({
-        pairId: pair.id,
-        candidate,
-        sourceOrderHint: sourceOrderById.get(pair.source.id) ?? null,
-        targetOrderHint: targetOrderById.get(pair.target.id) ?? null
-      });
-      updateTask(pair.id, {
-        state: "found",
-        progress: 1,
-        message: `已找到 ${formatTimecode(candidate.sourceStartMs)}–${formatTimecode(candidate.sourceEndMs)}，正在与整批结果比较`
-      });
+      addCandidate(
+        appendCandidateDiagnostic(
+          candidate,
+          "原生精匹配：组件最终分配已解析，当前候选由后端选定。"
+        )
+      );
     }
-    const globalAssignmentComplete =
-      snapshot.status === "completed" &&
-      snapshot.processedPairCount === snapshot.totalPairCount &&
-      snapshot.failedPairCount === 0 &&
-      failedCount === 0 &&
-      cancelledCount === 0;
-    const globalResolution = resolveGlobalBatch(stagedCandidates, globalAssignmentComplete);
-    globalResolution.candidates.forEach((resolved) => {
-      addCandidate(resolved.candidate);
-      updateTask(resolved.pairId, {
-        state: "found",
-        progress: 1,
-        message: resolved.globalMessage
-      });
-    });
-    const batchSummary = globalAssignmentComplete
-      ? `找到 ${stagedCandidates.length} 组可能对应片段，其中 ${globalResolution.adoptedCount} 组建议优先复核，${globalResolution.blockedCount} 组需要额外复核`
-      : `找到 ${stagedCandidates.length} 组可能对应片段，全部保留为额外复核；批次未完整，不能形成全局最优组合`;
+    const batchSummary = [
+      `${confirmableCount} 组可逐项确认`,
+      blockedCount > 0 ? `${blockedCount} 组暂不可确认` : null,
+      noEligibleCount > 0 ? `${noEligibleCount} 组没有可用候选` : null,
+      failedCount > 0 ? `${failedCount} 组未完成分析` : null,
+      cancelledCount > 0 ? `${cancelledCount} 组已取消` : null
+    ]
+      .filter((part): part is string => part !== null)
+      .join("，");
     const cancelled =
       snapshot.status === "cancelled" ||
       (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status));
     if (cancelled) {
       setEditorStatus(
-        `批量匹配已取消：已完成结果中${batchSummary}；${cancelledCount} 组未完成。`,
+        `批量匹配已取消：${batchSummary}。已取消结果不会发布为可确认关系。`,
         "warning"
       );
     } else {
@@ -637,10 +615,8 @@ export function MediaMatchingPanel({
       setEditorStatus(
         `${summaryPrefix}：${batchSummary}${
           skippedCount > 0 ? `，跳过 ${skippedCount} 组已有结果` : ""
-        }${failedCount > 0 ? `，${failedCount} 组未能完成分析` : ""}${
-          batchFailure ? `；${batchFailure}` : ""
-        }。`,
-        snapshot.status === "failed" || failedCount > 0 || globalResolution.blockedCount > 0
+        }${batchFailure ? `；${batchFailure}` : ""}。`,
+        snapshot.status === "failed" || failedCount > 0 || blockedCount > 0
           ? "warning"
           : "success"
       );
@@ -709,18 +685,23 @@ export function MediaMatchingPanel({
         </span>
       </div>
       <p className="mt-2 leading-5 text-slate-500">
-        直接使用素材页导入的视频寻找可能对应的片段。自动结果只进入候选队列，请逐项检查参考范围、原片起点和删减修正后再决定是否确认。
+        直接使用素材页已导入的视频批量寻找对应关系。只有原生精匹配已经唯一确定的结果才会进入候选队列，并且仍需逐项检查后手动确认。
       </p>
       <div
         role="alert"
         data-testid="legacy-alignment-warning"
         className="mt-3 rounded border border-amber-400/40 bg-amber-400/10 p-3 leading-5 text-amber-100"
       >
-        <div className="font-medium">实验性定位线索</div>
+        <div className="font-medium">未决结果不会进入候选</div>
         <p className="mt-1">
-          当前旧对齐引擎尚未通过真实媒体精度基准，旧引擎分数未经校准。Alignment V2
-          也尚未在冻结真实媒体集完成校准。请以每张卡片的质量等级、实测指标和导出闸门为准；范围、起点和删减修正仍必须逐项试听或预览复核，自动结果不能直接作为导出依据。
+          无法唯一确定、可用资源不足、运行环境失败或已取消的组合，会在任务结果中说明原因且无法确认。自动结果不会直接改变导出；范围、起点和删减修正仍需逐项试听或预览复核。
         </p>
+        <details className="mt-2 text-[11px] text-amber-100/80">
+          <summary className="cursor-pointer">技术说明</summary>
+          <p className="mt-1">
+            候选发布只服从原生 Evidence v3 的组件最终分配与精执行证据绑定；旧的 coarse globalSelection 仅保留为诊断信息，前端不会再次求解。
+          </p>
+        </details>
       </div>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
@@ -825,162 +806,166 @@ function batchTaskPatchFromPairSnapshot(
   if (snapshot.status === "cancelled") {
     return { ...base, state: "cancelled", progress: 1, message: "未完成，已停止" };
   }
-  if (!snapshot.proposal?.matchRange) {
-    return { ...base, state: "notFound", progress: 1, message: "没有找到可信对应片段" };
+  if (!snapshot.fineFrontier) {
+    return {
+      ...base,
+      state: "running",
+      progress: Math.min(snapshot.progress, 0.99),
+      message: "精匹配已执行，正在等待原生组件最终裁决"
+    };
   }
+  const disposition = describeNativeFineDisposition(snapshot, "completed");
   return {
     ...base,
-    state: "found",
+    state: disposition.taskState,
     progress: 1,
-    message: `已找到 ${formatTimecode(snapshot.proposal.matchRange.sourceStartMs)}–${formatTimecode(snapshot.proposal.matchRange.sourceEndMs)}，等待整批比较`
+    message: disposition.message
   };
 }
 
-function resolveGlobalBatch(
-  stagedCandidates: readonly StagedPairwiseCandidate[],
-  globalAssignmentComplete: boolean
-): GlobalBatchResolution {
-  if (stagedCandidates.length === 0) {
-    return { candidates: [], adoptedCount: 0, blockedCount: 0 };
+function describeNativeFineDisposition(
+  snapshot: AudioAlignmentBatchPairSnapshot,
+  batchStatus: AudioAlignmentBatchJobSnapshot["status"]
+): NativeFineDisposition {
+  if (batchStatus === "cancelled" || snapshot.status === "cancelled") {
+    const reason = "这组没有完成分析：任务已取消；取消结果不会用于确认。";
+    return { kind: "cancelled", taskState: "cancelled", message: reason, reason };
   }
-  if (!globalAssignmentComplete) {
-    return {
-      candidates: stagedCandidates.map((staged) => {
-        const rangeText = `${formatTimecode(staged.candidate.sourceStartMs)}–${formatTimecode(staged.candidate.sourceEndMs)}`;
-        return {
-          ...staged,
-          adopted: false,
-          candidate: blockCandidateForGlobalReview(
-            staged.candidate,
-            INCOMPLETE_GLOBAL_ASSIGNMENT_REASON
-          ),
-          globalMessage: `已找到 ${rangeText}；批次未完整，不能形成全局最优组合，已保留供人工复核`
-        };
-      }),
-      adoptedCount: 0,
-      blockedCount: stagedCandidates.length
-    };
-  }
-  const assignment = assignGlobalMediaMatches(
-    stagedCandidates.map(createGlobalMatchHypothesis)
-  );
-  const selectedIds = new Set(assignment.selectedIds);
-  const rejectionById = new Map(
-    assignment.rejected.map((rejection) => [rejection.id, rejection] as const)
-  );
-  const runnerUpIds = new Set(assignment.runnerUpIds ?? []);
-  const ambiguityCandidateIds = new Set<string>();
-  if (assignment.ambiguous) {
-    if (assignment.runnerUpIds === null) {
-      stagedCandidates.forEach((staged) => ambiguityCandidateIds.add(staged.candidate.id));
-    } else {
-      stagedCandidates.forEach((staged) => {
-        const id = staged.candidate.id;
-        if (selectedIds.has(id) !== runnerUpIds.has(id)) {
-          ambiguityCandidateIds.add(id);
-        }
-      });
-    }
-  }
-  const ambiguityReason = assignment.ambiguous
-    ? `两套可行组合的把握接近（差距 ${formatQualityRatio(assignment.normalizedMargin)}），目前无法唯一确定，需人工复核。`
-    : null;
-  let adoptedCount = 0;
-  const candidates = stagedCandidates.map((staged): ResolvedGlobalCandidate => {
-    const isAmbiguousAlternative = ambiguityCandidateIds.has(staged.candidate.id);
-    const adopted = selectedIds.has(staged.candidate.id) && !isAmbiguousAlternative;
-    const rangeText = `${formatTimecode(staged.candidate.sourceStartMs)}–${formatTimecode(staged.candidate.sourceEndMs)}`;
-    if (adopted) {
-      adoptedCount += 1;
-      return {
-        ...staged,
-        adopted: true,
-        candidate: appendCandidateDiagnostic(
-          staged.candidate,
-          "全局分配：进入当前求解得到的无冲突组合。"
-        ),
-        globalMessage: `已找到 ${rangeText}；建议优先复核`
-      };
-    }
-
-    const rejection = rejectionById.get(staged.candidate.id);
+  const failureText = `${snapshot.error ?? ""} ${snapshot.message}`;
+  if (snapshot.status === "failed" && isResourceLimitedFineFailure(failureText)) {
     const reason =
-      (isAmbiguousAlternative ? ambiguityReason : null) ??
-      describeGlobalRejection(
-        rejection?.reason ?? "notInBestCombination",
-        rejection?.conflictsWith.length ?? 0
-      );
-    const resolvedCandidate =
-      rejection?.reason === "blocked"
-        ? staged.candidate
-        : blockCandidateForGlobalReview(staged.candidate, reason);
-    const globalMessage =
-      rejection?.reason === "blocked"
-        ? `已找到 ${rangeText}；证据不足，暂不建议采用`
-        : `已找到 ${rangeText}；与其他结果冲突，作为备选保留：${reason}`;
+      "这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。";
+    return { kind: "resourceBlocked", taskState: "failed", message: reason, reason };
+  }
+  if (batchStatus === "failed" || snapshot.status === "failed") {
+    const reason =
+      "这组没有完成分析：原生精匹配的运行环境或证据链失败。请检查 FFmpeg、GPU 环境和任务日志后重试。";
+    return { kind: "infrastructureFailed", taskState: "failed", message: reason, reason };
+  }
+  if (snapshot.status !== "completed") {
+    const reason = "这组没有完成分析：未收到原生精匹配终态。";
+    return { kind: "infrastructureFailed", taskState: "failed", message: reason, reason };
+  }
+
+  const frontier = snapshot.fineFrontier;
+  if (!frontier) {
+    const reason = "这组没有完成分析：缺少原生精匹配最终裁决证据。";
+    return { kind: "infrastructureFailed", taskState: "failed", message: reason, reason };
+  }
+  if (frontier.finalState === "noEligibleCandidate") {
     return {
-      ...staged,
-      adopted: false,
-      // A central quality block can be resolved by the existing per-span review workflow.
-      // Do not add a second, persistent global blocker that manual review cannot clear.
-      candidate: resolvedCandidate,
-      globalMessage
+      kind: "noEligibleCandidate",
+      taskState: "notFound",
+      message: "原生精匹配已完整评估，但没有可用的对应候选。",
+      reason: null
     };
-  });
-  return {
-    candidates,
-    adoptedCount,
-    blockedCount: candidates.length - adoptedCount
-  };
+  }
+
+  const execution = snapshot.fineExecutionEvidence;
+  const candidateId = execution?.candidateId ?? null;
+  const selectedByFinalAssignment =
+    candidateId !== null &&
+    frontier.selectedCandidateIds.some((id) => sameFineCandidateId(id, candidateId)) &&
+    frontier.bestCompleted.candidateIds.some((id) => sameFineCandidateId(id, candidateId));
+  const selectionReceiptConsistent =
+    frontier.selectedTotalScoreMicros === frontier.bestCompleted.totalScoreMicros &&
+    sameFineCandidateIdSet(
+      frontier.selectedCandidateIds,
+      frontier.bestCompleted.candidateIds
+    );
+  const componentBindsPair = frontier.componentPairOrdinals.includes(snapshot.pairOrdinal);
+  const executionBindsPair = candidateId?.pairOrdinal === snapshot.pairOrdinal;
+  const proposalTimeMap = snapshot.proposal?.timeMap ?? null;
+  const executionBindsProposal =
+    proposalTimeMap !== null &&
+    execution !== null &&
+    createAudioAlignmentBatchProposalTimeMapDigest(proposalTimeMap) ===
+      execution.proposalTimeMapDigest;
+  if (
+    frontier.resolved &&
+    frontier.finalState === "resolved" &&
+    selectedByFinalAssignment &&
+    selectionReceiptConsistent &&
+    componentBindsPair &&
+    executionBindsPair &&
+    executionBindsProposal &&
+    snapshot.proposal?.matchRange
+  ) {
+    const range = snapshot.proposal.matchRange;
+    return {
+      kind: "confirmable",
+      taskState: "found",
+      message: `${snapshot.targetMediaId} ← ${snapshot.sourceMediaId} ${formatTimecode(range.sourceStartMs)}–${formatTimecode(range.sourceEndMs)}；已唯一确定，等待逐项确认`,
+      reason: null
+    };
+  }
+
+  if (frontier.resolved && frontier.finalState === "resolved") {
+    if (selectedByFinalAssignment) {
+      const reason =
+        "原生精匹配结果的候选、组件裁决或 TimeMap 绑定校验未通过；为避免错配，本组不能确认。";
+      return { kind: "evidenceBlocked", taskState: "unresolved", message: reason, reason };
+    }
+    const reason =
+      "原生最终分配采用了同一组件中的另一组关系；当前结果只作为不可确认备选。";
+    return { kind: "alternative", taskState: "unresolved", message: reason, reason };
+  }
+
+  const stateCounts = frontier.inventoryStateCounts;
+  if (stateCounts.resourceBlocked > 0) {
+    const reason =
+      "这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。";
+    return { kind: "resourceBlocked", taskState: "failed", message: reason, reason };
+  }
+  if (frontier.finalState === "failed" || stateCounts.infrastructureFailed > 0) {
+    const reason =
+      "这组没有完成分析：原生精匹配的运行环境或证据链失败。请检查 FFmpeg、GPU 环境和任务日志后重试。";
+    return { kind: "infrastructureFailed", taskState: "failed", message: reason, reason };
+  }
+  if (stateCounts.cancelled > 0) {
+    const reason = "这组没有完成分析：任务已取消；取消结果不会用于确认。";
+    return { kind: "cancelled", taskState: "cancelled", message: reason, reason };
+  }
+  if (stateCounts.evidenceBlocked > 0) {
+    const reason = "原生精匹配证据未通过完整性检查；本组不能确认。";
+    return { kind: "evidenceBlocked", taskState: "unresolved", message: reason, reason };
+  }
+  const candidateCount = Math.max(1, frontier.inventoryCandidateCount);
+  const reason = `发现 ${candidateCount} 个接近位置，原生精匹配暂时不能唯一确定；本组不能确认。`;
+  return { kind: "unresolved", taskState: "unresolved", message: reason, reason };
 }
 
-function createGlobalMatchHypothesis(staged: StagedPairwiseCandidate): GlobalMatchHypothesis {
-  const { candidate } = staged;
-  const timeMap = candidate.proposal.timeMap;
-  const quality = timeMap?.quality;
-  return {
-    id: candidate.id,
-    alternativeGroupId: createMediaPairKey(candidate.sourceMediaId, candidate.targetMediaId),
-    sourceMediaId: candidate.sourceMediaId,
-    targetMediaId: candidate.targetMediaId,
-    sourceStartMs: timeMap?.sourceStartMs ?? candidate.sourceStartMs,
-    sourceEndMs: timeMap?.sourceEndMs ?? candidate.sourceEndMs,
-    targetStartMs: timeMap?.targetStartMs ?? candidate.targetStartMs,
-    targetEndMs: timeMap?.targetEndMs ?? candidate.targetEndMs,
-    score: clampUnitScore(quality?.probability ?? quality?.coverage ?? candidate.confidence),
-    uniqueCoverage: clampUnitScore(
-      timeMap?.evidence.uniqueContentCoverage ??
-        quality?.coverage ??
-        candidate.proposal.matchRange?.coverage ??
-        0
-    ),
-    alternativeMargin: clampUnitScore(quality?.alternativeMargin ?? 0),
-    repeatedContentOnly: timeMap?.evidence.repeatedContentOnly ?? false,
-    // A reviewable ambiguous span is a candidate result, not a globally invalid hypothesis.
-    // Only the central quality gate may exclude the whole hypothesis before assignment.
-    blocked: quality?.level === "blocked",
-    sourceOrderHint: staged.sourceOrderHint,
-    targetOrderHint: staged.targetOrderHint
-  };
+function sameFineCandidateId(
+  left: AudioAlignmentBatchFineCandidateIdSnapshot,
+  right: AudioAlignmentBatchFineCandidateIdSnapshot
+): boolean {
+  return (
+    left.pairOrdinal === right.pairOrdinal &&
+    left.candidateOrdinal === right.candidateOrdinal
+  );
 }
 
-function describeGlobalRejection(
-  reason: GlobalAssignmentRejectionReason,
-  conflictCount: number
-): string {
-  if (reason === "samePairAlternative") {
-    return `同一素材组合只能采用一个定位答案；此项与 ${conflictCount} 个已采用答案互斥，已保留供复核。`;
-  }
-  if (reason === "sourceOverlap") {
-    return `同一参考时间范围冲突（与 ${conflictCount} 个优先结果冲突），此项需单独复核。`;
-  }
-  if (reason === "targetOverlap") {
-    return `同一原片时间范围冲突（与 ${conflictCount} 个优先结果冲突），此项需单独复核。`;
-  }
-  if (reason === "blocked") {
-    return "这组定位证据不足，暂不建议采用。";
-  }
-  return "另一个整体组合更可信，此结果已作为备选保留。";
+function sameFineCandidateIdSet(
+  left: readonly AudioAlignmentBatchFineCandidateIdSnapshot[],
+  right: readonly AudioAlignmentBatchFineCandidateIdSnapshot[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((leftId) => right.some((rightId) => sameFineCandidateId(leftId, rightId)))
+  );
+}
+
+function isResourceLimitedFineFailure(message: string): boolean {
+  const normalized = message.toLocaleLowerCase("en-US");
+  return (
+    normalized.includes("blocked:resource-limit") ||
+    normalized.includes("resourceblocked") ||
+    normalized.includes("resource blocked") ||
+    normalized.includes("out of memory") ||
+    normalized.includes("memory budget") ||
+    normalized.includes("资源不足") ||
+    normalized.includes("资源上限")
+  );
 }
 
 function appendCandidateDiagnostic(
@@ -996,105 +981,8 @@ function appendCandidateDiagnostic(
   };
 }
 
-function blockCandidateForGlobalReview(
-  candidate: MediaMatchCandidate,
-  reason: string
-): MediaMatchCandidate {
-  const existingTimeMap = candidate.proposal.timeMap;
-  const timeMap: NonNullable<MediaMatchCandidate["proposal"]["timeMap"]> = existingTimeMap
-    ? {
-        ...existingTimeMap,
-        quality: {
-          ...existingTimeMap.quality,
-          level: "blocked",
-          probability: null,
-          reasons: appendUniqueText(existingTimeMap.quality.reasons, reason)
-        },
-        evidence: {
-          ...existingTimeMap.evidence,
-          notes: appendUniqueText(existingTimeMap.evidence.notes, reason)
-        }
-      }
-    : createLegacyGlobalBlockTimeMap(candidate, reason);
-  return {
-    ...candidate,
-    state: "blocked",
-    proposal: {
-      ...candidate.proposal,
-      diagnostics: appendUniqueText(candidate.proposal.diagnostics, `全局分配阻断：${reason}`),
-      timeMap
-    }
-  };
-}
-
-function createLegacyGlobalBlockTimeMap(
-  candidate: MediaMatchCandidate,
-  reason: string
-): NonNullable<MediaMatchCandidate["proposal"]["timeMap"]> {
-  const coverage = candidate.proposal.matchRange?.coverage ?? null;
-  return {
-    sourceStartMs: candidate.sourceStartMs,
-    sourceEndMs: candidate.sourceEndMs,
-    targetStartMs: candidate.targetStartMs,
-    targetEndMs: candidate.targetEndMs,
-    spans: [
-      normalizeLegacyUnverifiedTimeMapSpanEvidence({
-        kind: "ambiguous",
-        sourceStartMs: candidate.sourceStartMs,
-        sourceEndMs: candidate.sourceEndMs,
-        targetStartMs: candidate.targetStartMs,
-        targetEndMs: candidate.targetEndMs
-      }, {
-        id: `${candidate.id}:global-guard:span:0001`,
-        blocked: true,
-        reason
-      })
-    ],
-    quality: {
-      level: "blocked",
-      probability: null,
-      metricSource: coverage === null ? "missing" : "estimated",
-      coverage,
-      uniqueContentCoverage: null,
-      p50ResidualMs: null,
-      p95ResidualMs: null,
-      p99ResidualMs: null,
-      maxResidualMs: null,
-      boundaryUncertaintyMs: null,
-      alternativeMargin: null,
-      anchorCount: candidate.proposal.anchors.length,
-      anchorRegionCount: 0,
-      heldOutAnchorCount: 0,
-      reasons: [reason]
-    },
-    evidence: {
-      types: ["legacy"],
-      audioAnchorCount: 0,
-      visualAnchorCount: 0,
-      heldOutAnchorCount: 0,
-      top1Top2Margin: null,
-      uniqueContentCoverage: null,
-      repeatedContentOnly: false,
-      selectedTrackReason: "旧式全局保护候选没有可信音轨选择证据。",
-      alternativeTrackScores: [],
-      notes: [reason]
-    },
-    sourceStream: null,
-    targetStream: null,
-    sourceIdentity: null,
-    targetIdentity: null,
-    engineVersion: "legacy-global-guard-v1",
-    featureVersion: "legacy-global-guard-v1",
-    parametersHash: `legacy-global-guard:${candidate.id}`
-  };
-}
-
 function appendUniqueText(lines: readonly string[], line: string): string[] {
   return lines.includes(line) ? [...lines] : [...lines, line];
-}
-
-function clampUnitScore(value: number): number {
-  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
 }
 
 function MediaChoiceList({
@@ -1162,7 +1050,7 @@ function BatchTaskList({ tasks, project }: { tasks: BatchTask[]; project: Editor
           >
             <div className="min-w-0">
               <div className="truncate text-slate-300">
-                {source?.name ?? task.sourceMediaId} → {target?.name ?? task.targetMediaId}
+                {target?.name ?? task.targetMediaId} ← {source?.name ?? task.sourceMediaId}
               </div>
               <div
                 className={
@@ -1325,24 +1213,19 @@ function MediaMatchCandidateCard({
       <div className="flex flex-wrap items-start gap-2">
         <div className="min-w-0 flex-1">
           <div className="font-medium text-slate-100">
-            {source?.name ?? candidate.sourceMediaId} →{" "}
-            {target?.name ?? candidate.targetMediaId}
+            {target?.name ?? candidate.targetMediaId} ←{" "}
+            {source?.name ?? candidate.sourceMediaId}{" "}
+            {formatTimecode(candidate.sourceStartMs)}–{formatTimecode(candidate.sourceEndMs)}
           </div>
           <div className="mt-1 text-[11px] text-slate-500">
-            参考 {formatTimecode(candidate.sourceStartMs)}–
-            {formatTimecode(candidate.sourceEndMs)} 对应原片{" "}
-            {formatTimecode(candidate.targetStartMs)} 起
+            原片对应范围 {formatTimecode(candidate.targetStartMs)}–
+            {formatTimecode(candidate.targetEndMs)}
           </div>
         </div>
         <span
           className={`rounded border px-2 py-0.5 text-[11px] ${candidateStateClass(candidate.state, displayedTimeMapGate.exportReady)}`}
         >
           {candidateStateText(candidate, displayedTimeMapGate.exportReady)}
-        </span>
-        <span className="rounded border border-panel-line px-2 py-0.5 text-[11px] text-slate-400">
-          {candidate.proposal.timeMap
-            ? `定位线索分数 ${Math.round(candidate.confidence * 100)}% · 不是校准概率`
-            : `旧引擎分数 ${Math.round(candidate.confidence * 100)}% · 未校准`}
         </span>
       </div>
 
@@ -1437,6 +1320,11 @@ function MediaMatchCandidateCard({
       <details className="mt-3 rounded border border-panel-line/70 bg-black/10 p-2 text-[11px] text-slate-500">
         <summary className="cursor-pointer">匹配证据与诊断</summary>
         <div className="mt-2 grid gap-1">
+          <div>
+            {candidate.proposal.timeMap
+              ? `定位线索分数 ${Math.round(candidate.confidence * 100)}% · 不是校准概率`
+              : `旧引擎分数 ${Math.round(candidate.confidence * 100)}% · 未校准`}
+          </div>
           <div>覆盖率：{Math.round((candidate.proposal.matchRange?.coverage ?? 0) * 100)}%</div>
           <div>
             同步线索：{candidate.proposal.anchors.length} 个；删减修正：
@@ -2554,18 +2442,6 @@ function toggleId(ids: string[], id: string): string[] {
   return ids.includes(id) ? ids.filter((candidate) => candidate !== id) : [...ids, id];
 }
 
-function semanticEpisodeOrderHint(media: ProjectMediaReference): number | null {
-  // Ordering is only a soft prior when the project carries explicit episode semantics. Import
-  // array order and file names are not authoritative and must not silently steer assignment.
-  const match = media.episodeKey?.match(/^(?:S(\d+))?E(\d+)(?::|$)/i);
-  if (!match) {
-    return null;
-  }
-  const season = match[1] ? Number.parseInt(match[1], 10) : 0;
-  const episode = Number.parseInt(match[2], 10);
-  return season * 100_000 + episode;
-}
-
 function createMediaPairKey(sourceMediaId: string, targetMediaId: string): string {
   return `${sourceMediaId}\u0000${targetMediaId}`;
 }
@@ -2574,6 +2450,7 @@ function batchTaskStateText(state: BatchTaskState): string {
   if (state === "waiting") return "等待";
   if (state === "running") return "分析中";
   if (state === "found") return "已找到";
+  if (state === "unresolved") return "暂不可确认";
   if (state === "notFound") return "未找到";
   if (state === "cancelled") return "已取消";
   return "失败";

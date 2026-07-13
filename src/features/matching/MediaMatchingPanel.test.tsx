@@ -41,11 +41,17 @@ import {
 import {
   cancelTauriAudioAlignmentBatchJob,
   cancelTauriAudioAlignmentJob,
+  AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION,
+  AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
   AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+  createAudioAlignmentBatchProposalTimeMapDigest,
   getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
   startTauriAudioAlignmentBatchJob,
   startTauriAudioAlignmentJob,
+  type AudioAlignmentBatchFineExecutionEvidenceSnapshot,
+  type AudioAlignmentBatchFineFrontierReceiptSnapshot,
+  type AudioAlignmentBatchFineStateCountsSnapshot,
   type AudioAlignmentBatchJobSnapshot,
   type AudioAlignmentJobSnapshot
 } from "../../infrastructure/alignment/tauriAudioAlignment";
@@ -91,8 +97,16 @@ interface LegacyBatchPairState {
   snapshot: AudioAlignmentJobSnapshot;
 }
 
+interface TestFineBatchOptions {
+  finalState?: AudioAlignmentBatchFineFrontierReceiptSnapshot["finalState"];
+  selectedPairOrdinals?: readonly number[];
+  stateCounts?: Partial<AudioAlignmentBatchFineStateCountsSnapshot>;
+  inventoryCandidateCount?: number;
+}
+
 const legacyBatchJobs = new Map<string, LegacyBatchPairState[]>();
 let legacyBatchSequence = 0;
+let testFineBatchOptions: TestFineBatchOptions | null = null;
 
 function installLegacyPairwiseBatchAdapter(): void {
   vi.mocked(startTauriAudioAlignmentBatchJob).mockImplementation(async (request) => {
@@ -191,7 +205,8 @@ function installLegacyPairwiseBatchAdapter(): void {
 
 function createLegacyBatchSnapshot(
   jobId: string,
-  pairs: readonly LegacyBatchPairState[]
+  pairs: readonly LegacyBatchPairState[],
+  fineOptions: TestFineBatchOptions | null = testFineBatchOptions
 ): AudioAlignmentBatchJobSnapshot {
   const sourceMediaIds = [...new Set(pairs.map((pair) => pair.sourceMediaId))];
   const targetMediaIds = [...new Set(pairs.map((pair) => pair.targetMediaId))];
@@ -204,9 +219,10 @@ function createLegacyBatchSnapshot(
   const processedPairCount = pairs.filter(
     (pair) => pair.snapshot.status === "completed" || pair.snapshot.status === "failed"
   ).length;
+  const fineFrontier = createTestFineFrontier(pairs, status, fineOptions ?? {});
   return {
     schemaVersion: 1,
-    evidenceVersion: 2,
+    evidenceVersion: 3,
     jobId,
     pairingMode: "explicit",
     sourceMediaIds,
@@ -230,27 +246,218 @@ function createLegacyBatchSnapshot(
       pairs.findIndex(
         (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
       ) + 1 || null,
-    pairs: pairs.map((pair, index) => ({
-      pairIndex: index,
-      pairOrdinal: index + 1,
-      sourceMediaId: pair.sourceMediaId,
-      targetMediaId: pair.targetMediaId,
-      status: pair.snapshot.status,
-      progress: pair.snapshot.progress,
-      message: pair.snapshot.message,
-      relationRanking: createTestBatchRelationRanking(
-        pair.snapshot.status,
-        pair.snapshot.proposal
-      ),
-      globalSelection: createTestBatchGlobalSelection(
-        pair.snapshot.status,
-        pair.snapshot.proposal
-      ),
-      proposal: pair.snapshot.proposal,
-      error: pair.snapshot.error
-    })),
+    pairs: pairs.map((pair, index) => {
+      const proposal = createTestFineCompatibleProposal(pair.snapshot.proposal);
+      return {
+        pairIndex: index,
+        pairOrdinal: index + 1,
+        sourceMediaId: pair.sourceMediaId,
+        targetMediaId: pair.targetMediaId,
+        status: pair.snapshot.status,
+        progress: pair.snapshot.progress,
+        message: pair.snapshot.message,
+        relationRanking: createTestBatchRelationRanking(pair.snapshot.status, proposal),
+        globalSelection: createTestBatchGlobalSelection(pair.snapshot.status, proposal),
+        fineFrontier:
+          pair.snapshot.status === "completed" && status !== "running" ? fineFrontier : null,
+        fineExecutionEvidence:
+          pair.snapshot.status === "completed" && status !== "running" && proposal?.timeMap
+          && fineFrontier.selectedCandidateIds.some(
+            (candidateId) => candidateId.pairOrdinal === index + 1
+          )
+            ? createTestFineExecutionEvidence(index + 1, proposal)
+            : null,
+        proposal,
+        error: pair.snapshot.error
+      };
+    }),
     error: null,
     updatedAtMs: Math.max(1, ...pairs.map((pair) => pair.snapshot.updatedAtMs))
+  };
+}
+
+function createTestFineCompatibleProposal(
+  proposal: AlignmentProposal | null
+): AlignmentProposal | null {
+  if (!proposal || proposal.timeMap || !proposal.matchRange) {
+    return proposal;
+  }
+  const range = proposal.matchRange;
+  const template = createV2Proposal(range.sourceStartMs, "review").timeMap;
+  if (!template) {
+    throw new Error("测试 V2 TimeMap 模板缺失");
+  }
+  return {
+    ...proposal,
+    timeMap: {
+      ...template,
+      sourceStartMs: range.sourceStartMs,
+      sourceEndMs: range.sourceEndMs,
+      targetStartMs: range.targetStartMs,
+      targetEndMs: range.targetEndMs,
+      spans: [
+        createProposalSpan(
+          {
+            kind: "matched",
+            sourceStartMs: range.sourceStartMs,
+            sourceEndMs: range.sourceEndMs,
+            targetStartMs: range.targetStartMs,
+            targetEndMs: range.targetEndMs
+          },
+          `fine-fixture-${range.sourceStartMs}:span:0001`,
+          "review"
+        )
+      ]
+    }
+  };
+}
+
+function createTestFineFrontier(
+  pairs: readonly LegacyBatchPairState[],
+  batchStatus: AudioAlignmentBatchJobSnapshot["status"],
+  options: TestFineBatchOptions
+): AudioAlignmentBatchFineFrontierReceiptSnapshot {
+  const candidatePairOrdinals = pairs.flatMap((pair, index) =>
+    pair.snapshot.status === "completed" && pair.snapshot.proposal?.matchRange
+      ? [index + 1]
+      : []
+  );
+  const hasFailedPair = pairs.some((pair) => pair.snapshot.status === "failed");
+  const finalState =
+    options.finalState ??
+    (batchStatus === "cancelled"
+      ? "unresolved"
+      : hasFailedPair
+        ? "failed"
+        : candidatePairOrdinals.length === 0
+          ? "noEligibleCandidate"
+          : "resolved");
+  const resolved = finalState === "resolved";
+  const selectedPairOrdinals = resolved
+    ? (options.selectedPairOrdinals ?? candidatePairOrdinals).filter((ordinal) =>
+        candidatePairOrdinals.includes(ordinal)
+      )
+    : [];
+  const selectedCandidateIds = selectedPairOrdinals.map((pairOrdinal) => ({
+    pairOrdinal,
+    candidateOrdinal: 1
+  }));
+  const totalScoreMicros = selectedPairOrdinals.reduce((sum, pairOrdinal) => {
+    const confidence = pairs[pairOrdinal - 1]?.snapshot.proposal?.confidence ?? 0;
+    return sum + Math.round(confidence * 1_000_000);
+  }, 0);
+  const inventoryCandidateCount =
+    options.inventoryCandidateCount ?? Math.max(candidatePairOrdinals.length, 1);
+  const defaultStateCounts: AudioAlignmentBatchFineStateCountsSnapshot = {
+    unresolved: finalState === "unresolved" ? inventoryCandidateCount : 0,
+    scored: resolved ? candidatePairOrdinals.length : 0,
+    evaluatedIneligible: finalState === "noEligibleCandidate" ? inventoryCandidateCount : 0,
+    evidenceBlocked: 0,
+    resourceBlocked: 0,
+    infrastructureFailed: finalState === "failed" ? 1 : 0,
+    cancelled: batchStatus === "cancelled" ? inventoryCandidateCount : 0
+  };
+  const inventoryStateCounts = { ...defaultStateCounts, ...options.stateCounts };
+  const unresolvedCandidateIds =
+    finalState === "unresolved"
+      ? candidatePairOrdinals.map((pairOrdinal) => ({ pairOrdinal, candidateOrdinal: 1 }))
+      : [];
+  return {
+    contractVersion: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION,
+    scoreVersion: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+    inventoryDigest: `sha256:${"1".repeat(64)}`,
+    receiptDigest: `sha256:${"2".repeat(64)}`,
+    componentOrdinal: 1,
+    componentPairOrdinals: pairs.map((_pair, index) => index + 1),
+    inventoryCandidateCount,
+    resolutionMarginMicros: 10_000,
+    overlapToleranceMs: 250,
+    limits: {
+      maxCandidates: 128,
+      maxSearchStates: 100_000,
+      maxSearchExpansions: 1_000_000,
+      maxIntervalComparisons: 1_000_000,
+      maxIntervalsPerAxis: 256,
+      maxTotalIntervals: 4_096,
+      refinementBatchSize: 8
+    },
+    inventoryStateCounts,
+    refinementRoundCount: resolved ? 1 : 0,
+    evaluatedCandidateCount: inventoryStateCounts.scored,
+    finalState,
+    resolved,
+    selectedCandidateIds,
+    selectedTotalScoreMicros: resolved ? totalScoreMicros : null,
+    bestCompleted: { candidateIds: selectedCandidateIds, totalScoreMicros },
+    runnerUpCompleted: null,
+    optimisticOmitted:
+      finalState === "unresolved"
+        ? {
+            candidateIds: unresolvedCandidateIds,
+            totalUpperBoundMicros: unresolvedCandidateIds.length * 900_000,
+            openCandidateIds: unresolvedCandidateIds,
+            unresolvedCandidateIds,
+            blockedCandidateIds: []
+          }
+        : null,
+    nextRefinementCandidateIds: unresolvedCandidateIds,
+    deferredCandidateCount: 0,
+    proof: {
+      beatsRunnerUpWithMargin: resolved,
+      beatsOptimisticOmittedWithMargin: resolved
+    },
+    search: {
+      statesVisited: Math.max(1, inventoryCandidateCount),
+      expansionsConsidered: Math.max(1, inventoryCandidateCount),
+      intervalComparisons: Math.max(1, inventoryCandidateCount)
+    }
+  };
+}
+
+function createTestFineExecutionEvidence(
+  pairOrdinal: number,
+  proposal: AlignmentProposal
+): AudioAlignmentBatchFineExecutionEvidenceSnapshot {
+  const timeMap = proposal.timeMap;
+  if (!timeMap) {
+    throw new Error("测试精执行证据需要 TimeMap");
+  }
+  const createWindow = (startMs: number, endMs: number, effective: boolean) => {
+    const expectedSampleCount = Math.ceil(((endMs - startMs) * 16_000) / 1_000);
+    return {
+      startMs,
+      endMs,
+      presentationOffsetMs: startMs,
+      sampleRate: 16_000,
+      expectedSampleCount,
+      actualDecodedSampleCount: effective ? expectedSampleCount : null
+    };
+  };
+  const backend = {
+    backendId: "cpu-radix2-f64-r2c-512-v1",
+    requestedBackend: "auto",
+    backendDetail: "unit test fine backend",
+    fallbackReason: null
+  };
+  return {
+    candidateId: { pairOrdinal, candidateOrdinal: 1 },
+    selectedMemberRank: 1,
+    groupMemberRanks: [1],
+    sourceStreamIndex: timeMap.sourceStream?.index ?? 0,
+    targetStreamIndex: timeMap.targetStream?.index ?? 0,
+    sourceCoarseBackend: backend,
+    targetCoarseBackend: backend,
+    sourceFineBackend: backend,
+    targetFineBackend: backend,
+    sourceRequestedWindow: createWindow(timeMap.sourceStartMs, timeMap.sourceEndMs, false),
+    targetRequestedWindow: createWindow(timeMap.targetStartMs, timeMap.targetEndMs, false),
+    sourceEffectiveWindow: createWindow(timeMap.sourceStartMs, timeMap.sourceEndMs, true),
+    targetEffectiveWindow: createWindow(timeMap.targetStartMs, timeMap.targetEndMs, true),
+    parametersHash: `sha256:${"3".repeat(64)}`,
+    occupancyDigest: `sha256:${"4".repeat(64)}`,
+    proposalTimeMapDigest: createAudioAlignmentBatchProposalTimeMapDigest(timeMap),
+    scoreMicros: Math.round(proposal.confidence * 1_000_000),
+    evidenceDigest: `sha256:${"5".repeat(64)}`
   };
 }
 
@@ -447,6 +654,7 @@ describe("多媒体自动匹配工作台", () => {
     );
   });
   beforeEach(() => {
+    testFineBatchOptions = null;
     const project = createMatchingProject();
     useEditorStore.setState({
       project,
@@ -515,8 +723,9 @@ describe("多媒体自动匹配工作台", () => {
       })
     );
     expect(screen.getAllByTestId("media-match-candidate")).toHaveLength(2);
+    expect(screen.getAllByText(/target-ep1 ← source-long/).length).toBeGreaterThan(0);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：找到 2 组可能对应片段，其中 2 组建议优先复核，0 组需要额外复核。"
+      "批量匹配完成：2 组可逐项确认。"
     );
     expect(
       useEditorStore
@@ -524,7 +733,9 @@ describe("多媒体自动匹配工作台", () => {
         .project.mediaMatchCandidates.every(
           (candidate) =>
             candidate.state === "pending" &&
-            candidate.proposal.diagnostics.includes("全局分配：进入当前求解得到的无冲突组合。")
+            candidate.proposal.diagnostics.includes(
+              "原生精匹配：组件最终分配已解析，当前候选由后端选定。"
+            )
         )
     ).toBe(true);
 
@@ -671,7 +882,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(screen.getByRole("button", { name: "开始批量匹配" })).toBeDisabled();
   });
 
-  it("单组失败后保留其余候选，但不把部分结果包装成全局最优组合", async () => {
+  it("组件中有一组运行失败时不发布同组件的任何候选", async () => {
     const project = createMatchingProject();
     addSecondSource(project);
     useEditorStore.setState({ project });
@@ -696,9 +907,7 @@ describe("多媒体自动匹配工作台", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
 
     await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
-    await waitFor(() =>
-      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(3)
-    );
+    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("未完成分析"));
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
       expect.objectContaining({
         pairs: [
@@ -709,31 +918,16 @@ describe("多媒体自动匹配工作台", () => {
         ]
       })
     );
-    expect(
-      within(screen.getByLabelText("批量匹配任务")).getByText("第一组音轨不可用")
-    ).toBeInTheDocument();
+    const taskList = screen.getByLabelText("批量匹配任务");
+    expect(within(taskList).getAllByText(/运行环境或证据链失败/)).toHaveLength(4);
+    expect(within(taskList).queryByText("没有找到可信对应片段")).not.toBeInTheDocument();
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：找到 3 组可能对应片段，全部保留为额外复核；批次未完整，不能形成全局最优组合，1 组未能完成分析。"
+      "批量匹配完成：0 组可逐项确认，4 组未完成分析。"
     );
-    expect(
-      useEditorStore
-        .getState()
-        .project.mediaMatchCandidates.every((candidate) => candidate.state === "blocked")
-    ).toBe(true);
-    expect(
-      useEditorStore
-        .getState()
-        .project.mediaMatchCandidates.every(
-          (candidate) =>
-            candidate.proposal.timeMap?.quality.reasons.includes(
-              "批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。"
-            ) &&
-            !candidate.proposal.diagnostics.includes("全局分配：进入当前求解得到的无冲突组合。")
-        )
-    ).toBe(true);
+    expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
   });
 
-  it("多条参考竞争同一原片重叠区间时全局择优并阻断弱 V2 备选", async () => {
+  it("前端分数偏好第一组时仍只发布后端最终分配选中的第二组", async () => {
     const project = createMatchingProject();
     addSecondSource(project);
     project.mediaLibrary = project.mediaLibrary.filter((media) => media.id !== "target-ep2");
@@ -751,40 +945,37 @@ describe("多媒体自动匹配工作台", () => {
         updatedAtMs: 1
       });
     });
+    testFineBatchOptions = { selectedPairOrdinals: [2] };
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
     await waitFor(() =>
-      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(2)
+      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(1)
     );
 
     const candidates = useEditorStore.getState().project.mediaMatchCandidates;
-    const strong = candidates.find((candidate) => candidate.sourceMediaId === "source-long");
-    const weak = candidates.find((candidate) => candidate.sourceMediaId === "source-long-b");
-    expect(strong).toMatchObject({
+    expect(candidates[0]).toMatchObject({
+      sourceMediaId: "source-long-b",
+      targetMediaId: "target-ep1",
+      confidence: 0.62,
       state: "pending",
-      proposal: { timeMap: { quality: { level: "verified" } } }
+      proposal: { timeMap: { quality: { level: "review", probability: 0.62 } } }
     });
-    expect(weak).toMatchObject({
-      state: "blocked",
-      proposal: { timeMap: { quality: { level: "blocked", probability: null } } }
-    });
-    expect(weak?.proposal.timeMap?.quality.reasons.join(" ")).toContain("同一原片时间范围冲突");
+    expect(candidates.some((candidate) => candidate.sourceMediaId === "source-long")).toBe(false);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：找到 2 组可能对应片段，其中 1 组建议优先复核，1 组需要额外复核。"
+      "批量匹配完成：1 组可逐项确认，1 组暂不可确认。"
     );
     const taskList = screen.getByLabelText("批量匹配任务");
-    expect(within(taskList).getByText(/建议优先复核/)).toBeInTheDocument();
-    expect(within(taskList).getByText(/作为备选保留/)).toBeInTheDocument();
-    const weakCard = screen
-      .getAllByTestId("media-match-candidate")
-      .find((card) => card.textContent?.includes("source-long-b"));
-    expect(weakCard).toBeDefined();
-    expect(within(weakCard!).getAllByText("已阻断").length).toBeGreaterThanOrEqual(1);
-    expect(within(weakCard!).getByRole("button", { name: "此候选不能确认" })).toBeDisabled();
+    expect(
+      within(taskList).getByText(/target-ep1 ← source-long-b .*已唯一确定/)
+    ).toBeInTheDocument();
+    expect(within(taskList).getByText(/最终分配采用了同一组件中的另一组关系/)).toBeInTheDocument();
+    expect(screen.getByTestId("media-match-candidate")).toHaveTextContent(
+      "target-ep1 ← source-long-b"
+    );
   });
 
-  it("N×M 全局分配选择无冲突最佳组合并保留旧引擎阻断备选", async () => {
+  it("N×M 只发布原生组件最终分配，不按前端 confidence 重新求解", async () => {
     const project = createMatchingProject();
     addSecondSource(project);
     useEditorStore.setState({ project });
@@ -810,37 +1001,31 @@ describe("多媒体自动匹配工作台", () => {
         updatedAtMs: 1
       });
     });
+    testFineBatchOptions = { selectedPairOrdinals: [2, 3] };
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
     await waitFor(() =>
-      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(4)
+      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(2)
     );
 
     const candidates = useEditorStore.getState().project.mediaMatchCandidates;
-    const adoptedPairs = candidates
-      .filter((candidate) => candidate.state === "pending")
+    const publishedPairs = candidates
       .map((candidate) => `${candidate.sourceMediaId}->${candidate.targetMediaId}`)
       .sort();
-    const blocked = candidates.filter((candidate) => candidate.state === "blocked");
-    expect(adoptedPairs).toEqual(["source-long->target-ep1", "source-long-b->target-ep2"]);
-    expect(blocked).toHaveLength(2);
-    expect(
-      blocked.every(
-        (candidate) =>
-          candidate.proposal.timeMap?.engineVersion === "legacy-global-guard-v1" &&
-          candidate.proposal.timeMap.quality.level === "blocked" &&
-          candidate.proposal.timeMap.quality.probability === null &&
-          candidate.proposal.timeMap.spans[0]?.kind === "ambiguous" &&
-          candidate.proposal.diagnostics.some((line) => line.includes("全局分配阻断"))
-      )
-    ).toBe(true);
+    expect(publishedPairs).toEqual(["source-long->target-ep2", "source-long-b->target-ep1"]);
+    expect(candidates.map((candidate) => candidate.confidence).sort()).toEqual([0.1, 0.2]);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：找到 4 组可能对应片段，其中 2 组建议优先复核，2 组需要额外复核。"
+      "批量匹配完成：2 组可逐项确认，2 组暂不可确认。"
     );
+    expect(
+      within(screen.getByLabelText("批量匹配任务")).getAllByText(
+        /最终分配采用了同一组件中的另一组关系/
+      )
+    ).toHaveLength(2);
   });
 
-  it("全局 Top1/Top2 近同分时不假装唯一并阻断全部 V2 候选", async () => {
+  it("原生精匹配未决时不发布候选并明确说明接近位置数量", async () => {
     const project = createMatchingProject();
     addSecondSource(project);
     project.mediaLibrary = project.mediaLibrary.filter((media) => media.id !== "target-ep2");
@@ -858,37 +1043,50 @@ describe("多媒体自动匹配工作台", () => {
         updatedAtMs: 1
       });
     });
+    testFineBatchOptions = { finalState: "unresolved", inventoryCandidateCount: 2 };
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() =>
-      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(2)
-    );
+    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("暂不可确认"));
 
-    const candidates = useEditorStore.getState().project.mediaMatchCandidates;
-    expect(
-      candidates.every(
-        (candidate) =>
-          candidate.state === "blocked" &&
-          candidate.proposal.timeMap?.quality.level === "blocked" &&
-          candidate.proposal.timeMap.quality.probability === null &&
-          candidate.proposal.timeMap.quality.reasons.some((reason) =>
-            reason.includes("两套可行组合")
-          )
-      )
-    ).toBe(true);
+    expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：找到 2 组可能对应片段，其中 0 组建议优先复核，2 组需要额外复核。"
+      "批量匹配完成：0 组可逐项确认，2 组暂不可确认。"
     );
     expect(
-      within(screen.getByLabelText("批量匹配任务")).getAllByText(/两套可行组合/)
+      within(screen.getByLabelText("批量匹配任务")).getAllByText(
+        "发现 2 个接近位置，原生精匹配暂时不能唯一确定；本组不能确认。"
+      )
     ).toHaveLength(2);
-    screen.getAllByRole("button", { name: "此候选不能确认" }).forEach((button) => {
-      expect(button).toBeDisabled();
-    });
+    expect(screen.queryByText("没有找到可信对应片段")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /确认关系|保存关系/ })).not.toBeInTheDocument();
   });
 
-  it("取消后保留已完成候选但阻止全局建议，并可继续剩余任务", async () => {
+  it("精匹配受资源限制时显示可操作原因且绝不误报为未找到", async () => {
+    testFineBatchOptions = {
+      finalState: "unresolved",
+      inventoryCandidateCount: 2,
+      stateCounts: { unresolved: 0, resourceBlocked: 2 }
+    };
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("未完成分析"));
+
+    expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
+    const taskList = screen.getByLabelText("批量匹配任务");
+    expect(
+      within(taskList).getAllByText(
+        /这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。/
+      )
+    ).toHaveLength(2);
+    expect(within(taskList).queryByText(/没有找到可信对应片段/)).not.toBeInTheDocument();
+    expect(useEditorStore.getState().status.message).toBe(
+      "批量匹配完成：0 组可逐项确认，2 组未完成分析。"
+    );
+  });
+
+  it("取消后不发布任何迟到候选，并可继续剩余任务", async () => {
     const project = createMatchingProject();
     project.mediaLibrary.push(
       createMedia("target-ep3", "targetOriginal", "D:\\video\\ep3.mkv", 60_000)
@@ -935,25 +1133,13 @@ describe("多媒体自动匹配工作台", () => {
     await waitFor(() =>
       expect(useEditorStore.getState().status.message).toContain("批量匹配已取消")
     );
-    expect(useEditorStore.getState().status.message).toContain(
-      "找到 1 组可能对应片段，全部保留为额外复核；批次未完整，不能形成全局最优组合"
+    expect(useEditorStore.getState().status.message).toBe(
+      "批量匹配已取消：0 组可逐项确认，3 组已取消。已取消结果不会发布为可确认关系。"
     );
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
-    expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(1);
-    expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
-      state: "blocked"
-    });
-    expect(
-      useEditorStore.getState().project.mediaMatchCandidates[0].proposal.timeMap?.quality
-        .reasons
-    ).toContain("批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。");
-    expect(
-      within(screen.getByLabelText("批量匹配任务")).getByText(
-        /批次未完整，不能形成全局最优组合，已保留供人工复核/
-      )
-    ).toBeInTheDocument();
+    expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
     const taskList = screen.getByLabelText("批量匹配任务");
-    expect(within(taskList).getAllByText("未完成，已停止")).toHaveLength(2);
+    expect(within(taskList).getAllByText(/任务已取消；取消结果不会用于确认/)).toHaveLength(3);
 
     const continueButton = await screen.findByRole("button", { name: "继续剩余任务" });
     vi.mocked(startTauriAudioAlignmentJob).mockImplementation((request) =>
@@ -978,6 +1164,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenLastCalledWith(
       expect.objectContaining({
         pairs: [
+          { sourceMediaId: "source-long", targetMediaId: "target-ep1" },
           { sourceMediaId: "source-long", targetMediaId: "target-ep2" },
           { sourceMediaId: "source-long", targetMediaId: "target-ep3" }
         ]
@@ -1039,21 +1226,21 @@ describe("多媒体自动匹配工作台", () => {
     ).toBeInTheDocument();
   });
 
-  it("明确警告旧引擎未经真实媒体精度基准，并且不提供高可信批量确认", async () => {
+  it("明确说明 Evidence v3 发布边界，并且不提供批量确认", async () => {
     render(<MatchingHarness />);
 
     const warning = screen.getByTestId("legacy-alignment-warning");
-    expect(warning).toHaveTextContent("实验性定位线索");
-    expect(warning).toHaveTextContent("尚未通过真实媒体精度基准");
-    expect(warning).toHaveTextContent("Alignment V2 也尚未在冻结真实媒体集完成校准");
-    expect(warning).toHaveTextContent("必须逐项试听或预览复核");
-    expect(warning).toHaveTextContent("自动结果不能直接作为导出依据");
+    expect(warning).toHaveTextContent("未决结果不会进入候选");
+    expect(warning).toHaveTextContent("可用资源不足");
+    expect(warning).toHaveTextContent("仍需逐项试听或预览复核");
+    expect(warning).toHaveTextContent("Evidence v3");
+    expect(warning).toHaveTextContent("前端不会再次求解");
     expect(screen.queryByText(/高可信候选/)).not.toBeInTheDocument();
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
     await waitFor(() => expect(screen.getAllByTestId("media-match-candidate")).toHaveLength(2));
 
-    expect(screen.getAllByText("旧引擎分数 90% · 未校准")).toHaveLength(2);
+    expect(screen.getAllByText("定位线索分数 90% · 不是校准概率")).toHaveLength(2);
     expect(screen.queryByText(/高可信候选/)).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /批量.*确认|确认.*高可信/ })

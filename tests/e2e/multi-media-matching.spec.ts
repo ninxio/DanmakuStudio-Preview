@@ -22,6 +22,7 @@ test.beforeEach(async ({ page }) => {
         __C136_DIALOG_CALLS__: MockDialogCall[];
         __C137_VERIFICATION_CALLS__: string[];
         __C137_PERFORMANCE_CALLS__: string[];
+        __C137_FINE_MODE__: "resolved" | "unresolved" | "resourceBlocked" | "secondAssignment";
         __TAURI_INTERNALS__: {
           invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
         };
@@ -250,6 +251,39 @@ test.beforeEach(async ({ page }) => {
           parametersHash: `c137-e2e-${currentIndex + 1}`
         };
       };
+      const float64BitsHex = (value: number): string => {
+        const buffer = new ArrayBuffer(8);
+        const view = new DataView(buffer);
+        view.setFloat64(0, value, false);
+        return view.getBigUint64(0, false).toString(16).padStart(16, "0");
+      };
+      const canonicalizeRuntimeValue = (value: unknown): unknown => {
+        if (Array.isArray(value)) return value.map(canonicalizeRuntimeValue);
+        if (typeof value === "object" && value !== null) {
+          return Object.fromEntries(
+            Object.entries(value as Record<string, unknown>)
+              .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+              .map(([key, nested]) => [key, canonicalizeRuntimeValue(nested)])
+          );
+        }
+        if (typeof value === "number") {
+          if (!Number.isFinite(value)) throw new Error("E2E canonical JSON 不接受非有限数字");
+          return `f64:${float64BitsHex(value)}`;
+        }
+        return value;
+      };
+      const createRuntimeDigest = async (
+        domain: string,
+        value: unknown
+      ): Promise<`sha256:${string}`> => {
+        const canonical = JSON.stringify(canonicalizeRuntimeValue(value));
+        const bytes = new TextEncoder().encode(`${domain}\n${canonical}`);
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        const hex = [...new Uint8Array(digest)]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("");
+        return `sha256:${hex}`;
+      };
       const createGlobalSelection = (currentIndex: number) => {
         const sourceStartMs = currentIndex * 60_000;
         const candidate = {
@@ -339,6 +373,150 @@ test.beforeEach(async ({ page }) => {
           bestEligibleCandidate: candidate
         };
       };
+      const createFineFrontier = async (
+        pairCount: number,
+        mode: MockTauriWindow["__C137_FINE_MODE__"]
+      ) => {
+        const allCandidateIds = Array.from({ length: pairCount }, (_value, index) => ({
+          pairOrdinal: index + 1,
+          candidateOrdinal: 1
+        }));
+        const selectedCandidateIds =
+          mode === "resolved"
+            ? allCandidateIds
+            : mode === "secondAssignment"
+              ? allCandidateIds.slice(1, 2)
+              : [];
+        const resolved = mode === "resolved" || mode === "secondAssignment";
+        const blockedCount = mode === "resourceBlocked" ? pairCount : 0;
+        const unresolvedCount = mode === "unresolved" ? pairCount : 0;
+        const receipt = {
+          contractVersion: "alignment-v2-adaptive-fine-frontier-v1",
+          scoreVersion: "alignment-v2-coarse-upper-times-confidence-v1",
+          inventoryDigest: `sha256:${"d".repeat(64)}`,
+          receiptDigest: "",
+          componentOrdinal: 1,
+          componentPairOrdinals: Array.from({ length: pairCount }, (_value, index) => index + 1),
+          inventoryCandidateCount: pairCount,
+          resolutionMarginMicros: 10_000,
+          overlapToleranceMs: 250,
+          limits: {
+            maxCandidates: 128,
+            maxSearchStates: 100_000,
+            maxSearchExpansions: 1_000_000,
+            maxIntervalComparisons: 1_000_000,
+            maxIntervalsPerAxis: 256,
+            maxTotalIntervals: 4_096,
+            refinementBatchSize: 8
+          },
+          inventoryStateCounts: {
+            unresolved: unresolvedCount,
+            scored: resolved ? pairCount : 0,
+            evaluatedIneligible: 0,
+            evidenceBlocked: 0,
+            resourceBlocked: blockedCount,
+            infrastructureFailed: 0,
+            cancelled: 0
+          },
+          refinementRoundCount: resolved ? 1 : 0,
+          evaluatedCandidateCount: resolved ? pairCount : 0,
+          finalState: resolved ? "resolved" : "unresolved",
+          resolved,
+          selectedCandidateIds,
+          selectedTotalScoreMicros: resolved ? selectedCandidateIds.length * 900_000 : null,
+          bestCompleted: {
+            candidateIds: selectedCandidateIds,
+            totalScoreMicros: resolved ? selectedCandidateIds.length * 900_000 : 0
+          },
+          runnerUpCompleted: null,
+          optimisticOmitted: resolved
+            ? null
+            : {
+                candidateIds: allCandidateIds,
+                totalUpperBoundMicros: pairCount * 900_000,
+                openCandidateIds: allCandidateIds,
+                unresolvedCandidateIds: mode === "unresolved" ? allCandidateIds : [],
+                blockedCandidateIds: mode === "resourceBlocked" ? allCandidateIds : []
+              },
+          nextRefinementCandidateIds: mode === "unresolved" ? allCandidateIds : [],
+          deferredCandidateCount: 0,
+          proof: {
+            beatsRunnerUpWithMargin: resolved,
+            beatsOptimisticOmittedWithMargin: resolved
+          },
+          search: {
+            statesVisited: pairCount,
+            expansionsConsidered: pairCount,
+            intervalComparisons: pairCount
+          }
+        };
+        receipt.receiptDigest = await createRuntimeDigest(
+          "audio-alignment-v3/fine-frontier-receipt/v1",
+          receipt
+        );
+        return receipt;
+      };
+      const createFineExecutionEvidence = async (
+        currentIndex: number,
+        timeMap: ReturnType<typeof createTimeMap>
+      ) => {
+        const createWindow = (startMs: number, endMs: number, effective: boolean) => {
+          const expectedSampleCount = Math.ceil(((endMs - startMs) * 16_000) / 1_000);
+          return {
+            startMs,
+            endMs,
+            presentationOffsetMs: startMs,
+            sampleRate: 16_000,
+            expectedSampleCount,
+            actualDecodedSampleCount: effective ? expectedSampleCount : null
+          };
+        };
+        const coarseBackend = {
+          backendId: "cuda-cufft-r2c-512-v1",
+          requestedBackend: "auto",
+          backendDetail: "E2E CUDA/cuFFT fixture",
+          fallbackReason: null
+        };
+        // Keep this fixture aligned with deriveLockedFineSpectralBackendIdentity:
+        // a CUDA fine pass must preserve the complete coarse execution identity.
+        const fineBackend = { ...coarseBackend };
+        const evidence = {
+          candidateId: { pairOrdinal: currentIndex + 1, candidateOrdinal: 1 },
+          selectedMemberRank: 1,
+          groupMemberRanks: [1],
+          sourceStreamIndex: 1,
+          targetStreamIndex: 2,
+          sourceCoarseBackend: coarseBackend,
+          targetCoarseBackend: coarseBackend,
+          sourceFineBackend: fineBackend,
+          targetFineBackend: fineBackend,
+          sourceRequestedWindow: createWindow(timeMap.sourceStartMs, timeMap.sourceEndMs, false),
+          targetRequestedWindow: createWindow(timeMap.targetStartMs, timeMap.targetEndMs, false),
+          sourceEffectiveWindow: createWindow(timeMap.sourceStartMs, timeMap.sourceEndMs, true),
+          targetEffectiveWindow: createWindow(timeMap.targetStartMs, timeMap.targetEndMs, true),
+          parametersHash: await createRuntimeDigest(
+            "audio-alignment-v3/fine-parameters/v1",
+            {
+              engineVersion: "alignment-v2.4",
+              featureVersion: "chroma-v2",
+              fineScoreVersion: "alignment-v2-coarse-upper-times-confidence-v1",
+              legacyParametersHash: timeMap.parametersHash
+            }
+          ),
+          occupancyDigest: `sha256:${"7".repeat(64)}`,
+          proposalTimeMapDigest: await createRuntimeDigest(
+            "audio-alignment-v3/proposal-time-map/v1",
+            timeMap
+          ),
+          scoreMicros: 900_000,
+          evidenceDigest: ""
+        };
+        evidence.evidenceDigest = await createRuntimeDigest(
+          "audio-alignment-v3/fine-execution-evidence/v1",
+          evidence
+        );
+        return evidence;
+      };
 
       const mockWindow = window as unknown as MockTauriWindow;
       let batchJobIndex = 0;
@@ -347,6 +525,7 @@ test.beforeEach(async ({ page }) => {
       mockWindow.__C136_DIALOG_CALLS__ = [];
       mockWindow.__C137_VERIFICATION_CALLS__ = [];
       mockWindow.__C137_PERFORMANCE_CALLS__ = [];
+      mockWindow.__C137_FINE_MODE__ = "resolved";
       mockWindow.__TAURI_INTERNALS__ = {
         invoke: async (command, args = {}) => {
           await Promise.resolve();
@@ -503,9 +682,66 @@ test.beforeEach(async ({ page }) => {
               );
             batchJobIndex += 1;
             const jobId = `c137-batch-job-${batchJobIndex}`;
+            const fineMode = mockWindow.__C137_FINE_MODE__;
+            const fineFrontier = await createFineFrontier(pairs.length, fineMode);
+            const pairSnapshots = await Promise.all(
+              pairs.map(async (pair, currentIndex) => {
+                const timeMap = createTimeMap(currentIndex);
+                const confidence =
+                  fineMode === "secondAssignment"
+                    ? currentIndex === 0
+                      ? 0.99
+                      : currentIndex === 1
+                        ? 0.1
+                        : 0.8
+                    : 0.9;
+                return {
+                  pairIndex: currentIndex,
+                  pairOrdinal: currentIndex + 1,
+                  sourceMediaId: pair.sourceMediaId,
+                  targetMediaId: pair.targetMediaId,
+                  status: "completed",
+                  progress: 1,
+                  message: "已定位对应片段",
+                  relationRanking: createRelationRanking(currentIndex),
+                  globalSelection: createGlobalSelection(currentIndex),
+                  fineFrontier,
+                  fineExecutionEvidence: fineFrontier.selectedCandidateIds.some(
+                    (candidateId) => candidateId.pairOrdinal === currentIndex + 1
+                  )
+                    ? await createFineExecutionEvidence(currentIndex, timeMap)
+                    : null,
+                  proposal: {
+                    anchors: [
+                      {
+                        id: `anchor-${currentIndex + 1}`,
+                        sourceMs: currentIndex * 60_000 + 5_000,
+                        targetMs: 5_000,
+                        confidence: 0.94,
+                        origin: "automatic"
+                      }
+                    ],
+                    cutCandidates: [],
+                    confidence,
+                    diagnostics: [
+                      "E2E 使用确定性桌面批任务结果；真实定位由 Rust 测试覆盖。"
+                    ],
+                    timeMap,
+                    matchRange: {
+                      sourceStartMs: currentIndex * 60_000,
+                      sourceEndMs: (currentIndex + 1) * 60_000,
+                      targetStartMs: 0,
+                      targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
+                      coverage: currentIndex === 0 ? 0.72 : 0.96
+                    }
+                  },
+                  error: null
+                };
+              })
+            );
             const snapshot = {
               schemaVersion: 1,
-              evidenceVersion: 2,
+              evidenceVersion: 3,
               jobId,
               pairingMode,
               sourceMediaIds: sources.map((media) => media.mediaId),
@@ -517,40 +753,7 @@ test.beforeEach(async ({ page }) => {
               processedPairCount: pairs.length,
               failedPairCount: 0,
               currentPairOrdinal: null,
-              pairs: pairs.map((pair, currentIndex) => ({
-                pairIndex: currentIndex,
-                pairOrdinal: currentIndex + 1,
-                sourceMediaId: pair.sourceMediaId,
-                targetMediaId: pair.targetMediaId,
-                status: "completed",
-                progress: 1,
-                message: "已定位对应片段",
-                relationRanking: createRelationRanking(currentIndex),
-                globalSelection: createGlobalSelection(currentIndex),
-                proposal: {
-                  anchors: [
-                    {
-                      id: `anchor-${currentIndex + 1}`,
-                      sourceMs: currentIndex * 60_000 + 5_000,
-                      targetMs: 5_000,
-                      confidence: 0.94,
-                      origin: "automatic"
-                    }
-                  ],
-                  cutCandidates: [],
-                  confidence: 0.9,
-                  diagnostics: ["E2E 使用确定性桌面批任务结果；真实定位由 Rust 测试覆盖。"],
-                  timeMap: createTimeMap(currentIndex),
-                  matchRange: {
-                    sourceStartMs: currentIndex * 60_000,
-                    sourceEndMs: (currentIndex + 1) * 60_000,
-                    targetStartMs: 0,
-                    targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
-                    coverage: currentIndex === 0 ? 0.72 : 0.96
-                  }
-                },
-                error: null
-              })),
+              pairs: pairSnapshots,
               error: null,
               updatedAtMs: Date.now()
             };
@@ -685,9 +888,10 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
   await expect(page.getByTestId("media-match-candidate")).toHaveCount(5);
   await expect(page.getByTestId("status-bar")).toContainText(
-    "找到 5 组可能对应片段，其中 4 组建议优先复核，1 组需要额外复核"
+    "5 组可逐项确认"
   );
   const firstCandidate = page.getByTestId("media-match-candidate").nth(0);
+  await expect(firstCandidate).toContainText("C136-E01 ← C136-reference");
   await firstCandidate.getByText("来源↔原片时间图复核").click();
   await expect(
     firstCandidate.getByRole("img", { name: "来源与原片双时间轴分段图" })
@@ -783,6 +987,67 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
     path: resolve(screenshotDir, "c137-export-gate-blocked.png"),
     fullPage: true
   });
+});
+
+test("Evidence v3 未决、资源阻断与后端第二选择均失败关闭", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "批量导入原片素材" }).click();
+  await page.getByRole("button", { name: "批量导入 B 站参考素材" }).click();
+  await page.getByRole("button", { name: "导入 XML" }).click();
+  await page.getByLabel("normal.xml 弹幕来源视频").selectOption({ label: "C136-reference" });
+  await page.getByTestId("workspace-nav-matching").click();
+  const matchingPanel = page.getByTestId("media-matching-panel");
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __C137_FINE_MODE__: "resolved" | "unresolved" | "resourceBlocked" | "secondAssignment";
+      }
+    ).__C137_FINE_MODE__ = "unresolved";
+  });
+  await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText(
+    "0 组可逐项确认，5 组暂不可确认"
+  );
+  await expect(page.getByTestId("media-match-candidate")).toHaveCount(0);
+  await expect(
+    matchingPanel.getByText(
+      "发现 5 个接近位置，原生精匹配暂时不能唯一确定；本组不能确认。"
+    )
+  ).toHaveCount(5);
+  await expect(matchingPanel.getByText("没有找到可信对应片段")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __C137_FINE_MODE__: "resolved" | "unresolved" | "resourceBlocked" | "secondAssignment";
+      }
+    ).__C137_FINE_MODE__ = "resourceBlocked";
+  });
+  await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText(
+    "0 组可逐项确认，5 组未完成分析"
+  );
+  await expect(page.getByTestId("media-match-candidate")).toHaveCount(0);
+  await expect(matchingPanel.getByText(/这组没有完成分析：可用资源不足/)).toHaveCount(5);
+  await expect(matchingPanel.getByText("没有找到可信对应片段")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __C137_FINE_MODE__: "resolved" | "unresolved" | "resourceBlocked" | "secondAssignment";
+      }
+    ).__C137_FINE_MODE__ = "secondAssignment";
+  });
+  await matchingPanel.getByRole("button", { name: "开始批量匹配" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText(
+    "1 组可逐项确认，4 组暂不可确认"
+  );
+  await expect(page.getByTestId("media-match-candidate")).toHaveCount(1);
+  const selectedCard = page.getByTestId("media-match-candidate");
+  await expect(selectedCard).toContainText("C136-E02 ← C136-reference");
+  await selectedCard.getByText("匹配证据与诊断").click();
+  await expect(selectedCard).toContainText("定位线索分数 10% · 不是校准概率");
 });
 
 test("浏览器预览中的原生性能证据入口失败关闭", async ({ page }) => {

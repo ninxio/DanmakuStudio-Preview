@@ -1,4 +1,5 @@
 import { isAlignmentTimeMapProposal } from "./timeMapProposal";
+import { isLockedFineSpectralBackendIdentity } from "./fineSpectralBackend";
 import type { AlignmentTimeMapProposal } from "./types";
 import {
   areMediaContentIdentitiesEqual,
@@ -9,17 +10,28 @@ import type { MediaContentIdentity } from "../project/types";
 import { sha256Hex } from "../shared/sha256";
 
 export const REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION = 1 as const;
-export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 2 as const;
+export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 3 as const;
 export const REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION =
-  "c137-real-media-blind-full-cartesian-batch-v2" as const;
-export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 2 as const;
+  "c137-real-media-blind-full-cartesian-batch-v3" as const;
+export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 3 as const;
 export const REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION =
   "alignment-v2-pair-intrinsic-global-weight-v1" as const;
 export const REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION = 1 as const;
+export const REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION =
+  "alignment-v2-adaptive-fine-frontier-v1" as const;
+export const REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION =
+  "alignment-v2-coarse-upper-times-confidence-v1" as const;
 
 const NATIVE_BATCH_TOP_K_LIMIT = 10;
 const RELATION_MIN_TEMPORAL_COVERAGE = 0.2;
 const RELATION_MIN_INLIER_COUNT = 6;
+const FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN =
+  "audio-alignment-v3/fine-frontier-receipt/v1";
+const FINE_EXECUTION_EVIDENCE_DIGEST_DOMAIN =
+  "audio-alignment-v3/fine-execution-evidence/v1";
+const FINE_PROPOSAL_TIME_MAP_DIGEST_DOMAIN = "audio-alignment-v3/proposal-time-map/v1";
+const FINE_PARAMETERS_DIGEST_DOMAIN = "audio-alignment-v3/fine-parameters/v1";
+const FINE_WINDOW_DECODE_TOLERANCE_MS = 50;
 
 export interface RealMediaBlindBatchExecutionMedia {
   mediaId: string;
@@ -127,6 +139,108 @@ export interface NativeBatchSpectralBackendExecutionIdentity {
   fallbackReason: string | null;
 }
 
+export interface NativeBatchFineCandidateId {
+  pairOrdinal: number;
+  candidateOrdinal: number;
+}
+
+export interface NativeBatchFineStateCounts {
+  unresolved: number;
+  scored: number;
+  evaluatedIneligible: number;
+  evidenceBlocked: number;
+  resourceBlocked: number;
+  infrastructureFailed: number;
+  cancelled: number;
+}
+
+export interface NativeBatchFineAssignment {
+  candidateIds: NativeBatchFineCandidateId[];
+  totalScoreMicros: number;
+}
+
+export interface NativeBatchFineOmittedAssignment {
+  candidateIds: NativeBatchFineCandidateId[];
+  totalUpperBoundMicros: number;
+  openCandidateIds: NativeBatchFineCandidateId[];
+  unresolvedCandidateIds: NativeBatchFineCandidateId[];
+  blockedCandidateIds: NativeBatchFineCandidateId[];
+}
+
+export interface NativeBatchFineLimits {
+  maxCandidates: number;
+  maxSearchStates: number;
+  maxSearchExpansions: number;
+  maxIntervalComparisons: number;
+  maxIntervalsPerAxis: number;
+  maxTotalIntervals: number;
+  refinementBatchSize: number;
+}
+
+export interface NativeBatchFineFrontierReceipt {
+  contractVersion: typeof REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION;
+  scoreVersion: typeof REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION;
+  inventoryDigest: `sha256:${string}`;
+  receiptDigest: `sha256:${string}`;
+  componentOrdinal: number;
+  componentPairOrdinals: number[];
+  inventoryCandidateCount: number;
+  resolutionMarginMicros: number;
+  overlapToleranceMs: number;
+  limits: NativeBatchFineLimits;
+  inventoryStateCounts: NativeBatchFineStateCounts;
+  refinementRoundCount: number;
+  evaluatedCandidateCount: number;
+  finalState: "resolved" | "noEligibleCandidate" | "unresolved" | "failed";
+  resolved: boolean;
+  selectedCandidateIds: NativeBatchFineCandidateId[];
+  selectedTotalScoreMicros: number | null;
+  bestCompleted: NativeBatchFineAssignment;
+  runnerUpCompleted: NativeBatchFineAssignment | null;
+  optimisticOmitted: NativeBatchFineOmittedAssignment | null;
+  nextRefinementCandidateIds: NativeBatchFineCandidateId[];
+  deferredCandidateCount: number;
+  proof: {
+    beatsRunnerUpWithMargin: boolean;
+    beatsOptimisticOmittedWithMargin: boolean;
+  };
+  search: {
+    statesVisited: number;
+    expansionsConsidered: number;
+    intervalComparisons: number;
+  };
+}
+
+export interface NativeBatchFineDecodeWindow {
+  startMs: number;
+  endMs: number;
+  presentationOffsetMs: number;
+  sampleRate: number;
+  expectedSampleCount: number;
+  actualDecodedSampleCount: number | null;
+}
+
+export interface NativeBatchFineExecutionEvidence {
+  candidateId: NativeBatchFineCandidateId;
+  selectedMemberRank: number;
+  groupMemberRanks: number[];
+  sourceStreamIndex: number;
+  targetStreamIndex: number;
+  sourceCoarseBackend: NativeBatchSpectralBackendExecutionIdentity;
+  targetCoarseBackend: NativeBatchSpectralBackendExecutionIdentity;
+  sourceFineBackend: NativeBatchSpectralBackendExecutionIdentity;
+  targetFineBackend: NativeBatchSpectralBackendExecutionIdentity;
+  sourceRequestedWindow: NativeBatchFineDecodeWindow;
+  targetRequestedWindow: NativeBatchFineDecodeWindow;
+  sourceEffectiveWindow: NativeBatchFineDecodeWindow;
+  targetEffectiveWindow: NativeBatchFineDecodeWindow;
+  parametersHash: `sha256:${string}`;
+  occupancyDigest: `sha256:${string}`;
+  proposalTimeMapDigest: `sha256:${string}`;
+  scoreMicros: number;
+  evidenceDigest: `sha256:${string}`;
+}
+
 export interface NativeBatchExecutionIdentity {
   schemaVersion: typeof REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION;
   engineVersion: string;
@@ -164,6 +278,8 @@ export interface RealMediaBlindBatchPairOutcome {
   /** Native N×M coarse shortlist membership only; never a gold-aware relationship verdict. */
   globalSelected: boolean;
   globalSelection: NativeBatchGlobalSelectionEvidence;
+  fineFrontier: NativeBatchFineFrontierReceipt | null;
+  fineExecutionEvidence: NativeBatchFineExecutionEvidence | null;
   proposalTimeMap: AlignmentTimeMapProposal | null;
 }
 
@@ -248,6 +364,80 @@ export function createNativeBatchExecutionIdentityDigest(
   identity: NativeBatchExecutionIdentity
 ): `sha256:${string}` {
   return `sha256:${sha256Hex(canonicalJson(identity))}`;
+}
+
+export function createNativeBatchFineFrontierReceiptDigest(
+  receipt: NativeBatchFineFrontierReceipt
+): `sha256:${string}` {
+  return createNativeBatchFineV3Digest(FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN, {
+    ...receipt,
+    receiptDigest: ""
+  });
+}
+
+export function createNativeBatchFineExecutionEvidenceDigest(
+  evidence: NativeBatchFineExecutionEvidence
+): `sha256:${string}` {
+  return createNativeBatchFineV3Digest(FINE_EXECUTION_EVIDENCE_DIGEST_DOMAIN, {
+    ...evidence,
+    evidenceDigest: ""
+  });
+}
+
+export function createNativeBatchFineProposalTimeMapDigest(
+  timeMap: AlignmentTimeMapProposal
+): `sha256:${string}` {
+  return createNativeBatchFineV3Digest(FINE_PROPOSAL_TIME_MAP_DIGEST_DOMAIN, timeMap);
+}
+
+export function createNativeBatchFineParametersHash(
+  engineVersion: string,
+  featureVersion: string,
+  legacyParametersHash: string
+): `sha256:${string}` {
+  return createNativeBatchFineV3Digest(FINE_PARAMETERS_DIGEST_DOMAIN, {
+    engineVersion,
+    featureVersion,
+    fineScoreVersion: REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION,
+    legacyParametersHash
+  });
+}
+
+function createNativeBatchFineV3Digest(domain: string, value: unknown): `sha256:${string}` {
+  return `sha256:${sha256Hex(`${domain}\n${canonicalFineV3Json(value)}`)}`;
+}
+
+function canonicalFineV3Json(value: unknown): string {
+  return JSON.stringify(canonicalizeFineV3Value(value));
+}
+
+function canonicalizeFineV3Value(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeFineV3Value);
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, nested]) => [key, canonicalizeFineV3Value(nested)])
+    );
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("fine v3 canonical JSON 不接受非有限数值。");
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error("fine v3 canonical JSON 不接受超出安全范围的整数。");
+    }
+    const buffer = new ArrayBuffer(8);
+    const view = new DataView(buffer);
+    view.setFloat64(0, value, false);
+    return `f64:${view.getBigUint64(0, false).toString(16).padStart(16, "0")}`;
+  }
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string"
+  ) {
+    return value;
+  }
+  throw new Error("fine v3 canonical JSON 不接受 undefined、函数或 symbol。");
 }
 
 export function deriveRealMediaBlindBatchReceiptExecutionIdentityDigest(
@@ -360,6 +550,7 @@ export function validateRealMediaBlindBatchRunReceipt(
   const pairOutcomes = receipt.pairOutcomes.map((outcome, index) =>
     validateReceiptPairOutcome(outcome, index, suite)
   );
+  validateReceiptFineComponentCoherence(pairOutcomes);
   validateReceiptRunOutcomeCoherence(status, pairOutcomes);
   const executionIdentityDigest =
     deriveRealMediaBlindBatchReceiptExecutionIdentityDigest(pairOutcomes);
@@ -619,8 +810,13 @@ export function validateRealMediaBlindBatchGlobalSelectionEvidence(
   ) {
     throw new Error(`${label} ${state} evidence 不得公开候选证据。`);
   }
-  if (pairStatus === "completed" && state !== "selected" && state !== "blocked") {
-    throw new Error(`${label} completed pair 的 selection state 无效。`);
+  if (
+    pairStatus === "completed" &&
+    state !== "selected" &&
+    state !== "blocked" &&
+    state !== "failed"
+  ) {
+    throw new Error(`${label} completed pair 的 coarse diagnostic state 无效。`);
   }
   return {
     state,
@@ -1141,6 +1337,888 @@ function validateGlobalCandidateEvidence(
   };
 }
 
+function validateReceiptFineFrontier(
+  value: unknown,
+  label: string,
+  pairCount: number
+): NativeBatchFineFrontierReceipt {
+  const frontier = requireExactRecord(
+    value,
+    [
+      "contractVersion",
+      "scoreVersion",
+      "inventoryDigest",
+      "receiptDigest",
+      "componentOrdinal",
+      "componentPairOrdinals",
+      "inventoryCandidateCount",
+      "resolutionMarginMicros",
+      "overlapToleranceMs",
+      "limits",
+      "inventoryStateCounts",
+      "refinementRoundCount",
+      "evaluatedCandidateCount",
+      "finalState",
+      "resolved",
+      "selectedCandidateIds",
+      "selectedTotalScoreMicros",
+      "bestCompleted",
+      "runnerUpCompleted",
+      "optimisticOmitted",
+      "nextRefinementCandidateIds",
+      "deferredCandidateCount",
+      "proof",
+      "search"
+    ],
+    label
+  );
+  if (
+    frontier.contractVersion !== REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION ||
+    frontier.scoreVersion !== REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION
+  ) {
+    throw new Error(`${label} contractVersion/scoreVersion 无效。`);
+  }
+  const inventoryDigest = requireSha256Digest(frontier.inventoryDigest, `${label}.inventoryDigest`);
+  const receiptDigest = requireSha256Digest(frontier.receiptDigest, `${label}.receiptDigest`);
+  const componentOrdinal = requirePositiveSafeInteger(
+    frontier.componentOrdinal,
+    `${label}.componentOrdinal`
+  );
+  if (componentOrdinal > pairCount) throw new Error(`${label}.componentOrdinal 越界。`);
+  const componentPairOrdinals = requireFineIntegerArray(
+    frontier.componentPairOrdinals,
+    `${label}.componentPairOrdinals`,
+    1,
+    pairCount,
+    true
+  );
+  if (componentPairOrdinals.length === 0) {
+    throw new Error(`${label}.componentPairOrdinals 不能为空。`);
+  }
+  const inventoryCandidateCount = requireNonNegativeSafeInteger(
+    frontier.inventoryCandidateCount,
+    `${label}.inventoryCandidateCount`
+  );
+  const resolutionMarginMicros = requirePositiveSafeInteger(
+    frontier.resolutionMarginMicros,
+    `${label}.resolutionMarginMicros`
+  );
+  const overlapToleranceMs = requireNonNegativeSafeInteger(
+    frontier.overlapToleranceMs,
+    `${label}.overlapToleranceMs`
+  );
+  const limits = validateReceiptFineLimits(frontier.limits, `${label}.limits`);
+  if (inventoryCandidateCount > limits.maxCandidates) {
+    throw new Error(`${label}.inventoryCandidateCount 超过 maxCandidates。`);
+  }
+  const inventoryStateCounts = validateReceiptFineStateCounts(
+    frontier.inventoryStateCounts,
+    `${label}.inventoryStateCounts`
+  );
+  if (
+    inventoryStateCounts.unresolved +
+      inventoryStateCounts.scored +
+      inventoryStateCounts.evaluatedIneligible +
+      inventoryStateCounts.evidenceBlocked +
+      inventoryStateCounts.resourceBlocked +
+      inventoryStateCounts.infrastructureFailed +
+      inventoryStateCounts.cancelled !==
+    inventoryCandidateCount
+  ) {
+    throw new Error(`${label}.inventoryStateCounts 未完整划分库存。`);
+  }
+  const refinementRoundCount = requireNonNegativeSafeInteger(
+    frontier.refinementRoundCount,
+    `${label}.refinementRoundCount`
+  );
+  const evaluatedCandidateCount = requireNonNegativeSafeInteger(
+    frontier.evaluatedCandidateCount,
+    `${label}.evaluatedCandidateCount`
+  );
+  if (evaluatedCandidateCount > inventoryCandidateCount) {
+    throw new Error(`${label}.evaluatedCandidateCount 超过库存。`);
+  }
+  const finalState = requireFineFrontierState(frontier.finalState, `${label}.finalState`);
+  if (typeof frontier.resolved !== "boolean" || frontier.resolved !== (finalState === "resolved")) {
+    throw new Error(`${label}.resolved 与 finalState 不一致。`);
+  }
+  const selectedCandidateIds = validateFineCandidateIds(
+    frontier.selectedCandidateIds,
+    `${label}.selectedCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const selectedTotalScoreMicros = requireNonNegativeSafeIntegerOrNull(
+    frontier.selectedTotalScoreMicros,
+    `${label}.selectedTotalScoreMicros`
+  );
+  const bestCompleted = validateReceiptFineAssignment(
+    frontier.bestCompleted,
+    `${label}.bestCompleted`,
+    componentPairOrdinals
+  );
+  const runnerUpCompleted =
+    frontier.runnerUpCompleted === null
+      ? null
+      : validateReceiptFineAssignment(
+          frontier.runnerUpCompleted,
+          `${label}.runnerUpCompleted`,
+          componentPairOrdinals
+        );
+  if (runnerUpCompleted && runnerUpCompleted.totalScoreMicros > bestCompleted.totalScoreMicros) {
+    throw new Error(`${label}.runnerUpCompleted 分数超过 bestCompleted。`);
+  }
+  const optimisticOmitted =
+    frontier.optimisticOmitted === null
+      ? null
+      : validateReceiptFineOmitted(
+          frontier.optimisticOmitted,
+          `${label}.optimisticOmitted`,
+          componentPairOrdinals
+        );
+  const nextRefinementCandidateIds = validateFineCandidateIds(
+    frontier.nextRefinementCandidateIds,
+    `${label}.nextRefinementCandidateIds`,
+    componentPairOrdinals,
+    false,
+    false
+  );
+  const deferredCandidateCount = requireNonNegativeSafeInteger(
+    frontier.deferredCandidateCount,
+    `${label}.deferredCandidateCount`
+  );
+  if (deferredCandidateCount > inventoryCandidateCount) {
+    throw new Error(`${label}.deferredCandidateCount 超过库存。`);
+  }
+  const proofRecord = requireExactRecord(
+    frontier.proof,
+    ["beatsRunnerUpWithMargin", "beatsOptimisticOmittedWithMargin"],
+    `${label}.proof`
+  );
+  if (
+    typeof proofRecord.beatsRunnerUpWithMargin !== "boolean" ||
+    typeof proofRecord.beatsOptimisticOmittedWithMargin !== "boolean"
+  ) {
+    throw new Error(`${label}.proof 字段必须是 boolean。`);
+  }
+  const proof = {
+    beatsRunnerUpWithMargin: proofRecord.beatsRunnerUpWithMargin,
+    beatsOptimisticOmittedWithMargin: proofRecord.beatsOptimisticOmittedWithMargin
+  };
+  const searchRecord = requireExactRecord(
+    frontier.search,
+    ["statesVisited", "expansionsConsidered", "intervalComparisons"],
+    `${label}.search`
+  );
+  const search = {
+    statesVisited: requireBoundedFineInteger(
+      searchRecord.statesVisited,
+      `${label}.search.statesVisited`,
+      0,
+      limits.maxSearchStates
+    ),
+    expansionsConsidered: requireBoundedFineInteger(
+      searchRecord.expansionsConsidered,
+      `${label}.search.expansionsConsidered`,
+      0,
+      limits.maxSearchExpansions
+    ),
+    intervalComparisons: requireBoundedFineInteger(
+      searchRecord.intervalComparisons,
+      `${label}.search.intervalComparisons`,
+      0,
+      limits.maxIntervalComparisons
+    )
+  };
+  if (finalState === "resolved") {
+    if (
+      selectedCandidateIds.length === 0 ||
+      !sameFineCandidateIdArrays(selectedCandidateIds, bestCompleted.candidateIds) ||
+      selectedTotalScoreMicros !== bestCompleted.totalScoreMicros ||
+      !proof.beatsRunnerUpWithMargin ||
+      !proof.beatsOptimisticOmittedWithMargin ||
+      nextRefinementCandidateIds.length !== 0 ||
+      deferredCandidateCount !== 0
+    ) {
+      throw new Error(`${label} resolved 选择、分数或 proof 不闭合。`);
+    }
+  } else if (selectedCandidateIds.length !== 0 || selectedTotalScoreMicros !== null) {
+    throw new Error(`${label} 非 resolved 终态不能发布最终选择。`);
+  }
+  if (
+    finalState === "noEligibleCandidate" &&
+    (bestCompleted.candidateIds.length !== 0 ||
+      bestCompleted.totalScoreMicros !== 0 ||
+      runnerUpCompleted !== null ||
+      optimisticOmitted !== null ||
+      nextRefinementCandidateIds.length !== 0 ||
+      inventoryStateCounts.scored !== 0)
+  ) {
+    throw new Error(`${label} noEligibleCandidate 夹带候选结果。`);
+  }
+  const validated: NativeBatchFineFrontierReceipt = {
+    contractVersion: REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION,
+    scoreVersion: REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION,
+    inventoryDigest,
+    receiptDigest,
+    componentOrdinal,
+    componentPairOrdinals,
+    inventoryCandidateCount,
+    resolutionMarginMicros,
+    overlapToleranceMs,
+    limits,
+    inventoryStateCounts,
+    refinementRoundCount,
+    evaluatedCandidateCount,
+    finalState,
+    resolved: frontier.resolved,
+    selectedCandidateIds,
+    selectedTotalScoreMicros,
+    bestCompleted,
+    runnerUpCompleted,
+    optimisticOmitted,
+    nextRefinementCandidateIds,
+    deferredCandidateCount,
+    proof,
+    search
+  };
+  if (createNativeBatchFineFrontierReceiptDigest(validated) !== receiptDigest) {
+    throw new Error(`${label}.receiptDigest 与 canonical receipt 不一致。`);
+  }
+  return validated;
+}
+
+function validateReceiptFineLimits(value: unknown, label: string): NativeBatchFineLimits {
+  const record = requireExactRecord(
+    value,
+    [
+      "maxCandidates",
+      "maxSearchStates",
+      "maxSearchExpansions",
+      "maxIntervalComparisons",
+      "maxIntervalsPerAxis",
+      "maxTotalIntervals",
+      "refinementBatchSize"
+    ],
+    label
+  );
+  return {
+    maxCandidates: requirePositiveSafeInteger(record.maxCandidates, `${label}.maxCandidates`),
+    maxSearchStates: requirePositiveSafeInteger(
+      record.maxSearchStates,
+      `${label}.maxSearchStates`
+    ),
+    maxSearchExpansions: requirePositiveSafeInteger(
+      record.maxSearchExpansions,
+      `${label}.maxSearchExpansions`
+    ),
+    maxIntervalComparisons: requirePositiveSafeInteger(
+      record.maxIntervalComparisons,
+      `${label}.maxIntervalComparisons`
+    ),
+    maxIntervalsPerAxis: requirePositiveSafeInteger(
+      record.maxIntervalsPerAxis,
+      `${label}.maxIntervalsPerAxis`
+    ),
+    maxTotalIntervals: requirePositiveSafeInteger(
+      record.maxTotalIntervals,
+      `${label}.maxTotalIntervals`
+    ),
+    refinementBatchSize: requirePositiveSafeInteger(
+      record.refinementBatchSize,
+      `${label}.refinementBatchSize`
+    )
+  };
+}
+
+function validateReceiptFineStateCounts(value: unknown, label: string): NativeBatchFineStateCounts {
+  const record = requireExactRecord(
+    value,
+    [
+      "unresolved",
+      "scored",
+      "evaluatedIneligible",
+      "evidenceBlocked",
+      "resourceBlocked",
+      "infrastructureFailed",
+      "cancelled"
+    ],
+    label
+  );
+  return {
+    unresolved: requireNonNegativeSafeInteger(record.unresolved, `${label}.unresolved`),
+    scored: requireNonNegativeSafeInteger(record.scored, `${label}.scored`),
+    evaluatedIneligible: requireNonNegativeSafeInteger(
+      record.evaluatedIneligible,
+      `${label}.evaluatedIneligible`
+    ),
+    evidenceBlocked: requireNonNegativeSafeInteger(
+      record.evidenceBlocked,
+      `${label}.evidenceBlocked`
+    ),
+    resourceBlocked: requireNonNegativeSafeInteger(
+      record.resourceBlocked,
+      `${label}.resourceBlocked`
+    ),
+    infrastructureFailed: requireNonNegativeSafeInteger(
+      record.infrastructureFailed,
+      `${label}.infrastructureFailed`
+    ),
+    cancelled: requireNonNegativeSafeInteger(record.cancelled, `${label}.cancelled`)
+  };
+}
+
+function validateReceiptFineAssignment(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[]
+): NativeBatchFineAssignment {
+  const record = requireExactRecord(value, ["candidateIds", "totalScoreMicros"], label);
+  const candidateIds = validateFineCandidateIds(
+    record.candidateIds,
+    `${label}.candidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const totalScoreMicros = requireNonNegativeSafeInteger(
+    record.totalScoreMicros,
+    `${label}.totalScoreMicros`
+  );
+  if (candidateIds.length === 0 && totalScoreMicros !== 0) {
+    throw new Error(`${label} 空 assignment 总分必须为 0。`);
+  }
+  return { candidateIds, totalScoreMicros };
+}
+
+function validateReceiptFineOmitted(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[]
+): NativeBatchFineOmittedAssignment {
+  const record = requireExactRecord(
+    value,
+    [
+      "candidateIds",
+      "totalUpperBoundMicros",
+      "openCandidateIds",
+      "unresolvedCandidateIds",
+      "blockedCandidateIds"
+    ],
+    label
+  );
+  const candidateIds = validateFineCandidateIds(
+    record.candidateIds,
+    `${label}.candidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const openCandidateIds = validateFineCandidateIds(
+    record.openCandidateIds,
+    `${label}.openCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const unresolvedCandidateIds = validateFineCandidateIds(
+    record.unresolvedCandidateIds,
+    `${label}.unresolvedCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const blockedCandidateIds = validateFineCandidateIds(
+    record.blockedCandidateIds,
+    `${label}.blockedCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const openKeys = new Set(openCandidateIds.map(fineCandidateKey));
+  const partitionKeys = [...unresolvedCandidateIds, ...blockedCandidateIds].map(fineCandidateKey);
+  if (
+    candidateIds.length === 0 ||
+    openKeys.size === 0 ||
+    partitionKeys.length !== new Set(partitionKeys).size ||
+    partitionKeys.length !== openKeys.size ||
+    partitionKeys.some((key) => !openKeys.has(key)) ||
+    openCandidateIds.some(
+      (candidate) => !candidateIds.some((item) => sameFineCandidateId(item, candidate))
+    )
+  ) {
+    throw new Error(`${label} open/unresolved/blocked partition 不闭合。`);
+  }
+  return {
+    candidateIds,
+    totalUpperBoundMicros: requireNonNegativeSafeInteger(
+      record.totalUpperBoundMicros,
+      `${label}.totalUpperBoundMicros`
+    ),
+    openCandidateIds,
+    unresolvedCandidateIds,
+    blockedCandidateIds
+  };
+}
+
+function validateFineCandidateIds(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[],
+  canonicalOrder: boolean,
+  onePerPair: boolean
+): NativeBatchFineCandidateId[] {
+  if (!Array.isArray(value)) throw new Error(`${label} 必须是数组。`);
+  const ids = value.map((item, index) =>
+    validateFineCandidateId(item, `${label}[${index}]`, componentPairOrdinals)
+  );
+  const keys = ids.map(fineCandidateKey);
+  if (new Set(keys).size !== keys.length) throw new Error(`${label} 包含重复 candidateId。`);
+  if (onePerPair && new Set(ids.map((id) => id.pairOrdinal)).size !== ids.length) {
+    throw new Error(`${label} 同一 pair 只能选择一个候选。`);
+  }
+  if (canonicalOrder) {
+    const sorted = [...ids].sort(compareFineCandidateId);
+    if (!sameFineCandidateIdArrays(ids, sorted)) {
+      throw new Error(`${label} 未按 candidateId canonical 排序。`);
+    }
+  }
+  return ids;
+}
+
+function validateFineCandidateId(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[]
+): NativeBatchFineCandidateId {
+  const record = requireExactRecord(value, ["pairOrdinal", "candidateOrdinal"], label);
+  const pairOrdinal = requirePositiveSafeInteger(record.pairOrdinal, `${label}.pairOrdinal`);
+  if (!componentPairOrdinals.includes(pairOrdinal)) {
+    throw new Error(`${label}.pairOrdinal 不属于当前 component。`);
+  }
+  return {
+    pairOrdinal,
+    candidateOrdinal: requirePositiveSafeInteger(
+      record.candidateOrdinal,
+      `${label}.candidateOrdinal`
+    )
+  };
+}
+
+function requireFineFrontierState(
+  value: unknown,
+  label: string
+): NativeBatchFineFrontierReceipt["finalState"] {
+  if (
+    value !== "resolved" &&
+    value !== "noEligibleCandidate" &&
+    value !== "unresolved" &&
+    value !== "failed"
+  ) {
+    throw new Error(`${label} 无效。`);
+  }
+  return value;
+}
+
+function requireFineIntegerArray(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+  canonicalOrder: boolean
+): number[] {
+  if (!Array.isArray(value)) throw new Error(`${label} 必须是数组。`);
+  const items = value.map((item, index) =>
+    requireBoundedFineInteger(item, `${label}[${index}]`, minimum, maximum)
+  );
+  if (new Set(items).size !== items.length) throw new Error(`${label} 包含重复值。`);
+  if (canonicalOrder && items.some((item, index) => index > 0 && item <= (items[index - 1] ?? item))) {
+    throw new Error(`${label} 必须严格递增。`);
+  }
+  return items;
+}
+
+function requireBoundedFineInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number
+): number {
+  const integer = requireSafeInteger(value, label);
+  if (integer < minimum || integer > maximum) throw new Error(`${label} 越界。`);
+  return integer;
+}
+
+function compareFineCandidateId(left: NativeBatchFineCandidateId, right: NativeBatchFineCandidateId): number {
+  return left.pairOrdinal - right.pairOrdinal || left.candidateOrdinal - right.candidateOrdinal;
+}
+
+function fineCandidateKey(value: NativeBatchFineCandidateId): string {
+  return `${value.pairOrdinal}:${value.candidateOrdinal}`;
+}
+
+function sameFineCandidateId(
+  left: NativeBatchFineCandidateId | undefined,
+  right: NativeBatchFineCandidateId | undefined
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.pairOrdinal === right.pairOrdinal &&
+    left.candidateOrdinal === right.candidateOrdinal
+  );
+}
+
+function sameFineCandidateIdArrays(
+  left: readonly NativeBatchFineCandidateId[],
+  right: readonly NativeBatchFineCandidateId[]
+): boolean {
+  return left.length === right.length && left.every((item, index) => sameFineCandidateId(item, right[index]));
+}
+
+function validateReceiptFineExecutionEvidence(
+  value: unknown,
+  label: string,
+  pairOrdinal: number,
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  relationRanking: NativeBatchRelationRankingEvidence
+): NativeBatchFineExecutionEvidence {
+  const record = requireExactRecord(
+    value,
+    [
+      "candidateId",
+      "selectedMemberRank",
+      "groupMemberRanks",
+      "sourceStreamIndex",
+      "targetStreamIndex",
+      "sourceCoarseBackend",
+      "targetCoarseBackend",
+      "sourceFineBackend",
+      "targetFineBackend",
+      "sourceRequestedWindow",
+      "targetRequestedWindow",
+      "sourceEffectiveWindow",
+      "targetEffectiveWindow",
+      "parametersHash",
+      "occupancyDigest",
+      "proposalTimeMapDigest",
+      "scoreMicros",
+      "evidenceDigest"
+    ],
+    label
+  );
+  const candidateId = validateFineCandidateId(record.candidateId, `${label}.candidateId`, [
+    pairOrdinal
+  ]);
+  const selectedMemberRank = requirePositiveSafeInteger(
+    record.selectedMemberRank,
+    `${label}.selectedMemberRank`
+  );
+  const groupMemberRanks = requireFineIntegerArray(
+    record.groupMemberRanks,
+    `${label}.groupMemberRanks`,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    true
+  );
+  if (groupMemberRanks.length === 0 || !groupMemberRanks.includes(selectedMemberRank)) {
+    throw new Error(`${label}.selectedMemberRank 不属于 groupMemberRanks。`);
+  }
+  const sourceStreamIndex = requireNonNegativeSafeInteger(
+    record.sourceStreamIndex,
+    `${label}.sourceStreamIndex`
+  );
+  const targetStreamIndex = requireNonNegativeSafeInteger(
+    record.targetStreamIndex,
+    `${label}.targetStreamIndex`
+  );
+  if (sourceStreamIndex !== source.audioStreamIndex || targetStreamIndex !== target.audioStreamIndex) {
+    throw new Error(`${label} 音轨索引与 execution suite 不一致。`);
+  }
+  const sourceCoarseBackend = validateReceiptFineBackend(
+    record.sourceCoarseBackend,
+    `${label}.sourceCoarseBackend`
+  );
+  const targetCoarseBackend = validateReceiptFineBackend(
+    record.targetCoarseBackend,
+    `${label}.targetCoarseBackend`
+  );
+  const sourceFineBackend = validateReceiptFineBackend(
+    record.sourceFineBackend,
+    `${label}.sourceFineBackend`
+  );
+  const targetFineBackend = validateReceiptFineBackend(
+    record.targetFineBackend,
+    `${label}.targetFineBackend`
+  );
+  validateReceiptFineBackendContinuity(sourceCoarseBackend, sourceFineBackend, `${label}.source`);
+  validateReceiptFineBackendContinuity(targetCoarseBackend, targetFineBackend, `${label}.target`);
+  const executionIdentity = relationRanking.executionIdentity;
+  if (
+    executionIdentity === null ||
+    !executionIdentity.sourceSpectralBackends.some((backend) =>
+      canonicalEqual(backend, sourceCoarseBackend)
+    ) ||
+    !executionIdentity.targetSpectralBackends.some((backend) =>
+      canonicalEqual(backend, targetCoarseBackend)
+    )
+  ) {
+    throw new Error(`${label} coarse backend 未绑定 relation execution identity。`);
+  }
+  const sourceRequestedWindow = validateReceiptFineWindow(
+    record.sourceRequestedWindow,
+    `${label}.sourceRequestedWindow`,
+    false
+  );
+  const targetRequestedWindow = validateReceiptFineWindow(
+    record.targetRequestedWindow,
+    `${label}.targetRequestedWindow`,
+    false
+  );
+  const sourceEffectiveWindow = validateReceiptFineWindow(
+    record.sourceEffectiveWindow,
+    `${label}.sourceEffectiveWindow`,
+    true
+  );
+  const targetEffectiveWindow = validateReceiptFineWindow(
+    record.targetEffectiveWindow,
+    `${label}.targetEffectiveWindow`,
+    true
+  );
+  validateReceiptFineWindowRelation(
+    sourceRequestedWindow,
+    sourceEffectiveWindow,
+    `${label}.source`
+  );
+  validateReceiptFineWindowRelation(
+    targetRequestedWindow,
+    targetEffectiveWindow,
+    `${label}.target`
+  );
+  const validated: NativeBatchFineExecutionEvidence = {
+    candidateId,
+    selectedMemberRank,
+    groupMemberRanks,
+    sourceStreamIndex,
+    targetStreamIndex,
+    sourceCoarseBackend,
+    targetCoarseBackend,
+    sourceFineBackend,
+    targetFineBackend,
+    sourceRequestedWindow,
+    targetRequestedWindow,
+    sourceEffectiveWindow,
+    targetEffectiveWindow,
+    parametersHash: requireSha256Digest(record.parametersHash, `${label}.parametersHash`),
+    occupancyDigest: requireSha256Digest(record.occupancyDigest, `${label}.occupancyDigest`),
+    proposalTimeMapDigest: requireSha256Digest(
+      record.proposalTimeMapDigest,
+      `${label}.proposalTimeMapDigest`
+    ),
+    scoreMicros: requireBoundedFineInteger(
+      record.scoreMicros,
+      `${label}.scoreMicros`,
+      1,
+      1_000_000
+    ),
+    evidenceDigest: requireSha256Digest(record.evidenceDigest, `${label}.evidenceDigest`)
+  };
+  if (createNativeBatchFineExecutionEvidenceDigest(validated) !== validated.evidenceDigest) {
+    throw new Error(`${label}.evidenceDigest 与 canonical evidence 不一致。`);
+  }
+  return validated;
+}
+
+function validateReceiptFineWindow(
+  value: unknown,
+  label: string,
+  requireActual: boolean
+): NativeBatchFineDecodeWindow {
+  const record = requireExactRecord(
+    value,
+    [
+      "startMs",
+      "endMs",
+      "presentationOffsetMs",
+      "sampleRate",
+      "expectedSampleCount",
+      "actualDecodedSampleCount"
+    ],
+    label
+  );
+  const startMs = requireSafeInteger(record.startMs, `${label}.startMs`);
+  const endMs = requireSafeInteger(record.endMs, `${label}.endMs`);
+  if (endMs <= startMs) throw new Error(`${label} 必须是正长度半开窗口。`);
+  const presentationOffsetMs = requireSafeInteger(
+    record.presentationOffsetMs,
+    `${label}.presentationOffsetMs`
+  );
+  if (presentationOffsetMs !== startMs) {
+    throw new Error(`${label}.presentationOffsetMs 未绑定窗口起点。`);
+  }
+  if (record.sampleRate !== 16_000) throw new Error(`${label}.sampleRate 必须为 16000。`);
+  const expectedSampleCount = requirePositiveSafeInteger(
+    record.expectedSampleCount,
+    `${label}.expectedSampleCount`
+  );
+  if (expectedSampleCount !== Math.ceil(((endMs - startMs) * 16_000) / 1_000)) {
+    throw new Error(`${label}.expectedSampleCount 与窗口时长不一致。`);
+  }
+  const actualDecodedSampleCount =
+    record.actualDecodedSampleCount === null
+      ? null
+      : requirePositiveSafeInteger(
+          record.actualDecodedSampleCount,
+          `${label}.actualDecodedSampleCount`
+        );
+  if (
+    (requireActual &&
+      (actualDecodedSampleCount === null || actualDecodedSampleCount > expectedSampleCount)) ||
+    (!requireActual && actualDecodedSampleCount !== null)
+  ) {
+    throw new Error(`${label}.actualDecodedSampleCount 与 requested/effective 语义不一致。`);
+  }
+  return {
+    startMs,
+    endMs,
+    presentationOffsetMs,
+    sampleRate: 16_000,
+    expectedSampleCount,
+    actualDecodedSampleCount
+  };
+}
+
+function validateReceiptFineWindowRelation(
+  requested: NativeBatchFineDecodeWindow,
+  effective: NativeBatchFineDecodeWindow,
+  label: string
+): void {
+  if (
+    effective.startMs !== requested.startMs ||
+    effective.endMs > requested.endMs + FINE_WINDOW_DECODE_TOLERANCE_MS
+  ) {
+    throw new Error(
+      `${label} effective window 必须与 requested 同起点，且结束点最多放宽 ${FINE_WINDOW_DECODE_TOLERANCE_MS}ms。`
+    );
+  }
+}
+
+function validateReceiptFineBackend(
+  value: unknown,
+  label: string
+): NativeBatchSpectralBackendExecutionIdentity {
+  return validateNativeBatchSpectralBackendIdentities([value], label)[0];
+}
+
+function validateReceiptFineBackendContinuity(
+  coarse: NativeBatchSpectralBackendExecutionIdentity,
+  fine: NativeBatchSpectralBackendExecutionIdentity,
+  label: string
+): void {
+  if (!isLockedFineSpectralBackendIdentity(coarse, fine)) {
+    throw new Error(`${label} coarse→fine backend continuity 不闭合。`);
+  }
+}
+
+function validateReceiptFinePairBinding(
+  pairOrdinal: number,
+  frontier: NativeBatchFineFrontierReceipt | null,
+  execution: NativeBatchFineExecutionEvidence | null,
+  proposalTimeMap: AlignmentTimeMapProposal | null,
+  relationRanking: NativeBatchRelationRankingEvidence,
+  label: string
+): void {
+  if (frontier === null || !frontier.componentPairOrdinals.includes(pairOrdinal)) {
+    throw new Error(`${label} completed pair 缺少绑定当前 pair 的 fineFrontier。`);
+  }
+  const selected = frontier.selectedCandidateIds.filter(
+    (candidate) => candidate.pairOrdinal === pairOrdinal
+  );
+  if (selected.length > 1) throw new Error(`${label} 第二次 assignment 对同一 pair 多选。`);
+  if (selected.length === 0) {
+    if (execution !== null || proposalTimeMap !== null) {
+      throw new Error(`${label} 未被最终选择却夹带 fine execution 或 TimeMap。`);
+    }
+    return;
+  }
+  if (
+    execution === null ||
+    proposalTimeMap === null ||
+    !sameFineCandidateId(selected[0], execution.candidateId)
+  ) {
+    throw new Error(`${label} 最终 candidate 与 fine execution 不一致。`);
+  }
+  if (
+    createNativeBatchFineProposalTimeMapDigest(proposalTimeMap) !==
+    execution.proposalTimeMapDigest
+  ) {
+    throw new Error(`${label} proposal TimeMap 与 fine execution 摘要不一致。`);
+  }
+  const identity = relationRanking.executionIdentity;
+  if (
+    identity === null ||
+    createNativeBatchFineParametersHash(
+      identity.engineVersion,
+      identity.featureVersion,
+      proposalTimeMap.parametersHash
+    ) !== execution.parametersHash
+  ) {
+    throw new Error(`${label} fine parametersHash 未绑定 coarse identity/TimeMap 参数。`);
+  }
+}
+
+function validateReceiptFineComponentCoherence(
+  outcomes: readonly RealMediaBlindBatchPairOutcome[]
+): void {
+  const byComponent = new Map<number, NativeBatchFineFrontierReceipt>();
+  for (const outcome of outcomes) {
+    const frontier = outcome.fineFrontier;
+    if (frontier === null) continue;
+    const existing = byComponent.get(frontier.componentOrdinal);
+    if (existing && !canonicalEqual(existing, frontier)) {
+      throw new Error("同一 fine component 的 receipt 内容发生漂移。");
+    }
+    byComponent.set(frontier.componentOrdinal, frontier);
+  }
+  const componentOrdinals = [...byComponent.keys()].sort((left, right) => left - right);
+  if (componentOrdinals.some((ordinal, index) => ordinal !== index + 1)) {
+    throw new Error("fine componentOrdinal 必须从 1 开始连续且无缺口。");
+  }
+  for (const frontier of byComponent.values()) {
+    const componentOutcomes: RealMediaBlindBatchPairOutcome[] = [];
+    for (const pairOrdinal of frontier.componentPairOrdinals) {
+      const outcome = outcomes[pairOrdinal - 1];
+      if (
+        outcome === undefined ||
+        outcome.fineFrontier === null ||
+        !canonicalEqual(outcome.fineFrontier, frontier)
+      ) {
+        throw new Error("fine component receipt 未由全部成员 pair 原子复用。");
+      }
+      componentOutcomes.push(outcome);
+    }
+    const executions = componentOutcomes
+      .map((outcome) => outcome.fineExecutionEvidence)
+      .filter((evidence): evidence is NativeBatchFineExecutionEvidence => evidence !== null);
+    if (
+      frontier.resolved &&
+      (executions.length !== frontier.selectedCandidateIds.length ||
+        executions.some(
+          (evidence) =>
+            !frontier.selectedCandidateIds.some((candidate) =>
+              sameFineCandidateId(candidate, evidence.candidateId)
+            )
+        ) ||
+        executions.reduce((sum, evidence) => sum + evidence.scoreMicros, 0) !==
+          frontier.selectedTotalScoreMicros)
+    ) {
+      throw new Error("fine component selected IDs、execution evidence 与总分不闭合。");
+    }
+  }
+}
+
 function validateReceiptPairOutcome(
   value: unknown,
   pairIndex: number,
@@ -1158,6 +2236,8 @@ function validateReceiptPairOutcome(
       "relationRanking",
       "globalSelected",
       "globalSelection",
+      "fineFrontier",
+      "fineExecutionEvidence",
       "proposalTimeMap"
     ],
     `pairOutcomes[${pairIndex}]`
@@ -1196,34 +2276,58 @@ function validateReceiptPairOutcome(
   ) {
     throw new Error("receipt pair outcome 的 globalSelected 与 native evidence 不一致。");
   }
+  const fineFrontier =
+    outcome.fineFrontier === null
+      ? null
+      : validateReceiptFineFrontier(
+          outcome.fineFrontier,
+          `receipt pair #${expected.pairOrdinal}.fineFrontier`,
+          suite.pairs.length
+        );
+  const fineExecutionEvidence =
+    outcome.fineExecutionEvidence === null
+      ? null
+      : validateReceiptFineExecutionEvidence(
+          outcome.fineExecutionEvidence,
+          `receipt pair #${expected.pairOrdinal}.fineExecutionEvidence`,
+          expected.pairOrdinal,
+          source,
+          target,
+          relationRanking
+        );
   let failureCode: RealMediaBlindBatchPairFailureCode | null;
   let proposalTimeMap: AlignmentTimeMapProposal | null;
   if (nativeStatus === "completed") {
     if (outcome.failureCode !== null) {
       throw new Error("completed receipt pair 不得包含 failureCode。");
     }
-    assertAlignmentTimeMapExactKeys(
-      outcome.proposalTimeMap,
-      `receipt pair #${expected.pairOrdinal}`
-    );
-    if (!isAlignmentTimeMapProposal(outcome.proposalTimeMap, true)) {
-      throw new Error("completed receipt pair 的 proposalTimeMap 不是完整 V2 TimeMap。");
-    }
-    proposalTimeMap = structuredClone(outcome.proposalTimeMap);
-    validateRealMediaBlindBatchProposalBinding(
-      proposalTimeMap,
-      source,
-      target,
-      suite.parameters,
-      expected.pairOrdinal
-    );
-    if (globalSelection.decisionCandidate) {
-      assertRealMediaBlindBatchDecisionCandidateMatchesTimeMap(
-        globalSelection.decisionCandidate,
+    if (outcome.proposalTimeMap === null) {
+      proposalTimeMap = null;
+    } else {
+      assertAlignmentTimeMapExactKeys(
+        outcome.proposalTimeMap,
+        `receipt pair #${expected.pairOrdinal}`
+      );
+      if (!isAlignmentTimeMapProposal(outcome.proposalTimeMap, true)) {
+        throw new Error("completed receipt pair 的 proposalTimeMap 不是完整 V2 TimeMap。");
+      }
+      proposalTimeMap = structuredClone(outcome.proposalTimeMap);
+      validateRealMediaBlindBatchProposalBinding(
         proposalTimeMap,
+        source,
+        target,
+        suite.parameters,
         expected.pairOrdinal
       );
     }
+    validateReceiptFinePairBinding(
+      expected.pairOrdinal,
+      fineFrontier,
+      fineExecutionEvidence,
+      proposalTimeMap,
+      relationRanking,
+      `receipt pair #${expected.pairOrdinal}`
+    );
     failureCode = null;
   } else {
     const expectedFailureCode =
@@ -1233,6 +2337,15 @@ function validateReceiptPairOutcome(
     }
     failureCode = expectedFailureCode;
     proposalTimeMap = null;
+    if (fineExecutionEvidence !== null) {
+      throw new Error("failed/cancelled receipt pair 不能包含 fineExecutionEvidence。");
+    }
+    if (
+      nativeStatus === "cancelled" &&
+      fineFrontier !== null
+    ) {
+      throw new Error("cancelled receipt pair 不能包含 fineFrontier。");
+    }
   }
   return {
     pairIndex,
@@ -1244,6 +2357,8 @@ function validateReceiptPairOutcome(
     relationRanking,
     globalSelected: globalSelection.selected,
     globalSelection,
+    fineFrontier,
+    fineExecutionEvidence,
     proposalTimeMap
   };
 }
@@ -1985,6 +3100,10 @@ function normalizePathForDistinctness(path: string): string {
 
 function assertCanonicalEqual(left: unknown, right: unknown, message: string): void {
   if (canonicalJson(left) !== canonicalJson(right)) throw new Error(message);
+}
+
+function canonicalEqual(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
 }
 
 function canonicalJson(value: unknown): string {

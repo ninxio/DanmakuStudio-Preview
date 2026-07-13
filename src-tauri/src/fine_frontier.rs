@@ -343,6 +343,7 @@ pub enum FineFrontierError {
     SearchLimitExceeded {
         kind: SearchLimitKind,
         limit: u64,
+        search: ExactSearchStats,
     },
     ScoreTotalOverflow,
 }
@@ -376,7 +377,7 @@ pub fn analyze_fine_frontier_with_cancel(
     check_cancel(cancel)?;
     let optimistic_omitted =
         find_optimistic_omitted_assignment(inventory, &ordered_indices, cancel)?;
-    let next_refinement = build_refinement_batch(
+    let mut next_refinement = build_refinement_batch(
         inventory,
         optimistic_omitted.as_ref(),
         config.limits.refinement_batch_size,
@@ -421,6 +422,19 @@ pub fn analyze_fine_frontier_with_cancel(
     } else {
         FineFrontierState::Unresolved
     };
+
+    // The optimistic batch is computed before the proof state so Pending can
+    // schedule work deterministically. Once the proof has already closed,
+    // however, that batch is stale and must not escape as executable work.
+    if matches!(
+        state,
+        FineFrontierState::Resolved | FineFrontierState::NoEligibleCandidate
+    ) {
+        next_refinement = RefinementBatch {
+            candidate_ids: Vec::new(),
+            deferred_candidate_count: 0,
+        };
+    }
 
     check_cancel(cancel)?;
     Ok(FineFrontierOutcome {
@@ -701,6 +715,7 @@ impl SearchBudget<'_> {
             return Err(FineFrontierError::SearchLimitExceeded {
                 kind: SearchLimitKind::States,
                 limit: self.max_states,
+                search: self.stats(),
             });
         }
         self.states_visited += 1;
@@ -718,6 +733,7 @@ impl SearchBudget<'_> {
             return Err(FineFrontierError::SearchLimitExceeded {
                 kind: SearchLimitKind::Expansions,
                 limit: self.max_expansions,
+                search: self.stats(),
             });
         }
         self.expansions_considered += 1;
@@ -735,6 +751,7 @@ impl SearchBudget<'_> {
             return Err(FineFrontierError::SearchLimitExceeded {
                 kind: SearchLimitKind::IntervalComparisons,
                 limit: self.max_interval_comparisons,
+                search: self.stats(),
             });
         }
         self.interval_comparisons += 1;
@@ -1708,6 +1725,24 @@ mod tests {
     }
 
     #[test]
+    fn resolved_proof_does_not_publish_stale_refinement_work() {
+        let inventory = FineCandidateInventory {
+            candidates: vec![
+                scored(0, 0, 900_000, 800_000),
+                candidate(0, 1, 100_000, FineEvaluationState::Unresolved),
+            ],
+        };
+
+        let outcome = analyze_fine_frontier(&inventory, FineFrontierConfig::default()).unwrap();
+
+        assert_eq!(outcome.state, FineFrontierState::Resolved);
+        assert_eq!(outcome.best_completed.candidate_ids, vec![id(0, 0)]);
+        assert!(outcome.proof.beats_optimistic_omitted_with_margin);
+        assert!(outcome.next_refinement.candidate_ids.is_empty());
+        assert_eq!(outcome.next_refinement.deferred_candidate_count, 0);
+    }
+
+    #[test]
     fn cancellation_fails_closed_without_a_partial_outcome() {
         let inventory = FineCandidateInventory {
             candidates: vec![scored(0, 0, 900_000, 800_000)],
@@ -2102,13 +2137,14 @@ mod tests {
         let mut config = FineFrontierConfig::default();
         config.limits.max_interval_comparisons = 1;
 
-        assert_eq!(
+        assert!(matches!(
             analyze_fine_frontier(&inventory, config),
             Err(FineFrontierError::SearchLimitExceeded {
                 kind: SearchLimitKind::IntervalComparisons,
                 limit: 1,
-            })
-        );
+                search,
+            }) if search.interval_comparisons == 1
+        ));
     }
 
     #[test]
@@ -2178,13 +2214,14 @@ mod tests {
         let mut config = FineFrontierConfig::default();
         config.limits.max_search_states = 1;
 
-        assert_eq!(
+        assert!(matches!(
             analyze_fine_frontier(&inventory, config),
             Err(FineFrontierError::SearchLimitExceeded {
                 kind: SearchLimitKind::States,
                 limit: 1,
-            })
-        );
+                search,
+            }) if search.states_visited == 1
+        ));
     }
 
     #[test]
@@ -2195,13 +2232,14 @@ mod tests {
         let mut config = FineFrontierConfig::default();
         config.limits.max_search_expansions = 1;
 
-        assert_eq!(
+        assert!(matches!(
             analyze_fine_frontier(&inventory, config),
             Err(FineFrontierError::SearchLimitExceeded {
                 kind: SearchLimitKind::Expansions,
                 limit: 1,
-            })
-        );
+                search,
+            }) if search.expansions_considered == 1
+        ));
     }
 
     #[test]

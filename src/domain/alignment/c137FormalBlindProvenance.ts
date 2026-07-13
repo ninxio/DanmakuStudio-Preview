@@ -36,20 +36,20 @@ import {
 } from "./realMediaBlindBatchContract";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION = 2 as const;
+export const C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION = 3 as const;
 
-const MANIFEST_DIGEST_DOMAIN = "c137-formal-blind-full-manifest-v2";
-const GOLD_DIGEST_DOMAIN = "c137-formal-blind-gold-v2";
-const MEDIA_BINDINGS_DIGEST_DOMAIN = "c137-formal-blind-media-bindings-v2";
-const PARAMETERS_DIGEST_DOMAIN = "c137-formal-blind-execution-parameters-v2";
-const PROVENANCE_DIGEST_DOMAIN = "c137-formal-blind-provenance-v2";
-const OBSERVATION_DIGEST_DOMAIN = "c137-formal-blind-query-observations-v2";
-const DECISION_DIGEST_DOMAIN = "c137-formal-blind-global-decision-v2";
-const GLOBAL_PAIR_ID_DOMAIN = "c137-formal-blind-global-pair-v2";
+const MANIFEST_DIGEST_DOMAIN = "c137-formal-blind-full-manifest-v3";
+const GOLD_DIGEST_DOMAIN = "c137-formal-blind-gold-v3";
+const MEDIA_BINDINGS_DIGEST_DOMAIN = "c137-formal-blind-media-bindings-v3";
+const PARAMETERS_DIGEST_DOMAIN = "c137-formal-blind-execution-parameters-v3";
+const PROVENANCE_DIGEST_DOMAIN = "c137-formal-blind-provenance-v3";
+const OBSERVATION_DIGEST_DOMAIN = "c137-formal-blind-query-observations-v3";
+const DECISION_DIGEST_DOMAIN = "c137-formal-blind-global-decision-v3";
+const GLOBAL_PAIR_ID_DOMAIN = "c137-formal-blind-global-pair-v3";
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 
-export interface C137FormalBlindProvenanceBatchEnvelopeV2 {
+export interface C137FormalBlindProvenanceBatchEnvelopeV3 {
   schemaVersion: typeof C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION;
   kind: "c137-formal-blind-provenance-batch";
   batchId: string;
@@ -59,7 +59,7 @@ export interface C137FormalBlindProvenanceBatchEnvelopeV2 {
   rawPrediction: C137BlindBatchRawPrediction;
 }
 
-export interface C137FormalBlindProvenanceV2 {
+export interface C137FormalBlindProvenanceV3 {
   schemaVersion: typeof C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION;
   kind: "c137-formal-blind-provenance";
   releaseEligible: false;
@@ -70,7 +70,7 @@ export interface C137FormalBlindProvenanceV2 {
   mediaBindingsDigest: C137Digest;
   executionIdentityDigest: C137Digest;
   plan: C137FormalBlindMatrixPlanV2;
-  batches: C137FormalBlindProvenanceBatchEnvelopeV2[];
+  batches: C137FormalBlindProvenanceBatchEnvelopeV3[];
   provenanceDigest: C137Digest;
 }
 
@@ -82,7 +82,7 @@ export interface C137FormalBlindProvenanceExpectations {
   topK: number;
 }
 
-export interface C137FormalBlindDerivedRelationshipDecisionV2 {
+export interface C137FormalBlindDerivedRelationshipDecisionV3 {
   caseId: string;
   provenanceRef: C137Digest;
   goldPairId: C137Digest;
@@ -99,7 +99,7 @@ export interface C137FormalBlindProvenanceEvaluation {
   valid: boolean;
   issues: string[];
   coverageValid: boolean;
-  decisions: C137FormalBlindDerivedRelationshipDecisionV2[];
+  decisions: C137FormalBlindDerivedRelationshipDecisionV3[];
 }
 
 interface MatrixObservation {
@@ -113,7 +113,7 @@ interface MatrixObservation {
   relationRanking: NativeBatchRelationRankingEvidence;
 }
 
-type C137FormalBlindProvenanceDraft = Omit<C137FormalBlindProvenanceV2, "provenanceDigest">;
+type C137FormalBlindProvenanceDraft = Omit<C137FormalBlindProvenanceV3, "provenanceDigest">;
 
 export {
   C137_FORMAL_BLIND_MATRIX_COVERAGE,
@@ -187,7 +187,7 @@ export function computeC137FormalBlindPlanDigest(
 }
 
 export function computeC137FormalBlindParametersDigest(
-  provenance: Pick<C137FormalBlindProvenanceV2, "plan" | "batches">
+  provenance: Pick<C137FormalBlindProvenanceV3, "plan" | "batches">
 ): C137Digest {
   const first = provenance.batches[0]?.executionSuite.parameters;
   if (first === undefined) throw new Error("formal blind provenance 至少需要一个 batch。");
@@ -206,7 +206,7 @@ export function computeC137FormalBlindParametersDigest(
 }
 
 function requireUnifiedExecutionIdentityDigest(
-  batches: readonly C137FormalBlindProvenanceBatchEnvelopeV2[]
+  batches: readonly C137FormalBlindProvenanceBatchEnvelopeV3[]
 ): C137Digest {
   const first = batches[0]?.nativeReceipt.executionIdentityDigest;
   if (first === undefined || first === null || !DIGEST.test(first)) {
@@ -232,7 +232,7 @@ function requireUnifiedExecutionIdentityDigest(
 }
 
 export function computeC137FormalBlindProvenanceDigest(
-  provenance: C137FormalBlindProvenanceDraft | C137FormalBlindProvenanceV2
+  provenance: C137FormalBlindProvenanceDraft | C137FormalBlindProvenanceV3
 ): C137Digest {
   return digest(
     PROVENANCE_DIGEST_DOMAIN,
@@ -252,11 +252,11 @@ export function computeC137FormalBlindProvenanceDigest(
   );
 }
 
-export function sealC137FormalBlindProvenanceV2(input: {
+export function sealC137FormalBlindProvenanceV3(input: {
   manifest: RealMediaBenchmarkManifest;
   plan: C137FormalBlindMatrixPlanV2;
-  batches: readonly C137FormalBlindProvenanceBatchEnvelopeV2[];
-}): C137FormalBlindProvenanceV2 {
+  batches: readonly C137FormalBlindProvenanceBatchEnvelopeV3[];
+}): C137FormalBlindProvenanceV3 {
   const manifest = structuredClone(input.manifest);
   const manifestDigest = computeC137FormalBlindManifestDigest(manifest);
   const expectedPlan = createC137FormalBlindMatrixPlan(manifest, manifestDigest, {
@@ -281,7 +281,7 @@ export function sealC137FormalBlindProvenanceV2(input: {
     plan: structuredClone(expectedPlan),
     batches: structuredClone([...input.batches])
   };
-  const sealed: C137FormalBlindProvenanceV2 = {
+  const sealed: C137FormalBlindProvenanceV3 = {
     ...draft,
     provenanceDigest: computeC137FormalBlindProvenanceDigest(draft)
   };
@@ -577,7 +577,7 @@ function deriveGlobalDecisions(
   candidateByPhysicalKey: ReadonlyMap<string, C137FormalBlindMatrixCandidateEntry>,
   observations: readonly MatrixObservation[],
   orderedReceiptDigests: readonly C137Digest[]
-): C137FormalBlindDerivedRelationshipDecisionV2[] {
+): C137FormalBlindDerivedRelationshipDecisionV3[] {
   const candidateSide = plan.relationshipAxis === "source" ? "target" : "source";
   const observationsByQuery = new Map<string, MatrixObservation[]>();
   for (const observation of observations) {
@@ -821,7 +821,7 @@ function validateExecutionSideBinding(
   });
 }
 
-function parseProvenance(value: unknown): C137FormalBlindProvenanceV2 {
+function parseProvenance(value: unknown): C137FormalBlindProvenanceV3 {
   const record = requireExactRecord(
     value,
     [
@@ -950,7 +950,7 @@ function parsePlanBatch(value: unknown, index: number): C137FormalBlindMatrixPla
 function parseBatchEnvelope(
   value: unknown,
   index: number
-): C137FormalBlindProvenanceBatchEnvelopeV2 {
+): C137FormalBlindProvenanceBatchEnvelopeV3 {
   const label = `formal blind batches[${index}]`;
   const record = requireExactRecord(
     value,

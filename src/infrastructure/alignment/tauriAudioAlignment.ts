@@ -1,5 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { isLockedFineSpectralBackendIdentity } from "../../domain/alignment/fineSpectralBackend";
 import type { AlignmentProposal } from "../../domain/alignment/types";
+import { sha256Hex } from "../../domain/shared/sha256";
 
 export interface TauriAudioAlignmentRequest {
   completePath: string;
@@ -127,6 +129,8 @@ export interface AudioAlignmentBatchPairSnapshot {
   message: string;
   relationRanking: AudioAlignmentBatchRelationRankingSnapshot;
   globalSelection: AudioAlignmentBatchGlobalSelectionSnapshot;
+  fineFrontier: AudioAlignmentBatchFineFrontierReceiptSnapshot | null;
+  fineExecutionEvidence: AudioAlignmentBatchFineExecutionEvidenceSnapshot | null;
   proposal: AlignmentProposal | null;
   error: string | null;
 }
@@ -198,6 +202,123 @@ export interface AudioAlignmentBatchSpectralBackendIdentitySnapshot {
   fallbackReason: string | null;
 }
 
+export const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION =
+  "alignment-v2-adaptive-fine-frontier-v1" as const;
+export const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION =
+  "alignment-v2-coarse-upper-times-confidence-v1" as const;
+
+export interface AudioAlignmentBatchFineCandidateIdSnapshot {
+  pairOrdinal: number;
+  candidateOrdinal: number;
+}
+
+export interface AudioAlignmentBatchFineStateCountsSnapshot {
+  unresolved: number;
+  scored: number;
+  evaluatedIneligible: number;
+  evidenceBlocked: number;
+  resourceBlocked: number;
+  infrastructureFailed: number;
+  cancelled: number;
+}
+
+export interface AudioAlignmentBatchFineAssignmentSnapshot {
+  candidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+  totalScoreMicros: number;
+}
+
+export interface AudioAlignmentBatchFineOmittedAssignmentSnapshot {
+  candidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+  totalUpperBoundMicros: number;
+  openCandidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+  unresolvedCandidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+  blockedCandidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+}
+
+export interface AudioAlignmentBatchFineResolutionProofSnapshot {
+  beatsRunnerUpWithMargin: boolean;
+  beatsOptimisticOmittedWithMargin: boolean;
+}
+
+export interface AudioAlignmentBatchFineSearchSnapshot {
+  statesVisited: number;
+  expansionsConsidered: number;
+  intervalComparisons: number;
+}
+
+export interface AudioAlignmentBatchFineLimitsSnapshot {
+  maxCandidates: number;
+  maxSearchStates: number;
+  maxSearchExpansions: number;
+  maxIntervalComparisons: number;
+  maxIntervalsPerAxis: number;
+  maxTotalIntervals: number;
+  refinementBatchSize: number;
+}
+
+export type AudioAlignmentBatchFineFrontierState =
+  | "resolved"
+  | "noEligibleCandidate"
+  | "unresolved"
+  | "failed";
+
+export interface AudioAlignmentBatchFineFrontierReceiptSnapshot {
+  contractVersion: typeof AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION;
+  scoreVersion: typeof AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION;
+  inventoryDigest: `sha256:${string}`;
+  receiptDigest: `sha256:${string}`;
+  componentOrdinal: number;
+  componentPairOrdinals: number[];
+  inventoryCandidateCount: number;
+  resolutionMarginMicros: number;
+  overlapToleranceMs: number;
+  limits: AudioAlignmentBatchFineLimitsSnapshot;
+  inventoryStateCounts: AudioAlignmentBatchFineStateCountsSnapshot;
+  refinementRoundCount: number;
+  evaluatedCandidateCount: number;
+  finalState: AudioAlignmentBatchFineFrontierState;
+  resolved: boolean;
+  selectedCandidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+  selectedTotalScoreMicros: number | null;
+  bestCompleted: AudioAlignmentBatchFineAssignmentSnapshot;
+  runnerUpCompleted: AudioAlignmentBatchFineAssignmentSnapshot | null;
+  optimisticOmitted: AudioAlignmentBatchFineOmittedAssignmentSnapshot | null;
+  nextRefinementCandidateIds: AudioAlignmentBatchFineCandidateIdSnapshot[];
+  deferredCandidateCount: number;
+  proof: AudioAlignmentBatchFineResolutionProofSnapshot;
+  search: AudioAlignmentBatchFineSearchSnapshot;
+}
+
+export interface AudioAlignmentBatchFineDecodeWindowSnapshot {
+  startMs: number;
+  endMs: number;
+  presentationOffsetMs: number;
+  sampleRate: number;
+  expectedSampleCount: number;
+  actualDecodedSampleCount: number | null;
+}
+
+export interface AudioAlignmentBatchFineExecutionEvidenceSnapshot {
+  candidateId: AudioAlignmentBatchFineCandidateIdSnapshot;
+  selectedMemberRank: number;
+  groupMemberRanks: number[];
+  sourceStreamIndex: number;
+  targetStreamIndex: number;
+  sourceCoarseBackend: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
+  targetCoarseBackend: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
+  sourceFineBackend: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
+  targetFineBackend: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
+  sourceRequestedWindow: AudioAlignmentBatchFineDecodeWindowSnapshot;
+  targetRequestedWindow: AudioAlignmentBatchFineDecodeWindowSnapshot;
+  sourceEffectiveWindow: AudioAlignmentBatchFineDecodeWindowSnapshot;
+  targetEffectiveWindow: AudioAlignmentBatchFineDecodeWindowSnapshot;
+  parametersHash: `sha256:${string}`;
+  occupancyDigest: `sha256:${string}`;
+  proposalTimeMapDigest: `sha256:${string}`;
+  scoreMicros: number;
+  evidenceDigest: `sha256:${string}`;
+}
+
 export interface AudioAlignmentBatchExecutionIdentitySnapshot {
   schemaVersion: 1;
   engineVersion: string;
@@ -223,7 +344,7 @@ export interface AudioAlignmentBatchRelationRankingSnapshot {
 
 export interface AudioAlignmentBatchJobSnapshot {
   schemaVersion: 1;
-  evidenceVersion: 2;
+  evidenceVersion: 3;
   jobId: string;
   pairingMode: AudioAlignmentBatchPairingMode;
   sourceMediaIds: string[];
@@ -533,6 +654,53 @@ function sameOrderedStrings(left: readonly string[], right: readonly string[]): 
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+export function createAudioAlignmentBatchProposalTimeMapDigest(
+  timeMap: unknown
+): `sha256:${string}` {
+  return createAudioAlignmentBatchV3Digest(
+    AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN,
+    timeMap
+  );
+}
+
+export function createAudioAlignmentBatchFineParametersHash(
+  engineVersion: string,
+  featureVersion: string,
+  legacyParametersHash: string
+): `sha256:${string}` {
+  return createAudioAlignmentBatchV3Digest(AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN, {
+    engineVersion,
+    featureVersion,
+    fineScoreVersion: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+    legacyParametersHash
+  });
+}
+
+export function createAudioAlignmentBatchFineExecutionEvidenceDigest(
+  evidence: AudioAlignmentBatchFineExecutionEvidenceSnapshot
+): `sha256:${string}` {
+  return createAudioAlignmentBatchV3Digest(AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN, {
+    ...evidence,
+    evidenceDigest: ""
+  });
+}
+
+export function createAudioAlignmentBatchFineFrontierReceiptDigest(
+  receipt: AudioAlignmentBatchFineFrontierReceiptSnapshot
+): `sha256:${string}` {
+  return createAudioAlignmentBatchV3Digest(AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_DIGEST_DOMAIN, {
+    ...receipt,
+    receiptDigest: ""
+  });
+}
+
+function createAudioAlignmentBatchV3Digest(
+  domain: string,
+  value: unknown
+): `sha256:${string}` {
+  return `sha256:${sha256Hex(`${domain}\n${canonicalRuntimeJson(value)}`)}`;
+}
+
 const AUDIO_ALIGNMENT_JOB_STATUSES = new Set<AudioAlignmentJobStatus>([
   "queued",
   "running",
@@ -570,7 +738,7 @@ function validateAudioAlignmentBatchJobSnapshot(
     ],
     "原生批任务响应"
   );
-  if (value.evidenceVersion !== 2) {
+  if (value.evidenceVersion !== 3) {
     throw new Error("原生批任务返回了不支持的 evidenceVersion。");
   }
   const jobId = requireRuntimeText(value.jobId, "批任务 jobId");
@@ -637,6 +805,7 @@ function validateAudioAlignmentBatchJobSnapshot(
       new Set(targetMediaIds)
     )
   );
+  validateAudioAlignmentBatchFineComponentCoherence(pairs);
   if (pairingMode === "fullCartesian") {
     pairs.forEach((pair, index) => {
       const sourceIndex = Math.floor(index / targetMediaIds.length);
@@ -714,6 +883,8 @@ function validateAudioAlignmentBatchPairSnapshot(
       "message",
       "relationRanking",
       "globalSelection",
+      "fineFrontier",
+      "fineExecutionEvidence",
       "proposal",
       "error"
     ],
@@ -762,12 +933,41 @@ function validateAudioAlignmentBatchPairSnapshot(
     value.globalSelection,
     `第 ${index + 1} 个 pair globalSelection`
   );
+  const fineFrontier =
+    value.fineFrontier === null
+      ? null
+      : validateAudioAlignmentBatchFineFrontier(
+          value.fineFrontier,
+          `第 ${index + 1} 个 pair fineFrontier`,
+          totalPairCount
+        );
+  const fineExecutionEvidence =
+    value.fineExecutionEvidence === null
+      ? null
+      : validateAudioAlignmentBatchFineExecutionEvidence(
+          value.fineExecutionEvidence,
+          `第 ${index + 1} 个 pair fineExecutionEvidence`,
+          pairOrdinal
+        );
+  validateAudioAlignmentBatchFinePairBinding(
+    value,
+    status,
+    pairOrdinal,
+    relationRanking,
+    fineFrontier,
+    fineExecutionEvidence,
+    `第 ${index + 1} 个 pair`
+  );
   if (status === "completed") {
     if (!isRecord(value.proposal) || value.error !== null) {
       throw new Error("已完成 pair 必须包含 proposal 且不能包含 error。");
     }
-    if (globalSelection.state !== "selected" && globalSelection.state !== "blocked") {
-      throw new Error("已完成 pair 必须发布 selected 或 blocked 的全局选择证据。");
+    if (
+      globalSelection.state !== "selected" &&
+      globalSelection.state !== "blocked" &&
+      globalSelection.state !== "failed"
+    ) {
+      throw new Error("已完成 pair 必须发布 terminal coarse 诊断证据。");
     }
     if (relationRanking.state !== "ranked" && relationRanking.state !== "noEligibleCandidate") {
       throw new Error("已完成 pair 必须发布 ranked 或 noEligibleCandidate 的关系排名证据。");
@@ -802,6 +1002,868 @@ function validateAudioAlignmentBatchPairSnapshot(
     throw new Error("原生批任务 pair 状态与关系排名证据状态不一致。");
   }
   return value as unknown as AudioAlignmentBatchPairSnapshot;
+}
+
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_STATES = [
+  "resolved",
+  "noEligibleCandidate",
+  "unresolved",
+  "failed"
+] as const;
+
+const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_DIGEST_DOMAIN =
+  "audio-alignment-v3/fine-frontier-receipt/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN =
+  "audio-alignment-v3/fine-execution-evidence/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN =
+  "audio-alignment-v3/proposal-time-map/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN =
+  "audio-alignment-v3/fine-parameters/v1";
+const AUDIO_ALIGNMENT_BATCH_FINE_SAMPLE_RATE = 16_000;
+const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_MICROS_ONE = 1_000_000;
+const AUDIO_ALIGNMENT_BATCH_FINE_WINDOW_DECODE_TOLERANCE_MS = 50;
+
+function validateAudioAlignmentBatchFineFrontier(
+  value: unknown,
+  label: string,
+  totalPairCount: number
+): AudioAlignmentBatchFineFrontierReceiptSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    [
+      "contractVersion",
+      "scoreVersion",
+      "inventoryDigest",
+      "receiptDigest",
+      "componentOrdinal",
+      "componentPairOrdinals",
+      "inventoryCandidateCount",
+      "resolutionMarginMicros",
+      "overlapToleranceMs",
+      "limits",
+      "inventoryStateCounts",
+      "refinementRoundCount",
+      "evaluatedCandidateCount",
+      "finalState",
+      "resolved",
+      "selectedCandidateIds",
+      "selectedTotalScoreMicros",
+      "bestCompleted",
+      "runnerUpCompleted",
+      "optimisticOmitted",
+      "nextRefinementCandidateIds",
+      "deferredCandidateCount",
+      "proof",
+      "search"
+    ],
+    label
+  );
+  if (value.contractVersion !== AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION) {
+    throw new Error(`${label}.contractVersion 无效。`);
+  }
+  if (value.scoreVersion !== AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION) {
+    throw new Error(`${label}.scoreVersion 无效。`);
+  }
+  requireRuntimeSha256(value.inventoryDigest, `${label}.inventoryDigest`);
+  const receiptDigest = requireRuntimeSha256(value.receiptDigest, `${label}.receiptDigest`);
+  requireRuntimeInteger(value.componentOrdinal, `${label}.componentOrdinal`, 1, totalPairCount);
+  const componentPairOrdinals = requireRuntimeIntegerArray(
+    value.componentPairOrdinals,
+    `${label}.componentPairOrdinals`,
+    1,
+    totalPairCount,
+    true
+  );
+  if (componentPairOrdinals.length === 0) {
+    throw new Error(`${label}.componentPairOrdinals 不能为空。`);
+  }
+  const inventoryCandidateCount = requireRuntimeInteger(
+    value.inventoryCandidateCount,
+    `${label}.inventoryCandidateCount`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  requireRuntimeInteger(
+    value.resolutionMarginMicros,
+    `${label}.resolutionMarginMicros`,
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+  requireRuntimeInteger(
+    value.overlapToleranceMs,
+    `${label}.overlapToleranceMs`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  const limits = validateAudioAlignmentBatchFineLimits(value.limits, `${label}.limits`);
+  if (inventoryCandidateCount > limits.maxCandidates) {
+    throw new Error(`${label}.inventoryCandidateCount 超过声明的 maxCandidates。`);
+  }
+  const stateCounts = validateAudioAlignmentBatchFineStateCounts(
+    value.inventoryStateCounts,
+    `${label}.inventoryStateCounts`
+  );
+  if (
+    stateCounts.unresolved +
+      stateCounts.scored +
+      stateCounts.evaluatedIneligible +
+      stateCounts.evidenceBlocked +
+      stateCounts.resourceBlocked +
+      stateCounts.infrastructureFailed +
+      stateCounts.cancelled !==
+    inventoryCandidateCount
+  ) {
+    throw new Error(`${label}.inventoryStateCounts 未完整划分候选库存。`);
+  }
+  requireRuntimeInteger(
+    value.refinementRoundCount,
+    `${label}.refinementRoundCount`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  requireRuntimeInteger(
+    value.evaluatedCandidateCount,
+    `${label}.evaluatedCandidateCount`,
+    0,
+    inventoryCandidateCount
+  );
+  const finalState = requireRuntimeEnum(
+    value.finalState,
+    AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_STATES,
+    `${label}.finalState`
+  );
+  if (typeof value.resolved !== "boolean" || value.resolved !== (finalState === "resolved")) {
+    throw new Error(`${label}.resolved 与 finalState 不一致。`);
+  }
+  const selectedCandidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.selectedCandidateIds,
+    `${label}.selectedCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const selectedTotalScoreMicros =
+    value.selectedTotalScoreMicros === null
+      ? null
+      : requireRuntimeInteger(
+          value.selectedTotalScoreMicros,
+          `${label}.selectedTotalScoreMicros`,
+          0,
+          Number.MAX_SAFE_INTEGER
+        );
+  const bestCompleted = validateAudioAlignmentBatchFineAssignment(
+    value.bestCompleted,
+    `${label}.bestCompleted`,
+    componentPairOrdinals
+  );
+  const runnerUpCompleted =
+    value.runnerUpCompleted === null
+      ? null
+      : validateAudioAlignmentBatchFineAssignment(
+          value.runnerUpCompleted,
+          `${label}.runnerUpCompleted`,
+          componentPairOrdinals
+        );
+  if (
+    runnerUpCompleted !== null &&
+    runnerUpCompleted.totalScoreMicros > bestCompleted.totalScoreMicros
+  ) {
+    throw new Error(`${label}.runnerUpCompleted 分数不能超过 bestCompleted。`);
+  }
+  const optimisticOmitted =
+    value.optimisticOmitted === null
+      ? null
+      : validateAudioAlignmentBatchFineOmittedAssignment(
+          value.optimisticOmitted,
+          `${label}.optimisticOmitted`,
+          componentPairOrdinals
+        );
+  const nextRefinementCandidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.nextRefinementCandidateIds,
+    `${label}.nextRefinementCandidateIds`,
+    componentPairOrdinals,
+    false,
+    false
+  );
+  const deferredCandidateCount = requireRuntimeInteger(
+    value.deferredCandidateCount,
+    `${label}.deferredCandidateCount`,
+    0,
+    inventoryCandidateCount
+  );
+  const proof = validateAudioAlignmentBatchFineProof(value.proof, `${label}.proof`);
+  validateAudioAlignmentBatchFineSearch(value.search, `${label}.search`, limits);
+
+  if (finalState === "resolved") {
+    if (
+      selectedCandidateIds.length === 0 ||
+      !sameFineCandidateIds(selectedCandidateIds, bestCompleted.candidateIds) ||
+      selectedTotalScoreMicros !== bestCompleted.totalScoreMicros ||
+      !proof.beatsRunnerUpWithMargin ||
+      !proof.beatsOptimisticOmittedWithMargin ||
+      nextRefinementCandidateIds.length !== 0 ||
+      deferredCandidateCount !== 0
+    ) {
+      throw new Error(`${label} resolved 终态的选择、分数或 proof 不闭合。`);
+    }
+  } else if (selectedCandidateIds.length !== 0 || selectedTotalScoreMicros !== null) {
+    throw new Error(`${label} 非 resolved 终态不能发布最终选择。`);
+  }
+  if (
+    finalState === "noEligibleCandidate" &&
+    (bestCompleted.candidateIds.length !== 0 ||
+      bestCompleted.totalScoreMicros !== 0 ||
+      runnerUpCompleted !== null ||
+      optimisticOmitted !== null ||
+      nextRefinementCandidateIds.length !== 0 ||
+      stateCounts.scored !== 0)
+  ) {
+    throw new Error(`${label} noEligibleCandidate 终态夹带了已完成或待评估候选。`);
+  }
+  if (
+    createAudioAlignmentBatchFineFrontierReceiptDigest(
+      value as unknown as AudioAlignmentBatchFineFrontierReceiptSnapshot
+    ) !== receiptDigest
+  ) {
+    throw new Error(`${label}.receiptDigest 与 canonical receipt 不一致。`);
+  }
+  return value as unknown as AudioAlignmentBatchFineFrontierReceiptSnapshot;
+}
+
+function validateAudioAlignmentBatchFineExecutionEvidence(
+  value: unknown,
+  label: string,
+  pairOrdinal: number
+): AudioAlignmentBatchFineExecutionEvidenceSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    [
+      "candidateId",
+      "selectedMemberRank",
+      "groupMemberRanks",
+      "sourceStreamIndex",
+      "targetStreamIndex",
+      "sourceCoarseBackend",
+      "targetCoarseBackend",
+      "sourceFineBackend",
+      "targetFineBackend",
+      "sourceRequestedWindow",
+      "targetRequestedWindow",
+      "sourceEffectiveWindow",
+      "targetEffectiveWindow",
+      "parametersHash",
+      "occupancyDigest",
+      "proposalTimeMapDigest",
+      "scoreMicros",
+      "evidenceDigest"
+    ],
+    label
+  );
+  const candidateId = validateAudioAlignmentBatchFineCandidateId(
+    value.candidateId,
+    `${label}.candidateId`,
+    [pairOrdinal]
+  );
+  const selectedMemberRank = requireRuntimeInteger(
+    value.selectedMemberRank,
+    `${label}.selectedMemberRank`,
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+  const groupMemberRanks = requireRuntimeIntegerArray(
+    value.groupMemberRanks,
+    `${label}.groupMemberRanks`,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    true
+  );
+  if (groupMemberRanks.length === 0 || !groupMemberRanks.includes(selectedMemberRank)) {
+    throw new Error(`${label}.selectedMemberRank 必须属于非空 groupMemberRanks。`);
+  }
+  requireRuntimeInteger(
+    value.sourceStreamIndex,
+    `${label}.sourceStreamIndex`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  requireRuntimeInteger(
+    value.targetStreamIndex,
+    `${label}.targetStreamIndex`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  const sourceCoarseBackend = validateAudioAlignmentBatchSpectralBackendIdentity(
+    value.sourceCoarseBackend,
+    `${label}.sourceCoarseBackend`
+  );
+  const targetCoarseBackend = validateAudioAlignmentBatchSpectralBackendIdentity(
+    value.targetCoarseBackend,
+    `${label}.targetCoarseBackend`
+  );
+  const sourceFineBackend = validateAudioAlignmentBatchSpectralBackendIdentity(
+    value.sourceFineBackend,
+    `${label}.sourceFineBackend`
+  );
+  const targetFineBackend = validateAudioAlignmentBatchSpectralBackendIdentity(
+    value.targetFineBackend,
+    `${label}.targetFineBackend`
+  );
+  validateFineBackendContinuity(sourceCoarseBackend, sourceFineBackend, `${label}.source`);
+  validateFineBackendContinuity(targetCoarseBackend, targetFineBackend, `${label}.target`);
+  const sourceRequestedWindow = validateAudioAlignmentBatchFineWindow(
+    value.sourceRequestedWindow,
+    `${label}.sourceRequestedWindow`,
+    false
+  );
+  const targetRequestedWindow = validateAudioAlignmentBatchFineWindow(
+    value.targetRequestedWindow,
+    `${label}.targetRequestedWindow`,
+    false
+  );
+  const sourceEffectiveWindow = validateAudioAlignmentBatchFineWindow(
+    value.sourceEffectiveWindow,
+    `${label}.sourceEffectiveWindow`,
+    true
+  );
+  const targetEffectiveWindow = validateAudioAlignmentBatchFineWindow(
+    value.targetEffectiveWindow,
+    `${label}.targetEffectiveWindow`,
+    true
+  );
+  validateAudioAlignmentBatchFineWindowRelation(
+    sourceRequestedWindow,
+    sourceEffectiveWindow,
+    `${label}.source`
+  );
+  validateAudioAlignmentBatchFineWindowRelation(
+    targetRequestedWindow,
+    targetEffectiveWindow,
+    `${label}.target`
+  );
+  requireRuntimeSha256(value.parametersHash, `${label}.parametersHash`);
+  requireRuntimeSha256(value.occupancyDigest, `${label}.occupancyDigest`);
+  requireRuntimeSha256(value.proposalTimeMapDigest, `${label}.proposalTimeMapDigest`);
+  requireRuntimeInteger(
+    value.scoreMicros,
+    `${label}.scoreMicros`,
+    1,
+    AUDIO_ALIGNMENT_BATCH_FINE_SCORE_MICROS_ONE
+  );
+  const evidenceDigest = requireRuntimeSha256(value.evidenceDigest, `${label}.evidenceDigest`);
+  if (
+    createAudioAlignmentBatchFineExecutionEvidenceDigest(
+      value as unknown as AudioAlignmentBatchFineExecutionEvidenceSnapshot
+    ) !== evidenceDigest
+  ) {
+    throw new Error(`${label}.evidenceDigest 与 canonical evidence 不一致。`);
+  }
+  return { ...(value as unknown as AudioAlignmentBatchFineExecutionEvidenceSnapshot), candidateId };
+}
+
+function validateAudioAlignmentBatchFinePairBinding(
+  pair: Record<string, unknown>,
+  status: AudioAlignmentJobStatus,
+  pairOrdinal: number,
+  relationRanking: AudioAlignmentBatchRelationRankingSnapshot,
+  frontier: AudioAlignmentBatchFineFrontierReceiptSnapshot | null,
+  execution: AudioAlignmentBatchFineExecutionEvidenceSnapshot | null,
+  label: string
+): void {
+  if (status === "queued" || status === "running" || status === "cancelled") {
+    if (frontier !== null || execution !== null) {
+      throw new Error(`${label} 非终态或 cancelled 状态不能发布 fine 证据。`);
+    }
+    return;
+  }
+  if (frontier === null) {
+    throw new Error(`${label} 终态缺少 fineFrontier receipt。`);
+  }
+  if (!frontier.componentPairOrdinals.includes(pairOrdinal)) {
+    throw new Error(`${label}.fineFrontier 未绑定当前 pairOrdinal。`);
+  }
+  const selectedForPair = frontier.selectedCandidateIds.filter(
+    (candidate) => candidate.pairOrdinal === pairOrdinal
+  );
+  if (selectedForPair.length > 1) {
+    throw new Error(`${label}.fineFrontier 对同一 pair 选择了多个候选。`);
+  }
+  if (selectedForPair.length === 0) {
+    if (execution !== null) {
+      throw new Error(`${label} 未进入第二次 assignment，却夹带 fineExecutionEvidence。`);
+    }
+    return;
+  }
+  if (status !== "completed" || execution === null || !sameFineCandidateId(selectedForPair[0], execution.candidateId)) {
+    throw new Error(`${label} 第二次 assignment 与 fineExecutionEvidence 不一致。`);
+  }
+  const identity = relationRanking.executionIdentity;
+  if (
+    identity === null ||
+    !identity.sourceSpectralBackends.some((backend) =>
+      sameSpectralBackendIdentity(backend, execution.sourceCoarseBackend)
+    ) ||
+    !identity.targetSpectralBackends.some((backend) =>
+      sameSpectralBackendIdentity(backend, execution.targetCoarseBackend)
+    )
+  ) {
+    throw new Error(`${label} fine coarse backend 未绑定 relation execution identity。`);
+  }
+  const proposal = pair.proposal;
+  if (!isRecord(proposal) || !isRecord(proposal.timeMap)) {
+    throw new Error(`${label} 已选 fine candidate 缺少 proposal.timeMap。`);
+  }
+  if (
+    createAudioAlignmentBatchProposalTimeMapDigest(proposal.timeMap) !==
+    execution.proposalTimeMapDigest
+  ) {
+    throw new Error(`${label} proposal.timeMap 与 fineExecutionEvidence 摘要不一致。`);
+  }
+  const legacyParametersHash = requireRuntimeText(
+    proposal.timeMap.parametersHash,
+    `${label}.proposal.timeMap.parametersHash`
+  );
+  if (
+    createAudioAlignmentBatchFineParametersHash(
+      identity.engineVersion,
+      identity.featureVersion,
+      legacyParametersHash
+    ) !== execution.parametersHash
+  ) {
+    throw new Error(`${label} fine parametersHash 未绑定 coarse identity/TimeMap 参数。`);
+  }
+}
+
+function validateAudioAlignmentBatchFineLimits(
+  value: unknown,
+  label: string
+): AudioAlignmentBatchFineLimitsSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  const keys = [
+    "maxCandidates",
+    "maxSearchStates",
+    "maxSearchExpansions",
+    "maxIntervalComparisons",
+    "maxIntervalsPerAxis",
+    "maxTotalIntervals",
+    "refinementBatchSize"
+  ] as const;
+  requireRuntimeExactKeys(value, keys, label);
+  for (const key of keys) {
+    requireRuntimeInteger(value[key], `${label}.${key}`, 1, Number.MAX_SAFE_INTEGER);
+  }
+  return value as unknown as AudioAlignmentBatchFineLimitsSnapshot;
+}
+
+function validateAudioAlignmentBatchFineStateCounts(
+  value: unknown,
+  label: string
+): AudioAlignmentBatchFineStateCountsSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  const keys = [
+    "unresolved",
+    "scored",
+    "evaluatedIneligible",
+    "evidenceBlocked",
+    "resourceBlocked",
+    "infrastructureFailed",
+    "cancelled"
+  ] as const;
+  requireRuntimeExactKeys(value, keys, label);
+  for (const key of keys) {
+    requireRuntimeInteger(value[key], `${label}.${key}`, 0, Number.MAX_SAFE_INTEGER);
+  }
+  return value as unknown as AudioAlignmentBatchFineStateCountsSnapshot;
+}
+
+function validateAudioAlignmentBatchFineAssignment(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[]
+): AudioAlignmentBatchFineAssignmentSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(value, ["candidateIds", "totalScoreMicros"], label);
+  const candidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.candidateIds,
+    `${label}.candidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const totalScoreMicros = requireRuntimeInteger(
+    value.totalScoreMicros,
+    `${label}.totalScoreMicros`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  if (candidateIds.length === 0 && totalScoreMicros !== 0) {
+    throw new Error(`${label} 空 assignment 的总分必须为 0。`);
+  }
+  return { candidateIds, totalScoreMicros };
+}
+
+function validateAudioAlignmentBatchFineOmittedAssignment(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[]
+): AudioAlignmentBatchFineOmittedAssignmentSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    [
+      "candidateIds",
+      "totalUpperBoundMicros",
+      "openCandidateIds",
+      "unresolvedCandidateIds",
+      "blockedCandidateIds"
+    ],
+    label
+  );
+  const candidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.candidateIds,
+    `${label}.candidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const openCandidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.openCandidateIds,
+    `${label}.openCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const unresolvedCandidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.unresolvedCandidateIds,
+    `${label}.unresolvedCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const blockedCandidateIds = validateAudioAlignmentBatchFineCandidateIds(
+    value.blockedCandidateIds,
+    `${label}.blockedCandidateIds`,
+    componentPairOrdinals,
+    true,
+    true
+  );
+  const totalUpperBoundMicros = requireRuntimeInteger(
+    value.totalUpperBoundMicros,
+    `${label}.totalUpperBoundMicros`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  const openKeys = new Set(openCandidateIds.map(fineCandidateIdKey));
+  const stateKeys = [...unresolvedCandidateIds, ...blockedCandidateIds].map(fineCandidateIdKey);
+  if (
+    openCandidateIds.length === 0 ||
+    candidateIds.length === 0 ||
+    stateKeys.length !== new Set(stateKeys).size ||
+    stateKeys.length !== openKeys.size ||
+    stateKeys.some((key) => !openKeys.has(key)) ||
+    openCandidateIds.some(
+      (candidate) => !candidateIds.some((item) => sameFineCandidateId(item, candidate))
+    )
+  ) {
+    throw new Error(`${label} open/unresolved/blocked candidate partition 不闭合。`);
+  }
+  return {
+    candidateIds,
+    totalUpperBoundMicros,
+    openCandidateIds,
+    unresolvedCandidateIds,
+    blockedCandidateIds
+  };
+}
+
+function validateAudioAlignmentBatchFineProof(
+  value: unknown,
+  label: string
+): AudioAlignmentBatchFineResolutionProofSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    ["beatsRunnerUpWithMargin", "beatsOptimisticOmittedWithMargin"],
+    label
+  );
+  if (
+    typeof value.beatsRunnerUpWithMargin !== "boolean" ||
+    typeof value.beatsOptimisticOmittedWithMargin !== "boolean"
+  ) {
+    throw new Error(`${label} proof 字段必须为 boolean。`);
+  }
+  return value as unknown as AudioAlignmentBatchFineResolutionProofSnapshot;
+}
+
+function validateAudioAlignmentBatchFineSearch(
+  value: unknown,
+  label: string,
+  limits: AudioAlignmentBatchFineLimitsSnapshot
+): AudioAlignmentBatchFineSearchSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    ["statesVisited", "expansionsConsidered", "intervalComparisons"],
+    label
+  );
+  requireRuntimeInteger(value.statesVisited, `${label}.statesVisited`, 0, limits.maxSearchStates);
+  requireRuntimeInteger(
+    value.expansionsConsidered,
+    `${label}.expansionsConsidered`,
+    0,
+    limits.maxSearchExpansions
+  );
+  requireRuntimeInteger(
+    value.intervalComparisons,
+    `${label}.intervalComparisons`,
+    0,
+    limits.maxIntervalComparisons
+  );
+  return value as unknown as AudioAlignmentBatchFineSearchSnapshot;
+}
+
+function validateAudioAlignmentBatchFineWindow(
+  value: unknown,
+  label: string,
+  requireActualSamples: boolean
+): AudioAlignmentBatchFineDecodeWindowSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    [
+      "startMs",
+      "endMs",
+      "presentationOffsetMs",
+      "sampleRate",
+      "expectedSampleCount",
+      "actualDecodedSampleCount"
+    ],
+    label
+  );
+  const startMs = requireRuntimeInteger(
+    value.startMs,
+    `${label}.startMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  const endMs = requireRuntimeInteger(
+    value.endMs,
+    `${label}.endMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  if (endMs <= startMs) throw new Error(`${label} 必须为正长度半开区间。`);
+  const presentationOffsetMs = requireRuntimeInteger(
+    value.presentationOffsetMs,
+    `${label}.presentationOffsetMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  if (presentationOffsetMs !== startMs) {
+    throw new Error(`${label}.presentationOffsetMs 必须绑定窗口起点。`);
+  }
+  if (value.sampleRate !== AUDIO_ALIGNMENT_BATCH_FINE_SAMPLE_RATE) {
+    throw new Error(`${label}.sampleRate 必须为 ${AUDIO_ALIGNMENT_BATCH_FINE_SAMPLE_RATE}。`);
+  }
+  const expectedSampleCount = requireRuntimeInteger(
+    value.expectedSampleCount,
+    `${label}.expectedSampleCount`,
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+  const expectedFromRange = Math.ceil(
+    ((endMs - startMs) * AUDIO_ALIGNMENT_BATCH_FINE_SAMPLE_RATE) / 1_000
+  );
+  if (expectedSampleCount !== expectedFromRange) {
+    throw new Error(`${label}.expectedSampleCount 与窗口时长不一致。`);
+  }
+  if (requireActualSamples) {
+    const actual = requireRuntimeInteger(
+      value.actualDecodedSampleCount,
+      `${label}.actualDecodedSampleCount`,
+      1,
+      expectedSampleCount
+    );
+    if (actual > expectedSampleCount) {
+      throw new Error(`${label}.actualDecodedSampleCount 超过请求上限。`);
+    }
+  } else if (value.actualDecodedSampleCount !== null) {
+    throw new Error(`${label} requested window 不能伪报实际解码样本数。`);
+  }
+  return value as unknown as AudioAlignmentBatchFineDecodeWindowSnapshot;
+}
+
+function validateAudioAlignmentBatchFineWindowRelation(
+  requested: AudioAlignmentBatchFineDecodeWindowSnapshot,
+  effective: AudioAlignmentBatchFineDecodeWindowSnapshot,
+  label: string
+): void {
+  if (
+    effective.startMs !== requested.startMs ||
+    effective.endMs > requested.endMs + AUDIO_ALIGNMENT_BATCH_FINE_WINDOW_DECODE_TOLERANCE_MS
+  ) {
+    throw new Error(
+      `${label} effective window 必须与 requested 同起点，且结束点最多放宽 ${AUDIO_ALIGNMENT_BATCH_FINE_WINDOW_DECODE_TOLERANCE_MS}ms。`
+    );
+  }
+}
+
+function validateAudioAlignmentBatchFineCandidateIds(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[],
+  requireCanonicalOrder: boolean,
+  requireOnePerPair: boolean
+): AudioAlignmentBatchFineCandidateIdSnapshot[] {
+  if (!Array.isArray(value)) throw new Error(`${label} 必须是数组。`);
+  const ids = value.map((item, index) =>
+    validateAudioAlignmentBatchFineCandidateId(
+      item,
+      `${label}[${index}]`,
+      componentPairOrdinals
+    )
+  );
+  const keys = ids.map(fineCandidateIdKey);
+  if (new Set(keys).size !== keys.length) throw new Error(`${label} 包含重复 candidateId。`);
+  if (requireOnePerPair && new Set(ids.map((id) => id.pairOrdinal)).size !== ids.length) {
+    throw new Error(`${label} 同一 pair 只能选择一个候选。`);
+  }
+  if (requireCanonicalOrder) {
+    const sorted = [...ids].sort(compareFineCandidateId);
+    if (!sameFineCandidateIds(ids, sorted)) {
+      throw new Error(`${label} 必须按 pairOrdinal/candidateOrdinal canonical 排序。`);
+    }
+  }
+  return ids;
+}
+
+function validateAudioAlignmentBatchFineCandidateId(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[]
+): AudioAlignmentBatchFineCandidateIdSnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(value, ["pairOrdinal", "candidateOrdinal"], label);
+  const pairOrdinal = requireRuntimeInteger(
+    value.pairOrdinal,
+    `${label}.pairOrdinal`,
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+  if (!componentPairOrdinals.includes(pairOrdinal)) {
+    throw new Error(`${label}.pairOrdinal 不属于当前 component。`);
+  }
+  const candidateOrdinal = requireRuntimeInteger(
+    value.candidateOrdinal,
+    `${label}.candidateOrdinal`,
+    1,
+    Number.MAX_SAFE_INTEGER
+  );
+  return { pairOrdinal, candidateOrdinal };
+}
+
+function validateFineBackendContinuity(
+  coarse: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+  fine: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+  label: string
+): void {
+  if (!isLockedFineSpectralBackendIdentity(coarse, fine)) {
+    throw new Error(`${label} coarse→fine backend continuity 不闭合。`);
+  }
+}
+
+function sameSpectralBackendIdentity(
+  left: AudioAlignmentBatchSpectralBackendIdentitySnapshot,
+  right: AudioAlignmentBatchSpectralBackendIdentitySnapshot
+): boolean {
+  return (
+    left.backendId === right.backendId &&
+    left.requestedBackend === right.requestedBackend &&
+    left.backendDetail === right.backendDetail &&
+    left.fallbackReason === right.fallbackReason
+  );
+}
+
+function compareFineCandidateId(
+  left: AudioAlignmentBatchFineCandidateIdSnapshot,
+  right: AudioAlignmentBatchFineCandidateIdSnapshot
+): number {
+  return left.pairOrdinal - right.pairOrdinal || left.candidateOrdinal - right.candidateOrdinal;
+}
+
+function fineCandidateIdKey(value: AudioAlignmentBatchFineCandidateIdSnapshot): string {
+  return `${value.pairOrdinal}:${value.candidateOrdinal}`;
+}
+
+function sameFineCandidateId(
+  left: AudioAlignmentBatchFineCandidateIdSnapshot | undefined,
+  right: AudioAlignmentBatchFineCandidateIdSnapshot | undefined
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.pairOrdinal === right.pairOrdinal &&
+    left.candidateOrdinal === right.candidateOrdinal
+  );
+}
+
+function sameFineCandidateIds(
+  left: readonly AudioAlignmentBatchFineCandidateIdSnapshot[],
+  right: readonly AudioAlignmentBatchFineCandidateIdSnapshot[]
+): boolean {
+  return left.length === right.length && left.every((item, index) => sameFineCandidateId(item, right[index]));
+}
+
+function validateAudioAlignmentBatchFineComponentCoherence(
+  pairs: readonly AudioAlignmentBatchPairSnapshot[]
+): void {
+  const components = new Map<number, AudioAlignmentBatchFineFrontierReceiptSnapshot>();
+  for (const pair of pairs) {
+    const frontier = pair.fineFrontier;
+    if (frontier === null) continue;
+    const existing = components.get(frontier.componentOrdinal);
+    if (existing && canonicalRuntimeJson(existing) !== canonicalRuntimeJson(frontier)) {
+      throw new Error("同一 fine component 的 frontier receipt 发生漂移。");
+    }
+    components.set(frontier.componentOrdinal, frontier);
+  }
+  const componentOrdinals = [...components.keys()].sort((left, right) => left - right);
+  if (componentOrdinals.some((ordinal, index) => ordinal !== index + 1)) {
+    throw new Error("fine componentOrdinal 必须从 1 开始连续且无缺口。");
+  }
+  for (const frontier of components.values()) {
+    const componentPairs = frontier.componentPairOrdinals.map((pairOrdinal) => {
+      const pair = pairs[pairOrdinal - 1];
+      if (
+        pair === undefined ||
+        pair.fineFrontier === null ||
+        canonicalRuntimeJson(pair.fineFrontier) !== canonicalRuntimeJson(frontier)
+      ) {
+        throw new Error("fine component receipt 未由全部成员 pair 原子复用。");
+      }
+      return pair;
+    });
+    const executions = componentPairs
+      .map((pair) => pair.fineExecutionEvidence)
+      .filter((evidence): evidence is AudioAlignmentBatchFineExecutionEvidenceSnapshot =>
+        evidence !== null
+      );
+    if (
+      frontier.resolved &&
+      (executions.length !== frontier.selectedCandidateIds.length ||
+        executions.some(
+          (evidence) =>
+            !frontier.selectedCandidateIds.some((candidate) =>
+              sameFineCandidateId(candidate, evidence.candidateId)
+            )
+        ) ||
+        executions.reduce((sum, evidence) => sum + evidence.scoreMicros, 0) !==
+          frontier.selectedTotalScoreMicros)
+    ) {
+      throw new Error("fine component 的 selected IDs、execution evidence 与总分不闭合。");
+    }
+  }
 }
 
 const AUDIO_ALIGNMENT_BATCH_SELECTION_STATES = [
@@ -963,27 +2025,9 @@ function validateAudioAlignmentBatchSpectralBackendIdentities(
   if (!Array.isArray(value) || value.length === 0) {
     throw new Error(`${label} 必须是非空数组。`);
   }
-  const canonical = value.map((item, index) => {
-    if (!isRecord(item)) throw new Error(`${label}[${index}] 不是对象。`);
-    requireRuntimeExactKeys(
-      item,
-      ["backendId", "requestedBackend", "backendDetail", "fallbackReason"],
-      `${label}[${index}]`
-    );
-    const fallbackReason =
-      item.fallbackReason === null
-        ? null
-        : requireRuntimeText(item.fallbackReason, `${label}[${index}].fallbackReason`);
-    return {
-      backendId: requireRuntimeText(item.backendId, `${label}[${index}].backendId`),
-      requestedBackend: requireRuntimeText(
-        item.requestedBackend,
-        `${label}[${index}].requestedBackend`
-      ),
-      backendDetail: requireRuntimeText(item.backendDetail, `${label}[${index}].backendDetail`),
-      fallbackReason
-    };
-  });
+  const canonical = value.map((item, index) =>
+    validateAudioAlignmentBatchSpectralBackendIdentity(item, `${label}[${index}]`)
+  );
   const sorted = [...canonical].sort(compareSpectralBackendIdentity);
   if (
     canonical.some((item, index) => JSON.stringify(item) !== JSON.stringify(sorted[index])) ||
@@ -994,6 +2038,27 @@ function validateAudioAlignmentBatchSpectralBackendIdentities(
   ) {
     throw new Error(`${label} 必须 canonical 排序且去重。`);
   }
+}
+
+function validateAudioAlignmentBatchSpectralBackendIdentity(
+  value: unknown,
+  label: string
+): AudioAlignmentBatchSpectralBackendIdentitySnapshot {
+  if (!isRecord(value)) throw new Error(`${label} 不是对象。`);
+  requireRuntimeExactKeys(
+    value,
+    ["backendId", "requestedBackend", "backendDetail", "fallbackReason"],
+    label
+  );
+  return {
+    backendId: requireRuntimeText(value.backendId, `${label}.backendId`),
+    requestedBackend: requireRuntimeText(value.requestedBackend, `${label}.requestedBackend`),
+    backendDetail: requireRuntimeText(value.backendDetail, `${label}.backendDetail`),
+    fallbackReason:
+      value.fallbackReason === null
+        ? null
+        : requireRuntimeText(value.fallbackReason, `${label}.fallbackReason`)
+  };
 }
 
 function compareSpectralBackendIdentity(
@@ -1381,6 +2446,29 @@ function requireRuntimeInteger(
   return value as number;
 }
 
+function requireRuntimeIntegerArray(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+  requireCanonicalOrder: boolean
+): number[] {
+  if (!Array.isArray(value)) throw new Error(`${label} 必须是数组。`);
+  const numbers = value.map((item, index) =>
+    requireRuntimeInteger(item, `${label}[${index}]`, minimum, maximum)
+  );
+  if (new Set(numbers).size !== numbers.length) {
+    throw new Error(`${label} 包含重复值。`);
+  }
+  if (
+    requireCanonicalOrder &&
+    numbers.some((item, index) => index > 0 && item <= (numbers[index - 1] ?? item))
+  ) {
+    throw new Error(`${label} 必须严格递增。`);
+  }
+  return numbers;
+}
+
 function requireRuntimeNullableInteger(
   value: unknown,
   label: string,
@@ -1503,6 +2591,43 @@ function requireRuntimeSha256(value: unknown, label: string): `sha256:${string}`
     throw new Error(`${label} 必须是规范小写 SHA-256 摘要。`);
   }
   return value as `sha256:${string}`;
+}
+
+function canonicalRuntimeJson(value: unknown): string {
+  const canonical = canonicalizeRuntimeValue(value);
+  const json = JSON.stringify(canonical);
+  if (json === undefined) {
+    throw new Error("原生 v3 canonical JSON 不接受 undefined、函数或 symbol。");
+  }
+  return json;
+}
+
+function canonicalizeRuntimeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeRuntimeValue);
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => compareCanonicalText(left, right))
+        .map(([key, nested]) => [key, canonicalizeRuntimeValue(nested)])
+    );
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("原生 v3 canonical JSON 不接受非有限数值。");
+    }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error("原生 v3 canonical JSON 不接受超出安全范围的整数。");
+    }
+    return `f64:${float64BitsHex(value)}`;
+  }
+  return value;
+}
+
+function float64BitsHex(value: number): string {
+  const buffer = new ArrayBuffer(8);
+  const view = new DataView(buffer);
+  view.setFloat64(0, value, false);
+  return view.getBigUint64(0, false).toString(16).padStart(16, "0");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

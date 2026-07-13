@@ -277,7 +277,7 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(validation.issues.join("\n")).toContain("bundle.formalEvidence.blindRelationship");
   });
 
-  it("单个 candidate tile 的 local raw prediction 不能冒充 private formal v2 provenance", () => {
+  it("单个 candidate tile 的 local raw prediction 不能冒充 private formal v3 provenance", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
     const bundle = createCompleteBundle() as unknown as {
       formalEvidence: { blindRelationship: unknown };
@@ -294,7 +294,7 @@ describe("C137 fail-closed acceptance gate", () => {
     });
   });
 
-  it("protocol v4 缺少 formal v2 matrix 精确契约字段时严格拒绝", () => {
+  it("protocol v4 缺少 formal v3 matrix 精确契约字段时严格拒绝", () => {
     const legacy = structuredClone(createCompleteBundle()) as unknown as {
       protocol: Record<string, unknown>;
     };
@@ -310,13 +310,13 @@ describe("C137 fail-closed acceptance gate", () => {
     const validation = validateC137AcceptanceBundle(legacy);
 
     expect(validation.valid).toBe(false);
-    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 5");
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 6");
     expect(validation.issues.join("\n")).toContain(
       "bundle.protocol.requiredFormalBlindProvenanceSchemaVersion 缺失"
     );
   });
 
-  it("旧 bundle v2/protocol4/ranking2/formal1 不能混入 v3/v5/v3/formal2 语义", () => {
+  it("旧 bundle v2/protocol4/ranking2/formal1 不能混入 v4/v6/ranking3/formal3 语义", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
     const current = createCompleteBundle();
     bindFormalBlindProvenanceFixture(current, fixture);
@@ -365,8 +365,8 @@ describe("C137 fail-closed acceptance gate", () => {
     const issues = validation.issues.join("\n");
 
     expect(validation.valid).toBe(false);
-    expect(issues).toContain("bundle.schemaVersion 必须为 3");
-    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 5");
+    expect(issues).toContain("bundle.schemaVersion 必须为 4");
+    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 6");
     expect(issues).toContain("bundle.protocol.requiredBlindAggregation 缺失");
     expect(issues).toContain("bundle.reports.relationshipRanking.schemaVersion 必须为 3");
     expect(issues).toContain("bundle.reports.relationshipRanking.rankingScope 缺失");
@@ -959,15 +959,15 @@ function createCompleteBundle(): C137AcceptanceBundle {
   }));
 
   const bundle: C137AcceptanceBundle = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     kind: "c137-acceptance-bundle",
     manifestDigest,
     datasetVersion: "real-frozen-1",
     certificationClass: "real-frozen",
     protocol: {
-      schemaVersion: 5,
+      schemaVersion: 6,
       id: "c137-acceptance",
-      version: "5",
+      version: "6",
       topK: 5,
       calibrationBinCount: 10,
       requiredColdRuns: 1,
@@ -975,11 +975,11 @@ function createCompleteBundle(): C137AcceptanceBundle {
       requiredCancellationRuns: 1,
       performancePlanDigest: performanceEvidence.planDigest,
       blindRankingPlanDigest: digest("c"),
-      requiredFormalBlindProvenanceSchemaVersion: 2,
+      requiredFormalBlindProvenanceSchemaVersion: 3,
       requiredBlindMatrixPlanSchemaVersion: 2,
       requiredBlindProjectionSchemaVersion: 1,
-      requiredNativeEvidenceVersion: 2,
-      requiredNativeReceiptSchemaVersion: 2,
+      requiredNativeEvidenceVersion: 3,
+      requiredNativeReceiptSchemaVersion: 3,
       requiredBlindPairingMode: "fullCartesian",
       requiredBlindScoreContract: "alignment-v2-pair-intrinsic-global-weight-v1",
       requiredBlindMatrixCoverage: "exhaustive",

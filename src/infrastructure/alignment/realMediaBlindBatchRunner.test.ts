@@ -3,10 +3,16 @@ import type { AlignmentProposal, AlignmentTimeMapProposal } from "../../domain/a
 import type { MediaContentIdentity } from "../../domain/project/types";
 import {
   createNativeBatchExecutionIdentityDigest,
+  createNativeBatchFineExecutionEvidenceDigest,
+  createNativeBatchFineFrontierReceiptDigest,
   REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
   type NativeBatchExecutionIdentity
 } from "../../domain/alignment/realMediaBlindBatchContract";
 import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
+import {
+  createTestFineExecutionEvidence,
+  createTestFineFrontierReceipt
+} from "../../test/audioAlignmentBatchEvidenceV3";
 import type {
   AudioAlignmentBatchGlobalCandidateSnapshot,
   AudioAlignmentBatchGlobalSelectionSnapshot,
@@ -93,12 +99,12 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(nativeRequest).not.toHaveProperty("pairs");
 
     expect(receipt).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       receiptKind: "c137-real-media-blind-batch-run",
       suiteId: suite.suiteId,
       datasetVersion: suite.datasetVersion,
       executionDigest: createRealMediaBlindBatchExecutionDigest(suite),
-      nativeEvidenceVersion: 2,
+      nativeEvidenceVersion: 3,
       pairingMode: "fullCartesian",
       status: "completed",
       terminationReason: "native-terminal",
@@ -184,6 +190,92 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(serialized).not.toContain(suite.parameters.ffprobePath);
     expect(receipt.receiptDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
+  });
+
+  it("resolved component 只要求最终选中 pair 携带 TimeMap，未选中 alternative 保持 completed+null", async () => {
+    const suite = createSuite();
+    const snapshot = createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]);
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({ start: snapshot, get: [] })
+    });
+
+    expect(receipt.pairOutcomes[0]?.nativeStatus).toBe("completed");
+    expect(receipt.pairOutcomes[0]?.fineExecutionEvidence).not.toBeNull();
+    expect(receipt.pairOutcomes[0]?.proposalTimeMap).not.toBeNull();
+    expect(receipt.pairOutcomes[1]).toMatchObject({
+      nativeStatus: "completed",
+      fineExecutionEvidence: null,
+      proposalTimeMap: null
+    });
+    expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
+
+    const alternativeWithTimeMap = structuredClone(receipt);
+    const alternativePair = suite.pairs[1];
+    const alternativeSource = suite.sources.find(
+      (media) => media.mediaId === alternativePair.sourceMediaId
+    )!;
+    const alternativeTarget = suite.targets.find(
+      (media) => media.mediaId === alternativePair.targetMediaId
+    )!;
+    alternativeWithTimeMap.pairOutcomes[1].proposalTimeMap =
+      createProposal(alternativeSource, alternativeTarget, "review").timeMap ?? null;
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(alternativeWithTimeMap), suite)
+    ).toThrow("未被最终选择却夹带 fine execution 或 TimeMap");
+
+    const selectedWithoutTimeMap = structuredClone(receipt);
+    selectedWithoutTimeMap.pairOutcomes[0].proposalTimeMap = null;
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(selectedWithoutTimeMap), suite)
+    ).toThrow("最终 candidate 与 fine execution 不一致");
+  });
+
+  it.each(["unresolved", "noEligibleCandidate"] as const)(
+    "%s component 允许 completed pair 保留 frontier 且 TimeMap 全部为空",
+    async (finalState) => {
+      const suite = createSuite();
+      const snapshot = createCompletedSnapshotWithoutFineSelection(
+        suite,
+        [0.93, 0.71, 0.62, 0.88],
+        finalState
+      );
+      const receipt = await runRealMediaBlindBatchSuite(suite, {
+        alignmentInvoker: createInvoker({ start: snapshot, get: [] })
+      });
+
+      expect(receipt.status).toBe("completed");
+      expect(
+        receipt.pairOutcomes.every(
+          (outcome) =>
+            outcome.nativeStatus === "completed" &&
+            outcome.fineFrontier?.finalState === finalState &&
+            outcome.fineExecutionEvidence === null &&
+            outcome.proposalTimeMap === null
+        )
+      ).toBe(true);
+      expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
+    }
+  );
+
+  it("receipt 即使由调用方重签也拒绝篡改 fine backendDetail", async () => {
+    const suite = createSuite();
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({
+        start: createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]),
+        get: []
+      })
+    });
+    const tampered = structuredClone(receipt);
+    const execution = tampered.pairOutcomes[0]?.fineExecutionEvidence;
+    if (execution === null || execution === undefined) {
+      throw new Error("fixture fine execution missing");
+    }
+    execution.sourceFineBackend.backendDetail = "caller-forged fine backend detail";
+    execution.evidenceDigest = createNativeBatchFineExecutionEvidenceDigest(execution);
+
+    expect(() => validateRealMediaBlindBatchRunReceipt(rehashReceipt(tampered), suite)).toThrow(
+      "coarse→fine backend continuity"
+    );
   });
 
   it("注入 receipt 时复算两个 digest，并拒绝 pair/双向排名/TimeMap exact-key 篡改", async () => {
@@ -293,6 +385,17 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
       if (!identity || !backend) throw new Error("fixture identity missing");
       backend.requestedBackend = "auto";
       backend.fallbackReason = `CUDA fallback while reading ${suite.sources[0].path}`;
+      const fineExecution = outcome.fineExecutionEvidence;
+      if (fineExecution !== null) {
+        fineExecution.sourceCoarseBackend = { ...backend };
+        fineExecution.sourceFineBackend = {
+          ...fineExecution.sourceFineBackend,
+          requestedBackend: backend.requestedBackend,
+          fallbackReason: backend.fallbackReason
+        };
+        fineExecution.evidenceDigest =
+          createNativeBatchFineExecutionEvidenceDigest(fineExecution);
+      }
       outcome.relationRanking.executionIdentityDigest =
         createNativeBatchExecutionIdentityDigest(identity);
     }
@@ -459,11 +562,12 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     const completed = createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]);
     for (const pair of completed.pairs) {
       const timeMap = pair.proposal?.timeMap;
-      if (!timeMap) throw new Error("fixture TimeMap missing");
+      if (!timeMap) continue;
       timeMap.sourceVisualStream = createVideoStream(20 + pair.pairIndex);
       timeMap.targetVisualStream = createVideoStream(40 + pair.pairIndex);
       timeMap.evidence.types = ["audio", "visual"];
       timeMap.evidence.visualAnchorCount = 8;
+      refreshPairFineExecution(pair);
     }
 
     const receipt = await runRealMediaBlindBatchSuite(suite, {
@@ -494,6 +598,7 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     const timeMap = completed.pairs[0].proposal?.timeMap;
     if (!timeMap) throw new Error("fixture TimeMap missing");
     timeMap.sourceVisualStream = createVideoStream(0);
+    refreshPairFineExecution(completed.pairs[0]);
 
     await expect(
       runRealMediaBlindBatchSuite(suite, {
@@ -605,6 +710,7 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
         ...snapshot.pairs[0],
         proposal: mutate(snapshot.pairs[0].proposal!)
       };
+      refreshPairFineExecution(snapshot.pairs[0]);
       const invoker = createInvoker({ start: snapshot, get: [] });
       await expect(
         runRealMediaBlindBatchSuite(suite, { alignmentInvoker: invoker })
@@ -641,7 +747,7 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(receipt.pairOutcomes[0]?.globalSelected).toBe(false);
   });
 
-  it("fine 失败时保留严格闭合的 coarse Top-K，但绝不保留 selected", async () => {
+  it("coarse globalSelection 失败时仍接受已闭合的 fine frontier，且不误报 coarse selected", async () => {
     const suite = createSuite();
     const snapshot = createCompletedSnapshot(suite, [0.9, 0.8, 0.7, 0.6]);
     const pair = snapshot.pairs[0];
@@ -661,21 +767,16 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     };
     snapshot.pairs[0] = {
       ...pair,
-      status: "failed",
-      globalSelection: failedSelection,
-      proposal: null,
-      error: "fine failed"
+      globalSelection: failedSelection
     };
-    snapshot.failedPairCount = 1;
     const receipt = await runRealMediaBlindBatchSuite(suite, {
       alignmentInvoker: createInvoker({ start: snapshot, get: [] })
     });
-    expect(receipt.status).toBe("completed-with-errors");
+    expect(receipt.status).toBe("completed");
     expect(receipt.pairOutcomes[0]).toMatchObject({
-      nativeStatus: "failed",
-      failureCode: "native-pair-failed",
+      nativeStatus: "completed",
+      failureCode: null,
       globalSelected: false,
-      proposalTimeMap: null,
       globalSelection: {
         state: "failed",
         candidateCount: 1,
@@ -849,12 +950,14 @@ function createRunningSnapshot(
     message: pairIndex === 0 ? "running" : "queued",
     globalSelection: createPendingSelection(),
     relationRanking: createPendingRelationRanking(),
+    fineFrontier: null,
+    fineExecutionEvidence: null,
     proposal: null,
     error: null
   }));
   return {
     schemaVersion: 1,
-    evidenceVersion: 2,
+    evidenceVersion: 3,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -877,11 +980,19 @@ function createCompletedSnapshot(
   scores: readonly number[]
 ): AudioAlignmentBatchJobSnapshot {
   const selectedPairIndexes = new Set([0, suite.pairs.length - 1]);
+  const selectedCandidateIds = suite.pairs
+    .filter((_, pairIndex) => selectedPairIndexes.has(pairIndex))
+    .map((pair) => ({ pairOrdinal: pair.pairOrdinal, candidateOrdinal: 1 }));
+  const fineFrontier = createTestFineFrontierReceipt(
+    suite.pairs.map((pair) => pair.pairOrdinal),
+    selectedCandidateIds
+  );
   const pairs = suite.pairs.map((pair, pairIndex): AudioAlignmentBatchPairSnapshot => {
     const source = suite.sources.find((media) => media.mediaId === pair.sourceMediaId)!;
     const target = suite.targets.find((media) => media.mediaId === pair.targetMediaId)!;
     const selected = selectedPairIndexes.has(pairIndex);
     const score = scores[pairIndex] ?? 0.5;
+    const proposal = createProposal(source, target, selected ? "review" : "blocked");
     return {
       pairIndex,
       pairOrdinal: pair.pairOrdinal,
@@ -892,13 +1003,26 @@ function createCompletedSnapshot(
       message: "completed",
       globalSelection: createSelection(source, target, score, selected),
       relationRanking: createRelationRanking(source, target, score),
-      proposal: createProposal(source, target, selected ? "review" : "blocked"),
+      fineFrontier: structuredClone(fineFrontier),
+      fineExecutionEvidence:
+        selected && proposal.timeMap
+          ? createTestFineExecutionEvidence(proposal.timeMap, {
+              pairOrdinal: pair.pairOrdinal,
+              sourceStreamIndex: source.audioStreamIndex,
+              targetStreamIndex: target.audioStreamIndex,
+              engineVersion: TEST_EXECUTION_IDENTITY.engineVersion,
+              featureVersion: TEST_EXECUTION_IDENTITY.featureVersion,
+              coarseBackend: TEST_EXECUTION_IDENTITY.sourceSpectralBackends[0],
+              fineBackend: TEST_EXECUTION_IDENTITY.sourceSpectralBackends[0]
+            })
+          : null,
+      proposal,
       error: null
     };
   });
   return {
     schemaVersion: 1,
-    evidenceVersion: 2,
+    evidenceVersion: 3,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -916,6 +1040,64 @@ function createCompletedSnapshot(
   };
 }
 
+function createCompletedSnapshotWithoutFineSelection(
+  suite: RealMediaBlindBatchExecutionSuite,
+  scores: readonly number[],
+  finalState: "unresolved" | "noEligibleCandidate"
+): AudioAlignmentBatchJobSnapshot {
+  const snapshot = createCompletedSnapshot(suite, scores);
+  const componentPairOrdinals = suite.pairs.map((pair) => pair.pairOrdinal);
+  const candidateIds = componentPairOrdinals.map((pairOrdinal) => ({
+    pairOrdinal,
+    candidateOrdinal: 1
+  }));
+  const frontier = createTestFineFrontierReceipt(componentPairOrdinals, [], {
+    finalState,
+    inventoryCandidateCount: candidateIds.length
+  });
+  if (finalState === "unresolved") {
+    frontier.inventoryStateCounts.unresolved = 0;
+    frontier.inventoryStateCounts.evidenceBlocked = candidateIds.length;
+    frontier.optimisticOmitted = {
+      candidateIds: structuredClone(candidateIds),
+      totalUpperBoundMicros: candidateIds.length * 900_000,
+      openCandidateIds: structuredClone(candidateIds),
+      unresolvedCandidateIds: [],
+      blockedCandidateIds: structuredClone(candidateIds)
+    };
+    frontier.proof.beatsRunnerUpWithMargin = true;
+    frontier.receiptDigest = createNativeBatchFineFrontierReceiptDigest(frontier);
+  }
+  for (const pair of snapshot.pairs) {
+    const source = suite.sources.find((media) => media.mediaId === pair.sourceMediaId)!;
+    const target = suite.targets.find((media) => media.mediaId === pair.targetMediaId)!;
+    pair.fineFrontier = structuredClone(frontier);
+    pair.fineExecutionEvidence = null;
+    pair.proposal = createProposal(source, target, "blocked");
+  }
+  return snapshot;
+}
+
+function refreshPairFineExecution(pair: AudioAlignmentBatchPairSnapshot): void {
+  const timeMap = pair.proposal?.timeMap;
+  const current = pair.fineExecutionEvidence;
+  if (current === null) return;
+  if (timeMap === undefined) throw new Error("fixture selected pair TimeMap missing");
+  pair.fineExecutionEvidence = createTestFineExecutionEvidence(timeMap, {
+    pairOrdinal: current.candidateId.pairOrdinal,
+    candidateOrdinal: current.candidateId.candidateOrdinal,
+    sourceStreamIndex: current.sourceStreamIndex,
+    targetStreamIndex: current.targetStreamIndex,
+    scoreMicros: current.scoreMicros,
+    engineVersion: TEST_EXECUTION_IDENTITY.engineVersion,
+    featureVersion: TEST_EXECUTION_IDENTITY.featureVersion,
+    sourceCoarseBackend: current.sourceCoarseBackend,
+    targetCoarseBackend: current.targetCoarseBackend,
+    sourceFineBackend: current.sourceFineBackend,
+    targetFineBackend: current.targetFineBackend
+  });
+}
+
 function createCancelledSnapshot(
   suite: RealMediaBlindBatchExecutionSuite
 ): AudioAlignmentBatchJobSnapshot {
@@ -929,12 +1111,14 @@ function createCancelledSnapshot(
     message: "cancelled",
     globalSelection: { ...createPendingSelection(), state: "cancelled" },
     relationRanking: { ...createPendingRelationRanking(), state: "cancelled" },
+    fineFrontier: null,
+    fineExecutionEvidence: null,
     proposal: null,
     error: null
   }));
   return {
     schemaVersion: 1,
-    evidenceVersion: 2,
+    evidenceVersion: 3,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -1067,6 +1251,14 @@ function createProposal(
   target: RealMediaBlindBatchExecutionMedia,
   level: "review" | "blocked"
 ): AlignmentProposal {
+  if (level === "blocked") {
+    return {
+      anchors: [],
+      cutCandidates: [],
+      confidence: 0,
+      diagnostics: ["fixture blocked without a final TimeMap"]
+    };
+  }
   const timeMap: AlignmentTimeMapProposal = {
     sourceStartMs: 0,
     sourceEndMs: 60_000,
@@ -1075,7 +1267,7 @@ function createProposal(
     spans: [
       createTestCompleteTimeMapSpan(
         {
-          kind: level === "blocked" ? "ambiguous" : "matched",
+          kind: "matched",
           sourceStartMs: 0,
           sourceEndMs: 60_000,
           targetStartMs: 0,
@@ -1085,8 +1277,8 @@ function createProposal(
       )
     ],
     quality: {
-      level,
-      probability: level === "review" ? 0.91 : null,
+      level: "review",
+      probability: 0.91,
       metricSource: "measured",
       coverage: 0.95,
       uniqueContentCoverage: 0.9,
@@ -1099,7 +1291,7 @@ function createProposal(
       anchorCount: 40,
       anchorRegionCount: 3,
       heldOutAnchorCount: 8,
-      reasons: [level === "review" ? "需要复核。" : "全局候选被阻断。"]
+      reasons: ["需要复核。"]
     },
     evidence: {
       types: ["audio"],
@@ -1135,7 +1327,7 @@ function createProposal(
   return {
     anchors: [],
     cutCandidates: [],
-    confidence: level === "review" ? 0.91 : 0,
+    confidence: 0.91,
     diagnostics: ["fixture"],
     matchRange: {
       sourceStartMs: 0,

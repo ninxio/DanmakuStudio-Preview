@@ -1,4 +1,9 @@
 import { createTestCompleteTimeMapSpan } from "./timeMapEvidence";
+import { deriveLockedFineSpectralBackendIdentity } from "../domain/alignment/fineSpectralBackend";
+import {
+  createTestFineExecutionEvidence,
+  createTestFineFrontierReceipt
+} from "./audioAlignmentBatchEvidenceV3";
 import {
   createC137BlindBatchMediaBindingCommitment,
   deriveC137BlindBatchRawPredictionFromNativeReceipt,
@@ -6,6 +11,7 @@ import {
   type C137BlindBatchExecutionProjection
 } from "../domain/alignment/c137BlindBatchEvidence";
 import {
+  C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
   C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
   computeC137FormalBlindManifestDigest as computeFixtureManifestDigest,
   computeC137FormalBlindParametersDigest,
@@ -14,13 +20,13 @@ import {
   createC137FormalBlindMatrixModel,
   createC137FormalBlindMatrixPlan,
   evaluateC137FormalBlindProvenance,
-  sealC137FormalBlindProvenanceV2,
+  sealC137FormalBlindProvenanceV3,
   type C137FormalBlindMatrixPlanBatchV2,
   type C137FormalBlindMatrixPlanV2,
-  type C137FormalBlindProvenanceBatchEnvelopeV2,
+  type C137FormalBlindProvenanceBatchEnvelopeV3,
   type C137FormalBlindProvenanceEvaluation,
   type C137FormalBlindProvenanceExpectations,
-  type C137FormalBlindProvenanceV2
+  type C137FormalBlindProvenanceV3
 } from "../domain/alignment/c137FormalBlindProvenance";
 import {
   type RealMediaBenchmarkCase,
@@ -96,7 +102,7 @@ export interface C137FormalBlindProvenanceFixtureOptions {
 }
 
 export interface C137FormalBlindProvenanceFixture {
-  provenance: C137FormalBlindProvenanceV2;
+  provenance: C137FormalBlindProvenanceV3;
   manifest: RealMediaBenchmarkManifest;
   plan: C137FormalBlindMatrixPlanV2;
   expectations: C137FormalBlindProvenanceExpectations;
@@ -122,7 +128,7 @@ export function createC137FormalBlindProvenanceFixture(
   const batches = plan.batches.map((batch) =>
     createC137FormalBlindBatchEnvelopeFixture(manifest, plan, batch, options.relationScore)
   );
-  const provenance = sealC137FormalBlindProvenanceV2({ manifest, plan, batches });
+  const provenance = sealC137FormalBlindProvenanceV3({ manifest, plan, batches });
   const expectations: C137FormalBlindProvenanceExpectations = {
     manifestDigest: provenance.manifestDigest,
     datasetVersion: manifest.datasetVersion,
@@ -146,7 +152,7 @@ export function createC137FormalBlindBatchEnvelopeFixture(
   plan: C137FormalBlindMatrixPlanV2,
   planBatch: C137FormalBlindMatrixPlanBatchV2,
   relationScore?: C137FormalBlindProvenanceFixtureOptions["relationScore"]
-): C137FormalBlindProvenanceBatchEnvelopeV2 {
+): C137FormalBlindProvenanceBatchEnvelopeV3 {
   const projection = createProjection(manifest, plan, planBatch);
   const executionSuite = createExecutionSuite(manifest, plan, planBatch, projection);
   const nativeReceipt = createNativeReceipt(
@@ -163,7 +169,7 @@ export function createC137FormalBlindBatchEnvelopeFixture(
     nativeReceipt
   );
   return {
-    schemaVersion: 2,
+    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
     kind: "c137-formal-blind-provenance-batch",
     batchId: planBatch.batchId,
     projection,
@@ -299,7 +305,7 @@ function createNativeReceipt(
   const projectedById = new Map(
     [...projection.sources, ...projection.targets].map((media) => [media.mediaId, media])
   );
-  const pairOutcomes: RealMediaBlindBatchPairOutcome[] = suite.pairs.map((pair, index) => {
+  const draftOutcomes = suite.pairs.map((pair, index) => {
     const source = requireExecutionMedia(suite.sources, pair.sourceMediaId);
     const target = requireExecutionMedia(suite.targets, pair.targetMediaId);
     const queryMediaId =
@@ -329,19 +335,46 @@ function createNativeReceipt(
         gold
       }) ?? (gold ? 0.95 : 0.25 - candidate.ordinal / 10_000);
     const selected = gold;
+    const proposalTimeMap = createProposal(source, target);
     return {
       pairIndex: index,
       pairOrdinal: pair.pairOrdinal,
       sourceMediaId: pair.sourceMediaId,
       targetMediaId: pair.targetMediaId,
-      nativeStatus: "completed",
+      nativeStatus: "completed" as const,
       failureCode: null,
       relationRanking: createRelationRanking(source, target, score),
       globalSelected: selected,
       globalSelection: createSelection(source, target, score, selected),
-      proposalTimeMap: createProposal(source, target)
+      proposalTimeMap: selected ? proposalTimeMap : null,
+      selected
     };
   });
+  const selectedCandidateIds = draftOutcomes
+    .filter((outcome) => outcome.selected)
+    .map((outcome) => ({ pairOrdinal: outcome.pairOrdinal, candidateOrdinal: 1 }));
+  const fineFrontier = createTestFineFrontierReceipt(
+    suite.pairs.map((pair) => pair.pairOrdinal),
+    selectedCandidateIds
+  );
+  const coarseBackend = TEST_NATIVE_EXECUTION_IDENTITY.sourceSpectralBackends[0];
+  const pairOutcomes: RealMediaBlindBatchPairOutcome[] = draftOutcomes.map(
+    ({ selected, ...outcome }) => ({
+      ...outcome,
+      fineFrontier: structuredClone(fineFrontier),
+      fineExecutionEvidence: selected && outcome.proposalTimeMap !== null
+        ? createTestFineExecutionEvidence(outcome.proposalTimeMap, {
+            pairOrdinal: outcome.pairOrdinal,
+            sourceStreamIndex: outcome.proposalTimeMap.sourceStream?.index ?? 0,
+            targetStreamIndex: outcome.proposalTimeMap.targetStream?.index ?? 0,
+            engineVersion: TEST_NATIVE_EXECUTION_IDENTITY.engineVersion,
+            featureVersion: TEST_NATIVE_EXECUTION_IDENTITY.featureVersion,
+            coarseBackend,
+            fineBackend: coarseBackend
+          })
+        : null
+    })
+  );
   const withoutDigest: Omit<RealMediaBlindBatchRunReceipt, "receiptDigest"> = {
     schemaVersion: REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION,
     receiptKind: "c137-real-media-blind-batch-run",
@@ -673,9 +706,32 @@ function requireExecutionMedia(
 }
 
 export function resealC137FormalBlindNativeReceiptFixture(
-  envelope: C137FormalBlindProvenanceBatchEnvelopeV2
+  envelope: C137FormalBlindProvenanceBatchEnvelopeV3
 ): void {
   const receipt = envelope.nativeReceipt;
+  for (const outcome of receipt.pairOutcomes) {
+    const current = outcome.fineExecutionEvidence;
+    const identity = outcome.relationRanking.executionIdentity;
+    if (current === null || identity === null || outcome.proposalTimeMap === null) continue;
+    const sourceCoarseBackend = identity.sourceSpectralBackends[0];
+    const targetCoarseBackend = identity.targetSpectralBackends[0];
+    if (sourceCoarseBackend === undefined || targetCoarseBackend === undefined) {
+      throw new Error("fixture execution identity backend missing");
+    }
+    outcome.fineExecutionEvidence = createTestFineExecutionEvidence(outcome.proposalTimeMap, {
+      pairOrdinal: current.candidateId.pairOrdinal,
+      candidateOrdinal: current.candidateId.candidateOrdinal,
+      sourceStreamIndex: current.sourceStreamIndex,
+      targetStreamIndex: current.targetStreamIndex,
+      scoreMicros: current.scoreMicros,
+      engineVersion: identity.engineVersion,
+      featureVersion: identity.featureVersion,
+      sourceCoarseBackend,
+      targetCoarseBackend,
+      sourceFineBackend: createFixtureFineBackend(sourceCoarseBackend),
+      targetFineBackend: createFixtureFineBackend(targetCoarseBackend)
+    });
+  }
   receipt.sourceRankings = envelope.executionSuite.sources.map((source) =>
     createRealMediaBlindBatchSourceRanking(
       source.mediaId,
@@ -700,8 +756,16 @@ export function resealC137FormalBlindNativeReceiptFixture(
   );
 }
 
+function createFixtureFineBackend(
+  coarse: NativeBatchExecutionIdentity["sourceSpectralBackends"][number]
+): NativeBatchExecutionIdentity["sourceSpectralBackends"][number] {
+  const locked = deriveLockedFineSpectralBackendIdentity(coarse);
+  if (locked === null) throw new Error(`fixture coarse backend 无法锁定 fine：${coarse.backendId}`);
+  return locked;
+}
+
 export function resealC137FormalBlindProvenanceFixture(
-  provenance: C137FormalBlindProvenanceV2
+  provenance: C137FormalBlindProvenanceV3
 ): void {
   const { provenanceDigest, ...draft } = provenance;
   void provenanceDigest;
@@ -709,7 +773,7 @@ export function resealC137FormalBlindProvenanceFixture(
 }
 
 export function resealC137FormalBlindPlanAndProvenanceFixture(
-  provenance: C137FormalBlindProvenanceV2
+  provenance: C137FormalBlindProvenanceV3
 ): void {
   const expected = createC137FormalBlindMatrixPlan(
     provenance.manifest,

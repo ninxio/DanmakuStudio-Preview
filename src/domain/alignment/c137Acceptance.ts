@@ -20,7 +20,7 @@ import {
   computeC137FormalBlindParametersDigest,
   evaluateC137FormalBlindProvenance,
   validateC137FormalBlindProvenance,
-  type C137FormalBlindProvenanceV2
+  type C137FormalBlindProvenanceV3
 } from "./c137FormalBlindProvenance";
 import {
   REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
@@ -28,8 +28,8 @@ import {
 } from "./realMediaBlindBatchContract";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_ACCEPTANCE_SCHEMA_VERSION = 3 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 5 as const;
+export const C137_ACCEPTANCE_SCHEMA_VERSION = 4 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 6 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
 export const C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION = 3 as const;
@@ -89,7 +89,7 @@ export interface C137CancellationThresholdApproval {
 export interface C137AcceptanceProtocol {
   schemaVersion: typeof C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION;
   id: string;
-  version: string;
+  version: "6";
   topK: number;
   calibrationBinCount: number;
   requiredColdRuns: number;
@@ -333,7 +333,7 @@ export interface C137PerformanceReport {
   binding: C137EvidenceBinding;
   /**
    * v1 remains readable as engineering evidence during migration. The formal gate independently
-   * requires native v2 evidence plus its four assurance receipts, so legacy evidence can never
+   * requires native v3 evidence plus its four assurance receipts, so legacy evidence can never
    * grant release status.
    */
   rawEvidence: C137PerformanceRawEvidenceV1 | C137PerformanceRawEvidenceV2;
@@ -377,7 +377,7 @@ export interface C137AcceptanceReports {
 
 export interface C137AcceptanceFormalEvidence {
   /** Private evidence: it contains frozen gold bindings and execution paths; never share it. */
-  blindRelationship: C137FormalBlindProvenanceV2 | null;
+  blindRelationship: C137FormalBlindProvenanceV3 | null;
 }
 
 export interface C137AcceptanceBundle {
@@ -738,13 +738,13 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-envelope-integrity",
         "incomplete",
         "missing",
-        "必须提交私有 formal v2 blind envelope，包含预注册 exhaustive matrix 计划、每个 tile 的 execution suite、native receipt v2 与确定性 raw prediction"
+        "必须提交私有 formal v3 blind envelope，包含预注册 exhaustive matrix 计划、每个 tile 的 execution suite、native receipt v3 与确定性 raw prediction"
       ),
       createCheck(
         "native-blind-protocol-structure",
         "incomplete",
         "missing",
-        "protocol v5 必须精确绑定 formal schema2、matrix plan schema2、native evidence/receipt v2、shard-invariant score、exhaustive coverage 与全矩阵重算"
+        "protocol v6 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v3、shard-invariant score、exhaustive coverage 与全矩阵重算"
       ),
       createCheck(
         "native-blind-decision-coverage",
@@ -762,7 +762,7 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-ranking-provenance",
         "incomplete",
         "missing-private-provenance",
-        "acceptance v3 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
+        "acceptance v4 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
       ),
       ...createPendingBlindAuthorityChecks("missing-private-provenance")
     ];
@@ -848,13 +848,13 @@ function evaluateFormalBlindRankingEvidence(
       "native-blind-envelope-integrity",
       integrityValid ? "pass" : "incomplete",
       integrityValid ? provenance.provenanceDigest : issueSummary,
-      "每个 formal v2 matrix tile 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt v2 与 raw prediction"
+      "每个 formal v3 matrix tile 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt v3 与 raw prediction"
     ),
     createCheck(
       "native-blind-protocol-structure",
       protocolStructureBound ? "pass" : "incomplete",
       protocolStructureBound,
-      "protocol v5 必须精确绑定 formal schema2、matrix plan schema2、native evidence/receipt v2、固定 shard-invariant scoreContract、exhaustive coverage 与全矩阵重算"
+      "protocol v6 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v3、固定 shard-invariant scoreContract、exhaustive coverage 与全矩阵重算"
     ),
     createCheck(
       "native-blind-plan-binding",
@@ -864,7 +864,7 @@ function evaluateFormalBlindRankingEvidence(
         ? "pass"
         : "incomplete",
       provenance.plan.planDigest,
-      "预运行 matrix plan 摘要必须由 protocol v5 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
+      "预运行 matrix plan 摘要必须由 protocol v6 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
     ),
     createCheck(
       "native-blind-decision-coverage",
@@ -914,11 +914,11 @@ function evaluateFormalBlindRankingEvidence(
       structuralClosure
         ? "self-consistent-no-native-authority"
         : "private-provenance-not-closed",
-      "formal v2 内容闭环仍不能证明签发者或 native job 真实存在；当前仍缺少独立 plan authority、native attestation、challenge freshness 与有状态 replay ledger"
+      "formal v3 内容闭环仍不能证明签发者或 native job 真实存在；当前仍缺少独立 plan authority、native attestation、challenge freshness 与有状态 replay ledger"
     ),
     ...createPendingBlindAuthorityChecks(
       structuralClosure
-        ? "not-implemented-in-formal-provenance-v2"
+        ? "not-implemented-in-formal-provenance-v3"
         : "private-provenance-not-closed"
     )
   ];
@@ -2216,7 +2216,7 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   requireString(record.id, "bundle.protocol.id", issues);
-  requireString(record.version, "bundle.protocol.version", issues);
+  requireLiteral(record.version, "6", "bundle.protocol.version", issues);
   requirePositiveInteger(record.topK, "bundle.protocol.topK", issues);
   if (
     Number.isSafeInteger(record.topK) &&
