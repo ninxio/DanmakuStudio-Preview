@@ -324,7 +324,7 @@ describe("多媒体自动匹配工作台", () => {
         .project.mediaMatchCandidates.every(
           (candidate) =>
             candidate.state === "pending" &&
-            candidate.proposal.diagnostics.includes("全局分配：进入本批次最佳无冲突组合。")
+            candidate.proposal.diagnostics.includes("全局分配：进入当前求解得到的无冲突组合。")
         )
     ).toBe(true);
 
@@ -471,7 +471,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(screen.getByRole("button", { name: "开始批量匹配" })).toBeDisabled();
   });
 
-  it("按多参考与多原片生成笛卡尔任务，单组失败后继续处理其余组合", async () => {
+  it("单组失败后保留其余候选，但不把部分结果包装成全局最优组合", async () => {
     const project = createMatchingProject();
     addSecondSource(project);
     useEditorStore.setState({ project });
@@ -513,18 +513,24 @@ describe("多媒体自动匹配工作台", () => {
       within(screen.getByLabelText("批量匹配任务")).getByText("第一组音轨不可用")
     ).toBeInTheDocument();
     expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：找到 3 组可能对应片段，其中 1 组建议优先复核，2 组需要额外复核，1 组未能完成分析。"
+      "批量匹配完成：找到 3 组可能对应片段，全部保留为额外复核；批次未完整，不能形成全局最优组合，1 组未能完成分析。"
     );
     expect(
       useEditorStore
         .getState()
         .project.mediaMatchCandidates.every((candidate) => candidate.state === "blocked")
-    ).toBe(false);
+    ).toBe(true);
     expect(
       useEditorStore
         .getState()
-        .project.mediaMatchCandidates.filter((candidate) => candidate.state === "blocked")
-    ).toHaveLength(2);
+        .project.mediaMatchCandidates.every(
+          (candidate) =>
+            candidate.proposal.timeMap?.quality.reasons.includes(
+              "批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。"
+            ) &&
+            !candidate.proposal.diagnostics.includes("全局分配：进入当前求解得到的无冲突组合。")
+        )
+    ).toBe(true);
   });
 
   it("多条参考竞争同一原片重叠区间时全局择优并阻断弱 V2 备选", async () => {
@@ -682,7 +688,7 @@ describe("多媒体自动匹配工作台", () => {
     });
   });
 
-  it("取消后可继续剩余任务，并始终跳过已有候选组合", async () => {
+  it("取消后保留已完成候选但阻止全局建议，并可继续剩余任务", async () => {
     const project = createMatchingProject();
     project.mediaLibrary.push(
       createMedia("target-ep3", "targetOriginal", "D:\\video\\ep3.mkv", 60_000)
@@ -736,10 +742,21 @@ describe("多媒体自动匹配工作台", () => {
       expect(useEditorStore.getState().status.message).toContain("批量匹配已取消")
     );
     expect(useEditorStore.getState().status.message).toContain(
-      "找到 1 组可能对应片段，其中 1 组建议优先复核，0 组需要额外复核"
+      "找到 1 组可能对应片段，全部保留为额外复核；批次未完整，不能形成全局最优组合"
     );
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
     expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(1);
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]).toMatchObject({
+      state: "blocked"
+    });
+    expect(
+      useEditorStore.getState().project.mediaMatchCandidates[0].proposal.timeMap?.quality.reasons
+    ).toContain("批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。");
+    expect(
+      within(screen.getByLabelText("批量匹配任务")).getByText(
+        /批次未完整，不能形成全局最优组合，已保留供人工复核/
+      )
+    ).toBeInTheDocument();
     const taskList = screen.getByLabelText("批量匹配任务");
     expect(within(taskList).getAllByText("未完成，已停止")).toHaveLength(2);
 

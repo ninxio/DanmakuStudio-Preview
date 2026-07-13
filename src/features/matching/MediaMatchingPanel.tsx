@@ -98,6 +98,9 @@ interface GlobalBatchResolution {
   blockedCount: number;
 }
 
+const INCOMPLETE_GLOBAL_ASSIGNMENT_REASON =
+  "批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。";
+
 export function MediaMatchingPanel({
   project,
   suspectedCutCandidates,
@@ -600,7 +603,13 @@ export function MediaMatchingPanel({
         message: `已找到 ${formatTimecode(candidate.sourceStartMs)}–${formatTimecode(candidate.sourceEndMs)}，正在与整批结果比较`
       });
     }
-    const globalResolution = resolveGlobalBatch(stagedCandidates);
+    const globalAssignmentComplete =
+      snapshot.status === "completed" &&
+      snapshot.processedPairCount === snapshot.totalPairCount &&
+      snapshot.failedPairCount === 0 &&
+      failedCount === 0 &&
+      cancelledCount === 0;
+    const globalResolution = resolveGlobalBatch(stagedCandidates, globalAssignmentComplete);
     globalResolution.candidates.forEach((resolved) => {
       addCandidate(resolved.candidate);
       updateTask(resolved.pairId, {
@@ -609,7 +618,9 @@ export function MediaMatchingPanel({
         message: resolved.globalMessage
       });
     });
-    const batchSummary = `找到 ${stagedCandidates.length} 组可能对应片段，其中 ${globalResolution.adoptedCount} 组建议优先复核，${globalResolution.blockedCount} 组需要额外复核`;
+    const batchSummary = globalAssignmentComplete
+      ? `找到 ${stagedCandidates.length} 组可能对应片段，其中 ${globalResolution.adoptedCount} 组建议优先复核，${globalResolution.blockedCount} 组需要额外复核`
+      : `找到 ${stagedCandidates.length} 组可能对应片段，全部保留为额外复核；批次未完整，不能形成全局最优组合`;
     const cancelled =
       snapshot.status === "cancelled" ||
       (cancelRequestedRef.current && !isAudioAlignmentJobFinished(snapshot.status));
@@ -824,10 +835,29 @@ function batchTaskPatchFromPairSnapshot(
 }
 
 function resolveGlobalBatch(
-  stagedCandidates: readonly StagedPairwiseCandidate[]
+  stagedCandidates: readonly StagedPairwiseCandidate[],
+  globalAssignmentComplete: boolean
 ): GlobalBatchResolution {
   if (stagedCandidates.length === 0) {
     return { candidates: [], adoptedCount: 0, blockedCount: 0 };
+  }
+  if (!globalAssignmentComplete) {
+    return {
+      candidates: stagedCandidates.map((staged) => {
+        const rangeText = `${formatTimecode(staged.candidate.sourceStartMs)}–${formatTimecode(staged.candidate.sourceEndMs)}`;
+        return {
+          ...staged,
+          adopted: false,
+          candidate: blockCandidateForGlobalReview(
+            staged.candidate,
+            INCOMPLETE_GLOBAL_ASSIGNMENT_REASON
+          ),
+          globalMessage: `已找到 ${rangeText}；批次未完整，不能形成全局最优组合，已保留供人工复核`
+        };
+      }),
+      adoptedCount: 0,
+      blockedCount: stagedCandidates.length
+    };
   }
   const assignment = assignGlobalMediaMatches(
     stagedCandidates.map(createGlobalMatchHypothesis)
@@ -865,7 +895,7 @@ function resolveGlobalBatch(
         adopted: true,
         candidate: appendCandidateDiagnostic(
           staged.candidate,
-          "全局分配：进入本批次最佳无冲突组合。"
+          "全局分配：进入当前求解得到的无冲突组合。"
         ),
         globalMessage: `已找到 ${rangeText}；建议优先复核`
       };

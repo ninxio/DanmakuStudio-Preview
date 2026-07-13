@@ -479,7 +479,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] 多音轨自动比较并保存被选流与备选证据。
 - [x] 无共同音轨时音频正确降级，视觉路径可独立运行。
 
-### 算法
+### 算法工程组件（不等于真实冻结集精度通过）
 
 - [x] landmark Top-K 能定位长参考后半段并抵抗重复 OP/ED。
 - [x] 仿射拟合同时恢复 offset 和 scale。
@@ -513,7 +513,9 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 
 当前剩余限制：双侧证据、不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷回执和 fail-closed acceptance v3 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；实测校准、批准的 production protocol / trust root、Job working-set/terminal cleanup/native attestation 正式证据和 20 套北极星长合集均未完成，不能据此宣称准确率或性能达标。
 
-性能执行也仍未成熟：当前匹配页把 source×target 全量展开后逐 pair 串行运行 CPU Alignment V2，单个媒体超过 60 分钟会在探测阶段失败。V2.1 已先消除单 pair 的二次 PCM 解码与 landmark/fine 重复 FFT，并以 768 MiB 字节 LRU 跨 pair 复用完整制品；1 GiB 单任务预检、实际容量 guard 和 native 并发 1 保证这项优化不会把内存放大为无界。它仍没有消除每 pair 的 run identity/FFprobe、笛卡尔积匹配、DP 和边界工作，普通缓存的 FFmpeg 身份也还未升级为整批 tool pin。当前仓库没有 CUDA/cuFFT backend，4090 不会参与匹配。下一阶段必须落地“整批 media/tool pins → 每媒体一次流式索引 → N×M Top-K 粗筛 → 候选窗口精对齐”，再增加可选 CUDA/cuFFT 声谱与批量相关后端；CPU 继续作为确定性基线和自动回退，GPU 结果必须在固定样本上满足容差内等价且不能改变 fail-closed 质量门槛。视觉 NVDEC 只作为视觉帧解码优化，不得冒充音频计算加速。
+性能执行已完成新的生产切片：匹配页把 1×N、N×1、N×M 一次提交为原生批任务；worker 按 distinct media 只建立一次媒体 lease、全文件身份、timeline/逐帧 PTS、候选音轨与 coarse landmark，再让全部 pair 完成 coarse scoring。每个合理音轨组合的去重 Top-K 会先经过有界 fine-window 与活动内存检查，然后由不使用文件名、数组顺序或剧集号先验的 exact branch-and-bound 选择项目级非冲突组合；搜索超过确定性硬上限时整批失败关闭，未入选或全批 coarse 不完整的候选不会进入 fine。长媒体以有界 CPU 流建立 coarse 索引；候选只有在至少一侧能提供完整的分集级查询轴，并且完整候选逆投影、全部 coarse inlier support、edit-aware DP 与边界精修所需 guard 都能同时装入两侧各自不超过 60 分钟的精解码窗口、活动内存预算也允许时，才会按仿射窗口进入 fine。双侧都超过 60 分钟且没有完整短轴只是其中一个明确阻断分支；任何窗口内容、必需 guard 或内存预算不满足的候选也会 fail-closed，不会截断后冒充完整时间图。批次 proposal 在最终媒体身份复核前只存在于 worker 私有 staging，完成或取消都必须复核后才原子发布。
+
+本机 RTX 4090 已接入可选 CUDA/cuFFT 声谱后端：capability probe 会验证 CUDA driver、cuFFT、context 和真实 R2C 计算，短媒体共享声谱 FFT 可由 4090 执行，失败自动完整重算 CPU；强制 CUDA 模式则失败关闭。当前长媒体 streaming coarse、FFmpeg 音频解码、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修与项目级搜索仍在 CPU，尚未实现 GPU 批量相关；普通产品 batch 也尚未像 benchmark session 一样对整批 FFmpeg/FFprobe 建立二进制只读 pin 并把 tool digest 纳入普通制品缓存键。同一物理文件被不同 mediaId/路径别名重复提交时，全局冲突仍按计划媒体节点识别。上述剩余项和真实冻结集缺口意味着当前只能宣称工程能力与资源边界，不能宣称准确率或正式性能达标。视觉 NVDEC 只可作为视觉帧解码优化，不得冒充音频计算加速。
 
 ### 真实准确率与发布
 
@@ -521,8 +523,9 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [ ] 正式批准 versioned 验收协议、校准/取消阈值、数据审批 receipts 与独立 production trust root。
 - [x] 工程性能 raw v2 可在原生独占 session 中输出硬件/工具链、实际 workload media volumes、阶段耗时、冷/热缓存、ToolHelp 进程树峰值内存、取消响应和一致性证据，并保持不可晋级状态。
 - [x] V2.1 中间性能层将 PCM/landmark/fine 合并为 768 MiB 字节 LRU 制品，同一主音轨冷路径只解码一次、landmark/fine 每帧只做一次 FFT；以 1 GiB 单任务预算和 native 并发 1 保持总资源有界，并用 exact/FFmpeg 回归证明语义不变。
-- [ ] 将 N×M 产品执行改为每媒体一次流式 PTS/landmark/粗特征索引、全局 Top-K 粗筛和候选 pair 精对齐，移除长参考对整段 PCM 与 60 分钟上限的依赖。
-- [ ] 实现可选 CUDA/cuFFT 声谱和批量相关后端、4090 能力/显存诊断、CPU 容差等价校验与失败自动回退；安装包不得在后端或 runtime 不存在时显示 GPU 已启用。
+- [x] N×M 产品执行已改为 distinct-media 一次预处理、全 pair coarse-before-fine、精确且资源有界的项目级 Top-K 非冲突选择，并只让入选候选进入 fine；长参考不再要求整段 PCM，但仿射窗口 fine 是条件能力：必须存在完整分集级查询轴，完整逆投影、全部 coarse support、DP/边界 guard 均装入每侧不超过 60 分钟的窗口且活动内存预算通过，否则明确阻断。
+- [x] 可选 CUDA/cuFFT 声谱后端、4090 能力诊断、CPU 容差等价校验和失败自动回退已落地；安装包在 runtime 或真实 smoke 不可用时不会报告 GPU ready。
+- [ ] 为长媒体 coarse / 批量相关提供 GPU 后端，并完成普通产品 batch 的 FFmpeg/FFprobe 整批只读 pin、tool digest 缓存绑定与同物理媒体别名合并；CPU 保持确定性基线。
 - [ ] 正式性能采集在现有 lifecycle Job 之上实现诚实限定覆盖范围的 Job working-set receipt、终态 cleanup receipt 与独立 attestation；在规定 4 核目标机按获批协议重复运行并形成受信原始报告。
 - [ ] 所有上线准确率、校准和性能门槛通过并有可重复报告。
 - [ ] 北极星 20 套长合集 5/5 定位和完整导出通过。

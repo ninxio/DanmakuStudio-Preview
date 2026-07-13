@@ -157,11 +157,13 @@ C137 数据闸门要求至少 150 组真实关系、30 组长参考、500 个 go
 
 产品中的自动媒体分析只有匹配页一个入口。它直接消费素材页已经导入并保存真实本地路径的 B 站参考素材与原片，按 1×N、N×1 或 N×M 建立任务，再通过 `src/infrastructure/alignment/tauriAudioAlignment.ts` 调用与真实 benchmark 共用的 Rust Alignment V2 job API。匹配页不会再次弹出文件选择器，也不会把 Emby 临时播放 URL 交给 FFmpeg；只有本地路径已连接、媒体身份可核验的项目素材才能进入自动分析。`AlignmentProvider` 与 `ManualAlignmentProvider` 仍作为领域兼容和测试扩展保留，但不代表当前产品只有手工匹配。
 
-当前 UI 编排把所选 source×target 展开为笛卡尔积，并用单个 `for...of` 依次等待每个 pair；全部 pair 完成后才运行项目级全局 assignment。单 pair 内部的 Top-K 目前用于选择最佳仿射位置、歧义诊断和降级，产品层送入全局求解的是每个 pair 的最佳持久候选，而不是所有 pair-local Top-K 的联合优化。V2.1 已把同一音轨的 PCM、landmark 与 50ms fine features 组成一个内容身份/流/PTS/引擎参数绑定的制品：冷路径只解码一次，landmark 与 fine 共用一次声谱 FFT，进程内 768 MiB 字节 LRU 可跨 pair 复用；同键 fine 富化不虚增 benchmark write，cold reset 和 session release 仍清同一 `landmarks` 槽。单任务候选制品按最坏上界限制为 1 GiB，native 普通重任务并发固定为 1，防止 per-run 上限被并发放大。
+当前匹配页把所选 source×target 关系一次提交为原生 batch job，可执行 1×N、N×1 和 N×M。worker 按计划中的 distinct media 节点各建立一次媒体 lease、完整内容身份、FFprobe timeline/逐帧 PTS、候选音轨和 coarse landmark，再让全部 pair 完成 coarse scoring；同一媒体的这些证据不会在每个 pair 中重新建立。每个合理音轨组合的去重 Top-K 先通过 fine-window 与活动内存预检，再由不使用文件名、请求顺序或剧集号先验的 exact branch-and-bound 求项目级非冲突组合。candidate、状态或展开数超过确定性硬上限、任一可执行 pair 的 coarse 不完整，都会使整批候选 fail-closed；系统不会截断搜索后宣称全局最优。只有入选且不存在接近 runner-up 歧义的候选才进入 fine，proposal 在批次最终身份复核前保留于 worker 私有 staging，之后才原子发布。
 
-这一中间优化没有把产品变成真正的媒体级 batch：每个 pair 仍重新取得 run lease、计算/复核全文件身份并 FFprobe，整个笛卡尔积仍会进入 pair-local 匹配和后续精对齐；普通制品缓存的 FFmpeg 绑定目前仍依赖进程内路径/参数和 V2 feature version，而正式 benchmark 另有全二进制摘要与固定句柄。V2 也仍在探测阶段拒绝任一超过 60 分钟的媒体。因此“支持 N×M 编排”不能解释为已经具备高吞吐长合集批处理；下一阶段仍需一个持有整批 media pins/tool pins 的原生 batch job、流式长参考 coarse index、pair-local Top-K 联合全局分配和候选窗口精解码。
+长媒体会以有界 CPU 流建立 coarse 索引，不再因媒体总时长超过 60 分钟就在探测阶段一律拒绝，也不要求为长参考保留整段 PCM。窗口 fine 仍是条件能力：候选必须至少有一侧能提供完整的分集级查询轴，并且完整候选逆投影、全部 coarse inlier support、edit-aware DP 与边界精修所需 guard 都能同时装入两侧各自不超过 60 分钟的精解码窗口，活动内存预算也必须通过。双侧都超过 60 分钟且没有完整短轴只是其中一个阻断分支；任何必需内容、guard 或预算不能满足时同样阻断，不会截断窗口后生成不完整时间图。
 
-当前 release 是 CPU-only matching：FFmpeg 以 `-vn` 解码单声道 PCM，Rust 自实现 radix-2 FFT 并在 CPU 上完成 landmark、DP 和相关精修；仓库和安装包都没有 CUDA/cuFFT backend 或 GPU 设置。共享声谱 API 已用 exact 回归证明输出等于原 landmark+fine 两次独立遍历，同时每帧 FFT 从 2 次降为 1 次；它也成为未来 GPU provider 的单一替换边界。目标流水线仍是先为每个媒体建立一次可版本化、可取消、受内容身份约束的流式 PTS/landmark/粗特征索引，再对 N×M 做低成本 Top-K 粗筛，只让候选 pair 进入精对齐；之后才增加可选 CUDA/cuFFT 声谱与批量相关后端，并逐 case 与 CPU 基线做容差内等价校验，初始化失败、显存不足或结果越界时自动回退 CPU。NVDEC 只能优化独立视觉回退的帧解码，不能替代音频匹配计算。
+普通产品 batch 还没有达到 benchmark session 的工具链固定强度：它尚未对整批 FFmpeg/FFprobe 二进制建立只读 pin，也未把 tool digest 纳入普通制品缓存键。同一物理文件若以不同 `mediaId` 或路径别名重复提交，目前仍会被当作不同计划媒体节点，全局冲突约束也按这些节点计算；因此 distinct media 表示当前批计划中的去重节点，不等于已完成物理文件别名合并。这些限制不否定真实 N×M 批处理能力，但禁止把它描述成任意长合集、任意别名和工具替换场景下都已完成的高吞吐方案。
+
+当前 release 已包含可选 CUDA/cuFFT 声谱后端。capability probe 只有在 CUDA driver、cuFFT、context 和真实 R2C smoke 都通过时才报告 ready；它当前只加速不超过 60 分钟短媒体的共享声谱 FFT，并按固定样本与 CPU 基线做容差等价验证。默认 auto 模式下初始化失败、显存不足或执行失败会丢弃 GPU 中间结果并从头用 CPU 重算；强制 CUDA 模式则 fail-closed。长媒体 streaming coarse、FFmpeg `-vn` 音频解码、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修和项目级 exact branch-and-bound 仍在 CPU，GPU 批量相关也尚未实现。NVDEC 只能优化独立视觉回退的帧解码，不能替代音频匹配计算。
 
 Alignment V2 从显式音视频流的 frame/packet PTS 开始，经过多音轨候选、声谱 landmark、全局仿射 offset/scale、edit-aware 分块对齐和局部边界精修，生成带 `matched/sourceOnly/targetOnly/ambiguous` 分段的 `MediaTimeMap`。无共同音轨时可以使用绑定视频流身份的独立视觉回退。项目级全局分配负责处理多素材竞争与区间冲突；所有自动结果先进入候选，关系保存后仍须 A/B 复核、差异分类和质量闸门验证，不能因“已保存”被视为可导出。
 

@@ -1,12 +1,14 @@
 use crate::{
     alignment_v2::{
-        align_features_edit_aware_with_cancel, extract_fine_features_with_cancel,
+        align_features_edit_aware_with_cancel, derive_affine_fine_decode_windows,
+        extract_fine_features_with_cancel,
         extract_landmarks_and_fine_features_with_backend_request,
         match_landmarks_affine_with_cancel, refine_boundary_by_correlation_with_cancel,
         refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_request,
-        AffineHypothesis, AffineMatchConfig, BoundaryContextSide, BoundaryRefinementConfig,
-        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
-        FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, SpectralBackendExecution,
+        AffineFineDecodeWindows, AffineFineWindowRequest, AffineHypothesis, AffineMatchConfig,
+        BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig, EditAlignmentMode,
+        EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
+        MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
         SpectralBackendRequest, SpectralLandmark, StreamingLandmarkExtractor,
         STREAMING_CPU_SPECTRAL_BACKEND_ID,
     },
@@ -96,13 +98,24 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.1-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-coarse-cuda-batch-artifact-cache-dual-boundary-v6";
+    "pcm-s16le-16k-pts-streaming-coarse-affine-window-fine-cuda-batch-dual-boundary-v7";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_DP_CHUNK_MS: i64 = 45_000;
 const ALIGNMENT_V2_DP_BAND_RADIUS_MS: i64 = 30_000;
-const ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS: i64 = 0;
+// The fine window must contain the complete candidate episode plus enough context for the DP
+// corridor and the 500 ms boundary search. A round 1 s addition also covers the STFT window and
+// codec seek/preroll rounding without permitting an unbounded decode.
+const ALIGNMENT_V2_FINE_WINDOW_GUARD_MS: i64 = ALIGNMENT_V2_DP_BAND_RADIUS_MS + 1_000;
+// At most one 50 ms fine-feature hop may be lost to codec/frame rounding. Larger shortfall means
+// the requested presentation interval was not fully decoded and must block.
+const ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS: u64 = 50;
+// After the first target chunk, keep bounded source-axis lookahead so a reference-side insert
+// (opening, advertisement, or uncensored material) can be consumed as sourceOnly instead of
+// pushing every later target chunk into a false targetOnly path. At the production 50 ms hop,
+// 45 s target chunks plus 120 s lookahead remain below the 4M-cell DP hard limit.
+const ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS: i64 = 120_000;
 const ALIGNMENT_V2_MAX_DP_CELLS: usize = 4_000_000;
 const ALIGNMENT_V2_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 const ALIGNMENT_V2_MAX_PCM_BYTES: usize =
@@ -116,10 +129,18 @@ const ALIGNMENT_V2_COARSE_MAX_LANDMARKS: usize = 48 * 48 * 64;
 const ALIGNMENT_V2_MIN_TRACK_MARGIN: f64 = 0.10;
 const ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE: f64 = 0.20;
 const ALIGNMENT_V2_MAX_UNSELECTED_STREAMS: usize = 12;
-// Short-media V2 entries own decoded mono PCM plus landmarks/fine features; long-media
-// coarse-only entries own only the bounded index until windowed fine decode exists. Bound both
-// forms by resident bytes instead of entry count. One hour of 16 kHz mono i16 PCM is about
-// 110 MiB, while a 20-minute episode is about 37 MiB; larger sets degrade by LRU eviction.
+const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES: usize = 32_768;
+const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_STATES: usize = 500_000;
+const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_EXPANSIONS: usize = 2_000_000;
+const ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS: i64 = 250;
+const ALIGNMENT_V2_GLOBAL_REPEATED_CONTENT_PENALTY: f64 = 0.30;
+const ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN: f64 = 0.08;
+// Short-media V2 cache entries own decoded mono PCM plus landmarks/fine features; long-media
+// cache entries permanently own only the bounded coarse index. A selected long-media affine
+// window is decoded into a run-local, separately charged working set and is never published as
+// whole-media PCM. Bound cached forms by resident bytes instead of entry count. One hour of
+// 16 kHz mono i16 PCM is about 110 MiB, while a 20-minute episode is about 37 MiB; larger sets
+// degrade by LRU eviction.
 const MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES: usize = 768 * 1024 * 1024;
 // Short candidate PCM must remain alive until track-pair selection finishes to preserve the
 // one-decode shared-FFT path. Long candidates contribute only the bounded coarse index here.
@@ -789,6 +810,7 @@ struct CachedV2Landmarks {
     cache_key: String,
     cache_hit: bool,
     spectral_backend: SpectralBackendExecution,
+    presentation_bounds: PresentationRangeMs,
 }
 
 struct V2CandidateExtractionState<'a> {
@@ -801,6 +823,7 @@ struct V2CandidateExtractionState<'a> {
 struct DecodedV2Audio {
     pcm: Arc<Vec<i16>>,
     fine_features: Arc<Vec<FineFeatureFrame>>,
+    presentation_offset_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +832,13 @@ struct V2MediaArtifact {
     landmarks: Arc<Vec<SpectralLandmark>>,
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
     spectral_backend: SpectralBackendExecution,
+    presentation_bounds: PresentationRangeMs,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DecodedV2CoarseLandmarks {
+    index: MediaCoarseIndexResult,
+    decoded_sample_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -930,6 +960,37 @@ struct V2TrackPairCandidate {
     target_landmark_count: usize,
     source_spectral_backend_id: String,
     target_spectral_backend_id: String,
+    global_source_interval: PresentationRangeMs,
+    global_target_interval: PresentationRangeMs,
+    fine_working_set_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct V2PairCoarseCandidates {
+    candidates: Vec<V2TrackPairCandidate>,
+    alternatives: Vec<AudioAlternativeTrackScoreDto>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedV2SelectedCandidate {
+    candidate: V2TrackPairCandidate,
+    alternatives: Vec<AudioAlternativeTrackScoreDto>,
+    global_margin: f64,
+    global_diagnostic: String,
+}
+
+#[derive(Debug, Clone)]
+enum V2GlobalShortlistDecision {
+    Selected(PreparedV2SelectedCandidate),
+    Blocked {
+        candidate: Option<V2TrackPairCandidate>,
+        alternatives: Vec<AudioAlternativeTrackScoreDto>,
+        margin: f64,
+        reason: String,
+        diagnostics: Vec<String>,
+    },
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -1092,11 +1153,60 @@ struct PlannedAudioAlignmentBatchPair {
     pair_ordinal: usize,
     source_media_id: String,
     target_media_id: String,
+    source_media_index: usize,
+    target_media_index: usize,
     request: AudioAlignmentRequest,
 }
 
+#[derive(Debug, Clone)]
+struct PlannedAudioAlignmentBatchMedia {
+    media_id: String,
+    path: String,
+    requested_audio_stream_index: Option<u32>,
+    role_label: &'static str,
+}
+
 struct PlannedAudioAlignmentBatch {
+    media: Vec<PlannedAudioAlignmentBatchMedia>,
     pairs: Vec<PlannedAudioAlignmentBatchPair>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedV2BatchMediaEvidence {
+    inputs: Vec<AlignmentAudioInput>,
+    landmarks: HashMap<u32, CachedV2Landmarks>,
+    extraction_notes: Vec<String>,
+    retained_artifact_bytes: usize,
+}
+
+struct PreparedAudioAlignmentBatchMedia {
+    _read_lease: File,
+    path: String,
+    expected_identity: MediaContentIdentity,
+    evidence: PreparedV2BatchMediaEvidence,
+}
+
+enum PreparedAudioAlignmentBatchMediaState {
+    Ready(Box<PreparedAudioAlignmentBatchMedia>),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedV2PairEvidence {
+    source: PreparedV2BatchMediaEvidence,
+    target: PreparedV2BatchMediaEvidence,
+    batch_retained_artifact_bytes: usize,
+    selected_coarse: PreparedV2SelectedCandidate,
+}
+
+enum StagedAudioAlignmentBatchPairOutcome {
+    Proposal(Box<AudioAlignmentProposal>),
+    Failed(String),
+}
+
+struct StagedAudioAlignmentBatchPairResult {
+    pair_index: usize,
+    outcome: StagedAudioAlignmentBatchPairOutcome,
 }
 
 struct AudioAlignmentBatchJobEntry {
@@ -4674,6 +4784,7 @@ where
             &options,
             update_progress,
             cancel_flag,
+            None,
         );
     }
     update_progress(0.08, "正在探测媒体展示时间线和可用音轨。")?;
@@ -4819,53 +4930,72 @@ where
     Ok(proposal)
 }
 
+fn v2_effective_alternative_margin(
+    forced_global_margin: Option<f64>,
+    pair_margin: f64,
+    intrinsic_margin: f64,
+) -> f64 {
+    forced_global_margin
+        .map(|global_margin| global_margin.min(intrinsic_margin))
+        .unwrap_or_else(|| pair_margin.min(intrinsic_margin))
+}
+
 fn align_audio_files_v2_with_progress<F>(
     request: &AudioAlignmentRequest,
     options: &AudioAlignmentOptions,
     update_progress: &mut F,
     cancel_flag: Option<&AtomicBool>,
+    prepared: Option<PreparedV2PairEvidence>,
 ) -> Result<AudioAlignmentProposal, String>
 where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
     benchmark_stage("validating", "探测候选音轨与展示时间线");
     update_progress(0.08, "Alignment V2 正在探测展示时间线和候选音轨。")?;
-    let target_inputs = match probe_alignment_audio_candidates(
-        &request.complete_path,
-        "目标原片",
-        request.complete_audio_stream_index,
-        options,
-        cancel_flag,
-    ) {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            update_progress(0.10, "目标音频不可比较，正在尝试独立视觉定位。")?;
-            return try_v2_visual_fallback(
-                request,
-                options,
-                &format!("目标音频探测未通过：{}", truncate_visual_note(&error)),
-                vec![error],
-                cancel_flag,
-            );
+    let target_inputs = if let Some(prepared) = prepared.as_ref() {
+        prepared.target.inputs.clone()
+    } else {
+        match probe_alignment_audio_candidates(
+            &request.complete_path,
+            "目标原片",
+            request.complete_audio_stream_index,
+            options,
+            cancel_flag,
+        ) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                update_progress(0.10, "目标音频不可比较，正在尝试独立视觉定位。")?;
+                return try_v2_visual_fallback(
+                    request,
+                    options,
+                    &format!("目标音频探测未通过：{}", truncate_visual_note(&error)),
+                    vec![error],
+                    cancel_flag,
+                );
+            }
         }
     };
-    let source_inputs = match probe_alignment_audio_candidates(
-        &request.source_path,
-        "B 站参考",
-        request.source_audio_stream_index,
-        options,
-        cancel_flag,
-    ) {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            update_progress(0.10, "参考音频不可比较，正在尝试独立视觉定位。")?;
-            return try_v2_visual_fallback(
-                request,
-                options,
-                &format!("参考音频探测未通过：{}", truncate_visual_note(&error)),
-                vec![error],
-                cancel_flag,
-            );
+    let source_inputs = if let Some(prepared) = prepared.as_ref() {
+        prepared.source.inputs.clone()
+    } else {
+        match probe_alignment_audio_candidates(
+            &request.source_path,
+            "B 站参考",
+            request.source_audio_stream_index,
+            options,
+            cancel_flag,
+        ) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                update_progress(0.10, "参考音频不可比较，正在尝试独立视觉定位。")?;
+                return try_v2_visual_fallback(
+                    request,
+                    options,
+                    &format!("参考音频探测未通过：{}", truncate_visual_note(&error)),
+                    vec![error],
+                    cancel_flag,
+                );
+            }
         }
     };
     if source_inputs.is_empty() || target_inputs.is_empty() {
@@ -4882,42 +5012,75 @@ where
     // Reserve the worst-case candidate payload before the first FFmpeg decode. This makes
     // the auto-track path transactional with respect to the active-memory guard: an input
     // with too many long tracks is rejected without leaving a partially warmed artifact set.
-    ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)?;
+    if prepared.is_none() {
+        ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)?;
+    }
     check_cancelled(cancel_flag)?;
     // Resolve capability once for the whole alignment run; candidate tracks and both media then
     // share the same planned backend identity during cache lookup and extraction.
-    let spectral_backend_request = resolve_spectral_backend_request()?;
+    let spectral_backend_request = if prepared.is_none() {
+        Some(resolve_spectral_backend_request()?)
+    } else {
+        None
+    };
 
     benchmark_stage("extracting-source", "提取参考音轨 landmark");
     update_progress(0.12, "正在为 B 站参考候选音轨提取 16 kHz landmark。")?;
-    let mut extraction_notes = Vec::new();
-    let mut retained_artifact_bytes = 0_usize;
-    let source_landmarks = extract_v2_landmark_candidates(
-        &request.source_path,
-        "B 站参考",
-        options,
-        &source_inputs,
-        cancel_flag,
-        &mut V2CandidateExtractionState {
-            notes: &mut extraction_notes,
-            retained_artifact_bytes: &mut retained_artifact_bytes,
-            spectral_backend_request: &spectral_backend_request,
-        },
-    )?;
+    let mut extraction_notes = prepared
+        .as_ref()
+        .map(|prepared| {
+            prepared
+                .source
+                .extraction_notes
+                .iter()
+                .chain(&prepared.target.extraction_notes)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut retained_artifact_bytes = v2_prepared_retained_artifact_baseline(prepared.as_ref());
+    let source_landmarks = if let Some(prepared) = prepared.as_ref() {
+        prepared.source.landmarks.clone()
+    } else {
+        extract_v2_landmark_candidates(
+            &request.source_path,
+            "B 站参考",
+            options,
+            &source_inputs,
+            cancel_flag,
+            &mut V2CandidateExtractionState {
+                notes: &mut extraction_notes,
+                retained_artifact_bytes: &mut retained_artifact_bytes,
+                spectral_backend_request: spectral_backend_request
+                    .as_ref()
+                    .expect("ordinary V2 preparation must resolve a spectral backend"),
+            },
+        )?
+    };
     benchmark_stage("extracting-complete", "提取目标原片 landmark");
     update_progress(0.40, "正在为目标原片候选音轨提取 16 kHz landmark。")?;
-    let target_landmarks = extract_v2_landmark_candidates(
-        &request.complete_path,
-        "目标原片",
-        options,
-        &target_inputs,
-        cancel_flag,
-        &mut V2CandidateExtractionState {
-            notes: &mut extraction_notes,
-            retained_artifact_bytes: &mut retained_artifact_bytes,
-            spectral_backend_request: &spectral_backend_request,
-        },
-    )?;
+    let target_landmarks = if let Some(prepared) = prepared.as_ref() {
+        extraction_notes.push(
+            "本 pair 复用批次级 distinct-media timeline、PTS 与 coarse artifact，并只对项目级 Top-K shortlist 选中的 affine 候选执行 fine。"
+                .to_string(),
+        );
+        prepared.target.landmarks.clone()
+    } else {
+        extract_v2_landmark_candidates(
+            &request.complete_path,
+            "目标原片",
+            options,
+            &target_inputs,
+            cancel_flag,
+            &mut V2CandidateExtractionState {
+                notes: &mut extraction_notes,
+                retained_artifact_bytes: &mut retained_artifact_bytes,
+                spectral_backend_request: spectral_backend_request
+                    .as_ref()
+                    .expect("ordinary V2 preparation must resolve a spectral backend"),
+            },
+        )?
+    };
     check_cancelled(cancel_flag)?;
     if source_landmarks.is_empty() || target_landmarks.is_empty() {
         let reason = "候选音轨未产生可用 landmark，不能据此断言存在或不存在内容段。";
@@ -4927,158 +5090,28 @@ where
 
     benchmark_stage("matching", "比较音轨组合与 Top-K 仿射假设");
     update_progress(0.78, "正在比较合理音轨组合的 Top-K 仿射假设。")?;
-    let affine_config = AffineMatchConfig {
-        residual_tolerance_ms: 140,
-        min_inliers: 6,
-        top_k: 5,
-        ..AffineMatchConfig::default()
-    };
-    let has_explicit_selection = request.source_audio_stream_index.is_some()
-        || request.complete_audio_stream_index.is_some();
-    let mut pair_candidates = Vec::new();
-    let mut hypothesis_alternatives = Vec::new();
-    for source_input in &source_inputs {
-        for target_input in &target_inputs {
-            check_cancelled(cancel_flag)?;
-            if !has_explicit_selection
-                && !is_reasonable_audio_stream_pair(source_input, target_input)
-            {
-                continue;
-            }
-            let Some(source_artifact) = source_landmarks.get(&source_input.stream.stream_index)
-            else {
-                continue;
-            };
-            let Some(target_artifact) = target_landmarks.get(&target_input.stream.stream_index)
-            else {
-                continue;
-            };
-            let result = match match_landmarks_affine_with_cancel(
-                &source_artifact.landmarks,
-                &target_artifact.landmarks,
-                &affine_config,
+    let affine_config = v2_affine_match_config();
+    let (pair_candidates, alternatives, forced_global_margin) =
+        if let Some(prepared) = prepared.as_ref() {
+            extraction_notes.push(prepared.selected_coarse.global_diagnostic.clone());
+            (
+                vec![prepared.selected_coarse.candidate.clone()],
+                prepared.selected_coarse.alternatives.clone(),
+                Some(prepared.selected_coarse.global_margin),
+            )
+        } else {
+            let coarse = collect_v2_pair_coarse_candidates(
+                &source_inputs,
+                &target_inputs,
+                &source_landmarks,
+                &target_landmarks,
+                request.source_audio_stream_index.is_some()
+                    || request.complete_audio_stream_index.is_some(),
                 cancel_flag,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    extraction_notes.push(format!(
-                        "音轨 #{} → #{} landmark 拟合失败：{error}",
-                        source_input.stream.stream_index, target_input.stream.stream_index
-                    ));
-                    continue;
-                }
-            };
-            let Some(best) = result.hypotheses.first().cloned() else {
-                extraction_notes.push(format!(
-                    "音轨 #{} → #{} 没有达到最小内点数的仿射假设。",
-                    source_input.stream.stream_index, target_input.stream.stream_index
-                ));
-                continue;
-            };
-            extraction_notes.push(format!(
-                "音轨 #{} → #{} Top-K affine：{}。",
-                source_input.stream.stream_index,
-                target_input.stream.stream_index,
-                result
-                    .hypotheses
-                    .iter()
-                    .map(|item| format!(
-                        "scale={:.6},offset={:+},inliers={},range={}-{}",
-                        item.scale,
-                        item.offset_ms,
-                        item.inlier_count,
-                        item.source_start_ms,
-                        item.source_end_ms
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("；")
-            ));
-            let temporal_coverage = affine_temporal_coverage(
-                &best,
-                &target_artifact.landmarks,
-                v2_normalized_pcm_origin_ms(target_input),
-            );
-            for hypothesis in &result.hypotheses {
-                let hypothesis_coverage = affine_temporal_coverage(
-                    hypothesis,
-                    &target_artifact.landmarks,
-                    v2_normalized_pcm_origin_ms(target_input),
-                );
-                hypothesis_alternatives.push(v2_alternative_hypothesis_score(
-                    source_input,
-                    target_input,
-                    hypothesis,
-                    score_v2_track_pair(
-                        hypothesis,
-                        hypothesis_coverage,
-                        &affine_config,
-                        source_input,
-                        target_input,
-                    ),
-                ));
-            }
-            let score = score_v2_track_pair(
-                &best,
-                temporal_coverage,
-                &affine_config,
-                source_input,
-                target_input,
-            );
-            // Every distinct Top-K location competes, including disjoint repeated-content
-            // ranges. Only global assignment or a user choice may resolve that ambiguity.
-            let intrinsic_margin = result.top1_top2_margin;
-            let repeated_content_only =
-                v2_affine_has_competing_repeated_location(&result.hypotheses, intrinsic_margin);
-            pair_candidates.push(V2TrackPairCandidate {
-                source_input: source_input.clone(),
-                target_input: target_input.clone(),
-                hypothesis: best,
-                score,
-                temporal_coverage,
-                intrinsic_margin,
-                repeated_content_only,
-                observation_count: result.observation_count,
-                source_landmark_count: result.source_landmark_count,
-                target_landmark_count: result.target_landmark_count,
-                source_spectral_backend_id: source_artifact.spectral_backend.backend_id.clone(),
-                target_spectral_backend_id: target_artifact.spectral_backend.backend_id.clone(),
-            });
-        }
-    }
-    pair_candidates.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| {
-                right
-                    .hypothesis
-                    .inlier_count
-                    .cmp(&left.hypothesis.inlier_count)
-            })
-            .then_with(|| {
-                left.source_input
-                    .stream
-                    .stream_index
-                    .cmp(&right.source_input.stream.stream_index)
-            })
-            .then_with(|| {
-                left.target_input
-                    .stream
-                    .stream_index
-                    .cmp(&right.target_input.stream.stream_index)
-            })
-    });
-    hypothesis_alternatives.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| right.inlier_count.cmp(&left.inlier_count))
-            .then_with(|| left.source_stream_index.cmp(&right.source_stream_index))
-            .then_with(|| left.target_stream_index.cmp(&right.target_stream_index))
-            .then_with(|| left.offset_ms.cmp(&right.offset_ms))
-    });
-    hypothesis_alternatives.truncate(10);
-    let alternatives = hypothesis_alternatives;
+            )?;
+            extraction_notes.extend(coarse.diagnostics);
+            (coarse.candidates, coarse.alternatives, None)
+        };
     let Some(best_pair) = pair_candidates.first().cloned() else {
         let reason = "合理的非 commentary 音轨组合之间没有共同音频证据。";
         extraction_notes.push(format!(
@@ -5094,11 +5127,23 @@ where
             ((best_pair.score - second.score) / best_pair.score.max(0.001)).clamp(0.0, 1.0)
         })
         .unwrap_or(1.0);
-    let top1_top2_margin = pair_margin.min(best_pair.intrinsic_margin);
+    let top1_top2_margin = v2_effective_alternative_margin(
+        forced_global_margin,
+        pair_margin,
+        best_pair.intrinsic_margin,
+    );
+    // Batch selection cannot weaken the pair-local ambiguity gate. In particular, a 1x1 batch
+    // must have exactly the same intrinsic-margin blocked semantics as ordinary single-pair V2.
+    let minimum_alternative_margin = ALIGNMENT_V2_MIN_TRACK_MARGIN;
     let selected_track_reason = format!(
-        "landmark 内容评分选择 B 站参考音轨 #{} 与目标原片音轨 #{}；Top1/Top2 margin {:.3}。",
+        "landmark 内容评分选择 B 站参考音轨 #{} 与目标原片音轨 #{}；{} margin {:.3}。",
         best_pair.source_input.stream.stream_index,
         best_pair.target_input.stream.stream_index,
+        if forced_global_margin.is_some() {
+            "项目级 Top-K shortlist"
+        } else {
+            "Top1/Top2"
+        },
         top1_top2_margin
     );
     extraction_notes.push(selected_track_reason.clone());
@@ -5110,7 +5155,7 @@ where
         "目标原片",
         &best_pair.target_input,
     ));
-    if top1_top2_margin < ALIGNMENT_V2_MIN_TRACK_MARGIN {
+    if top1_top2_margin < minimum_alternative_margin {
         extraction_notes.push(
             "Top1/Top2 候选过于接近；继续计算显式 spans 供复核，但最终质量将保持 blocked。"
                 .to_string(),
@@ -5128,18 +5173,92 @@ where
         ));
     }
 
+    let source_landmark_artifact = source_landmarks
+        .get(&best_pair.source_input.stream.stream_index)
+        .ok_or_else(|| {
+            "blocked:artifact-missing：所选 B 站参考音轨的粗定位制品已丢失。".to_string()
+        })?;
+    let target_landmark_artifact = target_landmarks
+        .get(&best_pair.target_input.stream.stream_index)
+        .ok_or_else(|| {
+            "blocked:artifact-missing：所选目标原片音轨的粗定位制品已丢失。".to_string()
+        })?;
+    let fine_decode_plan = match plan_v2_selected_fine_decode(
+        &best_pair,
+        source_landmark_artifact,
+        target_landmark_artifact,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            extraction_notes.push(error);
+            return Ok(create_blocked_v2_affine_proposal(
+                "粗定位候选无法形成完整、有界的 affine 精解码窗口。",
+                &best_pair,
+                top1_top2_margin,
+                alternatives,
+                extraction_notes,
+            ));
+        }
+    };
+    if let Some(plan) = fine_decode_plan {
+        let mut fine_working_set_bytes = retained_artifact_bytes;
+        for (input, window) in [
+            (&best_pair.source_input, plan.windows.source),
+            (&best_pair.target_input, plan.windows.target),
+        ] {
+            if should_stream_v2_coarse_only(input) {
+                let window_bytes = match v2_fine_window_artifact_upper_bound(window) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        extraction_notes.push(error);
+                        return Ok(create_blocked_v2_affine_proposal(
+                            "所选 affine 精解码窗口无法建立可信的活动内存上界。",
+                            &best_pair,
+                            top1_top2_margin,
+                            alternatives,
+                            extraction_notes,
+                        ));
+                    }
+                };
+                fine_working_set_bytes =
+                    match ensure_v2_active_artifact_budget(fine_working_set_bytes, window_bytes) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            extraction_notes.push(error);
+                            return Ok(create_blocked_v2_affine_proposal(
+                                "所选 affine 精解码窗口超过单次活动内存预算。",
+                                &best_pair,
+                                top1_top2_margin,
+                                alternatives,
+                                extraction_notes,
+                            ));
+                        }
+                    };
+            }
+        }
+        extraction_notes.push(format!(
+            "所选 affine 候选采用绝对 presentation 窗口精解码：参考 [{}，{}] ms，目标 [{}，{}] ms，自适应 guard {} ms；窗口包含完整目标逆投影与全部 coarse source support；本次活动制品上界 {} MiB。",
+            plan.windows.source.start_ms,
+            plan.windows.source.end_ms,
+            plan.windows.target.start_ms,
+            plan.windows.target.end_ms,
+            plan.adaptive_guard_ms,
+            fine_working_set_bytes.div_ceil(1024 * 1024)
+        ));
+    }
+
     benchmark_stage("extracting-source", "解码参考音轨细粒度特征");
-    update_progress(0.84, "已选择音轨，正在保留 PCM 并生成 50 ms 细特征。")?;
-    let source_audio = match decode_v2_audio(
+    update_progress(
+        0.84,
+        "已选择音轨，正在有界解码 PCM 并生成绝对时间轴 50 ms 细特征。",
+    )?;
+    let source_audio = match decode_v2_audio_for_selected_window(
         &request.source_path,
         "B 站参考",
         options,
         &best_pair.source_input,
-        source_landmarks
-            .get(&best_pair.source_input.stream.stream_index)
-            .ok_or_else(|| {
-                "blocked:artifact-missing：所选 B 站参考音轨的粗定位制品已丢失。".to_string()
-            })?,
+        source_landmark_artifact,
+        fine_decode_plan.map(|plan| plan.windows.source),
         cancel_flag,
     ) {
         Ok(audio) => audio,
@@ -5159,16 +5278,13 @@ where
         }
     };
     benchmark_stage("extracting-complete", "解码目标原片细粒度特征");
-    let target_audio = match decode_v2_audio(
+    let target_audio = match decode_v2_audio_for_selected_window(
         &request.complete_path,
         "目标原片",
         options,
         &best_pair.target_input,
-        target_landmarks
-            .get(&best_pair.target_input.stream.stream_index)
-            .ok_or_else(|| {
-                "blocked:artifact-missing：所选目标原片音轨的粗定位制品已丢失。".to_string()
-            })?,
+        target_landmark_artifact,
+        fine_decode_plan.map(|plan| plan.windows.target),
         cancel_flag,
     ) {
         Ok(audio) => audio,
@@ -5216,8 +5332,8 @@ where
         &mut chunk_alignment.spans,
         &source_audio.pcm,
         &target_audio.pcm,
-        &best_pair.source_input,
-        &best_pair.target_input,
+        source_audio.presentation_offset_ms,
+        target_audio.presentation_offset_ms,
         cancel_flag,
     );
     check_cancelled(cancel_flag)?;
@@ -5237,6 +5353,7 @@ where
         boundary_summary,
         best_pair,
         top1_top2_margin,
+        minimum_alternative_margin,
         selected_track_reason,
         alternatives,
         extraction_notes,
@@ -5248,6 +5365,728 @@ where
         benchmark_stage("reporting", "汇总音频与视觉复核证据");
     }
     Ok(proposal)
+}
+
+fn v2_prepared_retained_artifact_baseline(prepared: Option<&PreparedV2PairEvidence>) -> usize {
+    prepared
+        .map(|prepared| prepared.batch_retained_artifact_bytes)
+        .unwrap_or(0)
+}
+
+fn collect_v2_pair_coarse_candidates(
+    source_inputs: &[AlignmentAudioInput],
+    target_inputs: &[AlignmentAudioInput],
+    source_landmarks: &HashMap<u32, CachedV2Landmarks>,
+    target_landmarks: &HashMap<u32, CachedV2Landmarks>,
+    has_explicit_selection: bool,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<V2PairCoarseCandidates, String> {
+    let affine_config = v2_affine_match_config();
+    let mut candidates = Vec::<V2TrackPairCandidate>::new();
+    let mut alternatives = Vec::new();
+    let mut diagnostics = Vec::new();
+    for source_input in source_inputs {
+        for target_input in target_inputs {
+            check_cancelled(cancel_flag)?;
+            if !has_explicit_selection
+                && !is_reasonable_audio_stream_pair(source_input, target_input)
+            {
+                continue;
+            }
+            let Some(source_artifact) = source_landmarks.get(&source_input.stream.stream_index)
+            else {
+                continue;
+            };
+            let Some(target_artifact) = target_landmarks.get(&target_input.stream.stream_index)
+            else {
+                continue;
+            };
+            let result = match match_landmarks_affine_with_cancel(
+                &source_artifact.landmarks,
+                &target_artifact.landmarks,
+                &affine_config,
+                cancel_flag,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "音轨 #{} → #{} landmark 拟合失败：{error}",
+                        source_input.stream.stream_index, target_input.stream.stream_index
+                    ));
+                    continue;
+                }
+            };
+            if result.hypotheses.is_empty() {
+                diagnostics.push(format!(
+                    "音轨 #{} → #{} 没有达到最小内点数的仿射假设。",
+                    source_input.stream.stream_index, target_input.stream.stream_index
+                ));
+                continue;
+            }
+            diagnostics.push(format!(
+                "音轨 #{} → #{} Top-K affine：{}。",
+                source_input.stream.stream_index,
+                target_input.stream.stream_index,
+                result
+                    .hypotheses
+                    .iter()
+                    .map(|item| format!(
+                        "scale={:.6},offset={:+},inliers={},range={}-{}",
+                        item.scale,
+                        item.offset_ms,
+                        item.inlier_count,
+                        item.source_start_ms,
+                        item.source_end_ms
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+            let repeated_content_only = v2_affine_has_competing_repeated_location(
+                &result.hypotheses,
+                result.top1_top2_margin,
+            );
+            for hypothesis in &result.hypotheses {
+                let temporal_coverage = affine_temporal_coverage(
+                    hypothesis,
+                    &target_artifact.landmarks,
+                    v2_normalized_pcm_origin_ms(target_input),
+                );
+                let score = score_v2_track_pair(
+                    hypothesis,
+                    temporal_coverage,
+                    &affine_config,
+                    source_input,
+                    target_input,
+                );
+                alternatives.push(v2_alternative_hypothesis_score(
+                    source_input,
+                    target_input,
+                    hypothesis,
+                    score,
+                ));
+                let mut candidate = V2TrackPairCandidate {
+                    source_input: source_input.clone(),
+                    target_input: target_input.clone(),
+                    hypothesis: hypothesis.clone(),
+                    score,
+                    temporal_coverage,
+                    intrinsic_margin: result.top1_top2_margin,
+                    repeated_content_only,
+                    observation_count: result.observation_count,
+                    source_landmark_count: result.source_landmark_count,
+                    target_landmark_count: result.target_landmark_count,
+                    source_spectral_backend_id: source_artifact.spectral_backend.backend_id.clone(),
+                    target_spectral_backend_id: target_artifact.spectral_backend.backend_id.clone(),
+                    global_source_interval: source_artifact.presentation_bounds,
+                    global_target_interval: target_artifact.presentation_bounds,
+                    fine_working_set_bytes: 0,
+                };
+                candidate = match bind_v2_candidate_global_intervals(
+                    candidate,
+                    source_artifact,
+                    target_artifact,
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        diagnostics.push(format!(
+                            "音轨 #{} → #{} 的 affine candidate scale={:.6},offset={:+} 无法形成有界 fine window，已在项目级 shortlist 前排除：{error}",
+                            source_input.stream.stream_index,
+                            target_input.stream.stream_index,
+                            hypothesis.scale,
+                            hypothesis.offset_ms
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(existing) = candidates
+                    .iter_mut()
+                    .find(|existing| v2_track_pair_candidates_same_location(existing, &candidate))
+                {
+                    if compare_v2_track_pair_candidates(&candidate, existing).is_lt() {
+                        *existing = candidate;
+                    }
+                } else {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    candidates.sort_by(compare_v2_track_pair_candidates);
+    alternatives.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| right.inlier_count.cmp(&left.inlier_count))
+            .then_with(|| left.source_stream_index.cmp(&right.source_stream_index))
+            .then_with(|| left.target_stream_index.cmp(&right.target_stream_index))
+            .then_with(|| left.offset_ms.cmp(&right.offset_ms))
+    });
+    alternatives.truncate(10);
+    if let Some(best) = candidates.first().cloned() {
+        let margin = candidates
+            .get(1)
+            .map(|second| ((best.score - second.score) / best.score.max(0.001)).clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        if let Some(best) = candidates.first_mut() {
+            best.intrinsic_margin = margin.min(best.intrinsic_margin);
+        }
+    }
+    Ok(V2PairCoarseCandidates {
+        candidates,
+        alternatives,
+        diagnostics,
+    })
+}
+
+fn bind_v2_candidate_global_intervals(
+    mut candidate: V2TrackPairCandidate,
+    source_artifact: &CachedV2Landmarks,
+    target_artifact: &CachedV2Landmarks,
+) -> Result<V2TrackPairCandidate, String> {
+    // The guarded plan proves this candidate can enter bounded fine. Conflict geometry uses a
+    // separate zero-guard content interval: adjacent episodes may share decoder context while
+    // their actual candidate content intervals only touch.
+    let fine_plan = plan_v2_selected_fine_decode(&candidate, source_artifact, target_artifact)?;
+    let mut fine_working_set_bytes = 0_usize;
+    if let Some(plan) = fine_plan {
+        for (input, window) in [
+            (&candidate.source_input, plan.windows.source),
+            (&candidate.target_input, plan.windows.target),
+        ] {
+            if should_stream_v2_coarse_only(input) {
+                fine_working_set_bytes = fine_working_set_bytes
+                    .checked_add(v2_fine_window_artifact_upper_bound(window)?)
+                    .ok_or_else(|| {
+                        "blocked:resource-limit：candidate fine working-set 上界溢出。".to_string()
+                    })?;
+            }
+        }
+    }
+    let content_intervals = derive_v2_selected_candidate_content_intervals(
+        &candidate,
+        source_artifact,
+        target_artifact,
+    )?;
+    candidate.global_source_interval = content_intervals.source;
+    candidate.global_target_interval = content_intervals.target;
+    candidate.fine_working_set_bytes = fine_working_set_bytes;
+    Ok(candidate)
+}
+
+fn v2_affine_match_config() -> AffineMatchConfig {
+    AffineMatchConfig {
+        residual_tolerance_ms: 140,
+        min_inliers: 6,
+        top_k: 5,
+        ..AffineMatchConfig::default()
+    }
+}
+
+fn compare_v2_track_pair_candidates(
+    left: &V2TrackPairCandidate,
+    right: &V2TrackPairCandidate,
+) -> std::cmp::Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| {
+            right
+                .hypothesis
+                .inlier_count
+                .cmp(&left.hypothesis.inlier_count)
+        })
+        .then_with(|| {
+            left.source_input
+                .stream
+                .stream_index
+                .cmp(&right.source_input.stream.stream_index)
+        })
+        .then_with(|| {
+            left.target_input
+                .stream
+                .stream_index
+                .cmp(&right.target_input.stream.stream_index)
+        })
+        .then_with(|| {
+            left.hypothesis
+                .source_start_ms
+                .cmp(&right.hypothesis.source_start_ms)
+        })
+        .then_with(|| left.hypothesis.offset_ms.cmp(&right.hypothesis.offset_ms))
+}
+
+fn v2_track_pair_candidates_same_location(
+    left: &V2TrackPairCandidate,
+    right: &V2TrackPairCandidate,
+) -> bool {
+    if left.source_input.stream.stream_index != right.source_input.stream.stream_index
+        || left.target_input.stream.stream_index != right.target_input.stream.stream_index
+        || (left.hypothesis.scale - right.hypothesis.scale).abs() > 0.002
+    {
+        return false;
+    }
+    let left_source = v2_hypothesis_source_interval(&left.hypothesis);
+    let right_source = v2_hypothesis_source_interval(&right.hypothesis);
+    let source_overlap = v2_interval_overlap_ms(left_source, right_source);
+    let shorter_source = (left_source.1 - left_source.0)
+        .min(right_source.1 - right_source.0)
+        .max(1);
+    let left_target = v2_hypothesis_target_interval(&left.hypothesis);
+    let right_target = v2_hypothesis_target_interval(&right.hypothesis);
+    let target_overlap = v2_interval_overlap_ms(left_target, right_target);
+    let shorter_target = (left_target.1 - left_target.0)
+        .min(right_target.1 - right_target.0)
+        .max(1);
+    source_overlap as f64 / shorter_source as f64 >= 0.80
+        && target_overlap as f64 / shorter_target as f64 >= 0.80
+}
+
+fn v2_hypothesis_source_interval(hypothesis: &AffineHypothesis) -> (i64, i64) {
+    (
+        hypothesis.source_start_ms.min(hypothesis.source_end_ms),
+        hypothesis.source_start_ms.max(hypothesis.source_end_ms),
+    )
+}
+
+fn v2_hypothesis_target_interval(hypothesis: &AffineHypothesis) -> (i64, i64) {
+    let start = hypothesis.scale * hypothesis.source_start_ms as f64 + hypothesis.offset_ms as f64;
+    let end = hypothesis.scale * hypothesis.source_end_ms as f64 + hypothesis.offset_ms as f64;
+    (
+        start
+            .min(end)
+            .floor()
+            .clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+        start
+            .max(end)
+            .ceil()
+            .clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+    )
+}
+
+fn v2_interval_overlap_ms(left: (i64, i64), right: (i64, i64)) -> i64 {
+    left.1
+        .min(right.1)
+        .saturating_sub(left.0.max(right.0))
+        .max(0)
+}
+
+#[derive(Debug, Clone)]
+struct V2GlobalAssignmentState {
+    choices: Vec<Option<usize>>,
+    selected_count: usize,
+    total_score: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2GlobalExactLimits {
+    max_states: usize,
+    max_expansions: usize,
+}
+
+impl V2GlobalExactLimits {
+    const PRODUCTION: Self = Self {
+        max_states: ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_STATES,
+        max_expansions: ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_EXPANSIONS,
+    };
+}
+
+struct V2GlobalExactSearch<'a> {
+    plan: &'a PlannedAudioAlignmentBatch,
+    coarse: &'a [&'a V2PairCoarseCandidates],
+    eligible_indices: &'a [Vec<usize>],
+    processing_order: &'a [usize],
+    remaining_score_upper_bound: Vec<f64>,
+    best_states: Vec<V2GlobalAssignmentState>,
+    state_count: usize,
+    expansion_count: usize,
+    limits: V2GlobalExactLimits,
+    cancel_flag: Option<&'a AtomicBool>,
+}
+
+impl V2GlobalExactSearch<'_> {
+    fn search(&mut self, depth: usize, state: &mut V2GlobalAssignmentState) -> Result<(), String> {
+        check_cancelled(self.cancel_flag)?;
+        self.state_count = self.state_count.checked_add(1).ok_or_else(|| {
+            "blocked:resource-limit：批次级 Top-K exact 状态计数溢出。".to_string()
+        })?;
+        if self.state_count > self.limits.max_states {
+            return Err(format!(
+                "blocked:resource-limit：批次级 Top-K exact branch-and-bound 预计需要超过 {} 个状态；未截断搜索冒充全局最优。",
+                self.limits.max_states
+            ));
+        }
+        if depth == self.processing_order.len() {
+            self.record_solution(state);
+            return Ok(());
+        }
+        if self.best_states.len() >= 2
+            && state.total_score + self.remaining_score_upper_bound[depth]
+                < self.best_states[1].total_score
+        {
+            return Ok(());
+        }
+
+        let pair_index = self.processing_order[depth];
+        let expansion_width = self.eligible_indices[pair_index]
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| "blocked:resource-limit：批次级 Top-K exact 分支数溢出。".to_string())?;
+        self.expansion_count = self
+            .expansion_count
+            .checked_add(expansion_width)
+            .ok_or_else(|| {
+                "blocked:resource-limit：批次级 Top-K exact 展开计数溢出。".to_string()
+            })?;
+        if self.expansion_count > self.limits.max_expansions {
+            return Err(format!(
+                "blocked:resource-limit：批次级 Top-K exact branch-and-bound 预计需要超过 {} 次展开；未截断搜索冒充全局最优。",
+                self.limits.max_expansions
+            ));
+        }
+
+        // Candidate-first traversal establishes strong incumbents early, improving the exact
+        // upper-bound pruning rate. Final ranking remains deterministic and independent of this
+        // traversal order.
+        for candidate_position in 0..self.eligible_indices[pair_index].len() {
+            let candidate_index = self.eligible_indices[pair_index][candidate_position];
+            if v2_global_candidate_conflicts_with_state(
+                self.plan,
+                self.coarse,
+                state,
+                pair_index,
+                candidate_index,
+            ) {
+                continue;
+            }
+            let candidate_weight =
+                v2_global_candidate_weight(&self.coarse[pair_index].candidates[candidate_index]);
+            state.choices[pair_index] = Some(candidate_index);
+            state.selected_count = state.selected_count.saturating_add(1);
+            state.total_score += candidate_weight;
+            self.search(depth + 1, state)?;
+            state.total_score -= candidate_weight;
+            state.selected_count = state.selected_count.saturating_sub(1);
+            state.choices[pair_index] = None;
+        }
+        self.search(depth + 1, state)
+    }
+
+    fn record_solution(&mut self, state: &V2GlobalAssignmentState) {
+        self.best_states.push(state.clone());
+        self.best_states
+            .sort_by(compare_v2_global_assignment_states);
+        self.best_states
+            .dedup_by(|left, right| left.choices == right.choices);
+        self.best_states.truncate(2);
+    }
+}
+
+fn v2_global_runner_up<'a>(
+    states: &'a [V2GlobalAssignmentState],
+    best_choices: &[Option<usize>],
+) -> Option<&'a V2GlobalAssignmentState> {
+    states
+        .iter()
+        .skip(1)
+        .find(|state| state.choices != best_choices)
+}
+
+fn block_v2_global_shortlist_for_resource_limit(
+    coarse: &[&V2PairCoarseCandidates],
+    reason: &str,
+) -> Vec<V2GlobalShortlistDecision> {
+    coarse
+        .iter()
+        .map(|pair| {
+            let mut diagnostics = pair.diagnostics.clone();
+            diagnostics.push(reason.to_string());
+            V2GlobalShortlistDecision::Blocked {
+                candidate: pair.candidates.first().cloned(),
+                alternatives: pair.alternatives.clone(),
+                margin: 0.0,
+                reason: reason.to_string(),
+                diagnostics,
+            }
+        })
+        .collect()
+}
+
+fn select_v2_global_shortlist(
+    plan: &PlannedAudioAlignmentBatch,
+    coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
+    batch_retained_artifact_bytes: usize,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<V2GlobalShortlistDecision>, String> {
+    select_v2_global_shortlist_with_limits(
+        plan,
+        coarse_by_pair,
+        batch_retained_artifact_bytes,
+        cancel_flag,
+        V2GlobalExactLimits::PRODUCTION,
+    )
+}
+
+fn select_v2_global_shortlist_with_limits(
+    plan: &PlannedAudioAlignmentBatch,
+    coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
+    batch_retained_artifact_bytes: usize,
+    cancel_flag: Option<&AtomicBool>,
+    limits: V2GlobalExactLimits,
+) -> Result<Vec<V2GlobalShortlistDecision>, String> {
+    if coarse_by_pair.len() != plan.pairs.len() {
+        return Err("批次级 Top-K coarse 结果数量与 pair 计划不一致。".to_string());
+    }
+    check_cancelled(cancel_flag)?;
+    let coarse_incomplete = coarse_by_pair.iter().any(Result::is_err);
+    if coarse_incomplete {
+        return Ok(coarse_by_pair
+            .iter()
+            .map(|coarse| match coarse {
+                Err(error) => V2GlobalShortlistDecision::Failed(error.clone()),
+                Ok(coarse) => V2GlobalShortlistDecision::Blocked {
+                    candidate: coarse.candidates.first().cloned(),
+                    alternatives: coarse.alternatives.clone(),
+                    margin: 0.0,
+                    reason: "批次至少一个可执行 pair 未完成 coarse scoring；项目级全局最优不成立，所有已评分候选均未进入 fine。"
+                        .to_string(),
+                    diagnostics: coarse.diagnostics.clone(),
+                },
+            })
+            .collect());
+    }
+
+    let coarse = coarse_by_pair
+        .iter()
+        .map(|item| item.as_ref().expect("coarse completeness checked above"))
+        .collect::<Vec<_>>();
+    let affine_config = v2_affine_match_config();
+    let eligible_indices = coarse
+        .iter()
+        .map(|pair| {
+            pair.candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    candidate.temporal_coverage >= ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE
+                        && candidate.hypothesis.inlier_count >= affine_config.min_inliers
+                        && v2_global_candidate_weight(candidate) > 0.0
+                        && ensure_v2_active_artifact_budget(
+                            batch_retained_artifact_bytes,
+                            candidate.fine_working_set_bytes,
+                        )
+                        .is_ok()
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let total_candidate_count = eligible_indices
+        .iter()
+        .try_fold(0_usize, |total, candidates| {
+            total.checked_add(candidates.len())
+        })
+        .ok_or_else(|| "blocked:resource-limit：批次级 Top-K candidate 计数溢出。".to_string())?;
+    if total_candidate_count > ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES {
+        let reason = format!(
+            "blocked:resource-limit：批次级 Top-K 有 {total_candidate_count} 个可执行 candidate，超过 {} 个确定性硬上限；未截断候选冒充全局最优。",
+            ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES
+        );
+        return Ok(block_v2_global_shortlist_for_resource_limit(
+            &coarse, &reason,
+        ));
+    }
+
+    // Process the most constrained pair first. This improves exact branch-and-bound pruning
+    // without using file names, request order or inferred episode numbers as a prior. Pair index
+    // is only the final deterministic tie-break when the constraint graph is otherwise identical.
+    let mut processing_order = (0..plan.pairs.len()).collect::<Vec<_>>();
+    processing_order.sort_by(|left, right| {
+        eligible_indices[*left]
+            .len()
+            .cmp(&eligible_indices[*right].len())
+            .then_with(|| {
+                plan.pairs[*left]
+                    .source_media_index
+                    .cmp(&plan.pairs[*right].source_media_index)
+            })
+            .then_with(|| {
+                plan.pairs[*left]
+                    .target_media_index
+                    .cmp(&plan.pairs[*right].target_media_index)
+            })
+            .then_with(|| left.cmp(right))
+    });
+    let mut remaining_score_upper_bound = vec![0.0_f64; processing_order.len() + 1];
+    for depth in (0..processing_order.len()).rev() {
+        let pair_index = processing_order[depth];
+        let pair_upper_bound = eligible_indices[pair_index]
+            .iter()
+            .map(|candidate_index| {
+                v2_global_candidate_weight(&coarse[pair_index].candidates[*candidate_index])
+            })
+            .fold(0.0_f64, f64::max);
+        remaining_score_upper_bound[depth] =
+            remaining_score_upper_bound[depth + 1] + pair_upper_bound;
+    }
+    let mut initial_state = V2GlobalAssignmentState {
+        choices: vec![None; plan.pairs.len()],
+        selected_count: 0,
+        total_score: 0.0,
+    };
+    let mut exact = V2GlobalExactSearch {
+        plan,
+        coarse: &coarse,
+        eligible_indices: &eligible_indices,
+        processing_order: &processing_order,
+        remaining_score_upper_bound,
+        best_states: Vec::new(),
+        state_count: 0,
+        expansion_count: 0,
+        limits,
+        cancel_flag,
+    };
+    if let Err(error) = exact.search(0, &mut initial_state) {
+        if error.starts_with("blocked:resource-limit") {
+            return Ok(block_v2_global_shortlist_for_resource_limit(
+                &coarse, &error,
+            ));
+        }
+        return Err(error);
+    }
+    let Some(best) = exact.best_states.first() else {
+        return Err("批次级 Top-K exact branch-and-bound 没有产生任何完整状态。".to_string());
+    };
+    let runner_up = v2_global_runner_up(&exact.best_states, &best.choices);
+    let global_margin = runner_up
+        .map(|runner| {
+            ((best.total_score - runner.total_score) / best.total_score.max(0.001)).clamp(0.0, 1.0)
+        })
+        .unwrap_or(1.0);
+    let close_competition =
+        runner_up.is_some() && global_margin < ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN;
+    let global_summary = format!(
+        "项目级 Top-K shortlist：{} 个 pair、{} 个合格 candidate，exact branch-and-bound 访问 {} 个状态、展开 {} 次；best 选择 {}/{} 个 pair，总分 {:.4}，runner-up margin {:.3}；未静默截断，未使用文件名、数组顺序或剧集号先验。",
+        plan.pairs.len(),
+        total_candidate_count,
+        exact.state_count,
+        exact.expansion_count,
+        best.selected_count,
+        plan.pairs.len(),
+        best.total_score,
+        global_margin
+    );
+    Ok(coarse
+        .iter()
+        .enumerate()
+        .map(|(pair_index, coarse)| {
+            let mut diagnostics = coarse.diagnostics.clone();
+            diagnostics.push(global_summary.clone());
+            match best.choices[pair_index] {
+                Some(candidate_index) if !close_competition => {
+                    V2GlobalShortlistDecision::Selected(PreparedV2SelectedCandidate {
+                        candidate: coarse.candidates[candidate_index].clone(),
+                        alternatives: coarse.alternatives.clone(),
+                        global_margin,
+                        global_diagnostic: diagnostics.join("；"),
+                    })
+                }
+                Some(candidate_index) => V2GlobalShortlistDecision::Blocked {
+                    candidate: Some(coarse.candidates[candidate_index].clone()),
+                    alternatives: coarse.alternatives.clone(),
+                    margin: global_margin,
+                    reason: format!(
+                        "项目级 Top-K best/runner-up margin {global_margin:.3} 低于 {:.3}；竞争接近，未执行 fine。",
+                        ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN
+                    ),
+                    diagnostics,
+                },
+                None => V2GlobalShortlistDecision::Blocked {
+                    candidate: coarse.candidates.first().cloned(),
+                    alternatives: coarse.alternatives.clone(),
+                    margin: global_margin,
+                    reason: "该 pair 的 Top-K 候选与同一物理媒体上已选区间冲突，未进入项目级 shortlist，也未执行 fine。"
+                        .to_string(),
+                    diagnostics,
+                },
+            }
+        })
+        .collect())
+}
+
+fn compare_v2_global_assignment_states(
+    left: &V2GlobalAssignmentState,
+    right: &V2GlobalAssignmentState,
+) -> std::cmp::Ordering {
+    right
+        .total_score
+        .total_cmp(&left.total_score)
+        .then_with(|| left.choices.cmp(&right.choices))
+}
+
+fn v2_global_candidate_weight(candidate: &V2TrackPairCandidate) -> f64 {
+    let uniqueness_factor =
+        0.35 + candidate.hypothesis.unique_source_coverage.clamp(0.0, 1.0) * 0.65;
+    let alternative_bonus = candidate.intrinsic_margin.clamp(0.0, 1.0) * 0.20;
+    let repeated_penalty = if candidate.repeated_content_only {
+        ALIGNMENT_V2_GLOBAL_REPEATED_CONTENT_PENALTY
+    } else {
+        0.0
+    };
+    candidate.score.clamp(0.0, 1.0) * uniqueness_factor + alternative_bonus - repeated_penalty
+}
+
+fn v2_global_candidate_conflicts_with_state(
+    plan: &PlannedAudioAlignmentBatch,
+    coarse: &[&V2PairCoarseCandidates],
+    state: &V2GlobalAssignmentState,
+    pair_index: usize,
+    candidate_index: usize,
+) -> bool {
+    state
+        .choices
+        .iter()
+        .enumerate()
+        .filter_map(|(selected_pair_index, selected_candidate_index)| {
+            selected_candidate_index.map(|candidate_index| (selected_pair_index, candidate_index))
+        })
+        .any(|(selected_pair_index, selected_candidate_index)| {
+            v2_global_candidates_conflict(
+                &plan.pairs[pair_index],
+                &coarse[pair_index].candidates[candidate_index],
+                &plan.pairs[selected_pair_index],
+                &coarse[selected_pair_index].candidates[selected_candidate_index],
+            )
+        })
+}
+
+fn v2_global_candidates_conflict(
+    left_pair: &PlannedAudioAlignmentBatchPair,
+    left: &V2TrackPairCandidate,
+    right_pair: &PlannedAudioAlignmentBatchPair,
+    right: &V2TrackPairCandidate,
+) -> bool {
+    (left_pair.source_media_index == right_pair.source_media_index
+        && v2_interval_overlap_ms(
+            (
+                left.global_source_interval.start_ms,
+                left.global_source_interval.end_ms,
+            ),
+            (
+                right.global_source_interval.start_ms,
+                right.global_source_interval.end_ms,
+            ),
+        ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+        || (left_pair.target_media_index == right_pair.target_media_index
+            && v2_interval_overlap_ms(
+                (
+                    left.global_target_interval.start_ms,
+                    left.global_target_interval.end_ms,
+                ),
+                (
+                    right.global_target_interval.start_ms,
+                    right.global_target_interval.end_ms,
+                ),
+            ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
 }
 
 fn probe_alignment_audio_candidates(
@@ -5531,11 +6370,54 @@ fn v2_pcm_bytes_for_duration_ms(duration_ms: u64) -> Option<usize> {
     usize::try_from(bytes).ok()
 }
 
+fn v2_presentation_bounds_for_samples(
+    presentation_offset_ms: i64,
+    sample_count: u64,
+) -> Result<PresentationRangeMs, String> {
+    if sample_count == 0 {
+        return Err("细对齐 PCM 没有可表示的 presentation 区间。".to_string());
+    }
+    let duration_ms = (u128::from(sample_count)
+        .checked_mul(1_000)
+        .ok_or_else(|| "blocked:resource-limit：PCM presentation 时长溢出。".to_string())?
+        .checked_add(u128::from(ALIGNMENT_V2_SAMPLE_RATE - 1))
+        .ok_or_else(|| "blocked:resource-limit：PCM presentation 时长溢出。".to_string())?)
+        / u128::from(ALIGNMENT_V2_SAMPLE_RATE);
+    let duration_ms = i64::try_from(duration_ms)
+        .map_err(|_| "blocked:resource-limit：PCM presentation 时长无法表示。".to_string())?;
+    let end_ms = presentation_offset_ms
+        .checked_add(duration_ms)
+        .ok_or_else(|| "blocked:resource-limit：PCM presentation 终点溢出。".to_string())?;
+    if end_ms <= presentation_offset_ms {
+        return Err("细对齐 PCM presentation 区间为空。".to_string());
+    }
+    Ok(PresentationRangeMs {
+        start_ms: presentation_offset_ms,
+        end_ms,
+    })
+}
+
+fn v2_presentation_range_duration_ms(range: PresentationRangeMs) -> Result<u64, String> {
+    let duration = range
+        .end_ms
+        .checked_sub(range.start_ms)
+        .ok_or_else(|| "blocked:resource-limit：精解码窗口时长溢出。".to_string())?;
+    u64::try_from(duration)
+        .map_err(|_| "blocked:resource-limit：精解码窗口必须是正毫秒区间。".to_string())
+        .and_then(|duration| {
+            if duration == 0 {
+                Err("blocked:resource-limit：精解码窗口不能为空。".to_string())
+            } else {
+                Ok(duration)
+            }
+        })
+}
+
 fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usize, String> {
     if should_stream_v2_coarse_only(input) {
-        // Long candidates retain only the duration-independent coarse index. The selected long
-        // track still stops at the existing fine-stage 60-minute gate until windowed fine decode
-        // is implemented.
+        // All long candidates retain only the duration-independent coarse index. After Top-K
+        // selection, the one selected window is charged separately by
+        // `v2_fine_window_artifact_upper_bound` before any bounded PCM decode begins.
         return ALIGNMENT_V2_COARSE_MAX_LANDMARKS
             .checked_mul(std::mem::size_of::<SpectralLandmark>())
             .ok_or_else(|| {
@@ -5569,6 +6451,37 @@ fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usiz
         .ok_or_else(|| "blocked:resource-limit：候选音轨制品驻留上界溢出。".to_string())
 }
 
+fn v2_fine_window_artifact_upper_bound(range: PresentationRangeMs) -> Result<usize, String> {
+    let duration_ms = v2_presentation_range_duration_ms(range)?;
+    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
+        return Err(format!(
+            "blocked:resource-limit：精解码窗口超过 {} 分钟硬上限。",
+            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
+        ));
+    }
+    let pcm_bytes = v2_pcm_bytes_for_duration_ms(duration_ms)
+        .ok_or_else(|| "blocked:resource-limit：精解码窗口 PCM 上界无法表示。".to_string())?;
+    let frame_count =
+        usize::try_from(u128::from(duration_ms).div_ceil(u128::from(ALIGNMENT_V2_FINE_HOP_MS)))
+            .map_err(|_| "blocked:resource-limit：精解码窗口细特征帧数无法表示。".to_string())?;
+    let fine_bytes_per_frame =
+        std::mem::size_of::<FineFeatureFrame>().saturating_add(14 * std::mem::size_of::<f32>());
+    // `run_supervised_ffmpeg_output` owns raw stdout while `parse_v2_pcm_output` constructs the
+    // i16 Vec. Both buffers coexist before stdout is dropped, so charging only one PCM copy would
+    // understate a 60-minute window by about 110 MiB. Summing this conservative peak for both
+    // selected axes also covers the retained source artifact while the target window decodes.
+    let peak_pcm_bytes = pcm_bytes
+        .checked_mul(2)
+        .ok_or_else(|| "blocked:resource-limit：精解码窗口双 PCM 驻留上界溢出。".to_string())?;
+    peak_pcm_bytes
+        .checked_add(
+            frame_count
+                .checked_mul(fine_bytes_per_frame)
+                .ok_or_else(|| "blocked:resource-limit：精解码窗口细特征上界溢出。".to_string())?,
+        )
+        .ok_or_else(|| "blocked:resource-limit：精解码窗口活动内存上界溢出。".to_string())
+}
+
 fn should_stream_v2_coarse_only(input: &AlignmentAudioInput) -> bool {
     input
         .media_duration_ms
@@ -5587,12 +6500,35 @@ fn ensure_v2_candidate_set_active_budget(
     source_inputs: &[AlignmentAudioInput],
     target_inputs: &[AlignmentAudioInput],
 ) -> Result<(), String> {
-    let mut retained = 0_usize;
+    reserve_v2_candidate_set_active_budget(0, source_inputs, target_inputs).map(|_| ())
+}
+
+fn reserve_v2_candidate_set_active_budget(
+    retained_artifact_bytes: usize,
+    source_inputs: &[AlignmentAudioInput],
+    target_inputs: &[AlignmentAudioInput],
+) -> Result<usize, String> {
+    let mut retained = retained_artifact_bytes;
     for input in source_inputs.iter().chain(target_inputs) {
         retained =
             ensure_v2_active_artifact_budget(retained, v2_candidate_artifact_upper_bound(input)?)?;
     }
-    Ok(())
+    Ok(retained)
+}
+
+fn execute_after_v2_candidate_reservation<T, F>(
+    retained_artifact_bytes: usize,
+    source_inputs: &[AlignmentAudioInput],
+    target_inputs: &[AlignmentAudioInput],
+    execute: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    // Reservation is deliberately completed before `execute` can spawn FFmpeg. Actual retained
+    // bytes are settled by the caller after extraction, so conservative headroom is not kept.
+    reserve_v2_candidate_set_active_budget(retained_artifact_bytes, source_inputs, target_inputs)?;
+    execute()
 }
 
 fn ensure_v2_active_artifact_budget(
@@ -5617,6 +6553,7 @@ fn cached_v2_landmark_retained_bytes(artifact: &CachedV2Landmarks) -> usize {
         landmarks: artifact.landmarks.clone(),
         fine_features: artifact.fine_features.clone(),
         spectral_backend: artifact.spectral_backend.clone(),
+        presentation_bounds: artifact.presentation_bounds,
     })
 }
 
@@ -5735,6 +6672,7 @@ fn get_v2_landmarks(
             cache_key,
             cache_hit: true,
             spectral_backend: artifact.spectral_backend,
+            presentation_bounds: artifact.presentation_bounds,
         });
     }
     benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
@@ -5743,12 +6681,17 @@ fn get_v2_landmarks(
         .as_ref()
         .map(|item| item.normalized_pcm_origin_ms)
         .unwrap_or(0);
-    let (pcm, landmarks, fine_features, spectral_backend) = if streaming_coarse {
+    let (pcm, landmarks, fine_features, spectral_backend, presentation_bounds) = if streaming_coarse
+    {
         let coarse =
             decode_v2_coarse_landmarks_streaming(media_path, label, options, input, cancel_flag)?;
+        let presentation_bounds = v2_presentation_bounds_for_samples(
+            presentation_offset_ms,
+            coarse.decoded_sample_count,
+        )?;
         (
             None,
-            Arc::new(coarse.landmarks),
+            Arc::new(coarse.index.landmarks),
             None,
             SpectralBackendExecution {
                 backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
@@ -5759,6 +6702,7 @@ fn get_v2_landmarks(
                         .to_string(),
                 ),
             },
+            presentation_bounds,
         )
     } else {
         let pcm = Arc::new(decode_v2_pcm(
@@ -5787,11 +6731,17 @@ fn get_v2_landmarks(
             cancel_flag,
             backend_request.expect("short-media extraction must resolve a spectral backend"),
         )?;
+        let presentation_bounds = v2_presentation_bounds_for_samples(
+            presentation_offset_ms,
+            u64::try_from(pcm.len())
+                .map_err(|_| "blocked:resource-limit：短媒体 PCM 样本数无法表示。".to_string())?,
+        )?;
         (
             Some(pcm),
             Arc::new(extracted.bundle.landmarks),
             Some(Arc::new(extracted.bundle.fine_features)),
             extracted.spectral_backend,
+            presentation_bounds,
         )
     };
     cache_key = create_v2_audio_cache_key_for_backend(
@@ -5808,6 +6758,7 @@ fn get_v2_landmarks(
         landmarks: landmarks.clone(),
         fine_features: fine_features.clone(),
         spectral_backend: spectral_backend.clone(),
+        presentation_bounds,
     };
     let mut cache = v2_landmark_cache()
         .lock()
@@ -5829,6 +6780,7 @@ fn get_v2_landmarks(
         cache_key,
         cache_hit: false,
         spectral_backend,
+        presentation_bounds,
     })
 }
 
@@ -5908,7 +6860,11 @@ fn decode_v2_audio(
         let pcm = landmark_artifact.pcm.clone().ok_or_else(|| {
             "blocked:artifact-missing：细特征制品缺少对应的完整 PCM。".to_string()
         })?;
-        return Ok(DecodedV2Audio { pcm, fine_features });
+        return Ok(DecodedV2Audio {
+            pcm,
+            fine_features,
+            presentation_offset_ms: landmark_artifact.presentation_bounds.start_ms,
+        });
     }
 
     let pcm = match landmark_artifact.pcm.clone() {
@@ -5925,11 +6881,7 @@ fn decode_v2_audio(
         &pcm,
         &FineFeatureConfig {
             sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-            presentation_offset_ms: input
-                .decode_timeline
-                .as_ref()
-                .map(|item| item.normalized_pcm_origin_ms)
-                .unwrap_or(0),
+            presentation_offset_ms: landmark_artifact.presentation_bounds.start_ms,
             window_ms: 50,
             hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
         },
@@ -5945,6 +6897,7 @@ fn decode_v2_audio(
         landmarks: landmark_artifact.landmarks.clone(),
         fine_features: Some(fine_features.clone()),
         spectral_backend: landmark_artifact.spectral_backend.clone(),
+        presentation_bounds: landmark_artifact.presentation_bounds,
     };
     let insertion = v2_landmark_cache()
         .lock()
@@ -5962,7 +6915,334 @@ fn decode_v2_audio(
     if insertion.stored && insertion.new_entry {
         benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Write);
     }
-    Ok(DecodedV2Audio { pcm, fine_features })
+    Ok(DecodedV2Audio {
+        pcm,
+        fine_features,
+        presentation_offset_ms: landmark_artifact.presentation_bounds.start_ms,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2SelectedFineDecodePlan {
+    windows: AffineFineDecodeWindows,
+    adaptive_guard_ms: i64,
+}
+
+fn plan_v2_selected_fine_decode(
+    pair: &V2TrackPairCandidate,
+    source_artifact: &CachedV2Landmarks,
+    target_artifact: &CachedV2Landmarks,
+) -> Result<Option<V2SelectedFineDecodePlan>, String> {
+    let source_requires_window = should_stream_v2_coarse_only(&pair.source_input);
+    let target_requires_window = should_stream_v2_coarse_only(&pair.target_input);
+    if !source_requires_window && !target_requires_window {
+        return Ok(None);
+    }
+
+    let target_query = v2_selected_candidate_target_query(
+        pair,
+        source_artifact.presentation_bounds,
+        target_artifact.presentation_bounds,
+    )?;
+
+    // Spend the remaining one-hour decode budget on context rather than fixing every candidate
+    // to exactly ±31 s. The helper also unions the complete coarse source support, so internal
+    // source-only edits wider than the guard cannot be clipped. If even the mandatory DP/boundary
+    // context does not fit, fail closed instead of silently truncating the map.
+    let mut guard_ms = 5 * 60_000_i64;
+    let mut selected = None;
+    while guard_ms >= ALIGNMENT_V2_FINE_WINDOW_GUARD_MS {
+        let windows = derive_affine_fine_decode_windows(
+            &pair.hypothesis,
+            &AffineFineWindowRequest {
+                source_bounds: source_artifact.presentation_bounds,
+                target_bounds: target_artifact.presentation_bounds,
+                target_query,
+                source_guard_ms: guard_ms,
+                target_guard_ms: guard_ms,
+            },
+        )?;
+        let source_window_duration = v2_presentation_range_duration_ms(windows.source)?;
+        let target_window_duration = v2_presentation_range_duration_ms(windows.target)?;
+        if source_window_duration <= ALIGNMENT_V2_MAX_DURATION_MS
+            && target_window_duration <= ALIGNMENT_V2_MAX_DURATION_MS
+        {
+            selected = Some(V2SelectedFineDecodePlan {
+                windows,
+                adaptive_guard_ms: guard_ms,
+            });
+            break;
+        }
+        guard_ms = guard_ms.saturating_sub(1_000);
+    }
+    selected.ok_or_else(|| {
+        "blocked:resource-limit：完整候选逆投影、全部 coarse inlier support 与 edit-aware DP 必需上下文无法同时装入 60 分钟精解码窗口；未截断成功。"
+            .to_string()
+    })
+    .map(Some)
+}
+
+fn derive_v2_selected_candidate_content_intervals(
+    pair: &V2TrackPairCandidate,
+    source_artifact: &CachedV2Landmarks,
+    target_artifact: &CachedV2Landmarks,
+) -> Result<AffineFineDecodeWindows, String> {
+    let target_query = v2_selected_candidate_target_query(
+        pair,
+        source_artifact.presentation_bounds,
+        target_artifact.presentation_bounds,
+    )?;
+    derive_affine_fine_decode_windows(
+        &pair.hypothesis,
+        &AffineFineWindowRequest {
+            source_bounds: source_artifact.presentation_bounds,
+            target_bounds: target_artifact.presentation_bounds,
+            target_query,
+            source_guard_ms: 0,
+            target_guard_ms: 0,
+        },
+    )
+}
+
+fn v2_selected_candidate_target_query(
+    pair: &V2TrackPairCandidate,
+    source_bounds: PresentationRangeMs,
+    target_bounds: PresentationRangeMs,
+) -> Result<PresentationRangeMs, String> {
+    let source_duration_ms = v2_presentation_range_duration_ms(source_bounds)?;
+    let target_duration_ms = v2_presentation_range_duration_ms(target_bounds)?;
+    if target_duration_ms <= ALIGNMENT_V2_MAX_DURATION_MS {
+        // Product direction is source=Bilibili reference -> target=original. When the original
+        // is episode-sized, consume its complete presentation interval.
+        Ok(target_bounds)
+    } else if source_duration_ms <= ALIGNMENT_V2_MAX_DURATION_MS {
+        // Symmetric long-target case: project the complete short source interval.
+        project_v2_source_range_to_target(source_bounds, &pair.hypothesis)
+    } else {
+        Err(
+            "blocked:window-evidence-insufficient：粗定位两侧都超过 60 分钟，且没有一条完整 episode-sized 轴可定义精对齐查询；系统不会把局部 inlier support 冒充完整时间图。"
+                .to_string(),
+        )
+    }
+}
+
+fn project_v2_source_range_to_target(
+    source: PresentationRangeMs,
+    hypothesis: &AffineHypothesis,
+) -> Result<PresentationRangeMs, String> {
+    if !hypothesis.scale.is_finite() || hypothesis.scale <= 0.0 {
+        return Err("粗定位 affine scale 必须是有限正数。".to_string());
+    }
+    let projected_start = hypothesis.scale * source.start_ms as f64 + hypothesis.offset_ms as f64;
+    let projected_end = hypothesis.scale * source.end_ms as f64 + hypothesis.offset_ms as f64;
+    if !projected_start.is_finite() || !projected_end.is_finite() {
+        return Err("粗定位 affine 正向投影产生了非有限时间。".to_string());
+    }
+    let start_ms = v2_checked_f64_milliseconds(projected_start.min(projected_end), f64::floor)?;
+    let end_ms = v2_checked_f64_milliseconds(projected_start.max(projected_end), f64::ceil)?;
+    if end_ms <= start_ms {
+        return Err("粗定位 affine 正向投影没有形成非空目标区间。".to_string());
+    }
+    Ok(PresentationRangeMs { start_ms, end_ms })
+}
+
+fn v2_checked_f64_milliseconds(value: f64, round: fn(f64) -> f64) -> Result<i64, String> {
+    let rounded = round(value);
+    if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+        return Err("粗定位 affine 投影毫秒值超出 i64 范围。".to_string());
+    }
+    Ok(rounded as i64)
+}
+
+fn decode_v2_audio_for_selected_window(
+    media_path: &str,
+    label: &str,
+    options: &AudioAlignmentOptions,
+    input: &AlignmentAudioInput,
+    landmark_artifact: &CachedV2Landmarks,
+    requested_window: Option<PresentationRangeMs>,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<DecodedV2Audio, String> {
+    if !should_stream_v2_coarse_only(input) {
+        return decode_v2_audio(
+            media_path,
+            label,
+            options,
+            input,
+            landmark_artifact,
+            cancel_flag,
+        );
+    }
+    let window = requested_window.ok_or_else(|| {
+        format!(
+            "blocked:window-evidence-insufficient：{label}只有流式粗定位制品，但没有经过 affine 证明的精解码窗口。"
+        )
+    })?;
+    if window.start_ms < landmark_artifact.presentation_bounds.start_ms
+        || window.end_ms > landmark_artifact.presentation_bounds.end_ms
+    {
+        return Err(format!(
+            "blocked:window-evidence-insufficient：{label}精解码窗口超出已完整消费的流式 presentation 边界。"
+        ));
+    }
+    let expected_cache_key = create_v2_audio_cache_key_for_backend(
+        media_path,
+        options,
+        input,
+        v2_landmark_artifact_kind(input),
+        &landmark_artifact.spectral_backend.backend_id,
+    )?;
+    if landmark_artifact.cache_key != expected_cache_key {
+        return Err(format!(
+            "blocked:media-identity-changed：{label}粗定位制品与当前内容身份、音轨、PTS 或算法参数不一致。"
+        ));
+    }
+    let pcm = Arc::new(decode_v2_pcm_window(
+        media_path,
+        label,
+        options,
+        input,
+        landmark_artifact.presentation_bounds,
+        window,
+        cancel_flag,
+    )?);
+    let fine_features = Arc::new(extract_fine_features_with_cancel(
+        &pcm,
+        &FineFeatureConfig {
+            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+            // FFmpeg rebases the input-side seek to zero. Reattach every fine frame to the
+            // absolute presentation axis here; downstream DP and TimeMap never see seek time.
+            presentation_offset_ms: window.start_ms,
+            window_ms: 50,
+            hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
+        },
+        cancel_flag,
+    )?);
+    if fine_features.is_empty() {
+        return Err(format!(
+            "{label}精解码窗口没有可用的 50 ms 细粒度音频特征。"
+        ));
+    }
+    Ok(DecodedV2Audio {
+        pcm,
+        fine_features,
+        presentation_offset_ms: window.start_ms,
+    })
+}
+
+fn decode_v2_pcm_window(
+    media_path: &str,
+    label: &str,
+    options: &AudioAlignmentOptions,
+    input: &AlignmentAudioInput,
+    media_bounds: PresentationRangeMs,
+    window: PresentationRangeMs,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<i16>, String> {
+    check_cancelled(cancel_flag)?;
+    let duration_ms = v2_presentation_range_duration_ms(window)?;
+    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
+        return Err(format!(
+            "blocked:resource-limit：{label}精解码窗口为 {duration_ms} ms，超过 {} 分钟硬上限。",
+            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
+        ));
+    }
+    let seek_ms = window
+        .start_ms
+        .checked_sub(media_bounds.start_ms)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            format!("blocked:window-evidence-insufficient：{label}精解码 seek 早于媒体 PCM 起点。")
+        })?;
+    let output_budget_ms = duration_ms
+        .checked_add(ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS)
+        .ok_or_else(|| "blocked:resource-limit：精解码 stdout 时长预算溢出。".to_string())?;
+    let stdout_hard_limit = v2_pcm_bytes_for_duration_ms(output_budget_ms)
+        .ok_or_else(|| "blocked:resource-limit：精解码 stdout 字节预算无法表示。".to_string())?;
+    verify_media_content_identity_before_tool_input(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 affine 窗口精解码",
+    )?;
+    let output_result = run_supervised_ffmpeg_output(
+        &options.ffmpeg_path,
+        create_v2_fine_window_audio_decode_args(media_path, input, seek_ms, duration_ms),
+        "FFmpeg V2 affine 窗口精解码",
+        stdout_hard_limit,
+        cancel_flag,
+    );
+    // As in streaming coarse, identity/cleanup failure invalidates every decoded byte and takes
+    // precedence over an ordinary codec failure.
+    verify_media_content_identity_after_tool_output(
+        media_path,
+        input.content_identity.as_ref(),
+        cancel_flag,
+        "V2 affine 窗口精解码",
+    )?;
+    let output = output_result?;
+    if !output.status.success() {
+        return Err(format_media_tool_nonzero_exit(
+            &format!("FFmpeg 提取 {label} V2 affine 窗口 PCM"),
+            output.status.code(),
+            &output.stderr,
+        ));
+    }
+    let mut pcm = parse_v2_pcm_output(&output.stdout, label, cancel_flag)?;
+    let actual_duration_ms =
+        v2_presentation_range_duration_ms(v2_presentation_bounds_for_samples(
+            window.start_ms,
+            u64::try_from(pcm.len())
+                .map_err(|_| "blocked:resource-limit：精解码 PCM 样本数无法表示。".to_string())?,
+        )?)?;
+    if actual_duration_ms.saturating_add(ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS) < duration_ms
+    {
+        return Err(format!(
+            "blocked:decode-window-short：{label}请求 {duration_ms} ms 精解码窗口，但受监督 FFmpeg 只返回 {actual_duration_ms} ms；不会用缺失尾部生成时间图。"
+        ));
+    }
+    let maximum_samples = usize::try_from(
+        (u128::from(duration_ms) * u128::from(ALIGNMENT_V2_SAMPLE_RATE)).div_ceil(1_000),
+    )
+    .map_err(|_| "blocked:resource-limit：精解码样本上限无法表示。".to_string())?;
+    pcm.truncate(maximum_samples);
+    check_cancelled(cancel_flag)?;
+    Ok(pcm)
+}
+
+fn create_v2_fine_window_audio_decode_args(
+    media_path: &str,
+    input: &AlignmentAudioInput,
+    seek_ms: u64,
+    duration_ms: u64,
+) -> Vec<String> {
+    vec![
+        "-nostdin".to_string(),
+        "-v".to_string(),
+        "error".to_string(),
+        // Input-side accurate seeking prevents a 20-hour compilation from being decoded from
+        // byte zero. FFmpeg rebases the selected interval; absolute presentation time is restored
+        // on FineFeatureConfig and BoundaryRefinementConfig, not inferred from stdout.
+        "-ss".to_string(),
+        format!("{:.3}", seek_ms as f64 / 1_000.0),
+        "-accurate_seek".to_string(),
+        "-i".to_string(),
+        media_path.to_string(),
+        "-map".to_string(),
+        format!("0:{}", input.stream.stream_index),
+        "-vn".to_string(),
+        "-ac".to_string(),
+        "1".to_string(),
+        "-af".to_string(),
+        format!("aresample={ALIGNMENT_V2_SAMPLE_RATE}:async=1:first_pts=0"),
+        // Output-side -t and the independent stdout hard limit are both required. Neither can be
+        // removed without reintroducing whole-file PCM risk for unknown-duration media.
+        "-t".to_string(),
+        format!("{:.3}", duration_ms as f64 / 1_000.0),
+        "-f".to_string(),
+        "s16le".to_string(),
+        "pipe:1".to_string(),
+    ]
 }
 
 struct V2S16LeLandmarkStream {
@@ -6033,7 +7313,7 @@ impl V2S16LeLandmarkStream {
         stdout_bytes: usize,
         label: &str,
         cancel_flag: Option<&AtomicBool>,
-    ) -> Result<MediaCoarseIndexResult, String> {
+    ) -> Result<DecodedV2CoarseLandmarks, String> {
         check_cancelled(cancel_flag)?;
         if self.pending_low_byte.is_some() {
             return Err(format!(
@@ -6051,9 +7331,15 @@ impl V2S16LeLandmarkStream {
                 "blocked:decode-format：{label}流式 V2 PCM 样本数与 stdout 字节数不一致。"
             ));
         }
-        self.extractor
+        let decoded_sample_count = self.decoded_samples;
+        let index = self
+            .extractor
             .finish_with_cancel(cancel_flag)
-            .map_err(map_v2_streaming_algorithm_error)
+            .map_err(map_v2_streaming_algorithm_error)?;
+        Ok(DecodedV2CoarseLandmarks {
+            index,
+            decoded_sample_count,
+        })
     }
 }
 
@@ -6074,7 +7360,7 @@ fn decode_v2_coarse_landmarks_streaming(
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
     cancel_flag: Option<&AtomicBool>,
-) -> Result<MediaCoarseIndexResult, String> {
+) -> Result<DecodedV2CoarseLandmarks, String> {
     check_cancelled(cancel_flag)?;
     verify_media_content_identity_before_tool_input(
         media_path,
@@ -6387,6 +7673,7 @@ fn align_v2_feature_chunks(
             .ok_or_else(|| "V2 目标分块为空。".to_string())?
             .time_ms
             .saturating_add(target_hop_ms);
+        let recursive_chunk = previous_source_end_ms.is_some();
         let (source_lower_ms, source_upper_ms, chunk_inverse) =
             if let Some(previous_source_end_ms) = previous_source_end_ms {
                 // Re-anchor each chunk at the last confirmed source position. A target-only edit
@@ -6426,9 +7713,14 @@ fn align_v2_feature_chunks(
         let source_end_index =
             source_frames.partition_point(|frame| frame.time_ms <= source_upper_ms);
         if source_end_index <= source_start_index {
+            let corridor_radius_ms = if recursive_chunk {
+                ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS
+            } else {
+                ALIGNMENT_V2_DP_BAND_RADIUS_MS
+            };
             return Err(format!(
                 "粗 affine 在目标 {}–{} ms 的 ±{} ms 走廊内没有参考特征。",
-                target_start_ms, target_end_ms, ALIGNMENT_V2_DP_BAND_RADIUS_MS
+                target_start_ms, target_end_ms, corridor_radius_ms
             ));
         }
         let source_window = &source_frames[source_start_index..source_end_index];
@@ -6469,7 +7761,15 @@ fn align_v2_feature_chunks(
             &chunk_inverse,
             &EditAlignmentConfig {
                 mode: EditAlignmentMode::SemiGlobal,
-                band_radius_ms: ALIGNMENT_V2_DP_BAND_RADIUS_MS,
+                // The recursive window intentionally includes up to two minutes of bounded
+                // source lookahead. The DP band must include the same range or a decoded 45 s
+                // source-only insert would remain unreachable and the later target would be
+                // mislabeled targetOnly despite the evidence already being resident.
+                band_radius_ms: if recursive_chunk {
+                    ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS
+                } else {
+                    ALIGNMENT_V2_DP_BAND_RADIUS_MS
+                },
                 max_dp_cells: allowed_cells,
                 gap_open_cost: 320,
                 gap_extend_cost: 55,
@@ -6697,8 +7997,8 @@ fn refine_v2_span_boundaries(
     spans: &mut [AudioTimeMapSpanDto],
     source_pcm: &[i16],
     target_pcm: &[i16],
-    source_input: &AlignmentAudioInput,
-    target_input: &AlignmentAudioInput,
+    source_presentation_offset_ms: i64,
+    target_presentation_offset_ms: i64,
     cancel_flag: Option<&AtomicBool>,
 ) -> V2BoundarySummary {
     let mut summary = V2BoundarySummary::default();
@@ -6762,7 +8062,10 @@ fn refine_v2_span_boundaries(
                     target_boundary_ms,
                     source_boundary_ms,
                     context_side,
-                    &v2_boundary_refinement_config(target_input, source_input),
+                    &v2_boundary_refinement_config(
+                        target_presentation_offset_ms,
+                        source_presentation_offset_ms,
+                    ),
                     cancel_flag,
                 )
             }
@@ -6773,7 +8076,10 @@ fn refine_v2_span_boundaries(
                     source_boundary_ms,
                     target_boundary_ms,
                     context_side,
-                    &v2_boundary_refinement_config(source_input, target_input),
+                    &v2_boundary_refinement_config(
+                        source_presentation_offset_ms,
+                        target_presentation_offset_ms,
+                    ),
                     cancel_flag,
                 )
             }
@@ -6783,7 +8089,10 @@ fn refine_v2_span_boundaries(
                 target_pcm,
                 source_boundary_ms,
                 target_boundary_ms,
-                &v2_boundary_refinement_config(source_input, target_input),
+                &v2_boundary_refinement_config(
+                    source_presentation_offset_ms,
+                    target_presentation_offset_ms,
+                ),
                 cancel_flag,
             ),
         };
@@ -6921,13 +8230,13 @@ fn is_v2_edit_span(kind: AudioTimeMapSpanKind) -> bool {
 }
 
 fn v2_boundary_refinement_config(
-    fixed_input: &AlignmentAudioInput,
-    searched_input: &AlignmentAudioInput,
+    fixed_presentation_offset_ms: i64,
+    searched_presentation_offset_ms: i64,
 ) -> BoundaryRefinementConfig {
     BoundaryRefinementConfig {
         sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-        source_presentation_offset_ms: v2_normalized_pcm_origin_ms(fixed_input),
-        target_presentation_offset_ms: v2_normalized_pcm_origin_ms(searched_input),
+        source_presentation_offset_ms: fixed_presentation_offset_ms,
+        target_presentation_offset_ms: searched_presentation_offset_ms,
         search_radius_ms: 500,
         window_ms: 300,
         score_tolerance: 0.01,
@@ -6959,6 +8268,7 @@ fn create_v2_alignment_proposal(
     boundary: V2BoundarySummary,
     pair: V2TrackPairCandidate,
     top1_top2_margin: f64,
+    minimum_alternative_margin: f64,
     selected_track_reason: String,
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     mut diagnostics: Vec<String>,
@@ -7002,7 +8312,7 @@ fn create_v2_alignment_proposal(
     let blocked = catastrophic
         || ambiguous_span_count > 0
         || alignment.matched_step_count == 0
-        || top1_top2_margin < ALIGNMENT_V2_MIN_TRACK_MARGIN
+        || top1_top2_margin < minimum_alternative_margin
         || boundary.ambiguous_count > 0;
     let quality_level = if blocked { "blocked" } else { "review" };
     let mut quality_reasons = Vec::new();
@@ -7020,10 +8330,10 @@ fn create_v2_alignment_proposal(
     if alignment.matched_step_count == 0 {
         quality_reasons.push("细对齐没有 matched step。".to_string());
     }
-    if top1_top2_margin < ALIGNMENT_V2_MIN_TRACK_MARGIN {
+    if top1_top2_margin < minimum_alternative_margin {
         quality_reasons.push(format!(
             "Top1/Top2 margin {:.3} 低于 {:.3}，音轨或重复内容假设仍有歧义。",
-            top1_top2_margin, ALIGNMENT_V2_MIN_TRACK_MARGIN
+            top1_top2_margin, minimum_alternative_margin
         ));
     }
     if boundary.ambiguous_count > 0 {
@@ -8402,24 +9712,48 @@ fn plan_audio_alignment_batch(
         .map(|media| normalize_audio_alignment_batch_media(media, &mut media_ids))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let mut media = sources
+        .iter()
+        .map(|item| PlannedAudioAlignmentBatchMedia {
+            media_id: item.media_id.clone(),
+            path: item.path.clone(),
+            requested_audio_stream_index: item.audio_stream_index,
+            role_label: "B 站参考",
+        })
+        .collect::<Vec<_>>();
+    let target_media_offset = media.len();
+    media.extend(targets.iter().map(|item| PlannedAudioAlignmentBatchMedia {
+        media_id: item.media_id.clone(),
+        path: item.path.clone(),
+        requested_audio_stream_index: item.audio_stream_index,
+        role_label: "目标原片",
+    }));
+
     let mut pairs = Vec::with_capacity(pair_count);
     if let Some(pair_selection) = &request.pairs {
         let sources_by_id = sources
             .iter()
-            .map(|media| (media.media_id.as_str(), media))
+            .enumerate()
+            .map(|(index, media)| (media.media_id.as_str(), (index, media)))
             .collect::<HashMap<_, _>>();
         let targets_by_id = targets
             .iter()
-            .map(|media| (media.media_id.as_str(), media))
+            .enumerate()
+            .map(|(index, media)| {
+                (
+                    media.media_id.as_str(),
+                    (target_media_offset.saturating_add(index), media),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut selected_pairs = HashSet::new();
         for selected in pair_selection {
             let source_id = selected.source_media_id.trim();
             let target_id = selected.target_media_id.trim();
-            let Some(source) = sources_by_id.get(source_id).copied() else {
+            let Some((source_media_index, source)) = sources_by_id.get(source_id).copied() else {
                 return Err("显式 pair 引用了不存在的 sourceMediaId。".to_string());
             };
-            let Some(target) = targets_by_id.get(target_id).copied() else {
+            let Some((target_media_index, target)) = targets_by_id.get(target_id).copied() else {
                 return Err("显式 pair 引用了不存在的 targetMediaId。".to_string());
             };
             if !selected_pairs.insert((source_id.to_string(), target_id.to_string())) {
@@ -8427,16 +9761,20 @@ fn plan_audio_alignment_batch(
             }
             pairs.push(create_planned_audio_alignment_batch_pair(
                 pairs.len() + 1,
+                source_media_index,
+                target_media_index,
                 source,
                 target,
                 &request,
             ));
         }
     } else {
-        for source in &sources {
-            for target in &targets {
+        for (source_media_index, source) in sources.iter().enumerate() {
+            for (target_index, target) in targets.iter().enumerate() {
                 pairs.push(create_planned_audio_alignment_batch_pair(
                     pairs.len() + 1,
+                    source_media_index,
+                    target_media_offset.saturating_add(target_index),
                     source,
                     target,
                     &request,
@@ -8444,15 +9782,39 @@ fn plan_audio_alignment_batch(
             }
         }
     }
+    // Explicit pair lists may mention only a subset of the supplied media. Keep the plan's media
+    // table distinct and compact so the worker never hashes, probes or decodes an unreferenced
+    // local file merely because it appeared in the request envelope.
+    let referenced_media = pairs
+        .iter()
+        .flat_map(|pair| [pair.source_media_index, pair.target_media_index])
+        .collect::<HashSet<_>>();
+    let mut media_index_remap = vec![usize::MAX; media.len()];
+    let mut compact_media = Vec::with_capacity(referenced_media.len());
+    for (old_index, item) in media.into_iter().enumerate() {
+        if referenced_media.contains(&old_index) {
+            media_index_remap[old_index] = compact_media.len();
+            compact_media.push(item);
+        }
+    }
+    for pair in &mut pairs {
+        pair.source_media_index = media_index_remap[pair.source_media_index];
+        pair.target_media_index = media_index_remap[pair.target_media_index];
+        debug_assert_ne!(pair.source_media_index, usize::MAX);
+        debug_assert_ne!(pair.target_media_index, usize::MAX);
+    }
+    let media = compact_media;
     let first = pairs
         .first()
         .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())?;
     create_options(&first.request)?;
-    Ok(PlannedAudioAlignmentBatch { pairs })
+    Ok(PlannedAudioAlignmentBatch { media, pairs })
 }
 
 fn create_planned_audio_alignment_batch_pair(
     pair_ordinal: usize,
+    source_media_index: usize,
+    target_media_index: usize,
     source: &AudioAlignmentBatchMediaRequest,
     target: &AudioAlignmentBatchMediaRequest,
     batch: &AudioAlignmentBatchRequest,
@@ -8461,6 +9823,8 @@ fn create_planned_audio_alignment_batch_pair(
         pair_ordinal,
         source_media_id: source.media_id.clone(),
         target_media_id: target.media_id.clone(),
+        source_media_index,
+        target_media_index,
         request: AudioAlignmentRequest {
             complete_path: target.path.clone(),
             source_path: source.path.clone(),
@@ -8579,23 +9943,480 @@ fn insert_audio_alignment_batch_job(
     Ok(())
 }
 
+fn prepare_audio_alignment_batch_media(
+    plan: &PlannedAudioAlignmentBatch,
+    options: &AudioAlignmentOptions,
+    cancel_flag: &AtomicBool,
+) -> Result<Vec<PreparedAudioAlignmentBatchMediaState>, String> {
+    let spectral_backend_request = match resolve_spectral_backend_request() {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(plan
+                .media
+                .iter()
+                .map(|_| PreparedAudioAlignmentBatchMediaState::Failed(error.clone()))
+                .collect());
+        }
+    };
+    let mut batch_retained_artifact_bytes = 0_usize;
+    let prepared = prepare_distinct_audio_alignment_batch_media_with(
+        &plan.media,
+        cancel_flag,
+        |media| {
+            validate_media_input(&media.path, media.role_label)?;
+            let read_lease = open_alignment_media_read_lease(Path::new(&media.path))?;
+            let inputs = probe_alignment_audio_candidates(
+                &media.path,
+                media.role_label,
+                media.requested_audio_stream_index,
+                options,
+                Some(cancel_flag),
+            )?;
+            if inputs.is_empty() {
+                return Err(format!(
+                    "{}没有可用的非 commentary 音轨。",
+                    media.role_label
+                ));
+            }
+            let expected_identity = inputs
+                .first()
+                .and_then(|input| input.content_identity.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "blocked:media-identity-missing：{}批次预处理缺少完整媒体身份。",
+                        media.role_label
+                    )
+                })?;
+            require_full_file_media_content_identity(Some(&expected_identity))?;
+            if inputs
+                .iter()
+                .any(|input| input.content_identity.as_ref() != Some(&expected_identity))
+            {
+                return Err(format!(
+                    "blocked:media-identity-changed：{}候选音轨没有绑定到同一批次媒体身份。",
+                    media.role_label
+                ));
+            }
+            let mut extraction_notes = vec![format!(
+                "批次级 distinct-media 预处理：素材 {} 的 timeline、全量音频 PTS 与候选音轨只建立一次。",
+                media.media_id
+            )];
+            let media_retained_baseline = batch_retained_artifact_bytes;
+            let mut combined_retained_artifact_bytes = media_retained_baseline;
+            let landmarks = execute_after_v2_candidate_reservation(
+                media_retained_baseline,
+                &inputs,
+                &[],
+                || {
+                    extract_v2_landmark_candidates(
+                        &media.path,
+                        media.role_label,
+                        options,
+                        &inputs,
+                        Some(cancel_flag),
+                        &mut V2CandidateExtractionState {
+                            notes: &mut extraction_notes,
+                            retained_artifact_bytes: &mut combined_retained_artifact_bytes,
+                            spectral_backend_request: &spectral_backend_request,
+                        },
+                    )
+                },
+            )?;
+            if landmarks.is_empty() {
+                return Err(format!("{}候选音轨未产生可用 landmark。", media.role_label));
+            }
+            let media_retained_artifact_bytes = combined_retained_artifact_bytes
+                .checked_sub(media_retained_baseline)
+                .ok_or_else(|| {
+                    "blocked:resource-limit：批次级媒体制品驻留计数发生回退。".to_string()
+                })?;
+            batch_retained_artifact_bytes = combined_retained_artifact_bytes;
+            Ok(PreparedAudioAlignmentBatchMedia {
+                _read_lease: read_lease,
+                path: media.path.clone(),
+                expected_identity,
+                evidence: PreparedV2BatchMediaEvidence {
+                    inputs,
+                    landmarks,
+                    extraction_notes,
+                    retained_artifact_bytes: media_retained_artifact_bytes,
+                },
+            })
+        },
+    )?;
+    Ok(prepared
+        .into_iter()
+        .map(|result| match result {
+            Ok(media) => PreparedAudioAlignmentBatchMediaState::Ready(Box::new(media)),
+            Err(error) => PreparedAudioAlignmentBatchMediaState::Failed(error),
+        })
+        .collect())
+}
+
+fn prepare_distinct_audio_alignment_batch_media_with<T, F>(
+    media: &[PlannedAudioAlignmentBatchMedia],
+    cancel_flag: &AtomicBool,
+    mut prepare_one: F,
+) -> Result<Vec<Result<T, String>>, String>
+where
+    F: FnMut(&PlannedAudioAlignmentBatchMedia) -> Result<T, String>,
+{
+    let mut prepared = Vec::with_capacity(media.len());
+    for item in media {
+        check_cancelled(Some(cancel_flag))?;
+        match prepare_one(item) {
+            Ok(value) => prepared.push(Ok(value)),
+            Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => return Err(error),
+            Err(error)
+                if process_supervision_cleanup_faulted()
+                    || error.starts_with("blocked:process-cleanup") =>
+            {
+                return Err("blocked:process-cleanup：批次级媒体预处理未能可信收尾。".to_string());
+            }
+            Err(error) => prepared.push(Err(error)),
+        }
+    }
+    check_cancelled(Some(cancel_flag))?;
+    Ok(prepared)
+}
+
+fn prepared_audio_alignment_batch_media<'a>(
+    prepared: &'a [PreparedAudioAlignmentBatchMediaState],
+    index: usize,
+    role: &str,
+) -> Result<&'a PreparedAudioAlignmentBatchMedia, String> {
+    match prepared.get(index) {
+        Some(PreparedAudioAlignmentBatchMediaState::Ready(media)) => Ok(media.as_ref()),
+        Some(PreparedAudioAlignmentBatchMediaState::Failed(error)) => Err(format!(
+            "{role}批次级预处理失败；只有引用该素材的 pair 被阻断：{error}"
+        )),
+        None => Err(format!("{role}批次级预处理索引越界。")),
+    }
+}
+
+fn score_prepared_audio_alignment_batch_pair_coarse(
+    pair: &PlannedAudioAlignmentBatchPair,
+    prepared: &[PreparedAudioAlignmentBatchMediaState],
+    cancel_flag: &AtomicBool,
+) -> Result<V2PairCoarseCandidates, String> {
+    check_cancelled(Some(cancel_flag))?;
+    let source =
+        prepared_audio_alignment_batch_media(prepared, pair.source_media_index, "B 站参考")?;
+    let target =
+        prepared_audio_alignment_batch_media(prepared, pair.target_media_index, "目标原片")?;
+    collect_v2_pair_coarse_candidates(
+        &source.evidence.inputs,
+        &target.evidence.inputs,
+        &source.evidence.landmarks,
+        &target.evidence.landmarks,
+        pair.request.source_audio_stream_index.is_some()
+            || pair.request.complete_audio_stream_index.is_some(),
+        Some(cancel_flag),
+    )
+}
+
+fn align_prepared_audio_alignment_batch_pair<F>(
+    pair: &PlannedAudioAlignmentBatchPair,
+    prepared: &[PreparedAudioAlignmentBatchMediaState],
+    options: &AudioAlignmentOptions,
+    batch_retained_artifact_bytes: usize,
+    selected_coarse: PreparedV2SelectedCandidate,
+    update_progress: &mut F,
+    cancel_flag: &AtomicBool,
+) -> Result<AudioAlignmentProposal, String>
+where
+    F: FnMut(f64, &str) -> Result<(), String>,
+{
+    check_cancelled(Some(cancel_flag))?;
+    ensure_alignment_process_supervision_clean()?;
+    let source =
+        prepared_audio_alignment_batch_media(prepared, pair.source_media_index, "B 站参考")?;
+    let target =
+        prepared_audio_alignment_batch_media(prepared, pair.target_media_index, "目标原片")?;
+    let result = align_audio_files_v2_with_progress(
+        &pair.request,
+        options,
+        update_progress,
+        Some(cancel_flag),
+        Some(PreparedV2PairEvidence {
+            source: source.evidence.clone(),
+            target: target.evidence.clone(),
+            batch_retained_artifact_bytes,
+            selected_coarse,
+        }),
+    );
+    ensure_alignment_process_supervision_clean()?;
+    if let Ok(proposal) = &result {
+        verify_media_content_identity_after_tool_output(
+            &source.path,
+            Some(&source.expected_identity),
+            Some(cancel_flag),
+            "批次 pair 结果最终复核",
+        )?;
+        verify_media_content_identity_after_tool_output(
+            &target.path,
+            Some(&target.expected_identity),
+            Some(cancel_flag),
+            "批次 pair 结果最终复核",
+        )?;
+        verify_proposal_time_map_identities_match_run(
+            proposal,
+            &source.expected_identity,
+            &target.expected_identity,
+        )?;
+    }
+    result
+}
+
+fn create_v2_global_shortlist_blocked_proposal(
+    decision: V2GlobalShortlistDecision,
+) -> Result<AudioAlignmentProposal, String> {
+    match decision {
+        V2GlobalShortlistDecision::Selected(_) => {
+            Err("内部错误：已选择的 shortlist candidate 不应走 blocked proposal。".to_string())
+        }
+        V2GlobalShortlistDecision::Failed(error) => Err(error),
+        V2GlobalShortlistDecision::Blocked {
+            candidate,
+            alternatives,
+            margin,
+            reason,
+            diagnostics,
+        } => Ok(match candidate {
+            Some(candidate) => create_blocked_v2_affine_proposal(
+                &reason,
+                &candidate,
+                margin,
+                alternatives,
+                diagnostics,
+            ),
+            None => create_blocked_v2_proposal(
+                &reason,
+                None,
+                None,
+                Some(margin),
+                alternatives,
+                diagnostics,
+            ),
+        }),
+    }
+}
+
+fn execute_v2_global_shortlist_decision<F>(
+    decision: V2GlobalShortlistDecision,
+    execute_selected: F,
+) -> Result<AudioAlignmentProposal, String>
+where
+    F: FnOnce(PreparedV2SelectedCandidate) -> Result<AudioAlignmentProposal, String>,
+{
+    match decision {
+        V2GlobalShortlistDecision::Selected(selected) => execute_selected(selected),
+        blocked => create_v2_global_shortlist_blocked_proposal(blocked),
+    }
+}
+
+fn verify_prepared_audio_alignment_batch_media(
+    prepared: &[PreparedAudioAlignmentBatchMediaState],
+    media_indices_by_pair: &[(usize, usize)],
+    completed_pair_indices: &[usize],
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let mut referenced_media = vec![false; prepared.len()];
+    for pair_index in completed_pair_indices {
+        let (source_media_index, target_media_index) = media_indices_by_pair
+            .get(*pair_index)
+            .copied()
+            .ok_or_else(|| "批次最终身份复核的 pair 索引越界。".to_string())?;
+        let source = referenced_media
+            .get_mut(source_media_index)
+            .ok_or_else(|| "批次最终身份复核的参考媒体索引越界。".to_string())?;
+        *source = true;
+        let target = referenced_media
+            .get_mut(target_media_index)
+            .ok_or_else(|| "批次最终身份复核的目标媒体索引越界。".to_string())?;
+        *target = true;
+    }
+    for (media_index, state) in prepared.iter().enumerate() {
+        check_cancelled(cancel_flag)?;
+        if !referenced_media[media_index] {
+            continue;
+        }
+        let PreparedAudioAlignmentBatchMediaState::Ready(media) = state else {
+            continue;
+        };
+        verify_media_content_identity_after_tool_output(
+            &media.path,
+            Some(&media.expected_identity),
+            cancel_flag,
+            "批次结束前 distinct-media 身份复核",
+        )?;
+    }
+    ensure_alignment_process_supervision_clean()
+}
+
 fn run_audio_alignment_batch_job(
     job_id: String,
     cancel_flag: Arc<AtomicBool>,
     plan: PlannedAudioAlignmentBatch,
 ) {
-    run_audio_alignment_batch_job_with_pair_executor(
-        job_id,
-        cancel_flag,
-        plan,
-        |job_id, pair_index, request, cancel_flag| {
-            let mut update = |progress: f64, message: &str| {
-                if cancel_flag.load(Ordering::Acquire) {
-                    return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
+    let localization_mode = plan
+        .pairs
+        .first()
+        .and_then(|pair| pair.request.localization_mode)
+        .unwrap_or(false);
+    if !localization_mode {
+        run_audio_alignment_batch_job_with_pair_executor(
+            job_id,
+            cancel_flag,
+            plan,
+            |job_id, pair_index, pair, cancel_flag| {
+                let mut update = |progress: f64, message: &str| {
+                    if cancel_flag.load(Ordering::Acquire) {
+                        return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
+                    }
+                    update_audio_alignment_batch_pair_progress(
+                        job_id, pair_index, progress, message,
+                    )
+                };
+                align_audio_files_with_progress(pair.request, &mut update, Some(cancel_flag))
+            },
+        );
+        return;
+    }
+
+    let options = match plan
+        .pairs
+        .first()
+        .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())
+        .and_then(|pair| create_options(&pair.request))
+    {
+        Ok(options) => options,
+        Err(_) => {
+            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+            return;
+        }
+    };
+    let prepared = match prepare_audio_alignment_batch_media(&plan, &options, cancel_flag.as_ref())
+    {
+        Ok(prepared) => prepared,
+        Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        Err(error)
+            if process_supervision_cleanup_faulted()
+                || error.starts_with("blocked:process-cleanup") =>
+        {
+            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+            return;
+        }
+        Err(_) => {
+            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+            return;
+        }
+    };
+
+    let batch_retained_artifact_bytes =
+        prepared
+            .iter()
+            .try_fold(0_usize, |retained, state| match state {
+                PreparedAudioAlignmentBatchMediaState::Ready(media) => {
+                    ensure_v2_active_artifact_budget(
+                        retained,
+                        media.evidence.retained_artifact_bytes,
+                    )
                 }
-                update_audio_alignment_batch_pair_progress(job_id, pair_index, progress, message)
-            };
-            align_audio_files_with_progress(request, &mut update, Some(cancel_flag))
+                PreparedAudioAlignmentBatchMediaState::Failed(_) => Ok(retained),
+            });
+    let batch_retained_artifact_bytes = match batch_retained_artifact_bytes {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+            return;
+        }
+    };
+
+    // Coarse-score every executable pair before the first fine decode/DP. This is the native
+    // batch boundary that prevents pair order from greedily consuming a repeated location in a
+    // shared long reference. Failed preparation remains visible as an incomplete coarse batch;
+    // in that case no otherwise valid pair may claim a project-level optimum or enter fine.
+    let mut coarse_by_pair = Vec::with_capacity(plan.pairs.len());
+    for (pair_index, pair) in plan.pairs.iter().enumerate() {
+        if cancel_flag.load(Ordering::Acquire) {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        let _ = update_audio_alignment_batch_pair_progress(
+            &job_id,
+            pair_index,
+            0.08,
+            "正在完成全批项目级 Top-K coarse scoring；尚未执行 fine。",
+        );
+        let coarse =
+            score_prepared_audio_alignment_batch_pair_coarse(pair, &prepared, cancel_flag.as_ref());
+        if coarse
+            .as_ref()
+            .is_err_and(|error| error == AUDIO_ALIGNMENT_CANCELLED)
+        {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        coarse_by_pair.push(coarse);
+    }
+    let shortlist = match select_v2_global_shortlist(
+        &plan,
+        &coarse_by_pair,
+        batch_retained_artifact_bytes,
+        Some(cancel_flag.as_ref()),
+    ) {
+        Ok(shortlist) => shortlist,
+        Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => {
+            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            return;
+        }
+        Err(error) => vec![V2GlobalShortlistDecision::Failed(error); plan.pairs.len()],
+    };
+    let media_indices_by_pair = plan
+        .pairs
+        .iter()
+        .map(|pair| (pair.source_media_index, pair.target_media_index))
+        .collect::<Vec<_>>();
+
+    run_audio_alignment_batch_job_with_pair_executor_and_finalizer(
+        job_id,
+        cancel_flag.clone(),
+        plan,
+        |job_id, pair_index, pair, cancel_flag| {
+            let decision = shortlist.get(pair_index).cloned().ok_or_else(|| {
+                "批次级 Top-K shortlist decision 索引与 pair 计划不一致。".to_string()
+            })?;
+            execute_v2_global_shortlist_decision(decision, |selected_coarse| {
+                let mut update = |progress: f64, message: &str| {
+                    if cancel_flag.load(Ordering::Acquire) {
+                        return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
+                    }
+                    update_audio_alignment_batch_pair_progress(
+                        job_id, pair_index, progress, message,
+                    )
+                };
+                align_prepared_audio_alignment_batch_pair(
+                    &pair,
+                    &prepared,
+                    &options,
+                    batch_retained_artifact_bytes,
+                    selected_coarse,
+                    &mut update,
+                    cancel_flag,
+                )
+            })
+        },
+        |completed_pair_indices, ignore_cancel| {
+            verify_prepared_audio_alignment_batch_media(
+                &prepared,
+                &media_indices_by_pair,
+                completed_pair_indices,
+                (!ignore_cancel).then_some(cancel_flag.as_ref()),
+            )
         },
     );
 }
@@ -8604,18 +10425,47 @@ fn run_audio_alignment_batch_job_with_pair_executor<F>(
     job_id: String,
     cancel_flag: Arc<AtomicBool>,
     plan: PlannedAudioAlignmentBatch,
-    mut execute_pair: F,
+    execute_pair: F,
 ) where
     F: FnMut(
         &str,
         usize,
-        AudioAlignmentRequest,
+        PlannedAudioAlignmentBatchPair,
         &AtomicBool,
     ) -> Result<AudioAlignmentProposal, String>,
 {
+    run_audio_alignment_batch_job_with_pair_executor_and_finalizer(
+        job_id,
+        cancel_flag,
+        plan,
+        execute_pair,
+        |_, _| Ok(()),
+    );
+}
+
+fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
+    job_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    plan: PlannedAudioAlignmentBatch,
+    mut execute_pair: F,
+    mut verify_before_finalize: G,
+) where
+    F: FnMut(
+        &str,
+        usize,
+        PlannedAudioAlignmentBatchPair,
+        &AtomicBool,
+    ) -> Result<AudioAlignmentProposal, String>,
+    G: FnMut(&[usize], bool) -> Result<(), String>,
+{
+    let mut staged_results = Vec::<StagedAudioAlignmentBatchPairResult>::new();
     for (pair_index, pair) in plan.pairs.into_iter().enumerate() {
         if cancel_flag.load(Ordering::Acquire) {
-            let _ = cancel_audio_alignment_batch_worker(&job_id);
+            finish_cancelled_audio_alignment_batch_with_staging(
+                &job_id,
+                staged_results,
+                &mut verify_before_finalize,
+            );
             return;
         }
         if update_audio_alignment_batch_pair_progress(
@@ -8628,19 +10478,21 @@ fn run_audio_alignment_batch_job_with_pair_executor<F>(
         {
             return;
         }
-        let result = execute_pair(&job_id, pair_index, pair.request, cancel_flag.as_ref());
-        if cancel_flag.load(Ordering::Acquire)
-            || result
-                .as_ref()
-                .is_err_and(|error| error == AUDIO_ALIGNMENT_CANCELLED)
-        {
-            let _ = cancel_audio_alignment_batch_worker(&job_id);
-            return;
-        }
+        let result = execute_pair(&job_id, pair_index, pair, cancel_flag.as_ref());
         match result {
             Ok(proposal) => {
-                let _ =
-                    complete_audio_alignment_batch_pair(&job_id, pair_index, Some(proposal), None);
+                staged_results.push(StagedAudioAlignmentBatchPairResult {
+                    pair_index,
+                    outcome: StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(proposal)),
+                });
+            }
+            Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => {
+                finish_cancelled_audio_alignment_batch_with_staging(
+                    &job_id,
+                    staged_results,
+                    &mut verify_before_finalize,
+                );
+                return;
             }
             Err(error) => {
                 if process_supervision_cleanup_faulted()
@@ -8649,13 +10501,187 @@ fn run_audio_alignment_batch_job_with_pair_executor<F>(
                     let _ = fail_audio_alignment_batch_worker(&job_id, pair_index);
                     return;
                 }
-                let _ = complete_audio_alignment_batch_pair(&job_id, pair_index, None, Some(error));
+                staged_results.push(StagedAudioAlignmentBatchPairResult {
+                    pair_index,
+                    outcome: StagedAudioAlignmentBatchPairOutcome::Failed(error),
+                });
+            }
+        }
+        let _ = update_audio_alignment_batch_pair_progress(
+            &job_id,
+            pair_index,
+            1.0,
+            "当前 pair 已执行完成，正在等待批次最终身份复核。",
+        );
+        if cancel_flag.load(Ordering::Acquire) {
+            finish_cancelled_audio_alignment_batch_with_staging(
+                &job_id,
+                staged_results,
+                &mut verify_before_finalize,
+            );
+            return;
+        }
+    }
+    let completed_pair_indices = staged_results
+        .iter()
+        .map(|result| result.pair_index)
+        .collect::<Vec<_>>();
+    match verify_before_finalize(&completed_pair_indices, false) {
+        Ok(()) => {}
+        Err(error) if cancel_flag.load(Ordering::Acquire) || error == AUDIO_ALIGNMENT_CANCELLED => {
+            finish_cancelled_audio_alignment_batch_with_staging(
+                &job_id,
+                staged_results,
+                &mut verify_before_finalize,
+            );
+            return;
+        }
+        Err(_) => {
+            let _ = invalidate_audio_alignment_batch_after_final_identity_failure(&job_id);
+            return;
+        }
+    }
+    // Staged outcomes become observable only after the final verifier has succeeded. The commit
+    // and terminal decision share one registry lock, so polling cannot observe a proposal in the
+    // unverified Running state. A cancellation accepted after the verifier is honored atomically.
+    if commit_staged_audio_alignment_batch_results(&job_id, staged_results, false).is_err() {
+        let _ = invalidate_audio_alignment_batch_after_final_identity_failure(&job_id);
+    }
+}
+
+fn finish_cancelled_audio_alignment_batch_with_staging<G>(
+    job_id: &str,
+    staged_results: Vec<StagedAudioAlignmentBatchPairResult>,
+    verify_before_finalize: &mut G,
+) where
+    G: FnMut(&[usize], bool) -> Result<(), String>,
+{
+    if ensure_alignment_process_supervision_clean().is_err() {
+        let current_pair_index = staged_results
+            .last()
+            .map(|result| result.pair_index)
+            .unwrap_or(0);
+        let _ = fail_audio_alignment_batch_worker(job_id, current_pair_index);
+        return;
+    }
+    if staged_results.is_empty() {
+        let _ = cancel_audio_alignment_batch_worker(job_id);
+        return;
+    }
+    let completed_pair_indices = staged_results
+        .iter()
+        .map(|result| result.pair_index)
+        .collect::<Vec<_>>();
+    // Cancellation has already set the shared token. Reusing it here would make verification
+    // vacuously fail, so the production verifier receives `ignore_cancel=true` and performs a
+    // fresh identity check only for media referenced by completed staged outcomes.
+    match verify_before_finalize(&completed_pair_indices, true) {
+        Ok(()) => {
+            if commit_staged_audio_alignment_batch_results(job_id, staged_results, true).is_err() {
+                let _ = invalidate_audio_alignment_batch_after_final_identity_failure(job_id);
+            }
+        }
+        Err(error)
+            if process_supervision_cleanup_faulted()
+                || error.starts_with("blocked:process-cleanup") =>
+        {
+            let current_pair_index = completed_pair_indices.last().copied().unwrap_or(0);
+            let _ = fail_audio_alignment_batch_worker(job_id, current_pair_index);
+        }
+        Err(_) => {
+            let _ = invalidate_audio_alignment_batch_after_final_identity_failure(job_id);
+        }
+    }
+}
+
+fn commit_staged_audio_alignment_batch_results(
+    job_id: &str,
+    staged_results: Vec<StagedAudioAlignmentBatchPairResult>,
+    force_cancelled: bool,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    if !matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) {
+        return Err("批量音频对齐任务已终止，不能提交 staged 结果。".to_string());
+    }
+    let mut committed = vec![false; entry.snapshot.total_pair_count];
+    for staged in &staged_results {
+        let committed_slot = committed
+            .get_mut(staged.pair_index)
+            .ok_or_else(|| "批量音频对齐 staged pair 索引越界。".to_string())?;
+        if *committed_slot {
+            return Err("批量音频对齐 staged pair 结果重复。".to_string());
+        }
+        *committed_slot = true;
+    }
+    let cancelled = force_cancelled || entry.cancel_flag.load(Ordering::Acquire);
+    if !cancelled && committed.iter().any(|committed| !committed) {
+        return Err("批量音频对齐正常完成时缺少 staged pair 结果。".to_string());
+    }
+    for staged in staged_results {
+        let pair = entry
+            .snapshot
+            .pairs
+            .get_mut(staged.pair_index)
+            .ok_or_else(|| "批量音频对齐 pair 索引越界。".to_string())?;
+        pair.progress = 1.0;
+        match staged.outcome {
+            StagedAudioAlignmentBatchPairOutcome::Proposal(proposal) => {
+                pair.status = AudioAlignmentJobStatus::Completed;
+                pair.message = "当前 pair 已完成并通过批次最终身份复核。".to_string();
+                pair.proposal = Some(*proposal);
+                pair.error = None;
+            }
+            StagedAudioAlignmentBatchPairOutcome::Failed(error) => {
+                pair.status = AudioAlignmentJobStatus::Failed;
+                pair.message = "当前 pair 执行失败。".to_string();
+                pair.proposal = None;
+                pair.error = Some(error);
             }
         }
     }
-    // The terminal decision is made while holding the registry lock. A cancellation request
-    // accepted after this worker's last atomic load must not be overwritten by Completed.
-    let _ = finalize_audio_alignment_batch_job(&job_id);
+
+    if cancelled {
+        mark_audio_alignment_batch_cancelled(entry);
+    } else {
+        entry.snapshot.current_pair_ordinal = None;
+        entry.snapshot.progress = 1.0;
+        entry.snapshot.processed_pair_count = entry.snapshot.total_pair_count;
+        entry.snapshot.failed_pair_count = entry
+            .snapshot
+            .pairs
+            .iter()
+            .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
+            .count();
+        entry.snapshot.status = AudioAlignmentJobStatus::Completed;
+        entry.snapshot.message = if entry.snapshot.failed_pair_count == 0 {
+            format!(
+                "批量音频对齐完成：{} 个 pair 均已真实执行。",
+                entry.snapshot.total_pair_count
+            )
+        } else {
+            format!(
+                "批量音频对齐完成：{} 个成功，{} 个失败；成功结果已保留。",
+                entry
+                    .snapshot
+                    .total_pair_count
+                    .saturating_sub(entry.snapshot.failed_pair_count),
+                entry.snapshot.failed_pair_count
+            )
+        };
+        entry.snapshot.error = None;
+        entry.snapshot.updated_at_ms = current_time_ms();
+    }
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
 }
 
 fn update_audio_alignment_batch_pair_progress(
@@ -8700,6 +10726,7 @@ fn update_audio_alignment_batch_pair_progress(
     Ok(())
 }
 
+#[cfg(test)]
 fn complete_audio_alignment_batch_pair(
     job_id: &str,
     pair_index: usize,
@@ -8760,6 +10787,7 @@ fn complete_audio_alignment_batch_pair(
     Ok(())
 }
 
+#[cfg(test)]
 fn finalize_audio_alignment_batch_job(job_id: &str) -> Result<(), String> {
     let mut jobs = audio_alignment_batch_jobs()
         .lock()
@@ -8946,6 +10974,35 @@ fn fail_audio_alignment_batch_worker(
     entry.snapshot.current_pair_ordinal = None;
     entry.snapshot.error =
         Some("批量任务生命周期失败；后续普通对齐将保持 fail-closed。".to_string());
+    entry.snapshot.updated_at_ms = current_time_ms();
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
+}
+
+fn invalidate_audio_alignment_batch_after_final_identity_failure(
+    job_id: &str,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    for pair in &mut entry.snapshot.pairs {
+        pair.status = AudioAlignmentJobStatus::Failed;
+        pair.progress = 1.0;
+        pair.message = "批次结束前媒体身份复核失败；该 pair 的结果已作废。".to_string();
+        pair.proposal = None;
+        pair.error = Some("批次级 distinct-media 身份绑定失效。".to_string());
+    }
+    entry.snapshot.status = AudioAlignmentJobStatus::Failed;
+    entry.snapshot.progress = 1.0;
+    entry.snapshot.processed_pair_count = entry.snapshot.total_pair_count;
+    entry.snapshot.failed_pair_count = entry.snapshot.total_pair_count;
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.message = "批次结束前媒体身份复核失败；所有 proposal 已清除。".to_string();
+    entry.snapshot.error = Some("批次级 distinct-media 身份绑定失效。".to_string());
     entry.snapshot.updated_at_ms = current_time_ms();
     mark_audio_alignment_batch_terminal(entry);
     prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
@@ -12588,6 +14645,61 @@ mod tests {
             target_landmark_count: 72,
             source_spectral_backend_id: "test-cpu-spectral-v1".to_string(),
             target_spectral_backend_id: "test-cpu-spectral-v1".to_string(),
+            global_source_interval: PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            global_target_interval: PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            fine_working_set_bytes: 0,
+        }
+    }
+
+    fn v2_test_global_candidate(
+        local_source: PresentationRangeMs,
+        content_source: PresentationRangeMs,
+        score: f64,
+        repeated_content_only: bool,
+    ) -> V2TrackPairCandidate {
+        let mut candidate = v2_test_pair_candidate();
+        candidate.hypothesis.scale = 1.0;
+        candidate.hypothesis.offset_ms = -content_source.start_ms;
+        candidate.hypothesis.source_start_ms = local_source.start_ms;
+        candidate.hypothesis.source_end_ms = local_source.end_ms;
+        candidate.hypothesis.unique_source_coverage = 0.90;
+        candidate.hypothesis.unique_target_coverage = 0.90;
+        candidate.score = score;
+        candidate.temporal_coverage = 0.90;
+        candidate.intrinsic_margin = 0.50;
+        candidate.repeated_content_only = repeated_content_only;
+        candidate.global_source_interval = content_source;
+        candidate.global_target_interval = PresentationRangeMs {
+            start_ms: 0,
+            end_ms: content_source.end_ms - content_source.start_ms,
+        };
+        candidate
+    }
+
+    fn v2_test_cached_landmarks(bounds: PresentationRangeMs) -> CachedV2Landmarks {
+        CachedV2Landmarks {
+            landmarks: Arc::new(vec![SpectralLandmark {
+                hash: 7,
+                time_ms: bounds.start_ms.saturating_add(1_000),
+                strength_milli: 1_000,
+            }]),
+            pcm: None,
+            fine_features: None,
+            cache_key: "test-window-artifact".to_string(),
+            cache_hit: false,
+            spectral_backend: SpectralBackendExecution {
+                backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
+                requested_backend: "streaming-cpu".to_string(),
+                backend_detail: "test streaming CPU".to_string(),
+                fallback_reason: None,
+            },
+            presentation_bounds: bounds,
         }
     }
 
@@ -13234,7 +15346,7 @@ mod tests {
         };
         let aligned = collect(&[16 * 1024]);
         let odd_chunks = collect(&[1, 3, 5, 7, 11, 13, 17]);
-        assert!(!aligned.landmarks.is_empty());
+        assert!(!aligned.index.landmarks.is_empty());
         assert_eq!(odd_chunks, aligned);
 
         let mut truncated = V2S16LeLandmarkStream::new(config).unwrap();
@@ -13560,6 +15672,193 @@ mod tests {
     }
 
     #[test]
+    fn v2_recursive_corridor_consumes_45_second_source_only_insert_after_first_chunk() {
+        let target_ids = (0..180usize).collect::<Vec<_>>();
+        let mut source_ids = target_ids[..60].to_vec();
+        source_ids.extend(10_000..10_045);
+        source_ids.extend_from_slice(&target_ids[60..]);
+        let source = v2_distinct_features(&source_ids, 0, 1_000);
+        let target = v2_distinct_features(&target_ids, 0, 1_000);
+        let coarse = v2_test_hypothesis(1.0, 0);
+
+        let result =
+            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), None).unwrap();
+        let source_only_ms = result
+            .spans
+            .iter()
+            .filter(|span| span.kind == AudioTimeMapSpanKind::SourceOnly)
+            .map(|span| span.source_end_ms.saturating_sub(span.source_start_ms))
+            .sum::<u64>();
+        let recovered_tail_ms = result
+            .spans
+            .iter()
+            .filter(|span| {
+                span.kind == AudioTimeMapSpanKind::Matched && span.target_end_ms > 135_000
+            })
+            .map(|span| span.target_end_ms.saturating_sub(span.target_start_ms))
+            .sum::<u64>();
+
+        assert!(
+            source_only_ms >= 40_000,
+            "sourceOnly={source_only_ms}, spans={:?}",
+            result.spans
+        );
+        assert!(
+            recovered_tail_ms >= 30_000,
+            "tail={recovered_tail_ms}, spans={:?}",
+            result.spans
+        );
+        validate_v2_time_map_spans(&result.spans).unwrap();
+    }
+
+    #[test]
+    fn selected_long_reference_window_consumes_complete_target_and_source_support() {
+        let mut pair = v2_test_pair_candidate();
+        pair.source_input.media_duration_ms = Some(2 * 60 * 60 * 1_000);
+        pair.target_input.media_duration_ms = Some(20 * 60 * 1_000);
+        pair.hypothesis.scale = 1.0;
+        pair.hypothesis.offset_ms = -60 * 60 * 1_000;
+        // Coarse support spans both sides of a source-only interval wider than the mandatory
+        // 31 s corridor. The decode plan must retain that whole envelope.
+        pair.hypothesis.source_start_ms = 59 * 60 * 1_000;
+        pair.hypothesis.source_end_ms = 82 * 60 * 1_000;
+        let source = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 2 * 60 * 60 * 1_000,
+        });
+        let target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 20 * 60 * 1_000,
+        });
+
+        let plan = plan_v2_selected_fine_decode(&pair, &source, &target)
+            .unwrap()
+            .expect("long source requires a fine window");
+
+        assert_eq!(plan.windows.target, target.presentation_bounds);
+        assert!(plan.windows.source.start_ms <= pair.hypothesis.source_start_ms);
+        assert!(plan.windows.source.end_ms >= pair.hypothesis.source_end_ms);
+        assert!(
+            v2_presentation_range_duration_ms(plan.windows.source).unwrap()
+                <= ALIGNMENT_V2_MAX_DURATION_MS
+        );
+        assert!(plan.adaptive_guard_ms >= ALIGNMENT_V2_FINE_WINDOW_GUARD_MS);
+    }
+
+    #[test]
+    fn fine_window_budget_charges_stdout_and_parsed_pcm_at_the_same_time() {
+        let range = PresentationRangeMs {
+            start_ms: 0,
+            end_ms: ALIGNMENT_V2_MAX_DURATION_MS as i64,
+        };
+        let upper_bound = v2_fine_window_artifact_upper_bound(range).unwrap();
+
+        assert!(
+            upper_bound >= ALIGNMENT_V2_MAX_PCM_BYTES * 2,
+            "upper_bound={upper_bound}, pcm={ALIGNMENT_V2_MAX_PCM_BYTES}"
+        );
+        assert!(upper_bound > ALIGNMENT_V2_MAX_PCM_BYTES * 2);
+    }
+
+    #[test]
+    fn selected_fine_window_blocks_instead_of_truncating_required_support() {
+        let mut pair = v2_test_pair_candidate();
+        pair.source_input.media_duration_ms = Some(4 * 60 * 60 * 1_000);
+        pair.target_input.media_duration_ms = Some(20 * 60 * 1_000);
+        pair.hypothesis.scale = 1.0;
+        pair.hypothesis.offset_ms = 0;
+        pair.hypothesis.source_start_ms = 0;
+        pair.hypothesis.source_end_ms = 2 * 60 * 60 * 1_000;
+        let source = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 4 * 60 * 60 * 1_000,
+        });
+        let target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 20 * 60 * 1_000,
+        });
+
+        let error = plan_v2_selected_fine_decode(&pair, &source, &target).unwrap_err();
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert!(error.contains("全部 coarse inlier support"));
+        assert!(error.contains("未截断成功"));
+    }
+
+    #[test]
+    fn selected_fine_window_blocks_when_both_axes_lack_complete_episode_bounds() {
+        let mut pair = v2_test_pair_candidate();
+        pair.source_input.media_duration_ms = None;
+        pair.target_input.media_duration_ms = Some(90 * 60 * 1_000);
+        let source = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 2 * 60 * 60 * 1_000,
+        });
+        let target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 90 * 60 * 1_000,
+        });
+
+        let error = plan_v2_selected_fine_decode(&pair, &source, &target).unwrap_err();
+        assert!(error.starts_with("blocked:window-evidence-insufficient"));
+        assert!(error.contains("不会把局部 inlier support 冒充完整时间图"));
+    }
+
+    #[test]
+    fn fine_window_ffmpeg_args_use_input_seek_and_bounded_output_duration() {
+        let args = create_v2_fine_window_audio_decode_args(
+            "private-long-reference.mkv",
+            &test_audio_input(4, 0),
+            3_723_456,
+            1_234_567,
+        );
+        let seek_index = args.iter().position(|arg| arg == "-ss").unwrap();
+        let input_index = args.iter().position(|arg| arg == "-i").unwrap();
+        let duration_index = args.iter().position(|arg| arg == "-t").unwrap();
+        assert!(seek_index < input_index, "-ss must be an input option");
+        assert!(duration_index > input_index, "-t must bound decoded output");
+        assert_eq!(args[seek_index + 1], "3723.456");
+        assert_eq!(args[duration_index + 1], "1234.567");
+        assert!(!args.iter().any(|arg| arg == "-copyts"));
+        assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
+    }
+
+    #[test]
+    fn windowed_boundary_refinement_uses_absolute_pcm_offsets() {
+        let mut state = 0x1234_5678_u64;
+        let pcm = (0..ALIGNMENT_V2_SAMPLE_RATE as usize * 2)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 48) as i16
+            })
+            .collect::<Vec<_>>();
+        let mut spans = vec![
+            AudioTimeMapSpanDto {
+                kind: AudioTimeMapSpanKind::Matched,
+                source_start_ms: 100_000,
+                source_end_ms: 101_000,
+                target_start_ms: 200_000,
+                target_end_ms: 201_000,
+            },
+            AudioTimeMapSpanDto {
+                kind: AudioTimeMapSpanKind::Matched,
+                source_start_ms: 101_000,
+                source_end_ms: 102_000,
+                target_start_ms: 201_000,
+                target_end_ms: 202_000,
+            },
+        ];
+
+        let summary = refine_v2_span_boundaries(&mut spans, &pcm, &pcm, 100_000, 200_000, None);
+
+        assert_eq!(summary.attempted_count, 1);
+        assert_eq!(summary.refined_count, 1);
+        assert_eq!(spans[0].source_end_ms, 101_000);
+        assert_eq!(spans[0].target_end_ms, 201_000);
+    }
+
+    #[test]
     fn v2_silent_source_only_boundaries_are_attempted_but_remain_blocking() {
         let mut spans = vec![
             AudioTimeMapSpanDto {
@@ -13585,14 +15884,7 @@ mod tests {
             },
         ];
         let pcm = vec![0i16; ALIGNMENT_V2_SAMPLE_RATE as usize * 31];
-        let summary = refine_v2_span_boundaries(
-            &mut spans,
-            &pcm,
-            &pcm,
-            &test_audio_input(1, 0),
-            &test_audio_input(2, 0),
-            None,
-        );
+        let summary = refine_v2_span_boundaries(&mut spans, &pcm, &pcm, 0, 0, None);
 
         assert_eq!(summary.attempted_count, 2);
         assert_eq!(summary.refined_count, 0);
@@ -13659,9 +15951,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!coarse.landmarks.is_empty());
-        assert!(coarse.observed_landmark_count >= coarse.retained_landmark_count as u64);
-        assert!(coarse.retained_landmark_count <= ALIGNMENT_V2_COARSE_MAX_LANDMARKS);
+        assert!(!coarse.index.landmarks.is_empty());
+        assert!(
+            coarse.index.observed_landmark_count >= coarse.index.retained_landmark_count as u64
+        );
+        assert!(coarse.index.retained_landmark_count <= ALIGNMENT_V2_COARSE_MAX_LANDMARKS);
+        assert!(coarse.decoded_sample_count > 0);
 
         let mut synthetic_long_input = input.clone();
         synthetic_long_input.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS + 1);
@@ -13690,6 +15985,29 @@ mod tests {
         .unwrap_err();
         assert!(fine_error.starts_with("blocked:resource-limit"));
 
+        let fine_window = PresentationRangeMs {
+            start_ms: 2_000,
+            end_ms: 6_000,
+        };
+        let window_audio = decode_v2_audio_for_selected_window(
+            &path_text,
+            "真实 fixture",
+            &test_options(),
+            &synthetic_long_input,
+            &coarse_artifact,
+            Some(fine_window),
+            None,
+        )
+        .unwrap();
+        assert_eq!(window_audio.presentation_offset_ms, 2_000);
+        assert_eq!(
+            window_audio.fine_features.first().unwrap().time_ms,
+            2_025,
+            "windowed fine features must return to absolute presentation time"
+        );
+        assert!(window_audio.pcm.len() <= ALIGNMENT_V2_SAMPLE_RATE as usize * 4);
+        assert!(window_audio.pcm.len() >= ALIGNMENT_V2_SAMPLE_RATE as usize * 4 - 16);
+
         let mut stale = input.clone();
         let mut stale_identity = stale.content_identity.clone().unwrap();
         stale_identity.first_sample_digest = "b".repeat(64);
@@ -13709,6 +16027,22 @@ mod tests {
         assert!(identity_error.starts_with("blocked:media-identity-changed"));
         assert!(!identity_error.contains("alice"));
         assert!(!identity_error.contains("must-not-run"));
+
+        let mut stale_long = synthetic_long_input.clone();
+        stale_long.content_identity = stale.content_identity.clone();
+        let window_identity_error = decode_v2_audio_for_selected_window(
+            &path_text,
+            "真实 fixture",
+            &must_not_spawn,
+            &stale_long,
+            &coarse_artifact,
+            Some(fine_window),
+            None,
+        )
+        .unwrap_err();
+        assert!(window_identity_error.starts_with("blocked:media-identity-changed"));
+        assert!(!window_identity_error.contains("alice"));
+        assert!(!window_identity_error.contains("must-not-run"));
 
         let cancelled = AtomicBool::new(true);
         let cancel_error = decode_v2_coarse_landmarks_streaming(
@@ -14291,6 +16625,7 @@ mod tests {
             V2BoundarySummary::default(),
             v2_test_pair_candidate(),
             0.5,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
             "test audio".to_string(),
             Vec::new(),
             Vec::new(),
@@ -14324,6 +16659,7 @@ mod tests {
             V2BoundarySummary::default(),
             v2_test_pair_candidate(),
             0.5,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
             "test audio".to_string(),
             Vec::new(),
             Vec::new(),
@@ -14361,6 +16697,7 @@ mod tests {
             V2BoundarySummary::default(),
             v2_test_pair_candidate(),
             0.5,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
             "benchmark identity".to_string(),
             Vec::new(),
             Vec::new(),
@@ -14594,6 +16931,10 @@ mod tests {
                 requested_backend: "cpu".to_string(),
                 backend_detail: "CPU radix-2 f64 FFT".to_string(),
                 fallback_reason: None,
+            },
+            presentation_bounds: PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
             },
         }
     }
@@ -15137,6 +17478,835 @@ mod tests {
         assert_eq!(explicit.pairs[1].pair_ordinal, 2);
         assert_eq!(explicit.pairs[1].source_media_id, "source-1");
         assert_eq!(explicit.pairs[1].target_media_id, "target-2");
+        assert_eq!(explicit.media.len(), 4);
+    }
+
+    #[test]
+    fn global_shortlist_selects_three_non_overlapping_episodes_before_fine() {
+        let plan = test_one_source_three_target_batch_plan();
+        let mut coarse_by_pair = Vec::new();
+        for (episode_index, start_ms) in [600_000_i64, 1_200_000, 1_800_000].into_iter().enumerate()
+        {
+            // The repeated opening has a higher raw pair score but little unique coverage and a
+            // repeated-content penalty. The project-level objective must prefer the complete,
+            // mutually non-overlapping episode candidate for all three targets.
+            let mut repeated_opening = v2_test_global_candidate(
+                PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 15_000,
+                },
+                PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 120_000,
+                },
+                0.99,
+                true,
+            );
+            repeated_opening.hypothesis.unique_source_coverage = 0.10;
+            repeated_opening.intrinsic_margin = 0.02;
+            let complete_episode = v2_test_global_candidate(
+                PresentationRangeMs {
+                    start_ms: start_ms + 30_000,
+                    end_ms: start_ms + 90_000,
+                },
+                PresentationRangeMs {
+                    start_ms,
+                    end_ms: start_ms + 600_000,
+                },
+                0.78 - episode_index as f64 * 0.01,
+                false,
+            );
+            assert!(
+                repeated_opening.score > complete_episode.score,
+                "fixture must prove the weighted objective is not raw score"
+            );
+            coarse_by_pair.push(Ok(V2PairCoarseCandidates {
+                candidates: vec![repeated_opening, complete_episode],
+                alternatives: Vec::new(),
+                diagnostics: vec![format!("episode {} coarse complete", episode_index + 1)],
+            }));
+        }
+
+        let decisions = select_v2_global_shortlist(&plan, &coarse_by_pair, 0, None).unwrap();
+        let selected_starts = decisions
+            .iter()
+            .map(|decision| match decision {
+                V2GlobalShortlistDecision::Selected(selected) => {
+                    selected.candidate.global_source_interval.start_ms
+                }
+                other => panic!("expected selected shortlist decision, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected_starts, vec![600_000, 1_200_000, 1_800_000]);
+
+        let mut fine_invocations = vec![0_usize; decisions.len()];
+        for (pair_index, decision) in decisions.into_iter().enumerate() {
+            execute_v2_global_shortlist_decision(decision, |_| {
+                fine_invocations[pair_index] += 1;
+                Ok(test_audio_alignment_batch_proposal("shortlist-fine"))
+            })
+            .unwrap();
+        }
+        assert_eq!(fine_invocations, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn global_shortlist_exactly_solves_adversarial_one_source_five_target_top_k() {
+        let plan = test_one_source_five_target_batch_plan();
+        let mut coarse_by_pair = Vec::new();
+        for pair_index in 0..plan.pairs.len() {
+            let episode_start_ms = if pair_index == 0 {
+                100_000
+            } else {
+                pair_index as i64 * 1_000_000
+            };
+            let episode_range = PresentationRangeMs {
+                start_ms: episode_start_ms,
+                end_ms: episode_start_ms + 600_000,
+            };
+            let mut candidates = Vec::new();
+            if pair_index == 0 {
+                // A locally strongest trap overlaps every other episode. A truncated greedy
+                // search can keep it and lose four compatible matches; exact search must take
+                // backup #1.
+                candidates.push(v2_test_global_candidate(
+                    PresentationRangeMs {
+                        start_ms: 0,
+                        end_ms: 60_000,
+                    },
+                    PresentationRangeMs {
+                        start_ms: 0,
+                        end_ms: 5_600_000,
+                    },
+                    1.0,
+                    false,
+                ));
+                candidates.push(v2_test_global_candidate(
+                    episode_range,
+                    episode_range,
+                    0.70,
+                    false,
+                ));
+                for score in [0.05, 0.04, 0.03] {
+                    candidates.push(v2_test_global_candidate(
+                        episode_range,
+                        episode_range,
+                        score,
+                        false,
+                    ));
+                }
+            } else {
+                candidates.push(v2_test_global_candidate(
+                    episode_range,
+                    episode_range,
+                    0.90,
+                    false,
+                ));
+                for score in [0.05, 0.04, 0.03, 0.02] {
+                    candidates.push(v2_test_global_candidate(
+                        episode_range,
+                        episode_range,
+                        score,
+                        false,
+                    ));
+                }
+            }
+            assert_eq!(candidates.len(), 5);
+            coarse_by_pair.push(Ok(V2PairCoarseCandidates {
+                candidates,
+                alternatives: Vec::new(),
+                diagnostics: vec![format!("pair {} coarse complete", pair_index + 1)],
+            }));
+        }
+
+        let decisions = select_v2_global_shortlist(&plan, &coarse_by_pair, 0, None).unwrap();
+        let selected_scores = decisions
+            .iter()
+            .map(|decision| match decision {
+                V2GlobalShortlistDecision::Selected(selected) => selected.candidate.score,
+                other => panic!("expected exact selected decision, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected_scores, vec![0.70, 0.90, 0.90, 0.90, 0.90]);
+        let V2GlobalShortlistDecision::Selected(first) = &decisions[0] else {
+            unreachable!("all decisions checked selected above");
+        };
+        assert!(first.global_diagnostic.contains("exact branch-and-bound"));
+        assert!(first.global_diagnostic.contains("未静默截断"));
+    }
+
+    #[test]
+    fn global_shortlist_exact_cap_fails_closed_before_any_fine_work() {
+        let mut plan = test_one_source_three_target_batch_plan();
+        plan.pairs.truncate(1);
+        let coarse = vec![Ok(V2PairCoarseCandidates {
+            candidates: vec![v2_test_global_candidate(
+                PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 60_000,
+                },
+                PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 600_000,
+                },
+                0.9,
+                false,
+            )],
+            alternatives: Vec::new(),
+            diagnostics: Vec::new(),
+        })];
+        let shortlist = select_v2_global_shortlist_with_limits(
+            &plan,
+            &coarse,
+            0,
+            None,
+            V2GlobalExactLimits {
+                max_states: 100,
+                max_expansions: 1,
+            },
+        );
+        let decisions = shortlist.expect("hard-cap is a blocked shortlist, not a failed batch");
+        assert_eq!(decisions.len(), 1);
+        let V2GlobalShortlistDecision::Blocked { reason, .. } = &decisions[0] else {
+            panic!("hard-cap must block the pair");
+        };
+        assert!(reason.starts_with("blocked:resource-limit"));
+        assert!(reason.contains("exact branch-and-bound"));
+        assert!(reason.contains("未截断搜索冒充全局最优"));
+        let mut fine_invocations = 0usize;
+        for decision in decisions {
+            let _ = execute_v2_global_shortlist_decision(decision, |_| {
+                fine_invocations += 1;
+                Ok(test_audio_alignment_batch_proposal("must-not-run"))
+            });
+        }
+        assert_eq!(fine_invocations, 0);
+    }
+
+    #[test]
+    fn global_runner_up_accepts_any_complete_choice_vector_different_from_best() {
+        let best = V2GlobalAssignmentState {
+            choices: vec![Some(0), Some(1)],
+            selected_count: 2,
+            total_score: 2.0,
+        };
+        let duplicate_best = best.clone();
+        let different_choices = V2GlobalAssignmentState {
+            choices: vec![Some(0), None],
+            selected_count: 1,
+            total_score: 1.0,
+        };
+        let states = vec![best.clone(), duplicate_best, different_choices.clone()];
+        let runner_up = v2_global_runner_up(&states, &best.choices).unwrap();
+        assert_eq!(runner_up.choices, different_choices.choices);
+    }
+
+    #[test]
+    fn incomplete_global_coarse_never_runs_fine_or_claims_global_optimum() {
+        let plan = test_one_source_three_target_batch_plan();
+        let valid = || {
+            Ok(V2PairCoarseCandidates {
+                candidates: vec![v2_test_global_candidate(
+                    PresentationRangeMs {
+                        start_ms: 0,
+                        end_ms: 60_000,
+                    },
+                    PresentationRangeMs {
+                        start_ms: 0,
+                        end_ms: 120_000,
+                    },
+                    0.9,
+                    false,
+                )],
+                alternatives: Vec::new(),
+                diagnostics: Vec::new(),
+            })
+        };
+        let decisions = select_v2_global_shortlist(
+            &plan,
+            &[valid(), Err("fixture coarse failed".to_string()), valid()],
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(decisions
+            .iter()
+            .all(|decision| !matches!(decision, V2GlobalShortlistDecision::Selected(_))));
+        let mut fine_invocations = 0usize;
+        for decision in decisions {
+            let _ = execute_v2_global_shortlist_decision(decision, |_| {
+                fine_invocations += 1;
+                Ok(test_audio_alignment_batch_proposal("must-not-run"))
+            });
+        }
+        assert_eq!(fine_invocations, 0);
+    }
+
+    #[test]
+    fn global_shortlist_conflicts_on_complete_content_not_disjoint_local_support() {
+        let mut plan = test_one_source_three_target_batch_plan();
+        plan.pairs.truncate(2);
+        let first = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 10_000,
+                end_ms: 20_000,
+            },
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            0.90,
+            false,
+        );
+        let second = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 80_000,
+                end_ms: 90_000,
+            },
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            0.89,
+            false,
+        );
+        assert_eq!(
+            v2_interval_overlap_ms(
+                v2_hypothesis_source_interval(&first.hypothesis),
+                v2_hypothesis_source_interval(&second.hypothesis),
+            ),
+            0,
+            "local inlier supports intentionally do not overlap"
+        );
+        assert!(v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &first,
+            &plan.pairs[1],
+            &second,
+        ));
+        let decisions = select_v2_global_shortlist(
+            &plan,
+            &[
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![first],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![second],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .filter(|decision| matches!(decision, V2GlobalShortlistDecision::Selected(_)))
+                .count()
+                < 2,
+            "same complete episode must never select both local supports"
+        );
+    }
+
+    #[test]
+    fn global_shortlist_uses_250ms_overlap_tolerance_and_zero_guard_content_ranges() {
+        let plan = test_one_source_three_target_batch_plan();
+        let left = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 1_000,
+            },
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 1_000,
+            },
+            0.9,
+            false,
+        );
+        let mut touching = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 750,
+                end_ms: 1_750,
+            },
+            PresentationRangeMs {
+                start_ms: 750,
+                end_ms: 1_750,
+            },
+            0.9,
+            false,
+        );
+        assert!(!v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &left,
+            &plan.pairs[1],
+            &touching,
+        ));
+        touching.global_source_interval.start_ms = 749;
+        assert!(v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &left,
+            &plan.pairs[1],
+            &touching,
+        ));
+
+        let mut adjacent_left = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 600_000,
+                end_ms: 610_000,
+            },
+            PresentationRangeMs {
+                start_ms: 600_000,
+                end_ms: 1_200_000,
+            },
+            0.9,
+            false,
+        );
+        let mut adjacent_right = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 1_210_000,
+                end_ms: 1_220_000,
+            },
+            PresentationRangeMs {
+                start_ms: 1_200_000,
+                end_ms: 1_800_000,
+            },
+            0.9,
+            false,
+        );
+        for candidate in [&mut adjacent_left, &mut adjacent_right] {
+            candidate.source_input.media_duration_ms = Some(3 * 60 * 60 * 1_000);
+            candidate.target_input.media_duration_ms = Some(10 * 60 * 1_000);
+            candidate.hypothesis.scale = 1.0;
+            candidate.hypothesis.offset_ms = -candidate.global_source_interval.start_ms;
+            candidate.hypothesis.source_start_ms = candidate.global_source_interval.start_ms;
+            candidate.hypothesis.source_end_ms = candidate.global_source_interval.end_ms;
+        }
+        let long_source = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 3 * 60 * 60 * 1_000,
+        });
+        let short_target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 10 * 60 * 1_000,
+        });
+        let left_guarded =
+            plan_v2_selected_fine_decode(&adjacent_left, &long_source, &short_target)
+                .unwrap()
+                .unwrap();
+        let right_guarded =
+            plan_v2_selected_fine_decode(&adjacent_right, &long_source, &short_target)
+                .unwrap()
+                .unwrap();
+        assert!(
+            v2_interval_overlap_ms(
+                (
+                    left_guarded.windows.source.start_ms,
+                    left_guarded.windows.source.end_ms,
+                ),
+                (
+                    right_guarded.windows.source.start_ms,
+                    right_guarded.windows.source.end_ms,
+                ),
+            ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS,
+            "decoder guards intentionally overlap"
+        );
+        let adjacent_left =
+            bind_v2_candidate_global_intervals(adjacent_left, &long_source, &short_target).unwrap();
+        let adjacent_right =
+            bind_v2_candidate_global_intervals(adjacent_right, &long_source, &short_target)
+                .unwrap();
+        assert!(!v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &adjacent_left,
+            &plan.pairs[1],
+            &adjacent_right,
+        ));
+    }
+
+    #[test]
+    fn unbounded_fine_candidate_is_removed_before_it_can_replace_executable_backup() {
+        let mut impossible = v2_test_pair_candidate();
+        impossible.source_input.media_duration_ms = Some(2 * 60 * 60 * 1_000);
+        impossible.target_input.media_duration_ms = Some(2 * 60 * 60 * 1_000);
+        impossible.score = 0.99;
+        let long_source = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 2 * 60 * 60 * 1_000,
+        });
+        let long_target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 2 * 60 * 60 * 1_000,
+        });
+        assert!(
+            bind_v2_candidate_global_intervals(impossible, &long_source, &long_target)
+                .unwrap_err()
+                .starts_with("blocked:window-evidence-insufficient")
+        );
+
+        let mut executable = v2_test_pair_candidate();
+        executable.source_input.media_duration_ms = Some(2 * 60 * 60 * 1_000);
+        executable.target_input.media_duration_ms = Some(20 * 60 * 1_000);
+        executable.hypothesis.scale = 1.0;
+        executable.hypothesis.offset_ms = -60 * 60 * 1_000;
+        executable.hypothesis.source_start_ms = 60 * 60 * 1_000;
+        executable.hypothesis.source_end_ms = 80 * 60 * 1_000;
+        executable.score = 0.70;
+        let short_target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 20 * 60 * 1_000,
+        });
+        let executable =
+            bind_v2_candidate_global_intervals(executable, &long_source, &short_target)
+                .expect("bounded backup must remain selectable");
+        assert_eq!(
+            executable.global_target_interval,
+            short_target.presentation_bounds
+        );
+
+        let mut plan = test_one_source_three_target_batch_plan();
+        plan.pairs.truncate(1);
+        let mut over_budget = executable.clone();
+        over_budget.score = 0.99;
+        over_budget.fine_working_set_bytes = 1_025;
+        let mut backup = executable;
+        backup.fine_working_set_bytes = 1_024;
+        let decisions = select_v2_global_shortlist(
+            &plan,
+            &[Ok(V2PairCoarseCandidates {
+                candidates: vec![over_budget, backup],
+                alternatives: Vec::new(),
+                diagnostics: Vec::new(),
+            })],
+            MAX_V2_ACTIVE_ARTIFACT_BYTES - 1_024,
+            None,
+        )
+        .unwrap();
+        let V2GlobalShortlistDecision::Selected(selected) = &decisions[0] else {
+            panic!("in-budget backup must be selected");
+        };
+        assert_eq!(selected.candidate.fine_working_set_bytes, 1_024);
+    }
+
+    #[test]
+    fn audio_alignment_batch_prepares_five_distinct_media_once_before_six_pair_matches() {
+        let mut request = test_audio_alignment_batch_request(None);
+        request.targets.push(AudioAlignmentBatchMediaRequest {
+            media_id: "target-3".to_string(),
+            path: "target-3.mkv".to_string(),
+            audio_stream_index: Some(13),
+            video_stream_index: Some(15),
+        });
+        let plan = plan_audio_alignment_batch(request).unwrap();
+        assert_eq!(plan.media.len(), 5);
+        assert_eq!(plan.pairs.len(), 6);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut preparation_counts = HashMap::<String, usize>::new();
+        let prepared = prepare_distinct_audio_alignment_batch_media_with(
+            &plan.media,
+            cancel_flag.as_ref(),
+            |media| {
+                *preparation_counts
+                    .entry(media.media_id.clone())
+                    .or_default() += 1;
+                Ok(media.media_id.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(preparation_counts.len(), 5);
+        assert!(preparation_counts.values().all(|count| *count == 1));
+
+        let job_id = format!("test-audio-batch-distinct-prep-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+        let mut matcher_count = 0usize;
+        run_audio_alignment_batch_job_with_pair_executor(
+            job_id.clone(),
+            cancel_flag,
+            plan,
+            |_job_id, _pair_index, pair, _cancel_flag| {
+                prepared[pair.source_media_index]
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                prepared[pair.target_media_index]
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                matcher_count += 1;
+                Ok(test_audio_alignment_batch_proposal("prepared-pair"))
+            },
+        );
+        assert_eq!(matcher_count, 6);
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Completed);
+        assert_eq!(terminal.failed_pair_count, 0);
+    }
+
+    #[test]
+    fn bad_media_is_localized_but_incomplete_coarse_blocks_every_pair_before_fine() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-1"),
+        ])))
+        .unwrap();
+        // target-2 is present in the request envelope but no explicit pair references it.
+        assert_eq!(plan.media.len(), 3);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut prepared_ids = Vec::new();
+        let prepared = prepare_distinct_audio_alignment_batch_media_with(
+            &plan.media,
+            cancel_flag.as_ref(),
+            |media| {
+                prepared_ids.push(media.media_id.clone());
+                if media.media_id == "source-1" {
+                    Err("fixture bad media".to_string())
+                } else {
+                    Ok(media.media_id.clone())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared_ids.len(), 3);
+        assert!(!prepared_ids.iter().any(|id| id == "target-2"));
+
+        let coarse_by_pair = plan
+            .pairs
+            .iter()
+            .map(|pair| {
+                prepared[pair.source_media_index]
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                prepared[pair.target_media_index]
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![v2_test_global_candidate(
+                        PresentationRangeMs {
+                            start_ms: 0,
+                            end_ms: 60_000,
+                        },
+                        PresentationRangeMs {
+                            start_ms: 0,
+                            end_ms: 60_000,
+                        },
+                        0.9,
+                        false,
+                    )],
+                    alternatives: Vec::new(),
+                    diagnostics: vec!["fixture coarse retained".to_string()],
+                })
+            })
+            .collect::<Vec<_>>();
+        let decisions = select_v2_global_shortlist(&plan, &coarse_by_pair, 0, None).unwrap();
+        assert!(matches!(decisions[0], V2GlobalShortlistDecision::Failed(_)));
+        assert!(matches!(
+            decisions[1],
+            V2GlobalShortlistDecision::Blocked { .. }
+        ));
+        let mut fine_invocations = 0usize;
+        let retained = execute_v2_global_shortlist_decision(decisions[1].clone(), |_| {
+            fine_invocations += 1;
+            Ok(test_audio_alignment_batch_proposal("must-not-fine"))
+        })
+        .unwrap();
+        assert_eq!(fine_invocations, 0);
+        assert_eq!(
+            retained
+                .time_map
+                .as_ref()
+                .map(|time_map| time_map.quality.level),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn audio_alignment_batch_preparation_cancellation_stops_before_next_media() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(None)).unwrap();
+        let cancel_flag = AtomicBool::new(false);
+        let mut preparation_count = 0usize;
+        let error = prepare_distinct_audio_alignment_batch_media_with(
+            &plan.media,
+            &cancel_flag,
+            |_media| {
+                preparation_count += 1;
+                cancel_flag.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, AUDIO_ALIGNMENT_CANCELLED);
+        assert_eq!(preparation_count, 1);
+    }
+
+    #[test]
+    fn cumulative_batch_budget_blocks_second_media_before_prepare_or_decode_closure() {
+        let input = test_audio_input(1, 0);
+        let candidate_upper_bound = v2_candidate_artifact_upper_bound(&input).unwrap();
+        let almost_full_actual_retained = MAX_V2_ACTIVE_ARTIFACT_BYTES
+            .checked_sub(candidate_upper_bound)
+            .expect("fixture candidate must fit active budget")
+            + 1;
+        let mut prepare_or_decode_invocations = 0usize;
+        let settled_first_media =
+            execute_after_v2_candidate_reservation(0, std::slice::from_ref(&input), &[], || {
+                prepare_or_decode_invocations += 1;
+                Ok(almost_full_actual_retained)
+            })
+            .unwrap();
+        assert_eq!(prepare_or_decode_invocations, 1);
+
+        let error = execute_after_v2_candidate_reservation(
+            settled_first_media,
+            std::slice::from_ref(&input),
+            &[],
+            || {
+                prepare_or_decode_invocations += 1;
+                Ok(())
+            },
+        )
+        .expect_err("second media reservation must fail before starting FFmpeg preparation");
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert_eq!(prepare_or_decode_invocations, 1);
+
+        let baseline_that_fits_only_one = MAX_V2_ACTIVE_ARTIFACT_BYTES
+            .checked_sub(candidate_upper_bound)
+            .unwrap();
+        let error = execute_after_v2_candidate_reservation(
+            baseline_that_fits_only_one,
+            &[input.clone(), input],
+            &[],
+            || {
+                prepare_or_decode_invocations += 1;
+                Ok(())
+            },
+        )
+        .expect_err("all candidates of one media must be reserved before its first decode");
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert_eq!(prepare_or_decode_invocations, 1);
+    }
+
+    #[test]
+    fn one_by_one_batch_and_ordinary_v2_share_intrinsic_ambiguity_gate() {
+        let intrinsic_margin = ALIGNMENT_V2_MIN_TRACK_MARGIN / 2.0;
+        let ordinary_margin = v2_effective_alternative_margin(None, 1.0, intrinsic_margin);
+        let one_by_one_batch_margin =
+            v2_effective_alternative_margin(Some(1.0), 1.0, intrinsic_margin);
+        assert_eq!(ordinary_margin, intrinsic_margin);
+        assert_eq!(one_by_one_batch_margin, ordinary_margin);
+        assert!(ordinary_margin < ALIGNMENT_V2_MIN_TRACK_MARGIN);
+        assert!(one_by_one_batch_margin < ALIGNMENT_V2_MIN_TRACK_MARGIN);
+        assert_eq!(v2_effective_alternative_margin(Some(0.02), 0.9, 0.5), 0.02);
+    }
+
+    #[test]
+    fn prepared_pair_fine_budget_uses_all_batch_resident_artifacts_as_baseline() {
+        let empty_evidence = |retained_artifact_bytes| PreparedV2BatchMediaEvidence {
+            inputs: Vec::new(),
+            landmarks: HashMap::new(),
+            extraction_notes: Vec::new(),
+            retained_artifact_bytes,
+        };
+        let evidence = PreparedV2PairEvidence {
+            source: empty_evidence(32),
+            target: empty_evidence(64),
+            batch_retained_artifact_bytes: MAX_V2_ACTIVE_ARTIFACT_BYTES - 1_024,
+            selected_coarse: PreparedV2SelectedCandidate {
+                candidate: v2_test_pair_candidate(),
+                alternatives: Vec::new(),
+                global_margin: 1.0,
+                global_diagnostic: "test shortlist".to_string(),
+            },
+        };
+        let baseline = v2_prepared_retained_artifact_baseline(Some(&evidence));
+        assert_eq!(baseline, MAX_V2_ACTIVE_ARTIFACT_BYTES - 1_024);
+        assert!(ensure_v2_active_artifact_budget(baseline, 1_025).is_err());
+    }
+
+    #[test]
+    fn audio_alignment_batch_final_identity_failure_clears_every_completed_proposal() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+            "source-1", "target-1",
+        )])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-final-identity-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+
+        run_audio_alignment_batch_job_with_pair_executor_and_finalizer(
+            job_id.clone(),
+            cancel_flag,
+            plan,
+            |_job_id, _pair_index, _pair, _cancel_flag| {
+                Ok(test_audio_alignment_batch_proposal("must-be-cleared"))
+            },
+            |completed_pair_indices, ignore_cancel| {
+                assert_eq!(completed_pair_indices, &[0]);
+                assert!(!ignore_cancel);
+                let before_final_verification =
+                    get_audio_alignment_batch_job(job_id.clone()).unwrap();
+                assert_eq!(
+                    before_final_verification.status,
+                    AudioAlignmentJobStatus::Running
+                );
+                assert!(before_final_verification.pairs[0].proposal.is_none());
+                assert_ne!(
+                    before_final_verification.pairs[0].status,
+                    AudioAlignmentJobStatus::Completed
+                );
+                Err("blocked:media-identity-changed：fixture".to_string())
+            },
+        );
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Failed);
+        assert_eq!(terminal.failed_pair_count, terminal.total_pair_count);
+        assert!(terminal.pairs.iter().all(|pair| pair.proposal.is_none()));
+        assert!(terminal
+            .pairs
+            .iter()
+            .all(|pair| pair.status == AudioAlignmentJobStatus::Failed));
+    }
+
+    #[test]
+    fn audio_alignment_batch_polling_never_exposes_staged_proposals_before_final_verification() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-staging-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+
+        run_audio_alignment_batch_job_with_pair_executor(
+            job_id.clone(),
+            cancel_flag,
+            plan,
+            |running_job_id, pair_index, _pair, _cancel_flag| {
+                if pair_index == 1 {
+                    let in_flight =
+                        get_audio_alignment_batch_job(running_job_id.to_string()).unwrap();
+                    assert_eq!(in_flight.status, AudioAlignmentJobStatus::Running);
+                    assert!(in_flight.pairs.iter().all(|pair| pair.proposal.is_none()));
+                    assert!(in_flight
+                        .pairs
+                        .iter()
+                        .all(|pair| pair.status != AudioAlignmentJobStatus::Completed));
+                }
+                Ok(test_audio_alignment_batch_proposal(&format!(
+                    "staged-pair-{pair_index}"
+                )))
+            },
+        );
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Completed);
+        assert!(terminal
+            .pairs
+            .iter()
+            .all(|pair| pair.status == AudioAlignmentJobStatus::Completed));
+        assert!(terminal.pairs.iter().all(|pair| pair.proposal.is_some()));
     }
 
     #[test]
@@ -15199,10 +18369,10 @@ mod tests {
             job_id.clone(),
             cancel_flag,
             plan,
-            |_job_id, _pair_index, request, _cancel_flag| {
-                executed_source_paths.push(request.source_path.clone());
-                validate_media_input(&request.complete_path, "目标原片")?;
-                validate_media_input(&request.source_path, "B 站参考")?;
+            |_job_id, _pair_index, pair, _cancel_flag| {
+                executed_source_paths.push(pair.request.source_path.clone());
+                validate_media_input(&pair.request.complete_path, "目标原片")?;
+                validate_media_input(&pair.request.source_path, "B 站参考")?;
                 Ok(test_audio_alignment_batch_proposal("valid-pair"))
             },
         );
@@ -15230,22 +18400,38 @@ mod tests {
         let job_id = format!("test-audio-batch-cancel-{}", current_time_ms());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
-        complete_audio_alignment_batch_pair(
-            &job_id,
-            0,
-            Some(test_audio_alignment_batch_proposal(
-                "completed-before-cancel",
-            )),
-            None,
-        )
-        .unwrap();
-
-        let requested = cancel_audio_alignment_batch_job(job_id.clone()).unwrap();
-        assert_eq!(requested.status, AudioAlignmentJobStatus::Queued);
-        assert!(requested.message.contains("正在取消"));
+        let mut cancellation_verifier_called = false;
+        run_audio_alignment_batch_job_with_pair_executor_and_finalizer(
+            job_id.clone(),
+            cancel_flag.clone(),
+            plan,
+            |running_job_id, pair_index, _pair, _cancel_flag| {
+                if pair_index == 0 {
+                    return Ok(test_audio_alignment_batch_proposal(
+                        "completed-before-cancel",
+                    ));
+                }
+                let before_cancel =
+                    get_audio_alignment_batch_job(running_job_id.to_string()).unwrap();
+                assert!(before_cancel.pairs[0].proposal.is_none());
+                assert_ne!(
+                    before_cancel.pairs[0].status,
+                    AudioAlignmentJobStatus::Completed
+                );
+                let requested =
+                    cancel_audio_alignment_batch_job(running_job_id.to_string()).unwrap();
+                assert!(requested.message.contains("正在取消"));
+                Err(AUDIO_ALIGNMENT_CANCELLED.to_string())
+            },
+            |completed_pair_indices, ignore_cancel| {
+                cancellation_verifier_called = true;
+                assert!(ignore_cancel);
+                assert_eq!(completed_pair_indices, &[0]);
+                Ok(())
+            },
+        );
+        assert!(cancellation_verifier_called);
         assert!(cancel_flag.load(Ordering::Acquire));
-
-        run_audio_alignment_batch_job(job_id.clone(), cancel_flag, plan);
         let terminal = get_audio_alignment_batch_job(job_id).unwrap();
         assert_eq!(terminal.status, AudioAlignmentJobStatus::Cancelled);
         assert_eq!(terminal.processed_pair_count, 1);
@@ -15253,6 +18439,47 @@ mod tests {
         assert!(terminal.pairs[0].proposal.is_some());
         assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Cancelled);
         assert!(terminal.pairs[1].proposal.is_none());
+    }
+
+    #[test]
+    fn audio_alignment_batch_cancel_discards_staging_when_final_identity_verification_fails() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-cancel-identity-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+
+        run_audio_alignment_batch_job_with_pair_executor_and_finalizer(
+            job_id.clone(),
+            cancel_flag,
+            plan,
+            |running_job_id, pair_index, _pair, _cancel_flag| {
+                if pair_index == 0 {
+                    return Ok(test_audio_alignment_batch_proposal(
+                        "must-not-survive-cancel",
+                    ));
+                }
+                cancel_audio_alignment_batch_job(running_job_id.to_string()).unwrap();
+                Err(AUDIO_ALIGNMENT_CANCELLED.to_string())
+            },
+            |completed_pair_indices, ignore_cancel| {
+                assert!(ignore_cancel);
+                assert_eq!(completed_pair_indices, &[0]);
+                Err("blocked:media-identity-changed：cancel fixture".to_string())
+            },
+        );
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Failed);
+        assert_eq!(terminal.failed_pair_count, terminal.total_pair_count);
+        assert!(terminal.pairs.iter().all(|pair| pair.proposal.is_none()));
+        assert!(terminal
+            .pairs
+            .iter()
+            .all(|pair| pair.status == AudioAlignmentJobStatus::Failed));
     }
 
     #[test]
@@ -15507,6 +18734,49 @@ mod tests {
             visual_sample_interval_ms: None,
             localization_mode: Some(true),
         }
+    }
+
+    fn test_one_source_three_target_batch_plan() -> PlannedAudioAlignmentBatch {
+        let mut request = test_audio_alignment_batch_request(None);
+        request.sources.truncate(1);
+        request.targets.push(AudioAlignmentBatchMediaRequest {
+            media_id: "target-3".to_string(),
+            path: "target-3.mkv".to_string(),
+            audio_stream_index: Some(13),
+            video_stream_index: Some(15),
+        });
+        request.pairs = Some(
+            ["target-1", "target-2", "target-3"]
+                .into_iter()
+                .map(|target| AudioAlignmentBatchPairRequest {
+                    source_media_id: "source-1".to_string(),
+                    target_media_id: target.to_string(),
+                })
+                .collect(),
+        );
+        plan_audio_alignment_batch(request).unwrap()
+    }
+
+    fn test_one_source_five_target_batch_plan() -> PlannedAudioAlignmentBatch {
+        let mut request = test_audio_alignment_batch_request(None);
+        request.sources.truncate(1);
+        for target_index in 3..=5 {
+            request.targets.push(AudioAlignmentBatchMediaRequest {
+                media_id: format!("target-{target_index}"),
+                path: format!("target-{target_index}.mkv"),
+                audio_stream_index: Some(10 + target_index),
+                video_stream_index: Some(12 + target_index),
+            });
+        }
+        request.pairs = Some(
+            (1..=5)
+                .map(|target_index| AudioAlignmentBatchPairRequest {
+                    source_media_id: "source-1".to_string(),
+                    target_media_id: format!("target-{target_index}"),
+                })
+                .collect(),
+        );
+        plan_audio_alignment_batch(request).unwrap()
     }
 
     fn test_audio_alignment_batch_proposal(label: &str) -> AudioAlignmentProposal {

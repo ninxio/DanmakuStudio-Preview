@@ -25,7 +25,7 @@ corepack pnpm tauri:build
 
 最终用户安装和运行 NSIS 包时不需要 Node.js、pnpm、Rust 或 Visual Studio Build Tools。Windows 10/11 通常已预装 WebView2 Runtime；若目标机器缺失 WebView2，应按安装器提示或微软官方运行时安装指引补齐。
 
-当前安装包的媒体匹配后端只使用 CPU，不包含 CUDA Toolkit、cuFFT runtime、CUDA kernel 或 GPU 后端选择项。即使机器安装了 NVIDIA 驱动或 FFmpeg 列出了 CUDA/NVDEC 硬件加速，Alignment V2 的 `-vn` 音频解码、声谱 FFT、landmark、动态规划与相关精修仍不会自动使用 NVIDIA GPU；仅安装 CUDA Toolkit 也不会改变这一行为。可选 CUDA/cuFFT 后端必须在后续实现、与 CPU 基线做等价验证并完成独立打包测试后才能启用。
+当前安装包已包含可选 CUDA/cuFFT 声谱后端，但不随应用分发 CUDA Toolkit 或 cuFFT runtime。目标机器只有在 NVIDIA driver、cuFFT 动态库、CUDA context 和真实 R2C smoke 全部通过时才会报告 GPU ready；默认 auto 模式下初始化或执行失败会丢弃 GPU 中间结果并从头使用 CPU 重算，强制 CUDA 模式则 fail-closed。4090 当前只加速不超过 60 分钟短媒体的共享声谱 FFT；FFmpeg `-vn` 音频解码、长媒体 streaming coarse、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修和项目级搜索仍使用 CPU，也尚未实现 GPU 批量相关。FFmpeg 显示 CUDA/NVDEC 硬件解码能力不等于音频匹配已获得这些加速。
 
 ## C137 安装级人工验证状态
 
@@ -81,5 +81,6 @@ corepack pnpm build
 - Web 构建没有安装级 secret、签发命令或权威撤销注册表，因此只能展示/编辑复核状态，不能签发、恢复或撤销人工 `verified`。
 - release 不打包真实媒体 benchmark。仓库中的 manifest v2 文件是 `isExample=true` 的 placeholder；实际数据集路径、全文件身份和授权说明由评测者保留在本机，运行前通过 Tauri preflight 重新核对媒体身份和显式流索引。
 - 当前真实媒体关系数仍为 0，尚未完成统计校准、规定硬件性能报告、20 套北极星长合集验收。A/B v2 token 已要求共同内容和单侧差异达到 2000/1500 ms 有效/覆盖时长、边界达到 1500/1000 ms，但这些门槛也尚未在授权真实冻结集上完成充分性校准。因此现阶段安装包是 fail-closed 的工程预览，不能作为准确率、性能或人工观看充分性的验收证明。
-- 当前 N×M 匹配逐 pair 串行运行，且 V2 对单个媒体仍有 60 分钟 PCM 上限；本 release 不适合直接处理超过 60 分钟的单文件长合集，也不能把 4090 视为已启用的加速器。
-- V2.1 CPU 路径会在进程内保留最多 768 MiB 的 PCM/landmark/fine 制品 LRU，用于避免同 pair 二次解码并复用后续 pair；自动候选的单任务最坏驻留上限为 1 GiB，native 同时只运行一个普通重型对齐任务。结束应用会释放这些内存；benchmark 的 cold reset 与 session release 也会清空同一缓存槽。该缓存不代表已经完成媒体级 batch，重复全文件身份和 FFprobe 仍待后续整批 pin/index 方案移除。
+- 当前 1×N、N×1 和 N×M 会作为一个原生 batch job 执行：worker 按计划中的 distinct media 节点各建立一次媒体 lease、完整身份、FFprobe timeline/逐帧 PTS、候选音轨与 coarse landmark，全部 pair 完成 coarse scoring 后，再用 exact branch-and-bound 选择项目级 Top-K 非冲突组合。candidate、状态或展开数超过硬上限，或任一可执行 pair 的 coarse 不完整时会整批 fail-closed，不会截断搜索后宣称全局最优。
+- 超过 60 分钟的媒体可以用有界 CPU 流建立 coarse 索引，但窗口 fine 不是任意长媒体保证。候选必须存在完整分集级查询轴，且完整候选逆投影、全部 coarse inlier support、DP/边界 guard 都能同时装入两侧各自不超过 60 分钟的窗口，活动内存预算也必须通过；双侧都超过 60 分钟且没有完整短轴只是其中一个阻断分支。4090 仅在 capability probe 通过后加速不超过 60 分钟短媒体的共享声谱 FFT，不能把它理解为整条匹配流水线或长合集已经 GPU 化。
+- V2.1 在进程内保留最多 768 MiB 的 PCM/landmark/fine 制品 LRU，自动候选的活动制品上限为 1 GiB，native 同时只运行一个普通重型对齐任务；结束应用会释放这些内存，benchmark 的 cold reset 与 session release 也会清空同一缓存槽。普通产品 batch 尚未像 benchmark session 一样固定整批 FFmpeg/FFprobe 二进制并把 tool digest 纳入普通缓存键；同一物理文件若以不同 `mediaId` 或路径别名重复提交，也仍会被当作不同计划节点而不会合并。

@@ -209,7 +209,6 @@ struct SpectralPeak {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Pure streaming foundation; production FFmpeg wiring is a later slice.
 struct StreamingSpectralFrame {
     frame_index: usize,
     spectrum: Vec<f64>,
@@ -217,7 +216,6 @@ struct StreamingSpectralFrame {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Pure streaming foundation; production FFmpeg wiring is a later slice.
 struct StreamingAnchorPeak {
     bin: usize,
     magnitude: f64,
@@ -225,21 +223,18 @@ struct StreamingAnchorPeak {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Pure streaming foundation; production FFmpeg wiring is a later slice.
 struct StreamingAnchorFrame {
     time_ms: i64,
     peaks: Vec<StreamingAnchorPeak>,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Owned by the not-yet-wired MediaCoarseIndex foundation.
 struct CoarseFamilySample {
     seen: u64,
     retained: Vec<RankedLandmark>,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Owned by the not-yet-wired MediaCoarseIndex foundation.
 struct RankedLandmark {
     priority: u64,
     ordinal: u64,
@@ -253,7 +248,6 @@ struct RankedLandmark {
 /// 因而每个超限 family 的输出数仍严格等于 M、不会合成候选，且与 one-shot 均匀抽样
 /// 的对称差严格不超过 `2 * M`。该退化规范换取与媒体时长无关的常量内存。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Public contract for the later production streaming adapter.
 pub struct MediaCoarseIndexResult {
     pub landmarks: Vec<SpectralLandmark>,
     pub observed_landmark_count: u64,
@@ -266,7 +260,6 @@ pub struct MediaCoarseIndexResult {
 /// 按 landmark family 建立的有界粗索引。合法 landmark 只有 48×48 个 family，
 /// 每个 family 最多驻留 `max_hash_occurrences` 个候选。
 #[derive(Debug)]
-#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
 pub struct MediaCoarseIndex {
     max_hash_occurrences: usize,
     observed_landmark_count: u64,
@@ -274,7 +267,6 @@ pub struct MediaCoarseIndex {
     families: HashMap<u64, CoarseFamilySample>,
 }
 
-#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
 impl MediaCoarseIndex {
     pub fn new(max_hash_occurrences: usize) -> Result<Self, String> {
         if !(1..=MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY).contains(&max_hash_occurrences) {
@@ -382,6 +374,7 @@ impl MediaCoarseIndex {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn retained_landmark_count(&self) -> usize {
         self.retained_landmark_count
     }
@@ -389,7 +382,7 @@ impl MediaCoarseIndex {
 
 /// 流式 extractor 当前驻留状态，供长媒体调用方和测试验证内存边界。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Public contract for the later production streaming adapter.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct StreamingLandmarkStateUsage {
     pub stft_tail_samples: usize,
     pub temporal_spectrum_count: usize,
@@ -404,7 +397,6 @@ pub struct StreamingLandmarkStateUsage {
 /// 状态只保留不足一个 window 的 PCM tail、temporal local maximum 所需的前一帧谱、
 /// `max_pair_delta_ms` 窗口内尚未完成 fanout 的 anchors，以及有界 `MediaCoarseIndex`。
 #[derive(Debug)]
-#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
 pub struct StreamingLandmarkExtractor {
     config: LandmarkConfig,
     window_samples: usize,
@@ -417,7 +409,6 @@ pub struct StreamingLandmarkExtractor {
     coarse_index: MediaCoarseIndex,
 }
 
-#[allow(dead_code)] // Pure algorithm slice; deliberately not wired to Tauri in this stage.
 impl StreamingLandmarkExtractor {
     pub fn new(config: LandmarkConfig) -> Result<Self, String> {
         validate_landmark_config(&config)?;
@@ -461,6 +452,7 @@ impl StreamingLandmarkExtractor {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn push_pcm(&mut self, pcm: &[i16]) -> Result<(), String> {
         self.push_pcm_with_cancel(pcm, None)
     }
@@ -491,6 +483,7 @@ impl StreamingLandmarkExtractor {
         check_algorithm_cancelled(cancel_flag)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn finish(self) -> Result<MediaCoarseIndexResult, String> {
         self.finish_with_cancel(None)
     }
@@ -514,6 +507,7 @@ impl StreamingLandmarkExtractor {
         self.coarse_index.finish()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn state_usage(&self) -> StreamingLandmarkStateUsage {
         StreamingLandmarkStateUsage {
             stft_tail_samples: self.stft_tail.len(),
@@ -1092,17 +1086,14 @@ pub struct AffineHypothesis {
     pub max_residual_ms: i64,
 }
 
-// This window contract is staged ahead of the windowed FFmpeg decoder. Keeping it in production
-// code now lets the next C137 stage integrate against a reviewed axis-safe API; the temporary
-// dead-code allowances must disappear when that decoder is connected.
-#[allow(dead_code)]
+// Production callers use this axis-safe contract to bind windowed FFmpeg PCM back to the
+// absolute presentation timeline. It must remain independent of FFmpeg seek coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentationRangeMs {
     pub start_ms: i64,
     pub end_ms: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AffineFineWindowRequest {
     pub source_bounds: PresentationRangeMs,
@@ -1112,7 +1103,6 @@ pub struct AffineFineWindowRequest {
     pub target_guard_ms: i64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AffineFineDecodeWindows {
     pub source: PresentationRangeMs,
@@ -1124,8 +1114,11 @@ pub struct AffineFineDecodeWindows {
 /// Alignment V2 models `target_ms = scale * source_ms + offset_ms`. Fine alignment must cover
 /// the requested target interval and inverse-project that whole interval onto the source axis;
 /// using only the coarse inlier support would silently miss source-only or target-only edits at
-/// the episode edges. The returned ranges remain on the original absolute presentation axes.
-#[allow(dead_code)]
+/// the episode edges. The source window is also the union of that inverse projection and the
+/// complete coarse inlier support. This prevents a source-only insertion between two landmark
+/// regions (for example a 45 s reference-side advertisement) from being clipped merely because
+/// it is wider than the nominal guard. The returned ranges remain on the original absolute
+/// presentation axes.
 pub fn derive_affine_fine_decode_windows(
     hypothesis: &AffineHypothesis,
     request: &AffineFineWindowRequest,
@@ -1165,16 +1158,28 @@ pub fn derive_affine_fine_decode_windows(
     if !projected_start.is_finite() || !projected_end.is_finite() {
         return Err("粗定位 affine 反投影产生了非有限时间。".to_string());
     }
-    let source_start = f64_milliseconds_to_i64(
+    let projected_source_start = f64_milliseconds_to_i64(
         projected_start.min(projected_end) - request.source_guard_ms as f64,
         f64::floor,
-    )?
-    .max(request.source_bounds.start_ms);
-    let source_end = f64_milliseconds_to_i64(
+    )?;
+    let projected_source_end = f64_milliseconds_to_i64(
         projected_start.max(projected_end) + request.source_guard_ms as f64,
         f64::ceil,
-    )?
-    .min(request.source_bounds.end_ms);
+    )?;
+    let support_start = hypothesis
+        .source_start_ms
+        .min(hypothesis.source_end_ms)
+        .saturating_sub(request.source_guard_ms);
+    let support_end = hypothesis
+        .source_start_ms
+        .max(hypothesis.source_end_ms)
+        .saturating_add(request.source_guard_ms);
+    let source_start = projected_source_start
+        .min(support_start)
+        .max(request.source_bounds.start_ms);
+    let source_end = projected_source_end
+        .max(support_end)
+        .min(request.source_bounds.end_ms);
     if source_end <= source_start {
         return Err("反投影来源窗口与来源媒体展示边界没有交集。".to_string());
     }
@@ -1191,7 +1196,6 @@ pub fn derive_affine_fine_decode_windows(
     })
 }
 
-#[allow(dead_code)]
 fn validate_presentation_range(range: PresentationRangeMs, label: &str) -> Result<(), String> {
     if range.end_ms <= range.start_ms {
         return Err(format!("{label}必须是非空半开毫秒区间。"));
@@ -1199,7 +1203,6 @@ fn validate_presentation_range(range: PresentationRangeMs, label: &str) -> Resul
     Ok(())
 }
 
-#[allow(dead_code)]
 fn f64_milliseconds_to_i64(value: f64, round: fn(f64) -> f64) -> Result<i64, String> {
     let rounded = round(value);
     if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
@@ -2241,7 +2244,6 @@ fn landmark_frame_time_ms(
         .ok_or_else(|| "landmark presentation 时间溢出。".to_string())
 }
 
-#[allow(dead_code)] // Used by the pure streaming foundation before production wiring.
 fn validate_streaming_landmark_hash(hash: u64) -> Result<(), String> {
     let anchor_bin = hash >> 16;
     let target_bin = (hash >> 8) & 0xff;
@@ -2251,7 +2253,6 @@ fn validate_streaming_landmark_hash(hash: u64) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)] // Used by the pure streaming foundation before production wiring.
 fn streaming_landmark_priority(family: u64, ordinal: u64) -> u64 {
     // Sampling must depend only on the family-local ordinal. Absolute PTS, strength and the
     // delta bucket can all differ between two otherwise corresponding encodes; mixing any of
@@ -3426,8 +3427,52 @@ mod tests {
                 end_ms: 80_500,
             }
         );
-        assert_eq!(windows.source.start_ms, 27_921);
+        assert_eq!(windows.source.start_ms, 9_000);
         assert_eq!(windows.source.end_ms, 89_726);
+    }
+
+    #[test]
+    fn fine_decode_windows_keep_source_only_gap_wider_than_guard() {
+        let hypothesis = AffineHypothesis {
+            scale: 1.0,
+            offset_ms: -400_000,
+            inlier_count: 24,
+            unique_source_count: 24,
+            unique_source_coverage: 0.8,
+            unique_target_count: 24,
+            unique_target_coverage: 0.8,
+            // Inliers exist on both sides of a 45 s source-only advertisement. The support
+            // envelope, unlike a fixed 31 s inverse-projection guard, retains the whole gap.
+            source_start_ms: 350_000,
+            source_end_ms: 565_000,
+            p50_residual_ms: 10,
+            p95_residual_ms: 30,
+            max_residual_ms: 50,
+        };
+        let windows = derive_affine_fine_decode_windows(
+            &hypothesis,
+            &AffineFineWindowRequest {
+                source_bounds: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 900_000,
+                },
+                target_bounds: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 180_000,
+                },
+                target_query: PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 180_000,
+                },
+                source_guard_ms: 31_000,
+                target_guard_ms: 31_000,
+            },
+        )
+        .unwrap();
+
+        assert!(windows.source.start_ms <= 319_000);
+        assert!(windows.source.end_ms >= 596_000);
+        assert!(windows.source.end_ms - windows.source.start_ms < 60 * 60 * 1_000);
     }
 
     #[test]
