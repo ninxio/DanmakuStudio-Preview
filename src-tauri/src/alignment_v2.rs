@@ -121,11 +121,20 @@ fn resolve_spectral_backend_preference(
                     planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
                     requested_backend: preference.label().to_string(),
                     backend_detail: format!(
-                        "CUDA/cuFFT device #0 {}",
+                        "CUDA/cuFFT device #0 {}; bindings={}; driverLibrary={}; cufftLibrary={}; driverRuntime={}; cufftRuntime={}",
                         capability
                             .selected_device_name
                             .as_deref()
-                            .unwrap_or("未命名 NVIDIA GPU")
+                            .unwrap_or("未命名 NVIDIA GPU"),
+                        capability.bindings_version,
+                        capability.driver_library_name.as_deref().unwrap_or("unknown"),
+                        capability.cufft_library_name.as_deref().unwrap_or("unknown"),
+                        capability
+                            .driver_runtime_version
+                            .map_or_else(|| "unknown".to_string(), |version| version.to_string()),
+                        capability
+                            .cufft_runtime_version
+                            .map_or_else(|| "unknown".to_string(), |version| version.to_string())
                     ),
                     fallback_reason: None,
                 })
@@ -790,20 +799,11 @@ impl StreamingLandmarkExtractor {
                 reason,
             } => {
                 self.spectral_processor = StreamingSpectralProcessor::Cpu;
-                let used_cuda = completed_cuda_frames > 0;
-                self.spectral_backend.backend_id = if used_cuda {
-                    STREAMING_HYBRID_SPECTRAL_BACKEND_ID.to_string()
-                } else {
-                    STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string()
-                };
-                self.spectral_backend.backend_detail = if used_cuda {
-                    "CUDA/cuFFT 流式批次后回退 CPU radix-2 f64 FFT".to_string()
-                } else {
-                    "CPU 流式 radix-2 f64 FFT".to_string()
-                };
-                self.spectral_backend.fallback_reason = Some(format!(
-                    "CUDA 流式批量 FFT 运行失败，后续批次显式回退 CPU：{reason}"
-                ));
+                apply_streaming_cuda_fallback_identity(
+                    &mut self.spectral_backend,
+                    completed_cuda_frames,
+                    &reason,
+                );
                 frames
             }
         };
@@ -873,6 +873,26 @@ impl StreamingLandmarkExtractor {
         }
         Ok(())
     }
+}
+
+fn apply_streaming_cuda_fallback_identity(
+    spectral_backend: &mut SpectralBackendExecution,
+    completed_cuda_frames: usize,
+    reason: &str,
+) {
+    if completed_cuda_frames > 0 {
+        let cuda_runtime_detail = spectral_backend.backend_detail.clone();
+        spectral_backend.backend_id = STREAMING_HYBRID_SPECTRAL_BACKEND_ID.to_string();
+        spectral_backend.backend_detail = format!(
+            "{cuda_runtime_detail}; execution=hybrid-cuda-then-cpu-streaming; completedCudaFrames={completed_cuda_frames}; cpuBackend={STREAMING_CPU_SPECTRAL_BACKEND_ID}"
+        );
+    } else {
+        spectral_backend.backend_id = STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string();
+        spectral_backend.backend_detail = "CPU 流式 radix-2 f64 FFT".to_string();
+    }
+    spectral_backend.fallback_reason = Some(format!(
+        "CUDA 流式批量 FFT 运行失败，后续批次显式回退 CPU：{reason}"
+    ));
 }
 
 fn create_streaming_spectral_processor(
@@ -3752,6 +3772,45 @@ mod tests {
         let error = StreamingLandmarkExtractor::new_with_backend_request(config, &forced_request)
             .unwrap_err();
         assert!(error.starts_with("blocked:cuda-fft-runtime"));
+    }
+
+    #[test]
+    fn streaming_hybrid_fallback_preserves_cuda_runtime_identity() {
+        let create_backend = |runtime_detail: &str| SpectralBackendExecution {
+            backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: runtime_detail.to_string(),
+            fallback_reason: None,
+        };
+        let first_cuda_detail = "CUDA/cuFFT device #0 RTX 4090; bindings=CUDA 13.x ABI via cudarc 0.19.8; driverLibrary=nvcuda.dll; cufftLibrary=cufft64_12.dll; driverRuntime=13030; cufftRuntime=12300";
+        let second_cuda_detail = "CUDA/cuFFT device #0 RTX 4090; bindings=CUDA 13.x ABI via cudarc 0.19.8; driverLibrary=nvcuda.dll; cufftLibrary=cufft64_12.dll; driverRuntime=13040; cufftRuntime=12400";
+        let mut first = create_backend(first_cuda_detail);
+        let mut second = create_backend(second_cuda_detail);
+
+        apply_streaming_cuda_fallback_identity(&mut first, 4_096, "fixture runtime failure");
+        apply_streaming_cuda_fallback_identity(&mut second, 4_096, "fixture runtime failure");
+
+        assert_eq!(first.backend_id, STREAMING_HYBRID_SPECTRAL_BACKEND_ID);
+        assert_eq!(second.backend_id, STREAMING_HYBRID_SPECTRAL_BACKEND_ID);
+        assert!(first.backend_detail.contains(first_cuda_detail));
+        assert!(second.backend_detail.contains(second_cuda_detail));
+        assert!(first
+            .backend_detail
+            .contains("execution=hybrid-cuda-then-cpu-streaming"));
+        assert_ne!(first.backend_detail, second.backend_detail);
+        assert_ne!(first, second);
+
+        let mut zero_cuda_frames = create_backend(first_cuda_detail);
+        apply_streaming_cuda_fallback_identity(
+            &mut zero_cuda_frames,
+            0,
+            "fixture initialization failure",
+        );
+        assert_eq!(
+            zero_cuda_frames.backend_id,
+            STREAMING_CPU_SPECTRAL_BACKEND_ID
+        );
+        assert_eq!(zero_cuda_frames.backend_detail, "CPU 流式 radix-2 f64 FFT");
     }
 
     #[test]

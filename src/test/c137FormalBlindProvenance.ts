@@ -1,69 +1,104 @@
 import { createTestCompleteTimeMapSpan } from "./timeMapEvidence";
 import {
-  compileC137BlindBatchBenchmarkEvidence,
-  computeC137BlindBatchBenchmarkEvidenceDigest,
-  computeC137BlindBatchProjectionDigest,
-  createC137BlindBatchExecutionProjection,
   createC137BlindBatchMediaBindingCommitment,
   deriveC137BlindBatchRawPredictionFromNativeReceipt,
   orderC137BlindBatchMediaInputs,
-  type C137BlindBatchBenchmarkEvidence,
   type C137BlindBatchExecutionProjection
 } from "../domain/alignment/c137BlindBatchEvidence";
 import {
-  computeC137FormalBlindGoldDigest,
-  computeC137FormalBlindManifestDigest,
-  computeC137FormalBlindMediaBindingsDigest,
+  C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+  computeC137FormalBlindManifestDigest as computeFixtureManifestDigest,
   computeC137FormalBlindParametersDigest,
-  computeC137FormalBlindPlanDigest,
   computeC137FormalBlindProvenanceDigest,
+  createC137FormalBlindMatrixExecutionProjection,
+  createC137FormalBlindMatrixModel,
+  createC137FormalBlindMatrixPlan,
   evaluateC137FormalBlindProvenance,
-  type C137FormalBlindProvenanceBatchEnvelopeV1,
+  sealC137FormalBlindProvenanceV2,
+  type C137FormalBlindMatrixPlanBatchV2,
+  type C137FormalBlindMatrixPlanV2,
+  type C137FormalBlindProvenanceBatchEnvelopeV2,
   type C137FormalBlindProvenanceEvaluation,
   type C137FormalBlindProvenanceExpectations,
-  type C137FormalBlindProvenancePlanBatchV1,
-  type C137FormalBlindProvenancePlanV1,
-  type C137FormalBlindProvenanceV1
+  type C137FormalBlindProvenanceV2
 } from "../domain/alignment/c137FormalBlindProvenance";
-import type {
-  RealMediaBenchmarkCase,
-  RealMediaBenchmarkGold,
-  RealMediaBenchmarkManifest,
-  RealMediaBenchmarkMediaInput
+import {
+  type RealMediaBenchmarkCase,
+  type RealMediaBenchmarkGold,
+  type RealMediaBenchmarkManifest,
+  type RealMediaBenchmarkMediaInput
 } from "../domain/alignment/realMediaBenchmark";
 import {
+  REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION,
   REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
   REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION,
+  REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
   REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION,
+  createNativeBatchExecutionIdentityDigest,
   createRealMediaBlindBatchExecutionDigest,
   createRealMediaBlindBatchRunReceiptDigest,
   createRealMediaBlindBatchSourceRanking,
   createRealMediaBlindBatchTargetRanking,
   type NativeBatchGlobalCandidateEvidence,
+  type NativeBatchExecutionIdentity,
   type NativeBatchGlobalSelectionEvidence,
+  type NativeBatchRelationRankingEvidence,
   type RealMediaBlindBatchExecutionMedia,
   type RealMediaBlindBatchExecutionSuite,
   type RealMediaBlindBatchPairOutcome,
   type RealMediaBlindBatchRunReceipt
 } from "../domain/alignment/realMediaBlindBatchContract";
+
 import type { AlignmentTimeMapProposal } from "../domain/alignment/types";
 import type { MediaContentIdentity } from "../domain/project/types";
 
-const DEFAULT_QUERY_GROUPS: readonly (readonly string[])[] = [
-  ["formal-case-1", "formal-case-2"],
-  ["formal-case-3", "formal-case-4"],
-  ["formal-case-5", "formal-case-6"]
-];
+const TEST_NATIVE_EXECUTION_IDENTITY: NativeBatchExecutionIdentity = {
+  schemaVersion: 1,
+  engineVersion: "alignment-v2.2-rust",
+  featureVersion: "test-feature-v1",
+  relationScoreVersion: REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+  nativeExecutableDigest: `sha256:${"a".repeat(64)}`,
+  ffmpegBinaryDigest: `sha256:${"b".repeat(64)}`,
+  ffprobeBinaryDigest: `sha256:${"c".repeat(64)}`,
+  sourceSpectralBackends: [
+    {
+      backendId: "cuda-cufft-r2c-512-v1",
+      requestedBackend: "cuda",
+      backendDetail: "test RTX 4090",
+      fallbackReason: null
+    }
+  ],
+  targetSpectralBackends: [
+    {
+      backendId: "cuda-cufft-r2c-512-v1",
+      requestedBackend: "cuda",
+      backendDetail: "test RTX 4090",
+      fallbackReason: null
+    }
+  ]
+};
+const TEST_NATIVE_EXECUTION_IDENTITY_DIGEST = createNativeBatchExecutionIdentityDigest(
+  TEST_NATIVE_EXECUTION_IDENTITY
+);
 
 export interface C137FormalBlindProvenanceFixtureOptions {
-  queryGroups?: readonly (readonly string[])[];
+  caseCount?: number;
+  relationshipAxis?: "source" | "target";
+  visualEvidenceEnabled?: boolean;
+  globalTopK?: number;
   mutateManifest?: (manifest: RealMediaBenchmarkManifest) => void;
+  relationScore?: (input: {
+    queryCaseId: string;
+    candidateRepresentativeCaseId: string;
+    candidateOrdinal: number;
+    gold: boolean;
+  }) => number;
 }
 
 export interface C137FormalBlindProvenanceFixture {
-  provenance: C137FormalBlindProvenanceV1;
+  provenance: C137FormalBlindProvenanceV2;
   manifest: RealMediaBenchmarkManifest;
-  plan: C137FormalBlindProvenancePlanV1;
+  plan: C137FormalBlindMatrixPlanV2;
   expectations: C137FormalBlindProvenanceExpectations;
   evaluation: C137FormalBlindProvenanceEvaluation;
   decisions: C137FormalBlindProvenanceEvaluation["decisions"];
@@ -72,54 +107,28 @@ export interface C137FormalBlindProvenanceFixture {
 export function createC137FormalBlindProvenanceFixture(
   options: C137FormalBlindProvenanceFixtureOptions = {}
 ): C137FormalBlindProvenanceFixture {
-  const manifest = createManifest();
+  const manifest = createManifest(options.caseCount ?? 6);
   options.mutateManifest?.(manifest);
-  const manifestDigest = computeC137FormalBlindManifestDigest(manifest);
-  const candidateCaseIds = manifest.cases.map((benchmarkCase) => benchmarkCase.id);
-  const queryGroups = options.queryGroups ?? DEFAULT_QUERY_GROUPS;
-  const planDraft: Omit<C137FormalBlindProvenancePlanV1, "planDigest"> = {
-    schemaVersion: 1,
-    kind: "c137-formal-blind-provenance-plan",
-    manifestDigest,
-    datasetVersion: manifest.datasetVersion,
-    batches: queryGroups.map((caseIds, index) => ({
-      batchId: `formal-batch-${index + 1}`,
-      caseIds: [...caseIds],
-      candidateCaseIds: [...candidateCaseIds],
-      relationshipAxis: "source",
-      visualEvidenceEnabled: false,
-      topK: 2
-    }))
-  };
-  const plan: C137FormalBlindProvenancePlanV1 = {
-    ...planDraft,
-    planDigest: computeC137FormalBlindPlanDigest(planDraft)
-  };
+  const relationshipAxis = options.relationshipAxis ?? "source";
+  const visualEvidenceEnabled = options.visualEvidenceEnabled ?? false;
+  const globalTopK = options.globalTopK ?? 2;
+  const manifestDigest = computeFixtureManifestDigest(manifest);
+  const plan = createC137FormalBlindMatrixPlan(manifest, manifestDigest, {
+    relationshipAxis,
+    visualEvidenceEnabled,
+    globalTopK,
+    scoreContract: C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT
+  });
   const batches = plan.batches.map((batch) =>
-    createC137FormalBlindBatchEnvelopeFixture(manifest, batch)
+    createC137FormalBlindBatchEnvelopeFixture(manifest, plan, batch, options.relationScore)
   );
-  const draft: Omit<C137FormalBlindProvenanceV1, "provenanceDigest"> = {
-    schemaVersion: 1,
-    kind: "c137-formal-blind-provenance",
-    releaseEligible: false,
-    trustStatus: "untrusted-self-consistent-provenance",
-    manifest,
-    manifestDigest,
-    goldDigest: computeC137FormalBlindGoldDigest(manifest),
-    mediaBindingsDigest: computeC137FormalBlindMediaBindingsDigest(manifest),
-    plan,
-    batches
-  };
-  const provenance: C137FormalBlindProvenanceV1 = {
-    ...draft,
-    provenanceDigest: computeC137FormalBlindProvenanceDigest(draft)
-  };
+  const provenance = sealC137FormalBlindProvenanceV2({ manifest, plan, batches });
   const expectations: C137FormalBlindProvenanceExpectations = {
-    manifestDigest,
+    manifestDigest: provenance.manifestDigest,
     datasetVersion: manifest.datasetVersion,
     planDigest: plan.planDigest,
     parametersDigest: computeC137FormalBlindParametersDigest(provenance),
-    topK: 2
+    topK: globalTopK
   };
   const evaluation = evaluateC137FormalBlindProvenance(provenance, expectations);
   return {
@@ -134,67 +143,79 @@ export function createC137FormalBlindProvenanceFixture(
 
 export function createC137FormalBlindBatchEnvelopeFixture(
   manifest: RealMediaBenchmarkManifest,
-  planBatch: C137FormalBlindProvenancePlanBatchV1
-): C137FormalBlindProvenanceBatchEnvelopeV1 {
-  const options = {
-    caseIds: planBatch.caseIds,
-    candidateCaseIds: planBatch.candidateCaseIds,
-    relationshipAxis: planBatch.relationshipAxis,
-    visualEvidenceEnabled: planBatch.visualEvidenceEnabled,
-    topK: planBatch.topK
-  } as const;
-  const projection = createC137BlindBatchExecutionProjection(manifest, options);
-  const executionSuite = createExecutionSuite(manifest, planBatch, projection);
-  const nativeReceipt = createNativeReceipt(manifest, planBatch, projection, executionSuite);
+  plan: C137FormalBlindMatrixPlanV2,
+  planBatch: C137FormalBlindMatrixPlanBatchV2,
+  relationScore?: C137FormalBlindProvenanceFixtureOptions["relationScore"]
+): C137FormalBlindProvenanceBatchEnvelopeV2 {
+  const projection = createProjection(manifest, plan, planBatch);
+  const executionSuite = createExecutionSuite(manifest, plan, planBatch, projection);
+  const nativeReceipt = createNativeReceipt(
+    manifest,
+    plan,
+    planBatch,
+    projection,
+    executionSuite,
+    relationScore
+  );
   const rawPrediction = deriveC137BlindBatchRawPredictionFromNativeReceipt(
     projection,
     executionSuite,
     nativeReceipt
   );
-  const aggregateEvidence = compileC137BlindBatchBenchmarkEvidence(
-    manifest,
-    options,
-    projection,
-    rawPrediction
-  );
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "c137-formal-blind-provenance-batch",
     batchId: planBatch.batchId,
     projection,
     executionSuite,
     nativeReceipt,
-    rawPrediction,
-    aggregateEvidence
+    rawPrediction
   };
+}
+
+function createProjection(
+  manifest: RealMediaBenchmarkManifest,
+  plan: C137FormalBlindMatrixPlanV2,
+  batch: C137FormalBlindMatrixPlanBatchV2
+): C137BlindBatchExecutionProjection {
+  return createC137FormalBlindMatrixExecutionProjection(manifest, {
+    queryCaseIds: batch.queryCaseIds,
+    candidateCaseIds: batch.candidateCaseIds,
+    relationshipAxis: plan.relationshipAxis,
+    visualEvidenceEnabled: plan.visualEvidenceEnabled,
+    globalTopK: plan.globalTopK
+  });
 }
 
 function createExecutionSuite(
   manifest: RealMediaBenchmarkManifest,
-  planBatch: C137FormalBlindProvenancePlanBatchV1,
+  plan: C137FormalBlindMatrixPlanV2,
+  planBatch: C137FormalBlindMatrixPlanBatchV2,
   projection: C137BlindBatchExecutionProjection
 ): RealMediaBlindBatchExecutionSuite {
-  const byId = new Map(manifest.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase]));
-  const queries = planBatch.caseIds.map((caseId) => requireCase(byId, caseId));
+  const byId = new Map(
+    manifest.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase])
+  );
+  const queries = planBatch.queryCaseIds.map((caseId) => requireCase(byId, caseId));
   const candidates = planBatch.candidateCaseIds.map((caseId) => requireCase(byId, caseId));
-  const sourceCases = planBatch.relationshipAxis === "source" ? queries : candidates;
-  const targetCases = planBatch.relationshipAxis === "target" ? queries : candidates;
+  const sourceCases = plan.relationshipAxis === "source" ? queries : candidates;
+  const targetCases = plan.relationshipAxis === "target" ? queries : candidates;
   return {
-    schemaVersion: 1,
+    schemaVersion: REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION,
     suiteId: projection.suiteId,
     datasetVersion: manifest.datasetVersion,
-    topK: planBatch.topK,
+    topK: plan.globalTopK,
     sources: createExecutionMedia(
       manifest,
       "source",
-      planBatch.visualEvidenceEnabled,
+      plan.visualEvidenceEnabled,
       sourceCases.map((benchmarkCase) => benchmarkCase.source),
       projection.sources
     ),
     targets: createExecutionMedia(
       manifest,
       "target",
-      planBatch.visualEvidenceEnabled,
+      plan.visualEvidenceEnabled,
       targetCases.map((benchmarkCase) => benchmarkCase.target),
       projection.targets
     ),
@@ -211,8 +232,8 @@ function createExecutionSuite(
       matchThreshold: 0.72,
       minGapMs: 250,
       maxCells: 20_000,
-      enableVisualEvidence: planBatch.visualEvidenceEnabled,
-      visualSampleIntervalMs: planBatch.visualEvidenceEnabled ? 500 : null
+      enableVisualEvidence: plan.visualEvidenceEnabled,
+      visualSampleIntervalMs: plan.visualEvidenceEnabled ? 500 : null
     }
   };
 }
@@ -258,22 +279,56 @@ function createExecutionMedia(
 
 function createNativeReceipt(
   manifest: RealMediaBenchmarkManifest,
-  planBatch: C137FormalBlindProvenancePlanBatchV1,
+  plan: C137FormalBlindMatrixPlanV2,
+  planBatch: C137FormalBlindMatrixPlanBatchV2,
   projection: C137BlindBatchExecutionProjection,
-  suite: RealMediaBlindBatchExecutionSuite
+  suite: RealMediaBlindBatchExecutionSuite,
+  scoreOverride: C137FormalBlindProvenanceFixtureOptions["relationScore"]
 ): RealMediaBlindBatchRunReceipt {
-  const selectedPairIds = new Set(
-    planBatch.caseIds.map((caseId) =>
-      goldPairId(manifest, projection, requireCaseById(manifest, caseId))
-    )
+  const model = createC137FormalBlindMatrixModel(
+    manifest,
+    plan.relationshipAxis,
+    plan.visualEvidenceEnabled
+  );
+  const queryByCommitment = new Map(
+    model.queries.map((query) => [query.bindingCommitment, query])
+  );
+  const candidateByCommitment = new Map(
+    model.candidates.map((candidate) => [candidate.bindingCommitment, candidate])
+  );
+  const projectedById = new Map(
+    [...projection.sources, ...projection.targets].map((media) => [media.mediaId, media])
   );
   const pairOutcomes: RealMediaBlindBatchPairOutcome[] = suite.pairs.map((pair, index) => {
     const source = requireExecutionMedia(suite.sources, pair.sourceMediaId);
     const target = requireExecutionMedia(suite.targets, pair.targetMediaId);
-    const projectedPair = projection.pairs[index];
-    if (projectedPair === undefined) throw new Error("fixture projected pair missing");
-    const selected = selectedPairIds.has(projectedPair.pairId);
-    const score = selected ? 0.95 : 0.25 - index / 1_000;
+    const queryMediaId =
+      plan.relationshipAxis === "source" ? pair.sourceMediaId : pair.targetMediaId;
+    const candidateMediaId =
+      plan.relationshipAxis === "source" ? pair.targetMediaId : pair.sourceMediaId;
+    const queryProjection = projectedById.get(queryMediaId);
+    const candidateProjection = projectedById.get(candidateMediaId);
+    const query =
+      queryProjection === undefined
+        ? undefined
+        : queryByCommitment.get(queryProjection.bindingCommitment);
+    const candidate =
+      candidateProjection === undefined
+        ? undefined
+        : candidateByCommitment.get(candidateProjection.bindingCommitment);
+    if (query === undefined || candidate === undefined) {
+      throw new Error("fixture pair cannot map to matrix model");
+    }
+    const candidateSide = plan.relationshipAxis === "source" ? "target" : "source";
+    const gold = samePhysicalMedia(query.benchmarkCase[candidateSide], candidate.media);
+    const score =
+      scoreOverride?.({
+        queryCaseId: query.caseId,
+        candidateRepresentativeCaseId: candidate.representativeCaseId,
+        candidateOrdinal: candidate.ordinal,
+        gold
+      }) ?? (gold ? 0.95 : 0.25 - candidate.ordinal / 10_000);
+    const selected = gold;
     return {
       pairIndex: index,
       pairOrdinal: pair.pairOrdinal,
@@ -281,6 +336,7 @@ function createNativeReceipt(
       targetMediaId: pair.targetMediaId,
       nativeStatus: "completed",
       failureCode: null,
+      relationRanking: createRelationRanking(source, target, score),
       globalSelected: selected,
       globalSelection: createSelection(source, target, score, selected),
       proposalTimeMap: createProposal(source, target)
@@ -293,6 +349,7 @@ function createNativeReceipt(
     suiteId: suite.suiteId,
     datasetVersion: suite.datasetVersion,
     executionDigest: createRealMediaBlindBatchExecutionDigest(suite),
+    executionIdentityDigest: TEST_NATIVE_EXECUTION_IDENTITY_DIGEST,
     nativeJobId: `native-${planBatch.batchId}`,
     nativeEvidenceVersion: REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
     pairingMode: "fullCartesian",
@@ -318,6 +375,38 @@ function createNativeReceipt(
   return {
     ...withoutDigest,
     receiptDigest: createRealMediaBlindBatchRunReceiptDigest(withoutDigest)
+  };
+}
+
+function createRelationRanking(
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  score: number
+): NativeBatchRelationRankingEvidence {
+  return {
+    scoreVersion: REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest: TEST_NATIVE_EXECUTION_IDENTITY_DIGEST,
+    executionIdentity: structuredClone(TEST_NATIVE_EXECUTION_IDENTITY),
+    state: "ranked",
+    candidateCount: 1,
+    eligibleCandidateCount: 1,
+    score,
+    bestEligibleCandidate: {
+      rank: 1,
+      sourceStreamIndex: source.audioStreamIndex,
+      targetStreamIndex: target.audioStreamIndex,
+      score: Math.max(0, score - 0.05),
+      globalScore: score,
+      scale: 1,
+      offsetMs: 0,
+      sourceStartMs: 0,
+      sourceEndMs: 60_000,
+      targetStartMs: 0,
+      targetEndMs: 60_000,
+      inlierCount: 40,
+      temporalCoverage: 0.95,
+      uniqueSourceCoverage: 0.9
+    }
   };
 }
 
@@ -435,7 +524,7 @@ function createProposal(
     sourceIdentity: { ...source.contentIdentity },
     targetIdentity: { ...target.contentIdentity },
     engineVersion: "alignment-v2.0-rust",
-    featureVersion: "c137-formal-provenance-fixture-v1",
+    featureVersion: "c137-formal-matrix-fixture-v2",
     parametersHash: "sha256:test-parameters"
   };
 }
@@ -456,16 +545,16 @@ function createAudioStream(index: number) {
   };
 }
 
-function createManifest(): RealMediaBenchmarkManifest {
+function createManifest(caseCount: number): RealMediaBenchmarkManifest {
   return {
     schemaVersion: 2,
     id: "formal-blind-unit-suite",
-    name: "正式盲测结构证据单元测试",
-    datasetVersion: "formal-frozen-v1",
-    description: "程序构造的六关系冻结 manifest。",
+    name: "正式盲测矩阵结构证据单元测试",
+    datasetVersion: "formal-frozen-v2",
+    description: `程序构造的 ${caseCount} 关系冻结 manifest。`,
     isExample: false,
     licenseNotes: ["不包含真实媒体内容。"],
-    cases: Array.from({ length: 6 }, (_, index) => createCase(index + 1))
+    cases: Array.from({ length: caseCount }, (_, index) => createCase(index + 1))
   };
 }
 
@@ -495,23 +584,32 @@ function createCase(index: number): RealMediaBenchmarkCase {
   };
 }
 
-function createMedia(
-  side: "source" | "target",
-  index: number
-): RealMediaBenchmarkMediaInput {
-  const digestByte = side === "source" ? index : index + 64;
+function createMedia(side: "source" | "target", index: number): RealMediaBenchmarkMediaInput {
+  const digestSeed = side === "source" ? `source-${index}` : `target-${index}`;
+  const digest = deterministicDigest(digestSeed);
   return {
     path: `C:\\formal-suite\\${side}-${index}.mkv`,
-    audioStreamIndex: side === "source" ? index - 1 : index + 6,
+    audioStreamIndex: side === "source" ? 0 : 1,
     videoStreamIndex: 0,
     contentIdentity: {
       algorithm: "sha256-full-file-v2",
-      sizeBytes: side === "source" ? 1_000 + index : 2_000 + index,
-      digest: digestByte.toString(16).padStart(2, "0").repeat(32)
+      sizeBytes: side === "source" ? 1_000_000 + index : 2_000_000 + index,
+      digest
     },
     versionNote: `${side} ${index} 的冻结版本。`,
     licenseNote: "程序构造路径。"
   };
+}
+
+function deterministicDigest(seed: string): string {
+  let state = 2166136261;
+  for (const character of seed) {
+    state ^= character.charCodeAt(0);
+    state = Math.imul(state, 16777619) >>> 0;
+  }
+  return Array.from({ length: 8 }, (_, index) =>
+    ((state + Math.imul(index + 1, 2654435761)) >>> 0).toString(16).padStart(8, "0")
+  ).join("");
 }
 
 function createExecutionIdentity(media: RealMediaBenchmarkMediaInput): MediaContentIdentity {
@@ -532,51 +630,28 @@ function createGold(index: number): RealMediaBenchmarkGold {
     sourceEndMs: 60_000,
     targetStartMs: 0,
     targetEndMs: 60_000,
-    matchedAnchors: [1_000, 15_000, 30_000, 45_000, 59_000].map(
-      (timeMs, anchorIndex) => ({
-        id: `formal-${index}-anchor-${anchorIndex}`,
-        sourceMs: timeMs,
-        targetMs: timeMs
-      })
-    ),
+    matchedAnchors: [1_000, 15_000, 30_000, 45_000, 59_000].map((timeMs, anchorIndex) => ({
+      id: `formal-${index}-anchor-${anchorIndex}`,
+      sourceMs: timeMs,
+      targetMs: timeMs
+    })),
     sourceOnlySpans: [],
     targetOnlySpans: [],
     ambiguousSpans: []
   };
 }
 
-function goldPairId(
-  manifest: RealMediaBenchmarkManifest,
-  projection: C137BlindBatchExecutionProjection,
-  benchmarkCase: RealMediaBenchmarkCase
-): string {
-  const sourceCommitment = createC137BlindBatchMediaBindingCommitment(
-    manifest.id,
-    manifest.datasetVersion,
-    "source",
-    projection.visualEvidenceEnabled,
-    benchmarkCase.source
+function samePhysicalMedia(
+  left: RealMediaBenchmarkMediaInput,
+  right: RealMediaBenchmarkMediaInput
+): boolean {
+  return (
+    left.contentIdentity !== null &&
+    right.contentIdentity !== null &&
+    left.contentIdentity.algorithm === right.contentIdentity.algorithm &&
+    left.contentIdentity.sizeBytes === right.contentIdentity.sizeBytes &&
+    left.contentIdentity.digest.toLowerCase() === right.contentIdentity.digest.toLowerCase()
   );
-  const targetCommitment = createC137BlindBatchMediaBindingCommitment(
-    manifest.id,
-    manifest.datasetVersion,
-    "target",
-    projection.visualEvidenceEnabled,
-    benchmarkCase.target
-  );
-  const source = projection.sources.find(
-    (media) => media.bindingCommitment === sourceCommitment
-  );
-  const target = projection.targets.find(
-    (media) => media.bindingCommitment === targetCommitment
-  );
-  const pair = projection.pairs.find(
-    (candidate) =>
-      candidate.sourceMediaId === source?.mediaId &&
-      candidate.targetMediaId === target?.mediaId
-  );
-  if (pair === undefined) throw new Error("fixture gold pair missing");
-  return pair.pairId;
 }
 
 function requireCase(
@@ -584,15 +659,6 @@ function requireCase(
   caseId: string
 ): RealMediaBenchmarkCase {
   const benchmarkCase = cases.get(caseId);
-  if (benchmarkCase === undefined) throw new Error(`fixture case missing: ${caseId}`);
-  return benchmarkCase;
-}
-
-function requireCaseById(
-  manifest: RealMediaBenchmarkManifest,
-  caseId: string
-): RealMediaBenchmarkCase {
-  const benchmarkCase = manifest.cases.find((item) => item.id === caseId);
   if (benchmarkCase === undefined) throw new Error(`fixture case missing: ${caseId}`);
   return benchmarkCase;
 }
@@ -606,35 +672,55 @@ function requireExecutionMedia(
   return result;
 }
 
-export function resealC137FormalBlindPlanAndProvenanceFixture(
-  provenance: C137FormalBlindProvenanceV1
+export function resealC137FormalBlindNativeReceiptFixture(
+  envelope: C137FormalBlindProvenanceBatchEnvelopeV2
 ): void {
-  const { planDigest, ...planDraft } = provenance.plan;
-  void planDigest;
-  provenance.plan.planDigest = computeC137FormalBlindPlanDigest(planDraft);
-  resealC137FormalBlindProvenanceFixture(provenance);
+  const receipt = envelope.nativeReceipt;
+  receipt.sourceRankings = envelope.executionSuite.sources.map((source) =>
+    createRealMediaBlindBatchSourceRanking(
+      source.mediaId,
+      receipt.pairOutcomes,
+      envelope.executionSuite.topK
+    )
+  );
+  receipt.targetRankings = envelope.executionSuite.targets.map((target) =>
+    createRealMediaBlindBatchTargetRanking(
+      target.mediaId,
+      receipt.pairOutcomes,
+      Math.min(envelope.executionSuite.topK, envelope.executionSuite.sources.length)
+    )
+  );
+  const { receiptDigest, ...draft } = receipt;
+  void receiptDigest;
+  receipt.receiptDigest = createRealMediaBlindBatchRunReceiptDigest(draft);
+  envelope.rawPrediction = deriveC137BlindBatchRawPredictionFromNativeReceipt(
+    envelope.projection,
+    envelope.executionSuite,
+    receipt
+  );
 }
 
 export function resealC137FormalBlindProvenanceFixture(
-  provenance: C137FormalBlindProvenanceV1
+  provenance: C137FormalBlindProvenanceV2
 ): void {
   const { provenanceDigest, ...draft } = provenance;
   void provenanceDigest;
   provenance.provenanceDigest = computeC137FormalBlindProvenanceDigest(draft);
 }
 
-export function resealC137FormalBlindProjectionFixture(
-  projection: C137BlindBatchExecutionProjection
+export function resealC137FormalBlindPlanAndProvenanceFixture(
+  provenance: C137FormalBlindProvenanceV2
 ): void {
-  const { projectionDigest, ...draft } = projection;
-  void projectionDigest;
-  projection.projectionDigest = computeC137BlindBatchProjectionDigest(draft);
-}
-
-export function resealC137FormalBlindAggregateEvidenceFixture(
-  evidence: C137BlindBatchBenchmarkEvidence
-): void {
-  const { evidenceDigest, ...draft } = evidence;
-  void evidenceDigest;
-  evidence.evidenceDigest = computeC137BlindBatchBenchmarkEvidenceDigest(draft);
+  const expected = createC137FormalBlindMatrixPlan(
+    provenance.manifest,
+    provenance.manifestDigest,
+    {
+      relationshipAxis: provenance.plan.relationshipAxis,
+      visualEvidenceEnabled: provenance.plan.visualEvidenceEnabled,
+      globalTopK: provenance.plan.globalTopK,
+      scoreContract: provenance.plan.scoreContract
+    }
+  );
+  provenance.plan = expected;
+  resealC137FormalBlindProvenanceFixture(provenance);
 }

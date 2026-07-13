@@ -17,6 +17,8 @@ import {
   type C137PerformanceRawEvidenceV2
 } from "./c137PerformanceEvidence";
 import {
+  C137_BLIND_GLOBAL_AGGREGATION_CONTRACT,
+  C137_RELATIONSHIP_RANKING_SCOPE,
   computeC137CanonicalDigest,
   computeC137EnvironmentDigest,
   computeC137ReportEvidenceDigest,
@@ -82,11 +84,10 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(raw.collector.sampler).toBe("windows-job-object-working-set-v1");
     expect(raw.environment.storageScope).toBe("workload-media-volumes");
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
-    expect(gate.checks.find((check) => check.id === "external-trust-authority"))
-      .toMatchObject({
-        status: "incomplete",
-        actual: "unverified-caller-snapshot"
-      });
+    expect(gate.checks.find((check) => check.id === "external-trust-authority")).toMatchObject({
+      status: "incomplete",
+      actual: "unverified-caller-snapshot"
+    });
     const rawSchemaCheck = gate.checks.find(
       (check) => check.id === "performance-formal-raw-schema-version"
     );
@@ -100,24 +101,25 @@ describe("C137 fail-closed acceptance gate", () => {
     });
   });
 
-  it("关系排名缺少 private full-Cartesian provenance 时即使调用方补齐 trustContext 也不能放行", () => {
+  it("关系排名缺少 private exhaustive-matrix provenance 时即使调用方补齐 trustContext 也不能放行", () => {
     const bundle = createCompleteBundle();
     refreshReportEvidenceDigests(bundle);
 
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
-    expect(gate.checks.find((check) => check.id === "native-blind-ranking-provenance"))
-      .toMatchObject({
-        status: "incomplete",
-        actual: "missing-private-provenance"
-      });
+    expect(
+      gate.checks.find((check) => check.id === "native-blind-ranking-provenance")
+    ).toMatchObject({
+      status: "incomplete",
+      actual: "missing-private-provenance"
+    });
     expect(
       gate.checks.find((check) => check.id === "native-blind-envelope-integrity")
     ).toMatchObject({ status: "incomplete", actual: "missing" });
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
   });
 
-  it("acceptance 直接重算 private full-Cartesian provenance 并逐条绑定 native-derived ranking", () => {
+  it("acceptance 从全部 matrix cell 重算 global Top-K 并逐条绑定 relationship report v3", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
     const bundle = createCompleteBundle();
     bindFormalBlindProvenanceFixture(bundle, fixture);
@@ -127,6 +129,7 @@ describe("C137 fail-closed acceptance gate", () => {
 
     for (const id of [
       "native-blind-envelope-integrity",
+      "native-blind-protocol-structure",
       "native-blind-plan-binding",
       "native-blind-decision-coverage",
       "native-blind-manifest-binding",
@@ -136,7 +139,10 @@ describe("C137 fail-closed acceptance gate", () => {
       "native-blind-parameters-binding",
       "native-blind-ranking-binding"
     ]) {
-      expect(gate.checks.find((check) => check.id === id), id).toMatchObject({
+      expect(
+        gate.checks.find((check) => check.id === id),
+        id
+      ).toMatchObject({
         status: "pass"
       });
     }
@@ -146,12 +152,24 @@ describe("C137 fail-closed acceptance gate", () => {
       status: "incomplete",
       actual: "self-consistent-no-native-authority"
     });
-    expect(gate.checks.find((check) => check.id === "native-blind-native-attestation"))
-      .toMatchObject({ status: "incomplete" });
+    for (const id of [
+      "external-trust-authority",
+      "native-blind-plan-authority",
+      "native-blind-native-attestation",
+      "native-blind-challenge-freshness",
+      "native-blind-replay-ledger"
+    ]) {
+      expect(
+        gate.checks.find((check) => check.id === id),
+        id
+      ).toMatchObject({
+        status: "incomplete"
+      });
+    }
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
   });
 
-  it("调用方重排 relationship Top-K 并重签全部 report 仍不能越过 native-derived exact binding", () => {
+  it("调用方重排 global Top-K 并重签全部 report 仍不能越过 formal 全矩阵 exact binding", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
     const bundle = createCompleteBundle();
     bindFormalBlindProvenanceFixture(bundle, fixture);
@@ -162,78 +180,197 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
-    expect(gate.checks.find((check) => check.id === "native-blind-envelope-integrity"))
-      .toMatchObject({ status: "pass" });
-    expect(gate.checks.find((check) => check.id === "native-blind-ranking-binding"))
-      .toMatchObject({ status: "incomplete", actual: false });
+    expect(
+      gate.checks.find((check) => check.id === "native-blind-envelope-integrity")
+    ).toMatchObject({ status: "pass" });
+    expect(
+      gate.checks.find((check) => check.id === "native-blind-ranking-binding")
+    ).toMatchObject({ status: "incomplete", actual: false });
     expect(
       gate.checks.find((check) => check.id === "native-blind-ranking-provenance")
     ).toMatchObject({ status: "incomplete", actual: "private-provenance-not-closed" });
   });
 
-  it("公开 aggregate blind evidence 不能冒充 private formal provenance", () => {
-    const fixture = createC137FormalBlindProvenanceFixture();
-    const bundle = createCompleteBundle() as unknown as {
-      formalEvidence: { blindRelationship: unknown };
-    };
-    bundle.formalEvidence.blindRelationship =
-      fixture.provenance.batches[0].aggregateEvidence;
+  it("relationship report v3 的 globalTopK 必须与 protocol5 精确一致", () => {
+    const bundle = createCompleteBundle();
+    bundle.reports.relationshipRanking!.globalTopK = bundle.protocol.topK - 1;
 
     const validation = validateC137AcceptanceBundle(bundle);
 
     expect(validation.valid).toBe(false);
     expect(validation.issues.join("\n")).toContain(
-      "bundle.formalEvidence.blindRelationship"
+      "bundle.reports.relationshipRanking.globalTopK 必须精确等于 bundle.protocol.topK"
     );
+  });
+
+  it("local candidate-shard scope 不能冒充 relationship report v3 的 global exhaustive scope", () => {
+    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+      reports: { relationshipRanking: Record<string, unknown> };
+    };
+    legacy.reports.relationshipRanking.rankingScope = "local-candidate-shard";
+
+    const validation = validateC137AcceptanceBundle(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain(
+      "bundle.reports.relationshipRanking.rankingScope 必须为 global-exhaustive-matrix"
+    );
+  });
+
+  it.each([
+    ["requiredFormalBlindProvenanceSchemaVersion", 1],
+    ["requiredBlindMatrixPlanSchemaVersion", 1],
+    ["requiredNativeEvidenceVersion", 1],
+    ["requiredNativeReceiptSchemaVersion", 1],
+    ["requiredBlindScoreContract", "alignment-v2-pair-local-order-v0"],
+    ["requiredBlindMatrixCoverage", "partial"],
+    ["requiredBlindAggregation", "merge-local-top-k-v0"]
+  ] as const)("protocol5 字段 %s 被降级或篡改时严格拒绝", (field, value) => {
+    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+      protocol: Record<string, unknown>;
+    };
+    legacy.protocol[field] = value;
+
+    const validation = validateC137AcceptanceBundle(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain(`bundle.protocol.${field} 必须为`);
+  });
+
+  it.each([
+    ["matrix plan schema", "schemaVersion", 1],
+    ["shard-invariant score contract", "scoreContract", "local-score-v0"],
+    ["exhaustive matrix coverage", "matrixCoverage", "partial"]
+  ] as const)("formal %s 篡改后即使保留旧摘要也严格拒绝", (_label, field, value) => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const bundle = createCompleteBundle();
+    bindFormalBlindProvenanceFixture(bundle, fixture);
+    const formal = bundle.formalEvidence.blindRelationship;
+    if (formal === null) throw new Error("expected formal fixture");
+    const mutablePlan = formal.plan as unknown as Record<string, unknown>;
+    mutablePlan[field] = value;
+
+    const validation = validateC137AcceptanceBundle(bundle);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("bundle.formalEvidence.blindRelationship");
+  });
+
+  it("formal/native schema 降级为 v1 时严格拒绝，不接受只改版本号的旧 receipt", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const bundle = createCompleteBundle();
+    bindFormalBlindProvenanceFixture(bundle, fixture);
+    const formal = bundle.formalEvidence.blindRelationship;
+    if (formal === null) throw new Error("expected formal fixture");
+    const mutableFormal = formal as unknown as { schemaVersion: number };
+    const mutableReceipt = formal.batches[0].nativeReceipt as unknown as {
+      schemaVersion: number;
+      nativeEvidenceVersion: number;
+    };
+    mutableFormal.schemaVersion = 1;
+    mutableReceipt.schemaVersion = 1;
+    mutableReceipt.nativeEvidenceVersion = 1;
+
+    const validation = validateC137AcceptanceBundle(bundle);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("bundle.formalEvidence.blindRelationship");
+  });
+
+  it("单个 candidate tile 的 local raw prediction 不能冒充 private formal v2 provenance", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const bundle = createCompleteBundle() as unknown as {
+      formalEvidence: { blindRelationship: unknown };
+    };
+    bundle.formalEvidence.blindRelationship = fixture.provenance.batches[0].rawPrediction;
+
+    const validation = validateC137AcceptanceBundle(bundle);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("bundle.formalEvidence.blindRelationship");
     expect(evaluateC137AcceptanceBundle(bundle)).toMatchObject({
       status: "incomplete-evidence",
       verifiedEligible: false
     });
   });
 
-  it("旧 protocol v2 缺少正式 raw schema 绑定时严格拒绝", () => {
+  it("protocol v4 缺少 formal v2 matrix 精确契约字段时严格拒绝", () => {
     const legacy = structuredClone(createCompleteBundle()) as unknown as {
       protocol: Record<string, unknown>;
     };
-    legacy.protocol.schemaVersion = 2;
-    delete legacy.protocol.requiredPerformanceRawSchemaVersion;
+    legacy.protocol.schemaVersion = 4;
+    legacy.protocol.version = "4";
+    delete legacy.protocol.requiredFormalBlindProvenanceSchemaVersion;
+    delete legacy.protocol.requiredBlindMatrixPlanSchemaVersion;
+    delete legacy.protocol.requiredNativeReceiptSchemaVersion;
+    delete legacy.protocol.requiredBlindScoreContract;
+    delete legacy.protocol.requiredBlindMatrixCoverage;
+    delete legacy.protocol.requiredBlindAggregation;
 
     const validation = validateC137AcceptanceBundle(legacy);
 
     expect(validation.valid).toBe(false);
-    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 4");
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 5");
     expect(validation.issues.join("\n")).toContain(
-      "bundle.protocol.requiredPerformanceRawSchemaVersion 缺失"
+      "bundle.protocol.requiredFormalBlindProvenanceSchemaVersion 缺失"
     );
   });
 
-  it("真实上一版 bundle v1/protocol v3/ranking v1 不能混入 v2 formal 字段语义", () => {
-    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+  it("旧 bundle v2/protocol4/ranking2/formal1 不能混入 v3/v5/v3/formal2 语义", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const current = createCompleteBundle();
+    bindFormalBlindProvenanceFixture(current, fixture);
+    const legacy = structuredClone(current) as unknown as {
       schemaVersion: number;
       protocol: Record<string, unknown>;
-      reports: { relationshipRanking: { schemaVersion: number; decisions: Record<string, unknown>[] } };
+      reports: { relationshipRanking: Record<string, unknown> };
+      formalEvidence: {
+        blindRelationship: {
+          schemaVersion: number;
+          plan: { schemaVersion: number };
+          batches: Array<{
+            schemaVersion: number;
+            nativeReceipt: { schemaVersion: number; nativeEvidenceVersion: number };
+          }>;
+        };
+      };
     };
-    legacy.schemaVersion = 1;
-    legacy.protocol.schemaVersion = 3;
-    legacy.protocol.version = "3";
-    delete legacy.protocol.blindRankingPlanDigest;
-    delete legacy.protocol.requiredBlindProjectionSchemaVersion;
-    delete legacy.protocol.requiredNativeEvidenceVersion;
-    delete legacy.protocol.requiredBlindPairingMode;
-    legacy.reports.relationshipRanking.schemaVersion = 1;
-    for (const decision of legacy.reports.relationshipRanking.decisions) {
-      delete decision.provenanceRef;
+    legacy.schemaVersion = 2;
+    legacy.protocol.schemaVersion = 4;
+    legacy.protocol.version = "4";
+    legacy.protocol.requiredNativeEvidenceVersion = 1;
+    for (const field of [
+      "requiredFormalBlindProvenanceSchemaVersion",
+      "requiredBlindMatrixPlanSchemaVersion",
+      "requiredNativeReceiptSchemaVersion",
+      "requiredBlindScoreContract",
+      "requiredBlindMatrixCoverage",
+      "requiredBlindAggregation"
+    ]) {
+      delete legacy.protocol[field];
+    }
+    legacy.reports.relationshipRanking.schemaVersion = 2;
+    delete legacy.reports.relationshipRanking.rankingScope;
+    delete legacy.reports.relationshipRanking.scoreContract;
+    delete legacy.reports.relationshipRanking.globalTopK;
+    legacy.formalEvidence.blindRelationship.schemaVersion = 1;
+    legacy.formalEvidence.blindRelationship.plan.schemaVersion = 1;
+    for (const batch of legacy.formalEvidence.blindRelationship.batches) {
+      batch.schemaVersion = 1;
+      batch.nativeReceipt.schemaVersion = 1;
+      batch.nativeReceipt.nativeEvidenceVersion = 1;
     }
 
     const validation = validateC137AcceptanceBundle(legacy);
     const issues = validation.issues.join("\n");
 
     expect(validation.valid).toBe(false);
-    expect(issues).toContain("bundle.schemaVersion 必须为 2");
-    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 4");
-    expect(issues).toContain("bundle.protocol.blindRankingPlanDigest 缺失");
-    expect(issues).toContain("bundle.reports.relationshipRanking.schemaVersion 必须为 2");
-    expect(issues).toContain("provenanceRef 缺失");
+    expect(issues).toContain("bundle.schemaVersion 必须为 3");
+    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 5");
+    expect(issues).toContain("bundle.protocol.requiredBlindAggregation 缺失");
+    expect(issues).toContain("bundle.reports.relationshipRanking.schemaVersion 必须为 3");
+    expect(issues).toContain("bundle.reports.relationshipRanking.rankingScope 缺失");
+    expect(issues).toContain("bundle.formalEvidence.blindRelationship");
   });
 
   it.each([1, 21])("protocol topK=%s 与 formal blind 2..20 契约不一致时严格拒绝", (topK) => {
@@ -243,9 +380,7 @@ describe("C137 fail-closed acceptance gate", () => {
     const validation = validateC137AcceptanceBundle(bundle);
 
     expect(validation.valid).toBe(false);
-    expect(validation.issues.join("\n")).toContain(
-      "bundle.protocol.topK 必须位于 2..20"
-    );
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.topK 必须位于 2..20");
   });
 
   it("performance report v2 不能冒充绑定 raw v2 的 v3 报告", () => {
@@ -282,11 +417,7 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(storageCheck?.requirement).toContain("结构完整");
     expect(storageCheck?.requirement).toContain("native attestation");
     expect(storageCheck?.requirement).not.toContain("原生 v2 生成");
-    for (const id of [
-      "job-memory-receipt",
-      "terminal-cleanup-receipt",
-      "native-attestation"
-    ]) {
+    for (const id of ["job-memory-receipt", "terminal-cleanup-receipt", "native-attestation"]) {
       expect(gate.checks.find((check) => check.id === id)).toMatchObject({
         status: "incomplete",
         actual: "not-verifiable-in-schema-v2"
@@ -312,35 +443,43 @@ describe("C137 fail-closed acceptance gate", () => {
       status: "incomplete",
       actual: raw.runManifestDigest
     });
-    expect(gate.checks.find((check) => check.id === "performance-measurements"))
-      .toMatchObject({ status: "incomplete", actual: false });
+    expect(gate.checks.find((check) => check.id === "performance-measurements")).toMatchObject({
+      status: "incomplete",
+      actual: false
+    });
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
   });
 
-  it("协议锁定 Top-K 后，冻结 decision 少报候选即使重签全部 report 也必须失败", () => {
+  it("用 local Top-K 子集冒充 protocol 锁定的 global Top-K 时 schema 层即拒绝", () => {
     const bundle = createCompleteBundle();
     const decision = bundle.reports.relationshipRanking!.decisions[0];
     decision.rankedCandidateIds = [decision.goldCandidateId];
     refreshReportEvidenceDigests(bundle);
 
+    const validation = validateC137AcceptanceBundle(bundle);
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
-    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain(
+      "rankedCandidateIds 必须恰好包含 report.globalTopK=5 个候选"
+    );
     expect(bundle.protocol.topK).toBe(5);
-    expect(gate.checks.find((check) => check.id === "ranking-top-k-reported")).toMatchObject({
-      status: "fail",
-      actual: 999
-    });
     expect(gate.status).toBe("incomplete-evidence");
-    expect(gate.reasons.join("\n")).toContain("external-trust-authority");
-    expect(gate.reasons.join("\n")).toContain("ranking-top-k-reported");
+    expect(gate.checks.find((check) => check.id === "bundle-schema")).toMatchObject({
+      status: "incomplete"
+    });
   });
 
   it("Top-K 数量完整但不含 gold 时，即使重签全部 report 也必须失败", () => {
     const bundle = createCompleteBundle();
     const decision = bundle.reports.relationshipRanking!.decisions[0];
     decision.rankedCandidateIds = decision.rankedCandidateIds.map((candidateId, index) =>
-      candidateId === decision.goldCandidateId ? `wrong-candidate-${index}` : candidateId
+      candidateId === decision.goldCandidateId
+        ? computeC137CanonicalDigest({
+            domain: "c137-acceptance-wrong-global-pair-v3",
+            index
+          })
+        : candidateId
     );
     refreshReportEvidenceDigests(bundle);
 
@@ -361,47 +500,78 @@ describe("C137 fail-closed acceptance gate", () => {
   });
 
   it.each([
-    ["ranking mediaKind", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.relationshipRanking!.decisions[0].mediaKind = "synthetic";
-    }],
-    ["TimeMap split", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.timeMap!.cases[0].split = "development";
-    }],
-    ["TimeMap scenarios", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.timeMap!.cases[0].scenarios = ["global-offset"];
-    }],
-    ["visual metadata", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.visualFallback!.cases[0].split = "calibration";
-    }],
-    ["degradation metadata", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.degradation!.cases[0].mediaKind = "synthetic";
-    }]
-  ] as const)("%s 与 dataset 不一致时，重签 report 仍必须被元数据闭环阻断", (_label, mutate) => {
-    const bundle = createCompleteBundle();
-    mutate(bundle);
-    refreshReportEvidenceDigests(bundle);
+    [
+      "ranking mediaKind",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.relationshipRanking!.decisions[0].mediaKind = "synthetic";
+      }
+    ],
+    [
+      "TimeMap split",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.timeMap!.cases[0].split = "development";
+      }
+    ],
+    [
+      "TimeMap scenarios",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.timeMap!.cases[0].scenarios = ["global-offset"];
+      }
+    ],
+    [
+      "visual metadata",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.visualFallback!.cases[0].split = "calibration";
+      }
+    ],
+    [
+      "degradation metadata",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.degradation!.cases[0].mediaKind = "synthetic";
+      }
+    ]
+  ] as const)(
+    "%s 与 dataset 不一致时，重签 report 仍必须被元数据闭环阻断",
+    (_label, mutate) => {
+      const bundle = createCompleteBundle();
+      mutate(bundle);
+      refreshReportEvidenceDigests(bundle);
 
-    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+      const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
-    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
-    expect(gate.checks.find((check) => check.id === "case-metadata-consistency"))
-      .toMatchObject({ status: "incomplete", actual: false });
-    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
-  });
+      expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+      expect(
+        gate.checks.find((check) => check.id === "case-metadata-consistency")
+      ).toMatchObject({ status: "incomplete", actual: false });
+      expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+    }
+  );
 
   it.each([
-    ["缺少 frozen decision", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.calibration!.samples.pop();
-    }],
-    ["metadata 不一致", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.calibration!.samples[0].split = "development";
-    }],
-    ["伪造 correct", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.calibration!.samples[0].correct = false;
-    }],
-    ["decisionId 不一致", (bundle: C137AcceptanceBundle) => {
-      bundle.reports.calibration!.samples[0].decisionId = "unbound-calibration-decision";
-    }]
+    [
+      "缺少 frozen decision",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples.pop();
+      }
+    ],
+    [
+      "metadata 不一致",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].split = "development";
+      }
+    ],
+    [
+      "伪造 correct",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].correct = false;
+      }
+    ],
+    [
+      "decisionId 不一致",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].decisionId = "unbound-calibration-decision";
+      }
+    ]
   ] as const)("calibration %s 时，重签 report 仍不能冒充一对一校准", (_label, mutate) => {
     const bundle = createCompleteBundle();
     mutate(bundle);
@@ -410,8 +580,10 @@ describe("C137 fail-closed acceptance gate", () => {
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
     expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
-    expect(gate.checks.find((check) => check.id === "calibration-samples"))
-      .toMatchObject({ status: "incomplete", actual: false });
+    expect(gate.checks.find((check) => check.id === "calibration-samples")).toMatchObject({
+      status: "incomplete",
+      actual: false
+    });
   });
 
   it("dataset gold 事件计数与 TimeMap 原始事件不一致时，重签 report 仍必须阻断", () => {
@@ -422,8 +594,9 @@ describe("C137 fail-closed acceptance gate", () => {
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
     expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
-    expect(gate.checks.find((check) => check.id === "gold-edit-event-count-binding"))
-      .toMatchObject({ status: "incomplete", actual: false });
+    expect(
+      gate.checks.find((check) => check.id === "gold-edit-event-count-binding")
+    ).toMatchObject({ status: "incomplete", actual: false });
   });
 
   it("任一冻结 time-stretch case 漏报漂移时，其他完美样本不能掩盖", () => {
@@ -434,10 +607,13 @@ describe("C137 fail-closed acceptance gate", () => {
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
     expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
-    expect(gate.checks.find((check) => check.id === "drift-measurements"))
-      .toMatchObject({ status: "incomplete", actual: false });
-    expect(gate.checks.find((check) => check.id === "time-map-end-drift-45m"))
-      .toMatchObject({ status: "pass" });
+    expect(gate.checks.find((check) => check.id === "drift-measurements")).toMatchObject({
+      status: "incomplete",
+      actual: false
+    });
+    expect(gate.checks.find((check) => check.id === "time-map-end-drift-45m")).toMatchObject({
+      status: "pass"
+    });
   });
 
   it("修改硬件或工具链字段但保留旧环境摘要时严格拒绝", () => {
@@ -447,7 +623,9 @@ describe("C137 fail-closed acceptance gate", () => {
     const validation = validateC137AcceptanceBundle(bundle);
     expect(validation.valid).toBe(false);
     expect(validation.issues.join("\n")).toContain("规范摘要不一致");
-    expect(evaluateC137AcceptanceBundle(bundle, createTrustContext(createCompleteBundle()))).toMatchObject({
+    expect(
+      evaluateC137AcceptanceBundle(bundle, createTrustContext(createCompleteBundle()))
+    ).toMatchObject({
       status: "incomplete-evidence",
       verifiedEligible: false
     });
@@ -542,8 +720,8 @@ describe("C137 fail-closed acceptance gate", () => {
         probability: item.rankedCandidateIds[0] === item.goldCandidateId ? 1 : 0,
         correct: item.rankedCandidateIds[0] === item.goldCandidateId
       }));
-    bundle.reports.visualFallback!.cases = bundle.reports.visualFallback!.cases
-      .slice(105)
+    bundle.reports.visualFallback!.cases = bundle.reports
+      .visualFallback!.cases.slice(105)
       .map((item) => ({ ...item, split: "frozen-test" as const }));
     bundle.reports.degradation!.cases = Array.from({ length: 10 }, (_, index) => ({
       caseId: `case-${140 + index}`,
@@ -585,9 +763,11 @@ describe("C137 fail-closed acceptance gate", () => {
     const gate = evaluateC137AcceptanceBundle(bundle, trustContext);
 
     expect(gate.status).toBe("incomplete-evidence");
-    expect(gate.checks.find((check) => check.id === "trusted-receipt:preflight")).toMatchObject({
-      status: "incomplete"
-    });
+    expect(gate.checks.find((check) => check.id === "trusted-receipt:preflight")).toMatchObject(
+      {
+        status: "incomplete"
+      }
+    );
   });
 
   it("raw report 内容篡改但不更新 evidence digest 时必须 incomplete", () => {
@@ -647,8 +827,10 @@ describe("C137 fail-closed acceptance gate", () => {
     const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
 
     expect(gate.status).toBe("incomplete-evidence");
-    expect(gate.checks.find((check) => check.id === "performance-measurements"))
-      .toMatchObject({ status: "incomplete", actual: false });
+    expect(gate.checks.find((check) => check.id === "performance-measurements")).toMatchObject({
+      status: "incomplete",
+      actual: false
+    });
   });
 
   it("bundle 自带任意 approval ID 不能替代外部受信 receipt digest", () => {
@@ -665,7 +847,10 @@ describe("C137 fail-closed acceptance gate", () => {
   });
 
   it("拒绝注入 summary/gate，所有汇总必须从 raw evidence 重算", () => {
-    const tampered = structuredClone(createCompleteBundle()) as unknown as Record<string, unknown>;
+    const tampered = structuredClone(createCompleteBundle()) as unknown as Record<
+      string,
+      unknown
+    >;
     tampered.summary = { status: "pass" };
     tampered.gate = { status: "pass", verifiedEligible: true };
 
@@ -692,8 +877,9 @@ function createCompleteBundle(): C137AcceptanceBundle {
   const { digest: ignoredEnvironmentDigest, ...performanceEnvironmentFields } =
     performanceEvidence.environment;
   void ignoredEnvironmentDigest;
-  performanceEvidence.environment.digest =
-    computeC137PerformanceEnvironmentDigest(performanceEnvironmentFields);
+  performanceEvidence.environment.digest = computeC137PerformanceEnvironmentDigest(
+    performanceEnvironmentFields
+  );
   for (const trial of performanceEvidence.trials) {
     if (trial.trialType === "run") {
       for (const item of trial.cases) {
@@ -703,7 +889,8 @@ function createCompleteBundle(): C137AcceptanceBundle {
       trial.telemetry.memory.sampler = "windows-job-object-working-set-v1";
     }
   }
-  performanceEvidence.evidenceDigest = computeC137PerformanceEvidenceDigest(performanceEvidence);
+  performanceEvidence.evidenceDigest =
+    computeC137PerformanceEvidenceDigest(performanceEvidence);
   const performanceEnvironment = performanceEvidence.environment;
   const environmentWithoutDigest: Omit<C137EnvironmentFingerprint, "digest"> = {
     schemaVersion: 2,
@@ -728,7 +915,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
     goldDigest,
     datasetVersion: "real-frozen-1",
     predictionsDigest,
-    protocolId: "c137-acceptance@4",
+    protocolId: "c137-acceptance@5",
     environmentDigest,
     buildDigest,
     engineVersion: "alignment-v2",
@@ -741,9 +928,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
     mediaKind: "real" as const,
     split: "frozen-test" as const,
     scenarios:
-      index < 30
-        ? (["long-reference", "time-stretch"] as const)
-        : (["global-offset"] as const),
+      index < 30 ? (["long-reference", "time-stretch"] as const) : (["global-offset"] as const),
     goldEditEventCount: 4,
     independentlyReviewed: true,
     adjudicationComplete: true
@@ -759,7 +944,9 @@ function createCompleteBundle(): C137AcceptanceBundle {
     matchedProjectionErrorsMs: [0, 0, 0],
     endDriftAt45MinutesMs: item.scenarios.includes("time-stretch") ? 0 : null,
     editDecisions: Array.from({ length: 4 }, (_, eventIndex) => {
-      const kind = ["sourceOnly", "targetOnly", "replacement"][(caseIndex + eventIndex) % 3] as C137EditKind;
+      const kind = ["sourceOnly", "targetOnly", "replacement"][
+        (caseIndex + eventIndex) % 3
+      ] as C137EditKind;
       return {
         eventId: `${item.caseId}-event-${eventIndex}`,
         goldKind: kind,
@@ -772,15 +959,15 @@ function createCompleteBundle(): C137AcceptanceBundle {
   }));
 
   const bundle: C137AcceptanceBundle = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     kind: "c137-acceptance-bundle",
     manifestDigest,
     datasetVersion: "real-frozen-1",
     certificationClass: "real-frozen",
     protocol: {
-      schemaVersion: 4,
+      schemaVersion: 5,
       id: "c137-acceptance",
-      version: "4",
+      version: "5",
       topK: 5,
       calibrationBinCount: 10,
       requiredColdRuns: 1,
@@ -788,9 +975,15 @@ function createCompleteBundle(): C137AcceptanceBundle {
       requiredCancellationRuns: 1,
       performancePlanDigest: performanceEvidence.planDigest,
       blindRankingPlanDigest: digest("c"),
+      requiredFormalBlindProvenanceSchemaVersion: 2,
+      requiredBlindMatrixPlanSchemaVersion: 2,
       requiredBlindProjectionSchemaVersion: 1,
-      requiredNativeEvidenceVersion: 1,
+      requiredNativeEvidenceVersion: 2,
+      requiredNativeReceiptSchemaVersion: 2,
       requiredBlindPairingMode: "fullCartesian",
+      requiredBlindScoreContract: "alignment-v2-pair-intrinsic-global-weight-v1",
+      requiredBlindMatrixCoverage: "exhaustive",
+      requiredBlindAggregation: C137_BLIND_GLOBAL_AGGREGATION_CONTRACT,
       requiredPerformanceRawSchemaVersion: 2,
       maximumMemorySampleIntervalMs: 100,
       requiredMonotonicClock: "rust-std-instant-session-relative-v1",
@@ -815,7 +1008,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
     },
     environment: {
       ...environmentWithoutDigest,
-      digest: environmentDigest,
+      digest: environmentDigest
     },
     runner: {
       schemaVersion: 1,
@@ -857,7 +1050,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
         manifestDigest,
         datasetVersion: "real-frozen-1",
         predictionsDigest,
-        protocolId: "c137-acceptance@4",
+        protocolId: "c137-acceptance@5",
         environmentDigest,
         buildDigest,
         engineVersion: "alignment-v2",
@@ -872,8 +1065,11 @@ function createCompleteBundle(): C137AcceptanceBundle {
     reports: {
       dataset: { schemaVersion: 1, binding: { ...binding }, cases: datasetCases },
       relationshipRanking: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         binding: { ...binding },
+        rankingScope: C137_RELATIONSHIP_RANKING_SCOPE,
+        scoreContract: "alignment-v2-pair-intrinsic-global-weight-v1",
+        globalTopK: 5,
         decisions
       },
       timeMap: { schemaVersion: 1, binding: { ...binding }, cases: timeMapCases },
@@ -1046,6 +1242,8 @@ function bindFormalBlindProvenanceFixture(
   bundle.datasetVersion = manifest.datasetVersion;
   bundle.protocol.topK = expectations.topK;
   bundle.protocol.blindRankingPlanDigest = provenance.plan.planDigest;
+  relationshipReport.globalTopK = expectations.topK;
+  relationshipReport.scoreContract = provenance.plan.scoreContract;
   bundle.runner.parametersDigest = expectations.parametersDigest;
   bundle.formalEvidence.blindRelationship = structuredClone(provenance);
 
@@ -1125,18 +1323,14 @@ function rebindV2EvidenceWorkload(
   raw.environment.workloadStorage.runManifestDigest = workloadDigest;
   raw.environment.workloadStorage.workloadDigest = workloadDigest;
   raw.environment.workloadStorage.receiptDigest =
-    computeC137PerformanceWorkloadStorageReceiptDigest(
-      raw.environment.workloadStorage
-    );
+    computeC137PerformanceWorkloadStorageReceiptDigest(raw.environment.workloadStorage);
   const { digest: ignoredEnvironmentDigest, ...unsignedEnvironment } = raw.environment;
   void ignoredEnvironmentDigest;
   raw.environment.digest = computeC137PerformanceEnvironmentDigestV2(unsignedEnvironment);
   raw.collector.runManifestDigest = workloadDigest;
   raw.collector.workloadDigest = workloadDigest;
-  raw.collector.workloadStorageReceiptDigest =
-    raw.environment.workloadStorage.receiptDigest;
-  raw.assurance.workloadStorageReceiptDigest =
-    raw.environment.workloadStorage.receiptDigest;
+  raw.collector.workloadStorageReceiptDigest = raw.environment.workloadStorage.receiptDigest;
+  raw.assurance.workloadStorageReceiptDigest = raw.environment.workloadStorage.receiptDigest;
   for (const trial of raw.trials) trial.workloadDigest = workloadDigest;
   raw.planDigest = createC137PerformancePlanDigest(raw.plan);
   raw.evidenceDigest = computeC137PerformanceEvidenceDigestV2(raw);
@@ -1149,14 +1343,28 @@ function relationshipDecision(
   correct: boolean,
   prefix: string
 ): C137RelationshipDecisionEvidence {
-  const goldCandidateId = `${prefix}-gold-${index}`;
-  const distractors = Array.from(
-    { length: 4 },
-    (_, distractorIndex) => `${prefix}-wrong-${index}-${distractorIndex}`
+  const decisionId = computeC137CanonicalDigest({
+    domain: "c137-acceptance-fixture-decision-v3",
+    prefix,
+    index
+  });
+  const goldCandidateId = computeC137CanonicalDigest({
+    domain: "c137-acceptance-fixture-global-pair-v3",
+    prefix,
+    index,
+    candidate: "gold"
+  });
+  const distractors = Array.from({ length: 4 }, (_, distractorIndex) =>
+    computeC137CanonicalDigest({
+      domain: "c137-acceptance-fixture-global-pair-v3",
+      prefix,
+      index,
+      candidate: distractorIndex
+    })
   );
   return {
-    decisionId: `${prefix}-decision-${index}`,
-    provenanceRef: null,
+    decisionId,
+    provenanceRef: decisionId,
     caseId,
     mediaKind: "real",
     split,

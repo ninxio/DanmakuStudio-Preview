@@ -10,23 +10,34 @@ import {
   type C137PerformanceRawEvidenceV2
 } from "./c137PerformanceEvidence";
 import {
+  C137_FORMAL_BLIND_MATRIX_COVERAGE,
+  C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION,
+  C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+  C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
   computeC137FormalBlindGoldDigest,
   computeC137FormalBlindManifestDigest,
   computeC137FormalBlindMediaBindingsDigest,
   computeC137FormalBlindParametersDigest,
   evaluateC137FormalBlindProvenance,
   validateC137FormalBlindProvenance,
-  type C137FormalBlindProvenanceV1
+  type C137FormalBlindProvenanceV2
 } from "./c137FormalBlindProvenance";
+import {
+  REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
+  REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION
+} from "./realMediaBlindBatchContract";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_ACCEPTANCE_SCHEMA_VERSION = 2 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 4 as const;
+export const C137_ACCEPTANCE_SCHEMA_VERSION = 3 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 5 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
-export const C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION = 2 as const;
+export const C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION = 3 as const;
 export const C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION = 3 as const;
 export const C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION = 2 as const;
+export const C137_BLIND_GLOBAL_AGGREGATION_CONTRACT =
+  "global-recompute-from-all-matrix-cells-v1" as const;
+export const C137_RELATIONSHIP_RANKING_SCOPE = "global-exhaustive-matrix" as const;
 
 export const C137_FIXED_ACCEPTANCE_THRESHOLDS = {
   targetPhysicalCoreCount: 4,
@@ -57,10 +68,7 @@ export const C137_FIXED_ACCEPTANCE_THRESHOLDS = {
 } as const;
 
 export type C137Digest = `sha256:${string}`;
-export type C137CertificationClass =
-  | "synthetic-smoke"
-  | "real-development"
-  | "real-frozen";
+export type C137CertificationClass = "synthetic-smoke" | "real-development" | "real-frozen";
 export type C137DatasetSplit = "development" | "calibration" | "frozen-test";
 export type C137EditKind = "sourceOnly" | "targetOnly" | "replacement";
 export type C137QualityLevel = "verified" | "review" | "blocked" | "legacy-unverified";
@@ -89,9 +97,15 @@ export interface C137AcceptanceProtocol {
   requiredCancellationRuns: number;
   performancePlanDigest: C137Digest;
   blindRankingPlanDigest: C137Digest;
+  requiredFormalBlindProvenanceSchemaVersion: typeof C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION;
+  requiredBlindMatrixPlanSchemaVersion: typeof C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION;
   requiredBlindProjectionSchemaVersion: 1;
-  requiredNativeEvidenceVersion: 1;
+  requiredNativeEvidenceVersion: typeof REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION;
+  requiredNativeReceiptSchemaVersion: typeof REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION;
   requiredBlindPairingMode: "fullCartesian";
+  requiredBlindScoreContract: typeof C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT;
+  requiredBlindMatrixCoverage: typeof C137_FORMAL_BLIND_MATRIX_COVERAGE;
+  requiredBlindAggregation: typeof C137_BLIND_GLOBAL_AGGREGATION_CONTRACT;
   requiredPerformanceRawSchemaVersion: typeof C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION;
   maximumMemorySampleIntervalMs: number;
   requiredMonotonicClock: "rust-std-instant-session-relative-v1";
@@ -207,21 +221,23 @@ export interface C137DatasetReport {
 }
 
 export interface C137RelationshipDecisionEvidence {
-  decisionId: string;
-  /** Null marks legacy/self-reported evidence; formal evidence must bind this to native derivation. */
-  provenanceRef: C137Digest | null;
+  decisionId: C137Digest;
+  provenanceRef: C137Digest;
   caseId: string;
   mediaKind: RealMediaBenchmarkMediaKind;
   split: C137DatasetSplit;
   modality: "same-audio" | "visual-only" | "mixed" | "no-common-content";
-  goldCandidateId: string;
-  rankedCandidateIds: string[];
-  verifiedCandidateId: string | null;
+  goldCandidateId: C137Digest;
+  rankedCandidateIds: C137Digest[];
+  verifiedCandidateId: null;
 }
 
 export interface C137RelationshipRankingReport {
   schemaVersion: typeof C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION;
   binding: C137EvidenceBinding;
+  rankingScope: typeof C137_RELATIONSHIP_RANKING_SCOPE;
+  scoreContract: typeof C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT;
+  globalTopK: number;
   decisions: C137RelationshipDecisionEvidence[];
 }
 
@@ -361,7 +377,7 @@ export interface C137AcceptanceReports {
 
 export interface C137AcceptanceFormalEvidence {
   /** Private evidence: it contains frozen gold bindings and execution paths; never share it. */
-  blindRelationship: C137FormalBlindProvenanceV1 | null;
+  blindRelationship: C137FormalBlindProvenanceV2 | null;
 }
 
 export interface C137AcceptanceBundle {
@@ -478,9 +494,7 @@ export function computeC137EnvironmentDigest(
  * Recomputes a report digest from raw evidence. The embedded evidenceDigest is deliberately
  * excluded so a report cannot authenticate itself by changing both its content and claimed hash.
  */
-export function computeC137ReportEvidenceDigest(
-  report: C137BoundAcceptanceReport
-): C137Digest {
+export function computeC137ReportEvidenceDigest(report: C137BoundAcceptanceReport): C137Digest {
   return computeC137CanonicalDigest({
     ...report,
     binding: {
@@ -724,25 +738,31 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-envelope-integrity",
         "incomplete",
         "missing",
-        "必须提交私有 formal blind envelope，包含预注册计划、完整候选全集、execution suite、native full-Cartesian receipt、确定性 raw 与 gold 重算 evidence"
+        "必须提交私有 formal v2 blind envelope，包含预注册 exhaustive matrix 计划、每个 tile 的 execution suite、native receipt v2 与确定性 raw prediction"
+      ),
+      createCheck(
+        "native-blind-protocol-structure",
+        "incomplete",
+        "missing",
+        "protocol v5 必须精确绑定 formal schema2、matrix plan schema2、native evidence/receipt v2、shard-invariant score、exhaustive coverage 与全矩阵重算"
       ),
       createCheck(
         "native-blind-decision-coverage",
         "incomplete",
         "missing",
-        "formal blind 计划必须按序覆盖全部冻结关系，且不得用重复 easy case 或裁剪候选池凑决策数"
+        "formal blind 计划必须无重无漏覆盖全部 query×candidate matrix cell，并在收齐所有候选分片后为每个冻结 query 生成一次全局决策"
       ),
       createCheck(
         "native-blind-ranking-binding",
         "incomplete",
         "missing",
-        "relationship report 必须逐条等于由 native receipt 确定性派生的 gold-free ranking"
+        "relationship report v3 必须声明 global exhaustive scope，并逐条等于所有 native matrix cell 的确定性全局 Top-K 重算"
       ),
       createCheck(
         "native-blind-ranking-provenance",
         "incomplete",
         "missing-private-provenance",
-        "acceptance v2 不再信任调用方自报 Top-K；缺少 private full-Cartesian provenance 时不得放行"
+        "acceptance v3 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
       ),
       ...createPendingBlindAuthorityChecks("missing-private-provenance")
     ];
@@ -757,6 +777,24 @@ function evaluateFormalBlindRankingEvidence(
   });
   const integrityValid = evaluation.valid;
   const coverageValid = integrityValid && evaluation.coverageValid;
+  const protocolStructureBound =
+    integrityValid &&
+    provenance.schemaVersion === bundle.protocol.requiredFormalBlindProvenanceSchemaVersion &&
+    provenance.plan.schemaVersion === bundle.protocol.requiredBlindMatrixPlanSchemaVersion &&
+    provenance.plan.scoreContract === bundle.protocol.requiredBlindScoreContract &&
+    provenance.plan.matrixCoverage === bundle.protocol.requiredBlindMatrixCoverage &&
+    provenance.plan.globalTopK === bundle.protocol.topK &&
+    bundle.protocol.requiredBlindAggregation === C137_BLIND_GLOBAL_AGGREGATION_CONTRACT &&
+    provenance.batches.every(
+      (batch) =>
+        batch.projection.schemaVersion ===
+          bundle.protocol.requiredBlindProjectionSchemaVersion &&
+        batch.nativeReceipt.pairingMode === bundle.protocol.requiredBlindPairingMode &&
+        batch.nativeReceipt.schemaVersion ===
+          bundle.protocol.requiredNativeReceiptSchemaVersion &&
+        batch.nativeReceipt.nativeEvidenceVersion ===
+          bundle.protocol.requiredNativeEvidenceVersion
+    );
   const manifestDigest = integrityValid
     ? computeC137FormalBlindManifestDigest(provenance.manifest)
     : null;
@@ -772,29 +810,32 @@ function evaluateFormalBlindRankingEvidence(
   const datasetApproval = bundle.receipts.datasetApproval;
   const preflight = bundle.receipts.preflight;
   const predictionRun = bundle.receipts.predictionRun;
-  const manifestBound =
-    integrityValid && manifestDigest === bundle.manifestDigest;
+  const manifestBound = integrityValid && manifestDigest === bundle.manifestDigest;
   const goldBound =
     integrityValid && datasetApproval !== null && goldDigest === datasetApproval.goldDigest;
   const mediaBound =
-    integrityValid && preflight !== null && mediaBindingsDigest === preflight.mediaBindingsDigest;
+    integrityValid &&
+    preflight !== null &&
+    mediaBindingsDigest === preflight.mediaBindingsDigest;
   const predictionRootBound =
     integrityValid &&
     predictionRun !== null &&
     predictionRun.predictionsDigest === provenance.provenanceDigest;
-  const parametersBound =
-    integrityValid && parametersDigest === bundle.runner.parametersDigest;
+  const parametersBound = integrityValid && parametersDigest === bundle.runner.parametersDigest;
   const rankingBound =
     integrityValid &&
     coverageValid &&
+    protocolStructureBound &&
     formalDecisionsMatchRelationshipReport(
       evaluation.decisions,
-      bundle.reports.relationshipRanking
+      bundle.reports.relationshipRanking,
+      bundle.protocol.topK
     );
 
   const structuralClosure =
     integrityValid &&
     coverageValid &&
+    protocolStructureBound &&
     manifestBound &&
     goldBound &&
     mediaBound &&
@@ -807,21 +848,29 @@ function evaluateFormalBlindRankingEvidence(
       "native-blind-envelope-integrity",
       integrityValid ? "pass" : "incomplete",
       integrityValid ? provenance.provenanceDigest : issueSummary,
-      "每个 formal batch 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt、raw ranking 与 aggregate evidence"
+      "每个 formal v2 matrix tile 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt v2 与 raw prediction"
+    ),
+    createCheck(
+      "native-blind-protocol-structure",
+      protocolStructureBound ? "pass" : "incomplete",
+      protocolStructureBound,
+      "protocol v5 必须精确绑定 formal schema2、matrix plan schema2、native evidence/receipt v2、固定 shard-invariant scoreContract、exhaustive coverage 与全矩阵重算"
     ),
     createCheck(
       "native-blind-plan-binding",
-      integrityValid && provenance.plan.planDigest === bundle.protocol.blindRankingPlanDigest
+      integrityValid &&
+        protocolStructureBound &&
+        provenance.plan.planDigest === bundle.protocol.blindRankingPlanDigest
         ? "pass"
         : "incomplete",
       provenance.plan.planDigest,
-      "预运行计划摘要必须由 protocol v4 锁定 axis、visual、K、query shards 与完整 candidate universe"
+      "预运行 matrix plan 摘要必须由 protocol v5 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
     ),
     createCheck(
       "native-blind-decision-coverage",
       coverageValid ? "pass" : "incomplete",
       coverageValid ? evaluation.decisions.length : issueSummary,
-      "计划与 native 派生决策必须对全部 frozen case 严格一一对应；同一 case 即使换 shard、axis 或 visual 模式也不能重复计数"
+      "计划与 native receipt 必须无重无漏覆盖全部 frozen query×candidate cell；每个 query 只能在全候选 union 上生成一个全局决策"
     ),
     createCheck(
       "native-blind-manifest-binding",
@@ -857,7 +906,7 @@ function evaluateFormalBlindRankingEvidence(
       "native-blind-ranking-binding",
       rankingBound ? "pass" : "incomplete",
       rankingBound,
-      "relationship report 的 decisionId/provenanceRef/case/gold/Top-K/verified policy 必须逐条等于 native receipt 派生结果"
+      "relationship report v3 的 scope/score/globalTopK 及每条 decisionId/provenanceRef/case/gold/有序全局 Top-K/verified policy 必须逐项等于 formal 全矩阵重算"
     ),
     createCheck(
       "native-blind-ranking-provenance",
@@ -865,11 +914,11 @@ function evaluateFormalBlindRankingEvidence(
       structuralClosure
         ? "self-consistent-no-native-authority"
         : "private-provenance-not-closed",
-      "内容闭环不能证明签发者或 native job 真实存在；必须再验证独立 plan authority、native execution attestation、challenge freshness 与防重放账本"
+      "formal v2 内容闭环仍不能证明签发者或 native job 真实存在；当前仍缺少独立 plan authority、native attestation、challenge freshness 与有状态 replay ledger"
     ),
     ...createPendingBlindAuthorityChecks(
       structuralClosure
-        ? "not-implemented-in-formal-provenance-v1"
+        ? "not-implemented-in-formal-provenance-v2"
         : "private-provenance-not-closed"
     )
   ];
@@ -882,15 +931,24 @@ function formalDecisionsMatchRelationshipReport(
     goldPairId: string;
     rankedPairIds: string[];
   }[],
-  report: C137RelationshipRankingReport | null
+  report: C137RelationshipRankingReport | null,
+  globalTopK: number
 ): boolean {
-  if (report === null || report.decisions.length !== decisions.length) {
+  if (
+    report === null ||
+    report.rankingScope !== C137_RELATIONSHIP_RANKING_SCOPE ||
+    report.scoreContract !== C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT ||
+    report.globalTopK !== globalTopK ||
+    report.decisions.length !== decisions.length
+  ) {
     return false;
   }
   return report.decisions.every((reported, index) => {
     const derived = decisions[index];
     return (
       derived !== undefined &&
+      derived.rankedPairIds.length === globalTopK &&
+      reported.rankedCandidateIds.length === globalTopK &&
       reported.decisionId === derived.provenanceRef &&
       reported.provenanceRef === derived.provenanceRef &&
       reported.caseId === derived.caseId &&
@@ -921,7 +979,13 @@ function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[
       "native-blind-challenge-freshness",
       "incomplete",
       actual,
-      "必须由有状态 authority 核验一次性 challenge、有效期与 receipt 防重放"
+      "必须由独立 authority 签发并核验一次性 challenge、有效期与 plan/run 绑定"
+    ),
+    createCheck(
+      "native-blind-replay-ledger",
+      "incomplete",
+      actual,
+      "必须由有状态 authority ledger 原子登记 challenge、native job、receipt 与 provenance root，拒绝跨 bundle 重放"
     ),
     createCheck(
       "native-blind-modality-provenance",
@@ -938,10 +1002,7 @@ function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[
   ];
 }
 
-function equalOrderedStrings(
-  left: readonly string[],
-  right: readonly string[]
-): boolean {
+function equalOrderedStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
@@ -1045,7 +1106,9 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
   const datasetIds = new Set(reports.dataset.cases.map((item) => item.caseId));
   const datasetById = new Map(reports.dataset.cases.map((item) => [item.caseId, item]));
   const timeMapIds = new Set(reports.timeMap.cases.map((item) => item.caseId));
-  const rankingCaseIds = new Set(reports.relationshipRanking.decisions.map((item) => item.caseId));
+  const rankingCaseIds = new Set(
+    reports.relationshipRanking.decisions.map((item) => item.caseId)
+  );
   const everyDatasetCaseMeasured = [...datasetIds].every(
     (caseId) => timeMapIds.has(caseId) && rankingCaseIds.has(caseId)
   );
@@ -1109,8 +1172,9 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
   const driftEvidenceComplete =
     frozenTimeStretchCases.length > 0 &&
     frozenTimeStretchCases.every((item) => item.endDriftAt45MinutesMs !== null);
-  const frozenRankingDecisions = reports.relationshipRanking.decisions.filter(isFrozenRealEvidence);
-  const rankingByDecisionId = new Map(
+  const frozenRankingDecisions =
+    reports.relationshipRanking.decisions.filter(isFrozenRealEvidence);
+  const rankingByDecisionId = new Map<string, C137RelationshipDecisionEvidence>(
     reports.relationshipRanking.decisions.map((item) => [item.decisionId, item])
   );
   const calibrationByDecisionId = new Map(
@@ -1172,15 +1236,16 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
     performanceWorkloadManifestBound &&
     matchesC137PerformanceEnvironment(bundle.environment, reports.performance.rawEvidence) &&
     reports.performance.rawEvidence.planDigest === bundle.protocol.performancePlanDigest &&
-    reports.performance.rawEvidence.collector.clock === bundle.protocol.requiredMonotonicClock &&
-    reports.performance.rawEvidence.collector.sampler === bundle.protocol.requiredMemorySampler &&
+    reports.performance.rawEvidence.collector.clock ===
+      bundle.protocol.requiredMonotonicClock &&
+    reports.performance.rawEvidence.collector.sampler ===
+      bundle.protocol.requiredMemorySampler &&
     reports.performance.rawEvidence.environment.storageScope ===
       bundle.protocol.requiredStorageScope &&
     reports.performance.rawEvidence.plan.memorySampleIntervalMs <=
       bundle.protocol.maximumMemorySampleIntervalMs &&
-    reports.performance.rawEvidence.trials.filter(
-      (trial) => trial.trialType === "cancellation"
-    ).length >= bundle.protocol.requiredCancellationRuns;
+    reports.performance.rawEvidence.trials.filter((trial) => trial.trialType === "cancellation")
+      .length >= bundle.protocol.requiredCancellationRuns;
 
   return [
     createCheck(
@@ -1293,8 +1358,7 @@ function evaluateDatasetThresholds(report: C137DatasetReport): C137AcceptanceChe
     ),
     thresholdCheck(
       "dataset-long-references",
-      longReferenceCount >=
-        C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumLongReferenceRelationCount,
+      longReferenceCount >= C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumLongReferenceRelationCount,
       longReferenceCount,
       `长参考关系数 ≥ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumLongReferenceRelationCount}`
     ),
@@ -1348,16 +1412,14 @@ function evaluateRelationshipThresholds(
   return [
     thresholdCheck(
       "ranking-frozen-decisions",
-      frozen.length >=
-        C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumFrozenRelationshipDecisionCount,
+      frozen.length >= C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumFrozenRelationshipDecisionCount,
       frozen.length,
       `frozen-test 关系判断数 ≥ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumFrozenRelationshipDecisionCount}`
     ),
     thresholdCheck(
       "ranking-same-audio-top1",
       sameAudio.length > 0 &&
-        sameAudioTop1Accuracy >=
-          C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumSameAudioTop1Accuracy,
+        sameAudioTop1Accuracy >= C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumSameAudioTop1Accuracy,
       sameAudioTop1Accuracy,
       `同源音轨 Top-1 ≥ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumSameAudioTop1Accuracy}`
     ),
@@ -1392,14 +1454,13 @@ function evaluateTimeMapThresholds(report: C137TimeMapReport): C137AcceptanceChe
     .filter((item) => item.scenarios.includes("time-stretch"))
     .map((item) => item.endDriftAt45MinutesMs)
     .filter((value): value is number => value !== null);
-  const maximumDrift = driftValues.length > 0 ? Math.max(...driftValues) : Number.POSITIVE_INFINITY;
+  const maximumDrift =
+    driftValues.length > 0 ? Math.max(...driftValues) : Number.POSITIVE_INFINITY;
   const events = frozenCases
     .flatMap((item) => item.editDecisions)
     .filter((item) => item.durationMs >= 1_000);
   const overall = evaluateEditClassification(events);
-  const paired = events.filter(
-    (item) => item.goldKind !== null && item.predictedKind !== null
-  );
+  const paired = events.filter((item) => item.goldKind !== null && item.predictedKind !== null);
   const boundaryP95 = percentile(
     paired
       .map((item) => item.boundaryErrorMs)
@@ -1462,8 +1523,7 @@ function evaluateTimeMapThresholds(report: C137TimeMapReport): C137AcceptanceChe
     checks.push(
       thresholdCheck(
         `time-map-edit-class:${kind}`,
-        sampleCount > 0 &&
-          metrics.f1 >= C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumPerEditClassF1,
+        sampleCount > 0 && metrics.f1 >= C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumPerEditClassF1,
         metrics.f1,
         `${kind} 分类 F1 ≥ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumPerEditClassF1}`
       )
@@ -1510,7 +1570,10 @@ function evaluateVisualFallbackThresholds(
     (item) => item.rankedCandidateIds[0] === item.goldCandidateId
   ).length;
   const top1Accuracy = safeRatio(top1Correct, cases.length);
-  const projectionP95 = percentile(cases.flatMap((item) => item.projectionErrorsMs), 0.95);
+  const projectionP95 = percentile(
+    cases.flatMap((item) => item.projectionErrorsMs),
+    0.95
+  );
   const unsafeSparseVerifiedCount = cases.filter(
     (item) => item.sparseVisualAutomaticVerified
   ).length;
@@ -1518,16 +1581,14 @@ function evaluateVisualFallbackThresholds(
     thresholdCheck(
       "visual-fallback-top1",
       cases.length > 0 &&
-        top1Accuracy >=
-          C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumVisualFallbackTop1Accuracy,
+        top1Accuracy >= C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumVisualFallbackTop1Accuracy,
       top1Accuracy,
       `独立视觉回退 Top-1 ≥ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.minimumVisualFallbackTop1Accuracy}`
     ),
     thresholdCheck(
       "visual-fallback-projection-p95",
       projectionP95 !== null &&
-        projectionP95 <=
-          C137_FIXED_ACCEPTANCE_THRESHOLDS.maximumVisualFallbackProjectionP95Ms,
+        projectionP95 <= C137_FIXED_ACCEPTANCE_THRESHOLDS.maximumVisualFallbackProjectionP95Ms,
       projectionP95 ?? "missing",
       `独立视觉回退投影误差 p95 ≤ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.maximumVisualFallbackProjectionP95Ms}ms`
     ),
@@ -1544,7 +1605,8 @@ function evaluateDegradationThresholds(report: C137DegradationReport): C137Accep
   const cases = report.cases.filter(isFrozenRealEvidence);
   const unsafe = cases.filter(
     (item) =>
-      item.actualLevel !== item.expectedLevel || item.actualReasonCode !== item.expectedReasonCode
+      item.actualLevel !== item.expectedLevel ||
+      item.actualReasonCode !== item.expectedReasonCode
   ).length;
   return [
     thresholdCheck(
@@ -1598,17 +1660,16 @@ function evaluatePerformanceThresholds(
     requiredRawSchemaVersion === C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION &&
     rawSchemaVersion === requiredRawSchemaVersion;
   const validation = validateC137PerformanceEvidence(report.rawEvidence);
-  const measuredRuns = report.rawEvidence.schemaVersion === 1
-    ? getC137PerformanceMeasuredRuns(report.rawEvidence)
-    : getC137PerformanceMeasuredRuns(report.rawEvidence);
+  const measuredRuns =
+    report.rawEvidence.schemaVersion === 1
+      ? getC137PerformanceMeasuredRuns(report.rawEvidence)
+      : getC137PerformanceMeasuredRuns(report.rawEvidence);
   const coldRuns = measuredRuns.filter((item) => item.runKind === "cold");
   const hotRuns = measuredRuns.filter((item) => item.runKind === "hot");
   const coldElapsed = maximum(coldRuns.map((item) => item.elapsedMs));
   const hotElapsed = maximum(hotRuns.map((item) => item.elapsedMs));
   const peakValues = measuredRuns.map(getC137PerformancePeakRss);
-  const peakRss = peakValues.every((item) => item !== null)
-    ? maximum(peakValues)
-    : null;
+  const peakRss = peakValues.every((item) => item !== null) ? maximum(peakValues) : null;
   const resultDigestCount = new Set(measuredRuns.map((item) => item.outputDigest)).size;
   const cancellations = report.rawEvidence.trials.filter(
     (trial) => trial.trialType === "cancellation"
@@ -1619,9 +1680,7 @@ function evaluatePerformanceThresholds(
   );
   const maximumCancellationP95 =
     protocol.cancellationThreshold.maximumP95Ms ?? Number.NEGATIVE_INFINITY;
-  const v2Evidence = report.rawEvidence.schemaVersion === 2
-    ? report.rawEvidence
-    : null;
+  const v2Evidence = report.rawEvidence.schemaVersion === 2 ? report.rawEvidence : null;
   const assurance = v2Evidence?.assurance ?? null;
   const workloadStorageReceiptComplete =
     formalRawSchemaMatches &&
@@ -1714,8 +1773,7 @@ function evaluatePerformanceThresholds(
     ),
     thresholdCheck(
       "performance-hot-elapsed",
-      hotElapsed !== null &&
-        hotElapsed <= C137_FIXED_ACCEPTANCE_THRESHOLDS.maximumHotElapsedMs,
+      hotElapsed !== null && hotElapsed <= C137_FIXED_ACCEPTANCE_THRESHOLDS.maximumHotElapsedMs,
       hotElapsed ?? "missing",
       `热缓存最大完成时间 ≤ ${C137_FIXED_ACCEPTANCE_THRESHOLDS.maximumHotElapsedMs}ms`
     ),
@@ -1836,9 +1894,7 @@ function bindingMatchesBundle(
   );
 }
 
-function isApprovedCalibrationThreshold(
-  value: C137CalibrationThresholdApproval
-): boolean {
+function isApprovedCalibrationThreshold(value: C137CalibrationThresholdApproval): boolean {
   return (
     value.status === "approved" &&
     value.approvalId !== null &&
@@ -1847,10 +1903,10 @@ function isApprovedCalibrationThreshold(
   );
 }
 
-function isApprovedCancellationThreshold(
-  value: C137CancellationThresholdApproval
-): boolean {
-  return value.status === "approved" && value.approvalId !== null && value.maximumP95Ms !== null;
+function isApprovedCancellationThreshold(value: C137CancellationThresholdApproval): boolean {
+  return (
+    value.status === "approved" && value.approvalId !== null && value.maximumP95Ms !== null
+  );
 }
 
 function isFrozenRealEvidence(value: {
@@ -1930,7 +1986,9 @@ function calculateEce(samples: readonly C137CalibrationSample[], binCount: numbe
     const lower = bin / binCount;
     const upper = (bin + 1) / binCount;
     const inBin = samples.filter(
-      (item) => item.probability >= lower && (bin === binCount - 1 ? item.probability <= upper : item.probability < upper)
+      (item) =>
+        item.probability >= lower &&
+        (bin === binCount - 1 ? item.probability <= upper : item.probability < upper)
     );
     if (inBin.length === 0) {
       continue;
@@ -1984,7 +2042,8 @@ function createCheck(
 function createAcceptanceGate(checks: C137AcceptanceCheck[]): C137AcceptanceGate {
   const incomplete = checks.filter((check) => check.status === "incomplete");
   const failed = checks.filter((check) => check.status === "fail");
-  const status = incomplete.length > 0 ? "incomplete-evidence" : failed.length > 0 ? "fail" : "pass";
+  const status =
+    incomplete.length > 0 ? "incomplete-evidence" : failed.length > 0 ? "fail" : "pass";
   const diagnostics = [...incomplete, ...failed];
   return {
     scope: "c137-release-acceptance",
@@ -2000,9 +2059,7 @@ function createAcceptanceGate(checks: C137AcceptanceCheck[]): C137AcceptanceGate
   };
 }
 
-export function validateC137AcceptanceBundle(
-  value: unknown
-): C137AcceptanceValidationResult {
+export function validateC137AcceptanceBundle(value: unknown): C137AcceptanceValidationResult {
   const issues: string[] = [];
   const bundle = strictRecord(
     value,
@@ -2025,7 +2082,12 @@ export function validateC137AcceptanceBundle(
   if (bundle === null) {
     return { valid: false, issues };
   }
-  requireLiteral(bundle.schemaVersion, C137_ACCEPTANCE_SCHEMA_VERSION, "bundle.schemaVersion", issues);
+  requireLiteral(
+    bundle.schemaVersion,
+    C137_ACCEPTANCE_SCHEMA_VERSION,
+    "bundle.schemaVersion",
+    issues
+  );
   requireLiteral(bundle.kind, "c137-acceptance-bundle", "bundle.kind", issues);
   requireDigest(bundle.manifestDigest, "bundle.manifestDigest", issues);
   requireString(bundle.datasetVersion, "bundle.datasetVersion", issues);
@@ -2041,16 +2103,12 @@ export function validateC137AcceptanceBundle(
   validateReceipts(bundle.receipts, issues);
   validateFormalEvidence(bundle.formalEvidence, issues);
   validateReports(bundle.reports, issues);
+  validateRelationshipProtocolContract(bundle.protocol, bundle.reports, issues);
   return { valid: issues.length === 0, issues };
 }
 
 function validateFormalEvidence(value: unknown, issues: string[]): void {
-  const record = strictRecord(
-    value,
-    "bundle.formalEvidence",
-    ["blindRelationship"],
-    issues
-  );
+  const record = strictRecord(value, "bundle.formalEvidence", ["blindRelationship"], issues);
   if (record === null || record.blindRelationship === null) {
     return;
   }
@@ -2103,11 +2161,7 @@ export function validateC137AcceptanceTrustContext(
   );
   if (reports !== null) {
     for (const key of REQUIRED_REPORT_KEYS) {
-      requireDigest(
-        reports[key],
-        `trustContext.trustedReportEvidenceDigests.${key}`,
-        issues
-      );
+      requireDigest(reports[key], `trustContext.trustedReportEvidenceDigests.${key}`, issues);
     }
   }
   return { valid: issues.length === 0, issues };
@@ -2128,9 +2182,15 @@ function validateProtocol(value: unknown, issues: string[]): void {
       "requiredCancellationRuns",
       "performancePlanDigest",
       "blindRankingPlanDigest",
+      "requiredFormalBlindProvenanceSchemaVersion",
+      "requiredBlindMatrixPlanSchemaVersion",
       "requiredBlindProjectionSchemaVersion",
       "requiredNativeEvidenceVersion",
+      "requiredNativeReceiptSchemaVersion",
       "requiredBlindPairingMode",
+      "requiredBlindScoreContract",
+      "requiredBlindMatrixCoverage",
+      "requiredBlindAggregation",
       "requiredPerformanceRawSchemaVersion",
       "maximumMemorySampleIntervalMs",
       "requiredMonotonicClock",
@@ -2177,7 +2237,23 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   requireDigest(record.performancePlanDigest, "bundle.protocol.performancePlanDigest", issues);
-  requireDigest(record.blindRankingPlanDigest, "bundle.protocol.blindRankingPlanDigest", issues);
+  requireDigest(
+    record.blindRankingPlanDigest,
+    "bundle.protocol.blindRankingPlanDigest",
+    issues
+  );
+  requireLiteral(
+    record.requiredFormalBlindProvenanceSchemaVersion,
+    C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
+    "bundle.protocol.requiredFormalBlindProvenanceSchemaVersion",
+    issues
+  );
+  requireLiteral(
+    record.requiredBlindMatrixPlanSchemaVersion,
+    C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION,
+    "bundle.protocol.requiredBlindMatrixPlanSchemaVersion",
+    issues
+  );
   requireLiteral(
     record.requiredBlindProjectionSchemaVersion,
     1,
@@ -2186,14 +2262,38 @@ function validateProtocol(value: unknown, issues: string[]): void {
   );
   requireLiteral(
     record.requiredNativeEvidenceVersion,
-    1,
+    REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
     "bundle.protocol.requiredNativeEvidenceVersion",
+    issues
+  );
+  requireLiteral(
+    record.requiredNativeReceiptSchemaVersion,
+    REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION,
+    "bundle.protocol.requiredNativeReceiptSchemaVersion",
     issues
   );
   requireLiteral(
     record.requiredBlindPairingMode,
     "fullCartesian",
     "bundle.protocol.requiredBlindPairingMode",
+    issues
+  );
+  requireLiteral(
+    record.requiredBlindScoreContract,
+    C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+    "bundle.protocol.requiredBlindScoreContract",
+    issues
+  );
+  requireLiteral(
+    record.requiredBlindMatrixCoverage,
+    C137_FORMAL_BLIND_MATRIX_COVERAGE,
+    "bundle.protocol.requiredBlindMatrixCoverage",
+    issues
+  );
+  requireLiteral(
+    record.requiredBlindAggregation,
+    C137_BLIND_GLOBAL_AGGREGATION_CONTRACT,
+    "bundle.protocol.requiredBlindAggregation",
     issues
   );
   requireLiteral(
@@ -2249,7 +2349,11 @@ function validateProtocol(value: unknown, issues: string[]): void {
     "bundle.protocol.hotCacheDefinition",
     issues
   );
-  requireDigest(record.targetEnvironmentDigest, "bundle.protocol.targetEnvironmentDigest", issues);
+  requireDigest(
+    record.targetEnvironmentDigest,
+    "bundle.protocol.targetEnvironmentDigest",
+    issues
+  );
   validateCalibrationThresholdApproval(record.calibrationThresholds, issues);
   validateCancellationThresholdApproval(record.cancellationThreshold, issues);
 }
@@ -2288,12 +2392,7 @@ function validateCalibrationThresholdApproval(value: unknown, issues: string[]):
 
 function validateCancellationThresholdApproval(value: unknown, issues: string[]): void {
   const path = "bundle.protocol.cancellationThreshold";
-  const record = strictRecord(
-    value,
-    path,
-    ["status", "approvalId", "maximumP95Ms"],
-    issues
-  );
+  const record = strictRecord(value, path, ["status", "approvalId", "maximumP95Ms"], issues);
   if (record === null) {
     return;
   }
@@ -2304,7 +2403,10 @@ function validateCancellationThresholdApproval(value: unknown, issues: string[])
     if (record.approvalId !== null || record.maximumP95Ms !== null) {
       issues.push(`${path} pending 状态不得携带伪批准阈值。`);
     }
-  } else if (!isNonEmptyString(record.approvalId) || !isNonNegativeInteger(record.maximumP95Ms)) {
+  } else if (
+    !isNonEmptyString(record.approvalId) ||
+    !isNonNegativeInteger(record.maximumP95Ms)
+  ) {
     issues.push(`${path} approved 状态必须包含 approvalId 和 maximumP95Ms。`);
   }
 }
@@ -2443,12 +2545,22 @@ function validateDatasetApprovalReceipt(value: unknown, issues: string[]): void 
     issues
   );
   if (record === null) return;
-  requireLiteral(record.schemaVersion, C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION, `${path}.schemaVersion`, issues);
+  requireLiteral(
+    record.schemaVersion,
+    C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION,
+    `${path}.schemaVersion`,
+    issues
+  );
   requireString(record.receiptId, `${path}.receiptId`, issues);
   requireDigest(record.manifestDigest, `${path}.manifestDigest`, issues);
   requireDigest(record.goldDigest, `${path}.goldDigest`, issues);
   requireString(record.datasetVersion, `${path}.datasetVersion`, issues);
-  requireOneOf(record.certificationClass, ["synthetic-smoke", "real-development", "real-frozen"], `${path}.certificationClass`, issues);
+  requireOneOf(
+    record.certificationClass,
+    ["synthetic-smoke", "real-development", "real-frozen"],
+    `${path}.certificationClass`,
+    issues
+  );
   requireBoolean(record.licenseReviewComplete, `${path}.licenseReviewComplete`, issues);
   requireBoolean(record.independentReviewComplete, `${path}.independentReviewComplete`, issues);
   requireBoolean(record.frozenGoldSealed, `${path}.frozenGoldSealed`, issues);
@@ -2460,11 +2572,26 @@ function validatePreflightReceipt(value: unknown, issues: string[]): void {
   const record = strictRecord(
     value,
     path,
-    ["schemaVersion", "receiptId", "manifestDigest", "datasetVersion", "mediaBindingsDigest", "ok", "realRelationCount", "checkedFileCount", "completedAt"],
+    [
+      "schemaVersion",
+      "receiptId",
+      "manifestDigest",
+      "datasetVersion",
+      "mediaBindingsDigest",
+      "ok",
+      "realRelationCount",
+      "checkedFileCount",
+      "completedAt"
+    ],
     issues
   );
   if (record === null) return;
-  requireLiteral(record.schemaVersion, C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION, `${path}.schemaVersion`, issues);
+  requireLiteral(
+    record.schemaVersion,
+    C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION,
+    `${path}.schemaVersion`,
+    issues
+  );
   requireString(record.receiptId, `${path}.receiptId`, issues);
   requireDigest(record.manifestDigest, `${path}.manifestDigest`, issues);
   requireString(record.datasetVersion, `${path}.datasetVersion`, issues);
@@ -2480,11 +2607,29 @@ function validatePredictionRunReceipt(value: unknown, issues: string[]): void {
   const record = strictRecord(
     value,
     path,
-    ["schemaVersion", "receiptId", "manifestDigest", "datasetVersion", "predictionsDigest", "protocolId", "environmentDigest", "buildDigest", "engineVersion", "featureVersion", "parametersDigest", "completedAt"],
+    [
+      "schemaVersion",
+      "receiptId",
+      "manifestDigest",
+      "datasetVersion",
+      "predictionsDigest",
+      "protocolId",
+      "environmentDigest",
+      "buildDigest",
+      "engineVersion",
+      "featureVersion",
+      "parametersDigest",
+      "completedAt"
+    ],
     issues
   );
   if (record === null) return;
-  requireLiteral(record.schemaVersion, C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION, `${path}.schemaVersion`, issues);
+  requireLiteral(
+    record.schemaVersion,
+    C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION,
+    `${path}.schemaVersion`,
+    issues
+  );
   requireString(record.receiptId, `${path}.receiptId`, issues);
   requireDigest(record.manifestDigest, `${path}.manifestDigest`, issues);
   requireString(record.datasetVersion, `${path}.datasetVersion`, issues);
@@ -2511,7 +2656,11 @@ function validateReports(value: unknown, issues: string[]): void {
   validateNullableReport(record.northStar, validateNorthStarReport, issues);
   validateNullableReport(record.performance, validatePerformanceReport, issues);
   validateNullableReport(record.uiWalkthrough, validateUiWalkthroughReceipt, issues);
-  validateNullableReport(record.releaseVerification, validateReleaseVerificationReceipt, issues);
+  validateNullableReport(
+    record.releaseVerification,
+    validateReleaseVerificationReceipt,
+    issues
+  );
 }
 
 function validateNullableReport(
@@ -2529,13 +2678,30 @@ function validateDatasetReport(value: unknown, issues: string[]): void {
   const record = validateReportHeader(value, path, ["cases"], issues);
   if (record === null) return;
   validateArray(record.cases, `${path}.cases`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["caseId", "mediaKind", "split", "scenarios", "goldEditEventCount", "independentlyReviewed", "adjudicationComplete"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      [
+        "caseId",
+        "mediaKind",
+        "split",
+        "scenarios",
+        "goldEditEventCount",
+        "independentlyReviewed",
+        "adjudicationComplete"
+      ],
+      issues
+    );
     if (entry === null) return;
     requireString(entry.caseId, `${itemPath}.caseId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
     validateScenarios(entry.scenarios, `${itemPath}.scenarios`, issues);
-    requireNonNegativeInteger(entry.goldEditEventCount, `${itemPath}.goldEditEventCount`, issues);
+    requireNonNegativeInteger(
+      entry.goldEditEventCount,
+      `${itemPath}.goldEditEventCount`,
+      issues
+    );
     requireBoolean(entry.independentlyReviewed, `${itemPath}.independentlyReviewed`, issues);
     requireBoolean(entry.adjudicationComplete, `${itemPath}.adjudicationComplete`, issues);
   });
@@ -2547,28 +2713,107 @@ function validateRelationshipRankingReport(value: unknown, issues: string[]): vo
   const record = validateReportHeader(
     value,
     path,
-    ["decisions"],
+    ["rankingScope", "scoreContract", "globalTopK", "decisions"],
     issues,
     C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION
   );
   if (record === null) return;
+  requireLiteral(
+    record.rankingScope,
+    C137_RELATIONSHIP_RANKING_SCOPE,
+    `${path}.rankingScope`,
+    issues
+  );
+  requireLiteral(
+    record.scoreContract,
+    C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+    `${path}.scoreContract`,
+    issues
+  );
+  requirePositiveInteger(record.globalTopK, `${path}.globalTopK`, issues);
+  if (
+    Number.isSafeInteger(record.globalTopK) &&
+    ((record.globalTopK as number) < 2 || (record.globalTopK as number) > 20)
+  ) {
+    issues.push(`${path}.globalTopK 必须位于 2..20。`);
+  }
   validateArray(record.decisions, `${path}.decisions`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["decisionId", "provenanceRef", "caseId", "mediaKind", "split", "modality", "goldCandidateId", "rankedCandidateIds", "verifiedCandidateId"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      [
+        "decisionId",
+        "provenanceRef",
+        "caseId",
+        "mediaKind",
+        "split",
+        "modality",
+        "goldCandidateId",
+        "rankedCandidateIds",
+        "verifiedCandidateId"
+      ],
+      issues
+    );
     if (entry === null) return;
-    requireString(entry.decisionId, `${itemPath}.decisionId`, issues);
-    if (entry.provenanceRef !== null) {
-      requireDigest(entry.provenanceRef, `${itemPath}.provenanceRef`, issues);
+    requireDigest(entry.decisionId, `${itemPath}.decisionId`, issues);
+    requireDigest(entry.provenanceRef, `${itemPath}.provenanceRef`, issues);
+    if (
+      typeof entry.decisionId === "string" &&
+      typeof entry.provenanceRef === "string" &&
+      entry.decisionId !== entry.provenanceRef
+    ) {
+      issues.push(`${itemPath}.decisionId 必须等于 provenanceRef。`);
     }
     requireString(entry.caseId, `${itemPath}.caseId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
-    requireOneOf(entry.modality, ["same-audio", "visual-only", "mixed", "no-common-content"], `${itemPath}.modality`, issues);
-    requireString(entry.goldCandidateId, `${itemPath}.goldCandidateId`, issues);
-    validateStringArray(entry.rankedCandidateIds, `${itemPath}.rankedCandidateIds`, issues, true);
-    requireNullableString(entry.verifiedCandidateId, `${itemPath}.verifiedCandidateId`, issues);
+    requireOneOf(
+      entry.modality,
+      ["same-audio", "visual-only", "mixed", "no-common-content"],
+      `${itemPath}.modality`,
+      issues
+    );
+    requireDigest(entry.goldCandidateId, `${itemPath}.goldCandidateId`, issues);
+    validateDigestArray(
+      entry.rankedCandidateIds,
+      `${itemPath}.rankedCandidateIds`,
+      issues,
+      true
+    );
+    if (entry.verifiedCandidateId !== null) {
+      issues.push(`${itemPath}.verifiedCandidateId 必须为 null。`);
+    }
+    if (
+      Number.isSafeInteger(record.globalTopK) &&
+      Array.isArray(entry.rankedCandidateIds) &&
+      entry.rankedCandidateIds.length !== record.globalTopK
+    ) {
+      issues.push(
+        `${itemPath}.rankedCandidateIds 必须恰好包含 report.globalTopK=${String(record.globalTopK)} 个候选。`
+      );
+    }
   });
   validateUniqueStringField(record.decisions, "decisionId", `${path}.decisions`, issues);
   validateUniqueStringField(record.decisions, "provenanceRef", `${path}.decisions`, issues);
+}
+
+function validateRelationshipProtocolContract(
+  protocol: unknown,
+  reports: unknown,
+  issues: string[]
+): void {
+  if (!isRecord(protocol) || !isRecord(reports)) return;
+  const report = reports.relationshipRanking;
+  if (report === null || !isRecord(report)) return;
+  if (
+    Number.isSafeInteger(protocol.topK) &&
+    Number.isSafeInteger(report.globalTopK) &&
+    report.globalTopK !== protocol.topK
+  ) {
+    issues.push(
+      "bundle.reports.relationshipRanking.globalTopK 必须精确等于 bundle.protocol.topK。"
+    );
+  }
 }
 
 function validateTimeMapReport(value: unknown, issues: string[]): void {
@@ -2576,28 +2821,79 @@ function validateTimeMapReport(value: unknown, issues: string[]): void {
   const record = validateReportHeader(value, path, ["cases"], issues);
   if (record === null) return;
   validateArray(record.cases, `${path}.cases`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["caseId", "mediaKind", "split", "scenarios", "matchedProjectionErrorsMs", "endDriftAt45MinutesMs", "editDecisions"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      [
+        "caseId",
+        "mediaKind",
+        "split",
+        "scenarios",
+        "matchedProjectionErrorsMs",
+        "endDriftAt45MinutesMs",
+        "editDecisions"
+      ],
+      issues
+    );
     if (entry === null) return;
     requireString(entry.caseId, `${itemPath}.caseId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
     validateScenarios(entry.scenarios, `${itemPath}.scenarios`, issues);
-    validateNumberArray(entry.matchedProjectionErrorsMs, `${itemPath}.matchedProjectionErrorsMs`, issues);
-    requireNullableNonNegativeInteger(entry.endDriftAt45MinutesMs, `${itemPath}.endDriftAt45MinutesMs`, issues);
-    validateArray(entry.editDecisions, `${itemPath}.editDecisions`, issues, (event, eventPath) => {
-      const decision = strictRecord(event, eventPath, ["eventId", "goldKind", "predictedKind", "durationMs", "boundaryErrorMs", "durationErrorMs"], issues);
-      if (decision === null) return;
-      requireString(decision.eventId, `${eventPath}.eventId`, issues);
-      validateNullableEditKind(decision.goldKind, `${eventPath}.goldKind`, issues);
-      validateNullableEditKind(decision.predictedKind, `${eventPath}.predictedKind`, issues);
-      if (decision.goldKind === null && decision.predictedKind === null) {
-        issues.push(`${eventPath} goldKind 与 predictedKind 不能同时为 null。`);
+    validateNumberArray(
+      entry.matchedProjectionErrorsMs,
+      `${itemPath}.matchedProjectionErrorsMs`,
+      issues
+    );
+    requireNullableNonNegativeInteger(
+      entry.endDriftAt45MinutesMs,
+      `${itemPath}.endDriftAt45MinutesMs`,
+      issues
+    );
+    validateArray(
+      entry.editDecisions,
+      `${itemPath}.editDecisions`,
+      issues,
+      (event, eventPath) => {
+        const decision = strictRecord(
+          event,
+          eventPath,
+          [
+            "eventId",
+            "goldKind",
+            "predictedKind",
+            "durationMs",
+            "boundaryErrorMs",
+            "durationErrorMs"
+          ],
+          issues
+        );
+        if (decision === null) return;
+        requireString(decision.eventId, `${eventPath}.eventId`, issues);
+        validateNullableEditKind(decision.goldKind, `${eventPath}.goldKind`, issues);
+        validateNullableEditKind(decision.predictedKind, `${eventPath}.predictedKind`, issues);
+        if (decision.goldKind === null && decision.predictedKind === null) {
+          issues.push(`${eventPath} goldKind 与 predictedKind 不能同时为 null。`);
+        }
+        requireNonNegativeInteger(decision.durationMs, `${eventPath}.durationMs`, issues);
+        requireNullableNonNegativeInteger(
+          decision.boundaryErrorMs,
+          `${eventPath}.boundaryErrorMs`,
+          issues
+        );
+        requireNullableNonNegativeInteger(
+          decision.durationErrorMs,
+          `${eventPath}.durationErrorMs`,
+          issues
+        );
       }
-      requireNonNegativeInteger(decision.durationMs, `${eventPath}.durationMs`, issues);
-      requireNullableNonNegativeInteger(decision.boundaryErrorMs, `${eventPath}.boundaryErrorMs`, issues);
-      requireNullableNonNegativeInteger(decision.durationErrorMs, `${eventPath}.durationErrorMs`, issues);
-    });
-    validateUniqueStringField(entry.editDecisions, "eventId", `${itemPath}.editDecisions`, issues);
+    );
+    validateUniqueStringField(
+      entry.editDecisions,
+      "eventId",
+      `${itemPath}.editDecisions`,
+      issues
+    );
   });
   validateUniqueStringField(record.cases, "caseId", `${path}.cases`, issues);
 }
@@ -2607,7 +2903,12 @@ function validateCalibrationReport(value: unknown, issues: string[]): void {
   const record = validateReportHeader(value, path, ["samples"], issues);
   if (record === null) return;
   validateArray(record.samples, `${path}.samples`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["decisionId", "mediaKind", "split", "probability", "correct"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      ["decisionId", "mediaKind", "split", "probability", "correct"],
+      issues
+    );
     if (entry === null) return;
     requireString(entry.decisionId, `${itemPath}.decisionId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
@@ -2623,15 +2924,37 @@ function validateVisualFallbackReport(value: unknown, issues: string[]): void {
   const record = validateReportHeader(value, path, ["cases"], issues);
   if (record === null) return;
   validateArray(record.cases, `${path}.cases`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["caseId", "mediaKind", "split", "goldCandidateId", "rankedCandidateIds", "projectionErrorsMs", "sparseVisualAutomaticVerified"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      [
+        "caseId",
+        "mediaKind",
+        "split",
+        "goldCandidateId",
+        "rankedCandidateIds",
+        "projectionErrorsMs",
+        "sparseVisualAutomaticVerified"
+      ],
+      issues
+    );
     if (entry === null) return;
     requireString(entry.caseId, `${itemPath}.caseId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
     requireString(entry.goldCandidateId, `${itemPath}.goldCandidateId`, issues);
-    validateStringArray(entry.rankedCandidateIds, `${itemPath}.rankedCandidateIds`, issues, true);
+    validateStringArray(
+      entry.rankedCandidateIds,
+      `${itemPath}.rankedCandidateIds`,
+      issues,
+      true
+    );
     validateNumberArray(entry.projectionErrorsMs, `${itemPath}.projectionErrorsMs`, issues);
-    requireBoolean(entry.sparseVisualAutomaticVerified, `${itemPath}.sparseVisualAutomaticVerified`, issues);
+    requireBoolean(
+      entry.sparseVisualAutomaticVerified,
+      `${itemPath}.sparseVisualAutomaticVerified`,
+      issues
+    );
   });
   validateUniqueStringField(record.cases, "caseId", `${path}.cases`, issues);
 }
@@ -2641,7 +2964,20 @@ function validateDegradationReport(value: unknown, issues: string[]): void {
   const record = validateReportHeader(value, path, ["cases"], issues);
   if (record === null) return;
   validateArray(record.cases, `${path}.cases`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["caseId", "mediaKind", "split", "expectedLevel", "actualLevel", "expectedReasonCode", "actualReasonCode"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      [
+        "caseId",
+        "mediaKind",
+        "split",
+        "expectedLevel",
+        "actualLevel",
+        "expectedReasonCode",
+        "actualReasonCode"
+      ],
+      issues
+    );
     if (entry === null) return;
     requireString(entry.caseId, `${itemPath}.caseId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
@@ -2659,14 +2995,39 @@ function validateNorthStarReport(value: unknown, issues: string[]): void {
   const record = validateReportHeader(value, path, ["suites"], issues);
   if (record === null) return;
   validateArray(record.suites, `${path}.suites`, issues, (item, itemPath) => {
-    const entry = strictRecord(item, itemPath, ["suiteId", "mediaKind", "split", "expectedEpisodeCount", "correctlyLocatedEpisodeCount", "crossEpisodeMismatchCount", "exportCompleted"], issues);
+    const entry = strictRecord(
+      item,
+      itemPath,
+      [
+        "suiteId",
+        "mediaKind",
+        "split",
+        "expectedEpisodeCount",
+        "correctlyLocatedEpisodeCount",
+        "crossEpisodeMismatchCount",
+        "exportCompleted"
+      ],
+      issues
+    );
     if (entry === null) return;
     requireString(entry.suiteId, `${itemPath}.suiteId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
-    requireNonNegativeInteger(entry.expectedEpisodeCount, `${itemPath}.expectedEpisodeCount`, issues);
-    requireNonNegativeInteger(entry.correctlyLocatedEpisodeCount, `${itemPath}.correctlyLocatedEpisodeCount`, issues);
-    requireNonNegativeInteger(entry.crossEpisodeMismatchCount, `${itemPath}.crossEpisodeMismatchCount`, issues);
+    requireNonNegativeInteger(
+      entry.expectedEpisodeCount,
+      `${itemPath}.expectedEpisodeCount`,
+      issues
+    );
+    requireNonNegativeInteger(
+      entry.correctlyLocatedEpisodeCount,
+      `${itemPath}.correctlyLocatedEpisodeCount`,
+      issues
+    );
+    requireNonNegativeInteger(
+      entry.crossEpisodeMismatchCount,
+      `${itemPath}.crossEpisodeMismatchCount`,
+      issues
+    );
     requireBoolean(entry.exportCompleted, `${itemPath}.exportCompleted`, issues);
   });
   validateUniqueStringField(record.suites, "suiteId", `${path}.suites`, issues);
@@ -2693,7 +3054,12 @@ function validatePerformanceReport(value: unknown, issues: string[]): void {
 
 function validateUiWalkthroughReceipt(value: unknown, issues: string[]): void {
   const path = "bundle.reports.uiWalkthrough";
-  const record = validateReportHeader(value, path, ["passed", "completedSuiteCount", "buildDigest", "completedAt"], issues);
+  const record = validateReportHeader(
+    value,
+    path,
+    ["passed", "completedSuiteCount", "buildDigest", "completedAt"],
+    issues
+  );
   if (record === null) return;
   requireBoolean(record.passed, `${path}.passed`, issues);
   requireNonNegativeInteger(record.completedSuiteCount, `${path}.completedSuiteCount`, issues);
@@ -2706,11 +3072,29 @@ function validateReleaseVerificationReceipt(value: unknown, issues: string[]): v
   const record = validateReportHeader(
     value,
     path,
-    ["sourceAuditPassed", "lintPassed", "frontendTestsPassed", "rustTestsPassed", "e2ePassed", "buildPassed", "tauriReleasePassed", "buildDigest", "completedAt"],
+    [
+      "sourceAuditPassed",
+      "lintPassed",
+      "frontendTestsPassed",
+      "rustTestsPassed",
+      "e2ePassed",
+      "buildPassed",
+      "tauriReleasePassed",
+      "buildDigest",
+      "completedAt"
+    ],
     issues
   );
   if (record === null) return;
-  for (const key of ["sourceAuditPassed", "lintPassed", "frontendTestsPassed", "rustTestsPassed", "e2ePassed", "buildPassed", "tauriReleasePassed"]) {
+  for (const key of [
+    "sourceAuditPassed",
+    "lintPassed",
+    "frontendTestsPassed",
+    "rustTestsPassed",
+    "e2ePassed",
+    "buildPassed",
+    "tauriReleasePassed"
+  ]) {
     requireBoolean(record[key], `${path}.${key}`, issues);
   }
   requireDigest(record.buildDigest, `${path}.buildDigest`, issues);
@@ -2740,7 +3124,19 @@ function validateEvidenceBinding(value: unknown, path: string, issues: string[])
   const record = strictRecord(
     value,
     path,
-    ["manifestDigest", "goldDigest", "datasetVersion", "predictionsDigest", "protocolId", "environmentDigest", "buildDigest", "engineVersion", "featureVersion", "parametersDigest", "evidenceDigest"],
+    [
+      "manifestDigest",
+      "goldDigest",
+      "datasetVersion",
+      "predictionsDigest",
+      "protocolId",
+      "environmentDigest",
+      "buildDigest",
+      "engineVersion",
+      "featureVersion",
+      "parametersDigest",
+      "evidenceDigest"
+    ],
     issues
   );
   if (record === null) return;
@@ -2776,7 +3172,10 @@ function validateScenarios(value: unknown, path: string, issues: string[]): void
   if (
     !Array.isArray(value) ||
     value.length === 0 ||
-    !value.every((item) => typeof item === "string" && ALL_SCENARIOS.has(item as RealMediaBenchmarkScenario)) ||
+    !value.every(
+      (item) =>
+        typeof item === "string" && ALL_SCENARIOS.has(item as RealMediaBenchmarkScenario)
+    ) ||
     new Set(value).size !== value.length
   ) {
     issues.push(`${path} 必须是非空、不重复的已知场景数组。`);
@@ -2827,6 +3226,22 @@ function validateStringArray(
     new Set(value).size !== value.length
   ) {
     issues.push(`${path} 必须是${requireNonEmpty ? "非空、" : ""}不重复的非空字符串数组。`);
+  }
+}
+
+function validateDigestArray(
+  value: unknown,
+  path: string,
+  issues: string[],
+  requireNonEmpty: boolean
+): void {
+  if (
+    !Array.isArray(value) ||
+    (requireNonEmpty && value.length === 0) ||
+    !value.every((item) => typeof item === "string" && SHA256_DIGEST.test(item)) ||
+    new Set(value).size !== value.length
+  ) {
+    issues.push(`${path} 必须是${requireNonEmpty ? "非空、" : ""}不重复的规范 SHA-256 数组。`);
   }
 }
 
@@ -2964,7 +3379,11 @@ function requireNonNegativeInteger(value: unknown, path: string, issues: string[
   }
 }
 
-function requireNullableNonNegativeInteger(value: unknown, path: string, issues: string[]): void {
+function requireNullableNonNegativeInteger(
+  value: unknown,
+  path: string,
+  issues: string[]
+): void {
   if (value !== null && !isNonNegativeInteger(value)) {
     issues.push(`${path} 必须是 null 或非负整数。`);
   }

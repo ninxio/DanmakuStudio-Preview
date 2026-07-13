@@ -1,4 +1,5 @@
 import {
+  assertC137BlindBatchSingleBatchCandidateUniverse,
   compileC137BlindBatchBenchmarkEvidence,
   createC137BlindBatchMediaBindingCommitment,
   createC137BlindBatchExecutionProjection,
@@ -13,6 +14,16 @@ import type {
   RealMediaBenchmarkManifest,
   RealMediaBenchmarkMediaInput
 } from "../../domain/alignment/realMediaBenchmark";
+import {
+  C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
+  computeC137FormalBlindManifestDigest,
+  createC137FormalBlindMatrixExecutionProjection,
+  createC137FormalBlindMatrixPlan,
+  sealC137FormalBlindProvenanceV2,
+  type C137FormalBlindMatrixPlanV2,
+  type C137FormalBlindProvenanceBatchEnvelopeV2,
+  type C137FormalBlindProvenanceV2
+} from "../../domain/alignment/c137FormalBlindProvenance";
 import type { MediaContentIdentity } from "../../domain/project/types";
 import {
   probeTauriMediaTimeline,
@@ -55,12 +66,44 @@ export type C137BlindBatchSuiteRunner = (
 
 export interface C137BlindBatchBenchmarkOptions extends C137BlindBatchProjectionOptions {
   parameters: RealMediaBlindBatchAlignmentParameters;
-  preflightOptions?: Omit<
-    RealMediaBenchmarkPreflightOptions,
-    "ffmpegPath" | "ffprobePath"
-  >;
+  preflightOptions?: Omit<RealMediaBenchmarkPreflightOptions, "ffmpegPath" | "ffprobePath">;
   runnerOptions?: RealMediaBlindBatchRunnerOptions;
   runner?: C137BlindBatchSuiteRunner;
+}
+
+export const C137_FORMAL_BLIND_MATRIX_BENCHMARK_RESULT_SCHEMA_VERSION = 1 as const;
+
+export type C137FormalBlindMatrixBenchmarkRunStatus =
+  | "completed"
+  | "preflight-failed"
+  | "execution-invalid"
+  | "runner-failed"
+  | "receipt-invalid"
+  | "incomplete-run"
+  | "sealing-failed";
+
+export interface C137FormalBlindMatrixBenchmarkOptions {
+  /** The deterministic exhaustive plan must be frozen before this coordinator performs I/O. */
+  plan: C137FormalBlindMatrixPlanV2;
+  parameters: RealMediaBlindBatchAlignmentParameters;
+  preflightOptions?: Omit<RealMediaBenchmarkPreflightOptions, "ffmpegPath" | "ffprobePath">;
+  runnerOptions?: RealMediaBlindBatchRunnerOptions;
+  runner?: C137BlindBatchSuiteRunner;
+}
+
+/**
+ * This is deliberately private evidence: successful provenance contains frozen gold and local
+ * media paths. Any non-completed result is fail-closed and contains no tile envelope or gold data.
+ */
+export interface C137FormalBlindMatrixBenchmarkResult {
+  schemaVersion: typeof C137_FORMAL_BLIND_MATRIX_BENCHMARK_RESULT_SCHEMA_VERSION;
+  resultKind: "c137-formal-blind-matrix-benchmark";
+  status: C137FormalBlindMatrixBenchmarkRunStatus;
+  preflight: RealMediaBenchmarkPreflightResult;
+  completedBatchCount: number;
+  totalBatchCount: number;
+  provenance: C137FormalBlindProvenanceV2 | null;
+  reasons: string[];
 }
 
 /**
@@ -97,6 +140,14 @@ interface ReportState {
   reasons: string[];
 }
 
+interface FormalMatrixResultState {
+  status: C137FormalBlindMatrixBenchmarkRunStatus;
+  preflight: RealMediaBenchmarkPreflightResult;
+  completedBatchCount: number;
+  provenance?: C137FormalBlindProvenanceV2 | null;
+  reasons: string[];
+}
+
 interface CapturedProbeState {
   byPath: Map<string, MediaTimelineProbeResult>;
   invoker: MediaTimelineProbeInvoker;
@@ -124,10 +175,8 @@ export async function runC137BlindBatchBenchmark(
       ? {}
       : { candidateCaseIds: options.candidateCaseIds })
   };
-  const projection = createC137BlindBatchExecutionProjection(
-    manifest,
-    projectionOptions
-  );
+  const projection = createC137BlindBatchExecutionProjection(manifest, projectionOptions);
+  assertC137BlindBatchSingleBatchCandidateUniverse(manifest, projectionOptions, projection);
   const decisionCases = selectFrozenCases(manifest, options.caseIds);
   const candidateCases = selectFrozenCases(
     manifest,
@@ -153,7 +202,7 @@ export async function runC137BlindBatchBenchmark(
       signal: options.preflightOptions?.signal ?? options.runnerOptions?.signal
     });
   } catch {
-    preflight = createExceptionalPreflight(candidateCases.length);
+    preflight = createExceptionalPreflight(decisionCases.length);
   }
 
   if (!preflight.ok) {
@@ -188,10 +237,7 @@ export async function runC137BlindBatchBenchmark(
   const runner = options.runner ?? defaultSuiteRunner;
   let receiptValue: unknown;
   try {
-    receiptValue = await runner(
-      structuredClone(executionSuite),
-      options.runnerOptions ?? {}
-    );
+    receiptValue = await runner(structuredClone(executionSuite), options.runnerOptions ?? {});
   } catch {
     return finalizeShareableReport(candidateCases, projection, {
       status: "runner-failed",
@@ -248,6 +294,215 @@ export async function runC137BlindBatchBenchmark(
       preflight,
       nativeRunStatus: receipt.status,
       reasons: ["严格回执无法确定性转换或编译为 blind benchmark evidence。"]
+    });
+  }
+}
+
+/**
+ * Execute one pre-registered exhaustive query×candidate matrix. The full manifest is preflighted
+ * exactly once, tiles run sequentially because native media jobs are exclusive, and no private
+ * provenance is published until every tile has completed and the global ranking validates.
+ */
+export async function runC137FormalBlindMatrixBenchmark(
+  manifest: RealMediaBenchmarkManifest,
+  options: C137FormalBlindMatrixBenchmarkOptions
+): Promise<C137FormalBlindMatrixBenchmarkResult> {
+  if (options.plan.visualEvidenceEnabled !== options.parameters.enableVisualEvidence) {
+    throw new Error(
+      "formal blind matrix visualEvidenceEnabled 必须与 native parameters.enableVisualEvidence 一致。"
+    );
+  }
+  const manifestDigest = computeC137FormalBlindManifestDigest(manifest);
+  const canonicalPlan = createC137FormalBlindMatrixPlan(manifest, manifestDigest, {
+    relationshipAxis: options.plan.relationshipAxis,
+    visualEvidenceEnabled: options.plan.visualEvidenceEnabled,
+    globalTopK: options.plan.globalTopK,
+    scoreContract: options.plan.scoreContract
+  });
+  if (!canonicalValuesEqual(options.plan, canonicalPlan)) {
+    throw new Error(
+      "formal blind matrix plan 必须在媒体 I/O 前精确等于 manifest 的唯一 exhaustive 计划。"
+    );
+  }
+
+  const capturedProbes = createCapturedProbeState(options.preflightOptions?.probe);
+  const preflightManifest: RealMediaBenchmarkManifest = {
+    ...structuredClone(manifest),
+    cases: manifest.cases.map((benchmarkCase) =>
+      normalizePreflightCase(benchmarkCase, canonicalPlan.visualEvidenceEnabled)
+    )
+  };
+  let preflight: RealMediaBenchmarkPreflightResult;
+  try {
+    preflight = await preflightRealMediaBenchmark(preflightManifest, {
+      ...options.preflightOptions,
+      ffmpegPath: options.parameters.ffmpegPath,
+      ffprobePath: options.parameters.ffprobePath,
+      probe: capturedProbes.invoker,
+      signal: options.preflightOptions?.signal ?? options.runnerOptions?.signal
+    });
+  } catch {
+    preflight = createExceptionalPreflight(manifest.cases.length);
+  }
+  if (!preflight.ok) {
+    return createFormalMatrixResult(canonicalPlan, {
+      status: "preflight-failed",
+      preflight,
+      completedBatchCount: 0,
+      reasons: ["全量 manifest 的路径、全文件身份或显式流预检未通过；未启动任何 tile。"]
+    });
+  }
+
+  const runner = options.runner ?? defaultSuiteRunner;
+  const envelopes: C137FormalBlindProvenanceBatchEnvelopeV2[] = [];
+  let pinnedExecutionIdentityDigest: string | null = null;
+  for (const planBatch of canonicalPlan.batches) {
+    const queryCases = selectFrozenCases(manifest, planBatch.queryCaseIds);
+    const candidateCases = selectFrozenCases(manifest, planBatch.candidateCaseIds);
+    const projection = createC137FormalBlindMatrixExecutionProjection(manifest, {
+      queryCaseIds: planBatch.queryCaseIds,
+      candidateCaseIds: planBatch.candidateCaseIds,
+      relationshipAxis: canonicalPlan.relationshipAxis,
+      visualEvidenceEnabled: canonicalPlan.visualEvidenceEnabled,
+      globalTopK: canonicalPlan.globalTopK
+    });
+    let executionSuite: RealMediaBlindBatchExecutionSuite;
+    try {
+      if (projection.projectionDigest !== planBatch.projectionDigest) {
+        throw new Error("matrix tile projectionDigest 与预注册计划不一致。");
+      }
+      executionSuite = validateRealMediaBlindBatchExecutionSuite(
+        createExecutionSuite(
+          manifest.id,
+          manifest.datasetVersion,
+          queryCases,
+          candidateCases,
+          projection,
+          capturedProbes.byPath,
+          options.parameters
+        )
+      );
+    } catch {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "execution-invalid",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "已核验媒体无法形成与预注册 matrix tile 一致的 pathful execution suite；全部私有 tile envelope 已丢弃。"
+        ]
+      });
+    }
+
+    let receiptValue: unknown;
+    try {
+      receiptValue = await runner(structuredClone(executionSuite), options.runnerOptions ?? {});
+    } catch {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "runner-failed",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "native matrix tile 执行异常；全部私有 tile envelope 已丢弃，未生成 provenance。"
+        ]
+      });
+    }
+
+    let receipt: RealMediaBlindBatchRunReceipt;
+    try {
+      receipt = validateRealMediaBlindBatchRunReceipt(receiptValue, executionSuite);
+    } catch {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "receipt-invalid",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "native matrix tile 回执未通过严格 digest、顺序或内容闭合校验；未生成 provenance。"
+        ]
+      });
+    }
+    if (
+      receipt.status !== "completed" ||
+      receipt.pairOutcomes.some((outcome) => outcome.nativeStatus !== "completed")
+    ) {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "incomplete-run",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "至少一个 native matrix tile 未完整成功；全部私有 tile envelope 已丢弃，未揭示 frozen gold。"
+        ]
+      });
+    }
+    if (receipt.executionIdentityDigest === null) {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "receipt-invalid",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "native matrix tile 缺少统一 actual execution identity；全部私有 tile envelope 已丢弃。"
+        ]
+      });
+    }
+    if (pinnedExecutionIdentityDigest === null) {
+      pinnedExecutionIdentityDigest = receipt.executionIdentityDigest;
+    } else if (receipt.executionIdentityDigest !== pinnedExecutionIdentityDigest) {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "receipt-invalid",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "native matrix tile 的 FFmpeg、FFprobe、原生构建或实际声谱后端身份发生漂移；全部私有 tile envelope 已丢弃。"
+        ]
+      });
+    }
+    try {
+      const rawPrediction = deriveC137BlindBatchRawPredictionFromNativeReceipt(
+        projection,
+        executionSuite,
+        receipt
+      );
+      envelopes.push({
+        schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
+        kind: "c137-formal-blind-provenance-batch",
+        batchId: planBatch.batchId,
+        projection,
+        executionSuite,
+        nativeReceipt: receipt,
+        rawPrediction
+      });
+    } catch {
+      return createFormalMatrixResult(canonicalPlan, {
+        status: "receipt-invalid",
+        preflight,
+        completedBatchCount: envelopes.length,
+        reasons: [
+          "native matrix tile 无法确定性派生 raw prediction；全部私有 tile envelope 已丢弃。"
+        ]
+      });
+    }
+  }
+
+  try {
+    const provenance = sealC137FormalBlindProvenanceV2({
+      manifest,
+      plan: canonicalPlan,
+      batches: envelopes
+    });
+    return createFormalMatrixResult(canonicalPlan, {
+      status: "completed",
+      preflight,
+      completedBatchCount: envelopes.length,
+      provenance,
+      reasons: []
+    });
+  } catch {
+    return createFormalMatrixResult(canonicalPlan, {
+      status: "sealing-failed",
+      preflight,
+      completedBatchCount: envelopes.length,
+      reasons: [
+        "全部 tile 已结束，但 exhaustive coverage、统一参数或全局 Top-K 未闭合；未发布 provenance。"
+      ]
     });
   }
 }
@@ -313,21 +568,12 @@ function createPreflightCases(
     decisionCases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase])
   );
   return candidateCases.map((candidateCase) => {
-    const normalized = normalizePreflightCase(
-      candidateCase,
-      visualEvidenceEnabled
-    );
+    const normalized = normalizePreflightCase(candidateCase, visualEvidenceEnabled);
     const decisionCase = decisionById.get(candidateCase.id) ?? fallbackDecision;
     if (relationshipAxis === "source") {
-      normalized.source = normalizePreflightCase(
-        decisionCase,
-        visualEvidenceEnabled
-      ).source;
+      normalized.source = normalizePreflightCase(decisionCase, visualEvidenceEnabled).source;
     } else {
-      normalized.target = normalizePreflightCase(
-        decisionCase,
-        visualEvidenceEnabled
-      ).target;
+      normalized.target = normalizePreflightCase(decisionCase, visualEvidenceEnabled).target;
     }
     return normalized;
   });
@@ -460,7 +706,9 @@ function cloneIdentity(identity: MediaContentIdentity): MediaContentIdentity {
   };
 }
 
-function createExceptionalPreflight(realRelationCount: number): RealMediaBenchmarkPreflightResult {
+function createExceptionalPreflight(
+  realRelationCount: number
+): RealMediaBenchmarkPreflightResult {
   return {
     ok: false,
     realRelationCount,
@@ -473,6 +721,33 @@ function createExceptionalPreflight(realRelationCount: number): RealMediaBenchma
         message: "运行前媒体核验异常；原始路径、身份和工具错误已移除。"
       }
     ]
+  };
+}
+
+function createFormalMatrixResult(
+  plan: C137FormalBlindMatrixPlanV2,
+  state: FormalMatrixResultState
+): C137FormalBlindMatrixBenchmarkResult {
+  if (
+    !Number.isSafeInteger(state.completedBatchCount) ||
+    state.completedBatchCount < 0 ||
+    state.completedBatchCount > plan.batches.length
+  ) {
+    throw new Error("formal blind matrix completedBatchCount 无效。");
+  }
+  const provenance = state.status === "completed" ? state.provenance : null;
+  if ((state.status === "completed") !== (provenance !== null && provenance !== undefined)) {
+    throw new Error("formal blind matrix 只有 completed 结果可以携带 provenance。");
+  }
+  return {
+    schemaVersion: C137_FORMAL_BLIND_MATRIX_BENCHMARK_RESULT_SCHEMA_VERSION,
+    resultKind: "c137-formal-blind-matrix-benchmark",
+    status: state.status,
+    preflight: createShareablePreflight(state.preflight),
+    completedBatchCount: state.completedBatchCount,
+    totalBatchCount: plan.batches.length,
+    provenance: provenance ?? null,
+    reasons: [...state.reasons]
   };
 }
 
@@ -570,9 +845,7 @@ function assertShareable(
     .filter((value) => value.length > 0);
   const containsPrivateToken =
     strings.some((value) =>
-      [...forbiddenCaseIds].some((caseId) =>
-        value.toLowerCase().includes(caseId.toLowerCase())
-      )
+      [...forbiddenCaseIds].some((caseId) => value.toLowerCase().includes(caseId.toLowerCase()))
     ) ||
     normalizedStrings.some((value) =>
       forbiddenPaths.some((path) => path.length > 0 && value.includes(path))
@@ -600,4 +873,18 @@ function collectStrings(value: unknown): string[] {
   if (Array.isArray(value)) return value.flatMap((item) => collectStrings(item));
   if (typeof value !== "object" || value === null) return [];
   return Object.values(value).flatMap((item) => collectStrings(item));
+}
+
+function canonicalValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalizeValue(left)) === JSON.stringify(canonicalizeValue(right));
+}
+
+function canonicalizeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([leftKey], [rightKey]) => (leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0))
+      .map(([key, nested]) => [key, canonicalizeValue(nested)])
+  );
 }

@@ -9,12 +9,17 @@ import type { MediaContentIdentity } from "../project/types";
 import { sha256Hex } from "../shared/sha256";
 
 export const REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION = 1 as const;
-export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 1 as const;
+export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 2 as const;
 export const REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION =
-  "c137-real-media-blind-full-cartesian-batch-v1" as const;
-export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 1 as const;
+  "c137-real-media-blind-full-cartesian-batch-v2" as const;
+export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 2 as const;
+export const REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION =
+  "alignment-v2-pair-intrinsic-global-weight-v1" as const;
+export const REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION = 1 as const;
 
 const NATIVE_BATCH_TOP_K_LIMIT = 10;
+const RELATION_MIN_TEMPORAL_COVERAGE = 0.2;
+const RELATION_MIN_INLIER_COUNT = 6;
 
 export interface RealMediaBlindBatchExecutionMedia {
   mediaId: string;
@@ -95,6 +100,56 @@ export interface NativeBatchGlobalSelectionEvidence {
   decisionCandidate: NativeBatchGlobalCandidateEvidence | null;
 }
 
+export type NativeBatchRelationRankingState =
+  "pending" | "ranked" | "noEligibleCandidate" | "failed" | "cancelled";
+
+export interface NativeBatchRelationCandidateEvidence {
+  rank: number;
+  sourceStreamIndex: number;
+  targetStreamIndex: number;
+  score: number;
+  globalScore: number;
+  scale: number;
+  offsetMs: number;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  targetStartMs: number;
+  targetEndMs: number;
+  inlierCount: number;
+  temporalCoverage: number;
+  uniqueSourceCoverage: number;
+}
+
+export interface NativeBatchSpectralBackendExecutionIdentity {
+  backendId: string;
+  requestedBackend: string;
+  backendDetail: string;
+  fallbackReason: string | null;
+}
+
+export interface NativeBatchExecutionIdentity {
+  schemaVersion: typeof REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION;
+  engineVersion: string;
+  featureVersion: string;
+  relationScoreVersion: typeof REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION;
+  nativeExecutableDigest: `sha256:${string}`;
+  ffmpegBinaryDigest: `sha256:${string}`;
+  ffprobeBinaryDigest: `sha256:${string}`;
+  sourceSpectralBackends: NativeBatchSpectralBackendExecutionIdentity[];
+  targetSpectralBackends: NativeBatchSpectralBackendExecutionIdentity[];
+}
+
+export interface NativeBatchRelationRankingEvidence {
+  scoreVersion: typeof REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION;
+  executionIdentityDigest: `sha256:${string}` | null;
+  executionIdentity: NativeBatchExecutionIdentity | null;
+  state: NativeBatchRelationRankingState;
+  candidateCount: number;
+  eligibleCandidateCount: number;
+  score: number | null;
+  bestEligibleCandidate: NativeBatchRelationCandidateEvidence | null;
+}
+
 export type RealMediaBlindBatchPairFailureCode = "native-pair-failed" | "native-pair-cancelled";
 
 export interface RealMediaBlindBatchPairOutcome {
@@ -104,6 +159,8 @@ export interface RealMediaBlindBatchPairOutcome {
   targetMediaId: string;
   nativeStatus: "completed" | "failed" | "cancelled";
   failureCode: RealMediaBlindBatchPairFailureCode | null;
+  /** Pair-intrinsic coarse relation score; independent of tile-local conflicts and fine budget. */
+  relationRanking: NativeBatchRelationRankingEvidence;
   /** Native N×M coarse shortlist membership only; never a gold-aware relationship verdict. */
   globalSelected: boolean;
   globalSelection: NativeBatchGlobalSelectionEvidence;
@@ -158,6 +215,8 @@ export interface RealMediaBlindBatchRunReceipt {
   suiteId: string;
   datasetVersion: string;
   executionDigest: `sha256:${string}`;
+  /** Exact actual scoring identity shared by every completed matrix cell in this receipt. */
+  executionIdentityDigest: `sha256:${string}` | null;
   nativeJobId: string;
   nativeEvidenceVersion: typeof REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION;
   pairingMode: "fullCartesian";
@@ -183,6 +242,26 @@ export interface RealMediaBlindBatchRunReceipt {
 export function createRealMediaBlindBatchExecutionDigest(value: unknown): `sha256:${string}` {
   const suite = validateRealMediaBlindBatchExecutionSuite(value);
   return `sha256:${sha256Hex(canonicalJson(suite))}`;
+}
+
+export function createNativeBatchExecutionIdentityDigest(
+  identity: NativeBatchExecutionIdentity
+): `sha256:${string}` {
+  return `sha256:${sha256Hex(canonicalJson(identity))}`;
+}
+
+export function deriveRealMediaBlindBatchReceiptExecutionIdentityDigest(
+  pairOutcomes: readonly RealMediaBlindBatchPairOutcome[]
+): `sha256:${string}` | null {
+  if (pairOutcomes.length === 0) return null;
+  const first = pairOutcomes[0]?.relationRanking.executionIdentityDigest ?? null;
+  if (
+    first === null ||
+    pairOutcomes.some((outcome) => outcome.relationRanking.executionIdentityDigest !== first)
+  ) {
+    return null;
+  }
+  return first;
 }
 
 /**
@@ -215,6 +294,7 @@ export function validateRealMediaBlindBatchRunReceipt(
       "suiteId",
       "datasetVersion",
       "executionDigest",
+      "executionIdentityDigest",
       "nativeJobId",
       "nativeEvidenceVersion",
       "pairingMode",
@@ -246,12 +326,18 @@ export function validateRealMediaBlindBatchRunReceipt(
   if (executionDigest !== createRealMediaBlindBatchExecutionDigest(suite)) {
     throw new Error("blind batch run receipt executionDigest 与 canonical suite 不一致。");
   }
+  const declaredExecutionIdentityDigest =
+    receipt.executionIdentityDigest === null
+      ? null
+      : requireSha256Digest(receipt.executionIdentityDigest, "executionIdentityDigest");
   const nativeJobId = requireNonBlankString(receipt.nativeJobId, "nativeJobId");
   if (
     receipt.nativeEvidenceVersion !== REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION ||
     receipt.pairingMode !== "fullCartesian"
   ) {
-    throw new Error("blind batch run receipt 缺少 fullCartesian native evidence v1 绑定。");
+    throw new Error(
+      `blind batch run receipt 缺少 fullCartesian native evidence v${REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION} 绑定。`
+    );
   }
   const status = validateReceiptRunStatus(receipt.status);
   const terminationReason = validateReceiptTerminationReason(receipt.terminationReason);
@@ -275,6 +361,16 @@ export function validateRealMediaBlindBatchRunReceipt(
     validateReceiptPairOutcome(outcome, index, suite)
   );
   validateReceiptRunOutcomeCoherence(status, pairOutcomes);
+  const executionIdentityDigest =
+    deriveRealMediaBlindBatchReceiptExecutionIdentityDigest(pairOutcomes);
+  if (declaredExecutionIdentityDigest !== executionIdentityDigest) {
+    throw new Error(
+      "blind batch run receipt executionIdentityDigest 未精确绑定全部 pair 的实际 scoring identity。"
+    );
+  }
+  if (status === "completed" && executionIdentityDigest === null) {
+    throw new Error("completed blind batch receipt 必须只有一个统一 executionIdentityDigest。");
+  }
   const sourceRankings = suite.sources.map((source) =>
     createRealMediaBlindBatchSourceRanking(source.mediaId, pairOutcomes, suite.topK)
   );
@@ -303,6 +399,7 @@ export function validateRealMediaBlindBatchRunReceipt(
     suiteId: suite.suiteId,
     datasetVersion: suite.datasetVersion,
     executionDigest,
+    executionIdentityDigest,
     nativeJobId,
     nativeEvidenceVersion: REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
     pairingMode: "fullCartesian",
@@ -540,6 +637,354 @@ export function validateRealMediaBlindBatchGlobalSelectionEvidence(
   };
 }
 
+export function validateRealMediaBlindBatchRelationRankingEvidence(
+  value: unknown,
+  pairStatus: "queued" | "running" | "completed" | "failed" | "cancelled",
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  label: string
+): NativeBatchRelationRankingEvidence {
+  const evidence = requireExactRecord(
+    value,
+    [
+      "scoreVersion",
+      "executionIdentityDigest",
+      "executionIdentity",
+      "state",
+      "candidateCount",
+      "eligibleCandidateCount",
+      "score",
+      "bestEligibleCandidate"
+    ],
+    `${label}.relationRanking`
+  );
+  if (evidence.scoreVersion !== REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION) {
+    throw new Error(`${label}.relationRanking.scoreVersion 无效。`);
+  }
+  const executionIdentityDigest =
+    evidence.executionIdentityDigest === null
+      ? null
+      : requireSha256Digest(
+          evidence.executionIdentityDigest,
+          `${label}.relationRanking.executionIdentityDigest`
+        );
+  const executionIdentity =
+    evidence.executionIdentity === null
+      ? null
+      : validateNativeBatchExecutionIdentity(
+          evidence.executionIdentity,
+          `${label}.relationRanking.executionIdentity`
+        );
+  if ((executionIdentityDigest === null) !== (executionIdentity === null)) {
+    throw new Error(`${label}.relationRanking execution identity/digest 不成对。`);
+  }
+  if (
+    executionIdentity !== null &&
+    executionIdentityDigest !== createNativeBatchExecutionIdentityDigest(executionIdentity)
+  ) {
+    throw new Error(`${label}.relationRanking executionIdentityDigest 与内容不一致。`);
+  }
+  if (
+    evidence.state !== "pending" &&
+    evidence.state !== "ranked" &&
+    evidence.state !== "noEligibleCandidate" &&
+    evidence.state !== "failed" &&
+    evidence.state !== "cancelled"
+  ) {
+    throw new Error(`${label}.relationRanking.state 无效。`);
+  }
+  const state = evidence.state;
+  const candidateCount = requireNonNegativeSafeInteger(
+    evidence.candidateCount,
+    `${label}.relationRanking.candidateCount`
+  );
+  const eligibleCandidateCount = requireNonNegativeSafeInteger(
+    evidence.eligibleCandidateCount,
+    `${label}.relationRanking.eligibleCandidateCount`
+  );
+  if (eligibleCandidateCount > candidateCount) {
+    throw new Error(`${label}.relationRanking eligibleCandidateCount 超过 candidateCount。`);
+  }
+  const score = requireFiniteNumberOrNull(evidence.score, `${label}.relationRanking.score`);
+  const bestEligibleCandidate =
+    evidence.bestEligibleCandidate === null
+      ? null
+      : validateRelationCandidateEvidence(
+          evidence.bestEligibleCandidate,
+          candidateCount,
+          source,
+          target,
+          `${label}.relationRanking.bestEligibleCandidate`
+        );
+
+  if (state === "ranked") {
+    if (
+      candidateCount === 0 ||
+      eligibleCandidateCount === 0 ||
+      score === null ||
+      bestEligibleCandidate === null ||
+      score !== bestEligibleCandidate.globalScore ||
+      executionIdentity === null
+    ) {
+      throw new Error(`${label} ranked relationRanking 内部不闭合。`);
+    }
+  } else if (state === "noEligibleCandidate") {
+    if (
+      eligibleCandidateCount !== 0 ||
+      score !== null ||
+      bestEligibleCandidate !== null ||
+      executionIdentity === null
+    ) {
+      throw new Error(`${label} noEligibleCandidate relationRanking 夹带了候选或分数。`);
+    }
+  } else if (
+    candidateCount !== 0 ||
+    eligibleCandidateCount !== 0 ||
+    score !== null ||
+    bestEligibleCandidate !== null ||
+    executionIdentity !== null
+  ) {
+    throw new Error(`${label} 非结果态 relationRanking 不得夹带候选证据。`);
+  }
+
+  if (
+    (pairStatus === "completed" && state !== "ranked" && state !== "noEligibleCandidate") ||
+    (pairStatus === "failed" &&
+      state !== "failed" &&
+      state !== "ranked" &&
+      state !== "noEligibleCandidate") ||
+    (pairStatus === "cancelled" && state !== "cancelled") ||
+    ((pairStatus === "queued" || pairStatus === "running") && state !== "pending")
+  ) {
+    throw new Error(`${label} pair status 与 relationRanking.state 不一致。`);
+  }
+  return {
+    scoreVersion: REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest,
+    executionIdentity,
+    state,
+    candidateCount,
+    eligibleCandidateCount,
+    score,
+    bestEligibleCandidate
+  };
+}
+
+function validateNativeBatchExecutionIdentity(
+  value: unknown,
+  label: string
+): NativeBatchExecutionIdentity {
+  const identity = requireExactRecord(
+    value,
+    [
+      "schemaVersion",
+      "engineVersion",
+      "featureVersion",
+      "relationScoreVersion",
+      "nativeExecutableDigest",
+      "ffmpegBinaryDigest",
+      "ffprobeBinaryDigest",
+      "sourceSpectralBackends",
+      "targetSpectralBackends"
+    ],
+    label
+  );
+  if (identity.schemaVersion !== REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION) {
+    throw new Error(`${label}.schemaVersion 无效。`);
+  }
+  const engineVersion = requireNonBlankString(identity.engineVersion, `${label}.engineVersion`);
+  const featureVersion = requireNonBlankString(
+    identity.featureVersion,
+    `${label}.featureVersion`
+  );
+  if (identity.relationScoreVersion !== REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION) {
+    throw new Error(`${label}.relationScoreVersion 无效。`);
+  }
+  return {
+    schemaVersion: REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION,
+    engineVersion,
+    featureVersion,
+    relationScoreVersion: REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+    nativeExecutableDigest: requireSha256Digest(
+      identity.nativeExecutableDigest,
+      `${label}.nativeExecutableDigest`
+    ),
+    ffmpegBinaryDigest: requireSha256Digest(
+      identity.ffmpegBinaryDigest,
+      `${label}.ffmpegBinaryDigest`
+    ),
+    ffprobeBinaryDigest: requireSha256Digest(
+      identity.ffprobeBinaryDigest,
+      `${label}.ffprobeBinaryDigest`
+    ),
+    sourceSpectralBackends: validateNativeBatchSpectralBackendIdentities(
+      identity.sourceSpectralBackends,
+      `${label}.sourceSpectralBackends`
+    ),
+    targetSpectralBackends: validateNativeBatchSpectralBackendIdentities(
+      identity.targetSpectralBackends,
+      `${label}.targetSpectralBackends`
+    )
+  };
+}
+
+function validateNativeBatchSpectralBackendIdentities(
+  value: unknown,
+  label: string
+): NativeBatchSpectralBackendExecutionIdentity[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${label} 必须是非空 canonical backend 集合。`);
+  }
+  const identities = value.map((item, index) => {
+    const backend = requireExactRecord(
+      item,
+      ["backendId", "requestedBackend", "backendDetail", "fallbackReason"],
+      `${label}[${index}]`
+    );
+    const fallbackReason =
+      backend.fallbackReason === null
+        ? null
+        : requireNonBlankString(backend.fallbackReason, `${label}[${index}].fallbackReason`);
+    return {
+      backendId: requireNonBlankString(backend.backendId, `${label}[${index}].backendId`),
+      requestedBackend: requireNonBlankString(
+        backend.requestedBackend,
+        `${label}[${index}].requestedBackend`
+      ),
+      backendDetail: requireNonBlankString(
+        backend.backendDetail,
+        `${label}[${index}].backendDetail`
+      ),
+      fallbackReason
+    };
+  });
+  const canonical = [...identities].sort(compareNativeBatchSpectralBackendIdentity);
+  if (
+    identities.some((item, index) => canonicalJson(item) !== canonicalJson(canonical[index])) ||
+    identities.some(
+      (item, index) => index > 0 && canonicalJson(item) === canonicalJson(identities[index - 1])
+    )
+  ) {
+    throw new Error(`${label} 必须按实际 backend identity 排序且去重。`);
+  }
+  return identities;
+}
+
+function compareNativeBatchSpectralBackendIdentity(
+  left: NativeBatchSpectralBackendExecutionIdentity,
+  right: NativeBatchSpectralBackendExecutionIdentity
+): number {
+  return (
+    compareCanonicalText(left.backendId, right.backendId) ||
+    compareCanonicalText(left.requestedBackend, right.requestedBackend) ||
+    compareCanonicalText(left.backendDetail, right.backendDetail) ||
+    (left.fallbackReason === right.fallbackReason
+      ? 0
+      : left.fallbackReason === null
+        ? -1
+        : right.fallbackReason === null
+          ? 1
+          : compareCanonicalText(left.fallbackReason, right.fallbackReason))
+  );
+}
+
+function compareCanonicalText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function validateRelationCandidateEvidence(
+  value: unknown,
+  candidateCount: number,
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  label: string
+): NativeBatchRelationCandidateEvidence {
+  const candidate = requireExactRecord(
+    value,
+    [
+      "rank",
+      "sourceStreamIndex",
+      "targetStreamIndex",
+      "score",
+      "globalScore",
+      "scale",
+      "offsetMs",
+      "sourceStartMs",
+      "sourceEndMs",
+      "targetStartMs",
+      "targetEndMs",
+      "inlierCount",
+      "temporalCoverage",
+      "uniqueSourceCoverage"
+    ],
+    label
+  );
+  const rank = requirePositiveSafeInteger(candidate.rank, `${label}.rank`);
+  if (rank > candidateCount) throw new Error(`${label}.rank 超过 candidateCount。`);
+  const sourceStreamIndex = requireNonNegativeSafeInteger(
+    candidate.sourceStreamIndex,
+    `${label}.sourceStreamIndex`
+  );
+  const targetStreamIndex = requireNonNegativeSafeInteger(
+    candidate.targetStreamIndex,
+    `${label}.targetStreamIndex`
+  );
+  if (
+    sourceStreamIndex !== source.audioStreamIndex ||
+    targetStreamIndex !== target.audioStreamIndex
+  ) {
+    throw new Error(`${label} 的音轨索引与 execution suite 错配。`);
+  }
+  const score = requireFiniteNumber(candidate.score, `${label}.score`);
+  const globalScore = requirePositiveFiniteNumber(
+    candidate.globalScore,
+    `${label}.globalScore`
+  );
+  const scale = requirePositiveFiniteNumber(candidate.scale, `${label}.scale`);
+  const offsetMs = requireSafeInteger(candidate.offsetMs, `${label}.offsetMs`);
+  const sourceStartMs = requireSafeInteger(candidate.sourceStartMs, `${label}.sourceStartMs`);
+  const sourceEndMs = requireSafeInteger(candidate.sourceEndMs, `${label}.sourceEndMs`);
+  const targetStartMs = requireSafeInteger(candidate.targetStartMs, `${label}.targetStartMs`);
+  const targetEndMs = requireSafeInteger(candidate.targetEndMs, `${label}.targetEndMs`);
+  if (sourceEndMs <= sourceStartMs || targetEndMs <= targetStartMs) {
+    throw new Error(`${label} 的内容区间无效。`);
+  }
+  const inlierCount = requireNonNegativeSafeInteger(
+    candidate.inlierCount,
+    `${label}.inlierCount`
+  );
+  if (inlierCount < RELATION_MIN_INLIER_COUNT) {
+    throw new Error(`${label}.inlierCount 未达到 intrinsic eligibility。`);
+  }
+  const temporalCoverage = requireUnitNumber(
+    candidate.temporalCoverage,
+    `${label}.temporalCoverage`
+  );
+  if (temporalCoverage < RELATION_MIN_TEMPORAL_COVERAGE) {
+    throw new Error(`${label}.temporalCoverage 未达到 intrinsic eligibility。`);
+  }
+  const uniqueSourceCoverage = requireUnitNumber(
+    candidate.uniqueSourceCoverage,
+    `${label}.uniqueSourceCoverage`
+  );
+  return {
+    rank,
+    sourceStreamIndex,
+    targetStreamIndex,
+    score,
+    globalScore,
+    scale,
+    offsetMs,
+    sourceStartMs,
+    sourceEndMs,
+    targetStartMs,
+    targetEndMs,
+    inlierCount,
+    temporalCoverage,
+    uniqueSourceCoverage
+  };
+}
+
 export function validateRealMediaBlindBatchProposalBinding(
   timeMap: AlignmentTimeMapProposal,
   source: RealMediaBlindBatchExecutionMedia,
@@ -710,6 +1155,7 @@ function validateReceiptPairOutcome(
       "targetMediaId",
       "nativeStatus",
       "failureCode",
+      "relationRanking",
       "globalSelected",
       "globalSelection",
       "proposalTimeMap"
@@ -730,6 +1176,13 @@ function validateReceiptPairOutcome(
   const target = suite.targets.find((media) => media.mediaId === expected.targetMediaId);
   if (!source || !target) throw new Error("receipt pair outcome 引用了缺失媒体。");
   const nativeStatus = validateReceiptNativePairStatus(outcome.nativeStatus);
+  const relationRanking = validateRealMediaBlindBatchRelationRankingEvidence(
+    outcome.relationRanking,
+    nativeStatus,
+    source,
+    target,
+    `receipt pair #${expected.pairOrdinal}`
+  );
   const globalSelection = validateRealMediaBlindBatchGlobalSelectionEvidence(
     outcome.globalSelection,
     nativeStatus,
@@ -788,6 +1241,7 @@ function validateReceiptPairOutcome(
     targetMediaId: expected.targetMediaId,
     nativeStatus,
     failureCode,
+    relationRanking,
     globalSelected: globalSelection.selected,
     globalSelection,
     proposalTimeMap
@@ -1186,8 +1640,8 @@ function validateExecutionMediaArray(
   value: unknown,
   label: "sources" | "targets"
 ): RealMediaBlindBatchExecutionMedia[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
-    throw new Error(`${label} 必须包含 1–64 个 distinct media。`);
+  if (!Array.isArray(value) || value.length === 0 || value.length > 256) {
+    throw new Error(`${label} 必须包含 1–256 个 distinct media。`);
   }
   return value.map((item, index) => {
     const media = requireExactRecord(

@@ -11,7 +11,18 @@ import {
   deriveC137BlindBatchRawPredictionFromNativeReceipt,
   orderC137BlindBatchMediaInputs
 } from "../../domain/alignment/c137BlindBatchEvidence";
+import {
+  computeC137FormalBlindManifestDigest,
+  createC137FormalBlindMatrixPlan,
+  validateC137FormalBlindProvenance
+} from "../../domain/alignment/c137FormalBlindProvenance";
 import type { AlignmentProposal, AlignmentTimeMapProposal } from "../../domain/alignment/types";
+import {
+  createNativeBatchExecutionIdentityDigest,
+  createRealMediaBlindBatchRunReceiptDigest,
+  REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+  type NativeBatchExecutionIdentity
+} from "../../domain/alignment/realMediaBlindBatchContract";
 import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import type {
   MediaTimelineProbeInvoker,
@@ -23,10 +34,13 @@ import type {
   AudioAlignmentBatchJobInvoker,
   AudioAlignmentBatchJobSnapshot,
   AudioAlignmentBatchPairSnapshot,
+  AudioAlignmentBatchRelationRankingSnapshot,
   NormalizedTauriAudioAlignmentBatchRequest
 } from "./tauriAudioAlignment";
+import { AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION } from "./tauriAudioAlignment";
 import {
   runRealMediaBlindBatchSuite,
+  validateRealMediaBlindBatchRunReceipt,
   type RealMediaBlindBatchAlignmentParameters,
   type RealMediaBlindBatchExecutionMedia,
   type RealMediaBlindBatchExecutionSuite,
@@ -34,6 +48,7 @@ import {
 } from "./realMediaBlindBatchRunner";
 import {
   runC137BlindBatchBenchmark,
+  runC137FormalBlindMatrixBenchmark,
   type C137BlindBatchSuiteRunner
 } from "./c137BlindBatchBenchmark";
 
@@ -53,6 +68,33 @@ const VISUAL_PARAMETERS: RealMediaBlindBatchAlignmentParameters = {
   enableVisualEvidence: true,
   visualSampleIntervalMs: 500
 };
+const TEST_EXECUTION_IDENTITY: NativeBatchExecutionIdentity = {
+  schemaVersion: 1,
+  engineVersion: "alignment-v2.2-rust",
+  featureVersion: "test-feature-v1",
+  relationScoreVersion: REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+  nativeExecutableDigest: `sha256:${"a".repeat(64)}`,
+  ffmpegBinaryDigest: `sha256:${"b".repeat(64)}`,
+  ffprobeBinaryDigest: `sha256:${"c".repeat(64)}`,
+  sourceSpectralBackends: [
+    {
+      backendId: "cuda-cufft-r2c-512-v1",
+      requestedBackend: "cuda",
+      backendDetail: "test RTX 4090",
+      fallbackReason: null
+    }
+  ],
+  targetSpectralBackends: [
+    {
+      backendId: "cuda-cufft-r2c-512-v1",
+      requestedBackend: "cuda",
+      backendDetail: "test RTX 4090",
+      fallbackReason: null
+    }
+  ]
+};
+const TEST_EXECUTION_IDENTITY_DIGEST =
+  createNativeBatchExecutionIdentityDigest(TEST_EXECUTION_IDENTITY);
 
 describe("C137 blind batch benchmark coordinator", () => {
   it("strictly derives raw prediction from the bound full-Cartesian native receipt", async () => {
@@ -106,10 +148,7 @@ describe("C137 blind batch benchmark coordinator", () => {
     if (rankingCandidates === undefined || rankingCandidates.length < 2) {
       throw new Error("fixture source ranking too small");
     }
-    [rankingCandidates[0], rankingCandidates[1]] = [
-      rankingCandidates[1],
-      rankingCandidates[0]
-    ];
+    [rankingCandidates[0], rankingCandidates[1]] = [rankingCandidates[1], rankingCandidates[0]];
     expect(() =>
       deriveC137BlindBatchRawPredictionFromNativeReceipt(
         projection,
@@ -193,6 +232,190 @@ describe("C137 blind batch benchmark coordinator", () => {
     expect(executionSuite?.sources).toHaveLength(3);
     expect(executionSuite?.targets).toHaveLength(1);
     expect(executionSuite?.pairs).toHaveLength(3);
+  });
+
+  it("rejects a partial candidate shard at the public single-batch boundary", async () => {
+    const manifest = createManifest();
+    manifest.cases.push(createCase(4));
+    const probe = createProbeInvoker(manifest);
+    const runner = createCompletedRunner();
+
+    await expect(
+      runC137BlindBatchBenchmark(manifest, {
+        relationshipAxis: "target",
+        visualEvidenceEnabled: false,
+        topK: 2,
+        caseIds: [manifest.cases[0].id],
+        candidateCaseIds: manifest.cases.slice(1).map((benchmarkCase) => benchmarkCase.id),
+        parameters: PARAMETERS,
+        preflightOptions: { probe },
+        runner
+      })
+    ).rejects.toThrow(/partial shard 不得单独揭示或编译准确率/);
+    expect(probe).not.toHaveBeenCalled();
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("preflights once, executes every 17×17 tile sequentially and seals one global provenance", async () => {
+    const manifest = createMatrixManifest(17);
+    const plan = createC137FormalBlindMatrixPlan(
+      manifest,
+      computeC137FormalBlindManifestDigest(manifest),
+      {
+        relationshipAxis: "target",
+        visualEvidenceEnabled: false,
+        globalTopK: 2
+      }
+    );
+    const probe = createProbeInvoker(manifest);
+    const runner = createUniqueJobCompletedRunner();
+
+    const result = await runC137FormalBlindMatrixBenchmark(manifest, {
+      plan,
+      parameters: PARAMETERS,
+      preflightOptions: { probe, concurrency: 4 },
+      runner
+    });
+
+    expect(plan.batches).toHaveLength(2);
+    expect(result).toMatchObject({
+      status: "completed",
+      completedBatchCount: 2,
+      totalBatchCount: 2,
+      reasons: []
+    });
+    expect(probe).toHaveBeenCalledTimes(34);
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(runner.mock.calls.map(([suite]) => suite.pairs.length)).toEqual([255, 34]);
+    expect(result.provenance).not.toBeNull();
+    expect(validateC137FormalBlindProvenance(result.provenance)).toMatchObject({
+      valid: true,
+      coverageValid: true
+    });
+  });
+
+  it("discards completed tile envelopes when a later matrix tile fails", async () => {
+    const manifest = createMatrixManifest(17);
+    const plan = createC137FormalBlindMatrixPlan(
+      manifest,
+      computeC137FormalBlindManifestDigest(manifest),
+      {
+        relationshipAxis: "target",
+        visualEvidenceEnabled: false,
+        globalTopK: 2
+      }
+    );
+    const probe = createProbeInvoker(manifest);
+    const completed = createUniqueJobCompletedRunner();
+    let callCount = 0;
+    const runner = vi.fn<C137BlindBatchSuiteRunner>(async (suite, options) => {
+      callCount += 1;
+      if (callCount === 2) throw new Error("fixture second tile failure");
+      return completed(suite, options);
+    });
+
+    const result = await runC137FormalBlindMatrixBenchmark(manifest, {
+      plan,
+      parameters: PARAMETERS,
+      preflightOptions: { probe },
+      runner
+    });
+
+    expect(result).toMatchObject({
+      status: "runner-failed",
+      completedBatchCount: 1,
+      totalBatchCount: 2,
+      provenance: null
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(manifest.cases[0].id);
+    expect(serialized).not.toContain(manifest.cases[0].source.path);
+    expect(serialized).not.toContain("matchedAnchors");
+  });
+
+  it("discards every tile when a later receipt is validly resealed under a drifted backend", async () => {
+    const manifest = createMatrixManifest(17);
+    const plan = createC137FormalBlindMatrixPlan(
+      manifest,
+      computeC137FormalBlindManifestDigest(manifest),
+      {
+        relationshipAxis: "target",
+        visualEvidenceEnabled: false,
+        globalTopK: 2
+      }
+    );
+    const completed = createUniqueJobCompletedRunner();
+    let callCount = 0;
+    const runner = vi.fn<C137BlindBatchSuiteRunner>(async (suite, options) => {
+      callCount += 1;
+      const receipt = validateRealMediaBlindBatchRunReceipt(
+        await completed(suite, options),
+        suite
+      );
+      if (callCount === 1) return receipt;
+      const drifted = structuredClone(receipt);
+      for (const outcome of drifted.pairOutcomes) {
+        const identity = outcome.relationRanking.executionIdentity;
+        const backend = identity?.sourceSpectralBackends[0];
+        if (!identity || !backend) throw new Error("fixture execution identity missing");
+        backend.backendId = "cpu-radix2-f64-r2c-512-v1";
+        backend.requestedBackend = "cpu";
+        backend.backendDetail = "test CPU fallback";
+        backend.fallbackReason = "fixture CUDA runtime fallback";
+        outcome.relationRanking.executionIdentityDigest =
+          createNativeBatchExecutionIdentityDigest(identity);
+      }
+      drifted.executionIdentityDigest =
+        drifted.pairOutcomes[0]?.relationRanking.executionIdentityDigest ?? null;
+      const { receiptDigest, ...withoutDigest } = drifted;
+      void receiptDigest;
+      return {
+        ...withoutDigest,
+        receiptDigest: createRealMediaBlindBatchRunReceiptDigest(withoutDigest)
+      };
+    });
+
+    const result = await runC137FormalBlindMatrixBenchmark(manifest, {
+      plan,
+      parameters: PARAMETERS,
+      preflightOptions: { probe: createProbeInvoker(manifest) },
+      runner
+    });
+
+    expect(result).toMatchObject({
+      status: "receipt-invalid",
+      completedBatchCount: 1,
+      totalBatchCount: 2,
+      provenance: null
+    });
+    expect(JSON.stringify(result)).not.toContain("sourceSpectralBackends");
+  });
+
+  it("rejects a non-canonical matrix plan before preflight or native I/O", async () => {
+    const manifest = createManifest();
+    const plan = createC137FormalBlindMatrixPlan(
+      manifest,
+      computeC137FormalBlindManifestDigest(manifest),
+      {
+        relationshipAxis: "target",
+        visualEvidenceEnabled: false,
+        globalTopK: 2
+      }
+    );
+    plan.batches[0]?.candidateCaseIds.reverse();
+    const probe = createProbeInvoker(manifest);
+    const runner = createUniqueJobCompletedRunner();
+
+    await expect(
+      runC137FormalBlindMatrixBenchmark(manifest, {
+        plan,
+        parameters: PARAMETERS,
+        preflightOptions: { probe },
+        runner
+      })
+    ).rejects.toThrow(/媒体 I\/O 前精确等于/);
+    expect(probe).not.toHaveBeenCalled();
+    expect(runner).not.toHaveBeenCalled();
   });
 
   it("preflights each path once, runs one pathful batch and returns only shareable evidence", async () => {
@@ -376,7 +599,7 @@ describe("C137 blind batch benchmark coordinator", () => {
     expect(runner).not.toHaveBeenCalled();
   });
 
-  it("rejects more than 64×1 media before preflight or native execution", async () => {
+  it("rejects more than 256×1 media before preflight or native execution", async () => {
     const manifest = createOverMediaLimitManifest();
     const probe = createProbeInvoker(manifest);
     const runner = vi.fn<C137BlindBatchSuiteRunner>();
@@ -390,7 +613,7 @@ describe("C137 blind batch benchmark coordinator", () => {
         preflightOptions: { probe },
         runner
       })
-    ).rejects.toThrow(/每侧最多允许 64/);
+    ).rejects.toThrow(/每侧最多允许 256/);
     expect(probe).not.toHaveBeenCalled();
     expect(runner).not.toHaveBeenCalled();
   });
@@ -436,10 +659,7 @@ describe("C137 blind batch benchmark coordinator", () => {
         media.contentIdentity.firstSampleDigest ===
         manifest.cases[1].source.contentIdentity?.digest
     );
-    expect(sharedIdentityViews?.map((media) => media.videoStreamIndex).sort()).toEqual([
-      0,
-      1
-    ]);
+    expect(sharedIdentityViews?.map((media) => media.videoStreamIndex).sort()).toEqual([0, 1]);
   });
 
   it("fails before the runner when the captured full-file identity mismatches", async () => {
@@ -541,9 +761,20 @@ function createCompletedRunner(tamperReceipt = false) {
       alignmentInvoker: createInvoker(createCompletedSnapshot(suite)),
       now: () => 100
     });
-    return tamperReceipt
-      ? { ...receipt, receiptDigest: `sha256:${"0".repeat(64)}` }
-      : receipt;
+    return tamperReceipt ? { ...receipt, receiptDigest: `sha256:${"0".repeat(64)}` } : receipt;
+  });
+}
+
+function createUniqueJobCompletedRunner() {
+  let jobOrdinal = 0;
+  return vi.fn<C137BlindBatchSuiteRunner>(async (suite) => {
+    jobOrdinal += 1;
+    const snapshot = createCompletedSnapshot(suite);
+    snapshot.jobId = `coordinator-matrix-job-${jobOrdinal}`;
+    return runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker(snapshot),
+      now: () => 100 + jobOrdinal
+    });
   });
 }
 
@@ -569,9 +800,15 @@ function createManifest(): RealMediaBenchmarkManifest {
   };
 }
 
+function createMatrixManifest(caseCount: number): RealMediaBenchmarkManifest {
+  const manifest = createManifest();
+  manifest.cases = Array.from({ length: caseCount }, (_, index) => createCase(index + 1));
+  return manifest;
+}
+
 function createOverMediaLimitManifest(): RealMediaBenchmarkManifest {
   const manifest = createManifest();
-  manifest.cases = Array.from({ length: 65 }, (_, index) => createCase(index + 1));
+  manifest.cases = Array.from({ length: 257 }, (_, index) => createCase(index + 1));
   const sharedTarget = structuredClone(manifest.cases[0].target);
   for (const benchmarkCase of manifest.cases) {
     benchmarkCase.target = structuredClone(sharedTarget);
@@ -632,11 +869,8 @@ function createGold(index: number): RealMediaBenchmarkGold {
   };
 }
 
-function createMedia(
-  side: "source" | "target",
-  index: number
-): RealMediaBenchmarkMediaInput {
-  const digestByte = side === "source" ? index : index + 128;
+function createMedia(side: "source" | "target", index: number): RealMediaBenchmarkMediaInput {
+  const digestByte = (side === "source" ? index : index + 128) & 0xff;
   return {
     path: `C:\\private-c137\\${side}-${index}.mkv`,
     audioStreamIndex: side === "source" ? index - 1 : index + 1,
@@ -658,10 +892,7 @@ function allMedia(manifest: RealMediaBenchmarkManifest): RealMediaBenchmarkMedia
   ]);
 }
 
-function createProbeInvoker(
-  manifest: RealMediaBenchmarkManifest,
-  mismatchedPath?: string
-) {
+function createProbeInvoker(manifest: RealMediaBenchmarkManifest, mismatchedPath?: string) {
   const byPath = new Map(allMedia(manifest).map((media) => [media.path, media]));
   return vi.fn<MediaTimelineProbeInvoker>(({ path }) => {
     const media = byPath.get(path);
@@ -733,7 +964,7 @@ function createCompletedSnapshot(
     const source = requireExecutionMedia(suite.sources, pair.sourceMediaId);
     const target = requireExecutionMedia(suite.targets, pair.targetMediaId);
     const selected = mediaEpisode(source.path) === mediaEpisode(target.path);
-    const score = selected ? 0.95 : 0.5 - pairIndex / 100;
+    const score = selected ? 0.95 : 0.5 - (pairIndex % 20) / 100;
     return {
       pairIndex,
       pairOrdinal: pair.pairOrdinal,
@@ -742,6 +973,7 @@ function createCompletedSnapshot(
       status: "completed",
       progress: 1,
       message: "completed",
+      relationRanking: createRelationRanking(source, target, score),
       globalSelection: createSelection(source, target, score, selected),
       proposal: createProposal(source, target, selected ? "review" : "blocked"),
       error: null
@@ -785,6 +1017,7 @@ function createPartialSnapshot(
     status: "failed",
     progress: 1,
     message: "failed",
+    relationRanking: createFailedRelationRanking(),
     globalSelection: failedSelection,
     proposal: null,
     error: "fixture failure"
@@ -800,7 +1033,7 @@ function createTerminalSnapshot(
 ): AudioAlignmentBatchJobSnapshot {
   return {
     schemaVersion: 1,
-    evidenceVersion: 1,
+    evidenceVersion: 2,
     jobId: "coordinator-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -815,6 +1048,52 @@ function createTerminalSnapshot(
     pairs,
     error: null,
     updatedAtMs: 2
+  };
+}
+
+function createFailedRelationRanking(): AudioAlignmentBatchRelationRankingSnapshot {
+  return {
+    scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest: null,
+    executionIdentity: null,
+    state: "failed",
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    score: null,
+    bestEligibleCandidate: null
+  };
+}
+
+function createRelationRanking(
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  score: number
+): AudioAlignmentBatchRelationRankingSnapshot {
+  const candidate = createGlobalCandidate(source, target, score, false);
+  return {
+    scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest: TEST_EXECUTION_IDENTITY_DIGEST,
+    executionIdentity: structuredClone(TEST_EXECUTION_IDENTITY),
+    state: "ranked",
+    candidateCount: 1,
+    eligibleCandidateCount: 1,
+    score,
+    bestEligibleCandidate: {
+      rank: candidate.rank,
+      sourceStreamIndex: candidate.sourceStreamIndex,
+      targetStreamIndex: candidate.targetStreamIndex,
+      score: candidate.score,
+      globalScore: candidate.globalScore,
+      scale: candidate.scale,
+      offsetMs: candidate.offsetMs,
+      sourceStartMs: candidate.sourceStartMs,
+      sourceEndMs: candidate.sourceEndMs,
+      targetStartMs: candidate.targetStartMs,
+      targetEndMs: candidate.targetEndMs,
+      inlierCount: candidate.inlierCount,
+      temporalCoverage: candidate.temporalCoverage,
+      uniqueSourceCoverage: candidate.uniqueSourceCoverage
+    }
   };
 }
 
@@ -999,7 +1278,9 @@ function requireExecutionMedia(
   return result;
 }
 
-function createInvoker(snapshot: AudioAlignmentBatchJobSnapshot): AudioAlignmentBatchJobInvoker {
+function createInvoker(
+  snapshot: AudioAlignmentBatchJobSnapshot
+): AudioAlignmentBatchJobInvoker {
   return {
     start: vi.fn<
       (

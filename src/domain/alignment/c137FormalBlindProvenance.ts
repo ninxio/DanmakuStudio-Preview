@@ -1,17 +1,27 @@
 import type { C137Digest } from "./c137Acceptance";
 import {
-  compileC137BlindBatchBenchmarkEvidence,
-  createC137BlindBatchExecutionProjection,
-  createC137BlindBatchMediaBindingCommitment,
   deriveC137BlindBatchRawPredictionFromNativeReceipt,
-  deriveC137BlindBatchRelationshipDecisions,
   orderC137BlindBatchMediaInputs,
-  type C137BlindBatchBenchmarkEvidence,
-  type C137BlindBatchDerivedRelationshipDecision,
+  createC137BlindBatchMediaBindingCommitment,
   type C137BlindBatchExecutionProjection,
-  type C137BlindBatchRawPrediction,
-  type C137BlindBatchRelationshipAxis
+  type C137BlindBatchRawPrediction
 } from "./c137BlindBatchEvidence";
+import {
+  C137_FORMAL_BLIND_MATRIX_COVERAGE,
+  C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION,
+  C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+  computeC137FormalBlindCandidateUniverseDigest,
+  computeC137FormalBlindMatrixPlanDigest,
+  createC137FormalBlindMatrixExecutionProjection,
+  createC137FormalBlindMatrixModel,
+  createC137FormalBlindMatrixPlan,
+  createC137FormalBlindMatrixTileLayout,
+  type C137FormalBlindMatrixCandidateEntry,
+  type C137FormalBlindMatrixPlanBatchV2,
+  type C137FormalBlindMatrixPlanOptions,
+  type C137FormalBlindMatrixPlanV2,
+  type C137FormalBlindMatrixTile
+} from "./c137FormalBlindMatrixPlan";
 import {
   validateRealMediaBenchmarkManifest,
   type RealMediaBenchmarkCase,
@@ -20,42 +30,26 @@ import {
 } from "./realMediaBenchmark";
 import {
   validateRealMediaBlindBatchExecutionSuite,
+  type NativeBatchRelationRankingEvidence,
   type RealMediaBlindBatchExecutionSuite,
   type RealMediaBlindBatchRunReceipt
 } from "./realMediaBlindBatchContract";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION = 1 as const;
+export const C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION = 2 as const;
 
-const MANIFEST_DIGEST_DOMAIN = "c137-formal-blind-full-manifest-v1";
-const GOLD_DIGEST_DOMAIN = "c137-formal-blind-gold-v1";
-const MEDIA_BINDINGS_DIGEST_DOMAIN = "c137-formal-blind-media-bindings-v1";
-const PLAN_DIGEST_DOMAIN = "c137-formal-blind-plan-v1";
-const PARAMETERS_DIGEST_DOMAIN = "c137-formal-blind-execution-parameters-v1";
-const PROVENANCE_DIGEST_DOMAIN = "c137-formal-blind-provenance-v1";
-const REPLAY_FINGERPRINT_DOMAIN = "c137-formal-blind-suite-case-fingerprint-v1";
+const MANIFEST_DIGEST_DOMAIN = "c137-formal-blind-full-manifest-v2";
+const GOLD_DIGEST_DOMAIN = "c137-formal-blind-gold-v2";
+const MEDIA_BINDINGS_DIGEST_DOMAIN = "c137-formal-blind-media-bindings-v2";
+const PARAMETERS_DIGEST_DOMAIN = "c137-formal-blind-execution-parameters-v2";
+const PROVENANCE_DIGEST_DOMAIN = "c137-formal-blind-provenance-v2";
+const OBSERVATION_DIGEST_DOMAIN = "c137-formal-blind-query-observations-v2";
+const DECISION_DIGEST_DOMAIN = "c137-formal-blind-global-decision-v2";
+const GLOBAL_PAIR_ID_DOMAIN = "c137-formal-blind-global-pair-v2";
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 
-export interface C137FormalBlindProvenancePlanBatchV1 {
-  batchId: string;
-  caseIds: string[];
-  candidateCaseIds: string[];
-  relationshipAxis: C137BlindBatchRelationshipAxis;
-  visualEvidenceEnabled: boolean;
-  topK: number;
-}
-
-export interface C137FormalBlindProvenancePlanV1 {
-  schemaVersion: typeof C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION;
-  kind: "c137-formal-blind-provenance-plan";
-  manifestDigest: C137Digest;
-  datasetVersion: string;
-  batches: C137FormalBlindProvenancePlanBatchV1[];
-  planDigest: C137Digest;
-}
-
-export interface C137FormalBlindProvenanceBatchEnvelopeV1 {
+export interface C137FormalBlindProvenanceBatchEnvelopeV2 {
   schemaVersion: typeof C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION;
   kind: "c137-formal-blind-provenance-batch";
   batchId: string;
@@ -63,10 +57,9 @@ export interface C137FormalBlindProvenanceBatchEnvelopeV1 {
   executionSuite: RealMediaBlindBatchExecutionSuite;
   nativeReceipt: RealMediaBlindBatchRunReceipt;
   rawPrediction: C137BlindBatchRawPrediction;
-  aggregateEvidence: C137BlindBatchBenchmarkEvidence;
 }
 
-export interface C137FormalBlindProvenanceV1 {
+export interface C137FormalBlindProvenanceV2 {
   schemaVersion: typeof C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION;
   kind: "c137-formal-blind-provenance";
   releaseEligible: false;
@@ -75,8 +68,9 @@ export interface C137FormalBlindProvenanceV1 {
   manifestDigest: C137Digest;
   goldDigest: C137Digest;
   mediaBindingsDigest: C137Digest;
-  plan: C137FormalBlindProvenancePlanV1;
-  batches: C137FormalBlindProvenanceBatchEnvelopeV1[];
+  executionIdentityDigest: C137Digest;
+  plan: C137FormalBlindMatrixPlanV2;
+  batches: C137FormalBlindProvenanceBatchEnvelopeV2[];
   provenanceDigest: C137Digest;
 }
 
@@ -88,22 +82,56 @@ export interface C137FormalBlindProvenanceExpectations {
   topK: number;
 }
 
+export interface C137FormalBlindDerivedRelationshipDecisionV2 {
+  caseId: string;
+  provenanceRef: C137Digest;
+  goldPairId: C137Digest;
+  rankedPairIds: C137Digest[];
+}
+
+export interface C137FormalBlindGlobalScoreObservation {
+  candidateOrdinal: number;
+  pairId: C137Digest;
+  score: number | null;
+}
+
 export interface C137FormalBlindProvenanceEvaluation {
   valid: boolean;
   issues: string[];
   coverageValid: boolean;
-  decisions: C137BlindBatchDerivedRelationshipDecision[];
+  decisions: C137FormalBlindDerivedRelationshipDecisionV2[];
 }
 
-type C137FormalBlindProvenancePlanDraft = Omit<
-  C137FormalBlindProvenancePlanV1,
-  "planDigest"
->;
+interface MatrixObservation {
+  queryCaseId: string;
+  candidateOrdinal: number;
+  candidateRepresentativeCaseId: string;
+  pairId: C137Digest;
+  batchId: string;
+  receiptDigest: C137Digest;
+  pairOrdinal: number;
+  relationRanking: NativeBatchRelationRankingEvidence;
+}
 
-type C137FormalBlindProvenanceDraft = Omit<
-  C137FormalBlindProvenanceV1,
-  "provenanceDigest"
->;
+type C137FormalBlindProvenanceDraft = Omit<C137FormalBlindProvenanceV2, "provenanceDigest">;
+
+export {
+  C137_FORMAL_BLIND_MATRIX_COVERAGE,
+  C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION,
+  C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+  computeC137FormalBlindCandidateUniverseDigest,
+  computeC137FormalBlindMatrixPlanDigest,
+  createC137FormalBlindMatrixExecutionProjection,
+  createC137FormalBlindMatrixModel,
+  createC137FormalBlindMatrixPlan,
+  createC137FormalBlindMatrixTileLayout
+};
+export type {
+  C137FormalBlindMatrixPlanBatchV2,
+  C137FormalBlindMatrixPlanOptions,
+  C137FormalBlindMatrixPlanV2,
+  C137FormalBlindMatrixTile
+};
 
 export function computeC137FormalBlindManifestDigest(
   manifest: RealMediaBenchmarkManifest
@@ -153,36 +181,58 @@ export function computeC137FormalBlindMediaBindingsDigest(
 }
 
 export function computeC137FormalBlindPlanDigest(
-  plan: C137FormalBlindProvenancePlanDraft | C137FormalBlindProvenancePlanV1
+  plan: Omit<C137FormalBlindMatrixPlanV2, "planDigest"> | C137FormalBlindMatrixPlanV2
 ): C137Digest {
+  return computeC137FormalBlindMatrixPlanDigest(plan);
+}
+
+export function computeC137FormalBlindParametersDigest(
+  provenance: Pick<C137FormalBlindProvenanceV2, "plan" | "batches">
+): C137Digest {
+  const first = provenance.batches[0]?.executionSuite.parameters;
+  if (first === undefined) throw new Error("formal blind provenance 至少需要一个 batch。");
+  if (
+    provenance.batches.some((batch) => !canonicalEqual(batch.executionSuite.parameters, first))
+  ) {
+    throw new Error("formal blind matrix 所有 batch execution parameters 必须 exact equal。");
+  }
   return digest(
-    PLAN_DIGEST_DOMAIN,
+    PARAMETERS_DIGEST_DOMAIN,
     canonicalJson({
-      schemaVersion: plan.schemaVersion,
-      kind: plan.kind,
-      manifestDigest: plan.manifestDigest,
-      datasetVersion: plan.datasetVersion,
-      batches: plan.batches
+      scoreContract: provenance.plan.scoreContract,
+      parameters: first
     })
   );
 }
 
-export function computeC137FormalBlindParametersDigest(
-  provenance: Pick<C137FormalBlindProvenanceV1, "batches">
+function requireUnifiedExecutionIdentityDigest(
+  batches: readonly C137FormalBlindProvenanceBatchEnvelopeV2[]
 ): C137Digest {
-  return digest(
-    PARAMETERS_DIGEST_DOMAIN,
-    canonicalJson(
-      provenance.batches.map((batch) => ({
-        batchId: batch.batchId,
-        parameters: batch.executionSuite.parameters
-      }))
-    )
-  );
+  const first = batches[0]?.nativeReceipt.executionIdentityDigest;
+  if (first === undefined || first === null || !DIGEST.test(first)) {
+    throw new Error("formal blind matrix 首个 tile 缺少规范 executionIdentityDigest。");
+  }
+  for (const batch of batches) {
+    if (batch.nativeReceipt.executionIdentityDigest !== first) {
+      throw new Error(
+        `formal blind batch ${batch.batchId} execution identity 与首个 tile 漂移。`
+      );
+    }
+    if (
+      batch.nativeReceipt.pairOutcomes.some(
+        (outcome) => outcome.relationRanking.executionIdentityDigest !== first
+      )
+    ) {
+      throw new Error(
+        `formal blind batch ${batch.batchId} 存在 cell execution identity 漂移。`
+      );
+    }
+  }
+  return first;
 }
 
 export function computeC137FormalBlindProvenanceDigest(
-  provenance: C137FormalBlindProvenanceDraft | C137FormalBlindProvenanceV1
+  provenance: C137FormalBlindProvenanceDraft | C137FormalBlindProvenanceV2
 ): C137Digest {
   return digest(
     PROVENANCE_DIGEST_DOMAIN,
@@ -195,10 +245,51 @@ export function computeC137FormalBlindProvenanceDigest(
       manifestDigest: provenance.manifestDigest,
       goldDigest: provenance.goldDigest,
       mediaBindingsDigest: provenance.mediaBindingsDigest,
+      executionIdentityDigest: provenance.executionIdentityDigest,
       plan: provenance.plan,
       batches: provenance.batches
     })
   );
+}
+
+export function sealC137FormalBlindProvenanceV2(input: {
+  manifest: RealMediaBenchmarkManifest;
+  plan: C137FormalBlindMatrixPlanV2;
+  batches: readonly C137FormalBlindProvenanceBatchEnvelopeV2[];
+}): C137FormalBlindProvenanceV2 {
+  const manifest = structuredClone(input.manifest);
+  const manifestDigest = computeC137FormalBlindManifestDigest(manifest);
+  const expectedPlan = createC137FormalBlindMatrixPlan(manifest, manifestDigest, {
+    relationshipAxis: input.plan.relationshipAxis,
+    visualEvidenceEnabled: input.plan.visualEvidenceEnabled,
+    globalTopK: input.plan.globalTopK,
+    scoreContract: input.plan.scoreContract
+  });
+  if (!canonicalEqual(input.plan, expectedPlan)) {
+    throw new Error("formal blind seal 拒绝非唯一、非 exhaustive 或摘要未闭合的 matrix plan。");
+  }
+  const draft: C137FormalBlindProvenanceDraft = {
+    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
+    kind: "c137-formal-blind-provenance",
+    releaseEligible: false,
+    trustStatus: "untrusted-self-consistent-provenance",
+    manifest,
+    manifestDigest,
+    goldDigest: computeC137FormalBlindGoldDigest(manifest),
+    mediaBindingsDigest: computeC137FormalBlindMediaBindingsDigest(manifest),
+    executionIdentityDigest: requireUnifiedExecutionIdentityDigest(input.batches),
+    plan: structuredClone(expectedPlan),
+    batches: structuredClone([...input.batches])
+  };
+  const sealed: C137FormalBlindProvenanceV2 = {
+    ...draft,
+    provenanceDigest: computeC137FormalBlindProvenanceDigest(draft)
+  };
+  const validation = validateC137FormalBlindProvenance(sealed);
+  if (!validation.valid) {
+    throw new Error(`formal blind seal 校验失败：${validation.issues.join("；")}`);
+  }
+  return structuredClone(sealed);
 }
 
 export function validateC137FormalBlindProvenance(
@@ -221,21 +312,7 @@ function evaluateInternal(
   try {
     if (expected !== undefined) validateExpectations(expected);
     const provenance = parseProvenance(value);
-    const manifestValidation = validateRealMediaBenchmarkManifest(provenance.manifest);
-    if (!manifestValidation.valid) {
-      throw new Error(
-        `formal blind manifest 无效：${manifestValidation.issues.join("；")}`
-      );
-    }
-    if (
-      provenance.manifest.cases.length === 0 ||
-      provenance.manifest.cases.some(
-        (benchmarkCase) =>
-          benchmarkCase.mediaKind !== "real" || benchmarkCase.split !== "frozen-test"
-      )
-    ) {
-      throw new Error("formal blind provenance 只接受非空、全 real frozen-test manifest。");
-    }
+    validateFormalManifest(provenance.manifest);
     validateConsistentPathIdentities(provenance.manifest);
     validateUniquePhysicalRelationships(provenance.manifest);
 
@@ -252,13 +329,37 @@ function evaluateInternal(
     ) {
       throw new Error("formal blind mediaBindingsDigest 与路径/全文件身份/流绑定不一致。");
     }
-    validatePlan(provenance.plan, provenance.manifest, manifestDigest);
     if (
-      provenance.provenanceDigest !==
-      computeC137FormalBlindProvenanceDigest(provenance)
+      provenance.executionIdentityDigest !==
+      requireUnifiedExecutionIdentityDigest(provenance.batches)
     ) {
+      throw new Error("formal blind executionIdentityDigest 未精确绑定全部 matrix tile/cell。");
+    }
+    const expectedPlan = createC137FormalBlindMatrixPlan(provenance.manifest, manifestDigest, {
+      relationshipAxis: provenance.plan.relationshipAxis,
+      visualEvidenceEnabled: provenance.plan.visualEvidenceEnabled,
+      globalTopK: provenance.plan.globalTopK,
+      scoreContract: provenance.plan.scoreContract
+    });
+    if (!canonicalEqual(provenance.plan, expectedPlan)) {
+      throw new Error(
+        "formal blind matrix plan 不是 manifest 的唯一 exhaustive query×candidate tile 计划。"
+      );
+    }
+    if (
+      provenance.plan.candidateUniverseDigest !==
+      computeC137FormalBlindCandidateUniverseDigest(
+        provenance.manifest,
+        provenance.plan.relationshipAxis,
+        provenance.plan.visualEvidenceEnabled
+      )
+    ) {
+      throw new Error("formal blind candidateUniverseDigest 不一致。");
+    }
+    if (provenance.provenanceDigest !== computeC137FormalBlindProvenanceDigest(provenance)) {
       throw new Error("formal blind provenanceDigest 与完整私有 provenance 内容不一致。");
     }
+
     if (expected !== undefined) {
       if (manifestDigest !== expected.manifestDigest) {
         throw new Error("formal blind manifestDigest 未命中外部期望。");
@@ -269,115 +370,195 @@ function evaluateInternal(
       if (provenance.plan.planDigest !== expected.planDigest) {
         throw new Error("formal blind planDigest 未命中外部期望。");
       }
-      if (computeC137FormalBlindParametersDigest(provenance) !== expected.parametersDigest) {
-        throw new Error("formal blind parametersDigest 未命中外部期望。");
-      }
-      if (provenance.plan.batches.some((batch) => batch.topK !== expected.topK)) {
-        throw new Error("formal blind batch topK 未全部命中外部期望。");
+      if (provenance.plan.globalTopK !== expected.topK) {
+        throw new Error("formal blind globalTopK 未命中外部期望。");
       }
     }
 
     if (provenance.batches.length !== provenance.plan.batches.length) {
       throw new Error("formal blind plan 与 batch envelope 数量不一一对应。");
     }
-    const batchIds = new Set<string>();
-    const envelopeBatchIds = new Set<string>();
-    const replayFingerprints = new Set<C137Digest>();
-    const coveredCaseIds = new Set<string>();
-    const decisions: C137BlindBatchDerivedRelationshipDecision[] = [];
+    const model = createC137FormalBlindMatrixModel(
+      provenance.manifest,
+      provenance.plan.relationshipAxis,
+      provenance.plan.visualEvidenceEnabled
+    );
+    const queryByCommitment = new Map(
+      model.queries.map((query) => [query.bindingCommitment, query])
+    );
+    const candidateByCommitment = new Map(
+      model.candidates.map((candidate) => [candidate.bindingCommitment, candidate])
+    );
+    const seenBatchIds = new Set<string>();
+    const seenNativeJobIds = new Set<string>();
+    const seenReceiptDigests = new Set<C137Digest>();
+    const coveredCells = new Set<string>();
+    const observations: MatrixObservation[] = [];
+    const orderedReceiptDigests: C137Digest[] = [];
+    let commonParameters: RealMediaBlindBatchExecutionSuite["parameters"] | null = null;
 
-    provenance.plan.batches.forEach((planBatch, index) => {
-      if (batchIds.has(planBatch.batchId)) {
-        throw new Error(`formal blind plan batchId 重复：${planBatch.batchId}。`);
+    provenance.plan.batches.forEach((planBatch, batchIndex) => {
+      if (seenBatchIds.has(planBatch.batchId)) {
+        throw new Error(`formal blind batchId 重复：${planBatch.batchId}。`);
       }
-      batchIds.add(planBatch.batchId);
-      const envelope = provenance.batches[index];
+      seenBatchIds.add(planBatch.batchId);
+      const envelope = provenance.batches[batchIndex];
       if (envelope === undefined || envelope.batchId !== planBatch.batchId) {
         throw new Error("formal blind plan/envelope 必须按序以 batchId 一一对应。");
       }
-      if (envelopeBatchIds.has(envelope.batchId)) {
-        throw new Error(`formal blind envelope batchId 重复：${envelope.batchId}。`);
-      }
-      envelopeBatchIds.add(envelope.batchId);
-
-      const options = {
-        caseIds: planBatch.caseIds,
-        candidateCaseIds: planBatch.candidateCaseIds,
-        relationshipAxis: planBatch.relationshipAxis,
-        visualEvidenceEnabled: planBatch.visualEvidenceEnabled,
-        topK: planBatch.topK
-      } as const;
-      const expectedProjection = createC137BlindBatchExecutionProjection(
+      const expectedProjection = createC137FormalBlindMatrixExecutionProjection(
         provenance.manifest,
-        options
+        {
+          queryCaseIds: planBatch.queryCaseIds,
+          candidateCaseIds: planBatch.candidateCaseIds,
+          relationshipAxis: provenance.plan.relationshipAxis,
+          visualEvidenceEnabled: provenance.plan.visualEvidenceEnabled,
+          globalTopK: provenance.plan.globalTopK
+        }
       );
-      if (!canonicalEqual(envelope.projection, expectedProjection)) {
-        throw new Error(`formal blind batch ${planBatch.batchId} projection 不是唯一重建结果。`);
+      if (
+        expectedProjection.projectionDigest !== planBatch.projectionDigest ||
+        !canonicalEqual(envelope.projection, expectedProjection)
+      ) {
+        throw new Error(
+          `formal blind batch ${planBatch.batchId} projection/projectionDigest 不是唯一重建结果。`
+        );
       }
-      validateExecutionManifestBinding(
+      const executionSuite = validateExecutionManifestBinding(
         provenance.manifest,
+        provenance.plan,
         planBatch,
         expectedProjection,
         envelope.executionSuite
       );
+      if (commonParameters === null) {
+        commonParameters = executionSuite.parameters;
+      } else if (!canonicalEqual(commonParameters, executionSuite.parameters)) {
+        throw new Error(
+          "formal blind matrix 所有 batch execution parameters 必须 exact equal。"
+        );
+      }
       const derivedRaw = deriveC137BlindBatchRawPredictionFromNativeReceipt(
         expectedProjection,
-        envelope.executionSuite,
+        executionSuite,
         envelope.nativeReceipt
       );
       if (!canonicalEqual(envelope.rawPrediction, derivedRaw)) {
-        throw new Error(`formal blind batch ${planBatch.batchId} rawPrediction 不是 native receipt 的唯一派生结果。`);
-      }
-      const aggregateEvidence = compileC137BlindBatchBenchmarkEvidence(
-        provenance.manifest,
-        options,
-        expectedProjection,
-        derivedRaw
-      );
-      if (!canonicalEqual(envelope.aggregateEvidence, aggregateEvidence)) {
-        throw new Error(`formal blind batch ${planBatch.batchId} aggregate evidence 不是冻结 gold 的唯一重算结果。`);
-      }
-      const batchDecisions = deriveC137BlindBatchRelationshipDecisions(
-        provenance.manifest,
-        options,
-        expectedProjection,
-        derivedRaw
-      );
-      if (batchDecisions.length !== planBatch.caseIds.length) {
-        throw new Error(`formal blind batch ${planBatch.batchId} decision 数量与 query 计划不一致。`);
-      }
-      batchDecisions.forEach((decision, decisionIndex) => {
-        if (decision.caseId !== planBatch.caseIds[decisionIndex]) {
-          throw new Error(`formal blind batch ${planBatch.batchId} decision 未保持 query manifest 顺序。`);
-        }
-        const replayFingerprint = digest(
-          REPLAY_FINGERPRINT_DOMAIN,
-          canonicalJson([decision.suiteId, decision.caseId])
+        throw new Error(
+          `formal blind batch ${planBatch.batchId} rawPrediction 不是 native receipt 的唯一派生结果。`
         );
-        if (replayFingerprints.has(replayFingerprint)) {
+      }
+      const receipt = envelope.nativeReceipt;
+      if (receipt.executionIdentityDigest !== provenance.executionIdentityDigest) {
+        throw new Error(
+          `formal blind batch ${planBatch.batchId} execution identity 与 matrix pin 漂移。`
+        );
+      }
+      if (seenNativeJobIds.has(receipt.nativeJobId)) {
+        throw new Error(`formal blind nativeJobId replay：${receipt.nativeJobId}。`);
+      }
+      if (seenReceiptDigests.has(receipt.receiptDigest)) {
+        throw new Error(`formal blind receiptDigest replay：${receipt.receiptDigest}。`);
+      }
+      seenNativeJobIds.add(receipt.nativeJobId);
+      seenReceiptDigests.add(receipt.receiptDigest);
+      orderedReceiptDigests.push(receipt.receiptDigest);
+
+      const projectedMediaById = new Map(
+        [...expectedProjection.sources, ...expectedProjection.targets].map((media) => [
+          media.mediaId,
+          media
+        ])
+      );
+      envelope.nativeReceipt.pairOutcomes.forEach((outcome, pairIndex) => {
+        const pair = expectedProjection.pairs[pairIndex];
+        if (pair === undefined || outcome.pairOrdinal !== pairIndex + 1) {
+          throw new Error(`formal blind batch ${planBatch.batchId} pair outcome 顺序错配。`);
+        }
+        const queryMediaId =
+          provenance.plan.relationshipAxis === "source"
+            ? pair.sourceMediaId
+            : pair.targetMediaId;
+        const candidateMediaId =
+          provenance.plan.relationshipAxis === "source"
+            ? pair.targetMediaId
+            : pair.sourceMediaId;
+        const queryProjection = projectedMediaById.get(queryMediaId);
+        const candidateProjection = projectedMediaById.get(candidateMediaId);
+        const query =
+          queryProjection === undefined
+            ? undefined
+            : queryByCommitment.get(queryProjection.bindingCommitment);
+        const candidate =
+          candidateProjection === undefined
+            ? undefined
+            : candidateByCommitment.get(candidateProjection.bindingCommitment);
+        if (query === undefined || candidate === undefined) {
+          throw new Error(`formal blind batch ${planBatch.batchId} pair 无法映射到全局矩阵。`);
+        }
+        if (outcome.relationRanking.scoreVersion !== provenance.plan.scoreContract) {
           throw new Error(
-            `formal blind suite+case replay 重复：${decision.suiteId}/${decision.caseId}。`
+            `formal blind batch ${planBatch.batchId} relationRanking scoreVersion 错配。`
           );
         }
-        replayFingerprints.add(replayFingerprint);
-        if (coveredCaseIds.has(decision.caseId)) {
-          throw new Error(`formal blind duplicate case coverage：${decision.caseId}。`);
+        if (
+          outcome.relationRanking.executionIdentityDigest !== provenance.executionIdentityDigest
+        ) {
+          throw new Error(
+            `formal blind batch ${planBatch.batchId} pair execution identity 与 matrix pin 漂移。`
+          );
         }
-        coveredCaseIds.add(decision.caseId);
-        decisions.push(decision);
+        const cellKey = matrixCellKey(query.caseId, candidate.ordinal);
+        if (coveredCells.has(cellKey)) {
+          throw new Error(
+            `formal blind matrix cell 重复：${query.caseId}×${candidate.representativeCaseId}。`
+          );
+        }
+        coveredCells.add(cellKey);
+        observations.push({
+          queryCaseId: query.caseId,
+          candidateOrdinal: candidate.ordinal,
+          candidateRepresentativeCaseId: candidate.representativeCaseId,
+          pairId: createGlobalPairId(provenance.plan, query.caseId, candidate),
+          batchId: planBatch.batchId,
+          receiptDigest: receipt.receiptDigest,
+          pairOrdinal: outcome.pairOrdinal,
+          relationRanking: structuredClone(outcome.relationRanking)
+        });
       });
     });
 
-    const allCaseIds = provenance.manifest.cases.map((benchmarkCase) => benchmarkCase.id);
-    const missingCaseIds = allCaseIds.filter((caseId) => !coveredCaseIds.has(caseId));
-    if (missingCaseIds.length > 0) {
-      return {
-        valid: false,
-        issues: [`formal blind query coverage 缺少：${missingCaseIds.join(", ")}。`],
-        coverageValid: false,
-        decisions: []
-      };
+    const expectedCellCount = model.queries.length * model.candidates.length;
+    if (coveredCells.size !== expectedCellCount) {
+      const missing: string[] = [];
+      for (const query of model.queries) {
+        for (const candidate of model.candidates) {
+          const key = matrixCellKey(query.caseId, candidate.ordinal);
+          if (!coveredCells.has(key)) {
+            missing.push(`${query.caseId}×${candidate.representativeCaseId}`);
+          }
+        }
+      }
+      throw new Error(
+        `formal blind exhaustive matrix coverage 缺少 ${expectedCellCount - coveredCells.size} cell：${missing.slice(0, 8).join(", ")}。`
+      );
     }
+    if (observations.length !== expectedCellCount) {
+      throw new Error("formal blind matrix observation 数量与 exhaustive coverage 不一致。");
+    }
+    const parametersDigest = computeC137FormalBlindParametersDigest(provenance);
+    if (expected !== undefined && parametersDigest !== expected.parametersDigest) {
+      throw new Error("formal blind parametersDigest 未命中外部期望。");
+    }
+
+    const decisions = deriveGlobalDecisions(
+      provenance.manifest,
+      provenance.plan,
+      model.candidates,
+      model.candidateByPhysicalKey,
+      observations,
+      orderedReceiptDigests
+    );
     return { valid: true, issues: [], coverageValid: true, decisions };
   } catch (error) {
     return {
@@ -389,282 +570,190 @@ function evaluateInternal(
   }
 }
 
-function parseProvenance(value: unknown): C137FormalBlindProvenanceV1 {
-  const record = requireExactRecord(
-    value,
-    [
-      "schemaVersion",
-      "kind",
-      "releaseEligible",
-      "trustStatus",
-      "manifest",
-      "manifestDigest",
-      "goldDigest",
-      "mediaBindingsDigest",
-      "plan",
-      "batches",
-      "provenanceDigest"
-    ],
-    "formal blind provenance"
-  );
-  if (
-    record.schemaVersion !== C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION ||
-    record.kind !== "c137-formal-blind-provenance" ||
-    record.releaseEligible !== false ||
-    record.trustStatus !== "untrusted-self-consistent-provenance"
-  ) {
-    throw new Error("formal blind provenance schema/kind/release/trust 标记无效。");
-  }
-  assertDigest(record.manifestDigest, "formal blind manifestDigest");
-  assertDigest(record.goldDigest, "formal blind goldDigest");
-  assertDigest(record.mediaBindingsDigest, "formal blind mediaBindingsDigest");
-  assertDigest(record.provenanceDigest, "formal blind provenanceDigest");
-  const plan = parsePlan(record.plan);
-  assertArray(record.batches, "formal blind batches");
-  const batches = record.batches.map((batch, index) => parseBatchEnvelope(batch, index));
-  if (!isRecord(record.manifest)) {
-    throw new Error("formal blind manifest 必须是对象。");
-  }
-  return {
-    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
-    kind: "c137-formal-blind-provenance",
-    releaseEligible: false,
-    trustStatus: "untrusted-self-consistent-provenance",
-    manifest: record.manifest as unknown as RealMediaBenchmarkManifest,
-    manifestDigest: record.manifestDigest,
-    goldDigest: record.goldDigest,
-    mediaBindingsDigest: record.mediaBindingsDigest,
-    plan,
-    batches,
-    provenanceDigest: record.provenanceDigest
-  };
-}
-
-function parsePlan(value: unknown): C137FormalBlindProvenancePlanV1 {
-  const record = requireExactRecord(
-    value,
-    ["schemaVersion", "kind", "manifestDigest", "datasetVersion", "batches", "planDigest"],
-    "formal blind plan"
-  );
-  if (
-    record.schemaVersion !== C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION ||
-    record.kind !== "c137-formal-blind-provenance-plan"
-  ) {
-    throw new Error("formal blind plan schema/kind 无效。");
-  }
-  assertDigest(record.manifestDigest, "formal blind plan.manifestDigest");
-  assertNonemptyString(record.datasetVersion, "formal blind plan.datasetVersion");
-  assertDigest(record.planDigest, "formal blind plan.planDigest");
-  assertArray(record.batches, "formal blind plan.batches");
-  if (record.batches.length === 0) throw new Error("formal blind plan 至少需要一个 batch。");
-  return {
-    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
-    kind: "c137-formal-blind-provenance-plan",
-    manifestDigest: record.manifestDigest,
-    datasetVersion: record.datasetVersion,
-    batches: record.batches.map((batch, index) => parsePlanBatch(batch, index)),
-    planDigest: record.planDigest
-  };
-}
-
-function parsePlanBatch(
-  value: unknown,
-  index: number
-): C137FormalBlindProvenancePlanBatchV1 {
-  const label = `formal blind plan.batches[${index}]`;
-  const record = requireExactRecord(
-    value,
-    [
-      "batchId",
-      "caseIds",
-      "candidateCaseIds",
-      "relationshipAxis",
-      "visualEvidenceEnabled",
-      "topK"
-    ],
-    label
-  );
-  assertIdentifier(record.batchId, `${label}.batchId`);
-  const caseIds = parseIdentifierArray(record.caseIds, `${label}.caseIds`);
-  const candidateCaseIds = parseIdentifierArray(
-    record.candidateCaseIds,
-    `${label}.candidateCaseIds`
-  );
-  if (record.relationshipAxis !== "source" && record.relationshipAxis !== "target") {
-    throw new Error(`${label}.relationshipAxis 无效。`);
-  }
-  if (typeof record.visualEvidenceEnabled !== "boolean") {
-    throw new Error(`${label}.visualEvidenceEnabled 必须是 boolean。`);
-  }
-  assertTopK(record.topK, `${label}.topK`);
-  return {
-    batchId: record.batchId,
-    caseIds,
-    candidateCaseIds,
-    relationshipAxis: record.relationshipAxis,
-    visualEvidenceEnabled: record.visualEvidenceEnabled,
-    topK: record.topK
-  };
-}
-
-function parseBatchEnvelope(
-  value: unknown,
-  index: number
-): C137FormalBlindProvenanceBatchEnvelopeV1 {
-  const label = `formal blind batches[${index}]`;
-  const record = requireExactRecord(
-    value,
-    [
-      "schemaVersion",
-      "kind",
-      "batchId",
-      "projection",
-      "executionSuite",
-      "nativeReceipt",
-      "rawPrediction",
-      "aggregateEvidence"
-    ],
-    label
-  );
-  if (
-    record.schemaVersion !== C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION ||
-    record.kind !== "c137-formal-blind-provenance-batch"
-  ) {
-    throw new Error(`${label} schema/kind 无效。`);
-  }
-  assertIdentifier(record.batchId, `${label}.batchId`);
-  for (const field of [
-    "projection",
-    "executionSuite",
-    "nativeReceipt",
-    "rawPrediction",
-    "aggregateEvidence"
-  ] as const) {
-    if (!isRecord(record[field])) throw new Error(`${label}.${field} 必须是对象。`);
-  }
-  return {
-    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
-    kind: "c137-formal-blind-provenance-batch",
-    batchId: record.batchId,
-    projection: record.projection as C137BlindBatchExecutionProjection,
-    executionSuite: record.executionSuite as RealMediaBlindBatchExecutionSuite,
-    nativeReceipt: record.nativeReceipt as RealMediaBlindBatchRunReceipt,
-    rawPrediction: record.rawPrediction as C137BlindBatchRawPrediction,
-    aggregateEvidence: record.aggregateEvidence as C137BlindBatchBenchmarkEvidence
-  };
-}
-
-function validatePlan(
-  plan: C137FormalBlindProvenancePlanV1,
+function deriveGlobalDecisions(
   manifest: RealMediaBenchmarkManifest,
-  manifestDigest: C137Digest
-): void {
-  if (
-    plan.manifestDigest !== manifestDigest ||
-    plan.datasetVersion !== manifest.datasetVersion
-  ) {
-    throw new Error("formal blind plan 未绑定同一 manifestDigest/datasetVersion。");
+  plan: C137FormalBlindMatrixPlanV2,
+  candidates: readonly C137FormalBlindMatrixCandidateEntry[],
+  candidateByPhysicalKey: ReadonlyMap<string, C137FormalBlindMatrixCandidateEntry>,
+  observations: readonly MatrixObservation[],
+  orderedReceiptDigests: readonly C137Digest[]
+): C137FormalBlindDerivedRelationshipDecisionV2[] {
+  const candidateSide = plan.relationshipAxis === "source" ? "target" : "source";
+  const observationsByQuery = new Map<string, MatrixObservation[]>();
+  for (const observation of observations) {
+    const list = observationsByQuery.get(observation.queryCaseId) ?? [];
+    list.push(observation);
+    observationsByQuery.set(observation.queryCaseId, list);
   }
-  if (plan.planDigest !== computeC137FormalBlindPlanDigest(plan)) {
-    throw new Error("formal blind planDigest 与有序计划内容不一致。");
-  }
-  const allCaseIds = manifest.cases.map((benchmarkCase) => benchmarkCase.id);
-  for (const batch of plan.batches) {
-    if (!sameOrderedStrings(batch.candidateCaseIds, allCaseIds)) {
+  return manifest.cases.map((benchmarkCase) => {
+    const queryObservations = observationsByQuery.get(benchmarkCase.id) ?? [];
+    if (queryObservations.length !== candidates.length) {
       throw new Error(
-        `formal blind batch ${batch.batchId} candidateCaseIds 必须严格等于完整 real frozen manifest 顺序；只允许切 query 轴。`
+        `formal blind query ${benchmarkCase.id} 未收齐完整 candidate universe 后不得生成 Top-K。`
       );
     }
-    assertManifestOrderedSubset(batch.caseIds, allCaseIds, batch.batchId);
-  }
-  validateUniqueQueryIdentities(plan, manifest);
-}
-
-function validateUniquePhysicalRelationships(manifest: RealMediaBenchmarkManifest): void {
-  const relationships = new Map<string, string>();
-  for (const benchmarkCase of manifest.cases) {
-    const key = canonicalJson([
-      fullFileIdentityKey(benchmarkCase.source, `${benchmarkCase.id}.source`),
-      fullFileIdentityKey(benchmarkCase.target, `${benchmarkCase.id}.target`)
-    ]);
-    const previousCaseId = relationships.get(key);
-    if (previousCaseId !== undefined && previousCaseId !== benchmarkCase.id) {
+    const orderedByCandidate = [...queryObservations].sort(
+      (left, right) => left.candidateOrdinal - right.candidateOrdinal
+    );
+    if (
+      orderedByCandidate.some((observation, index) => observation.candidateOrdinal !== index)
+    ) {
+      throw new Error(`formal blind query ${benchmarkCase.id} candidate ordinal 缺失或重复。`);
+    }
+    const rankedPairIds = rankC137FormalBlindGlobalScores(
+      orderedByCandidate.map((observation) => ({
+        candidateOrdinal: observation.candidateOrdinal,
+        pairId: observation.pairId,
+        score: observation.relationRanking.score
+      })),
+      plan.globalTopK,
+      benchmarkCase.id
+    );
+    const goldPhysicalKey = fullFileIdentityKey(
+      benchmarkCase[candidateSide],
+      `${benchmarkCase.id}.${candidateSide}`
+    );
+    const goldCandidate = candidateByPhysicalKey.get(goldPhysicalKey);
+    if (goldCandidate === undefined) {
       throw new Error(
-        `formal blind duplicate physical relationship：${previousCaseId}/${benchmarkCase.id} 绑定同一 source-target full-file identity。`
+        `formal blind query ${benchmarkCase.id} 的 gold candidate 不在全局 union。`
       );
     }
-    relationships.set(key, benchmarkCase.id);
-  }
+    const observationDigest = digest(
+      OBSERVATION_DIGEST_DOMAIN,
+      canonicalJson(
+        orderedByCandidate.map((observation) => ({
+          candidateOrdinal: observation.candidateOrdinal,
+          candidateRepresentativeCaseId: observation.candidateRepresentativeCaseId,
+          pairId: observation.pairId,
+          batchId: observation.batchId,
+          receiptDigest: observation.receiptDigest,
+          pairOrdinal: observation.pairOrdinal,
+          relationRanking: observation.relationRanking
+        }))
+      )
+    );
+    const provenanceRef = digest(
+      DECISION_DIGEST_DOMAIN,
+      canonicalJson({
+        planDigest: plan.planDigest,
+        caseId: benchmarkCase.id,
+        orderedReceiptDigests,
+        observationDigest,
+        rankedPairIds
+      })
+    );
+    return {
+      caseId: benchmarkCase.id,
+      provenanceRef,
+      goldPairId: createGlobalPairId(plan, benchmarkCase.id, goldCandidate),
+      rankedPairIds
+    };
+  });
 }
 
-function validateConsistentPathIdentities(manifest: RealMediaBenchmarkManifest): void {
-  const identitiesByPath = new Map<
-    string,
-    { caseId: string; side: "source" | "target"; identityKey: string }
-  >();
-  for (const benchmarkCase of manifest.cases) {
-    for (const side of ["source", "target"] as const) {
-      const media = benchmarkCase[side];
-      const pathKey = normalizePathForIdentityBinding(media.path);
-      const identityKey = fullFileIdentityKey(media, `${benchmarkCase.id}.${side}`);
-      const previous = identitiesByPath.get(pathKey);
-      if (previous !== undefined && previous.identityKey !== identityKey) {
-        throw new Error(
-          `formal blind path identity conflict：${previous.caseId}.${previous.side}/${benchmarkCase.id}.${side} 的同一规范化路径绑定了不同 full-file identity。`
-        );
-      }
-      identitiesByPath.set(pathKey, { caseId: benchmarkCase.id, side, identityKey });
+export function rankC137FormalBlindGlobalScores(
+  observations: readonly C137FormalBlindGlobalScoreObservation[],
+  globalTopK: number,
+  queryLabel: string = "unknown"
+): C137Digest[] {
+  assertGlobalTopK(globalTopK);
+  const ordinals = new Set<number>();
+  const pairIds = new Set<C137Digest>();
+  for (const observation of observations) {
+    if (
+      !Number.isSafeInteger(observation.candidateOrdinal) ||
+      observation.candidateOrdinal < 0
+    ) {
+      throw new Error("formal blind global score candidateOrdinal 无效。");
     }
+    if (ordinals.has(observation.candidateOrdinal) || pairIds.has(observation.pairId)) {
+      throw new Error("formal blind global score observation 含重复 candidate/pair。");
+    }
+    assertDigest(observation.pairId, "formal blind global score pairId");
+    if (observation.score !== null && !Number.isFinite(observation.score)) {
+      throw new Error("formal blind global score 必须是 finite number 或 null。");
+    }
+    ordinals.add(observation.candidateOrdinal);
+    pairIds.add(observation.pairId);
   }
+  const eligible = observations.filter((observation) => observation.score !== null);
+  if (eligible.length < globalTopK) {
+    throw new Error(
+      `formal blind query ${queryLabel} 只有 ${eligible.length} 个 intrinsic eligible candidate，少于 globalTopK=${globalTopK}。`
+    );
+  }
+  return [...eligible]
+    .sort(compareGlobalScoreObservations)
+    .slice(0, globalTopK)
+    .map((observation) => observation.pairId);
 }
 
-function validateUniqueQueryIdentities(
-  plan: C137FormalBlindProvenancePlanV1,
-  manifest: RealMediaBenchmarkManifest
-): void {
-  const byCaseId = new Map(manifest.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase]));
-  const identities = {
-    source: new Map<string, { batchId: string; caseId: string }>(),
-    target: new Map<string, { batchId: string; caseId: string }>()
-  };
-  for (const batch of plan.batches) {
-    const side = batch.relationshipAxis;
-    const sideIdentities = identities[side];
-    for (const caseId of batch.caseIds) {
-      const benchmarkCase = requireCase(byCaseId, caseId);
-      const key = fullFileIdentityKey(benchmarkCase[side], `${caseId}.${side}`);
-      const previous = sideIdentities.get(key);
-      if (previous !== undefined && previous.batchId !== batch.batchId) {
-        throw new Error(
-          `formal blind ${side}-axis duplicate physical query identity：${previous.caseId}@${previous.batchId}/${caseId}@${batch.batchId}。`
-        );
-      }
-      sideIdentities.set(key, { batchId: batch.batchId, caseId });
-    }
+function compareGlobalScoreObservations(
+  left: C137FormalBlindGlobalScoreObservation,
+  right: C137FormalBlindGlobalScoreObservation
+): number {
+  const leftScore = left.score;
+  const rightScore = right.score;
+  if (leftScore === null && rightScore !== null) return 1;
+  if (leftScore !== null && rightScore === null) return -1;
+  if (leftScore !== null && rightScore !== null && leftScore !== rightScore) {
+    return rightScore - leftScore;
   }
+  return left.candidateOrdinal - right.candidateOrdinal;
+}
+
+function createGlobalPairId(
+  plan: C137FormalBlindMatrixPlanV2,
+  queryCaseId: string,
+  candidate: C137FormalBlindMatrixCandidateEntry
+): C137Digest {
+  return digest(
+    GLOBAL_PAIR_ID_DOMAIN,
+    canonicalJson({
+      manifestDigest: plan.manifestDigest,
+      candidateUniverseDigest: plan.candidateUniverseDigest,
+      relationshipAxis: plan.relationshipAxis,
+      visualEvidenceEnabled: plan.visualEvidenceEnabled,
+      queryCaseId,
+      candidateOrdinal: candidate.ordinal,
+      candidateBindingCommitment: candidate.bindingCommitment
+    })
+  );
 }
 
 function validateExecutionManifestBinding(
   manifest: RealMediaBenchmarkManifest,
-  planBatch: C137FormalBlindProvenancePlanBatchV1,
+  plan: C137FormalBlindMatrixPlanV2,
+  planBatch: C137FormalBlindMatrixPlanBatchV2,
   projection: C137BlindBatchExecutionProjection,
   executionSuiteValue: unknown
-): void {
+): RealMediaBlindBatchExecutionSuite {
   const executionSuite = validateRealMediaBlindBatchExecutionSuite(executionSuiteValue);
-  if (executionSuite.datasetVersion !== manifest.datasetVersion) {
-    throw new Error(`formal blind batch ${planBatch.batchId} execution datasetVersion 错配。`);
+  if (
+    executionSuite.datasetVersion !== manifest.datasetVersion ||
+    executionSuite.suiteId !== projection.suiteId ||
+    executionSuite.topK !== plan.globalTopK
+  ) {
+    throw new Error(`formal blind batch ${planBatch.batchId} execution identity/topK 错配。`);
   }
-  const byCaseId = new Map(manifest.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase]));
-  const queryCases = planBatch.caseIds.map((caseId) => requireCase(byCaseId, caseId));
-  const candidateCases = planBatch.candidateCaseIds.map((caseId) =>
-    requireCase(byCaseId, caseId)
+  const model = createC137FormalBlindMatrixModel(
+    manifest,
+    plan.relationshipAxis,
+    plan.visualEvidenceEnabled
   );
-  const sourceCases = planBatch.relationshipAxis === "source" ? queryCases : candidateCases;
-  const targetCases = planBatch.relationshipAxis === "target" ? queryCases : candidateCases;
+  const queryCases = planBatch.queryCaseIds.map((caseId) =>
+    requireCase(model.caseById, caseId)
+  );
+  const candidateCases = planBatch.candidateCaseIds.map((caseId) =>
+    requireCase(model.caseById, caseId)
+  );
+  const sourceCases = plan.relationshipAxis === "source" ? queryCases : candidateCases;
+  const targetCases = plan.relationshipAxis === "target" ? queryCases : candidateCases;
   validateExecutionSideBinding(
     manifest,
     "source",
-    planBatch.visualEvidenceEnabled,
+    plan.visualEvidenceEnabled,
     sourceCases.map((benchmarkCase) => benchmarkCase.source),
     projection.sources,
     executionSuite.sources
@@ -672,11 +761,12 @@ function validateExecutionManifestBinding(
   validateExecutionSideBinding(
     manifest,
     "target",
-    planBatch.visualEvidenceEnabled,
+    plan.visualEvidenceEnabled,
     targetCases.map((benchmarkCase) => benchmarkCase.target),
     projection.targets,
     executionSuite.targets
   );
+  return executionSuite;
 }
 
 function validateExecutionSideBinding(
@@ -731,12 +821,233 @@ function validateExecutionSideBinding(
   });
 }
 
+function parseProvenance(value: unknown): C137FormalBlindProvenanceV2 {
+  const record = requireExactRecord(
+    value,
+    [
+      "schemaVersion",
+      "kind",
+      "releaseEligible",
+      "trustStatus",
+      "manifest",
+      "manifestDigest",
+      "goldDigest",
+      "mediaBindingsDigest",
+      "executionIdentityDigest",
+      "plan",
+      "batches",
+      "provenanceDigest"
+    ],
+    "formal blind provenance"
+  );
+  if (
+    record.schemaVersion !== C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION ||
+    record.kind !== "c137-formal-blind-provenance" ||
+    record.releaseEligible !== false ||
+    record.trustStatus !== "untrusted-self-consistent-provenance"
+  ) {
+    throw new Error("formal blind provenance schema/kind/release/trust 标记无效。");
+  }
+  assertDigest(record.manifestDigest, "formal blind manifestDigest");
+  assertDigest(record.goldDigest, "formal blind goldDigest");
+  assertDigest(record.mediaBindingsDigest, "formal blind mediaBindingsDigest");
+  assertDigest(record.executionIdentityDigest, "formal blind executionIdentityDigest");
+  assertDigest(record.provenanceDigest, "formal blind provenanceDigest");
+  if (!isRecord(record.manifest)) throw new Error("formal blind manifest 必须是对象。");
+  const plan = parsePlan(record.plan);
+  assertArray(record.batches, "formal blind batches");
+  if (record.batches.length === 0) throw new Error("formal blind batches 不能为空。");
+  return {
+    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
+    kind: "c137-formal-blind-provenance",
+    releaseEligible: false,
+    trustStatus: "untrusted-self-consistent-provenance",
+    manifest: record.manifest as unknown as RealMediaBenchmarkManifest,
+    manifestDigest: record.manifestDigest,
+    goldDigest: record.goldDigest,
+    mediaBindingsDigest: record.mediaBindingsDigest,
+    executionIdentityDigest: record.executionIdentityDigest,
+    plan,
+    batches: record.batches.map((batch, index) => parseBatchEnvelope(batch, index)),
+    provenanceDigest: record.provenanceDigest
+  };
+}
+
+function parsePlan(value: unknown): C137FormalBlindMatrixPlanV2 {
+  const record = requireExactRecord(
+    value,
+    [
+      "schemaVersion",
+      "kind",
+      "manifestDigest",
+      "datasetVersion",
+      "relationshipAxis",
+      "visualEvidenceEnabled",
+      "globalTopK",
+      "scoreContract",
+      "candidateUniverseDigest",
+      "matrixCoverage",
+      "batches",
+      "planDigest"
+    ],
+    "formal blind plan"
+  );
+  if (
+    record.schemaVersion !== C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION ||
+    record.kind !== "c137-formal-blind-matrix-plan" ||
+    record.scoreContract !== C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT ||
+    record.matrixCoverage !== C137_FORMAL_BLIND_MATRIX_COVERAGE
+  ) {
+    throw new Error("formal blind plan schema/kind/scoreContract/matrixCoverage 无效。");
+  }
+  assertDigest(record.manifestDigest, "formal blind plan.manifestDigest");
+  assertNonemptyString(record.datasetVersion, "formal blind plan.datasetVersion");
+  assertRelationshipAxis(record.relationshipAxis);
+  if (typeof record.visualEvidenceEnabled !== "boolean") {
+    throw new Error("formal blind plan.visualEvidenceEnabled 必须是 boolean。");
+  }
+  assertGlobalTopK(record.globalTopK);
+  assertDigest(record.candidateUniverseDigest, "formal blind plan.candidateUniverseDigest");
+  assertDigest(record.planDigest, "formal blind plan.planDigest");
+  assertArray(record.batches, "formal blind plan.batches");
+  if (record.batches.length === 0) throw new Error("formal blind plan 至少需要一个 batch。");
+  return {
+    schemaVersion: C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION,
+    kind: "c137-formal-blind-matrix-plan",
+    manifestDigest: record.manifestDigest,
+    datasetVersion: record.datasetVersion,
+    relationshipAxis: record.relationshipAxis,
+    visualEvidenceEnabled: record.visualEvidenceEnabled,
+    globalTopK: record.globalTopK,
+    scoreContract: C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+    candidateUniverseDigest: record.candidateUniverseDigest,
+    matrixCoverage: C137_FORMAL_BLIND_MATRIX_COVERAGE,
+    batches: record.batches.map((batch, index) => parsePlanBatch(batch, index)),
+    planDigest: record.planDigest
+  };
+}
+
+function parsePlanBatch(value: unknown, index: number): C137FormalBlindMatrixPlanBatchV2 {
+  const label = `formal blind plan.batches[${index}]`;
+  const record = requireExactRecord(
+    value,
+    ["batchId", "queryCaseIds", "candidateCaseIds", "projectionDigest"],
+    label
+  );
+  assertIdentifier(record.batchId, `${label}.batchId`);
+  assertDigest(record.projectionDigest, `${label}.projectionDigest`);
+  return {
+    batchId: record.batchId,
+    queryCaseIds: parseIdentifierArray(record.queryCaseIds, `${label}.queryCaseIds`),
+    candidateCaseIds: parseIdentifierArray(
+      record.candidateCaseIds,
+      `${label}.candidateCaseIds`
+    ),
+    projectionDigest: record.projectionDigest
+  };
+}
+
+function parseBatchEnvelope(
+  value: unknown,
+  index: number
+): C137FormalBlindProvenanceBatchEnvelopeV2 {
+  const label = `formal blind batches[${index}]`;
+  const record = requireExactRecord(
+    value,
+    [
+      "schemaVersion",
+      "kind",
+      "batchId",
+      "projection",
+      "executionSuite",
+      "nativeReceipt",
+      "rawPrediction"
+    ],
+    label
+  );
+  if (
+    record.schemaVersion !== C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION ||
+    record.kind !== "c137-formal-blind-provenance-batch"
+  ) {
+    throw new Error(`${label} schema/kind 无效。`);
+  }
+  assertIdentifier(record.batchId, `${label}.batchId`);
+  for (const field of [
+    "projection",
+    "executionSuite",
+    "nativeReceipt",
+    "rawPrediction"
+  ] as const) {
+    if (!isRecord(record[field])) throw new Error(`${label}.${field} 必须是对象。`);
+  }
+  return {
+    schemaVersion: C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION,
+    kind: "c137-formal-blind-provenance-batch",
+    batchId: record.batchId,
+    projection: record.projection as C137BlindBatchExecutionProjection,
+    executionSuite: record.executionSuite as RealMediaBlindBatchExecutionSuite,
+    nativeReceipt: record.nativeReceipt as RealMediaBlindBatchRunReceipt,
+    rawPrediction: record.rawPrediction as C137BlindBatchRawPrediction
+  };
+}
+
+function validateFormalManifest(manifest: RealMediaBenchmarkManifest): void {
+  const validation = validateRealMediaBenchmarkManifest(manifest);
+  if (!validation.valid) {
+    throw new Error(`formal blind manifest 无效：${validation.issues.join("；")}`);
+  }
+  if (
+    manifest.cases.length === 0 ||
+    manifest.cases.some(
+      (benchmarkCase) =>
+        benchmarkCase.mediaKind !== "real" || benchmarkCase.split !== "frozen-test"
+    )
+  ) {
+    throw new Error("formal blind provenance 只接受非空、全 real frozen-test manifest。");
+  }
+}
+
+function validateUniquePhysicalRelationships(manifest: RealMediaBenchmarkManifest): void {
+  const relationships = new Map<string, string>();
+  for (const benchmarkCase of manifest.cases) {
+    const key = canonicalJson([
+      fullFileIdentityKey(benchmarkCase.source, `${benchmarkCase.id}.source`),
+      fullFileIdentityKey(benchmarkCase.target, `${benchmarkCase.id}.target`)
+    ]);
+    const previousCaseId = relationships.get(key);
+    if (previousCaseId !== undefined) {
+      throw new Error(
+        `formal blind duplicate physical relationship：${previousCaseId}/${benchmarkCase.id}。`
+      );
+    }
+    relationships.set(key, benchmarkCase.id);
+  }
+}
+
+function validateConsistentPathIdentities(manifest: RealMediaBenchmarkManifest): void {
+  const identitiesByPath = new Map<string, string>();
+  for (const benchmarkCase of manifest.cases) {
+    for (const side of ["source", "target"] as const) {
+      const media = benchmarkCase[side];
+      const pathKey = media.path.trim().split("/").join("\\").toLocaleLowerCase("en-US");
+      const identityKey = fullFileIdentityKey(media, `${benchmarkCase.id}.${side}`);
+      const previous = identitiesByPath.get(pathKey);
+      if (previous !== undefined && previous !== identityKey) {
+        throw new Error(
+          "formal blind path identity conflict：同一规范化路径绑定了不同 full-file identity。"
+        );
+      }
+      identitiesByPath.set(pathKey, identityKey);
+    }
+  }
+}
+
 function validateExpectations(expected: C137FormalBlindProvenanceExpectations): void {
   assertDigest(expected.manifestDigest, "formal blind expected.manifestDigest");
   assertNonemptyString(expected.datasetVersion, "formal blind expected.datasetVersion");
   assertDigest(expected.planDigest, "formal blind expected.planDigest");
   assertDigest(expected.parametersDigest, "formal blind expected.parametersDigest");
-  assertTopK(expected.topK, "formal blind expected.topK");
+  assertGlobalTopK(expected.topK);
 }
 
 function formalMediaBinding(media: RealMediaBenchmarkMediaInput): unknown {
@@ -759,42 +1070,17 @@ function fullFileIdentityKey(media: RealMediaBenchmarkMediaInput, label: string)
   ]);
 }
 
-function normalizePathForIdentityBinding(path: string): string {
-  return path.trim().split("/").join("\\").toLocaleLowerCase("en-US");
-}
-
 function requireCase(
-  byCaseId: ReadonlyMap<string, RealMediaBenchmarkCase>,
+  cases: ReadonlyMap<string, RealMediaBenchmarkCase>,
   caseId: string
 ): RealMediaBenchmarkCase {
-  const benchmarkCase = byCaseId.get(caseId);
+  const benchmarkCase = cases.get(caseId);
   if (benchmarkCase === undefined) throw new Error(`formal blind case 不存在：${caseId}。`);
   return benchmarkCase;
 }
 
-function assertManifestOrderedSubset(
-  caseIds: readonly string[],
-  manifestCaseIds: readonly string[],
-  batchId: string
-): void {
-  const requested = new Set(caseIds);
-  const ordered = manifestCaseIds.filter((caseId) => requested.has(caseId));
-  if (!sameOrderedStrings(caseIds, ordered)) {
-    throw new Error(
-      `formal blind batch ${batchId} caseIds 必须是非空、不重复的 manifest 顺序子集。`
-    );
-  }
-}
-
-function parseIdentifierArray(value: unknown, label: string): string[] {
-  assertArray(value, label);
-  if (value.length === 0) throw new Error(`${label} 不能为空。`);
-  const result = value.map((item, index) => {
-    assertIdentifier(item, `${label}[${index}]`);
-    return item;
-  });
-  if (new Set(result).size !== result.length) throw new Error(`${label} 不得重复。`);
-  return result;
+function matrixCellKey(queryCaseId: string, candidateOrdinal: number): string {
+  return `${queryCaseId}\u0000${candidateOrdinal}`;
 }
 
 function requireExactRecord(
@@ -809,6 +1095,17 @@ function requireExactRecord(
     throw new Error(`${label} 含未知或缺失字段；formal schema 使用 exact keys。`);
   }
   return value;
+}
+
+function parseIdentifierArray(value: unknown, label: string): string[] {
+  assertArray(value, label);
+  if (value.length === 0) throw new Error(`${label} 不能为空。`);
+  const result = value.map((item, index) => {
+    assertIdentifier(item, `${label}[${index}]`);
+    return item;
+  });
+  if (new Set(result).size !== result.length) throw new Error(`${label} 不得重复。`);
+  return result;
 }
 
 function assertArray(value: unknown, label: string): asserts value is unknown[] {
@@ -833,9 +1130,15 @@ function assertDigest(value: unknown, label: string): asserts value is C137Diges
   }
 }
 
-function assertTopK(value: unknown, label: string): asserts value is number {
+function assertRelationshipAxis(value: unknown): asserts value is "source" | "target" {
+  if (value !== "source" && value !== "target") {
+    throw new Error("formal blind relationshipAxis 无效。");
+  }
+}
+
+function assertGlobalTopK(value: unknown): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 2 || (value as number) > 20) {
-    throw new Error(`${label} 必须是 2..20 的安全整数。`);
+    throw new Error("formal blind globalTopK 必须是 2..20 的安全整数。");
   }
 }
 

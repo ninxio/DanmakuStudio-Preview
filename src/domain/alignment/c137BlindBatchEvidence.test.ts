@@ -66,13 +66,25 @@ describe("C137 blind cross-media relationship evidence", () => {
     expect(legacySubset.sources).toHaveLength(3);
     expect(legacySubset.targets).toHaveLength(3);
 
+    const partialCandidateShardOptions = {
+      ...OPTIONS,
+      caseIds: decisionCaseIds,
+      candidateCaseIds: candidateCaseIds.slice(1)
+    } as const;
+    const partialCandidateShard = createC137BlindBatchExecutionProjection(
+      manifest,
+      partialCandidateShardOptions
+    );
+    expect(partialCandidateShard.sources).toHaveLength(4);
+    expect(partialCandidateShard.targets).toHaveLength(1);
     expect(() =>
-      createC137BlindBatchExecutionProjection(manifest, {
-        ...OPTIONS,
-        caseIds: decisionCaseIds,
-        candidateCaseIds: candidateCaseIds.slice(1)
-      })
-    ).toThrow(/必须包含全部 decision caseIds/);
+      compileC137BlindBatchBenchmarkEvidence(
+        manifest,
+        partialCandidateShardOptions,
+        partialCandidateShard,
+        createGoldFreeRawPrediction(partialCandidateShard)
+      )
+    ).toThrow(/partial shard 不得单独揭示或编译准确率/);
     expect(() =>
       createC137BlindBatchExecutionProjection(manifest, {
         ...OPTIONS,
@@ -120,12 +132,7 @@ describe("C137 blind cross-media relationship evidence", () => {
       expect(rawJson).not.toContain(media.contentIdentity?.digest);
     }
 
-    const evidence = compileC137BlindBatchBenchmarkEvidence(
-      manifest,
-      OPTIONS,
-      projection,
-      raw
-    );
+    const evidence = compileC137BlindBatchBenchmarkEvidence(manifest, OPTIONS, projection, raw);
 
     expect(evidence).toMatchObject({
       scope: "cross-media-relationship-and-known-pair-anchor-component",
@@ -163,13 +170,7 @@ describe("C137 blind cross-media relationship evidence", () => {
       expect(evidenceJson).not.toContain(media.bindingCommitment);
     }
     expect(
-      validateC137BlindBatchBenchmarkEvidence(
-        manifest,
-        OPTIONS,
-        projection,
-        raw,
-        evidence
-      )
+      validateC137BlindBatchBenchmarkEvidence(manifest, OPTIONS, projection, raw, evidence)
     ).toEqual({ valid: true, issues: [] });
   });
 
@@ -205,12 +206,7 @@ describe("C137 blind cross-media relationship evidence", () => {
       });
     });
     expect(
-      deriveC137BlindBatchRelationshipDecisions(
-        manifest,
-        OPTIONS,
-        projection,
-        raw
-      )
+      deriveC137BlindBatchRelationshipDecisions(manifest, OPTIONS, projection, raw)
     ).toEqual(decisions);
     expect(() =>
       deriveC137BlindBatchRelationshipDecisions(
@@ -228,10 +224,7 @@ describe("C137 blind cross-media relationship evidence", () => {
 
     const reversedCases = structuredClone(manifest);
     reversedCases.cases.reverse();
-    const reversedProjection = createC137BlindBatchExecutionProjection(
-      reversedCases,
-      OPTIONS
-    );
+    const reversedProjection = createC137BlindBatchExecutionProjection(reversedCases, OPTIONS);
     expect(reversedProjection.sources).toEqual(projection.sources);
     expect(reversedProjection.targets).toEqual(projection.targets);
     expect(reversedProjection.pairs).toEqual(projection.pairs);
@@ -241,9 +234,9 @@ describe("C137 blind cross-media relationship evidence", () => {
       changedGoldPairing.cases[1].target,
       changedGoldPairing.cases[0].target
     ];
-    expect(
-      createC137BlindBatchExecutionProjection(changedGoldPairing, OPTIONS)
-    ).toEqual(projection);
+    expect(createC137BlindBatchExecutionProjection(changedGoldPairing, OPTIONS)).toEqual(
+      projection
+    );
   });
 
   it("treats video-only media views as distinct only when visual evidence is enabled", () => {
@@ -251,14 +244,21 @@ describe("C137 blind cross-media relationship evidence", () => {
     const hiddenVideoOptions = { ...OPTIONS, visualEvidenceEnabled: false } as const;
     const visibleVideoOptions = { ...OPTIONS, visualEvidenceEnabled: true } as const;
 
-    expect(() =>
-      createC137BlindBatchExecutionProjection(manifest, hiddenVideoOptions)
-    ).toThrow(/严格大于 topK/);
-
-    const projection = createC137BlindBatchExecutionProjection(
+    const hiddenProjection = createC137BlindBatchExecutionProjection(
       manifest,
-      visibleVideoOptions
+      hiddenVideoOptions
     );
+    expect(hiddenProjection.sources).toHaveLength(2);
+    expect(() =>
+      compileC137BlindBatchBenchmarkEvidence(
+        manifest,
+        hiddenVideoOptions,
+        hiddenProjection,
+        createPerfectRawPrediction(manifest, hiddenProjection)
+      )
+    ).toThrow(/partial candidate shard 只能交给 exhaustive matrix aggregator/);
+
+    const projection = createC137BlindBatchExecutionProjection(manifest, visibleVideoOptions);
     const firstView = manifest.cases[1].source;
     const secondView = manifest.cases[2].source;
     const hiddenFirstCommitment = createC137BlindBatchMediaBindingCommitment(
@@ -308,9 +308,7 @@ describe("C137 blind cross-media relationship evidence", () => {
       visibleVideoOptions
     );
     expect(visualProjection.suiteId).not.toBe(audioOnlyProjection.suiteId);
-    expect(visualProjection.projectionDigest).not.toBe(
-      audioOnlyProjection.projectionDigest
-    );
+    expect(visualProjection.projectionDigest).not.toBe(audioOnlyProjection.projectionDigest);
   });
 
   it("recomputes Top-1 wrong relationship separately from Top-K and native shortlist", () => {
@@ -418,9 +416,7 @@ describe("C137 blind cross-media relationship evidence", () => {
     setShortlist(
       blocked,
       projection,
-      blocked.nativeShortlist.shortlistedPairIds.filter(
-        (pairId) => pairId !== goldPair.pairId
-      )
+      blocked.nativeShortlist.shortlistedPairIds.filter((pairId) => pairId !== goldPair.pairId)
     );
 
     const evidence = compileC137BlindBatchBenchmarkEvidence(
@@ -542,12 +538,7 @@ describe("C137 blind cross-media relationship evidence", () => {
       compileC137BlindBatchBenchmarkEvidence(manifest, OPTIONS, projection, dirtyRaw)
     ).toThrow(/手填 errors/);
 
-    const evidence = compileC137BlindBatchBenchmarkEvidence(
-      manifest,
-      OPTIONS,
-      projection,
-      raw
-    );
+    const evidence = compileC137BlindBatchBenchmarkEvidence(manifest, OPTIONS, projection, raw);
     const tampered = structuredClone(evidence);
     tampered.knownPairMappedAnchorError.p95Ms = 9_999;
     const validation = validateC137BlindBatchBenchmarkEvidence(
@@ -564,32 +555,50 @@ describe("C137 blind cross-media relationship evidence", () => {
   it("rejects inferred axes, duplicate query media, and non-discriminating Top-K", () => {
     const manifest = createManifest();
     expect(() =>
-      createC137BlindBatchExecutionProjection(
-        manifest,
-        { topK: 2 } as unknown as C137BlindBatchProjectionOptions
-      )
+      createC137BlindBatchExecutionProjection(manifest, {
+        topK: 2
+      } as unknown as C137BlindBatchProjectionOptions)
     ).toThrow(/禁止从 gold 推断/);
 
     const duplicateQuery = structuredClone(manifest);
     duplicateQuery.cases[2].target = structuredClone(duplicateQuery.cases[1].target);
-    expect(() =>
-      createC137BlindBatchExecutionProjection(duplicateQuery, OPTIONS)
-    ).toThrow(/query media 唯一/);
+    expect(() => createC137BlindBatchExecutionProjection(duplicateQuery, OPTIONS)).toThrow(
+      /query media 唯一/
+    );
 
+    const nonDiscriminatingOptions = {
+      relationshipAxis: "target",
+      visualEvidenceEnabled: false,
+      topK: 3
+    } as const;
+    const nonDiscriminatingProjection = createC137BlindBatchExecutionProjection(
+      manifest,
+      nonDiscriminatingOptions
+    );
     expect(() =>
-      createC137BlindBatchExecutionProjection(manifest, {
-        relationshipAxis: "target",
-        visualEvidenceEnabled: false,
-        topK: 3
-      })
+      compileC137BlindBatchBenchmarkEvidence(
+        manifest,
+        nonDiscriminatingOptions,
+        nonDiscriminatingProjection,
+        createPerfectRawPrediction(manifest, nonDiscriminatingProjection)
+      )
     ).toThrow(/严格大于 topK/);
 
     const singleCandidate = structuredClone(manifest);
     for (const benchmarkCase of singleCandidate.cases.slice(1)) {
       benchmarkCase.source = structuredClone(singleCandidate.cases[0].source);
     }
+    const singleCandidateProjection = createC137BlindBatchExecutionProjection(
+      singleCandidate,
+      OPTIONS
+    );
     expect(() =>
-      createC137BlindBatchExecutionProjection(singleCandidate, OPTIONS)
+      compileC137BlindBatchBenchmarkEvidence(
+        singleCandidate,
+        OPTIONS,
+        singleCandidateProjection,
+        createPerfectRawPrediction(singleCandidate, singleCandidateProjection)
+      )
     ).toThrow(/严格大于 topK/);
 
     const singlePair = structuredClone(manifest);
@@ -601,9 +610,9 @@ describe("C137 blind cross-media relationship evidence", () => {
 
   it("rejects a 17×17 Cartesian suite at the compiler boundary", () => {
     const oversizedCartesian = createManifestWithCaseCount(17);
-    expect(() =>
-      createC137BlindBatchExecutionProjection(oversizedCartesian, OPTIONS)
-    ).toThrow(/超过 256 pair/);
+    expect(() => createC137BlindBatchExecutionProjection(oversizedCartesian, OPTIONS)).toThrow(
+      /超过 256 pair/
+    );
   });
 
   it("requires explicit video streams for every formal visual benchmark input", () => {
@@ -674,10 +683,7 @@ function createCase(index: number): RealMediaBenchmarkCase {
   };
 }
 
-function createMedia(
-  side: "source" | "target",
-  index: number
-): RealMediaBenchmarkMediaInput {
+function createMedia(side: "source" | "target", index: number): RealMediaBenchmarkMediaInput {
   const digestByte = side === "source" ? index : index + 64;
   return {
     path: `C:\\frozen-suite\\${side}-${index}.mkv`,
@@ -772,6 +778,41 @@ function createPerfectRawPrediction(
   });
 }
 
+function createGoldFreeRawPrediction(
+  projection: C137BlindBatchExecutionProjection
+): C137BlindBatchRawPrediction {
+  return sealC137BlindBatchRawPrediction({
+    schemaVersion: 1,
+    kind: "c137-blind-batch-raw-prediction",
+    suiteId: projection.suiteId,
+    projectionDigest: projection.projectionDigest,
+    executionDigest: EXECUTION_DIGEST,
+    nativeReceiptDigest: NATIVE_RECEIPT_DIGEST,
+    topK: projection.topK,
+    pairOutcomes: projection.pairs.map((pair) => ({
+      ...pair,
+      status: "blocked",
+      proposalTimeMapSpans: []
+    })),
+    sourceRankings: projection.sources.map((source) => ({
+      sourceMediaId: source.mediaId,
+      rankedPairIds: projection.pairs
+        .filter((pair) => pair.sourceMediaId === source.mediaId)
+        .map((pair) => pair.pairId)
+    })),
+    targetRankings: projection.targets.map((target) => ({
+      targetMediaId: target.mediaId,
+      rankedPairIds: projection.pairs
+        .filter((pair) => pair.targetMediaId === target.mediaId)
+        .map((pair) => pair.pairId)
+    })),
+    nativeShortlist: {
+      shortlistedPairIds: [],
+      nonShortlistedPairIds: projection.pairs.map((pair) => pair.pairId)
+    }
+  });
+}
+
 function goldPairForCase(
   manifest: RealMediaBenchmarkManifest,
   projection: C137BlindBatchExecutionProjection,
@@ -799,8 +840,7 @@ function goldPairForCase(
   );
   const pair = projection.pairs.find(
     (candidate) =>
-      candidate.sourceMediaId === source?.mediaId &&
-      candidate.targetMediaId === target?.mediaId
+      candidate.sourceMediaId === source?.mediaId && candidate.targetMediaId === target?.mediaId
   );
   if (!pair) throw new Error("fixture gold pair missing");
   return pair;

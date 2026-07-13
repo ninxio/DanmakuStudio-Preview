@@ -33,6 +33,31 @@ const emptyProposal: AlignmentProposal = {
   confidence: 0,
   diagnostics: []
 };
+const testExecutionIdentity = {
+  schemaVersion: 1 as const,
+  engineVersion: "alignment-v2.2-rust",
+  featureVersion: "test-feature-v1",
+  relationScoreVersion: "alignment-v2-pair-intrinsic-global-weight-v1" as const,
+  nativeExecutableDigest: `sha256:${"a".repeat(64)}` as const,
+  ffmpegBinaryDigest: `sha256:${"b".repeat(64)}` as const,
+  ffprobeBinaryDigest: `sha256:${"c".repeat(64)}` as const,
+  sourceSpectralBackends: [
+    {
+      backendId: "cpu-radix2-f64-r2c-512-v1",
+      requestedBackend: "cpu",
+      backendDetail: "test CPU",
+      fallbackReason: null
+    }
+  ],
+  targetSpectralBackends: [
+    {
+      backendId: "cpu-radix2-f64-r2c-512-v1",
+      requestedBackend: "cpu",
+      backendDetail: "test CPU",
+      fallbackReason: null
+    }
+  ]
+};
 
 describe("Tauri 音频对齐调用", () => {
   beforeEach(() => {
@@ -322,7 +347,7 @@ describe("Tauri 音频对齐调用", () => {
   it("批任务一次发送全部媒体并规范化流索引", async () => {
     tauriMocks.invoke.mockResolvedValue({
       schemaVersion: 1,
-      evidenceVersion: 1,
+      evidenceVersion: 2,
       jobId: "batch-1",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
@@ -470,10 +495,41 @@ describe("Tauri 音频对齐调用", () => {
     expect(invoker).not.toHaveBeenCalled();
   });
 
+  it("批任务允许 1×256 inventory，并在 1×257 时于 bridge 前阻断", async () => {
+    const start = vi.fn<AudioAlignmentBatchJobInvoker["start"]>(() =>
+      Promise.reject(new Error("native-invoked"))
+    );
+    const invoker: AudioAlignmentBatchJobInvoker = {
+      start,
+      get: vi.fn(),
+      cancel: vi.fn()
+    };
+    const createTargets = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        mediaId: `target-${index}`,
+        path: `target-${index}.mkv`
+      }));
+    const base = {
+      sources: [{ mediaId: "source", path: "source.mkv" }],
+      ffmpegPath: null,
+      localizationMode: true as const
+    };
+
+    await expect(
+      startTauriAudioAlignmentBatchJob({ ...base, targets: createTargets(256) }, invoker)
+    ).rejects.toThrow("native-invoked");
+    expect(start).toHaveBeenCalledTimes(1);
+
+    await expect(
+      startTauriAudioAlignmentBatchJob({ ...base, targets: createTargets(257) }, invoker)
+    ).rejects.toThrow(/最多选择 256|最多分析 256/);
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
   it("批任务可显式指定未完成 pair，并拒绝重复或越界引用", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 1 as const,
+      evidenceVersion: 2 as const,
       jobId: "batch-explicit",
       pairingMode: "explicit" as const,
       sourceMediaIds: ["source"],
@@ -543,7 +599,7 @@ describe("Tauri 音频对齐调用", () => {
   it("支持读取和取消原生批任务", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 1 as const,
+      evidenceVersion: 2 as const,
       jobId: "batch-2",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
@@ -575,7 +631,7 @@ describe("Tauri 音频对齐调用", () => {
   it("拒绝计数矛盾或 jobId 不匹配的原生批任务响应", async () => {
     const invalidSnapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 1 as const,
+      evidenceVersion: 2 as const,
       jobId: "wrong-job",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
@@ -616,7 +672,7 @@ describe("Tauri 音频对齐调用", () => {
   it("启动响应必须绑定请求 inventory，completed 终态不得夹带 cancelled pair", async () => {
     const wrongInventory = {
       schemaVersion: 1 as const,
-      evidenceVersion: 1 as const,
+      evidenceVersion: 2 as const,
       jobId: "batch-boundary",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["other-source"],
@@ -662,15 +718,15 @@ describe("Tauri 音频对齐调用", () => {
       get: () => Promise.resolve(inconsistentCompleted),
       cancel: vi.fn()
     };
-    await expect(getTauriAudioAlignmentBatchJob("batch-completed", terminalInvoker)).rejects.toThrow(
-      "标记 completed"
-    );
+    await expect(
+      getTauriAudioAlignmentBatchJob("batch-completed", terminalInvoker)
+    ).rejects.toThrow("标记 completed");
   });
 
   it("接受 fine 失败后保留的 coarse 证据，并严格校验失败状态与完整 Top-K", async () => {
     const failedSnapshot: AudioAlignmentBatchJobSnapshot = {
       schemaVersion: 1,
-      evidenceVersion: 1,
+      evidenceVersion: 2,
       jobId: "batch-fine-failed",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
@@ -685,6 +741,7 @@ describe("Tauri 音频对齐调用", () => {
       pairs: [
         {
           ...batchPairSnapshot(1, "source", "target", "failed"),
+          relationRanking: batchRelationRanking("completed"),
           globalSelection: failedBatchGlobalSelectionWithCoarseEvidence()
         }
       ],
@@ -698,7 +755,11 @@ describe("Tauri 音频对齐调用", () => {
         cancel: vi.fn()
       });
 
-    await expect(read(failedSnapshot)).resolves.toEqual(failedSnapshot);
+    const preservedFineFailure = await read(failedSnapshot);
+    expect(preservedFineFailure.pairs[0].relationRanking).toMatchObject({
+      state: "ranked",
+      score: 0.8
+    });
 
     const completedWithErrors = structuredClone(failedSnapshot);
     completedWithErrors.status = "completed";
@@ -709,6 +770,10 @@ describe("Tauri 音频对齐调用", () => {
     const wrongState = structuredClone(failedSnapshot);
     wrongState.pairs[0].globalSelection.state = "blocked";
     await expect(read(wrongState)).rejects.toThrow("失败 pair 必须发布 failed");
+
+    const coarseFailedRelation = structuredClone(failedSnapshot);
+    coarseFailedRelation.pairs[0].relationRanking = batchRelationRanking("failed");
+    await expect(read(coarseFailedRelation)).resolves.toEqual(coarseFailedRelation);
 
     const truncatedTopK = structuredClone(failedSnapshot);
     truncatedTopK.pairs[0].globalSelection.topK = [];
@@ -736,9 +801,58 @@ function batchPairSnapshot(
     status,
     progress: status === "queued" ? 0 : status === "running" ? 0.5 : 1,
     message: status,
+    relationRanking: batchRelationRanking(status),
     globalSelection: batchGlobalSelection(status),
     proposal: status === "completed" ? emptyProposal : null,
     error: status === "failed" ? "pair failed" : null
+  };
+}
+
+function batchRelationRanking(
+  status: "queued" | "running" | "completed" | "failed" | "cancelled"
+) {
+  if (status === "completed") {
+    const candidate = {
+      rank: 1,
+      sourceStreamIndex: 0,
+      targetStreamIndex: 0,
+      score: 0.9,
+      globalScore: 0.8,
+      scale: 1,
+      offsetMs: 0,
+      sourceStartMs: 0,
+      sourceEndMs: 1_000,
+      targetStartMs: 0,
+      targetEndMs: 1_000,
+      inlierCount: 20,
+      temporalCoverage: 0.8,
+      uniqueSourceCoverage: 0.7
+    };
+    return {
+      scoreVersion: "alignment-v2-pair-intrinsic-global-weight-v1" as const,
+      executionIdentityDigest: `sha256:${"d".repeat(64)}` as const,
+      executionIdentity: structuredClone(testExecutionIdentity),
+      state: "ranked" as const,
+      candidateCount: 1,
+      eligibleCandidateCount: 1,
+      score: candidate.globalScore,
+      bestEligibleCandidate: candidate
+    };
+  }
+  return {
+    scoreVersion: "alignment-v2-pair-intrinsic-global-weight-v1" as const,
+    executionIdentityDigest: null,
+    executionIdentity: null,
+    state:
+      status === "failed"
+        ? ("failed" as const)
+        : status === "cancelled"
+          ? ("cancelled" as const)
+          : ("pending" as const),
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    score: null,
+    bestEligibleCandidate: null
   };
 }
 
@@ -779,7 +893,12 @@ function batchGlobalSelection(
     };
   }
   return {
-    state: status === "failed" ? ("failed" as const) : status === "cancelled" ? ("cancelled" as const) : ("pending" as const),
+    state:
+      status === "failed"
+        ? ("failed" as const)
+        : status === "cancelled"
+          ? ("cancelled" as const)
+          : ("pending" as const),
     selected: false,
     selectedRank: null,
     selectedScore: null,

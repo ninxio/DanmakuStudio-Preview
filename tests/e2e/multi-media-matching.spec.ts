@@ -90,7 +90,12 @@ test.beforeEach(async ({ page }) => {
           const boundary = (side: "start" | "end") => ({
             status: boundaryStatus,
             axis: boundaryAxis,
-            contextSide: isMatched || span.kind === "ambiguous" ? null : side === "start" ? "before" : "after",
+            contextSide:
+              isMatched || span.kind === "ambiguous"
+                ? null
+                : side === "start"
+                  ? "before"
+                  : "after",
             coarseMs: boundaryCoordinate(side),
             refinedMs: null,
             uncertaintyStartMs: null,
@@ -279,6 +284,61 @@ test.beforeEach(async ({ page }) => {
           decisionCandidate: candidate
         };
       };
+      const createRelationRanking = (currentIndex: number) => {
+        const sourceStartMs = currentIndex * 60_000;
+        const scoreVersion = "alignment-v2-pair-intrinsic-global-weight-v1";
+        const executionIdentity = {
+          schemaVersion: 1,
+          engineVersion: "alignment-v2.4",
+          featureVersion: "chroma-v2",
+          relationScoreVersion: scoreVersion,
+          nativeExecutableDigest: `sha256:${"9".repeat(64)}`,
+          ffmpegBinaryDigest: `sha256:${"a".repeat(64)}`,
+          ffprobeBinaryDigest: `sha256:${"b".repeat(64)}`,
+          sourceSpectralBackends: [
+            {
+              backendId: "cuda-cufft-r2c-512-v1",
+              requestedBackend: "auto",
+              backendDetail: "E2E CUDA/cuFFT fixture",
+              fallbackReason: null
+            }
+          ],
+          targetSpectralBackends: [
+            {
+              backendId: "cuda-cufft-r2c-512-v1",
+              requestedBackend: "auto",
+              backendDetail: "E2E CUDA/cuFFT fixture",
+              fallbackReason: null
+            }
+          ]
+        };
+        const candidate = {
+          rank: 1,
+          sourceStreamIndex: 1,
+          targetStreamIndex: 2,
+          score: 0.94,
+          globalScore: 0.9,
+          scale: 1,
+          offsetMs: -sourceStartMs,
+          sourceStartMs,
+          sourceEndMs: sourceStartMs + 60_000,
+          targetStartMs: 0,
+          targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
+          inlierCount: 36,
+          temporalCoverage: currentIndex === 0 ? 0.72 : 0.96,
+          uniqueSourceCoverage: 0.94
+        };
+        return {
+          scoreVersion,
+          executionIdentityDigest: `sha256:${"c".repeat(64)}`,
+          executionIdentity,
+          state: "ranked",
+          candidateCount: 1,
+          eligibleCandidateCount: 1,
+          score: candidate.globalScore,
+          bestEligibleCandidate: candidate
+        };
+      };
 
       const mockWindow = window as unknown as MockTauriWindow;
       let batchJobIndex = 0;
@@ -445,7 +505,7 @@ test.beforeEach(async ({ page }) => {
             const jobId = `c137-batch-job-${batchJobIndex}`;
             const snapshot = {
               schemaVersion: 1,
-              evidenceVersion: 1,
+              evidenceVersion: 2,
               jobId,
               pairingMode,
               sourceMediaIds: sources.map((media) => media.mediaId),
@@ -465,6 +525,7 @@ test.beforeEach(async ({ page }) => {
                 status: "completed",
                 progress: 1,
                 message: "已定位对应片段",
+                relationRanking: createRelationRanking(currentIndex),
                 globalSelection: createGlobalSelection(currentIndex),
                 proposal: {
                   anchors: [
@@ -628,7 +689,9 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   );
   const firstCandidate = page.getByTestId("media-match-candidate").nth(0);
   await firstCandidate.getByText("来源↔原片时间图复核").click();
-  await expect(firstCandidate.getByRole("img", { name: "来源与原片双时间轴分段图" })).toBeVisible();
+  await expect(
+    firstCandidate.getByRole("img", { name: "来源与原片双时间轴分段图" })
+  ).toBeVisible();
   const firstReview = firstCandidate.getByTestId("time-map-review");
   await expect(firstReview).toContainText(
     "候选图 · 共同内容 1 · 参考独有 1 · 原片独有 1 · 无法判断 1"
@@ -682,10 +745,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
 
   const candidateCards = page.getByTestId("media-match-candidate");
   for (let index = 0; index < 5; index += 1) {
-    await candidateCards
-      .nth(index)
-      .getByRole("button", { name: "保存关系供试听复核" })
-      .click();
+    await candidateCards.nth(index).getByRole("button", { name: "保存关系供试听复核" }).click();
   }
   await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E01");
   await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E05");

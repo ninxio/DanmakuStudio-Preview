@@ -41,6 +41,7 @@ import {
 import {
   cancelTauriAudioAlignmentBatchJob,
   cancelTauriAudioAlignmentJob,
+  AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
   getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
   startTauriAudioAlignmentBatchJob,
@@ -197,14 +198,15 @@ function createLegacyBatchSnapshot(
   const hasActivePair = pairs.some(
     (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
   );
-  const cancelled = !hasActivePair && pairs.some((pair) => pair.snapshot.status === "cancelled");
+  const cancelled =
+    !hasActivePair && pairs.some((pair) => pair.snapshot.status === "cancelled");
   const status = hasActivePair ? "running" : cancelled ? "cancelled" : "completed";
   const processedPairCount = pairs.filter(
     (pair) => pair.snapshot.status === "completed" || pair.snapshot.status === "failed"
   ).length;
   return {
     schemaVersion: 1,
-    evidenceVersion: 1,
+    evidenceVersion: 2,
     jobId,
     pairingMode: "explicit",
     sourceMediaIds,
@@ -212,9 +214,15 @@ function createLegacyBatchSnapshot(
     status,
     progress:
       status === "running"
-        ? pairs.reduce((sum, pair) => sum + pair.snapshot.progress, 0) / Math.max(1, pairs.length)
+        ? pairs.reduce((sum, pair) => sum + pair.snapshot.progress, 0) /
+          Math.max(1, pairs.length)
         : 1,
-    message: status === "cancelled" ? "批次已取消" : status === "completed" ? "批次已完成" : "批次执行中",
+    message:
+      status === "cancelled"
+        ? "批次已取消"
+        : status === "completed"
+          ? "批次已完成"
+          : "批次执行中",
     totalPairCount: pairs.length,
     processedPairCount: status === "cancelled" ? pairs.length : processedPairCount,
     failedPairCount: pairs.filter((pair) => pair.snapshot.status === "failed").length,
@@ -230,6 +238,10 @@ function createLegacyBatchSnapshot(
       status: pair.snapshot.status,
       progress: pair.snapshot.progress,
       message: pair.snapshot.message,
+      relationRanking: createTestBatchRelationRanking(
+        pair.snapshot.status,
+        pair.snapshot.proposal
+      ),
       globalSelection: createTestBatchGlobalSelection(
         pair.snapshot.status,
         pair.snapshot.proposal
@@ -239,6 +251,87 @@ function createLegacyBatchSnapshot(
     })),
     error: null,
     updatedAtMs: Math.max(1, ...pairs.map((pair) => pair.snapshot.updatedAtMs))
+  };
+}
+
+function createTestBatchRelationRanking(
+  status: AudioAlignmentJobSnapshot["status"],
+  proposal: AlignmentProposal | null
+) {
+  if (status === "completed") {
+    const sourceStartMs = proposal?.timeMap?.sourceStartMs ?? 0;
+    const sourceEndMs = Math.max(sourceStartMs + 1, proposal?.timeMap?.sourceEndMs ?? 1);
+    const targetStartMs = proposal?.timeMap?.targetStartMs ?? 0;
+    const targetEndMs = Math.max(targetStartMs + 1, proposal?.timeMap?.targetEndMs ?? 1);
+    const candidate = {
+      rank: 1,
+      sourceStreamIndex: proposal?.timeMap?.sourceStream?.index ?? 0,
+      targetStreamIndex: proposal?.timeMap?.targetStream?.index ?? 0,
+      score: 0.9,
+      globalScore: 0.8,
+      scale: 1,
+      offsetMs: targetStartMs - sourceStartMs,
+      sourceStartMs,
+      sourceEndMs,
+      targetStartMs,
+      targetEndMs,
+      inlierCount: 20,
+      temporalCoverage: 0.8,
+      uniqueSourceCoverage: 0.7
+    };
+    return {
+      scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+      executionIdentityDigest: `sha256:${"d".repeat(64)}` as const,
+      executionIdentity: createTestExecutionIdentity(),
+      state: "ranked" as const,
+      candidateCount: 1,
+      eligibleCandidateCount: 1,
+      score: candidate.globalScore,
+      bestEligibleCandidate: candidate
+    };
+  }
+  return {
+    scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest: null,
+    executionIdentity: null,
+    state:
+      status === "failed"
+        ? ("failed" as const)
+        : status === "cancelled"
+          ? ("cancelled" as const)
+          : ("pending" as const),
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    score: null,
+    bestEligibleCandidate: null
+  };
+}
+
+function createTestExecutionIdentity() {
+  return {
+    schemaVersion: 1 as const,
+    engineVersion: "alignment-v2.2-rust",
+    featureVersion: "test-feature-v1",
+    relationScoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+    nativeExecutableDigest: `sha256:${"a".repeat(64)}` as const,
+    ffmpegBinaryDigest: `sha256:${"b".repeat(64)}` as const,
+    ffprobeBinaryDigest: `sha256:${"c".repeat(64)}` as const,
+    sourceSpectralBackends: [
+      {
+        backendId: "cpu-radix2-f64-r2c-512-v1",
+        requestedBackend: "cpu",
+        backendDetail: "test CPU",
+        fallbackReason: null
+      }
+    ],
+    targetSpectralBackends: [
+      {
+        backendId: "cpu-radix2-f64-r2c-512-v1",
+        requestedBackend: "cpu",
+        backendDetail: "test CPU",
+        fallbackReason: null
+      }
+    ]
   };
 }
 
@@ -810,13 +903,7 @@ describe("多媒体自动匹配工作台", () => {
           createProposal(0),
           "第一组已完成"
         ),
-        createTestBatchPair(
-          "source-long",
-          "target-ep2",
-          "running",
-          null,
-          "正在分析第二组"
-        ),
+        createTestBatchPair("source-long", "target-ep2", "running", null, "正在分析第二组"),
         createTestBatchPair("source-long", "target-ep3", "queued", null, "等待执行")
       ])
     );
@@ -857,7 +944,8 @@ describe("多媒体自动匹配工作台", () => {
       state: "blocked"
     });
     expect(
-      useEditorStore.getState().project.mediaMatchCandidates[0].proposal.timeMap?.quality.reasons
+      useEditorStore.getState().project.mediaMatchCandidates[0].proposal.timeMap?.quality
+        .reasons
     ).toContain("批次未完整，不能形成全局最优组合；已完成候选仅保留供人工复核。");
     expect(
       within(screen.getByLabelText("批量匹配任务")).getByText(
@@ -1071,7 +1159,9 @@ describe("多媒体自动匹配工作台", () => {
     expect(review).toHaveTextContent("伸缩比例：1.000×");
     expect(review).toHaveTextContent("伸缩比例：不适用");
     expect(review).toHaveTextContent("边界不确定度：180 毫秒");
-    expect(review).toHaveTextContent("逐段 P95 / P99 / 最大残差：80 毫秒 / 120 毫秒 / 140 毫秒");
+    expect(review).toHaveTextContent(
+      "逐段 P95 / P99 / 最大残差：80 毫秒 / 120 毫秒 / 140 毫秒"
+    );
     expect(review).toHaveTextContent("导出阻断原因：存在无法唯一解释的歧义区间。");
 
     const matchedButton = within(review).getByRole("button", {
@@ -1798,13 +1888,7 @@ describe("多媒体自动匹配工作台", () => {
       .mockReturnValueOnce(oldStartDeferred.promise)
       .mockResolvedValueOnce(
         createLegacyBatchSnapshot("batch-new-project", [
-          createTestBatchPair(
-            "source-long",
-            "target-ep1",
-            "running",
-            null,
-            "新项目任务运行中"
-          ),
+          createTestBatchPair("source-long", "target-ep1", "running", null, "新项目任务运行中"),
           createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
         ])
       );
@@ -2093,13 +2177,17 @@ function createV2Proposal(
       targetStartMs: 0,
       targetEndMs: 60_000,
       spans: [
-        createProposalSpan({
-          kind: "matched",
-          sourceStartMs,
-          sourceEndMs,
-          targetStartMs: 0,
-          targetEndMs: 60_000
-        }, `v2-${level}:span:0001`, level)
+        createProposalSpan(
+          {
+            kind: "matched",
+            sourceStartMs,
+            sourceEndMs,
+            targetStartMs: 0,
+            targetEndMs: 60_000
+          },
+          `v2-${level}:span:0001`,
+          level
+        )
       ],
       quality: {
         level,
@@ -2219,34 +2307,50 @@ function createFourKindV2Proposal(): AlignmentProposal {
       targetStartMs: 0,
       targetEndMs: 21_000,
       spans: [
-        createProposalSpan({
-          kind: "matched",
-          sourceStartMs: 5_000,
-          sourceEndMs: 15_000,
-          targetStartMs: 0,
-          targetEndMs: 10_000
-        }, "four-kind:span:0001", "review"),
-        createProposalSpan({
-          kind: "sourceOnly",
-          sourceStartMs: 15_000,
-          sourceEndMs: 17_000,
-          targetStartMs: 10_000,
-          targetEndMs: 10_000
-        }, "four-kind:span:0002", "review"),
-        createProposalSpan({
-          kind: "targetOnly",
-          sourceStartMs: 17_000,
-          sourceEndMs: 17_000,
-          targetStartMs: 10_000,
-          targetEndMs: 13_000
-        }, "four-kind:span:0003", "review"),
-        createProposalSpan({
-          kind: "ambiguous",
-          sourceStartMs: 17_000,
-          sourceEndMs: 25_000,
-          targetStartMs: 13_000,
-          targetEndMs: 21_000
-        }, "four-kind:span:0004", "blocked")
+        createProposalSpan(
+          {
+            kind: "matched",
+            sourceStartMs: 5_000,
+            sourceEndMs: 15_000,
+            targetStartMs: 0,
+            targetEndMs: 10_000
+          },
+          "four-kind:span:0001",
+          "review"
+        ),
+        createProposalSpan(
+          {
+            kind: "sourceOnly",
+            sourceStartMs: 15_000,
+            sourceEndMs: 17_000,
+            targetStartMs: 10_000,
+            targetEndMs: 10_000
+          },
+          "four-kind:span:0002",
+          "review"
+        ),
+        createProposalSpan(
+          {
+            kind: "targetOnly",
+            sourceStartMs: 17_000,
+            sourceEndMs: 17_000,
+            targetStartMs: 10_000,
+            targetEndMs: 13_000
+          },
+          "four-kind:span:0003",
+          "review"
+        ),
+        createProposalSpan(
+          {
+            kind: "ambiguous",
+            sourceStartMs: 17_000,
+            sourceEndMs: 25_000,
+            targetStartMs: 13_000,
+            targetEndMs: 21_000
+          },
+          "four-kind:span:0004",
+          "blocked"
+        )
       ],
       quality: {
         ...proposal.timeMap.quality,
@@ -2260,11 +2364,7 @@ function createFourKindV2Proposal(): AlignmentProposal {
   };
 }
 
-function createProposalSpan(
-  span: TimeMapSpan,
-  id: string,
-  level: MediaTimeMapQualityLevel
-) {
+function createProposalSpan(span: TimeMapSpan, id: string, level: MediaTimeMapQualityLevel) {
   const complete = createTestCompleteTimeMapSpan(span, id);
   return {
     ...complete,

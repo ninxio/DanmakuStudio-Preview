@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AlignmentProposal, AlignmentTimeMapProposal } from "../../domain/alignment/types";
 import type { MediaContentIdentity } from "../../domain/project/types";
+import {
+  createNativeBatchExecutionIdentityDigest,
+  REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+  type NativeBatchExecutionIdentity
+} from "../../domain/alignment/realMediaBlindBatchContract";
 import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import type {
   AudioAlignmentBatchGlobalCandidateSnapshot,
@@ -8,8 +13,10 @@ import type {
   AudioAlignmentBatchJobInvoker,
   AudioAlignmentBatchJobSnapshot,
   AudioAlignmentBatchPairSnapshot,
+  AudioAlignmentBatchRelationRankingSnapshot,
   NormalizedTauriAudioAlignmentBatchRequest
 } from "./tauriAudioAlignment";
+import { AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION } from "./tauriAudioAlignment";
 import {
   createRealMediaBlindBatchExecutionDigest,
   createRealMediaBlindBatchRunReceiptDigest,
@@ -20,6 +27,34 @@ import {
   type RealMediaBlindBatchExecutionSuite,
   type RealMediaBlindBatchRunReceipt
 } from "./realMediaBlindBatchRunner";
+
+const TEST_EXECUTION_IDENTITY: NativeBatchExecutionIdentity = {
+  schemaVersion: 1,
+  engineVersion: "alignment-v2.2-rust",
+  featureVersion: "test-feature-v1",
+  relationScoreVersion: REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
+  nativeExecutableDigest: `sha256:${"a".repeat(64)}`,
+  ffmpegBinaryDigest: `sha256:${"b".repeat(64)}`,
+  ffprobeBinaryDigest: `sha256:${"c".repeat(64)}`,
+  sourceSpectralBackends: [
+    {
+      backendId: "cuda-cufft-r2c-512-v1",
+      requestedBackend: "cuda",
+      backendDetail: "test RTX 4090",
+      fallbackReason: null
+    }
+  ],
+  targetSpectralBackends: [
+    {
+      backendId: "cuda-cufft-r2c-512-v1",
+      requestedBackend: "cuda",
+      backendDetail: "test RTX 4090",
+      fallbackReason: null
+    }
+  ]
+};
+const TEST_EXECUTION_IDENTITY_DIGEST =
+  createNativeBatchExecutionIdentityDigest(TEST_EXECUTION_IDENTITY);
 
 describe("C137 real-media blind full-Cartesian batch runner", () => {
   it("一次启动真实 N×M batch、轮询到终态，并输出 path-free pair/排名/原生全局选择收据", async () => {
@@ -58,12 +93,12 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(nativeRequest).not.toHaveProperty("pairs");
 
     expect(receipt).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       receiptKind: "c137-real-media-blind-batch-run",
       suiteId: suite.suiteId,
       datasetVersion: suite.datasetVersion,
       executionDigest: createRealMediaBlindBatchExecutionDigest(suite),
-      nativeEvidenceVersion: 1,
+      nativeEvidenceVersion: 2,
       pairingMode: "fullCartesian",
       status: "completed",
       terminationReason: "native-terminal",
@@ -80,6 +115,15 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
       true
     ]);
     expect(receipt.pairOutcomes[0]?.globalSelection.selectedRank).toBe(1);
+    expect(receipt.pairOutcomes[0]?.relationRanking).toMatchObject({
+      scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+      state: "ranked",
+      score: 0.93
+    });
+    expect(receipt.pairOutcomes[0]?.relationRanking.bestEligibleCandidate?.rank).toBe(1);
+    expect(receipt.pairOutcomes[0]?.relationRanking.bestEligibleCandidate?.globalScore).toBe(
+      0.93
+    );
     expect(receipt.pairOutcomes[0]?.proposalTimeMap?.engineVersion).toContain("alignment-v2");
     expect(receipt.sourceRankings).toEqual([
       expect.objectContaining({
@@ -190,12 +234,74 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
       validateRealMediaBlindBatchRunReceipt(rehashReceipt(extraTimeMapField), suite)
     ).toThrow("字段不完整或含 gold/额外字段");
 
+    const wrongRelationScoreVersion = structuredClone(receipt);
+    (
+      wrongRelationScoreVersion.pairOutcomes[0].relationRanking as {
+        scoreVersion: string;
+      }
+    ).scoreVersion = "tile-local-score-v0";
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(wrongRelationScoreVersion), suite)
+    ).toThrow("relationRanking.scoreVersion");
+
+    const wrongRelationStream = structuredClone(receipt);
+    const relationCandidate =
+      wrongRelationStream.pairOutcomes[0].relationRanking.bestEligibleCandidate;
+    if (!relationCandidate) throw new Error("fixture relation candidate missing");
+    relationCandidate.sourceStreamIndex += 1;
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(wrongRelationStream), suite)
+    ).toThrow("音轨索引与 execution suite 错配");
+
+    const callerResignedIdentityDrift = structuredClone(receipt);
+    const driftedRanking = callerResignedIdentityDrift.pairOutcomes[0].relationRanking;
+    if (!driftedRanking.executionIdentity) throw new Error("fixture identity missing");
+    driftedRanking.executionIdentity.ffmpegBinaryDigest = `sha256:${"e".repeat(64)}`;
+    driftedRanking.executionIdentityDigest = createNativeBatchExecutionIdentityDigest(
+      driftedRanking.executionIdentity
+    );
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(callerResignedIdentityDrift), suite)
+    ).toThrow("executionIdentityDigest");
+
+    const legacyReceipt = structuredClone(receipt) as unknown as Record<string, unknown>;
+    delete legacyReceipt.executionIdentityDigest;
+    expect(() => validateRealMediaBlindBatchRunReceipt(legacyReceipt, suite)).toThrow(
+      "字段不完整"
+    );
+
     expect(() =>
       validateRealMediaBlindBatchRunReceipt(
         { ...receipt, receiptDigest: `sha256:${"0".repeat(64)}` },
         suite
       )
     ).toThrow("receiptDigest");
+  });
+
+  it("rejects a path leaked through an actual backend fallback reason", async () => {
+    const suite = createSuite();
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({
+        start: createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]),
+        get: []
+      })
+    });
+    const leaked = structuredClone(receipt);
+    for (const outcome of leaked.pairOutcomes) {
+      const identity = outcome.relationRanking.executionIdentity;
+      const backend = identity?.sourceSpectralBackends[0];
+      if (!identity || !backend) throw new Error("fixture identity missing");
+      backend.requestedBackend = "auto";
+      backend.fallbackReason = `CUDA fallback while reading ${suite.sources[0].path}`;
+      outcome.relationRanking.executionIdentityDigest =
+        createNativeBatchExecutionIdentityDigest(identity);
+    }
+    leaked.executionIdentityDigest =
+      leaked.pairOutcomes[0]?.relationRanking.executionIdentityDigest ?? null;
+
+    expect(() => validateRealMediaBlindBatchRunReceipt(rehashReceipt(leaked), suite)).toThrow(
+      "意外包含本地路径"
+    );
   });
 
   it("canonical execution digest 对对象字段顺序稳定，并绑定媒体路径与全笛卡尔注册", () => {
@@ -307,6 +413,15 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
       contentIdentity: suite.sources[0].contentIdentity,
       audioStreamIndex: suite.sources[0].audioStreamIndex + 1
     });
+  });
+
+  it("domain contract 接受 1×256 inventory，并在 1×257 时拒绝", () => {
+    expect(validateRealMediaBlindBatchExecutionSuite(createSuite(1, 256)).targets).toHaveLength(
+      256
+    );
+    expect(() => validateRealMediaBlindBatchExecutionSuite(createSuite(1, 257))).toThrow(
+      /1–256|最多允许 256/
+    );
   });
 
   it("关闭视觉证据时拒绝同物理内容同音轨仅视频流不同的伪独立视图", () => {
@@ -565,8 +680,17 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
         state: "failed",
         candidateCount: 1,
         decisionScore: 0.9
+      },
+      relationRanking: {
+        state: "ranked",
+        candidateCount: 1,
+        eligibleCandidateCount: 1,
+        score: 0.9
       }
     });
+    expect(receipt.pairOutcomes[0].relationRanking.bestEligibleCandidate?.globalScore).toBe(
+      0.9
+    );
     expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
   });
 
@@ -724,12 +848,13 @@ function createRunningSnapshot(
     progress: 0,
     message: pairIndex === 0 ? "running" : "queued",
     globalSelection: createPendingSelection(),
+    relationRanking: createPendingRelationRanking(),
     proposal: null,
     error: null
   }));
   return {
     schemaVersion: 1,
-    evidenceVersion: 1,
+    evidenceVersion: 2,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -766,13 +891,14 @@ function createCompletedSnapshot(
       progress: 1,
       message: "completed",
       globalSelection: createSelection(source, target, score, selected),
+      relationRanking: createRelationRanking(source, target, score),
       proposal: createProposal(source, target, selected ? "review" : "blocked"),
       error: null
     };
   });
   return {
     schemaVersion: 1,
-    evidenceVersion: 1,
+    evidenceVersion: 2,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -802,12 +928,13 @@ function createCancelledSnapshot(
     progress: 0,
     message: "cancelled",
     globalSelection: { ...createPendingSelection(), state: "cancelled" },
+    relationRanking: { ...createPendingRelationRanking(), state: "cancelled" },
     proposal: null,
     error: null
   }));
   return {
     schemaVersion: 1,
-    evidenceVersion: 1,
+    evidenceVersion: 2,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -838,6 +965,52 @@ function createPendingSelection(): AudioAlignmentBatchGlobalSelectionSnapshot {
     eligibleCandidateCount: 0,
     topK: [],
     decisionCandidate: null
+  };
+}
+
+function createPendingRelationRanking(): AudioAlignmentBatchRelationRankingSnapshot {
+  return {
+    scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest: null,
+    executionIdentity: null,
+    state: "pending",
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    score: null,
+    bestEligibleCandidate: null
+  };
+}
+
+function createRelationRanking(
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  score: number
+): AudioAlignmentBatchRelationRankingSnapshot {
+  const candidate = createGlobalCandidate(source, target, score, false);
+  return {
+    scoreVersion: AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION,
+    executionIdentityDigest: TEST_EXECUTION_IDENTITY_DIGEST,
+    executionIdentity: structuredClone(TEST_EXECUTION_IDENTITY),
+    state: "ranked",
+    candidateCount: 1,
+    eligibleCandidateCount: 1,
+    score,
+    bestEligibleCandidate: {
+      rank: candidate.rank,
+      sourceStreamIndex: candidate.sourceStreamIndex,
+      targetStreamIndex: candidate.targetStreamIndex,
+      score: candidate.score,
+      globalScore: candidate.globalScore,
+      scale: candidate.scale,
+      offsetMs: candidate.offsetMs,
+      sourceStartMs: candidate.sourceStartMs,
+      sourceEndMs: candidate.sourceEndMs,
+      targetStartMs: candidate.targetStartMs,
+      targetEndMs: candidate.targetEndMs,
+      inlierCount: candidate.inlierCount,
+      temporalCoverage: candidate.temporalCoverage,
+      uniqueSourceCoverage: candidate.uniqueSourceCoverage
+    }
   };
 }
 

@@ -25,7 +25,7 @@ const SUITE_DOMAIN = "c137-blind-batch-suite-v1";
 const MEDIA_BINDING_COMMITMENT_DOMAIN = "c137-blind-batch-media-binding-v1";
 const MINIMUM_TOP_K = 2;
 const MAXIMUM_TOP_K = 20;
-const MAXIMUM_MEDIA_PER_SIDE = 64;
+const MAXIMUM_MEDIA_PER_SIDE = 256;
 const MAXIMUM_PAIR_COUNT = 256;
 const MAXIMUM_SPANS_PER_PAIR = 4_096;
 const OPAQUE_ID = /^[a-z0-9][a-z0-9._-]{0,127}$/;
@@ -50,8 +50,10 @@ export interface C137BlindBatchProjectionOptions {
    */
   caseIds?: readonly string[];
   /**
-   * Optional frozen candidate-universe subset. It must contain every decision case, be unique and
-   * preserve manifest order. Omission retains the legacy behavior: candidates equal decisions.
+   * Optional frozen candidate-universe subset. It must be unique and preserve manifest order.
+   * A formal matrix tile may omit a query's gold candidate; only the exhaustive matrix aggregator
+   * may combine such shards. The single-batch evidence compiler still requires every gold pair.
+   * Omission retains the legacy behavior: candidates equal decisions.
    */
   candidateCaseIds?: readonly string[];
 }
@@ -217,6 +219,21 @@ export function createC137BlindBatchExecutionProjection(
 }
 
 /**
+ * A single public benchmark may reveal gold accuracy only when its local candidate universe is
+ * complete. Formal matrix tiles deliberately bypass this guard and are aggregated only after the
+ * exhaustive query×candidate coverage has completed.
+ */
+export function assertC137BlindBatchSingleBatchCandidateUniverse(
+  manifest: RealMediaBenchmarkManifest,
+  options: C137BlindBatchProjectionOptions,
+  projection: C137BlindBatchExecutionProjection
+): void {
+  const model = buildManifestModel(manifest, options);
+  assertProjectionMatchesManifestModel(projection, model);
+  assertCompleteSingleBatchCandidateUniverse(model);
+}
+
+/**
  * Deduplicate and independently permute one media side without consulting case pairing or gold.
  * The opaque hash ordering prevents episode-like size/digest ordering from becoming an ID oracle.
  */
@@ -305,14 +322,9 @@ export function deriveC137BlindBatchRawPredictionFromNativeReceipt(
   nativeReceiptValue: unknown
 ): C137BlindBatchRawPrediction {
   const projection = assertExecutionProjectionShape(projectionValue);
-  const executionSuite = validateRealMediaBlindBatchExecutionSuite(
-    executionSuiteValue
-  );
+  const executionSuite = validateRealMediaBlindBatchExecutionSuite(executionSuiteValue);
   validateProjectionExecutionSuiteBinding(projection, executionSuite);
-  const receipt = validateRealMediaBlindBatchRunReceipt(
-    nativeReceiptValue,
-    executionSuite
-  );
+  const receipt = validateRealMediaBlindBatchRunReceipt(nativeReceiptValue, executionSuite);
   if (
     receipt.status !== "completed" ||
     receipt.pairOutcomes.some((outcome) => outcome.nativeStatus !== "completed")
@@ -360,8 +372,7 @@ export function deriveC137BlindBatchRawPredictionFromNativeReceipt(
       const candidate =
         outcome.globalSelected &&
         proposal !== null &&
-        (proposal.quality.level === "review" ||
-          proposal.quality.level === "verified") &&
+        (proposal.quality.level === "review" || proposal.quality.level === "verified") &&
         proposal.spans.some((span) => span.kind === "matched");
       return {
         pairId: requirePairId(outcome.pairOrdinal),
@@ -380,15 +391,11 @@ export function deriveC137BlindBatchRawPredictionFromNativeReceipt(
     }),
     sourceRankings: receipt.sourceRankings.map((ranking) => ({
       sourceMediaId: ranking.sourceMediaId,
-      rankedPairIds: ranking.candidates.map((candidate) =>
-        requirePairId(candidate.pairOrdinal)
-      )
+      rankedPairIds: ranking.candidates.map((candidate) => requirePairId(candidate.pairOrdinal))
     })),
     targetRankings: receipt.targetRankings.map((ranking) => ({
       targetMediaId: ranking.targetMediaId,
-      rankedPairIds: ranking.candidates.map((candidate) =>
-        requirePairId(candidate.pairOrdinal)
-      )
+      rankedPairIds: ranking.candidates.map((candidate) => requirePairId(candidate.pairOrdinal))
     })),
     nativeShortlist: {
       shortlistedPairIds: projection.pairs
@@ -418,6 +425,7 @@ export function deriveC137BlindBatchRelationshipDecisions(
   assertProjectionMatchesManifestModel(projection, model);
   const rawPrediction = assertRawPredictionShape(rawPredictionValue);
   validateRawPredictionBinding(projection, rawPrediction);
+  assertCompleteSingleBatchCandidateUniverse(model);
 
   const sourceRankingsByMediaId = new Map(
     rawPrediction.sourceRankings.map((ranking) => [ranking.sourceMediaId, ranking])
@@ -443,16 +451,8 @@ export function deriveC137BlindBatchRelationshipDecisions(
     );
     const ranking =
       projection.relationshipAxis === "target"
-        ? requireMapValue(
-            targetRankingsByMediaId,
-            targetMediaId,
-            "target ranking"
-          )
-        : requireMapValue(
-            sourceRankingsByMediaId,
-            sourceMediaId,
-            "source ranking"
-          );
+        ? requireMapValue(targetRankingsByMediaId, targetMediaId, "target ranking")
+        : requireMapValue(sourceRankingsByMediaId, sourceMediaId, "source ranking");
     return {
       suiteId: projection.suiteId,
       caseId: benchmarkCase.id,
@@ -495,6 +495,7 @@ export function compileC137BlindBatchBenchmarkEvidence(
 
   const rawPrediction = assertRawPredictionShape(rawPredictionValue);
   validateRawPredictionBinding(projection, rawPrediction);
+  assertCompleteSingleBatchCandidateUniverse(model);
 
   const outcomesByPairId = new Map(
     rawPrediction.pairOutcomes.map((outcome) => [outcome.pairId, outcome])
@@ -505,9 +506,7 @@ export function compileC137BlindBatchBenchmarkEvidence(
   const targetRankingsByMediaId = new Map(
     rawPrediction.targetRankings.map((ranking) => [ranking.targetMediaId, ranking])
   );
-  const shortlistedPairIds = new Set(
-    rawPrediction.nativeShortlist.shortlistedPairIds
-  );
+  const shortlistedPairIds = new Set(rawPrediction.nativeShortlist.shortlistedPairIds);
   const caseMeasurements = model.selectedCases.map((benchmarkCase) => {
     const sourceMediaId = requireMapValue(
       model.sourceMediaIdByCaseId,
@@ -530,7 +529,10 @@ export function compileC137BlindBatchBenchmarkEvidence(
       projection.relationshipAxis === "target"
         ? requireMapValue(targetRankingsByMediaId, queryMediaId, "target ranking")
         : requireMapValue(sourceRankingsByMediaId, queryMediaId, "source ranking");
-    const rankedPairIds = ranking.rankedPairIds.slice(0, Math.min(projection.topK, ranking.rankedPairIds.length));
+    const rankedPairIds = ranking.rankedPairIds.slice(
+      0,
+      Math.min(projection.topK, ranking.rankedPairIds.length)
+    );
     const outcome = requireMapValue(outcomesByPairId, goldPairId, "known pair outcome");
     const anchorMeasurement = measureKnownPairAnchors(benchmarkCase, outcome);
     const goldPairShortlisted = shortlistedPairIds.has(goldPairId);
@@ -583,12 +585,10 @@ export function compileC137BlindBatchBenchmarkEvidence(
       caseMeasurements.filter((item) => item.topKHit).length,
       caseMeasurements.length
     ),
-    shortlistedGoldPairCount: caseMeasurements.filter(
-      (item) => item.goldPairShortlisted
-    ).length,
-    top1WrongRelationshipCount: caseMeasurements.filter(
-      (item) => item.top1WrongRelationship
-    ).length,
+    shortlistedGoldPairCount: caseMeasurements.filter((item) => item.goldPairShortlisted)
+      .length,
+    top1WrongRelationshipCount: caseMeasurements.filter((item) => item.top1WrongRelationship)
+      .length,
     knownPairMappedAnchorCount,
     knownPairUnmappedAnchorCount,
     knownPairAnchorCoverage: ratio(
@@ -651,32 +651,18 @@ function buildManifestModel(
     (benchmarkCase) =>
       benchmarkCase.mediaKind === "real" && benchmarkCase.split === "frozen-test"
   );
-  const selectedCases = selectFrozenCases(
-    frozenCases,
-    options.caseIds,
-    "caseIds"
-  );
+  const selectedCases = selectFrozenCases(frozenCases, options.caseIds, "caseIds");
   const candidateCases = selectFrozenCases(
     frozenCases,
     options.candidateCaseIds ?? options.caseIds,
     "candidateCaseIds"
   );
-  const candidateCaseIds = new Set(candidateCases.map((benchmarkCase) => benchmarkCase.id));
-  if (selectedCases.some((benchmarkCase) => !candidateCaseIds.has(benchmarkCase.id))) {
-    throw new Error("blind batch candidateCaseIds 必须包含全部 decision caseIds。 ");
-  }
-  const sourceCases =
-    options.relationshipAxis === "source" ? selectedCases : candidateCases;
-  const targetCases =
-    options.relationshipAxis === "target" ? selectedCases : candidateCases;
+  const sourceCases = options.relationshipAxis === "source" ? selectedCases : candidateCases;
+  const targetCases = options.relationshipAxis === "target" ? selectedCases : candidateCases;
   if (
     options.visualEvidenceEnabled &&
-    (sourceCases.some(
-      (benchmarkCase) => benchmarkCase.source.videoStreamIndex === null
-    ) ||
-      targetCases.some(
-        (benchmarkCase) => benchmarkCase.target.videoStreamIndex === null
-      ))
+    (sourceCases.some((benchmarkCase) => benchmarkCase.source.videoStreamIndex === null) ||
+      targetCases.some((benchmarkCase) => benchmarkCase.target.videoStreamIndex === null))
   ) {
     throw new Error(
       "formal blind visual benchmark 要求每个 selected source/target 显式指定 videoStreamIndex；禁止 null/auto。"
@@ -697,7 +683,10 @@ function buildManifestModel(
     targetCases.map((benchmarkCase) => benchmarkCase.target),
     "target"
   );
-  if (sources.entries.length > MAXIMUM_MEDIA_PER_SIDE || targets.entries.length > MAXIMUM_MEDIA_PER_SIDE) {
+  if (
+    sources.entries.length > MAXIMUM_MEDIA_PER_SIDE ||
+    targets.entries.length > MAXIMUM_MEDIA_PER_SIDE
+  ) {
     throw new Error(`blind batch 每侧最多允许 ${MAXIMUM_MEDIA_PER_SIDE} 个 distinct media。`);
   }
   const pairCount = sources.entries.length * targets.entries.length;
@@ -709,38 +698,31 @@ function buildManifestModel(
   if (pairCount > MAXIMUM_PAIR_COUNT) {
     throw new Error(`blind batch 笛卡尔积超过 ${MAXIMUM_PAIR_COUNT} pair，请拆分冻结 suite。`);
   }
-  const candidateMediaCount =
-    options.relationshipAxis === "target" ? sources.entries.length : targets.entries.length;
-  const candidateSide = options.relationshipAxis === "target" ? "source" : "target";
-  if (options.topK >= candidateMediaCount) {
-    throw new Error(
-      `relationshipAxis=${options.relationshipAxis} 的跨媒体 pair ranking 要求 distinct ${candidateSide} 候选数严格大于 topK=${options.topK}；当前只有 ${candidateMediaCount}，不能用必满 Top-K 生成虚假 accuracy。`
-    );
-  }
-
   const sourceMediaIdByCaseId = new Map<string, string>();
   const targetMediaIdByCaseId = new Map<string, string>();
   const goldPairKeys = new Set<string>();
   for (const benchmarkCase of selectedCases) {
-    const sourceMediaId = requireMapValue(
-      sources.idByKey,
-      mediaBindingKey(benchmarkCase.source, options.visualEvidenceEnabled),
-      "source media"
+    const sourceMediaId = sources.idByKey.get(
+      mediaBindingKey(benchmarkCase.source, options.visualEvidenceEnabled)
     );
-    const targetMediaId = requireMapValue(
-      targets.idByKey,
-      mediaBindingKey(benchmarkCase.target, options.visualEvidenceEnabled),
-      "target media"
+    const targetMediaId = targets.idByKey.get(
+      mediaBindingKey(benchmarkCase.target, options.visualEvidenceEnabled)
     );
-    const key = pairKey(sourceMediaId, targetMediaId);
-    if (goldPairKeys.has(key)) {
-      throw new Error(
-        `冻结 suite 含重复 gold pair ${sourceMediaId}/${targetMediaId}；v1 compiler 要求每个关系唯一。`
-      );
+    if (sourceMediaId !== undefined) {
+      sourceMediaIdByCaseId.set(benchmarkCase.id, sourceMediaId);
     }
-    goldPairKeys.add(key);
-    sourceMediaIdByCaseId.set(benchmarkCase.id, sourceMediaId);
-    targetMediaIdByCaseId.set(benchmarkCase.id, targetMediaId);
+    if (targetMediaId !== undefined) {
+      targetMediaIdByCaseId.set(benchmarkCase.id, targetMediaId);
+    }
+    if (sourceMediaId !== undefined && targetMediaId !== undefined) {
+      const key = pairKey(sourceMediaId, targetMediaId);
+      if (goldPairKeys.has(key)) {
+        throw new Error(
+          `冻结 suite 含重复 gold pair ${sourceMediaId}/${targetMediaId}；单批 compiler 要求每个关系唯一。`
+        );
+      }
+      goldPairKeys.add(key);
+    }
   }
   const relationshipAxis = options.relationshipAxis;
   const queryMediaIds =
@@ -806,13 +788,39 @@ function assertProjectionMatchesManifestModel(
   model: C137BlindBatchManifestModel
 ): void {
   if (
-    canonicalProjectionPayload(projection) !==
-      canonicalProjectionPayload(model.projection) ||
+    canonicalProjectionPayload(projection) !== canonicalProjectionPayload(model.projection) ||
     projection.projectionDigest !== model.projection.projectionDigest
   ) {
     throw new Error(
       "blind batch execution projection 与冻结 manifest 的唯一 gold-free 投影不一致。"
     );
+  }
+}
+
+function assertCompleteSingleBatchCandidateUniverse(model: C137BlindBatchManifestModel): void {
+  const projection = model.projection;
+  const candidateMediaCount =
+    projection.relationshipAxis === "target"
+      ? projection.sources.length
+      : projection.targets.length;
+  const candidateSide = projection.relationshipAxis === "target" ? "source" : "target";
+  if (projection.topK >= candidateMediaCount) {
+    throw new Error(
+      `单批 relationshipAxis=${projection.relationshipAxis} accuracy 要求 distinct ${candidateSide} 候选数严格大于 topK=${projection.topK}；partial candidate shard 只能交给 exhaustive matrix aggregator。`
+    );
+  }
+  for (const benchmarkCase of model.selectedCases) {
+    const sourceMediaId = model.sourceMediaIdByCaseId.get(benchmarkCase.id);
+    const targetMediaId = model.targetMediaIdByCaseId.get(benchmarkCase.id);
+    if (
+      sourceMediaId === undefined ||
+      targetMediaId === undefined ||
+      !model.pairIdByMediaIds.has(pairKey(sourceMediaId, targetMediaId))
+    ) {
+      throw new Error(
+        `单批 accuracy 的 candidateCaseIds 未包含 ${benchmarkCase.id} 的 gold candidate；partial shard 不得单独揭示或编译准确率。`
+      );
+    }
   }
 }
 
@@ -823,23 +831,9 @@ function validateProjectionExecutionSuiteBinding(
   if (suite.suiteId !== projection.suiteId || suite.topK !== projection.topK) {
     throw new Error("blind batch execution suite 未绑定同一 projection suiteId/topK。");
   }
-  if (
-    suite.parameters.enableVisualEvidence !== projection.visualEvidenceEnabled
-  ) {
-    throw new Error(
-      "blind batch execution suite visual evidence 设置与 projection 不一致。"
-    );
+  if (suite.parameters.enableVisualEvidence !== projection.visualEvidenceEnabled) {
+    throw new Error("blind batch execution suite visual evidence 设置与 projection 不一致。");
   }
-  const candidateMediaCount =
-    projection.relationshipAxis === "target"
-      ? projection.sources.length
-      : projection.targets.length;
-  if (projection.topK >= candidateMediaCount) {
-    throw new Error(
-      "blind batch projection 声明轴的 distinct 候选数必须严格大于 topK。"
-    );
-  }
-
   for (const [label, projectedMedia, executionMedia] of [
     ["source", projection.sources, suite.sources],
     ["target", projection.targets, suite.targets]
@@ -857,9 +851,7 @@ function validateProjectionExecutionSuiteBinding(
         (projection.visualEvidenceEnabled && projected.videoStreamIndex === null) ||
         (!projection.visualEvidenceEnabled && projected.videoStreamIndex !== null)
       ) {
-        throw new Error(
-          `blind batch ${label} mediaId/stream 与 projection 有序绑定不一致。`
-        );
+        throw new Error(`blind batch ${label} mediaId/stream 与 projection 有序绑定不一致。`);
       }
     });
   }
@@ -897,9 +889,7 @@ function selectFrozenCases(
   const requested = new Set(requestedIds);
   const selected = frozenCases.filter((benchmarkCase) => requested.has(benchmarkCase.id));
   if (selected.length !== requestedIds.length) {
-    throw new Error(
-      `blind batch ${fieldName} 含不存在、非 real 或非 frozen-test 的关系。 `
-    );
+    throw new Error(`blind batch ${fieldName} 含不存在、非 real 或非 frozen-test 的关系。 `);
   }
   if (selected.some((benchmarkCase, index) => benchmarkCase.id !== requestedIds[index])) {
     throw new Error(`blind batch ${fieldName} 必须保持冻结 manifest 顺序。 `);
@@ -989,7 +979,9 @@ function validateRawPredictionBinding(
       outcome.sourceMediaId !== expected.sourceMediaId ||
       outcome.targetMediaId !== expected.targetMediaId
     ) {
-      throw new Error("blind batch pair outcomes 必须完整、唯一并保持 execution projection 顺序。 ");
+      throw new Error(
+        "blind batch pair outcomes 必须完整、唯一并保持 execution projection 顺序。 "
+      );
     }
     if (outcomesByPairId.has(outcome.pairId)) {
       throw new Error(`blind batch pair outcome 重复：${outcome.pairId}。`);
@@ -1000,13 +992,19 @@ function validateRawPredictionBinding(
     "source",
     projection.sources.map((item) => item.mediaId),
     projection.pairs,
-    raw.sourceRankings.map((item) => ({ mediaId: item.sourceMediaId, pairIds: item.rankedPairIds }))
+    raw.sourceRankings.map((item) => ({
+      mediaId: item.sourceMediaId,
+      pairIds: item.rankedPairIds
+    }))
   );
   validateRankings(
     "target",
     projection.targets.map((item) => item.mediaId),
     projection.pairs,
-    raw.targetRankings.map((item) => ({ mediaId: item.targetMediaId, pairIds: item.rankedPairIds }))
+    raw.targetRankings.map((item) => ({
+      mediaId: item.targetMediaId,
+      pairIds: item.rankedPairIds
+    }))
   );
 
   const shortlisted = raw.nativeShortlist.shortlistedPairIds;
@@ -1202,7 +1200,9 @@ function assertExecutionProjectionShape(value: unknown): C137BlindBatchExecution
   return projection;
 }
 
-function assertRawPredictionDraftShape(value: unknown): asserts value is C137BlindBatchRawPredictionDraft {
+function assertRawPredictionDraftShape(
+  value: unknown
+): asserts value is C137BlindBatchRawPredictionDraft {
   assertRawPredictionShapeInternal(value, false);
 }
 
@@ -1290,7 +1290,10 @@ function assertRawPredictionShapeInternal(
     const rankings = record[field];
     assertArray(rankings, `raw ${field}`);
     rankings.forEach((item, index) => {
-      const ranking = assertRecordWithKeys(item, `${field}[${index}]`, [idField, "rankedPairIds"]);
+      const ranking = assertRecordWithKeys(item, `${field}[${index}]`, [
+        idField,
+        "rankedPairIds"
+      ]);
       assertOpaqueId(ranking[idField], `${field}[${index}].${idField}`);
       assertArray(ranking.rankedPairIds, `${field}[${index}].rankedPairIds`);
       ranking.rankedPairIds.forEach((pairId, pairIndex) =>
@@ -1428,12 +1431,15 @@ function assertErrorDistribution(value: unknown, label: string): void {
   ]);
   assertNonnegativeSafeInteger(record.sampleCount, `${label}.sampleCount`);
   for (const field of ["p50Ms", "p95Ms", "p99Ms", "maxMs"] as const) {
-    if (record[field] !== null) assertNonnegativeSafeInteger(record[field], `${label}.${field}`);
+    if (record[field] !== null)
+      assertNonnegativeSafeInteger(record[field], `${label}.${field}`);
   }
 }
 
 function canonicalProjectionPayload(
-  projection: Omit<C137BlindBatchExecutionProjection, "projectionDigest"> | C137BlindBatchExecutionProjection
+  projection:
+    | Omit<C137BlindBatchExecutionProjection, "projectionDigest">
+    | C137BlindBatchExecutionProjection
 ): string {
   return JSON.stringify([
     PROJECTION_DOMAIN,
@@ -1482,14 +1488,8 @@ function canonicalRawPredictionPayload(prediction: C137BlindBatchRawPredictionDr
         span.targetEndMs
       ])
     ]),
-    prediction.sourceRankings.map((ranking) => [
-      ranking.sourceMediaId,
-      ranking.rankedPairIds
-    ]),
-    prediction.targetRankings.map((ranking) => [
-      ranking.targetMediaId,
-      ranking.rankedPairIds
-    ]),
+    prediction.sourceRankings.map((ranking) => [ranking.sourceMediaId, ranking.rankedPairIds]),
+    prediction.targetRankings.map((ranking) => [ranking.targetMediaId, ranking.rankedPairIds]),
     [
       prediction.nativeShortlist.shortlistedPairIds,
       prediction.nativeShortlist.nonShortlistedPairIds
@@ -1498,7 +1498,8 @@ function canonicalRawPredictionPayload(prediction: C137BlindBatchRawPredictionDr
 }
 
 function canonicalEvidencePayload(
-  evidence: Omit<C137BlindBatchBenchmarkEvidence, "evidenceDigest"> | C137BlindBatchBenchmarkEvidence
+  evidence:
+    Omit<C137BlindBatchBenchmarkEvidence, "evidenceDigest"> | C137BlindBatchBenchmarkEvidence
 ): string {
   return JSON.stringify([
     EVIDENCE_DOMAIN,

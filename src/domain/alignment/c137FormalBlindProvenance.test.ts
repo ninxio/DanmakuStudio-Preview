@@ -1,48 +1,156 @@
 import { describe, expect, it } from "vitest";
 import {
-  createC137FormalBlindBatchEnvelopeFixture as createBatchEnvelope,
   createC137FormalBlindProvenanceFixture,
-  resealC137FormalBlindAggregateEvidenceFixture as resealAggregateEvidence,
-  resealC137FormalBlindPlanAndProvenanceFixture as resealPlanAndProvenance,
-  resealC137FormalBlindProjectionFixture as resealProjection,
-  resealC137FormalBlindProvenanceFixture as resealProvenance
+  resealC137FormalBlindNativeReceiptFixture,
+  resealC137FormalBlindProvenanceFixture
 } from "../../test/c137FormalBlindProvenance";
 import {
-  computeC137FormalBlindManifestDigest,
-  computeC137FormalBlindMediaBindingsDigest,
-  computeC137FormalBlindParametersDigest,
+  C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+  computeC137FormalBlindMatrixPlanDigest,
+  createC137FormalBlindMatrixPlan,
+  createC137FormalBlindMatrixTileLayout,
   evaluateC137FormalBlindProvenance,
+  rankC137FormalBlindGlobalScores,
+  sealC137FormalBlindProvenanceV2,
   validateC137FormalBlindProvenance,
-  type C137FormalBlindProvenancePlanBatchV1,
-  type C137FormalBlindProvenanceV1
+  type C137FormalBlindProvenanceV2
 } from "./c137FormalBlindProvenance";
+import {
+  createNativeBatchExecutionIdentityDigest,
+  createRealMediaBlindBatchExecutionDigest
+} from "./realMediaBlindBatchContract";
 
-describe("C137 formal blind structural provenance v1", () => {
-  it("validates a six-case full-universe structural smoke and derives every decision", () => {
+describe("C137 formal blind exhaustive matrix provenance v2", () => {
+  it("validates an exhaustive matrix and derives one global decision per query", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
-    const { provenance } = fixture;
-    const validation = validateC137FormalBlindProvenance(provenance);
-    const evaluation = evaluateC137FormalBlindProvenance(provenance, fixture.expectations);
+    const validation = validateC137FormalBlindProvenance(fixture.provenance);
+    const evaluation = evaluateC137FormalBlindProvenance(
+      fixture.provenance,
+      fixture.expectations
+    );
 
     expect(validation).toMatchObject({ valid: true, issues: [], coverageValid: true });
-    expect(evaluation).toMatchObject({ valid: true, issues: [], coverageValid: true });
-    expect(fixture.evaluation).toEqual(evaluation);
-    expect(fixture.decisions).toEqual(evaluation.decisions);
-    expect(evaluation.decisions).toHaveLength(6);
+    expect(evaluation).toEqual(fixture.evaluation);
+    expect(evaluation.decisions).toHaveLength(fixture.manifest.cases.length);
     expect(new Set(evaluation.decisions.map((decision) => decision.caseId))).toEqual(
-      new Set(provenance.manifest.cases.map((benchmarkCase) => benchmarkCase.id))
+      new Set(fixture.manifest.cases.map((benchmarkCase) => benchmarkCase.id))
     );
-    expect(new Set(evaluation.decisions.map((decision) => decision.provenanceRef)).size).toBe(6);
-    expect(provenance.releaseEligible).toBe(false);
-    expect(provenance.trustStatus).toBe("untrusted-self-consistent-provenance");
+    expect(new Set(evaluation.decisions.map((decision) => decision.provenanceRef)).size).toBe(
+      fixture.manifest.cases.length
+    );
+    expect(fixture.provenance.releaseEligible).toBe(false);
   });
 
-  it("fails closed when the plan omits one frozen query even though every batch is self-consistent", () => {
-    const provenance = createFormalProvenance([
-      ["formal-case-1", "formal-case-2"],
-      ["formal-case-3", "formal-case-4"],
-      ["formal-case-5"]
+  it("deterministically tiles 1×256, 1×257, 1×300 and 17×17 without exceeding 256 pairs", () => {
+    expect(createC137FormalBlindMatrixTileLayout(1, 256, 5)).toEqual([
+      { queryStart: 0, queryEnd: 1, candidateStart: 0, candidateEnd: 256 }
     ]);
+    expect(createC137FormalBlindMatrixTileLayout(1, 257, 5)).toHaveLength(2);
+    expect(createC137FormalBlindMatrixTileLayout(1, 300, 5)).toHaveLength(2);
+    expect(createC137FormalBlindMatrixTileLayout(17, 17, 5)).toHaveLength(2);
+
+    for (const [queries, candidates] of [
+      [1, 257],
+      [1, 300],
+      [17, 17]
+    ] as const) {
+      const layout = createC137FormalBlindMatrixTileLayout(queries, candidates, 5);
+      const cells = new Set<string>();
+      for (const tile of layout) {
+        expect(
+          (tile.queryEnd - tile.queryStart) * (tile.candidateEnd - tile.candidateStart)
+        ).toBeLessThanOrEqual(256);
+        for (let query = tile.queryStart; query < tile.queryEnd; query += 1) {
+          for (
+            let candidate = tile.candidateStart;
+            candidate < tile.candidateEnd;
+            candidate += 1
+          ) {
+            const key = `${query}/${candidate}`;
+            expect(cells.has(key)).toBe(false);
+            cells.add(key);
+          }
+        }
+      }
+      expect(cells.size).toBe(queries * candidates);
+    }
+  });
+
+  it("globally reranks all shard scores so a second-shard candidate can win", () => {
+    const ranked = rankC137FormalBlindGlobalScores(
+      [
+        { candidateOrdinal: 0, pairId: digest("a"), score: 0.72 },
+        { candidateOrdinal: 1, pairId: digest("b"), score: 0.71 },
+        { candidateOrdinal: 2, pairId: digest("c"), score: 0.99 },
+        { candidateOrdinal: 3, pairId: digest("d"), score: 0.73 }
+      ],
+      2,
+      "query-second-shard"
+    );
+
+    expect(ranked).toEqual([digest("c"), digest("d")]);
+    expect(ranked).not.toEqual([digest("a"), digest("b")]);
+  });
+
+  it("uses manifest candidate ordinal as the stable cross-shard tie break", () => {
+    const observations = [
+      { candidateOrdinal: 3, pairId: digest("d"), score: 0.8 },
+      { candidateOrdinal: 1, pairId: digest("b"), score: 0.8 },
+      { candidateOrdinal: 2, pairId: digest("c"), score: 0.8 },
+      { candidateOrdinal: 0, pairId: digest("a"), score: 0.8 }
+    ] as const;
+    const forward = rankC137FormalBlindGlobalScores(observations, 3, "tie");
+    const reversed = rankC137FormalBlindGlobalScores([...observations].reverse(), 3, "tie");
+
+    expect(forward).toEqual([digest("a"), digest("b"), digest("c")]);
+    expect(reversed).toEqual(forward);
+  });
+
+  it("fails closed instead of padding Top-K with noEligibleCandidate observations", () => {
+    expect(() =>
+      rankC137FormalBlindGlobalScores(
+        [
+          { candidateOrdinal: 0, pairId: digest("a"), score: 0.8 },
+          { candidateOrdinal: 1, pairId: digest("b"), score: null },
+          { candidateOrdinal: 2, pairId: digest("c"), score: null }
+        ],
+        2,
+        "insufficient"
+      )
+    ).toThrow(/只有 1 个 intrinsic eligible candidate.*globalTopK=2/);
+  });
+
+  it("uses the first physical candidate representative and rejects stream-divergent aliases", () => {
+    const alias = createC137FormalBlindProvenanceFixture({
+      mutateManifest(manifest) {
+        const first = manifest.cases[0];
+        const second = manifest.cases[1];
+        if (!first || !second) throw new Error("fixture case missing");
+        second.target.contentIdentity = structuredClone(first.target.contentIdentity);
+      }
+    });
+    expect(alias.evaluation.valid).toBe(true);
+    expect(alias.plan.batches[0]?.candidateCaseIds).toContain("formal-case-1");
+    expect(alias.plan.batches[0]?.candidateCaseIds).not.toContain("formal-case-2");
+
+    expect(() =>
+      createC137FormalBlindProvenanceFixture({
+        mutateManifest(manifest) {
+          const first = manifest.cases[0];
+          const second = manifest.cases[1];
+          if (!first || !second) throw new Error("fixture case missing");
+          second.target.contentIdentity = structuredClone(first.target.contentIdentity);
+          second.target.audioStreamIndex = first.target.audioStreamIndex + 1;
+        }
+      })
+    ).toThrow(/同一候选物理文件.*不同有效流|声明了不同有效流/);
+  });
+
+  it("rejects a missing matrix batch even after caller recomputes public digests", () => {
+    const provenance = createFormalProvenance({ caseCount: 17 });
+    provenance.plan.batches.pop();
+    provenance.batches.pop();
+    resealPlanDigest(provenance);
 
     expect(validateC137FormalBlindProvenance(provenance)).toMatchObject({
       valid: false,
@@ -50,256 +158,176 @@ describe("C137 formal blind structural provenance v1", () => {
       decisions: []
     });
     expect(validateC137FormalBlindProvenance(provenance).issues.join("\n")).toMatch(
-      /coverage.*formal-case-6/i
+      /唯一 exhaustive query×candidate tile 计划/
     );
   });
 
-  it("rejects duplicate batch ids and suite+case replay under a renamed batch", () => {
-    const duplicateId = createFormalProvenance();
-    duplicateId.plan.batches[1].batchId = duplicateId.plan.batches[0].batchId;
-    duplicateId.batches[1].batchId = duplicateId.batches[0].batchId;
-    resealPlanAndProvenance(duplicateId);
-    expect(validateC137FormalBlindProvenance(duplicateId).issues.join("\n")).toMatch(
-      /batchId 重复/
-    );
+  it("rejects a duplicate/renamed matrix cell rather than counting a query twice", () => {
+    const provenance = createFormalProvenance({ caseCount: 17 });
+    const planReplay = structuredClone(provenance.plan.batches[0]);
+    const envelopeReplay = structuredClone(provenance.batches[0]);
+    if (!planReplay || !envelopeReplay) throw new Error("fixture batch missing");
+    planReplay.batchId = "matrix-batch-replay";
+    envelopeReplay.batchId = planReplay.batchId;
+    provenance.plan.batches.push(planReplay);
+    provenance.batches.push(envelopeReplay);
+    resealPlanDigest(provenance);
 
-    const replay = createFormalProvenance();
-    const replayPlan = structuredClone(replay.plan.batches[0]);
-    replayPlan.batchId = "formal-batch-replay";
-    const replayEnvelope = structuredClone(replay.batches[0]);
-    replayEnvelope.batchId = replayPlan.batchId;
-    replay.plan.batches.push(replayPlan);
-    replay.batches.push(replayEnvelope);
-    resealPlanAndProvenance(replay);
-    expect(validateC137FormalBlindProvenance(replay).issues.join("\n")).toMatch(
-      /suite\+case replay|duplicate physical query identity/
+    expect(validateC137FormalBlindProvenance(provenance).issues.join("\n")).toMatch(
+      /唯一 exhaustive query×candidate tile 计划|replay|重复/
     );
   });
 
-  it("rejects candidate-universe cropping even when query cases remain included", () => {
-    const provenance = createFormalProvenance();
-    provenance.plan.batches[0].candidateCaseIds.pop();
-    resealPlanAndProvenance(provenance);
-
-    const result = validateC137FormalBlindProvenance(provenance);
-    expect(result).toMatchObject({ valid: false, coverageValid: false, decisions: [] });
-    expect(result.issues.join("\n")).toMatch(/candidateCaseIds.*完整 real frozen manifest/);
-  });
-
-  it("rejects duplicate case coverage across different batches and relationship axes", () => {
-    const provenance = createFormalProvenance([
-      ["formal-case-1", "formal-case-2"],
-      ["formal-case-1", "formal-case-3", "formal-case-4"],
-      ["formal-case-5", "formal-case-6"]
-    ]);
-    const secondPlanBatch = provenance.plan.batches[1];
-    if (secondPlanBatch === undefined) throw new Error("fixture second plan batch missing");
-    secondPlanBatch.relationshipAxis = "target";
-    provenance.batches[1] = createBatchEnvelope(provenance.manifest, secondPlanBatch);
-    resealPlanAndProvenance(provenance);
-
-    const result = validateC137FormalBlindProvenance(provenance);
-    expect(result).toMatchObject({ valid: false, coverageValid: false, decisions: [] });
-    expect(result.issues.join("\n")).toMatch(/duplicate case coverage.*formal-case-1/);
-  });
-
-  it("rejects copied physical relationships and cross-batch query identities", () => {
-    const queryGroups = [
-      ["formal-case-1"],
-      ["formal-case-2"],
-      ["formal-case-3", "formal-case-4"],
-      ["formal-case-5", "formal-case-6"]
-    ] as const;
-    const duplicatedPair = createC137FormalBlindProvenanceFixture({
-      queryGroups,
-      mutateManifest(manifest) {
-        const first = manifest.cases[0];
-        const second = manifest.cases[1];
-        if (first === undefined || second === undefined) throw new Error("fixture case missing");
-        second.source.contentIdentity = structuredClone(first.source.contentIdentity);
-        second.target.contentIdentity = structuredClone(first.target.contentIdentity);
-      }
-    }).provenance;
-    expect(validateC137FormalBlindProvenance(duplicatedPair).issues.join("\n")).toMatch(
-      /duplicate physical relationship.*formal-case-1\/formal-case-2/
+  it("rejects cross-tile execution parameter drift", () => {
+    const provenance = createFormalProvenance({ caseCount: 17 });
+    const second = provenance.batches[1];
+    if (!second) throw new Error("fixture second batch missing");
+    second.executionSuite.parameters.windowMs = 64;
+    second.nativeReceipt.executionDigest = createRealMediaBlindBatchExecutionDigest(
+      second.executionSuite
     );
+    resealC137FormalBlindNativeReceiptFixture(second);
+    resealC137FormalBlindProvenanceFixture(provenance);
 
-    const duplicatedQuery = createC137FormalBlindProvenanceFixture({
-      queryGroups,
-      mutateManifest(manifest) {
-        const first = manifest.cases[0];
-        const second = manifest.cases[1];
-        if (first === undefined || second === undefined) throw new Error("fixture case missing");
-        second.source.contentIdentity = structuredClone(first.source.contentIdentity);
-      }
-    }).provenance;
-    expect(validateC137FormalBlindProvenance(duplicatedQuery).issues.join("\n")).toMatch(
-      /source-axis duplicate physical query identity/
+    expect(validateC137FormalBlindProvenance(provenance).issues.join("\n")).toMatch(
+      /parameters 必须 exact equal/
     );
   });
 
-  it.each(["digest", "sizeBytes"] as const)(
-    "rejects one normalized path whose %s differs across query shards",
-    (differentField) => {
-      const conflictingPath = createC137FormalBlindProvenanceFixture({
-        mutateManifest(manifest) {
-          const first = manifest.cases[0];
-          const third = manifest.cases[2];
-          if (first === undefined || third === undefined) throw new Error("fixture case missing");
-          if (first.source.contentIdentity === null) throw new Error("fixture identity missing");
-          third.source.path = first.source.path.toUpperCase().split("\\").join("/");
-          third.source.contentIdentity = structuredClone(first.source.contentIdentity);
-          if (differentField === "digest") {
-            third.source.contentIdentity.digest = "fe".repeat(32);
-          } else {
-            third.source.contentIdentity.sizeBytes += 1;
-          }
+  it.each(["ffmpeg", "backend", "fallback"] as const)(
+    "rejects resealed cross-tile actual execution identity drift: %s",
+    (drift) => {
+      const provenance = createFormalProvenance({ caseCount: 17 });
+      const second = provenance.batches[1];
+      if (!second) throw new Error("fixture second batch missing");
+      for (const outcome of second.nativeReceipt.pairOutcomes) {
+        const identity = outcome.relationRanking.executionIdentity;
+        if (!identity) throw new Error("fixture execution identity missing");
+        if (drift === "ffmpeg") {
+          identity.ffmpegBinaryDigest = `sha256:${"e".repeat(64)}`;
+        } else if (drift === "backend") {
+          const sourceBackend = identity.sourceSpectralBackends[0];
+          if (!sourceBackend) throw new Error("fixture source backend missing");
+          sourceBackend.backendId = "cpu-radix2-f64-r2c-512-v1";
+          sourceBackend.requestedBackend = "cpu";
+          sourceBackend.backendDetail = "test CPU";
+        } else {
+          const sourceBackend = identity.sourceSpectralBackends[0];
+          if (!sourceBackend) throw new Error("fixture source backend missing");
+          sourceBackend.requestedBackend = "auto";
+          sourceBackend.fallbackReason = "CUDA runtime failure; explicit CPU fallback";
         }
-      }).provenance;
+        outcome.relationRanking.executionIdentityDigest =
+          createNativeBatchExecutionIdentityDigest(identity);
+      }
+      second.nativeReceipt.executionIdentityDigest =
+        second.nativeReceipt.pairOutcomes[0]?.relationRanking.executionIdentityDigest ?? null;
+      resealC137FormalBlindNativeReceiptFixture(second);
+      resealC137FormalBlindProvenanceFixture(provenance);
 
-      const result = validateC137FormalBlindProvenance(conflictingPath);
-      expect(result).toMatchObject({ valid: false, coverageValid: false, decisions: [] });
-      expect(result.issues.join("\n")).toMatch(
-        /path identity conflict.*同一规范化路径绑定了不同 full-file identity/
+      expect(validateC137FormalBlindProvenance(provenance).issues.join("\n")).toMatch(
+        /execution identity|executionIdentityDigest/
       );
     }
   );
 
-  it("rejects full-file identity algorithm drift before path binding can pass", () => {
-    const provenance = createFormalProvenance();
-    const first = provenance.manifest.cases[0];
-    const third = provenance.manifest.cases[2];
-    if (first === undefined || third === undefined) throw new Error("fixture case missing");
-    if (third.source.contentIdentity === null) throw new Error("fixture identity missing");
-    third.source.path = first.source.path;
-    (third.source.contentIdentity as { algorithm: string }).algorithm =
-      "sha256-full-file-v3";
-    provenance.manifestDigest = computeC137FormalBlindManifestDigest(provenance.manifest);
-    provenance.mediaBindingsDigest = computeC137FormalBlindMediaBindingsDigest(
-      provenance.manifest
-    );
-    provenance.plan.manifestDigest = provenance.manifestDigest;
-    resealPlanAndProvenance(provenance);
+  it.each(["relationshipAxis", "visualEvidenceEnabled", "globalTopK"] as const)(
+    "rejects resealed plan-root %s drift from its projections",
+    (field) => {
+      const provenance = createFormalProvenance();
+      if (field === "relationshipAxis") provenance.plan.relationshipAxis = "target";
+      if (field === "visualEvidenceEnabled") provenance.plan.visualEvidenceEnabled = true;
+      if (field === "globalTopK") provenance.plan.globalTopK = 3;
+      resealPlanDigest(provenance);
 
-    const result = validateC137FormalBlindProvenance(provenance);
-    expect(result).toMatchObject({ valid: false, coverageValid: false, decisions: [] });
-    expect(result.issues.join("\n")).toMatch(/manifest 无效.*contentIdentity/);
-  });
+      expect(validateC137FormalBlindProvenance(provenance).valid).toBe(false);
+    }
+  );
 
-  it.each([
-    ["relationshipAxis", (batch: C137FormalBlindProvenancePlanBatchV1) => {
-      batch.relationshipAxis = "target";
-    }],
-    ["visualEvidenceEnabled", (batch: C137FormalBlindProvenancePlanBatchV1) => {
-      batch.visualEvidenceEnabled = true;
-    }],
-    ["topK", (batch: C137FormalBlindProvenancePlanBatchV1) => {
-      batch.topK = 3;
-    }]
-  ] as const)("rejects a resealed plan whose %s no longer binds the envelope", (_label, mutate) => {
-    const provenance = createFormalProvenance();
-    mutate(provenance.plan.batches[0]);
-    resealPlanAndProvenance(provenance);
-
-    const result = evaluateC137FormalBlindProvenance(provenance, {
-      manifestDigest: provenance.manifestDigest,
-      datasetVersion: provenance.manifest.datasetVersion,
-      planDigest: provenance.plan.planDigest,
-      parametersDigest: computeC137FormalBlindParametersDigest(provenance),
-      topK: 2
-    });
-    expect(result).toMatchObject({ valid: false, coverageValid: false, decisions: [] });
-  });
-
-  it("rejects suite, native receipt, raw prediction and aggregate evidence tampering", () => {
-    const suiteTamper = createFormalProvenance();
-    const projection = suiteTamper.batches[0].projection;
-    projection.suiteId = "suite-replayed";
-    resealProjection(projection);
-    resealProvenance(suiteTamper);
-    expect(validateC137FormalBlindProvenance(suiteTamper).issues.join("\n")).toMatch(
-      /projection 不是唯一重建结果/
+  it("rejects relation score version drift and native receipt tampering", () => {
+    const scoreDrift = createFormalProvenance();
+    const firstOutcome = scoreDrift.batches[0]?.nativeReceipt.pairOutcomes[0];
+    if (!firstOutcome) throw new Error("fixture outcome missing");
+    (firstOutcome.relationRanking as { scoreVersion: string }).scoreVersion =
+      "alignment-v2-wrong-score";
+    resealC137FormalBlindProvenanceFixture(scoreDrift);
+    expect(validateC137FormalBlindProvenance(scoreDrift).issues.join("\n")).toMatch(
+      /scoreVersion/
     );
 
     const receiptTamper = createFormalProvenance();
-    receiptTamper.batches[0].nativeReceipt.receiptDigest = `sha256:${"0".repeat(64)}`;
-    resealProvenance(receiptTamper);
+    const firstBatch = receiptTamper.batches[0];
+    if (!firstBatch) throw new Error("fixture batch missing");
+    firstBatch.nativeReceipt.receiptDigest = digest("0");
+    resealC137FormalBlindProvenanceFixture(receiptTamper);
     expect(validateC137FormalBlindProvenance(receiptTamper).issues.join("\n")).toMatch(
       /receiptDigest/
     );
-
-    const rawTamper = createFormalProvenance();
-    rawTamper.batches[0].rawPrediction.nativeReceiptDigest = `sha256:${"1".repeat(64)}`;
-    resealProvenance(rawTamper);
-    expect(validateC137FormalBlindProvenance(rawTamper).issues.join("\n")).toMatch(
-      /rawPrediction 不是 native receipt/
-    );
-
-    const evidenceTamper = createFormalProvenance();
-    evidenceTamper.batches[0].aggregateEvidence.top1HitCount -= 1;
-    resealAggregateEvidence(evidenceTamper.batches[0].aggregateEvidence);
-    resealProvenance(evidenceTamper);
-    expect(validateC137FormalBlindProvenance(evidenceTamper).issues.join("\n")).toMatch(
-      /aggregate evidence 不是冻结 gold/
-    );
   });
 
-  it("rejects execution media identity that no longer matches the manifest full file", () => {
-    const provenance = createFormalProvenance();
-    const tamperedIdentity = provenance.batches[0].executionSuite.sources[0].contentIdentity;
-    tamperedIdentity.firstSampleDigest = "f".repeat(64);
-    tamperedIdentity.middleSampleDigest = "f".repeat(64);
-    tamperedIdentity.lastSampleDigest = "f".repeat(64);
-    resealProvenance(provenance);
+  it("rejects nativeJobId replay across otherwise distinct tiles", () => {
+    const provenance = createFormalProvenance({ caseCount: 17 });
+    const first = provenance.batches[0];
+    const second = provenance.batches[1];
+    if (!first || !second) throw new Error("fixture batch missing");
+    second.nativeReceipt.nativeJobId = first.nativeReceipt.nativeJobId;
+    resealC137FormalBlindNativeReceiptFixture(second);
+    resealC137FormalBlindProvenanceFixture(provenance);
 
     expect(validateC137FormalBlindProvenance(provenance).issues.join("\n")).toMatch(
-      /manifest path\/full identity commitment\/streams/
+      /nativeJobId replay/
     );
   });
 
-  it("rejects resealed execution parameters that miss the external parameter digest", () => {
-    const provenance = createFormalProvenance();
-    const expectedParametersDigest = computeC137FormalBlindParametersDigest(provenance);
-    provenance.batches[0].executionSuite.parameters.matchThreshold = 0.81;
-    resealProvenance(provenance);
-
-    const result = evaluateC137FormalBlindProvenance(provenance, {
-      manifestDigest: provenance.manifestDigest,
-      datasetVersion: provenance.manifest.datasetVersion,
-      planDigest: provenance.plan.planDigest,
-      parametersDigest: expectedParametersDigest,
-      topK: 2
+  it("seal is atomic and refuses a non-unique plan", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const sealed = sealC137FormalBlindProvenanceV2({
+      manifest: fixture.manifest,
+      plan: fixture.plan,
+      batches: fixture.provenance.batches
     });
-    expect(result).toMatchObject({ valid: false, coverageValid: false, decisions: [] });
-    expect(result.issues.join("\n")).toMatch(/parametersDigest 未命中外部期望/);
+    expect(sealed).toEqual(fixture.provenance);
+
+    const badPlan = structuredClone(fixture.plan);
+    badPlan.scoreContract = C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT;
+    badPlan.batches.pop();
+    badPlan.planDigest = computeC137FormalBlindMatrixPlanDigest(badPlan);
+    expect(() =>
+      sealC137FormalBlindProvenanceV2({
+        manifest: fixture.manifest,
+        plan: badPlan,
+        batches: fixture.provenance.batches.slice(0, -1)
+      })
+    ).toThrow(/非唯一、非 exhaustive/);
   });
 
-  it("rejects an envelope replay and unknown formal schema fields", () => {
-    const reordered = createFormalProvenance();
-    [reordered.batches[0], reordered.batches[1]] = [
-      reordered.batches[1],
-      reordered.batches[0]
-    ];
-    resealProvenance(reordered);
-    expect(validateC137FormalBlindProvenance(reordered).issues.join("\n")).toMatch(
-      /按序.*一一对应/
+  it("plan generation is deterministic", () => {
+    const fixture = createC137FormalBlindProvenanceFixture({ caseCount: 17 });
+    const regenerated = createC137FormalBlindMatrixPlan(
+      fixture.manifest,
+      fixture.provenance.manifestDigest,
+      {
+        relationshipAxis: fixture.plan.relationshipAxis,
+        visualEvidenceEnabled: fixture.plan.visualEvidenceEnabled,
+        globalTopK: fixture.plan.globalTopK,
+        scoreContract: fixture.plan.scoreContract
+      }
     );
-
-    const injected = structuredClone(createFormalProvenance()) as unknown as Record<
-      string,
-      unknown
-    >;
-    injected.claimedAuthority = true;
-    expect(validateC137FormalBlindProvenance(injected).issues.join("\n")).toMatch(
-      /exact keys/
-    );
+    expect(regenerated).toEqual(fixture.plan);
   });
 });
 
 function createFormalProvenance(
-  queryGroups?: readonly (readonly string[])[]
-): C137FormalBlindProvenanceV1 {
-  return createC137FormalBlindProvenanceFixture(
-    queryGroups === undefined ? {} : { queryGroups }
-  ).provenance;
+  options: Parameters<typeof createC137FormalBlindProvenanceFixture>[0] = {}
+): C137FormalBlindProvenanceV2 {
+  return createC137FormalBlindProvenanceFixture(options).provenance;
+}
+
+function resealPlanDigest(provenance: C137FormalBlindProvenanceV2): void {
+  provenance.plan.planDigest = computeC137FormalBlindMatrixPlanDigest(provenance.plan);
+  resealC137FormalBlindProvenanceFixture(provenance);
+}
+
+function digest(character: string): `sha256:${string}` {
+  return `sha256:${character.repeat(64).slice(0, 64)}`;
 }

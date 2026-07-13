@@ -7,16 +7,20 @@ import {
   createRealMediaBlindBatchRunReceiptDigest,
   createRealMediaBlindBatchSourceRanking,
   createRealMediaBlindBatchTargetRanking,
+  deriveRealMediaBlindBatchReceiptExecutionIdentityDigest,
   REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
   REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION,
   REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION,
   validateRealMediaBlindBatchExecutionSuite,
   validateRealMediaBlindBatchGlobalSelectionEvidence,
+  validateRealMediaBlindBatchRelationRankingEvidence,
   validateRealMediaBlindBatchProposalBinding
 } from "../../domain/alignment/realMediaBlindBatchContract";
 import type {
   NativeBatchGlobalSelectionEvidence,
+  NativeBatchExecutionIdentity,
   NativeBatchPairingMode,
+  NativeBatchRelationRankingEvidence,
   RealMediaBlindBatchExecutionSuite,
   RealMediaBlindBatchPairOutcome,
   RealMediaBlindBatchRunReceipt,
@@ -39,15 +43,20 @@ export {
   createRealMediaBlindBatchRunReceiptDigest,
   REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION,
   REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION,
+  REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
   REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION,
   validateRealMediaBlindBatchExecutionSuite,
   validateRealMediaBlindBatchRunReceipt
 } from "../../domain/alignment/realMediaBlindBatchContract";
 export type {
   NativeBatchGlobalCandidateEvidence,
+  NativeBatchExecutionIdentity,
   NativeBatchGlobalSelectionEvidence,
   NativeBatchGlobalSelectionState,
   NativeBatchPairingMode,
+  NativeBatchRelationCandidateEvidence,
+  NativeBatchRelationRankingEvidence,
+  NativeBatchRelationRankingState,
   RealMediaBlindBatchAlignmentParameters,
   RealMediaBlindBatchExecutionMedia,
   RealMediaBlindBatchExecutionSuite,
@@ -78,7 +87,7 @@ export interface RealMediaBlindBatchRunnerOptions {
 }
 
 interface NativeBatchEvidenceSnapshot extends AudioAlignmentBatchJobSnapshot {
-  evidenceVersion: 1;
+  evidenceVersion: 2;
   pairingMode: NativeBatchPairingMode;
   sourceMediaIds: string[];
   targetMediaIds: string[];
@@ -87,6 +96,7 @@ interface NativeBatchEvidenceSnapshot extends AudioAlignmentBatchJobSnapshot {
 
 interface NativeBatchEvidencePairSnapshot extends AudioAlignmentBatchPairSnapshot {
   pairIndex: number;
+  relationRanking: NativeBatchRelationRankingEvidence;
   globalSelection: NativeBatchGlobalSelectionEvidence;
 }
 
@@ -334,6 +344,13 @@ function validateNativePairEvidence(
     target,
     `native pair #${expected.pairOrdinal}`
   );
+  const relationRanking = validateRealMediaBlindBatchRelationRankingEvidence(
+    pair.relationRanking,
+    value.status,
+    source,
+    target,
+    `native pair #${expected.pairOrdinal}`
+  );
   if (value.status === "completed") {
     const proposal = value.proposal;
     if (!proposal?.timeMap || !isAlignmentTimeMapProposal(proposal.timeMap, true)) {
@@ -372,6 +389,7 @@ function validateNativePairEvidence(
   return {
     ...value,
     pairIndex,
+    relationRanking,
     globalSelection
   };
 }
@@ -383,6 +401,14 @@ function createReceiptWithoutDigest(
   wallElapsedMs: number
 ): Omit<RealMediaBlindBatchRunReceipt, "receiptDigest"> {
   const pairOutcomes = terminal.snapshot.pairs.map((pair) => createPairOutcome(pair));
+  const executionIdentityDigest =
+    deriveRealMediaBlindBatchReceiptExecutionIdentityDigest(pairOutcomes);
+  const status = deriveRunStatus(terminal);
+  if (status === "completed" && executionIdentityDigest === null) {
+    throw new Error(
+      "completed native blind batch 的 pair 存在 execution identity 漂移，拒绝生成 receipt。"
+    );
+  }
   const sourceRankings = suite.sources.map((source) =>
     createRealMediaBlindBatchSourceRanking(source.mediaId, pairOutcomes, suite.topK)
   );
@@ -400,10 +426,11 @@ function createReceiptWithoutDigest(
     suiteId: suite.suiteId,
     datasetVersion: suite.datasetVersion,
     executionDigest,
+    executionIdentityDigest,
     nativeJobId: terminal.snapshot.jobId,
     nativeEvidenceVersion: NATIVE_BATCH_EVIDENCE_VERSION,
     pairingMode: "fullCartesian",
-    status: deriveRunStatus(terminal),
+    status,
     terminationReason: terminal.terminationReason,
     wallElapsedMs,
     sourceCount: suite.sources.length,
@@ -432,6 +459,7 @@ function createPairOutcome(
         : nativeStatus === "cancelled"
           ? "native-pair-cancelled"
           : null,
+    relationRanking: cloneRelationRanking(pair.relationRanking),
     globalSelected: pair.globalSelection.selected,
     globalSelection: cloneGlobalSelection(pair.globalSelection),
     proposalTimeMap: pair.proposal?.timeMap ? cloneTimeMap(pair.proposal.timeMap) : null
@@ -480,6 +508,30 @@ function cloneGlobalSelection(
     ...selection,
     topK: selection.topK.map((candidate) => ({ ...candidate })),
     decisionCandidate: selection.decisionCandidate ? { ...selection.decisionCandidate } : null
+  };
+}
+
+function cloneRelationRanking(
+  ranking: NativeBatchRelationRankingEvidence
+): NativeBatchRelationRankingEvidence {
+  return {
+    ...ranking,
+    executionIdentity: ranking.executionIdentity
+      ? cloneExecutionIdentity(ranking.executionIdentity)
+      : null,
+    bestEligibleCandidate: ranking.bestEligibleCandidate
+      ? { ...ranking.bestEligibleCandidate }
+      : null
+  };
+}
+
+function cloneExecutionIdentity(
+  identity: NativeBatchExecutionIdentity
+): NativeBatchExecutionIdentity {
+  return {
+    ...identity,
+    sourceSpectralBackends: identity.sourceSpectralBackends.map((backend) => ({ ...backend })),
+    targetSpectralBackends: identity.targetSpectralBackends.map((backend) => ({ ...backend }))
   };
 }
 
