@@ -1,4 +1,5 @@
 import { sha256Hex } from "../shared/sha256";
+import type { SpectralBackendPreference } from "./spectralBackendPreference";
 
 export const C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION = 1 as const;
 export const C137_PERFORMANCE_EVIDENCE_SCHEMA_VERSION_V2 = 2 as const;
@@ -43,6 +44,7 @@ export interface C137PerformancePlanTrialV1 {
 }
 
 export interface C137PerformanceAlgorithmParametersV1 {
+  spectralBackend: SpectralBackendPreference;
   sampleRate: number | null;
   windowMs: number | null;
   matchThreshold: number | null;
@@ -1448,8 +1450,9 @@ function validatePlan(value: unknown, issues: string[]): void {
 
 function validateParameters(value: unknown, issues: string[]): void {
   const path = "evidence.plan.parameters";
-  const record = strictRecord(value, path, ["sampleRate", "windowMs", "matchThreshold", "minGapMs", "maxCells", "enableVisualEvidence", "visualSampleIntervalMs"], issues);
+  const record = strictRecord(value, path, ["spectralBackend", "sampleRate", "windowMs", "matchThreshold", "minGapMs", "maxCells", "enableVisualEvidence", "visualSampleIntervalMs"], issues);
   if (!record) return;
+  requireOneOf(record.spectralBackend, ["auto", "cuda", "cpu"], `${path}.spectralBackend`, issues);
   requireNullablePositiveSafeInteger(record.sampleRate, `${path}.sampleRate`, issues);
   requireNullablePositiveSafeInteger(record.windowMs, `${path}.windowMs`, issues);
   requireNullablePositiveNumber(record.matchThreshold, `${path}.matchThreshold`, issues);

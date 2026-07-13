@@ -127,6 +127,147 @@ describe("C137 原生性能 evidence 调度器", () => {
     ).rejects.toThrow("workloadDigest");
   });
 
+  it("CUDA/CPU 策略分别绑定计划摘要、请求摘要并传到每个原生 job", async () => {
+    const manifest = createManifest(false);
+    const collectPolicy = async (spectralBackend: "cuda" | "cpu") => {
+      const plan = createEngineeringRealMediaPerformancePlan(
+        manifest,
+        "performance-plan-policy",
+        spectralBackend
+      );
+      const invoker = createSuccessfulInvoker(manifest, []);
+      const received: NormalizedTauriAudioAlignmentRequest[] = [];
+      const startJob = invoker.startJob;
+      invoker.startJob = vi.fn(
+        (sessionId: string, request: NormalizedTauriAudioAlignmentRequest) => {
+          received.push(request);
+          return startJob(sessionId, request);
+        }
+      );
+      const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+        spectralBackend,
+        benchmarkInvoker: invoker,
+        preflightOptions: { probe: createProbe(manifest) },
+        wait: () => Promise.resolve(),
+        now: createClock()
+      });
+      const measuredCase = journal.trials.find((trial) => trial.kind === "run")?.run.cases[0];
+      return { journal, received, measuredCase };
+    };
+
+    const cuda = await collectPolicy("cuda");
+    const cpu = await collectPolicy("cpu");
+
+    expect(cuda.journal.plan.parameters.spectralBackend).toBe("cuda");
+    expect(cpu.journal.plan.parameters.spectralBackend).toBe("cpu");
+    expect(cuda.journal.planDigest).not.toBe(cpu.journal.planDigest);
+    expect(cuda.measuredCase?.requestParametersDigest).not.toBe(
+      cpu.measuredCase?.requestParametersDigest
+    );
+    expect(cuda.received).toHaveLength(4);
+    expect(cpu.received).toHaveLength(4);
+    expect(cuda.received.every((request) => request.spectralBackend === "cuda")).toBe(true);
+    expect(cpu.received.every((request) => request.spectralBackend === "cpu")).toBe(true);
+    expect(
+      createC137PerformanceRawEvidenceFromJournal(cuda.journal).plan.parameters.spectralBackend
+    ).toBe("cuda");
+    expect(
+      createC137PerformanceRawEvidenceFromJournal(cpu.journal).plan.parameters.spectralBackend
+    ).toBe("cpu");
+  });
+
+  it("显式未知性能声谱策略会在取得原生 lease 前拒绝", async () => {
+    const manifest = createManifest(false);
+    const plan = createEngineeringRealMediaPerformancePlan(
+      manifest,
+      "performance-plan-policy-invalid"
+    );
+    const invoker = createSuccessfulInvoker(manifest, []);
+    const invalidBackend = "metal" as unknown as "auto";
+
+    await expect(
+      collectRealMediaPerformanceEvidence(manifest, plan, {
+        spectralBackend: invalidBackend,
+        benchmarkInvoker: invoker
+      })
+    ).rejects.toThrow("声谱计算策略仅支持 auto、cuda 或 cpu");
+    expect(invoker.begin).not.toHaveBeenCalled();
+    expect(() =>
+      createEngineeringRealMediaPerformancePlan(
+        manifest,
+        "performance-plan-policy-invalid-create",
+        invalidBackend
+      )
+    ).toThrow("声谱计算策略仅支持 auto、cuda 或 cpu");
+  });
+
+  it.each([
+    ["blocked:cuda-fft-unavailable", "CUDA/cuFFT 能力不可用", "检测 4090 / CUDA"],
+    ["blocked:cuda-fft-runtime", "CUDA/cuFFT 执行失败", "强制 CPU"]
+  ] as const)(
+    "性能任务启动失败时只披露已知安全码 %s 的固定建议",
+    async (nativeCode, expectedReason, expectedRemediation) => {
+      const manifest = createManifest(false);
+      const plan = createEngineeringRealMediaPerformancePlan(
+        manifest,
+        "performance-plan-safe-failure",
+        "cuda"
+      );
+      const invoker = createSuccessfulInvoker(manifest, []);
+      const privateDetail = "C:\\private-performance\\driver.log stdout=SECRET";
+      invoker.startJob = vi.fn(() =>
+        Promise.reject(new Error(`${nativeCode}：${privateDetail}`))
+      );
+
+      const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+        spectralBackend: "cuda",
+        benchmarkInvoker: invoker,
+        preflightOptions: { probe: createProbe(manifest) },
+        wait: () => Promise.resolve(),
+        now: createClock()
+      });
+
+      expect(journal.status).toBe("failed");
+      expect(journal.failure).toMatchObject({ code: nativeCode });
+      expect(journal.failure?.message).toContain(expectedReason);
+      expect(journal.failure?.message).toContain(expectedRemediation);
+      expect(journal.issueCodes).toContain(nativeCode);
+      const raw = createC137PerformanceRawEvidenceFromJournal(journal);
+      const serialized = serializeC137PerformanceEvidence(raw);
+      expect(serialized).toContain(nativeCode);
+      expect(serialized).not.toContain(privateDetail);
+      expect(serialized).not.toContain("SECRET");
+    }
+  );
+
+  it("性能任务对未知伪 CUDA 码保持通用脱敏，不复述原始输出", async () => {
+    const manifest = createManifest(false);
+    const plan = createEngineeringRealMediaPerformancePlan(
+      manifest,
+      "performance-plan-unknown-failure",
+      "cuda"
+    );
+    const invoker = createSuccessfulInvoker(manifest, []);
+    invoker.startJob = vi.fn(() =>
+      Promise.reject(
+        new Error("blocked:cuda-fft-private-extension：C:\\private\\driver.log SECRET")
+      )
+    );
+
+    const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
+      spectralBackend: "cuda",
+      benchmarkInvoker: invoker,
+      preflightOptions: { probe: createProbe(manifest) },
+      wait: () => Promise.resolve(),
+      now: createClock()
+    });
+
+    expect(journal.status).toBe("failed");
+    expect(journal.failure).toBeNull();
+    expect(journal.issueCodes).toContain("trial-failed");
+    expect(JSON.stringify(journal)).not.toContain("SECRET");
+  });
+
   it("原生 workload receipt 与冻结 manifest 不匹配时 fail closed、跳过 preflight 并仍 finish", async () => {
     const manifest = createManifest(false);
     const plan = createEngineeringRealMediaPerformancePlan(

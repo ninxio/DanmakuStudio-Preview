@@ -259,6 +259,56 @@ export function computeMediaTimeMapCoreDigest(map: MediaTimeMap): string {
 }
 
 /**
+ * 对两张时间图的映射语义生成稳定摘要。
+ *
+ * 该摘要只用于校验 proposal.timeMap → candidate map 的完整确定性派生。它忽略
+ * map/revision/state/verification/时间戳等生命周期字段，以及仅用于数组寻址的 span id；
+ * 其余媒体、流、内容身份、完整 spans、图级质量、证据和引擎 provenance 均参与摘要。
+ * candidate → confirmed 的签发/撤销生命周期另用下方 immutable lineage 摘要。
+ */
+export function computeMediaTimeMapSemanticDigest(map: MediaTimeMap): string {
+  return `${TIME_MAP_CORE_DIGEST_PREFIX}:${sha256Hex(
+    createMediaTimeMapSemanticCanonicalJson(map)
+  )}`;
+}
+
+export function areMediaTimeMapsSemanticallyEquivalent(
+  left: MediaTimeMap,
+  right: MediaTimeMap
+): boolean {
+  try {
+    return computeMediaTimeMapSemanticDigest(left) === computeMediaTimeMapSemanticDigest(right);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 候选图复制为确认图后不可变化的映射与 provenance。图级 quality/evidence/verification
+ * 会在明确的人工签发、撤销和重开复核中变化，因此不属于 clone lineage；逐段映射及其
+ * 独立质量/边界证据仍然被完整绑定。
+ */
+export function computeMediaTimeMapImmutableLineageDigest(map: MediaTimeMap): string {
+  return `${TIME_MAP_CORE_DIGEST_PREFIX}:${sha256Hex(
+    createMediaTimeMapImmutableLineageCanonicalJson(map)
+  )}`;
+}
+
+export function areMediaTimeMapImmutableLineagesEquivalent(
+  left: MediaTimeMap,
+  right: MediaTimeMap
+): boolean {
+  try {
+    return (
+      computeMediaTimeMapImmutableLineageDigest(left) ===
+      computeMediaTimeMapImmutableLineageDigest(right)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Returns the exact positional JSON signed by a MediaTimeMap core digest.
  * Native verified export consumes this same value so it can reconstruct spans without trusting
  * a second, independently assembled representation of the map.
@@ -284,6 +334,54 @@ export function createMediaTimeMapCoreCanonicalJson(map: MediaTimeMap): string {
     map.spans.map(canonicalCompleteSpan),
     canonicalQualityMetrics(map.quality),
     canonicalEvidence(map.evidence),
+    map.engineVersion,
+    map.featureVersion,
+    map.parametersHash
+  ]);
+}
+
+function createMediaTimeMapSemanticCanonicalJson(map: MediaTimeMap): string {
+  if (!map.spans.every(isCompleteTimeMapSpanEvidence)) {
+    throw new Error("时间图缺少完整逐段质量、边界或备选路径证据，不能生成语义摘要。");
+  }
+  return JSON.stringify([
+    "media-time-map-semantic-v1",
+    map.sourceMediaId,
+    map.targetMediaId,
+    canonicalStreamIdentity(map.sourceStream),
+    canonicalStreamIdentity(map.targetStream),
+    canonicalContentIdentity(map.sourceIdentity),
+    canonicalContentIdentity(map.targetIdentity),
+    map.sourceStartMs,
+    map.sourceEndMs,
+    map.targetStartMs,
+    map.targetEndMs,
+    map.spans.map((span) => canonicalCompleteSpan(span).slice(1)),
+    canonicalQualityMetrics(map.quality),
+    canonicalEvidence(map.evidence),
+    map.engineVersion,
+    map.featureVersion,
+    map.parametersHash
+  ]);
+}
+
+function createMediaTimeMapImmutableLineageCanonicalJson(map: MediaTimeMap): string {
+  if (!map.spans.every(isCompleteTimeMapSpanEvidence)) {
+    throw new Error("时间图缺少完整逐段质量、边界或备选路径证据，不能生成 lineage 摘要。");
+  }
+  return JSON.stringify([
+    "media-time-map-immutable-lineage-v1",
+    map.sourceMediaId,
+    map.targetMediaId,
+    canonicalStreamIdentity(map.sourceStream),
+    canonicalStreamIdentity(map.targetStream),
+    canonicalContentIdentity(map.sourceIdentity),
+    canonicalContentIdentity(map.targetIdentity),
+    map.sourceStartMs,
+    map.sourceEndMs,
+    map.targetStartMs,
+    map.targetEndMs,
+    map.spans.map((span) => canonicalCompleteSpan(span).slice(1)),
     map.engineVersion,
     map.featureVersion,
     map.parametersHash

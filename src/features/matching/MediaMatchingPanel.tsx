@@ -28,6 +28,7 @@ import {
   TIME_MAP_SPAN_REVIEW_LABELS,
   type TimeMapSpanReviewDecision
 } from "../../domain/alignment/timeMapReviewDecision";
+import type { SpectralBackendPreference } from "../../domain/alignment/spectralBackendPreference";
 import { readTimeMapSpanPlaybackReview } from "../../domain/alignment/timeMapPlaybackReviewEvidence";
 import type { SuspectedCutCandidate } from "../../domain/danmaku/cutHints";
 import { createId } from "../../domain/project/factory";
@@ -239,6 +240,7 @@ export function MediaMatchingPanel({
   );
 
   const pairCount = selectedSourceIds.length * selectedTargetIds.length;
+  const spectralBackendPreference = loadAppSettings().alignment.spectralBackend;
   const pendingCandidates = project.mediaMatchCandidates.filter(
     (candidate) => candidate.state === "pending" || candidate.state === "blocked"
   );
@@ -370,6 +372,7 @@ export function MediaMatchingPanel({
           targetMediaId: pair.target.id
         })),
         ffmpegPath: settings.ffmpegPath.trim() || null,
+        spectralBackend: settings.spectralBackend,
         windowMs: settings.windowMs,
         minGapMs: settings.minGapMs,
         matchThreshold: settings.matchThreshold,
@@ -729,6 +732,9 @@ export function MediaMatchingPanel({
         <span className="mr-auto text-slate-400">
           将分析 {selectedSourceIds.length} 个参考 × {selectedTargetIds.length} 个原片，共{" "}
           {pairCount} 组；所选组合会合并为一个批次并按顺序检查，界面不会逐组重复启动任务。
+          <span className="mt-1 block text-[11px] text-slate-500" data-testid="spectral-backend-policy">
+            {describeSpectralBackendPolicy(spectralBackendPreference)}
+          </span>
         </span>
         {running ? (
           <TextButton tone="danger" onClick={() => void cancelBatch()}>
@@ -778,6 +784,16 @@ export function MediaMatchingPanel({
       <ConfirmedRelations project={project} />
     </section>
   );
+}
+
+function describeSpectralBackendPolicy(value: SpectralBackendPreference): string {
+  if (value === "cuda") {
+    return "计算策略：强制 GPU；CUDA/cuFFT 不可用或执行失败时停止本次匹配，不回退 CPU。";
+  }
+  if (value === "cpu") {
+    return "计算策略：强制 CPU；本次匹配完全禁用 CUDA。";
+  }
+  return "计算策略：自动推荐；CUDA 可用时加速声谱 FFT，失败时改用 CPU。";
 }
 
 function batchTaskPatchFromPairSnapshot(

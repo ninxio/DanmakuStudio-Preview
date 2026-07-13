@@ -1,3 +1,8 @@
+import {
+  isSpectralBackendPreference,
+  type SpectralBackendPreference
+} from "../../domain/alignment/spectralBackendPreference";
+
 export interface AppSettings {
   export: {
     defaultDirectory: string;
@@ -13,6 +18,7 @@ export interface AppSettings {
   };
   alignment: {
     ffmpegPath: string;
+    spectralBackend: SpectralBackendPreference;
     windowMs: number;
     minGapMs: number;
     matchThreshold: number;
@@ -45,6 +51,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   },
   alignment: {
     ffmpegPath: "",
+    spectralBackend: "auto",
     windowMs: 1000,
     minGapMs: 3000,
     matchThreshold: 0.35
@@ -85,7 +92,12 @@ export function cloneAppSettings(settings: AppSettings): AppSettings {
 
 export function parseAppSettingsText(text: string): AppSettings {
   try {
-    return parseAppSettingsTextStrict(text);
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed)) {
+      return cloneAppSettings(DEFAULT_APP_SETTINGS);
+    }
+    validateAppSettingsVersion(parsed);
+    return normalizeAppSettings(parsed);
   } catch {
     return cloneAppSettings(DEFAULT_APP_SETTINGS);
   }
@@ -97,6 +109,7 @@ export function parseAppSettingsTextStrict(text: string): AppSettings {
     throw new Error("设置备份必须是 JSON 对象。");
   }
   validateAppSettingsVersion(parsed);
+  validateExplicitSpectralBackendPreference(parsed);
   return normalizeAppSettings(parsed);
 }
 
@@ -130,6 +143,7 @@ export function normalizeAppSettings(value: unknown): AppSettings {
     },
     alignment: {
       ffmpegPath: readString(alignment.ffmpegPath, DEFAULT_APP_SETTINGS.alignment.ffmpegPath),
+      spectralBackend: readSpectralBackendPreference(alignment.spectralBackend),
       windowMs: readPositiveInteger(alignment.windowMs, DEFAULT_APP_SETTINGS.alignment.windowMs),
       minGapMs: readNonNegativeInteger(alignment.minGapMs, DEFAULT_APP_SETTINGS.alignment.minGapMs),
       matchThreshold: readPositiveNumber(alignment.matchThreshold, DEFAULT_APP_SETTINGS.alignment.matchThreshold)
@@ -166,6 +180,15 @@ function validateAppSettingsVersion(value: Record<string, unknown>): void {
   }
 }
 
+function validateExplicitSpectralBackendPreference(value: Record<string, unknown>): void {
+  if (!isRecord(value.alignment) || !("spectralBackend" in value.alignment)) {
+    return;
+  }
+  if (!isSpectralBackendPreference(value.alignment.spectralBackend)) {
+    throw new Error("声谱计算策略 spectralBackend 仅支持 auto、cuda 或 cpu。");
+  }
+}
+
 function readString(value: unknown, fallback: string): string {
   return typeof value === "string" ? value.trim() : fallback;
 }
@@ -174,6 +197,12 @@ function readPreviewBackendPreference(value: unknown): PreviewBackendPreference 
   return value === "auto" || value === "htmlVideo" || value === "nativeMpv"
     ? value
     : DEFAULT_APP_SETTINGS.player.preferredBackend;
+}
+
+function readSpectralBackendPreference(value: unknown): SpectralBackendPreference {
+  return isSpectralBackendPreference(value)
+    ? value
+    : DEFAULT_APP_SETTINGS.alignment.spectralBackend;
 }
 
 function normalizePathPrefix(value: string): string {

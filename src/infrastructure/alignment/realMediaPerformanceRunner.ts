@@ -1,7 +1,9 @@
-import type {
-  AudioAlignmentStageKey,
-  TauriAudioAlignmentRequest
+import {
+  normalizeTauriSpectralBackendPreference,
+  type AudioAlignmentStageKey,
+  type TauriAudioAlignmentRequest
 } from "./tauriAudioAlignment";
+import type { SpectralBackendPreference } from "../../domain/alignment/spectralBackendPreference";
 import {
   computeC137CanonicalDigest,
   type C137Digest
@@ -26,6 +28,10 @@ import {
   type C137PerformanceTrialV2
 } from "../../domain/alignment/c137PerformanceEvidence";
 import type { RealMediaBenchmarkManifest } from "../../domain/alignment/realMediaBenchmark";
+import {
+  discloseKnownAlignmentFailure,
+  type SafeAlignmentFailureDisclosure
+} from "./safeAlignmentFailureDisclosure";
 import {
   createRealMediaBenchmarkAlignmentRequest,
   createRealMediaBenchmarkRunManifestDigest,
@@ -74,6 +80,7 @@ export interface RealMediaPerformancePlanTrial {
 }
 
 export interface RealMediaPerformanceAlgorithmParameters {
+  spectralBackend: SpectralBackendPreference;
   sampleRate: number | null;
   windowMs: number | null;
   matchThreshold: number | null;
@@ -200,12 +207,14 @@ export interface RealMediaPerformanceCollectionJournal {
   cacheResets: AlignmentBenchmarkCacheResetReceipt[];
   trials: RealMediaPerformanceTrialEvidence[];
   terminalSessionStatus: AlignmentBenchmarkSessionSnapshot["status"] | null;
+  failure: SafeAlignmentFailureDisclosure | null;
   issueCodes: string[];
 }
 
 export interface RealMediaPerformanceRunnerOptions {
   ffmpegPath?: string | null;
   ffprobePath?: string | null;
+  spectralBackend?: SpectralBackendPreference;
   signal?: AbortSignal;
   preflightOptions?: Omit<
     RealMediaBenchmarkPreflightOptions,
@@ -326,7 +335,8 @@ export function createC137PerformanceRawEvidenceFromJournal(
 
 export function createEngineeringRealMediaPerformancePlan(
   manifest: RealMediaBenchmarkManifest,
-  planId: string
+  planId: string,
+  spectralBackend: SpectralBackendPreference = "auto"
 ): RealMediaPerformanceExecutionPlan {
   assertPerformanceWorkloadCaseLimit(manifest);
   const normalizedPlanId = requireOpaqueId(planId, "planId");
@@ -361,6 +371,7 @@ export function createEngineeringRealMediaPerformancePlan(
     maximumMemorySampleGapMs: 60,
     outputCanonicalization: "c137-time-map-output-digest-v1",
     parameters: {
+      spectralBackend: normalizeTauriSpectralBackendPreference(spectralBackend),
       sampleRate: null,
       windowMs: null,
       matchThreshold: null,
@@ -385,6 +396,9 @@ export async function collectRealMediaPerformanceEvidence(
   if (planIssues.length > 0) {
     throw new Error(`C137 性能运行计划无效：${planIssues.join("；")}`);
   }
+  if (planSnapshot.parameters.spectralBackend !== executionOptions.spectralBackend) {
+    throw new Error("C137 性能运行计划的声谱计算策略与采集请求不一致。");
+  }
   const runManifest = deepFreeze(projectRealMediaBenchmarkRunManifest(manifestSnapshot));
   const journal: RealMediaPerformanceCollectionJournal = {
     collectorVersion: REAL_MEDIA_PERFORMANCE_COLLECTOR_VERSION,
@@ -405,6 +419,7 @@ export async function collectRealMediaPerformanceEvidence(
     cacheResets: [],
     trials: [],
     terminalSessionStatus: null,
+    failure: null,
     issueCodes: []
   };
   if (manifestSnapshot.isExample || runManifest.cases.length === 0) {
@@ -598,13 +613,18 @@ export async function collectRealMediaPerformanceEvidence(
     ) {
       journal.status = "completed";
     }
-  } catch {
+  } catch (error: unknown) {
+    const disclosure = discloseKnownAlignmentFailure(error);
+    if (disclosure) {
+      journal.failure = disclosure;
+    }
     journal.status = executionOptions.signal?.aborted ? "cancelled" : "failed";
     journal.issueCodes.push(
-      activeJobRef.current &&
+      disclosure?.code ??
+      (activeJobRef.current &&
         !isAlignmentBenchmarkJobFinished(activeJobRef.current.status)
         ? "native-terminal-unknown"
-        : "collector-exception"
+        : "collector-exception")
     );
   } finally {
     if (session) {
@@ -701,6 +721,10 @@ async function executeMeasuredRun(
       );
     }
     const status = normalizeTerminalStatus(snapshot.status);
+    const terminalDisclosure = discloseKnownAlignmentFailure(snapshot.errorCode);
+    if (terminalDisclosure) {
+      throw new Error(terminalDisclosure.code);
+    }
     let timeMapParametersHash: string | null = null;
     let timeMapDigest: C137Digest | null = null;
     let outputDigest: C137Digest | null = null;
@@ -773,7 +797,9 @@ async function executeCancellationTrial(
       options.benchmarkInvoker
     );
     onActiveJob(snapshot);
-  } catch {
+  } catch (error: unknown) {
+    const disclosure = discloseKnownAlignmentFailure(error);
+    if (disclosure) throw new Error(disclosure.code);
     return null;
   }
   const watchdogStartedAt = now();
@@ -866,7 +892,9 @@ async function executeJobToTerminal(
       options.benchmarkInvoker
     );
     onActiveJob(snapshot);
-  } catch {
+  } catch (error: unknown) {
+    const disclosure = discloseKnownAlignmentFailure(error);
+    if (disclosure) throw new Error(disclosure.code);
     return { snapshot: null, state: "start-failed", userCancelled: false };
   }
   const watchdogStartedAt = now();
@@ -1088,6 +1116,13 @@ function validateExecutionPlan(
   if (plan.outputCanonicalization !== "c137-time-map-output-digest-v1") {
     issues.push("outputCanonicalization 不受支持");
   }
+  if (
+    plan.parameters.spectralBackend !== "auto" &&
+    plan.parameters.spectralBackend !== "cuda" &&
+    plan.parameters.spectralBackend !== "cpu"
+  ) {
+    issues.push("parameters.spectralBackend 仅支持 auto、cuda 或 cpu");
+  }
   if (plan.trialOrder.length === 0 || plan.trialOrder.length > 64) {
     issues.push("trialOrder 数量必须为 1–64");
   }
@@ -1172,6 +1207,7 @@ function createProductionRunnerOptions(
   return {
     ffmpegPath: options.ffmpegPath,
     ffprobePath: options.ffprobePath,
+    spectralBackend: options.spectralBackend,
     sampleRate: plan.parameters.sampleRate ?? undefined,
     windowMs: plan.parameters.windowMs ?? undefined,
     matchThreshold: plan.parameters.matchThreshold ?? undefined,
@@ -1196,6 +1232,7 @@ function createPerformanceRequestParametersDigest(
     sourceAudioStreamIndex: request.sourceAudioStreamIndex ?? null,
     completeVideoStreamIndex: request.completeVideoStreamIndex ?? null,
     sourceVideoStreamIndex: request.sourceVideoStreamIndex ?? null,
+    spectralBackend: normalizeTauriSpectralBackendPreference(request.spectralBackend),
     sampleRate: request.sampleRate ?? null,
     windowMs: request.windowMs ?? null,
     matchThreshold: request.matchThreshold ?? null,
@@ -1331,6 +1368,7 @@ function createExecutionOptionsSnapshot(
   return Object.freeze({
     ffmpegPath: options.ffmpegPath,
     ffprobePath: options.ffprobePath,
+    spectralBackend: normalizeTauriSpectralBackendPreference(options.spectralBackend),
     signal: options.signal,
     preflightOptions,
     benchmarkInvoker,

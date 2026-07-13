@@ -39,7 +39,8 @@ pub const STREAMING_CPU_SPECTRAL_BACKEND_ID: &str = "cpu-streaming-radix2-f64-r2
 pub const STREAMING_HYBRID_SPECTRAL_BACKEND_ID: &str =
     "cuda-cufft-r2c-512+cpu-streaming-radix2-f64-v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SpectralBackendPreference {
     Auto,
     Cpu,
@@ -105,7 +106,7 @@ fn spectral_backend_preference_from_environment() -> Result<SpectralBackendPrefe
     }
 }
 
-fn resolve_spectral_backend_preference(
+pub fn resolve_spectral_backend_preference(
     preference: SpectralBackendPreference,
 ) -> Result<SpectralBackendRequest, String> {
     match preference {
@@ -2046,7 +2047,13 @@ impl Default for FineFeatureConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FineFeatureFrame {
+    /// Coordinate used by the edit lattice. Ordinary frames keep this equal to
+    /// `presentation_time_ms`; a coarse-affine warped search sequence uses the shared
+    /// content-time coordinate here.
     pub time_ms: i64,
+    /// Original media presentation coordinate. Traceback and TimeMap spans must always use
+    /// this value so a warped lattice cannot erase real speed drift.
+    pub presentation_time_ms: i64,
     pub values: Vec<f32>,
 }
 
@@ -2287,9 +2294,11 @@ fn create_fine_feature_frame(
             *value = (f64::from(*value) / norm) as f32;
         }
     }
+    let presentation_time_ms = config.presentation_offset_ms
+        + samples_to_milliseconds(start + window_samples / 2, config.sample_rate);
     FineFeatureFrame {
-        time_ms: config.presentation_offset_ms
-            + samples_to_milliseconds(start + window_samples / 2, config.sample_rate),
+        time_ms: presentation_time_ms,
+        presentation_time_ms,
         values,
     }
 }
@@ -3982,6 +3991,7 @@ fn validate_feature_sequences(
 ) -> Result<(), String> {
     for (label, frames) in [("来源", source), ("目标", target)] {
         let mut previous_time = None;
+        let mut previous_presentation_time = None;
         for frame in frames {
             if frame.values.is_empty() || frame.values.iter().any(|value| !value.is_finite()) {
                 return Err(format!("{label}细粒度特征为空或包含非有限值。"));
@@ -3989,7 +3999,15 @@ fn validate_feature_sequences(
             if previous_time.is_some_and(|previous| frame.time_ms <= previous) {
                 return Err(format!("{label}细粒度特征时间戳不是严格递增。"));
             }
+            if previous_presentation_time
+                .is_some_and(|previous| frame.presentation_time_ms <= previous)
+            {
+                return Err(format!(
+                    "{label}细粒度特征 presentation 时间戳不是严格递增。"
+                ));
+            }
             previous_time = Some(frame.time_ms);
+            previous_presentation_time = Some(frame.presentation_time_ms);
         }
     }
     if let (Some(source_width), Some(target_width)) = (
@@ -4228,18 +4246,21 @@ fn create_frame_boundaries(frames: &[FineFeatureFrame]) -> Result<Vec<i64>, Stri
     let hop_ms = if frames.len() >= 2 {
         let mut differences = frames
             .windows(2)
-            .map(|window| window[1].time_ms - window[0].time_ms)
+            .map(|window| window[1].presentation_time_ms - window[0].presentation_time_ms)
             .collect::<Vec<_>>();
         differences.sort_unstable();
         differences[differences.len() / 2]
     } else {
         1
     };
-    let mut boundaries = frames.iter().map(|frame| frame.time_ms).collect::<Vec<_>>();
+    let mut boundaries = frames
+        .iter()
+        .map(|frame| frame.presentation_time_ms)
+        .collect::<Vec<_>>();
     boundaries.push(
         frames
             .last()
-            .and_then(|frame| frame.time_ms.checked_add(hop_ms))
+            .and_then(|frame| frame.presentation_time_ms.checked_add(hop_ms))
             .ok_or_else(|| "特征尾边界毫秒溢出。".to_string())?,
     );
     Ok(boundaries)
@@ -6103,28 +6124,34 @@ mod tests {
         let source = vec![
             FineFeatureFrame {
                 time_ms: 0,
+                presentation_time_ms: 0,
                 values: vec![0.25, -0.75, 1.5, 0.0],
             },
             FineFeatureFrame {
                 time_ms: 100,
+                presentation_time_ms: 100,
                 values: vec![0.0, 0.0, 0.0, 0.0],
             },
             FineFeatureFrame {
                 time_ms: 200,
+                presentation_time_ms: 200,
                 values: vec![3.5, -2.25, 0.125, 0.5],
             },
         ];
         let target = vec![
             FineFeatureFrame {
                 time_ms: 0,
+                presentation_time_ms: 0,
                 values: vec![0.5, -1.25, 0.75, 0.25],
             },
             FineFeatureFrame {
                 time_ms: 100,
+                presentation_time_ms: 100,
                 values: vec![0.0, 0.0, 0.0, 0.0],
             },
             FineFeatureFrame {
                 time_ms: 200,
+                presentation_time_ms: 200,
                 values: vec![2.0, -1.0, 0.375, -0.75],
             },
         ];
@@ -6457,8 +6484,10 @@ mod tests {
             .map(|(index, label)| {
                 let mut values = vec![0.0; 8];
                 values[*label] = 1.0;
+                let presentation_time_ms = start_ms + index as i64 * hop_ms;
                 FineFeatureFrame {
-                    time_ms: start_ms + index as i64 * hop_ms,
+                    time_ms: presentation_time_ms,
+                    presentation_time_ms,
                     values,
                 }
             })

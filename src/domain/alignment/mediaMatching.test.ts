@@ -494,6 +494,80 @@ describe("media matching candidates", () => {
     expect(acceptedAgain.cutMarkers).toEqual(project.cutMarkers);
   });
 
+  it("同范围但 spans 异构的候选图不能绕过 proposal.timeMap 语义绑定", () => {
+    let project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    proposal.timeMap = createVerifiedTimeMapProposal();
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-semantic-mismatch",
+      batchId: "batch-v2",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      proposal
+    });
+    project = upsertMediaMatchCandidate(project, candidate, TIMESTAMP);
+    const candidateMap = project.mediaTimeMaps.find((map) => map.id === candidate.timeMapId);
+    if (!candidateMap) {
+      throw new Error("测试候选图不存在。");
+    }
+    const corruptedSpans = structuredClone(candidateMap.spans);
+    corruptedSpans[0] = { ...corruptedSpans[0], targetEndMs: 62_000 };
+    corruptedSpans[1] = { ...corruptedSpans[1], targetStartMs: 62_000 };
+    const corrupted = {
+      ...project,
+      mediaTimeMaps: project.mediaTimeMaps.map((map) =>
+        map.id === candidateMap.id ? { ...map, spans: corruptedSpans } : map
+      )
+    };
+
+    expect(validateProjectSchema(corrupted).ok).toBe(false);
+    expect(() =>
+      acceptMediaMatchCandidate(corrupted, candidate.id, ["asset-1"], TIMESTAMP)
+    ).toThrow("与候选提案的映射语义不一致");
+  });
+
+  it("已确认 clone 的映射语义被篡改后，重复接受和 schema 都 fail-closed", () => {
+    let project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    proposal.timeMap = createVerifiedTimeMapProposal();
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-confirmed-tamper",
+      batchId: "batch-v2",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      proposal
+    });
+    project = upsertMediaMatchCandidate(project, candidate, TIMESTAMP);
+    const accepted = acceptMediaMatchCandidate(project, candidate.id, ["asset-1"], TIMESTAMP);
+    const confirmedMap = accepted.mediaTimeMaps.find((map) => map.state === "confirmed");
+    if (!confirmedMap) {
+      throw new Error("测试确认图不存在。");
+    }
+    const corrupted = {
+      ...accepted,
+      mediaTimeMaps: accepted.mediaTimeMaps.map((map) =>
+        map.id === confirmedMap.id
+          ? { ...map, engineVersion: `${map.engineVersion}:tampered` }
+          : map
+      )
+    };
+
+    expect(validateProjectSchema(corrupted).ok).toBe(false);
+    expect(() =>
+      acceptMediaMatchCandidate(corrupted, candidate.id, ["asset-1"], TIMESTAMP)
+    ).toThrow("确认时间图与候选时间图的映射语义不一致");
+  });
+
   it("撤销确认会删除候选生成的来源段并恢复待复核，且可重新接受", () => {
     const project = withCandidate(
       createMatchingProject(),
@@ -644,7 +718,8 @@ describe("media matching candidates", () => {
     });
     expect(withoutTarget.mediaMatchCandidates).toEqual([]);
     expect(validateProjectSchema(withoutSegment).ok).toBe(true);
-    expect(validateProjectSchema(withoutAsset).ok).toBe(true);
+    // 清理引用不会静默删除用户来源段；失去 accepted owner 的旧段由 schema fail-closed。
+    expect(validateProjectSchema(withoutAsset).ok).toBe(false);
     expect(validateProjectSchema(withoutTarget).ok).toBe(false);
   });
 

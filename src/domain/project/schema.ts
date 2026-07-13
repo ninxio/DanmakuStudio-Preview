@@ -17,9 +17,11 @@ import {
   type TimeMapSpan
 } from "../alignment/timeMap";
 import {
+  areMediaTimeMapImmutableLineagesEquivalent,
   createLegacyMediaTimeMap as createLegacyMediaTimeMapRecord,
   reconcileMediaTimeMapQuality
 } from "../alignment/mediaTimeMap";
+import { doesCandidateTimeMapMatchProposal } from "../alignment/mediaMatching";
 import {
   isAlignmentTimeMapProposal,
   reconcileAlignmentTimeMapProposalQuality
@@ -151,7 +153,13 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
   if (!value.syncAnchors.every(isSyncAnchor)) {
     return { ok: false, version, message: "项目文件中的同步锚点结构不完整。" };
   }
-  if (version >= 10 && !hasValidTimeMapReferences(value as unknown as EditorProject)) {
+  if (
+    version >= 10 &&
+    !hasValidTimeMapReferences(
+      value as unknown as EditorProject,
+      version === CURRENT_SCHEMA_VERSION
+    )
+  ) {
     return { ok: false, version, message: "项目文件中的时间映射引用或范围不一致。" };
   }
   return { ok: true, version, message: "项目文件可打开。" };
@@ -291,7 +299,8 @@ function migrateProjectToCurrentSchema(
           migratedSegments,
           legacyCandidates,
           project.mediaTimeMaps ?? [],
-          parsedVersion
+          parsedVersion,
+          normalizeMigrationTimestamp(project.updatedAt, project.createdAt)
         )
       : migrateLegacyProjectTimeMaps(
           migratedSegments,
@@ -445,9 +454,10 @@ function migrateExistingProjectTimeMaps(
   segments: LegacyDanmakuSourceSegment[],
   candidates: LegacyMediaMatchCandidate[],
   maps: LegacyMediaTimeMap[],
-  parsedVersion: number
+  parsedVersion: number,
+  timestamp: string
 ): LegacyProjectTimeMapMigrationResult {
-  return {
+  return ensureMigratedConfirmedMapOwners({
     segments: segments.map((segment) => ({ ...segment, timeMapId: segment.timeMapId ?? null })),
     candidates: candidates.map((candidate) => ({
       ...candidate,
@@ -468,7 +478,7 @@ function migrateExistingProjectTimeMaps(
         }
       };
     })
-  };
+  }, timestamp);
 }
 
 const V12_SPAN_EVIDENCE_MIGRATION_REASON =
@@ -729,7 +739,93 @@ function migrateLegacyProjectTimeMaps(
     };
   });
 
-  return { segments, candidates, mediaTimeMaps };
+  return ensureMigratedConfirmedMapOwners({ segments, candidates, mediaTimeMaps }, timestamp);
+}
+
+/**
+ * v1-v8 没有媒体匹配候选，v9 也可能保存了与候选规则不一致的独立来源段；v10-v12
+ * 仍允许 ownerless confirmed route。迁移到当前模型时为这些 legacy 路由补稳定 owner，
+ * 但当前版本导入不会调用此修复，仍会对伪造 ownerless route fail-closed。
+ */
+function ensureMigratedConfirmedMapOwners(
+  migrated: LegacyProjectTimeMapMigrationResult,
+  timestamp: string
+): LegacyProjectTimeMapMigrationResult {
+  const mediaTimeMaps = [...migrated.mediaTimeMaps];
+  const candidates = [...migrated.candidates];
+  const ownedSegmentIds = new Set(
+    candidates.flatMap((candidate) =>
+      candidate.state === "accepted" && candidate.confirmedTimeMapId !== null
+        ? candidate.appliedSegmentIds
+        : []
+    )
+  );
+
+  migrated.segments.forEach((segment, segmentIndex) => {
+    if (
+      segment.kind !== "content" ||
+      segment.timeMapId === null ||
+      ownedSegmentIds.has(segment.id) ||
+      !segment.sourceMediaId ||
+      !segment.targetMediaId
+    ) {
+      return;
+    }
+    const confirmedMap = mediaTimeMaps.find((map) => map.id === segment.timeMapId);
+    if (!confirmedMap || confirmedMap.state !== "confirmed") {
+      return;
+    }
+    const candidateId = createMigratedMediaId(
+      `migrated_v10_segment_owner_${segmentIndex + 1}`,
+      segment.id
+    );
+    const candidateMapId = createMigratedTimeMapId(
+      "candidate-segment-owner",
+      segmentIndex,
+      segment.id
+    );
+    mediaTimeMaps.push({
+      ...structuredClone(confirmedMap),
+      id: candidateMapId,
+      verification: null,
+      state: "candidate",
+      confirmedAt: null
+    });
+    candidates.push({
+      id: candidateId,
+      batchId: "migration-v10-segment-owners",
+      sourceMediaId: segment.sourceMediaId,
+      targetMediaId: segment.targetMediaId,
+      sourceStartMs: segment.sourceStartMs,
+      sourceEndMs: segment.sourceEndMs,
+      targetStartMs: segment.targetStartMs ?? 0,
+      targetEndMs: confirmedMap.targetEndMs,
+      timingRules: structuredClone(segment.timingRules),
+      confidence: 0,
+      proposal: {
+        anchors: [],
+        cutCandidates: [],
+        confidence: 0,
+        diagnostics: ["旧项目独立来源段已迁移为显式 legacy-unverified 所有权。"],
+        matchRange: {
+          sourceStartMs: segment.sourceStartMs,
+          sourceEndMs: segment.sourceEndMs,
+          targetStartMs: segment.targetStartMs ?? 0,
+          targetEndMs: confirmedMap.targetEndMs,
+          coverage: 0
+        }
+      },
+      timeMapId: candidateMapId,
+      confirmedTimeMapId: confirmedMap.id,
+      state: "accepted",
+      appliedSegmentIds: [segment.id],
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    ownedSegmentIds.add(segment.id);
+  });
+
+  return { ...migrated, candidates, mediaTimeMaps };
 }
 
 function createLegacyMediaTimeMap(draft: LegacyTimeMapDraft): MediaTimeMap {
@@ -1498,7 +1594,10 @@ function isMediaTimeMapTrackAlternative(value: unknown, requireV12Fields: boolea
   );
 }
 
-function hasValidTimeMapReferences(project: EditorProject): boolean {
+function hasValidTimeMapReferences(
+  project: EditorProject,
+  requireCurrentLineage = true
+): boolean {
   if (
     !hasUniqueIds(project.mediaLibrary) ||
     !hasUniqueIds(project.mediaTimeMaps) ||
@@ -1549,7 +1648,8 @@ function hasValidTimeMapReferences(project: EditorProject): boolean {
     const candidateMap = mapsById.get(candidate.timeMapId);
     if (
       candidateMap?.state !== "candidate" ||
-      !doesCandidateRangeMatchMap(candidate, candidateMap)
+      !doesCandidateRangeMatchMap(candidate, candidateMap) ||
+      (requireCurrentLineage && !doesCandidateTimeMapMatchProposal(candidateMap, candidate))
     ) {
       return false;
     }
@@ -1565,7 +1665,9 @@ function hasValidTimeMapReferences(project: EditorProject): boolean {
     const confirmedMap = mapsById.get(candidate.confirmedTimeMapId);
     if (
       confirmedMap?.state !== "confirmed" ||
-      !doesCandidateRangeMatchMap(candidate, confirmedMap)
+      !doesCandidateRangeMatchMap(candidate, confirmedMap) ||
+      (requireCurrentLineage &&
+        !areMediaTimeMapImmutableLineagesEquivalent(candidateMap, confirmedMap))
     ) {
       return false;
     }
@@ -1596,7 +1698,9 @@ function hasValidTimeMapReferences(project: EditorProject): boolean {
       return true;
     }
     const owner = confirmedMapOwners.get(segment.timeMapId);
-    return owner === undefined || owner.appliedSegmentIds.includes(segment.id);
+    return requireCurrentLineage
+      ? owner !== undefined && owner.appliedSegmentIds.includes(segment.id)
+      : owner === undefined || owner.appliedSegmentIds.includes(segment.id);
   });
 }
 

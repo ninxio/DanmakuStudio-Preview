@@ -58,6 +58,10 @@ import {
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import type { MediaAdapter } from "../../infrastructure/media/mediaAdapter";
 import { isManualVerificationAuthorityAvailable } from "../../infrastructure/media/manualVerificationAuthority";
+import {
+  DEFAULT_APP_SETTINGS,
+  saveAppSettings
+} from "../../infrastructure/settings/appSettings";
 import { useEditorStore } from "../../stores/editorStore";
 import { MediaMatchingPanel } from "./MediaMatchingPanel";
 import type { TimeMapPlaybackAdapterFactory } from "./TimeMapPlaybackReview";
@@ -134,6 +138,7 @@ function installLegacyPairwiseBatchAdapter(): void {
           completePath: target.path,
           ffmpegPath: request.ffmpegPath,
           ffprobePath: request.ffprobePath,
+          spectralBackend: request.spectralBackend,
           windowMs: request.windowMs,
           minGapMs: request.minGapMs,
           matchThreshold: request.matchThreshold,
@@ -654,6 +659,7 @@ describe("多媒体自动匹配工作台", () => {
     );
   });
   beforeEach(() => {
+    window.localStorage.clear();
     testFineBatchOptions = null;
     const project = createMatchingProject();
     useEditorStore.setState({
@@ -699,6 +705,9 @@ describe("多媒体自动匹配工作台", () => {
     render(<MatchingHarness />);
 
     await waitFor(() => expect(screen.getByText(/共 2 组/)).toBeInTheDocument());
+    expect(screen.getByTestId("spectral-backend-policy")).toHaveTextContent(
+      "计算策略：自动推荐"
+    );
     expect(screen.queryByLabelText("完整版输入")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "选择当前视频" })).not.toBeInTheDocument();
 
@@ -719,6 +728,7 @@ describe("多媒体自动匹配工作台", () => {
           { sourceMediaId: "source-long", targetMediaId: "target-ep1" },
           { sourceMediaId: "source-long", targetMediaId: "target-ep2" }
         ],
+        spectralBackend: "auto",
         localizationMode: true
       })
     );
@@ -768,6 +778,27 @@ describe("多媒体自动匹配工作台", () => {
         .project.mediaMatchCandidates.map((candidate) => candidate.state)
         .sort()
     ).toEqual(["accepted", "pending"]);
+  });
+
+  it("把持久化的强制 GPU 策略送入整个原生批次并就地说明失败不回退", async () => {
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      alignment: {
+        ...DEFAULT_APP_SETTINGS.alignment,
+        spectralBackend: "cuda"
+      }
+    });
+    render(<MatchingHarness />);
+
+    expect(await screen.findByTestId("spectral-backend-policy")).toHaveTextContent(
+      "CUDA/cuFFT 不可用或执行失败时停止本次匹配，不回退 CPU"
+    );
+    fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+      expect.objectContaining({ spectralBackend: "cuda" })
+    );
   });
 
   it("只启动一个原生批次并用同一 jobId 轮询一对多结果", async () => {

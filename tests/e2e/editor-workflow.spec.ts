@@ -45,6 +45,10 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page.getByLabel("关闭新手引导").click();
 
   await page.getByLabel("设置").click();
+  await page.getByRole("button", { name: "播放器与工具" }).click();
+  await expect(page.getByRole("radio", { name: /自动推荐/ })).toBeChecked();
+  await page.getByRole("radio", { name: /强制 GPU/ }).check();
+  await expect(page.getByText(/不会回退 CPU/)).toBeVisible();
   await page.getByRole("button", { name: "隐私与本地数据" }).click();
   await expect(page.getByRole("dialog")).toContainText("隐私与本地数据");
   await page.screenshot({ path: screenshotPath("settings-privacy.png"), fullPage: true });
@@ -55,6 +59,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await settingsDownload.saveAs(settingsBackupPath);
   const settingsBackupText = readFileSync(settingsBackupPath, "utf8");
   expect(settingsBackupText).toContain("alignment");
+  expect(settingsBackupText).toContain('"spectralBackend":"cuda"');
   expect(settingsBackupText).not.toContain("password");
   expect(settingsBackupText).not.toContain("token");
   const settingsImportPath = resolve(downloadDir, "imported-settings.json");
@@ -69,6 +74,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
       },
       alignment: {
         ffmpegPath: "ffmpeg",
+        spectralBackend: "cpu",
         windowMs: 600,
         minGapMs: 1500,
         matchThreshold: 0.3,
@@ -79,6 +85,8 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   );
   await page.getByTestId("settings-import-input").setInputFiles(settingsImportPath);
   await expect(page.getByTestId("status-bar")).toContainText("已导入设置");
+  await page.getByRole("button", { name: "播放器与工具" }).click();
+  await expect(page.getByRole("radio", { name: /强制 CPU/ })).toBeChecked();
   await page.getByLabel("关闭设置").click();
 
   await page

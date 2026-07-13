@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   clearAppSettings,
-  parseAppSettingsText,
+  parseAppSettingsTextStrict,
   saveAppSettings,
   serializeAppSettings,
   type AppSettings
@@ -29,7 +29,7 @@ export async function hydrateDesktopAppSettings(
   if (!content) {
     return null;
   }
-  const settings = parseAppSettingsText(content);
+  const settings = parseAppSettingsTextStrict(content);
   saveAppSettings(settings);
   return settings;
 }

@@ -27,6 +27,7 @@ import {
   createCompleteC137PerformanceEvidenceV2Fixture
 } from "../../test/c137PerformanceEvidence";
 import { createRealMediaPerformanceWorkloadDigest } from "../../infrastructure/alignment/realMediaPerformanceRunner";
+import { DEFAULT_APP_SETTINGS, saveAppSettings } from "../../infrastructure/settings/appSettings";
 import {
   REAL_MEDIA_BENCHMARK_RUNNER_VERSION,
   createRealMediaBenchmarkRunManifestDigest,
@@ -46,6 +47,7 @@ afterEach(() => {
   restoreObjectUrls?.();
   restoreObjectUrls = null;
   cleanup();
+  window.localStorage.clear();
   vi.restoreAllMocks();
 });
 
@@ -91,6 +93,41 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(screen.queryByLabelText("清单治理摘要")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeDisabled();
     expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("精度与性能入口都从持久设置传递声谱计算策略", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      alignment: {
+        ...DEFAULT_APP_SETTINGS.alignment,
+        spectralBackend: "cuda"
+      }
+    });
+    const runner = vi.fn<RealMediaBenchmarkPanelRunner>((input, options) =>
+      Promise.resolve(createCompletedReport(input, options.spectralBackend ?? "auto"))
+    );
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>((input, options) =>
+      Promise.resolve(bindPerformanceEvidenceToManifest(input, options.spectralBackend ?? "auto"))
+    );
+    render(
+      <RealMediaBenchmarkPanel
+        desktopAvailable
+        runner={runner}
+        performanceRunner={performanceRunner}
+      />
+    );
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+
+    await user.click(screen.getByRole("button", { name: "运行真实媒体精度基准" }));
+    await screen.findByLabelText("C137 真实媒体运行报告");
+    expect(runner.mock.calls[0]?.[1].spectralBackend).toBe("cuda");
+
+    await user.click(screen.getByRole("button", { name: "采集工程性能原始证据" }));
+    await screen.findByLabelText("性能 raw evidence 摘要");
+    expect(performanceRunner.mock.calls[0]?.[1].spectralBackend).toBe("cuda");
   });
 
   it.each([
@@ -609,12 +646,14 @@ function cloneGold(gold: RealMediaBenchmarkGold): RealMediaBenchmarkGold {
 }
 
 function bindPerformanceEvidenceToManifest(
-  manifest: RealMediaBenchmarkManifest
+  manifest: RealMediaBenchmarkManifest,
+  spectralBackend: "auto" | "cuda" | "cpu" = "auto"
 ): C137PerformanceRawEvidenceV2 {
   const evidence = createCompleteC137PerformanceEvidenceV2Fixture();
   const workloadDigest = createRealMediaPerformanceWorkloadDigest(manifest);
   evidence.runManifestDigest = workloadDigest;
   evidence.plan.workloadDigest = workloadDigest;
+  evidence.plan.parameters.spectralBackend = spectralBackend;
   for (const trial of evidence.trials) trial.workloadDigest = workloadDigest;
   evidence.environment.workloadStorage.runManifestDigest = workloadDigest;
   evidence.environment.workloadStorage.workloadDigest = workloadDigest;
@@ -636,7 +675,8 @@ function bindPerformanceEvidenceToManifest(
 }
 
 function createCompletedReport(
-  manifest: RealMediaBenchmarkManifest
+  manifest: RealMediaBenchmarkManifest,
+  spectralBackend: "auto" | "cuda" | "cpu" = "auto"
 ): RealMediaBenchmarkRunReport {
   const benchmarkCase = manifest.cases[0];
   if (!benchmarkCase) throw new Error("完成报告测试缺少 case");
@@ -656,7 +696,7 @@ function createCompletedReport(
   ]);
   return createReport(manifest, {
     status: "completed",
-    cases: [createCaseRunResult(benchmarkCase.id, "success")],
+    cases: [createCaseRunResult(benchmarkCase.id, "success", "run-cancelled", spectralBackend)],
     evaluation,
     reasons: ["全部真实关系完成组件级评估；不代表 release 通过。"]
   });
@@ -733,7 +773,8 @@ function createReport(
 function createCaseRunResult(
   caseId: string,
   status: RealMediaBenchmarkCaseRunResult["status"],
-  failureCode: NonNullable<RealMediaBenchmarkCaseRunResult["failure"]>["code"] = "run-cancelled"
+  failureCode: NonNullable<RealMediaBenchmarkCaseRunResult["failure"]>["code"] = "run-cancelled",
+  spectralBackend: "auto" | "cuda" | "cpu" = "auto"
 ): RealMediaBenchmarkCaseRunResult {
   const success = status === "success";
   return {
@@ -747,6 +788,7 @@ function createCaseRunResult(
     targetVisualStreamIndex: null,
     parameters: {
       localizationMode: true,
+      spectralBackend,
       sampleRate: null,
       windowMs: 1_000,
       matchThreshold: 0.35,

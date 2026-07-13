@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { mapSourceTime } from "../alignment/timeMap";
 import {
+  applyAuthorityRevokedManualMediaTimeMapVerification,
   clearRegisteredManualMediaTimeMapVerificationTrust,
   computeMediaTimeMapCoreDigest
 } from "../alignment/mediaTimeMap";
@@ -689,6 +690,67 @@ describe("project schema", () => {
     });
   });
 
+  it("accepted lineage 允许 confirmed 图完成签发、撤销并保存重开", () => {
+    const confirmedBase = createValidMediaTimeMap({
+      id: "confirmed-map-1",
+      state: "confirmed",
+      confirmedAt: "2026-07-12T00:00:00.000Z"
+    });
+    confirmedBase.quality = {
+      ...confirmedBase.quality,
+      probability: 0.999,
+      p95ResidualMs: 80
+    };
+    confirmedBase.evidence = {
+      ...confirmedBase.evidence,
+      types: ["audio", "visual", "manual"],
+      visualAnchorCount: 12
+    };
+    const signed = applyTestManualMediaTimeMapVerification(confirmedBase, {
+      calibrationArtifactId: "test-accepted-lineage",
+      calibrationArtifactVersion: "1",
+      verifier: "vitest",
+      verifiedAt: "2026-07-12T00:00:00.000Z"
+    });
+    const signedProject = createAcceptedMappedProject(signed);
+
+    expect(validateProjectSchema(signedProject).ok).toBe(true);
+    const reopenedSigned = parseProjectJson(serializeProject(signedProject));
+    expect(validateProjectSchema(reopenedSigned).ok).toBe(true);
+    expect(reopenedSigned.mediaTimeMaps.find((map) => map.id === signed.id)?.verification).toMatchObject({
+      recordVersion: 2,
+      revocation: null
+    });
+
+    const verification = signed.verification;
+    if (!verification || verification.recordVersion !== 2) {
+      throw new Error("测试签发记录不存在。");
+    }
+    const revoked = applyAuthorityRevokedManualMediaTimeMapVerification(
+      signed,
+      {
+        reason: "测试撤销 accepted lineage。",
+        revokedBy: "vitest",
+        revokedAt: "2026-07-12T01:00:00.000Z"
+      },
+      {
+        verificationId: verification.verificationId,
+        issuerKeyId: verification.issuerKeyId,
+        issuerSequence: verification.issuerSequence + 1,
+        signatureAlgorithm: "hmac-sha256-v1",
+        signature: "2".repeat(64)
+      }
+    );
+    const revokedProject = createAcceptedMappedProject(revoked);
+
+    expect(validateProjectSchema(revokedProject).ok).toBe(true);
+    const reopenedRevoked = parseProjectJson(serializeProject(revokedProject));
+    expect(validateProjectSchema(reopenedRevoked).ok).toBe(true);
+    expect(
+      reopenedRevoked.mediaTimeMaps.find((map) => map.id === revoked.id)?.verification
+    ).toMatchObject({ recordVersion: 2, revocation: { reason: "测试撤销 accepted lineage。" } });
+  });
+
   it("打开 v1 项目时迁移闭区间片段 sourceOutMs", () => {
     const project = {
       ...createEmptyProject("旧项目"),
@@ -998,9 +1060,16 @@ describe("project schema", () => {
     expect(parsed.danmakuSourceSegments[0].timeMapId).toContain(
       "migrated_v10_confirmed-segment"
     );
-    expect(parsed.mediaTimeMaps).toMatchObject([
-      { state: "confirmed", quality: { level: "legacy-unverified" } }
-    ]);
+    expect(parsed.mediaTimeMaps.find((map) => map.state === "confirmed")).toMatchObject({
+      quality: { level: "legacy-unverified" }
+    });
+    expect(parsed.mediaMatchCandidates).toContainEqual(
+      expect.objectContaining({
+        state: "accepted",
+        appliedSegmentIds: ["v7-segment"],
+        confirmedTimeMapId: parsed.danmakuSourceSegments[0].timeMapId
+      })
+    );
 
     const reopened = parseProjectJson(serializeProject(parsed));
     expect(reopened.danmakuSourceSegments[0]).toMatchObject({
@@ -1344,6 +1413,96 @@ describe("project schema", () => {
       ok: false,
       message: "项目文件中的时间映射引用或范围不一致。"
     });
+  });
+
+  it("拒绝完全没有 accepted candidate 所有者的 confirmed TimeMap 内容段", () => {
+    const confirmedMap = createValidMediaTimeMap({
+      id: "ownerless-confirmed-map",
+      state: "confirmed",
+      confirmedAt: "2026-07-11T00:00:00.000Z"
+    });
+    const project = {
+      ...createEmptyProject("无所有者确认图"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [confirmedMap],
+      danmakuSourceSegments: [
+        {
+          id: "ownerless-content-segment",
+          label: "无候选所有者的内容段",
+          kind: "content" as const,
+          assetId: "asset-1",
+          sourceMediaId: "source-media",
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetMediaId: "target-media",
+          targetStartMs: 0,
+          timingRules: [],
+          timeMapId: confirmedMap.id,
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    };
+
+    expect(validateProjectSchema(project)).toMatchObject({
+      ok: false,
+      message: "项目文件中的时间映射引用或范围不一致。"
+    });
+  });
+
+  it("v12 ownerless legacy route 迁移为显式 accepted owner 后可保存重开", () => {
+    const confirmedMap = createValidMediaTimeMap({
+      id: "v12-ownerless-confirmed-map",
+      state: "confirmed",
+      confirmedAt: "2026-07-11T00:00:00.000Z"
+    });
+    const legacyProject = {
+      ...createEmptyProject("v12 ownerless 迁移"),
+      schemaVersion: 12,
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaMatchCandidates: [],
+      mediaTimeMaps: [confirmedMap],
+      danmakuSourceSegments: [
+        {
+          id: "v12-ownerless-segment",
+          label: "旧版无所有者内容段",
+          kind: "content" as const,
+          assetId: "asset-1",
+          sourceMediaId: "source-media",
+          sourceStartMs: 10_000,
+          sourceEndMs: 70_000,
+          targetMediaId: "target-media",
+          targetStartMs: 0,
+          timingRules: [],
+          timeMapId: confirmedMap.id,
+          episodeKey: null,
+          episodeLabel: null,
+          note: "",
+          createdAt: "2026-07-11T00:00:00.000Z",
+          updatedAt: "2026-07-11T00:00:00.000Z"
+        }
+      ]
+    };
+
+    const parsed = parseProjectJson(JSON.stringify(legacyProject));
+    expect(parsed.mediaMatchCandidates).toContainEqual(
+      expect.objectContaining({
+        state: "accepted",
+        appliedSegmentIds: ["v12-ownerless-segment"],
+        confirmedTimeMapId: confirmedMap.id
+      })
+    );
+    expect(validateProjectSchema(parsed).ok).toBe(true);
+    expect(parseProjectJson(serializeProject(parsed))).toEqual(parsed);
   });
 
   it("打开当前版本项目时保留半开 sourceOutMs", () => {
@@ -1877,6 +2036,46 @@ function createValidMediaTimeMap(overrides: Partial<MediaTimeMap> = {}): MediaTi
         ? (overrides.targetIdentity ?? null)
         : createValidMediaIdentity(),
     verification: "verification" in overrides ? (overrides.verification ?? null) : null
+  };
+}
+
+function createAcceptedMappedProject(confirmedMap: MediaTimeMap) {
+  const segmentId = "candidate-1:segment:asset-1";
+  return {
+    ...createEmptyProject("accepted lineage 生命周期"),
+    mediaLibrary: [
+      createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+      createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+    ],
+    mediaMatchCandidates: [
+      {
+        ...createValidMediaMatchCandidate(),
+        state: "accepted" as const,
+        confirmedTimeMapId: confirmedMap.id,
+        appliedSegmentIds: [segmentId]
+      }
+    ],
+    mediaTimeMaps: [createValidMediaTimeMap(), confirmedMap],
+    danmakuSourceSegments: [
+      {
+        id: segmentId,
+        label: "已接受来源段",
+        kind: "content" as const,
+        assetId: "asset-1",
+        sourceMediaId: "source-media",
+        sourceStartMs: 10_000,
+        sourceEndMs: 70_000,
+        targetMediaId: "target-media",
+        targetStartMs: 0,
+        timingRules: [],
+        timeMapId: confirmedMap.id,
+        episodeKey: null,
+        episodeLabel: null,
+        note: "",
+        createdAt: "2026-07-11T00:00:00.000Z",
+        updatedAt: "2026-07-11T00:00:00.000Z"
+      }
+    ]
   };
 }
 

@@ -1,13 +1,15 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { AlignmentProposal } from "../../domain/alignment/types";
 import { sha256Hex } from "../../domain/shared/sha256";
-import type {
-  AudioAlignmentJobStatus,
-  AudioAlignmentStageKey,
-  NormalizedTauriAudioAlignmentRequest,
-  TauriAudioAlignmentRequest
+import {
+  normalizeTauriSpectralBackendPreference,
+  type AudioAlignmentJobStatus,
+  type AudioAlignmentStageKey,
+  type NormalizedTauriAudioAlignmentRequest,
+  type TauriAudioAlignmentRequest
 } from "./tauriAudioAlignment";
 import type { RealMediaBenchmarkRunManifest } from "./realMediaBenchmarkRunner";
+import { discloseKnownAlignmentFailure } from "./safeAlignmentFailureDisclosure";
 
 export const ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION = 2 as const;
 export const ALIGNMENT_BENCHMARK_MIN_SAMPLE_INTERVAL_MS = 10;
@@ -278,7 +280,11 @@ export async function startAlignmentBenchmarkJob(
   let response: unknown;
   try {
     response = await invoker.startJob(normalizedSessionId, normalizedRequest);
-  } catch {
+  } catch (error: unknown) {
+    const disclosure = discloseKnownAlignmentFailure(error);
+    if (disclosure) {
+      throw new Error(disclosure.code);
+    }
     throw new Error("原生性能任务启动失败；媒体路径和工具输出未进入错误。");
   }
   try {
@@ -612,7 +618,8 @@ function normalizeAlignmentRequest(
     sourceVideoStreamIndex: normalizeStreamIndex(
       request.sourceVideoStreamIndex,
       "参考视频流索引"
-    )
+    ),
+    spectralBackend: normalizeTauriSpectralBackendPreference(request.spectralBackend)
   };
 }
 

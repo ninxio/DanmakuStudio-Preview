@@ -120,6 +120,7 @@ describe("Tauri 音频对齐调用", () => {
       sourceAudioStreamIndex: 4,
       completeVideoStreamIndex: 6,
       sourceVideoStreamIndex: 8,
+      spectralBackend: "cuda",
       localizationMode: true
     };
     tauriMocks.invoke.mockResolvedValue(emptyProposal);
@@ -136,6 +137,7 @@ describe("Tauri 音频对齐调用", () => {
         sourceAudioStreamIndex: 4,
         completeVideoStreamIndex: 6,
         sourceVideoStreamIndex: 8,
+        spectralBackend: "cuda",
         localizationMode: true
       }
     });
@@ -163,7 +165,8 @@ describe("Tauri 音频对齐调用", () => {
         completeAudioStreamIndex: null,
         sourceAudioStreamIndex: null,
         completeVideoStreamIndex: null,
-        sourceVideoStreamIndex: null
+        sourceVideoStreamIndex: null,
+        spectralBackend: "auto"
       }
     ]);
   });
@@ -195,9 +198,33 @@ describe("Tauri 音频对齐调用", () => {
         completeAudioStreamIndex: null,
         sourceAudioStreamIndex: null,
         completeVideoStreamIndex: null,
-        sourceVideoStreamIndex: null
+        sourceVideoStreamIndex: null,
+        spectralBackend: "auto"
       }
     });
+  });
+
+  it("拒绝单次和批量请求中的未知声谱计算策略", async () => {
+    const invalidPreference = "metal" as unknown as TauriAudioAlignmentRequest["spectralBackend"];
+
+    await expect(
+      runTauriAudioAlignment({
+        completePath: "full.mp4",
+        sourcePath: "reference.mp4",
+        ffmpegPath: null,
+        spectralBackend: invalidPreference
+      })
+    ).rejects.toThrow("声谱计算策略仅支持 auto、cuda 或 cpu");
+    await expect(
+      startTauriAudioAlignmentBatchJob({
+        sources: [{ mediaId: "source", path: "source.mp4" }],
+        targets: [{ mediaId: "target", path: "target.mp4" }],
+        ffmpegPath: null,
+        spectralBackend: invalidPreference,
+        localizationMode: true
+      })
+    ).rejects.toThrow("声谱计算策略仅支持 auto、cuda 或 cpu");
+    expect(tauriMocks.invoke).not.toHaveBeenCalled();
   });
 
   it.each([-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])(
@@ -380,6 +407,7 @@ describe("Tauri 音频对齐调用", () => {
         { mediaId: "target-2", path: "D:\\media\\ep2.mkv", videoStreamIndex: 4 }
       ],
       ffmpegPath: null,
+      spectralBackend: "cpu",
       localizationMode: true
     });
 
@@ -410,6 +438,7 @@ describe("Tauri 音频对齐调用", () => {
         ],
         ffmpegPath: null,
         ffprobePath: null,
+        spectralBackend: "cpu",
         localizationMode: true
       }
     });

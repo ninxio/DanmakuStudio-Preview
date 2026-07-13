@@ -31,6 +31,7 @@ describe("桌面应用设置桥", () => {
           },
           alignment: {
             ffmpegPath: "ffmpeg",
+            spectralBackend: "cuda",
             windowMs: 500,
             minGapMs: 1200,
             matchThreshold: 0.25
@@ -54,6 +55,7 @@ describe("桌面应用设置桥", () => {
       preferredBackend: "nativeMpv"
     });
     expect(loadAppSettings().alignment.windowMs).toBe(500);
+    expect(loadAppSettings().alignment.spectralBackend).toBe("cuda");
     const raw = window.localStorage.getItem(APP_SETTINGS_STORAGE_KEY) ?? "";
     expect(raw).not.toContain("secret");
   });
@@ -82,6 +84,7 @@ describe("桌面应用设置桥", () => {
           },
           alignment: {
             ffmpegPath: " C:\\tools\\ffmpeg.exe ",
+            spectralBackend: "cpu",
             windowMs: 500,
             minGapMs: 1200,
             matchThreshold: 0.25
@@ -98,8 +101,41 @@ describe("桌面应用设置桥", () => {
     expect(content).toContain("D:\\\\exports");
     expect(content).toContain("mpv.exe");
     expect(content).toContain("/emby");
+    expect(content).toContain('"spectralBackend":"cpu"');
     expect(content).not.toContain("password");
     expect(loadAppSettings().emby.username).toBe("tester");
+  });
+
+  it("桌面配置显式包含未知声谱策略时 fail-safe，不覆盖浏览器 fallback", async () => {
+    saveAppSettings({
+      export: { defaultDirectory: "D:\\existing" },
+      player: { mpvPath: "mpv", preferredBackend: "auto" },
+      emby: { serverUrl: "", pathPrefix: "/emby", username: "" },
+      alignment: {
+        ffmpegPath: "ffmpeg",
+        spectralBackend: "cpu",
+        windowMs: 500,
+        minGapMs: 1200,
+        matchThreshold: 0.25
+      }
+    });
+    const bridge: DesktopAppSettingsBridge = {
+      load: vi.fn().mockResolvedValue(
+        JSON.stringify({
+          schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
+          alignment: { spectralBackend: "unknown-gpu" }
+        })
+      ),
+      save: vi.fn(),
+      clear: vi.fn()
+    };
+
+    await expect(hydrateDesktopAppSettings(bridge)).rejects.toThrow(
+      "声谱计算策略 spectralBackend 仅支持 auto、cuda 或 cpu"
+    );
+    expect(loadAppSettings().alignment.spectralBackend).toBe("cpu");
+    expect(loadAppSettings().export.defaultDirectory).toBe("D:\\existing");
+    expect(bridge.save).not.toHaveBeenCalled();
   });
 
   it("清除时同时移除桌面配置和浏览器 fallback 镜像", async () => {
@@ -123,6 +159,7 @@ describe("桌面应用设置桥", () => {
       },
       alignment: {
         ffmpegPath: "ffmpeg",
+        spectralBackend: "auto",
         windowMs: 500,
         minGapMs: 1200,
         matchThreshold: 0.25

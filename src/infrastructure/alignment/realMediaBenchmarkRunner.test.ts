@@ -132,6 +132,52 @@ describe("C137 manifest v2 生产 benchmark runner", () => {
     expect(createRealMediaBenchmarkRunManifestDigest(tampered)).not.toBe(originalDigest);
   });
 
+  it.each(["cuda", "cpu"] as const)(
+    "把 %s 策略完整传到生产请求并写入可审计参数摘要",
+    async (spectralBackend) => {
+      const manifest = createManifest(1);
+      const received: NormalizedTauriAudioAlignmentRequest[] = [];
+      const bridge: AudioAlignmentJobInvoker = {
+        start: (request) => {
+          received.push(request);
+          return Promise.resolve(completedSnapshot("job-policy", createProposal(manifest, 0)));
+        },
+        get: () => Promise.reject(new Error("不应读取")),
+        cancel: () => Promise.reject(new Error("不应取消"))
+      };
+
+      const report = await runRealMediaBenchmarkManifest(manifest, {
+        spectralBackend,
+        alignmentInvoker: bridge,
+        preflightOptions: { probe: createProbe(manifest) }
+      });
+
+      expect(received).toHaveLength(1);
+      expect(received[0].spectralBackend).toBe(spectralBackend);
+      expect(report.cases[0].parameters.spectralBackend).toBe(spectralBackend);
+      expect(validateRealMediaBenchmarkRunReport(report).valid).toBe(true);
+    }
+  );
+
+  it("显式未知声谱策略会在启动任何生产任务前拒绝", async () => {
+    const manifest = createManifest(1);
+    const start = vi.fn();
+    const invalidBackend = "metal" as unknown as "auto";
+
+    await expect(
+      runRealMediaBenchmarkManifest(manifest, {
+        spectralBackend: invalidBackend,
+        alignmentInvoker: {
+          start,
+          get: vi.fn(),
+          cancel: vi.fn()
+        },
+        preflightOptions: { probe: createProbe(manifest) }
+      })
+    ).rejects.toThrow("声谱计算策略仅支持 auto、cuda 或 cpu");
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it("case 启动失败会隔离到该关系，后续 case 继续，但不会计算部分质量", async () => {
     const manifest = createManifest(2);
     const start = vi.fn((request: NormalizedTauriAudioAlignmentRequest) => {
@@ -164,6 +210,55 @@ describe("C137 manifest v2 生产 benchmark runner", () => {
     const serialized = serializeRealMediaBenchmarkRunReport(report);
     expect(serialized).not.toContain(manifest.cases[0].source.path);
     expect(serialized).not.toContain(manifest.cases[0].source.contentIdentity?.digest);
+  });
+
+  it.each([
+    ["blocked:cuda-fft-unavailable", "CUDA/cuFFT 能力不可用", "检测 4090 / CUDA"],
+    ["blocked:cuda-fft-runtime", "CUDA/cuFFT 执行失败", "强制 CPU"]
+  ] as const)(
+    "精度任务启动失败时只披露已知安全码 %s 的固定建议",
+    async (nativeCode, expectedReason, expectedRemediation) => {
+      const manifest = createManifest(1);
+      const privateDetail = `${manifest.cases[0].source.path} driver stdout=SECRET`;
+      const report = await runRealMediaBenchmarkManifest(manifest, {
+        spectralBackend: "cuda",
+        alignmentInvoker: {
+          start: () => Promise.reject(new Error(`${nativeCode}：${privateDetail}`)),
+          get: vi.fn(),
+          cancel: vi.fn()
+        },
+        preflightOptions: { probe: createProbe(manifest) }
+      });
+
+      expect(report.cases[0].failure?.code).toBe("job-start-failed");
+      expect(report.cases[0].failure?.message).toContain(expectedReason);
+      expect(report.cases[0].failure?.message).toContain(expectedRemediation);
+      const serialized = serializeRealMediaBenchmarkRunReport(report);
+      expect(serialized).not.toContain(privateDetail);
+      expect(serialized).not.toContain("SECRET");
+      expect(serialized).not.toContain(manifest.cases[0].source.path);
+    }
+  );
+
+  it("精度任务对未知伪 CUDA 码保持通用脱敏，不复述原始输出", async () => {
+    const manifest = createManifest(1);
+    const report = await runRealMediaBenchmarkManifest(manifest, {
+      spectralBackend: "cuda",
+      alignmentInvoker: {
+        start: () =>
+          Promise.reject(
+            new Error("blocked:cuda-fft-private-extension：C:\\private\\driver.log SECRET")
+          ),
+        get: vi.fn(),
+        cancel: vi.fn()
+      },
+      preflightOptions: { probe: createProbe(manifest) }
+    });
+
+    expect(report.cases[0].failure?.message).toBe(
+      "生产 Alignment V2 任务启动失败；原始工具错误已从可分享报告移除。"
+    );
+    expect(serializeRealMediaBenchmarkRunReport(report)).not.toContain("SECRET");
   });
 
   it("视觉启用时拒绝只回报音轨、未证明实际视频流的 proposal", async () => {

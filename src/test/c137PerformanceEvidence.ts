@@ -203,6 +203,7 @@ export function createFixturePlan(): C137PerformancePlanV1 {
     maximumMemorySampleGapMs: 100,
     outputCanonicalization: "c137-time-map-output-digest-v1",
     parameters: {
+      spectralBackend: "auto",
       sampleRate: 8_000,
       windowMs: 250,
       matchThreshold: 0.7,

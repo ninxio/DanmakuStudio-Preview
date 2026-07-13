@@ -18,6 +18,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Field } from "../../components/Field";
 import { IconButton } from "../../components/IconButton";
 import { TextButton } from "../../components/TextButton";
+import type { SpectralBackendPreference } from "../../domain/alignment/spectralBackendPreference";
 import {
   DEFAULT_APP_SETTINGS,
   clearAppSettings,
@@ -522,7 +523,7 @@ function PlayerToolsSettingsPanel({
       setCudaCapability(capability);
       setStatus(
         capability.available
-          ? `CUDA/cuFFT 已就绪：${capability.selectedDeviceName ?? "NVIDIA GPU"}。高精度匹配会在自动模式下使用它。`
+          ? `CUDA/cuFFT 已就绪：${capability.selectedDeviceName ?? "NVIDIA GPU"}。当前计算策略：${formatSpectralBackendPreference(settings.alignment.spectralBackend)}。`
           : `CUDA/cuFFT 尚不可用：${capability.reason}`,
         capability.available ? "success" : "warning"
       );
@@ -562,9 +563,8 @@ function PlayerToolsSettingsPanel({
           <div>
             <div className="text-xs font-medium text-slate-200">NVIDIA CUDA/cuFFT 加速</div>
             <p className="mt-1 text-xs leading-5 text-slate-500">
-              高精度匹配默认使用自动策略；能力可用且本次粗定位实际由 CUDA 完成时，选中候选窗口的声谱
-              FFT 会继续锁定 CUDA。若粗定位回退 CPU 或混合后端，细匹配保持 CPU；FFmpeg
-              音频解码、候选决策、DP 和边界判定始终由 CPU 完成。
+              此设置影响之后启动的所有单次和批量匹配，不改变已有候选。GPU 只负责声谱 FFT；FFmpeg
+              音频解码、候选决策、DP 和边界判定仍由 CPU 完成。
             </p>
           </div>
           <TextButton onClick={() => void checkCuda()} disabled={checkingCuda}>
@@ -572,6 +572,15 @@ function PlayerToolsSettingsPanel({
             {checkingCuda ? "检测中" : "检测 4090 / CUDA"}
           </TextButton>
         </div>
+        <SpectralBackendPreferenceControl
+          value={settings.alignment.spectralBackend}
+          onChange={(spectralBackend) =>
+            onChange({
+              ...settings,
+              alignment: { ...settings.alignment, spectralBackend }
+            })
+          }
+        />
         <CudaCapabilityRow capability={cudaCapability} />
       </div>
       <Field
@@ -684,10 +693,78 @@ function CudaCapabilityRow({ capability }: { capability: CudaFftCapability | nul
       <Icon size={14} className="mt-0.5 shrink-0" />
       <span>
         {capability.available
-          ? `${capability.selectedDeviceName ?? "NVIDIA GPU"} · ${capability.cufftLibraryName ?? "cuFFT"} · 单批显存上界 ${formatMemoryMiB(capability.defaultBatchMemory.worstCaseTotalDeviceBytes)} MiB · 可用于自动模式`
+          ? `${capability.selectedDeviceName ?? "NVIDIA GPU"} · ${capability.cufftLibraryName ?? "cuFFT"} · 单批显存上界 ${formatMemoryMiB(capability.defaultBatchMemory.worstCaseTotalDeviceBytes)} MiB · 可用于自动推荐或强制 GPU`
           : `${capability.reason}${capability.remediation ? `；${capability.remediation}` : ""}`}
       </span>
     </div>
+  );
+}
+
+function SpectralBackendPreferenceControl({
+  value,
+  onChange
+}: {
+  value: SpectralBackendPreference;
+  onChange: (value: SpectralBackendPreference) => void;
+}) {
+  const options: Array<{
+    value: SpectralBackendPreference;
+    label: string;
+    description: string;
+  }> = [
+    {
+      value: "auto",
+      label: "自动推荐",
+      description: "CUDA 可用时加速声谱 FFT；不可用或运行失败时改用 CPU。"
+    },
+    {
+      value: "cuda",
+      label: "强制 GPU",
+      description: "只使用 CUDA/cuFFT；检测、初始化或执行失败会停止匹配，不会回退 CPU。"
+    },
+    {
+      value: "cpu",
+      label: "强制 CPU",
+      description: "完全禁用 CUDA，始终使用 CPU；适合基线复核和排查 GPU 差异。"
+    }
+  ];
+  return (
+    <fieldset className="grid gap-2" aria-describedby="spectral-backend-description">
+      <legend className="text-xs font-medium text-slate-200">声谱计算策略</legend>
+      <p id="spectral-backend-description" className="text-[11px] leading-5 text-slate-500">
+        保存后应用于新启动的匹配任务；每次批量任务只使用同一策略。
+      </p>
+      <div className="grid gap-2 sm:grid-cols-3">
+        {options.map((option) => {
+          const selected = value === option.value;
+          return (
+            <label
+              key={option.value}
+              className={`flex cursor-pointer items-start gap-2 rounded border p-2.5 text-left transition focus-within:ring-1 focus-within:ring-accent-cyan/60 ${
+                selected
+                  ? "border-accent-cyan/70 bg-accent-cyan/10"
+                  : "border-panel-line bg-panel-base hover:border-slate-500"
+              }`}
+            >
+              <input
+                type="radio"
+                name="spectral-backend-preference"
+                value={option.value}
+                checked={selected}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-accent-cyan"
+                onChange={() => onChange(option.value)}
+              />
+              <span>
+                <span className="block text-xs font-medium text-slate-200">{option.label}</span>
+                <span className="mt-1 block text-[11px] leading-4 text-slate-500">
+                  {option.description}
+                </span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </fieldset>
   );
 }
 
@@ -740,7 +817,7 @@ function PrivacySettingsPanel({
         项目文件只保存弹幕、媒体引用、本地路径引用和编辑状态，不嵌入视频内容，也不会保存 Emby 密码或 token。
       </InfoBox>
       <InfoBox>
-        本地应用设置只保存默认导出目录、服务器地址、路径前缀、用户名、FFmpeg 路径、mpv 路径、播放器后端偏好和对齐默认参数。设置备份会带 schemaVersion，旧版无版本备份仍可导入。桌面端优先写入 Tauri 应用配置目录，网页模式使用浏览器本地存储。Emby 密码只保存在当前应用进程内，关闭应用后失效；清除本地设置也会清除会话密码。
+        本地应用设置只保存默认导出目录、服务器地址、路径前缀、用户名、FFmpeg 路径、mpv 路径、播放器后端偏好、声谱计算策略和对齐默认参数。设置备份会带 schemaVersion，旧版无版本备份仍可导入。桌面端优先写入 Tauri 应用配置目录，网页模式使用浏览器本地存储。Emby 密码只保存在当前应用进程内，关闭应用后失效；清除本地设置也会清除会话密码。
       </InfoBox>
       <InfoBox>
         当前版本不实现视频下载、DRM 绕过、账号绕过、私有接口爬取或未授权媒体访问。
@@ -838,6 +915,16 @@ function formatPreviewBackendPreference(value: PreviewBackendPreference): string
     return "只使用 HTML Video 轻量预览";
   }
   return "自动选择可用后端";
+}
+
+function formatSpectralBackendPreference(value: SpectralBackendPreference): string {
+  if (value === "cuda") {
+    return "强制 GPU（失败不回退 CPU）";
+  }
+  if (value === "cpu") {
+    return "强制 CPU（CUDA 已禁用）";
+  }
+  return "自动推荐（需要时回退 CPU）";
 }
 
 function formatToolName(tool: MediaToolKind): string {

@@ -4,6 +4,8 @@ import {
   reconcileAlignmentTimeMapProposalQuality
 } from "./timeMapProposal";
 import {
+  areMediaTimeMapImmutableLineagesEquivalent,
+  areMediaTimeMapsSemanticallyEquivalent,
   confirmCandidateTimeMap,
   createCandidateTimeMapId,
   createConfirmedTimeMapId,
@@ -467,6 +469,9 @@ export function acceptMediaMatchCandidate(
           confirmedRevision,
           timestamp
         );
+  if (!areMediaTimeMapImmutableLineagesEquivalent(candidateMap, confirmedMap)) {
+    throw new Error("确认时间图与候选时间图的映射语义不一致，已阻断关系写入。");
+  }
   let mediaTimeMaps = upsertTimeMap(project.mediaTimeMaps, candidateMap);
   mediaTimeMaps = upsertTimeMap(mediaTimeMaps, confirmedMap);
 
@@ -1180,10 +1185,33 @@ function requireOrCreateCandidateTimeMap(
   if (!existing) {
     return createCandidateTimeMap(candidate, timestamp);
   }
-  if (existing.state !== "candidate" || !doesTimeMapMatchCandidate(existing, candidate)) {
-    throw new Error("候选时间图不存在、状态无效或与候选范围不一致。");
+  if (
+    existing.state !== "candidate" ||
+    !doesTimeMapMatchCandidate(existing, candidate) ||
+    !doesCandidateTimeMapMatchProposal(existing, candidate)
+  ) {
+    throw new Error("候选时间图不存在、状态无效，或与候选提案的映射语义不一致。");
   }
   return existing;
+}
+
+/**
+ * V2/V3 候选必须能由其持久化 proposal.timeMap 确定性重建；旧候选没有正式提案图，
+ * 仍由 legacy-unverified 闸门负责阻断导出。
+ */
+export function doesCandidateTimeMapMatchProposal(
+  map: MediaTimeMap,
+  candidate: MediaMatchCandidate
+): boolean {
+  if (!candidate.proposal.timeMap) {
+    return true;
+  }
+  try {
+    const expected = createCandidateTimeMap(candidate, candidate.createdAt);
+    return areMediaTimeMapsSemanticallyEquivalent(map, expected);
+  } catch {
+    return false;
+  }
 }
 
 function doesTimeMapMatchCandidate(map: MediaTimeMap, candidate: MediaMatchCandidate): boolean {

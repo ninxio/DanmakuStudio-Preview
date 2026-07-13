@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   applyAuthorityIssuedManualMediaTimeMapVerification,
+  areMediaTimeMapImmutableLineagesEquivalent,
+  areMediaTimeMapsSemanticallyEquivalent,
   assessMediaTimeMapVerification,
   clearRegisteredManualMediaTimeMapVerificationTrust,
   computeMediaTimeMapCoreDigest,
@@ -172,6 +174,38 @@ describe("媒体时间图 revision", () => {
       mutate(changed);
       expect(computeMediaTimeMapCoreDigest(changed)).not.toBe(digest);
     }
+  });
+
+  it("proposal 语义与 confirmed immutable lineage 使用分层摘要", () => {
+    const candidate = createVerificationEligibleMap();
+    candidate.state = "candidate";
+    candidate.confirmedAt = null;
+    const confirmed = confirmCandidateTimeMap(
+      candidate,
+      createConfirmedTimeMapId("semantic-layer", 1),
+      1,
+      "2026-07-12T00:01:00.000Z"
+    );
+
+    expect(areMediaTimeMapsSemanticallyEquivalent(candidate, confirmed)).toBe(true);
+    expect(areMediaTimeMapImmutableLineagesEquivalent(candidate, confirmed)).toBe(true);
+
+    const verificationLifecycle = structuredClone(confirmed);
+    verificationLifecycle.quality = {
+      ...verificationLifecycle.quality,
+      p95ResidualMs: 99,
+      reasons: [...verificationLifecycle.quality.reasons, "人工签发生命周期质量记录"]
+    };
+    verificationLifecycle.evidence = {
+      ...verificationLifecycle.evidence,
+      notes: [...verificationLifecycle.evidence.notes, "人工签发生命周期证据"]
+    };
+    expect(areMediaTimeMapsSemanticallyEquivalent(candidate, verificationLifecycle)).toBe(false);
+    expect(areMediaTimeMapImmutableLineagesEquivalent(candidate, verificationLifecycle)).toBe(true);
+
+    const tamperedMapping = structuredClone(verificationLifecycle);
+    tamperedMapping.spans[0].targetEndMs += 1;
+    expect(areMediaTimeMapImmutableLineagesEquivalent(candidate, tamperedMapping)).toBe(false);
   });
 
   it("签名人工 record 按值跨 structuredClone 可信，应用重启前必须重新核验注册表", () => {

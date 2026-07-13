@@ -37,6 +37,7 @@ describe("应用设置持久化", () => {
         },
         alignment: {
           ffmpegPath: " C:\\tools\\ffmpeg.exe ",
+          spectralBackend: "cuda",
           windowMs: 500,
           minGapMs: 0,
           matchThreshold: 0.2
@@ -63,6 +64,7 @@ describe("应用设置持久化", () => {
       preferredBackend: "nativeMpv"
     });
     expect(loadAppSettings(storage).alignment.windowMs).toBe(500);
+    expect(loadAppSettings(storage).alignment.spectralBackend).toBe("cuda");
   });
 
   it("读取旧数据时忽略敏感字段和无效数字", () => {
@@ -87,6 +89,7 @@ describe("应用设置持久化", () => {
         },
         alignment: {
           ffmpegPath: "ffmpeg",
+          spectralBackend: "unsupported",
           windowMs: -1,
           minGapMs: -10,
           matchThreshold: 0,
@@ -106,6 +109,7 @@ describe("应用设置持久化", () => {
     expect(loaded.alignment.windowMs).toBe(DEFAULT_APP_SETTINGS.alignment.windowMs);
     expect(loaded.alignment.minGapMs).toBe(DEFAULT_APP_SETTINGS.alignment.minGapMs);
     expect(loaded.alignment.matchThreshold).toBe(DEFAULT_APP_SETTINGS.alignment.matchThreshold);
+    expect(loaded.alignment.spectralBackend).toBe("auto");
     expect(loaded.player).toEqual({
       mpvPath: "mpv",
       preferredBackend: DEFAULT_APP_SETTINGS.player.preferredBackend
@@ -145,6 +149,7 @@ describe("应用设置持久化", () => {
           },
           alignment: {
             ffmpegPath: "ffmpeg",
+            spectralBackend: "cpu",
             windowMs: "500",
             minGapMs: "1200",
             matchThreshold: "0.25",
@@ -158,13 +163,13 @@ describe("应用设置持久化", () => {
     expect(text).toContain("D:\\\\exports");
     expect(text).toContain("https://emby.example.test");
     expect(text).toContain("nativeMpv");
+    expect(text).toContain('"spectralBackend":"cpu"');
     expect(text).not.toContain("secret");
     expect(text).not.toContain("token");
   });
 
   it("严格解析设置备份时兼容无版本的旧备份", () => {
-    expect(
-      parseAppSettingsTextStrict(
+    const migrated = parseAppSettingsTextStrict(
         JSON.stringify({
           export: {
             defaultDirectory: "D:\\legacy-exports"
@@ -181,8 +186,9 @@ describe("应用设置持久化", () => {
             matchThreshold: 0.25
           }
         })
-      )
-    ).toMatchObject({
+      );
+
+    expect(migrated).toMatchObject({
       export: {
         defaultDirectory: "D:\\legacy-exports"
       },
@@ -192,6 +198,20 @@ describe("应用设置持久化", () => {
         username: "legacy"
       }
     });
+    expect(migrated.alignment.spectralBackend).toBe("auto");
+  });
+
+  it("严格解析设置备份时拒绝显式未知的声谱计算策略", () => {
+    expect(() =>
+      parseAppSettingsTextStrict(
+        JSON.stringify({
+          schemaVersion: APP_SETTINGS_SCHEMA_VERSION,
+          alignment: {
+            spectralBackend: "metal"
+          }
+        })
+      )
+    ).toThrow("声谱计算策略 spectralBackend 仅支持 auto、cuda 或 cpu");
   });
 
   it("严格解析设置备份时保留 JSON 语法错误", () => {

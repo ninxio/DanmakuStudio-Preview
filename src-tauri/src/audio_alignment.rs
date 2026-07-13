@@ -7,12 +7,13 @@ use crate::{
         extract_landmarks_and_fine_features_with_backend_request,
         lock_fine_spectral_backend_request, match_landmarks_affine_coarse_universe_with_cancel,
         materialize_affine_hypothesis_with_cancel, refine_boundary_by_correlation_with_cancel,
-        refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_request,
-        AffineAnchorEvidence, AffineFineDecodeWindows, AffineFineWindowRequest, AffineHypothesis,
-        AffineMatchConfig, BoundaryContextSide, BoundaryRefinementConfig, CoarseAffineHypothesis,
-        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
-        FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs,
-        SpectralBackendExecution, SpectralBackendRequest, SpectralLandmark,
+        refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_preference,
+        resolve_spectral_backend_request, AffineAnchorEvidence, AffineFineDecodeWindows,
+        AffineFineWindowRequest, AffineHypothesis, AffineMatchConfig, BoundaryContextSide,
+        BoundaryRefinementConfig, CoarseAffineHypothesis, EditAlignmentConfig, EditAlignmentMode,
+        EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
+        MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
+        SpectralBackendPreference, SpectralBackendRequest, SpectralLandmark,
         StreamingLandmarkExtractor, CPU_SPECTRAL_BACKEND_ID, STREAMING_CPU_SPECTRAL_BACKEND_ID,
         STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
     },
@@ -114,7 +115,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.3-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-frontier-second-assignment-v14";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-frontier-second-assignment-v15";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -141,6 +142,15 @@ const ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS: i64 = 120_000;
 const ALIGNMENT_V2_PENDING_RECOVERY_MIN_MATCH_MS: u64 = 5_000;
 const ALIGNMENT_V2_PENDING_RECOVERY_ABSOLUTE_FLOOR_MS: u64 = 500;
 const ALIGNMENT_V2_PENDING_RECOVERY_CURSOR_TOLERANCE_MS: u64 = 100;
+// A constant non-unit playback rate creates isolated one/two-frame lattice skips even when no
+// content was edited. Duration alone cannot distinguish that sampling artifact from a real short
+// edit, so absorption also requires consistent neighboring slope and residual evidence.
+const ALIGNMENT_V2_TEMPO_SKIP_MAX_MS: u64 = 2 * ALIGNMENT_V2_FINE_HOP_MS as u64;
+const ALIGNMENT_V2_TEMPO_INTERNAL_SIDE_MIN_MS: u64 = 10 * ALIGNMENT_V2_FINE_HOP_MS as u64;
+const ALIGNMENT_V2_TEMPO_EDGE_SUPPORT_MIN_MS: u64 = 5_000;
+const ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE: f64 = 0.03;
+const ALIGNMENT_V2_TEMPO_CADENCE_SCALE_TOLERANCE: f64 = 0.005;
+const ALIGNMENT_V2_TEMPO_EDGE_DIRECTION_EPSILON: f64 = 0.0025;
 const ALIGNMENT_V2_MAX_DP_CELLS: usize = 4_000_000;
 // The edit-aware solver retains three full u8 parent planes for exact traceback, while its three
 // i64 cost states use previous/current rolling rows. Charge both explicitly; the rolling width is
@@ -233,7 +243,7 @@ const DIRECTION_SKIP_SOURCE: u8 = 2;
 const DIRECTION_MATCH: u8 = 3;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioAlignmentRequest {
     complete_path: String,
     source_path: String,
@@ -243,6 +253,7 @@ pub struct AudioAlignmentRequest {
     source_audio_stream_index: Option<u32>,
     complete_video_stream_index: Option<u32>,
     source_video_stream_index: Option<u32>,
+    spectral_backend: Option<SpectralBackendPreference>,
     sample_rate: Option<u32>,
     window_ms: Option<u64>,
     match_threshold: Option<f64>,
@@ -649,6 +660,7 @@ pub struct AudioAlignmentBatchRequest {
     pairs: Option<Vec<AudioAlignmentBatchPairRequest>>,
     ffmpeg_path: Option<String>,
     ffprobe_path: Option<String>,
+    spectral_backend: Option<SpectralBackendPreference>,
     sample_rate: Option<u32>,
     window_ms: Option<u64>,
     match_threshold: Option<f64>,
@@ -1322,6 +1334,7 @@ pub struct AlignmentBenchmarkCacheResetReceipt {
     all_caches_empty: bool,
 }
 
+#[derive(Clone)]
 struct AudioAlignmentOptions {
     sample_rate: u32,
     window_ms: u64,
@@ -1330,6 +1343,7 @@ struct AudioAlignmentOptions {
     max_cells: usize,
     ffmpeg_path: String,
     ffprobe_path: PathBuf,
+    spectral_backend_request: SpectralBackendRequest,
     toolchain_cache_identity: Option<String>,
     enable_visual_evidence: bool,
     visual_sample_interval_ms: u64,
@@ -1794,6 +1808,7 @@ struct PlannedAudioAlignmentBatch {
     target_media_ids: Vec<String>,
     media: Vec<PlannedAudioAlignmentBatchMedia>,
     pairs: Vec<PlannedAudioAlignmentBatchPair>,
+    spectral_backend_request: SpectralBackendRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -2103,6 +2118,7 @@ struct PreparedAlignmentBenchmarkJob {
     session_id: String,
     job_id: String,
     request: AudioAlignmentRequest,
+    spectral_backend_request: SpectralBackendRequest,
     expected_source_identity: MediaContentIdentity,
     expected_target_identity: MediaContentIdentity,
     cancel_flag: Arc<AtomicBool>,
@@ -2155,10 +2171,11 @@ static ALIGNMENT_BENCHMARK_COORDINATOR: OnceLock<Mutex<AlignmentBenchmarkCoordin
 pub async fn align_audio_files(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentProposal, String> {
+    let spectral_backend_request = resolve_audio_alignment_request_spectral_backend(&request)?;
     let permit = acquire_ordinary_alignment_run()?;
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
-        align_audio_files_inner(request)
+        align_audio_files_inner_with_spectral_backend_request(request, spectral_backend_request)
     })
     .await
     .map_err(|error| format!("本地音频对齐任务启动失败：{error}"))?
@@ -2168,6 +2185,7 @@ pub async fn align_audio_files(
 pub async fn start_audio_alignment_job(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentJobSnapshot, String> {
+    let spectral_backend_request = resolve_audio_alignment_request_spectral_backend(&request)?;
     let permit = acquire_ordinary_alignment_run()?;
     let job_id = next_audio_alignment_job_id();
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -2175,7 +2193,12 @@ pub async fn start_audio_alignment_job(
     let worker_job_id = job_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
-        run_audio_alignment_job(worker_job_id, cancel_flag, request);
+        run_audio_alignment_job(
+            worker_job_id,
+            cancel_flag,
+            request,
+            spectral_backend_request,
+        );
     });
     get_audio_alignment_job(job_id)
 }
@@ -2897,6 +2920,7 @@ fn prepare_alignment_benchmark_job(
     session_id: &str,
     mut request: AudioAlignmentRequest,
 ) -> Result<PreparedAlignmentBenchmarkJob, String> {
+    let spectral_backend_request = resolve_audio_alignment_request_spectral_backend(&request)?;
     let mut coordinator = alignment_benchmark_coordinator()
         .lock()
         .map_err(|_| "原生对齐基准协调锁已损坏。".to_string())?;
@@ -2962,6 +2986,7 @@ fn prepare_alignment_benchmark_job(
         session_id: session_id.to_string(),
         job_id,
         request,
+        spectral_backend_request,
         expected_source_identity,
         expected_target_identity,
         cancel_flag,
@@ -3544,8 +3569,9 @@ fn run_alignment_benchmark_job(prepared: PreparedAlignmentBenchmarkJob) {
     let mut update = |_progress: f64, _message: &str| Ok(());
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         with_alignment_benchmark_telemetry(prepared.telemetry.clone(), || {
-            align_audio_files_with_progress(
+            align_audio_files_with_progress_and_spectral_backend_request(
                 prepared.request,
+                prepared.spectral_backend_request,
                 &mut update,
                 Some(cancel_flag.as_ref()),
             )
@@ -5467,15 +5493,30 @@ fn collect_process_descendants(root_pid: u32, pairs: &[(u32, u32)]) -> HashSet<u
     descendants
 }
 
+#[cfg(test)]
 fn align_audio_files_inner(
     request: AudioAlignmentRequest,
 ) -> Result<AudioAlignmentProposal, String> {
-    let mut update = |_progress: f64, _message: &str| Ok(());
-    align_audio_files_with_progress(request, &mut update, None)
+    let spectral_backend_request = resolve_audio_alignment_request_spectral_backend(&request)?;
+    align_audio_files_inner_with_spectral_backend_request(request, spectral_backend_request)
 }
 
-fn align_audio_files_with_progress<F>(
+fn align_audio_files_inner_with_spectral_backend_request(
     request: AudioAlignmentRequest,
+    spectral_backend_request: SpectralBackendRequest,
+) -> Result<AudioAlignmentProposal, String> {
+    let mut update = |_progress: f64, _message: &str| Ok(());
+    align_audio_files_with_progress_and_spectral_backend_request(
+        request,
+        spectral_backend_request,
+        &mut update,
+        None,
+    )
+}
+
+fn align_audio_files_with_progress_and_spectral_backend_request<F>(
+    request: AudioAlignmentRequest,
+    spectral_backend_request: SpectralBackendRequest,
     update_progress: &mut F,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<AudioAlignmentProposal, String>
@@ -5483,7 +5524,10 @@ where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
     ensure_alignment_process_supervision_clean()?;
-    let (options, toolchain) = create_pinned_audio_alignment_options(&request)?;
+    let (options, toolchain) = create_pinned_audio_alignment_options_with_spectral_backend_request(
+        &request,
+        &spectral_backend_request,
+    )?;
     align_audio_files_with_pinned_toolchain(
         request,
         &options,
@@ -5790,10 +5834,10 @@ where
             cancel_flag,
         );
     }
-    // Resolve capability once for the whole alignment run; candidate tracks and both media then
-    // share the same planned backend identity during cache lookup and extraction.
+    // The request-local capability snapshot was resolved when options were created. Candidate
+    // tracks and both media share it throughout cache lookup and extraction.
     let spectral_backend_request = if prepared.is_none() {
-        Some(resolve_spectral_backend_request()?)
+        Some(&options.spectral_backend_request)
     } else {
         None
     };
@@ -5801,7 +5845,7 @@ where
     // Ordinary source/target extraction is one transactional admission boundary. Plan both media
     // before the first FFmpeg decode, retain every prefetched hit Arc, and charge the target from
     // the source plan's conservative projected prefix.
-    let ordinary_cache_plans = if let Some(backend_request) = spectral_backend_request.as_ref() {
+    let ordinary_cache_plans = if let Some(backend_request) = spectral_backend_request {
         Some(plan_v2_ordinary_candidate_sets_cache_aware(
             &request.source_path,
             &request.complete_path,
@@ -5852,7 +5896,6 @@ where
                 notes: &mut extraction_notes,
                 retained_artifact_bytes: &mut retained_artifact_bytes,
                 spectral_backend_request: spectral_backend_request
-                    .as_ref()
                     .expect("ordinary V2 preparation must resolve a spectral backend"),
             },
         )?
@@ -5880,7 +5923,6 @@ where
                 notes: &mut extraction_notes,
                 retained_artifact_bytes: &mut retained_artifact_bytes,
                 spectral_backend_request: spectral_backend_request
-                    .as_ref()
                     .expect("ordinary V2 preparation must resolve a spectral backend"),
             },
         )?
@@ -7140,6 +7182,7 @@ fn select_v2_global_shortlist_with_limits(
                     .iter()
                     .map(|index| plan.pairs[*index].clone())
                     .collect(),
+                spectral_backend_request: plan.spectral_backend_request.clone(),
             };
             let subcoarse = unaffected_indices
                 .iter()
@@ -9803,13 +9846,7 @@ fn get_v2_landmarks(
     } = context;
     check_cancelled(cancel_flag)?;
     let streaming_coarse = should_stream_v2_coarse_only(input);
-    let owned_backend_request;
-    let backend_request = if let Some(request) = shared_backend_request {
-        request
-    } else {
-        owned_backend_request = resolve_spectral_backend_request()?;
-        &owned_backend_request
-    };
+    let backend_request = shared_backend_request.unwrap_or(&options.spectral_backend_request);
     let mut cache_key = create_v2_planned_coarse_cache_key(
         media_path,
         options,
@@ -9824,6 +9861,10 @@ fn get_v2_landmarks(
                         .to_string(),
                 );
             }
+            verify_v2_spectral_backend_policy(
+                &cached.spectral_backend,
+                &options.spectral_backend_request,
+            )?;
             verify_media_content_identity_after_tool_output(
                 media_path,
                 input.content_identity.as_ref(),
@@ -9850,6 +9891,10 @@ fn get_v2_landmarks(
                 cache.get(&cache_key)
             };
             if let Some(artifact) = cached_artifact {
+                verify_v2_spectral_backend_policy(
+                    &artifact.spectral_backend,
+                    &options.spectral_backend_request,
+                )?;
                 verify_media_content_identity_after_tool_output(
                     media_path,
                     input.content_identity.as_ref(),
@@ -9936,6 +9981,7 @@ fn get_v2_landmarks(
                 }
             },
         )?;
+    verify_v2_spectral_backend_policy(&spectral_backend, &options.spectral_backend_request)?;
     cache_key = create_v2_audio_cache_key_for_backend(
         media_path,
         options,
@@ -9983,13 +10029,13 @@ fn create_v2_audio_cache_key(
     input: &AlignmentAudioInput,
     artifact: &str,
 ) -> Result<String, String> {
-    let request = resolve_spectral_backend_request()?;
+    let request = &options.spectral_backend_request;
     let backend_id = if should_stream_v2_coarse_only(input)
         && request.planned_backend_id != crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
     {
         STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string()
     } else {
-        request.planned_backend_id
+        request.planned_backend_id.clone()
     };
     create_v2_audio_cache_key_for_backend(media_path, options, input, artifact, &backend_id)
 }
@@ -10004,7 +10050,8 @@ fn create_v2_audio_cache_key_for_backend(
     let legacy_identity = create_audio_feature_cache_key(media_path, options, input)?;
     let timeline = input.decode_timeline.as_ref();
     Ok(format!(
-        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|artifact={artifact}|spectralBackend={spectral_backend_id}|ptsOrigin={}|streamPtsOffset={}|firstDecodedPts={:?}|ptsDiscontinuities={}|maxPtsGap={:?}|skipSamples={}|discardPadding={}|normalizedPcmOrigin={}|{legacy_identity}",
+        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|artifact={artifact}|requestedSpectralBackend={}|spectralBackend={spectral_backend_id}|ptsOrigin={}|streamPtsOffset={}|firstDecodedPts={:?}|ptsDiscontinuities={}|maxPtsGap={:?}|skipSamples={}|discardPadding={}|normalizedPcmOrigin={}|{legacy_identity}",
+        options.spectral_backend_request.requested_backend,
         input.presentation_origin_ms,
         input.stream.timeline_offset_ms,
         timeline.and_then(|item| item.first_decoded_pts_ms),
@@ -10018,6 +10065,19 @@ fn create_v2_audio_cache_key_for_backend(
     ))
 }
 
+fn verify_v2_spectral_backend_policy(
+    execution: &SpectralBackendExecution,
+    request: &SpectralBackendRequest,
+) -> Result<(), String> {
+    if execution.requested_backend != request.requested_backend {
+        return Err(
+            "blocked:spectral-backend-policy-mismatch：V2 声谱制品与本次请求的 CPU/GPU 策略不一致。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn decode_v2_audio(
     media_path: &str,
     label: &str,
@@ -10028,6 +10088,10 @@ fn decode_v2_audio(
 ) -> Result<DecodedV2Audio, String> {
     check_v2_duration_limit(input, label)?;
     check_cancelled(cancel_flag)?;
+    verify_v2_spectral_backend_policy(
+        &landmark_artifact.spectral_backend,
+        &options.spectral_backend_request,
+    )?;
     let expected_cache_key = create_v2_audio_cache_key_for_backend(
         media_path,
         options,
@@ -11104,8 +11168,13 @@ fn align_v2_feature_chunks(
             ));
         }
         let source_window = &source_frames[source_start_index..source_end_index];
+        // DP operates in the target chunk's shared content-time coordinate. The searched source
+        // keeps its original presentation timestamp in each frame, so traceback emits a real
+        // non-unit TimeMap slope instead of flattening every matched step to 50/50 ms.
+        let common_time_source_window =
+            project_v2_search_features_to_common_time(source_window, &chunk_inverse)?;
         let required_cells = (target_chunk.len() + 1)
-            .checked_mul(source_window.len() + 1)
+            .checked_mul(common_time_source_window.len() + 1)
             .ok_or_else(|| "V2 分块 DP 单元数溢出。".to_string())?;
         if required_cells > allowed_cells {
             return Err(format!(
@@ -11121,10 +11190,13 @@ fn align_v2_feature_chunks(
         )?;
         // 反向调用：完整消费目标原片块，并在较宽的参考窗内 semi-global 定位。
         // 返回后交换两条轴，恢复 B 站参考 -> 目标原片的正式 TimeMap 方向。
+        let mut common_grid = chunk_inverse.clone();
+        common_grid.scale = 1.0;
+        common_grid.offset_ms = 0;
         let result = align_features_edit_aware_with_cancel(
             target_chunk,
-            source_window,
-            &chunk_inverse,
+            &common_time_source_window,
+            &common_grid,
             &EditAlignmentConfig {
                 mode: EditAlignmentMode::SemiGlobal,
                 // The recursive window intentionally includes up to two minutes of bounded
@@ -11143,11 +11215,12 @@ fn align_v2_feature_chunks(
             },
             cancel_flag,
         )?;
-        let chunk_spans = result
+        let mut chunk_spans = result
             .spans
             .iter()
             .map(swap_v2_edit_span_axes)
             .collect::<Result<Vec<_>, _>>()?;
+        absorb_v2_short_tempo_skips(&mut chunk_spans, coarse.scale);
         let target_chunk_duration_ms = u64::try_from(target_end_ms - target_start_ms)
             .map_err(|_| "V2 target chunk 时长无法表示为非负毫秒。".to_string())?;
         let required_recovery_match_ms = ALIGNMENT_V2_PENDING_RECOVERY_MIN_MATCH_MS.min(
@@ -11209,6 +11282,7 @@ fn align_v2_feature_chunks(
             pending_has_unreliable_common_content = false;
         }
         append_v2_chunk_spans(&mut spans, chunk_spans)?;
+        absorb_v2_short_tempo_skips(&mut spans, coarse.scale);
         previous_source_end_ms = spans.last().map(|span| span.source_end_ms as i64);
         matched_step_count += result.matched_step_count;
         ambiguous_step_count += result.ambiguous_step_count;
@@ -11328,6 +11402,40 @@ fn inverse_affine_hypothesis(coarse: &AffineHypothesis) -> Result<AffineHypothes
     })
 }
 
+fn project_v2_search_features_to_common_time(
+    frames: &[FineFeatureFrame],
+    searched_from_common: &AffineHypothesis,
+) -> Result<Vec<FineFeatureFrame>, String> {
+    if !searched_from_common.scale.is_finite() || searched_from_common.scale <= 0.0 {
+        return Err("无法把搜索侧 fine features 投影到无效 affine 网格。".to_string());
+    }
+    let mut projected = Vec::with_capacity(frames.len());
+    let mut previous_common_time = None;
+    for frame in frames {
+        let common_time = ((frame.presentation_time_ms as f64
+            - searched_from_common.offset_ms as f64)
+            / searched_from_common.scale)
+            .round();
+        if !common_time.is_finite()
+            || common_time < i64::MIN as f64
+            || common_time > i64::MAX as f64
+        {
+            return Err("搜索侧 fine feature 的共同 content-time 无法表示。".to_string());
+        }
+        let common_time = common_time as i64;
+        if previous_common_time.is_some_and(|previous| common_time <= previous) {
+            return Err("搜索侧 fine feature 投影后的共同 content-time 不是严格递增。".to_string());
+        }
+        projected.push(FineFeatureFrame {
+            time_ms: common_time,
+            presentation_time_ms: frame.presentation_time_ms,
+            values: frame.values.clone(),
+        });
+        previous_common_time = Some(common_time);
+    }
+    Ok(projected)
+}
+
 fn swap_v2_edit_span_axes(span: &EditTimeSpan) -> Result<AudioTimeMapSpanDto, String> {
     let kind = match span.kind {
         EditPathKind::Matched => AudioTimeMapSpanKind::Matched,
@@ -11398,6 +11506,345 @@ fn append_or_merge_v2_span(output: &mut Vec<AudioTimeMapSpanDto>, span: AudioTim
         }
     }
     output.push(span);
+}
+
+fn absorb_v2_short_tempo_skips(spans: &mut Vec<AudioTimeMapSpanDto>, expected_scale: f64) {
+    if !expected_scale.is_finite() || expected_scale <= 0.0 {
+        return;
+    }
+
+    // A run of repeated, same-direction lattice gaps can establish tempo evidence before any
+    // individual matched run has accumulated a visible non-unit slope. A single short edit can
+    // never satisfy this certificate.
+    absorb_v2_repeated_tempo_skip_runs(spans, expected_scale);
+
+    // Internal gaps are the strongest evidence: both sides must independently describe the same
+    // local tempo, and consuming the lattice skip must improve the fit to the coarse tempo model.
+    // Process these first so a long, evidence-backed run can later support edge extrapolation.
+    let mut index = 1usize;
+    while index + 1 < spans.len() {
+        let left = &spans[index - 1];
+        let skip = &spans[index];
+        let right = &spans[index + 1];
+        let absorb = is_v2_supported_internal_tempo_skip(left, skip, right, expected_scale);
+        if !absorb {
+            index += 1;
+            continue;
+        }
+        let merged = create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            left.source_start_ms,
+            right.source_end_ms,
+            left.target_start_ms,
+            right.target_end_ms,
+        );
+        spans.splice(index - 1..=index + 1, [merged]);
+        index = index.saturating_sub(1).max(1);
+    }
+
+    while spans.len() >= 2 {
+        let skip = &spans[0];
+        let matched = &spans[1];
+        let absorb = is_v2_supported_edge_tempo_skip(skip, matched, expected_scale)
+            && skip.source_end_ms == matched.source_start_ms
+            && skip.target_end_ms == matched.target_start_ms;
+        if !absorb {
+            break;
+        }
+        let merged = create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            skip.source_start_ms,
+            matched.source_end_ms,
+            skip.target_start_ms,
+            matched.target_end_ms,
+        );
+        spans.splice(0..=1, [merged]);
+    }
+    while spans.len() >= 2 {
+        let last_index = spans.len() - 1;
+        let matched = &spans[last_index - 1];
+        let skip = &spans[last_index];
+        let absorb = is_v2_supported_edge_tempo_skip(skip, matched, expected_scale)
+            && matched.source_end_ms == skip.source_start_ms
+            && matched.target_end_ms == skip.target_start_ms;
+        if !absorb {
+            break;
+        }
+        let merged = create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            matched.source_start_ms,
+            skip.source_end_ms,
+            matched.target_start_ms,
+            skip.target_end_ms,
+        );
+        spans.splice(last_index - 1..=last_index, [merged]);
+    }
+}
+
+fn absorb_v2_repeated_tempo_skip_runs(spans: &mut Vec<AudioTimeMapSpanDto>, expected_scale: f64) {
+    let mut start = 0usize;
+    while start + 4 < spans.len() {
+        if spans[start].kind != AudioTimeMapSpanKind::Matched {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        let mut best_supported_end = None;
+        while end + 2 < spans.len() {
+            let left = &spans[end];
+            let skip = &spans[end + 1];
+            let right = &spans[end + 2];
+            let extends_run = left.kind == AudioTimeMapSpanKind::Matched
+                && right.kind == AudioTimeMapSpanKind::Matched
+                && is_v2_short_tempo_skip(skip)
+                && v2_tempo_skip_direction_matches_scale(skip, expected_scale)
+                && left.source_end_ms == skip.source_start_ms
+                && left.target_end_ms == skip.target_start_ms
+                && skip.source_end_ms == right.source_start_ms
+                && skip.target_end_ms == right.target_start_ms;
+            if !extends_run {
+                break;
+            }
+            end += 2;
+            if is_v2_supported_repeated_tempo_run(&spans[start..=end], expected_scale) {
+                best_supported_end = Some(end);
+            }
+        }
+        let Some(end) = best_supported_end else {
+            start += 1;
+            continue;
+        };
+        let merged = create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            spans[start].source_start_ms,
+            spans[end].source_end_ms,
+            spans[start].target_start_ms,
+            spans[end].target_end_ms,
+        );
+        spans.splice(start..=end, [merged]);
+        start = start.saturating_sub(1);
+    }
+}
+
+fn is_v2_supported_repeated_tempo_run(run: &[AudioTimeMapSpanDto], expected_scale: f64) -> bool {
+    if run.len() < 5 || run.len().is_multiple_of(2) {
+        return false;
+    }
+    let matched = run.iter().step_by(2).collect::<Vec<_>>();
+    let skips = run.iter().skip(1).step_by(2).collect::<Vec<_>>();
+    if skips.len() < 3
+        || skips
+            .iter()
+            .any(|skip| !v2_tempo_skip_direction_matches_scale(skip, expected_scale))
+        || run.windows(2).any(|items| {
+            items[0].source_end_ms != items[1].source_start_ms
+                || items[0].target_end_ms != items[1].target_start_ms
+        })
+    {
+        return false;
+    }
+    let matched_scales = matched
+        .iter()
+        .map(|span| {
+            let (source_ms, target_ms) = v2_span_axis_durations_ms(span);
+            if source_ms.min(target_ms) < ALIGNMENT_V2_TEMPO_INTERNAL_SIDE_MIN_MS {
+                return None;
+            }
+            v2_matched_span_scale(span)
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(matched_scales) = matched_scales else {
+        return false;
+    };
+    let minimum_scale = matched_scales.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximum_scale = matched_scales
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let average_scale = matched_scales.iter().sum::<f64>() / matched_scales.len() as f64;
+    if maximum_scale - minimum_scale > ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE
+        || (average_scale - expected_scale).abs() > ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE
+        || run.chunks_exact(2).any(|items| {
+            let (left_source_ms, left_target_ms) = v2_span_axis_durations_ms(&items[0]);
+            let (skip_source_ms, skip_target_ms) = v2_span_axis_durations_ms(&items[1]);
+            let combined_source_ms = left_source_ms.saturating_add(skip_source_ms);
+            let combined_target_ms = left_target_ms.saturating_add(skip_target_ms);
+            combined_source_ms == 0
+                || (combined_target_ms as f64 / combined_source_ms as f64 - expected_scale).abs()
+                    > ALIGNMENT_V2_TEMPO_CADENCE_SCALE_TOLERANCE
+        })
+    {
+        return false;
+    }
+    let (base_source_ms, base_target_ms) = matched.iter().fold((0u64, 0u64), |total, span| {
+        let duration = v2_span_axis_durations_ms(span);
+        (
+            total.0.saturating_add(duration.0),
+            total.1.saturating_add(duration.1),
+        )
+    });
+    let (skip_source_ms, skip_target_ms) = skips.iter().fold((0u64, 0u64), |total, span| {
+        let duration = v2_span_axis_durations_ms(span);
+        (
+            total.0.saturating_add(duration.0),
+            total.1.saturating_add(duration.1),
+        )
+    });
+    v2_tempo_durations_improve_expected_fit(
+        base_source_ms,
+        base_target_ms,
+        skip_source_ms,
+        skip_target_ms,
+        expected_scale,
+    )
+}
+
+fn is_v2_supported_internal_tempo_skip(
+    left: &AudioTimeMapSpanDto,
+    skip: &AudioTimeMapSpanDto,
+    right: &AudioTimeMapSpanDto,
+    expected_scale: f64,
+) -> bool {
+    if left.kind != AudioTimeMapSpanKind::Matched
+        || right.kind != AudioTimeMapSpanKind::Matched
+        || !is_v2_short_tempo_skip(skip)
+        || !v2_tempo_skip_direction_matches_scale(skip, expected_scale)
+        || left.source_end_ms != skip.source_start_ms
+        || left.target_end_ms != skip.target_start_ms
+        || skip.source_end_ms != right.source_start_ms
+        || skip.target_end_ms != right.target_start_ms
+    {
+        return false;
+    }
+    let (left_source_ms, left_target_ms) = v2_span_axis_durations_ms(left);
+    let (right_source_ms, right_target_ms) = v2_span_axis_durations_ms(right);
+    if left_source_ms.min(left_target_ms) < ALIGNMENT_V2_TEMPO_INTERNAL_SIDE_MIN_MS
+        || right_source_ms.min(right_target_ms) < ALIGNMENT_V2_TEMPO_INTERNAL_SIDE_MIN_MS
+    {
+        return false;
+    }
+    let Some(left_scale) = v2_matched_span_scale(left) else {
+        return false;
+    };
+    let Some(right_scale) = v2_matched_span_scale(right) else {
+        return false;
+    };
+    if (left_scale - right_scale).abs() > ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE
+        || ((left_scale + right_scale) / 2.0 - expected_scale).abs()
+            > ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE
+        || !v2_matched_scale_supports_skip_direction(left_scale, skip.kind)
+        || !v2_matched_scale_supports_skip_direction(right_scale, skip.kind)
+    {
+        return false;
+    }
+    v2_tempo_skip_improves_expected_fit(
+        left_source_ms.saturating_add(right_source_ms),
+        left_target_ms.saturating_add(right_target_ms),
+        skip,
+        expected_scale,
+    )
+}
+
+fn is_v2_supported_edge_tempo_skip(
+    skip: &AudioTimeMapSpanDto,
+    matched: &AudioTimeMapSpanDto,
+    expected_scale: f64,
+) -> bool {
+    if matched.kind != AudioTimeMapSpanKind::Matched
+        || !is_v2_short_tempo_skip(skip)
+        || !v2_tempo_skip_direction_matches_scale(skip, expected_scale)
+    {
+        return false;
+    }
+    let (source_ms, target_ms) = v2_span_axis_durations_ms(matched);
+    if source_ms.min(target_ms) < ALIGNMENT_V2_TEMPO_EDGE_SUPPORT_MIN_MS {
+        return false;
+    }
+    let Some(matched_scale) = v2_matched_span_scale(matched) else {
+        return false;
+    };
+    v2_matched_scale_supports_skip_direction(matched_scale, skip.kind)
+        && (matched_scale - expected_scale).abs() <= ALIGNMENT_V2_TEMPO_SLOPE_TOLERANCE
+        && v2_tempo_skip_improves_expected_fit(source_ms, target_ms, skip, expected_scale)
+}
+
+fn v2_span_axis_durations_ms(span: &AudioTimeMapSpanDto) -> (u64, u64) {
+    (
+        span.source_end_ms.saturating_sub(span.source_start_ms),
+        span.target_end_ms.saturating_sub(span.target_start_ms),
+    )
+}
+
+fn v2_matched_span_scale(span: &AudioTimeMapSpanDto) -> Option<f64> {
+    let (source_ms, target_ms) = v2_span_axis_durations_ms(span);
+    (span.kind == AudioTimeMapSpanKind::Matched && source_ms > 0 && target_ms > 0)
+        .then_some(target_ms as f64 / source_ms as f64)
+}
+
+fn v2_tempo_skip_direction_matches_scale(skip: &AudioTimeMapSpanDto, expected_scale: f64) -> bool {
+    match skip.kind {
+        AudioTimeMapSpanKind::TargetOnly => expected_scale > 1.0,
+        AudioTimeMapSpanKind::SourceOnly => expected_scale < 1.0,
+        AudioTimeMapSpanKind::Matched | AudioTimeMapSpanKind::Ambiguous => false,
+    }
+}
+
+fn v2_matched_scale_supports_skip_direction(
+    matched_scale: f64,
+    skip_kind: AudioTimeMapSpanKind,
+) -> bool {
+    match skip_kind {
+        AudioTimeMapSpanKind::TargetOnly => {
+            matched_scale > 1.0 + ALIGNMENT_V2_TEMPO_EDGE_DIRECTION_EPSILON
+        }
+        AudioTimeMapSpanKind::SourceOnly => {
+            matched_scale < 1.0 - ALIGNMENT_V2_TEMPO_EDGE_DIRECTION_EPSILON
+        }
+        AudioTimeMapSpanKind::Matched | AudioTimeMapSpanKind::Ambiguous => false,
+    }
+}
+
+fn v2_tempo_skip_improves_expected_fit(
+    base_source_ms: u64,
+    base_target_ms: u64,
+    skip: &AudioTimeMapSpanDto,
+    expected_scale: f64,
+) -> bool {
+    let (skip_source_ms, skip_target_ms) = v2_span_axis_durations_ms(skip);
+    v2_tempo_durations_improve_expected_fit(
+        base_source_ms,
+        base_target_ms,
+        skip_source_ms,
+        skip_target_ms,
+        expected_scale,
+    )
+}
+
+fn v2_tempo_durations_improve_expected_fit(
+    base_source_ms: u64,
+    base_target_ms: u64,
+    skip_source_ms: u64,
+    skip_target_ms: u64,
+    expected_scale: f64,
+) -> bool {
+    let base_residual_ms = (base_target_ms as f64 - expected_scale * base_source_ms as f64).abs();
+    let merged_residual_ms = ((base_target_ms.saturating_add(skip_target_ms)) as f64
+        - expected_scale * (base_source_ms.saturating_add(skip_source_ms)) as f64)
+        .abs();
+    merged_residual_ms + 0.5 < base_residual_ms
+        && merged_residual_ms <= ALIGNMENT_V2_TEMPO_SKIP_MAX_MS as f64
+}
+
+fn is_v2_short_tempo_skip(span: &AudioTimeMapSpanDto) -> bool {
+    let duration_ms = span
+        .source_end_ms
+        .saturating_sub(span.source_start_ms)
+        .max(span.target_end_ms.saturating_sub(span.target_start_ms));
+    matches!(
+        span.kind,
+        AudioTimeMapSpanKind::SourceOnly | AudioTimeMapSpanKind::TargetOnly
+    ) && duration_ms > 0
+        && duration_ms <= ALIGNMENT_V2_TEMPO_SKIP_MAX_MS
 }
 
 fn validate_v2_time_map_spans(spans: &[AudioTimeMapSpanDto]) -> Result<(), String> {
@@ -11800,7 +12247,8 @@ fn finalize_v2_span_evidence(
     spans: &mut [AudioTimeMapSpanDto],
     hypothesis: &AffineHypothesis,
     alternative_margin: f64,
-) {
+) -> V2FinalMapAnchorSummary {
+    let final_summary = v2_recompute_final_map_anchor_summary(spans, hypothesis);
     for (index, span) in spans.iter_mut().enumerate() {
         span.id = format!(
             "span-{}-{}-{}-{}-{}-{}",
@@ -11811,29 +12259,28 @@ fn finalize_v2_span_evidence(
             span.target_start_ms,
             span.target_end_ms
         );
-        let training = v2_anchors_in_span(&hypothesis.training_anchors, span);
-        let held_out = v2_anchors_in_span(&hypothesis.held_out_anchors, span);
-        let residuals = if held_out.is_empty() {
-            training
-                .iter()
-                .map(|item| item.residual_ms.max(0) as u64)
-                .collect::<Vec<_>>()
-        } else {
-            held_out
-                .iter()
-                .map(|item| item.residual_ms.max(0) as u64)
-                .collect::<Vec<_>>()
-        };
+        let training = v2_anchors_in_source_span(&hypothesis.training_anchors, span);
+        let held_out = v2_anchors_in_source_span(&hypothesis.held_out_anchors, span);
+        let training_residuals = training
+            .iter()
+            .filter_map(|item| v2_final_map_anchor_residual(std::slice::from_ref(&*span), item))
+            .collect::<Vec<_>>();
+        let residuals = held_out
+            .iter()
+            .filter_map(|item| v2_final_map_anchor_residual(std::slice::from_ref(&*span), item))
+            .collect::<Vec<_>>();
+        let held_out_unmapped_count = held_out.len().saturating_sub(residuals.len());
+        let training_unmapped_count = training.len().saturating_sub(training_residuals.len());
         let (p50_residual_ms, p95_residual_ms, p99_residual_ms, max_residual_ms) =
             v2_residual_statistics(&residuals);
         let validation_coverage = if held_out.is_empty() {
             None
         } else {
             Some(
-                held_out
+                residuals
                     .iter()
-                    .filter(|item| {
-                        item.residual_ms <= v2_affine_match_config().residual_tolerance_ms
+                    .filter(|residual| {
+                        **residual <= v2_affine_match_config().residual_tolerance_ms as u64
                     })
                     .count() as f64
                     / held_out.len() as f64,
@@ -11865,11 +12312,22 @@ fn finalize_v2_span_evidence(
         let no_independent_validation =
             span.kind == AudioTimeMapSpanKind::Matched && held_out.is_empty();
         let no_training_support = span.kind == AudioTimeMapSpanKind::Matched && training.is_empty();
+        let anchors_in_unmapped_span = span.kind != AudioTimeMapSpanKind::Matched
+            && (!training.is_empty() || !held_out.is_empty());
+        let final_residual_blocked = span.kind == AudioTimeMapSpanKind::Matched
+            && (held_out_unmapped_count > 0
+                || training_unmapped_count > 0
+                || validation_coverage.is_some_and(|value| value < 0.50)
+                || p95_residual_ms.is_some_and(|value| value > 400)
+                || p99_residual_ms.is_some_and(|value| value > 500)
+                || max_residual_ms.is_some_and(|value| value > 1_000));
         let blocked = span.kind == AudioTimeMapSpanKind::Ambiguous
             || boundary_conflict
             || boundary_blocked
             || no_training_support
-            || no_independent_validation;
+            || no_independent_validation
+            || anchors_in_unmapped_span
+            || final_residual_blocked;
         let mut reasons = vec![span.reason.clone()];
         if no_independent_validation {
             reasons
@@ -11881,6 +12339,24 @@ fn finalize_v2_span_evidence(
                 held_out.len()
             ));
         }
+        if held_out_unmapped_count > 0 || training_unmapped_count > 0 {
+            reasons.push(format!(
+                "最终分段 TimeMap 无法投影该 span 的 {} 个留出 anchor 和 {} 个训练 anchor；这些观测已计为失败而非被丢弃。",
+                held_out_unmapped_count, training_unmapped_count
+            ));
+        }
+        if anchors_in_unmapped_span {
+            reasons.push(format!(
+                "最终分段 TimeMap 将含 {} 个真实 anchor 的范围分类为不可投影内容，必须阻断复核。",
+                training.len().saturating_add(held_out.len())
+            ));
+        }
+        if final_residual_blocked {
+            reasons.push(format!(
+                "最终分段 TimeMap 重投影残差未通过门控：P95/P99/max={:?}/{:?}/{:?} ms。",
+                p95_residual_ms, p99_residual_ms, max_residual_ms
+            ));
+        }
         if no_training_support {
             reasons.push("该 matched span 范围内没有真实训练 anchor 支持。".to_string());
         }
@@ -11890,12 +12366,26 @@ fn finalize_v2_span_evidence(
         if boundary_conflict {
             reasons.push("局部边界存在竞争相关峰，不能唯一定位。".to_string());
         }
+        let final_graph_coverage = if span.kind == AudioTimeMapSpanKind::Matched {
+            validation_coverage.or(temporal_coverage)
+        } else {
+            Some(0.0)
+        };
+        let final_graph_unique_content_coverage = if span.kind == AudioTimeMapSpanKind::Matched {
+            temporal_coverage
+        } else {
+            Some(0.0)
+        };
         span.quality = AudioTimeMapSpanQualityDto {
             level: if blocked { "blocked" } else { "review" },
-            metric_source: "measured",
+            metric_source: if held_out.is_empty() {
+                "missing"
+            } else {
+                "measured"
+            },
             probability: None,
-            coverage: validation_coverage.or(temporal_coverage),
-            unique_content_coverage: temporal_coverage,
+            coverage: final_graph_coverage,
+            unique_content_coverage: final_graph_unique_content_coverage,
             alternative_margin: Some(alternative_margin),
             anchor_count: training.len().saturating_add(held_out.len()),
             held_out_anchor_count: held_out.len(),
@@ -11920,13 +12410,85 @@ fn finalize_v2_span_evidence(
             reasons,
         };
     }
+    final_summary
 }
 
-fn v2_anchors_in_span<'a>(
+#[derive(Debug, Default)]
+struct V2FinalMapAnchorSummary {
+    training_residuals: Vec<u64>,
+    held_out_residuals: Vec<u64>,
+    training_unmapped_count: usize,
+    held_out_unmapped_count: usize,
+    held_out_within_tolerance_count: usize,
+}
+
+fn v2_recompute_final_map_anchor_summary(
+    spans: &[AudioTimeMapSpanDto],
+    hypothesis: &AffineHypothesis,
+) -> V2FinalMapAnchorSummary {
+    let training_residuals = hypothesis
+        .training_anchors
+        .iter()
+        .filter_map(|anchor| v2_final_map_anchor_residual(spans, anchor))
+        .collect::<Vec<_>>();
+    let held_out_residuals = hypothesis
+        .held_out_anchors
+        .iter()
+        .filter_map(|anchor| v2_final_map_anchor_residual(spans, anchor))
+        .collect::<Vec<_>>();
+    let held_out_within_tolerance_count = held_out_residuals
+        .iter()
+        .filter(|residual| **residual <= v2_affine_match_config().residual_tolerance_ms as u64)
+        .count();
+    V2FinalMapAnchorSummary {
+        training_unmapped_count: hypothesis
+            .training_anchors
+            .len()
+            .saturating_sub(training_residuals.len()),
+        held_out_unmapped_count: hypothesis
+            .held_out_anchors
+            .len()
+            .saturating_sub(held_out_residuals.len()),
+        training_residuals,
+        held_out_residuals,
+        held_out_within_tolerance_count,
+    }
+}
+
+fn v2_final_map_anchor_residual(
+    spans: &[AudioTimeMapSpanDto],
+    anchor: &AffineAnchorEvidence,
+) -> Option<u64> {
+    let source_ms = u64::try_from(anchor.source_time_ms).ok()?;
+    let expected_target_ms = u64::try_from(anchor.target_time_ms).ok()?;
+    let matched = spans.iter().find(|span| {
+        span.kind == AudioTimeMapSpanKind::Matched
+            && source_ms >= span.source_start_ms
+            && source_ms < span.source_end_ms
+    })?;
+    let source_duration_ms = matched.source_end_ms.checked_sub(matched.source_start_ms)?;
+    let target_duration_ms = matched.target_end_ms.checked_sub(matched.target_start_ms)?;
+    if source_duration_ms == 0 || target_duration_ms == 0 {
+        return None;
+    }
+    let source_delta_ms = source_ms.checked_sub(matched.source_start_ms)?;
+    let scaled_delta = u128::from(source_delta_ms)
+        .checked_mul(u128::from(target_duration_ms))?
+        .checked_add(u128::from(source_duration_ms / 2))?
+        / u128::from(source_duration_ms);
+    let mapped_target_ms = u128::from(matched.target_start_ms).checked_add(scaled_delta)?;
+    let mapped_target_ms = u64::try_from(mapped_target_ms).ok()?;
+    // Keep validation bit-for-bit aligned with export_files::map_signed_source_time: spans are
+    // half-open, so rounded interpolation may never escape to target_end_ms.
+    let mapped_target_ms = mapped_target_ms.min(matched.target_end_ms.checked_sub(1)?);
+    Some(mapped_target_ms.abs_diff(expected_target_ms))
+}
+
+fn v2_anchors_in_source_span<'a>(
     anchors: &'a [AffineAnchorEvidence],
     span: &AudioTimeMapSpanDto,
 ) -> Vec<&'a AffineAnchorEvidence> {
-    if span.kind != AudioTimeMapSpanKind::Matched {
+    if span.source_end_ms <= span.source_start_ms {
         return Vec::new();
     }
     anchors
@@ -12059,6 +12621,26 @@ fn v2_source_time_region_count(
     occupied.into_iter().filter(|value| *value).count()
 }
 
+fn v2_matched_source_coverage(spans: &[AudioTimeMapSpanDto]) -> f64 {
+    let Some(first) = spans.first() else {
+        return 0.0;
+    };
+    let source_end_ms = spans
+        .last()
+        .map(|span| span.source_end_ms)
+        .unwrap_or(first.source_start_ms);
+    let source_duration_ms = source_end_ms.saturating_sub(first.source_start_ms);
+    if source_duration_ms == 0 {
+        return 0.0;
+    }
+    let matched_source_ms = spans
+        .iter()
+        .filter(|span| span.kind == AudioTimeMapSpanKind::Matched)
+        .map(|span| span.source_end_ms.saturating_sub(span.source_start_ms))
+        .sum::<u64>();
+    (matched_source_ms as f64 / source_duration_ms as f64).clamp(0.0, 1.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_v2_alignment_proposal(
     mut alignment: V2ChunkAlignment,
@@ -12070,7 +12652,8 @@ fn create_v2_alignment_proposal(
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     mut diagnostics: Vec<String>,
 ) -> AudioAlignmentProposal {
-    finalize_v2_span_evidence(&mut alignment.spans, &pair.hypothesis, top1_top2_margin);
+    let final_anchor_summary =
+        finalize_v2_span_evidence(&mut alignment.spans, &pair.hypothesis, top1_top2_margin);
     let source_start_ms = alignment
         .spans
         .first()
@@ -12098,49 +12681,44 @@ fn create_v2_alignment_proposal(
         .filter(|span| span.kind == AudioTimeMapSpanKind::Matched)
         .map(|span| span.target_end_ms.saturating_sub(span.target_start_ms))
         .sum::<u64>();
-    let coverage = (matched_target_ms as f64 / target_duration_ms as f64).clamp(0.0, 1.0);
+    let target_matched_ratio =
+        (matched_target_ms as f64 / target_duration_ms as f64).clamp(0.0, 1.0);
+    // A legitimate targetOnly insertion must not lower source mapping coverage. This is the
+    // authoritative coverage consumed by proposal confidence and the fine frontier.
+    let coverage = v2_matched_source_coverage(&alignment.spans);
     let ambiguous_span_count = alignment
         .spans
         .iter()
         .filter(|span| span.kind == AudioTimeMapSpanKind::Ambiguous)
         .count();
-    let held_out_residuals = pair
-        .hypothesis
-        .held_out_anchors
-        .iter()
-        .map(|item| item.residual_ms.max(0) as u64)
-        .collect::<Vec<_>>();
-    let training_residuals = pair
-        .hypothesis
-        .training_anchors
-        .iter()
-        .map(|item| item.residual_ms.max(0) as u64)
-        .collect::<Vec<_>>();
-    let graph_residuals = if held_out_residuals.is_empty() {
-        training_residuals.as_slice()
-    } else {
-        held_out_residuals.as_slice()
-    };
     let (
         graph_p50_residual_ms,
         graph_p95_residual_ms,
         graph_p99_residual_ms,
         graph_max_residual_ms,
-    ) = v2_residual_statistics(graph_residuals);
+    ) = v2_residual_statistics(&final_anchor_summary.held_out_residuals);
     let held_out_validation_coverage = if pair.hypothesis.held_out_anchors.is_empty() {
         None
     } else {
         Some(
-            pair.hypothesis.held_out_within_tolerance_count as f64
+            final_anchor_summary.held_out_within_tolerance_count as f64
                 / pair.hypothesis.held_out_anchors.len() as f64,
         )
     };
     let catastrophic = coverage < 0.50
+        || final_anchor_summary.held_out_unmapped_count > 0
+        || final_anchor_summary.training_unmapped_count > 0
         || graph_p95_residual_ms.is_none_or(|value| value > 400)
         || graph_p99_residual_ms.is_none_or(|value| value > 500)
         || graph_max_residual_ms.is_none_or(|value| value > 1_000)
         || held_out_validation_coverage.is_some_and(|value| value < 0.50);
+    let blocked_span_count = alignment
+        .spans
+        .iter()
+        .filter(|span| span.quality.level == "blocked")
+        .count();
     let blocked = catastrophic
+        || blocked_span_count > 0
         || ambiguous_span_count > 0
         || alignment.matched_step_count == 0
         || top1_top2_margin < minimum_alternative_margin
@@ -12149,12 +12727,14 @@ fn create_v2_alignment_proposal(
     let mut quality_reasons = Vec::new();
     if catastrophic {
         quality_reasons.push(format!(
-            "灾难性门控：coverage {:.3}、验证 P95 {:?} ms、P99 {:?} ms、max {:?} ms、留出成功率 {:?}。",
+            "灾难性门控：final-map source coverage {:.3}、验证 P95 {:?} ms、P99 {:?} ms、max {:?} ms、留出成功率 {:?}、未映射训练/留出 anchor={}/{}。",
             coverage,
             graph_p95_residual_ms,
             graph_p99_residual_ms,
             graph_max_residual_ms,
-            held_out_validation_coverage
+            held_out_validation_coverage,
+            final_anchor_summary.training_unmapped_count,
+            final_anchor_summary.held_out_unmapped_count
         ));
     }
     if pair.hypothesis.held_out_anchors.is_empty() {
@@ -12166,8 +12746,13 @@ fn create_v2_alignment_proposal(
         quality_reasons.push(format!(
             "独立留出验证覆盖率 {:.1}%（{} / {} 个 source landmark 在残差阈值内）；留出未参与 seed、候选排名或重拟合。",
             validation_coverage * 100.0,
-            pair.hypothesis.held_out_within_tolerance_count,
+            final_anchor_summary.held_out_within_tolerance_count,
             pair.hypothesis.held_out_anchors.len()
+        ));
+    }
+    if blocked_span_count > 0 {
+        quality_reasons.push(format!(
+            "最终分段 TimeMap 有 {blocked_span_count} 个 span 未通过逐段留出残差、边界或支持门控。"
         ));
     }
     if ambiguous_span_count > 0 {
@@ -12195,27 +12780,33 @@ fn create_v2_alignment_proposal(
             .push("真实媒体冻结集和概率校准尚未完成；该结果最高只能进入人工复核。".to_string());
     }
     diagnostics.push(format!(
-        "Alignment V2 输出 {} 个 span（matched steps {}，ambiguous steps {}），目标覆盖率 {:.1}%。",
+        "Alignment V2 输出 {} 个 span（matched steps {}，ambiguous steps {}），final-map 来源覆盖率 {:.1}%，目标 matched 比例 {:.1}%。",
         alignment.spans.len(),
         alignment.matched_step_count,
         alignment.ambiguous_step_count,
-        coverage * 100.0
+        coverage * 100.0,
+        target_matched_ratio * 100.0
     ));
     diagnostics.push(format!(
-        "Affine：scale {:.8}，offset {:+} ms，训练内点 {}，留出 {}（阈值内 {}），验证 P50/P95/P99/max={:?}/{:?}/{:?}/{:?} ms。",
+        "Final TimeMap：coarse scale {:.8}，offset {:+} ms，训练 anchor {} 个（最终图可投影 {}，未映射 {}），留出 {} 个（最终图阈值内 {}，未映射 {}），重投影 P50/P95/P99/max={:?}/{:?}/{:?}/{:?} ms。",
         pair.hypothesis.scale,
         pair.hypothesis.offset_ms,
-        pair.hypothesis.inlier_count,
+        pair.hypothesis.training_anchors.len(),
+        final_anchor_summary.training_residuals.len(),
+        final_anchor_summary.training_unmapped_count,
         pair.hypothesis.held_out_anchors.len(),
-        pair.hypothesis.held_out_within_tolerance_count,
+        final_anchor_summary.held_out_within_tolerance_count,
+        final_anchor_summary.held_out_unmapped_count,
         graph_p50_residual_ms,
         graph_p95_residual_ms,
         graph_p99_residual_ms,
         graph_max_residual_ms
     ));
     diagnostics.extend(quality_reasons.clone());
-    let anchors =
-        create_v2_compatibility_anchors(&alignment.spans, pair.hypothesis.p95_residual_ms, blocked);
+    let compatibility_p95 = graph_p95_residual_ms
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or(i64::MAX);
+    let anchors = create_v2_compatibility_anchors(&alignment.spans, compatibility_p95, blocked);
     let cut_candidates = create_v2_compatibility_cut_candidates(&alignment.spans, blocked);
     let parameters_hash = create_v2_parameters_hash(&pair);
     let anchor_region_count =
@@ -12228,7 +12819,11 @@ fn create_v2_alignment_proposal(
         spans: alignment.spans.clone(),
         quality: AudioTimeMapQualityDto {
             level: quality_level,
-            metric_source: "measured",
+            metric_source: if pair.hypothesis.held_out_anchors.is_empty() {
+                "missing"
+            } else {
+                "measured"
+            },
             probability: None,
             coverage: Some(coverage),
             unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
@@ -12476,41 +13071,49 @@ fn create_blocked_v2_affine_proposal(
         target_start_ms,
         target_end_ms,
     )];
-    finalize_v2_span_evidence(&mut spans, &pair.hypothesis, margin);
-    let held_out_residuals = pair
-        .hypothesis
-        .held_out_anchors
-        .iter()
-        .map(|item| item.residual_ms.max(0) as u64)
-        .collect::<Vec<_>>();
-    let training_residuals = pair
-        .hypothesis
-        .training_anchors
-        .iter()
-        .map(|item| item.residual_ms.max(0) as u64)
-        .collect::<Vec<_>>();
-    let residuals = if held_out_residuals.is_empty() {
-        training_residuals.as_slice()
-    } else {
-        held_out_residuals.as_slice()
-    };
+    let final_anchor_summary = finalize_v2_span_evidence(&mut spans, &pair.hypothesis, margin);
     let (p50_residual_ms, p95_residual_ms, p99_residual_ms, max_residual_ms) =
-        v2_residual_statistics(residuals);
+        v2_residual_statistics(&final_anchor_summary.held_out_residuals);
+    let coverage = v2_matched_source_coverage(&spans);
+    let held_out_validation_coverage = if pair.hypothesis.held_out_anchors.is_empty() {
+        None
+    } else {
+        Some(
+            final_anchor_summary.held_out_within_tolerance_count as f64
+                / pair.hypothesis.held_out_anchors.len() as f64,
+        )
+    };
     let anchor_region_count =
         v2_anchor_region_count(&pair.hypothesis, source_start_ms, source_end_ms);
     let mut blocked_reasons = vec![reason.to_string()];
     if pair.hypothesis.held_out_anchors.is_empty() {
         blocked_reasons.push("没有可用的独立留出 source landmark。".to_string());
-    } else {
+    } else if let Some(validation_coverage) = held_out_validation_coverage {
         blocked_reasons.push(format!(
             "独立留出验证覆盖率 {:.1}%（{} / {} 个在残差阈值内）。",
-            pair.hypothesis.held_out_within_tolerance_count as f64
-                / pair.hypothesis.held_out_anchors.len() as f64
-                * 100.0,
-            pair.hypothesis.held_out_within_tolerance_count,
+            validation_coverage * 100.0,
+            final_anchor_summary.held_out_within_tolerance_count,
             pair.hypothesis.held_out_anchors.len()
         ));
     }
+    blocked_reasons.push(format!(
+        "最终阻断 TimeMap 未映射训练/留出 anchor={}/{}；残差与覆盖率不会回退 coarse affine 结果。",
+        final_anchor_summary.training_unmapped_count, final_anchor_summary.held_out_unmapped_count
+    ));
+    proposal.diagnostics.push(format!(
+        "Final blocked TimeMap：source coverage {:.1}%，训练 anchor {} 个（最终图可投影 {}，未映射 {}），留出 {} 个（最终图阈值内 {}，未映射 {}），重投影 P50/P95/P99/max={:?}/{:?}/{:?}/{:?} ms；未使用 coarse residual fallback。",
+        coverage * 100.0,
+        pair.hypothesis.training_anchors.len(),
+        final_anchor_summary.training_residuals.len(),
+        final_anchor_summary.training_unmapped_count,
+        pair.hypothesis.held_out_anchors.len(),
+        final_anchor_summary.held_out_within_tolerance_count,
+        final_anchor_summary.held_out_unmapped_count,
+        p50_residual_ms,
+        p95_residual_ms,
+        p99_residual_ms,
+        max_residual_ms
+    ));
     let time_map = AudioAlignmentTimeMapDto {
         source_start_ms,
         source_end_ms,
@@ -12519,10 +13122,14 @@ fn create_blocked_v2_affine_proposal(
         spans,
         quality: AudioTimeMapQualityDto {
             level: "blocked",
-            metric_source: "measured",
+            metric_source: if pair.hypothesis.held_out_anchors.is_empty() {
+                "missing"
+            } else {
+                "measured"
+            },
             probability: None,
-            coverage: Some(pair.temporal_coverage.clamp(0.0, 1.0)),
-            unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
+            coverage: Some(coverage),
+            unique_content_coverage: Some(coverage),
             p50_residual_ms,
             p95_residual_ms,
             p99_residual_ms,
@@ -12546,7 +13153,7 @@ fn create_blocked_v2_affine_proposal(
             visual_anchor_count: 0,
             held_out_anchor_count: pair.hypothesis.held_out_anchors.len(),
             top1_top2_margin: Some(margin),
-            unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
+            unique_content_coverage: Some(coverage),
             repeated_content_only: pair.repeated_content_only,
             selected_track_reason,
             alternative_track_scores: alternatives,
@@ -12567,7 +13174,7 @@ fn create_blocked_v2_affine_proposal(
         source_end_ms,
         target_start_ms,
         target_end_ms,
-        coverage: pair.temporal_coverage.clamp(0.0, 1.0),
+        coverage,
     });
     proposal.time_map = Some(time_map);
     proposal
@@ -13584,6 +14191,7 @@ fn run_audio_alignment_job(
     job_id: String,
     cancel_flag: Arc<AtomicBool>,
     request: AudioAlignmentRequest,
+    spectral_backend_request: SpectralBackendRequest,
 ) {
     let mut update = |progress: f64, message: &str| {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -13598,7 +14206,12 @@ fn run_audio_alignment_job(
             None,
         )
     };
-    let result = align_audio_files_with_progress(request, &mut update, Some(cancel_flag.as_ref()));
+    let result = align_audio_files_with_progress_and_spectral_backend_request(
+        request,
+        spectral_backend_request,
+        &mut update,
+        Some(cancel_flag.as_ref()),
+    );
     if cancel_flag.load(Ordering::Relaxed) {
         let _ = update_audio_alignment_job(
             &job_id,
@@ -13794,13 +14407,17 @@ fn plan_audio_alignment_batch(
     let first = pairs
         .first()
         .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())?;
-    create_options(&first.request)?;
+    // Resolve the request-local backend policy exactly once before the worker starts. The batch
+    // carries this immutable capability snapshot so later media/pair workers never re-read the
+    // process environment or silently change policy mid-run.
+    let spectral_backend_request = create_options(&first.request)?.spectral_backend_request;
     Ok(PlannedAudioAlignmentBatch {
         pairing_mode,
         source_media_ids,
         target_media_ids,
         media,
         pairs,
+        spectral_backend_request,
     })
 }
 
@@ -13833,6 +14450,7 @@ fn create_planned_audio_alignment_batch_pair(
             source_audio_stream_index: source.audio_stream_index,
             complete_video_stream_index: target.video_stream_index,
             source_video_stream_index: source.video_stream_index,
+            spectral_backend: batch.spectral_backend,
             sample_rate: batch.sample_rate,
             window_ms: batch.window_ms,
             match_threshold: batch.match_threshold,
@@ -13957,19 +14575,7 @@ fn prepare_audio_alignment_batch_media(
     cancel_flag: &AtomicBool,
 ) -> Result<Vec<PreparedAudioAlignmentBatchMediaState>, String> {
     let toolchain_cache_identity = audio_alignment_toolchain_cache_identity(options)?.to_string();
-    let spectral_backend_request = match resolve_spectral_backend_request() {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(plan
-                .media
-                .iter()
-                .map(|_| PreparedAudioAlignmentBatchMediaState::Failed {
-                    error: error.clone(),
-                    physical_group_index: None,
-                })
-                .collect());
-        }
-    };
+    let spectral_backend_request = &options.spectral_backend_request;
     let mut batch_retained_artifact_bytes = 0_usize;
     let mut physical_groups =
         HashMap::<PhysicalFileObjectKey, (usize, Arc<PinnedPhysicalFile>)>::new();
@@ -14057,7 +14663,7 @@ fn prepare_audio_alignment_batch_media(
                     &mut V2CandidateExtractionState {
                         notes: &mut extraction_notes,
                         retained_artifact_bytes: &mut combined_retained_artifact_bytes,
-                        spectral_backend_request: &spectral_backend_request,
+                        spectral_backend_request,
                     },
                 )?;
                 if landmarks.is_empty() {
@@ -15416,8 +16022,12 @@ fn run_audio_alignment_batch_job(
         .pairs
         .first()
         .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())
-        .and_then(|pair| create_pinned_audio_alignment_options(&pair.request))
-    {
+        .and_then(|pair| {
+            create_pinned_audio_alignment_options_with_spectral_backend_request(
+                &pair.request,
+                &plan.spectral_backend_request,
+            )
+        }) {
         Ok(pinned) => pinned,
         Err(error) => {
             let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
@@ -17192,7 +17802,24 @@ fn invalidate_audio_alignment_batch_after_final_identity_failure(
     Ok(())
 }
 
+fn resolve_audio_alignment_request_spectral_backend(
+    request: &AudioAlignmentRequest,
+) -> Result<SpectralBackendRequest, String> {
+    match request.spectral_backend {
+        Some(preference) => resolve_spectral_backend_preference(preference),
+        None => resolve_spectral_backend_request(),
+    }
+}
+
 fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptions, String> {
+    let spectral_backend_request = resolve_audio_alignment_request_spectral_backend(request)?;
+    create_options_with_spectral_backend_request(request, spectral_backend_request)
+}
+
+fn create_options_with_spectral_backend_request(
+    request: &AudioAlignmentRequest,
+    spectral_backend_request: SpectralBackendRequest,
+) -> Result<AudioAlignmentOptions, String> {
     let sample_rate = request.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
     let window_ms = request.window_ms.unwrap_or(DEFAULT_WINDOW_MS);
     let match_threshold = request.match_threshold.unwrap_or(DEFAULT_MATCH_THRESHOLD);
@@ -17235,6 +17862,7 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
         max_cells,
         ffmpeg_path,
         ffprobe_path,
+        spectral_backend_request,
         toolchain_cache_identity: None,
         enable_visual_evidence: request.enable_visual_evidence.unwrap_or(false),
         visual_sample_interval_ms,
@@ -17242,10 +17870,27 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
     })
 }
 
+#[cfg(test)]
 fn create_pinned_audio_alignment_options(
     request: &AudioAlignmentRequest,
 ) -> Result<(AudioAlignmentOptions, PinnedMediaToolchain), String> {
-    let mut options = create_options(request)?;
+    pin_audio_alignment_options(request, create_options(request)?)
+}
+
+fn create_pinned_audio_alignment_options_with_spectral_backend_request(
+    request: &AudioAlignmentRequest,
+    spectral_backend_request: &SpectralBackendRequest,
+) -> Result<(AudioAlignmentOptions, PinnedMediaToolchain), String> {
+    pin_audio_alignment_options(
+        request,
+        create_options_with_spectral_backend_request(request, spectral_backend_request.clone())?,
+    )
+}
+
+fn pin_audio_alignment_options(
+    request: &AudioAlignmentRequest,
+    mut options: AudioAlignmentOptions,
+) -> Result<(AudioAlignmentOptions, PinnedMediaToolchain), String> {
     let toolchain = PinnedMediaToolchain::pin(
         request.ffmpeg_path.as_deref(),
         request.ffprobe_path.as_deref(),
@@ -20622,6 +21267,7 @@ mod tests {
             source_audio_stream_index: None,
             complete_video_stream_index: None,
             source_video_stream_index: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -20658,6 +21304,10 @@ mod tests {
             max_cells: 1_000_000,
             ffmpeg_path: "ffmpeg".to_string(),
             ffprobe_path: PathBuf::from("ffprobe"),
+            spectral_backend_request: resolve_spectral_backend_preference(
+                SpectralBackendPreference::Cpu,
+            )
+            .expect("CPU backend fixture"),
             toolchain_cache_identity: Some("toolchain=test-fixture-v1".to_string()),
             enable_visual_evidence: false,
             visual_sample_interval_ms: DEFAULT_VISUAL_SAMPLE_INTERVAL_MS,
@@ -20767,8 +21417,10 @@ mod tests {
             .map(|(index, label)| {
                 let mut values = vec![0.0f32; 32];
                 values[*label] = 1.0;
+                let presentation_time_ms = start_ms + index as i64 * hop_ms;
                 FineFeatureFrame {
-                    time_ms: start_ms + index as i64 * hop_ms,
+                    time_ms: presentation_time_ms,
+                    presentation_time_ms,
                     values,
                 }
             })
@@ -20796,8 +21448,10 @@ mod tests {
                 for value in &mut values {
                     *value = (f64::from(*value) / norm) as f32;
                 }
+                let presentation_time_ms = start_ms + index as i64 * hop_ms;
                 FineFeatureFrame {
-                    time_ms: start_ms + index as i64 * hop_ms,
+                    time_ms: presentation_time_ms,
+                    presentation_time_ms,
                     values,
                 }
             })
@@ -20844,6 +21498,39 @@ mod tests {
         }
     }
 
+    fn v2_test_final_map_hypothesis(scale: f64, stored_residual_ms: i64) -> AffineHypothesis {
+        let create_anchor = |source_time_ms: i64| AffineAnchorEvidence {
+            source_time_ms,
+            target_time_ms: (scale * source_time_ms as f64).round() as i64,
+            residual_ms: stored_residual_ms,
+        };
+        let training_anchors = [1_000, 10_000, 20_000, 30_000, 40_000, 49_000]
+            .into_iter()
+            .map(create_anchor)
+            .collect::<Vec<_>>();
+        let held_out_anchors = [5_000, 15_000, 25_000, 35_000, 45_000]
+            .into_iter()
+            .map(create_anchor)
+            .collect::<Vec<_>>();
+        AffineHypothesis {
+            scale,
+            offset_ms: 0,
+            inlier_count: training_anchors.len(),
+            unique_source_count: training_anchors.len(),
+            unique_source_coverage: 0.96,
+            unique_target_count: training_anchors.len(),
+            unique_target_coverage: 0.96,
+            source_start_ms: 0,
+            source_end_ms: 50_000,
+            p50_residual_ms: stored_residual_ms,
+            p95_residual_ms: stored_residual_ms,
+            max_residual_ms: stored_residual_ms,
+            training_anchors,
+            held_out_within_tolerance_count: held_out_anchors.len(),
+            held_out_anchors,
+        }
+    }
+
     fn v2_test_pair_candidate() -> V2TrackPairCandidate {
         let source_input = test_audio_input(1, 80);
         let mut target_input = test_audio_input(2, 120);
@@ -20852,7 +21539,10 @@ mod tests {
             source_input,
             target_input,
             coarse_hypothesis: None,
-            hypothesis: v2_test_hypothesis(1.02, 500),
+            // Default proposal fixtures use an identity final TimeMap. Tests that exercise
+            // non-unit slopes replace this hypothesis explicitly so final-map residual gates do
+            // not accidentally compare an identity span against unrelated affine evidence.
+            hypothesis: v2_test_hypothesis(1.0, 0),
             score: 0.8,
             temporal_coverage: 0.75,
             intrinsic_margin: 0.5,
@@ -22788,6 +23478,7 @@ mod tests {
 
         assert!(first.contains(ALIGNMENT_V2_ENGINE_VERSION));
         assert!(first.contains(ALIGNMENT_V2_FEATURE_VERSION));
+        assert!(first.contains("requestedSpectralBackend=cpu"));
         assert!(first.contains("ptsOrigin=-80"));
         assert!(first.contains("streamPtsOffset=80"));
         assert!(first.contains(crate::alignment_v2::CPU_SPECTRAL_BACKEND_ID));
@@ -22795,6 +23486,44 @@ mod tests {
         assert_ne!(first, cuda_key);
         assert_ne!(first, other_stream);
         assert_ne!(first, other_pts);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_cache_key_binds_requested_policy_separately_from_actual_backend() {
+        let path = temp_audio_cache_path("v2-cache-policy");
+        std::fs::write(&path, b"media-policy").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let mut cpu_options = test_options();
+        cpu_options.spectral_backend_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        let mut auto_options = test_options();
+        auto_options.spectral_backend_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Auto).unwrap();
+        let input = test_audio_input(1, 80);
+
+        let cpu_key = create_v2_audio_cache_key_for_backend(
+            &path_text,
+            &cpu_options,
+            &input,
+            "landmark",
+            CPU_SPECTRAL_BACKEND_ID,
+        )
+        .unwrap();
+        let auto_cpu_key = create_v2_audio_cache_key_for_backend(
+            &path_text,
+            &auto_options,
+            &input,
+            "landmark",
+            CPU_SPECTRAL_BACKEND_ID,
+        )
+        .unwrap();
+
+        assert!(cpu_key.contains("requestedSpectralBackend=cpu"));
+        assert!(auto_cpu_key.contains("requestedSpectralBackend=auto"));
+        assert!(cpu_key.contains(CPU_SPECTRAL_BACKEND_ID));
+        assert!(auto_cpu_key.contains(CPU_SPECTRAL_BACKEND_ID));
+        assert_ne!(cpu_key, auto_cpu_key);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -22989,6 +23718,184 @@ mod tests {
         assert!(kinds.contains(&AudioTimeMapSpanKind::TargetOnly));
         assert!(kinds.contains(&AudioTimeMapSpanKind::Matched));
         validate_v2_time_map_spans(&result.spans).unwrap();
+    }
+
+    #[test]
+    fn v2_short_real_edits_survive_thresholds_even_when_coarse_tempo_is_biased() {
+        for duration_ms in [50, 100, 101] {
+            let mut target_only = vec![
+                create_v2_span(AudioTimeMapSpanKind::Matched, 0, 5_000, 0, 5_000),
+                create_v2_span(
+                    AudioTimeMapSpanKind::TargetOnly,
+                    5_000,
+                    5_000,
+                    5_000,
+                    5_000 + duration_ms,
+                ),
+                create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    5_000,
+                    10_000,
+                    5_000 + duration_ms,
+                    10_000 + duration_ms,
+                ),
+            ];
+            absorb_v2_short_tempo_skips(&mut target_only, 1.02);
+            assert_eq!(target_only.len(), 3, "duration={duration_ms}");
+            assert_eq!(target_only[1].kind, AudioTimeMapSpanKind::TargetOnly);
+            validate_v2_time_map_spans(&target_only).unwrap();
+
+            let mut source_only = vec![
+                create_v2_span(AudioTimeMapSpanKind::Matched, 0, 5_000, 0, 5_000),
+                create_v2_span(
+                    AudioTimeMapSpanKind::SourceOnly,
+                    5_000,
+                    5_000 + duration_ms,
+                    5_000,
+                    5_000,
+                ),
+                create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    5_000 + duration_ms,
+                    10_000 + duration_ms,
+                    5_000,
+                    10_000,
+                ),
+            ];
+            absorb_v2_short_tempo_skips(&mut source_only, 0.98);
+            assert_eq!(source_only.len(), 3, "duration={duration_ms}");
+            assert_eq!(source_only[1].kind, AudioTimeMapSpanKind::SourceOnly);
+            validate_v2_time_map_spans(&source_only).unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_repeated_real_microdeletes_are_not_reclassified_as_tempo() {
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 2_500, 0, 2_500),
+            create_v2_span(AudioTimeMapSpanKind::SourceOnly, 2_500, 2_550, 2_500, 2_500),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 2_550, 5_050, 2_500, 5_000),
+            create_v2_span(AudioTimeMapSpanKind::SourceOnly, 5_050, 5_150, 5_000, 5_000),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 5_150, 7_650, 5_000, 7_500),
+        ];
+
+        absorb_v2_short_tempo_skips(&mut spans, 0.98);
+
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.kind == AudioTimeMapSpanKind::SourceOnly)
+                .count(),
+            2
+        );
+        validate_v2_time_map_spans(&spans).unwrap();
+    }
+
+    #[test]
+    fn v2_repeated_regular_lattice_skips_form_tempo_evidence() {
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 2_500, 0, 2_500),
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 2_500, 2_500, 2_500, 2_550),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 2_500, 5_000, 2_550, 5_050),
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 5_000, 5_000, 5_050, 5_100),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 5_000, 7_500, 5_100, 7_600),
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 7_500, 7_500, 7_600, 7_650),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 7_500, 10_000, 7_650, 10_150),
+        ];
+
+        absorb_v2_short_tempo_skips(&mut spans, 1.02);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].kind, AudioTimeMapSpanKind::Matched);
+        assert_eq!(spans[0].source_end_ms, 10_000);
+        assert_eq!(spans[0].target_end_ms, 10_150);
+    }
+
+    #[test]
+    fn v2_prefix_and_suffix_tempo_skips_require_extrapolation_evidence() {
+        let mut unsupported_prefix = vec![
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 0, 0, 0, 50),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 50, 10_050),
+        ];
+        absorb_v2_short_tempo_skips(&mut unsupported_prefix, 1.005);
+        assert_eq!(unsupported_prefix.len(), 2);
+
+        let mut unsupported_suffix = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 0, 10_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::TargetOnly,
+                10_000,
+                10_000,
+                10_000,
+                10_050,
+            ),
+        ];
+        absorb_v2_short_tempo_skips(&mut unsupported_suffix, 1.005);
+        assert_eq!(unsupported_suffix.len(), 2);
+
+        let mut supported_prefix = vec![
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 0, 0, 0, 50),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 50, 10_150),
+        ];
+        absorb_v2_short_tempo_skips(&mut supported_prefix, 1.015);
+        assert_eq!(supported_prefix.len(), 1);
+        assert_eq!(supported_prefix[0].target_end_ms, 10_150);
+
+        let mut supported_suffix = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 0, 10_100),
+            create_v2_span(
+                AudioTimeMapSpanKind::TargetOnly,
+                10_000,
+                10_000,
+                10_100,
+                10_150,
+            ),
+        ];
+        absorb_v2_short_tempo_skips(&mut supported_suffix, 1.015);
+        assert_eq!(supported_suffix.len(), 1);
+        assert_eq!(supported_suffix[0].target_end_ms, 10_150);
+    }
+
+    #[test]
+    fn v2_equal_hop_scale_1_02_outputs_real_slope_without_false_edit_or_end_drift() {
+        let source_ids = (0..200usize).collect::<Vec<_>>();
+        let target_ids = (0..204usize)
+            .map(|index| ((index as f64) / 1.02).floor() as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(target_ids.last(), Some(&199));
+        let source = v2_distinct_features(&source_ids, 0, 50);
+        let target = v2_distinct_features(&target_ids, 0, 50);
+        let coarse = v2_test_hypothesis(1.02, 0);
+
+        let result =
+            align_v2_feature_chunks(&source, &target, &coarse, &test_options(), 0, None).unwrap();
+        validate_v2_time_map_spans(&result.spans).unwrap();
+        assert!(
+            result
+                .spans
+                .iter()
+                .all(|span| span.kind == AudioTimeMapSpanKind::Matched),
+            "constant tempo drift must not become a version edit: {:?}",
+            result.spans
+        );
+        let first = result.spans.first().unwrap();
+        let last = result.spans.last().unwrap();
+        let source_duration_ms = last.source_end_ms - first.source_start_ms;
+        let target_duration_ms = last.target_end_ms - first.target_start_ms;
+        let final_scale = target_duration_ms as f64 / source_duration_ms as f64;
+        assert!(
+            (final_scale - 1.02).abs() <= 0.005,
+            "scale={final_scale}, spans={:?}",
+            result.spans
+        );
+        let projected_source_end_ms = first.target_start_ms as f64
+            + (last.source_end_ms - first.source_start_ms) as f64 * final_scale;
+        assert!(
+            (projected_source_end_ms - last.target_end_ms as f64).abs() <= 50.0,
+            "end drift={} ms, spans={:?}",
+            projected_source_end_ms - last.target_end_ms as f64,
+            result.spans
+        );
     }
 
     #[test]
@@ -23357,12 +24264,12 @@ mod tests {
             v2_coarse_stage_budget_for_backend_id(&short, CPU_SPECTRAL_BACKEND_ID).unwrap();
         let short_cuda =
             v2_coarse_stage_budget_for_backend_id(&short, CUDA_FFT_BACKEND_ID).unwrap();
-        assert_eq!(short_cpu.final_artifact_bytes, 156_096_000);
+        assert_eq!(short_cpu.final_artifact_bytes, 156_672_000);
         assert_eq!(short_cpu.decode_phase_bytes, 347_697_152);
-        assert_eq!(short_cpu.analysis_phase_bytes, 299_497_152);
+        assert_eq!(short_cpu.analysis_phase_bytes, 300_073_152);
         assert_eq!(short_cpu.peak_additional_bytes, 347_697_152);
-        assert_eq!(short_cuda.analysis_phase_bytes, 475_788_992);
-        assert_eq!(short_cuda.peak_additional_bytes, 475_788_992);
+        assert_eq!(short_cuda.analysis_phase_bytes, 476_364_992);
+        assert_eq!(short_cuda.peak_additional_bytes, 476_364_992);
         assert_eq!(
             short_cuda.analysis_phase_bytes - short_cpu.analysis_phase_bytes,
             v2_cuda_fft_batch_transient_upper_bound_bytes().unwrap()
@@ -23591,6 +24498,210 @@ mod tests {
     }
 
     #[test]
+    fn v2_final_map_wrong_slope_blocks_even_when_coarse_anchor_residuals_are_perfect() {
+        let mut pair = v2_test_pair_candidate();
+        pair.hypothesis = v2_test_final_map_hypothesis(1.02, 0);
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    50_000,
+                    0,
+                    50_000,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "final-map residual test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.quality.level, "blocked");
+        assert!(time_map
+            .quality
+            .p95_residual_ms
+            .is_some_and(|value| value > 400));
+        assert_eq!(time_map.spans[0].quality.level, "blocked");
+        assert!(proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("Final TimeMap")));
+    }
+
+    #[test]
+    fn v2_correct_final_map_ignores_stale_coarse_residual_fields() {
+        let mut pair = v2_test_pair_candidate();
+        pair.hypothesis = v2_test_final_map_hypothesis(1.02, 10_000);
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    50_000,
+                    0,
+                    51_000,
+                )],
+                matched_step_count: 1_000,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "final-map residual test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.quality.level, "review");
+        assert_eq!(time_map.quality.p50_residual_ms, Some(0));
+        assert_eq!(time_map.quality.p95_residual_ms, Some(0));
+        assert_eq!(time_map.quality.p99_residual_ms, Some(0));
+        assert_eq!(time_map.quality.max_residual_ms, Some(0));
+        assert_eq!(time_map.spans[0].quality.level, "review");
+    }
+
+    #[test]
+    fn v2_final_map_anchor_residual_matches_export_half_open_endpoint_rounding() {
+        let contracted = create_v2_span(AudioTimeMapSpanKind::Matched, 0, 3, 100, 101);
+        let contracted_endpoint = AffineAnchorEvidence {
+            source_time_ms: 2,
+            target_time_ms: 100,
+            residual_ms: 0,
+        };
+        assert_eq!(
+            v2_final_map_anchor_residual(&[contracted], &contracted_endpoint),
+            Some(0),
+            "rounded interpolation must clamp to targetEnd-1 exactly like signed export"
+        );
+
+        let expanded = create_v2_span(AudioTimeMapSpanKind::Matched, 0, 3, 200, 207);
+        let expanded_endpoint = AffineAnchorEvidence {
+            source_time_ms: 2,
+            target_time_ms: 205,
+            residual_ms: 0,
+        };
+        assert_eq!(
+            v2_final_map_anchor_residual(&[expanded], &expanded_endpoint),
+            Some(0),
+            "slope > 1 endpoint rounding must stay identical to signed export"
+        );
+    }
+
+    #[test]
+    fn v2_held_out_anchor_in_unmappable_span_blocks_the_final_graph() {
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 0, 10_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::SourceOnly,
+                10_000,
+                20_000,
+                10_000,
+                10_000,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                20_000,
+                30_000,
+                10_000,
+                20_000,
+            ),
+        ];
+        let edit_span = &mut spans[1];
+        for boundary in [
+            &mut edit_span.boundaries.start,
+            &mut edit_span.boundaries.end,
+        ] {
+            boundary.status = AudioTimeMapBoundaryStatus::Refined;
+            boundary.support_duration_ms = 5_000;
+            boundary.refined_ms = boundary.coarse_ms;
+            boundary.reason = "test boundary evidence".to_string();
+        }
+        let anchor = |source_time_ms, target_time_ms| AffineAnchorEvidence {
+            source_time_ms,
+            target_time_ms,
+            residual_ms: 0,
+        };
+        let mut hypothesis = v2_test_hypothesis(1.0, 0);
+        hypothesis.training_anchors = vec![
+            anchor(1_000, 1_000),
+            anchor(9_000, 9_000),
+            anchor(21_000, 11_000),
+            anchor(29_000, 19_000),
+        ];
+        hypothesis.held_out_anchors = vec![
+            anchor(5_000, 5_000),
+            anchor(15_000, 10_000),
+            anchor(25_000, 15_000),
+        ];
+        hypothesis.inlier_count = hypothesis.training_anchors.len();
+        hypothesis.held_out_within_tolerance_count = hypothesis.held_out_anchors.len();
+        hypothesis.source_end_ms = 30_000;
+        let mut pair = v2_test_pair_candidate();
+        pair.hypothesis = hypothesis;
+
+        let proposal = create_v2_alignment_proposal(
+            V2ChunkAlignment {
+                spans,
+                matched_step_count: 400,
+                ambiguous_step_count: 0,
+            },
+            V2BoundarySummary::default(),
+            pair,
+            1.0,
+            ALIGNMENT_V2_MIN_TRACK_MARGIN,
+            "unmappable heldout test".to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let time_map = proposal.time_map.unwrap();
+        assert_eq!(time_map.quality.level, "blocked");
+        assert_eq!(time_map.quality.coverage, Some(2.0 / 3.0));
+        assert_eq!(time_map.spans[1].quality.level, "blocked");
+        assert!(time_map.spans[1]
+            .quality
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("不可投影")));
+        assert!(proposal
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("未映射训练/留出 anchor=0/1")));
+    }
+
+    #[test]
+    fn v2_target_only_duration_does_not_reduce_source_mapping_coverage() {
+        let spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 0, 10_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::TargetOnly,
+                10_000,
+                10_000,
+                10_000,
+                60_000,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                10_000,
+                20_000,
+                60_000,
+                70_000,
+            ),
+        ];
+
+        assert_eq!(v2_matched_source_coverage(&spans), 1.0);
+    }
+
+    #[test]
     fn v2_refined_edit_span_uses_boundary_support_without_fake_internal_anchors() {
         let mut span = create_v2_span(
             AudioTimeMapSpanKind::SourceOnly,
@@ -23653,7 +24764,9 @@ mod tests {
         assert!(without_range.time_map.is_none());
         assert!(without_range.match_range.is_none());
 
-        let pair = v2_test_pair_candidate();
+        let mut pair = v2_test_pair_candidate();
+        pair.temporal_coverage = 0.91;
+        pair.hypothesis.unique_source_coverage = 0.93;
         let with_affine = create_blocked_v2_affine_proposal(
             "Top1/Top2 歧义。",
             &pair,
@@ -23661,14 +24774,31 @@ mod tests {
             vec![v2_alternative_track_score(&pair)],
             Vec::new(),
         );
-        let time_map = with_affine.time_map.unwrap();
+        let time_map = with_affine.time_map.as_ref().unwrap();
         assert_eq!(time_map.quality.level, "blocked");
         assert!(time_map.quality.probability.is_none());
+        assert_eq!(time_map.quality.coverage, Some(0.0));
+        assert_eq!(time_map.quality.unique_content_coverage, Some(0.0));
+        assert_eq!(time_map.quality.p50_residual_ms, None);
+        assert_eq!(time_map.quality.p95_residual_ms, None);
+        assert_eq!(time_map.quality.p99_residual_ms, None);
+        assert_eq!(time_map.quality.max_residual_ms, None);
         assert_eq!(time_map.spans.len(), 1);
         assert_eq!(time_map.spans[0].kind, AudioTimeMapSpanKind::Ambiguous);
+        assert_eq!(time_map.spans[0].quality.coverage, Some(0.0));
         assert!(time_map.source_end_ms > time_map.source_start_ms);
         assert!(time_map.target_end_ms > time_map.target_start_ms);
         validate_v2_time_map_spans(&time_map.spans).unwrap();
+        assert_eq!(with_affine.match_range.as_ref().unwrap().coverage, 0.0);
+        assert!(time_map
+            .quality
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("不会回退 coarse affine")));
+        assert!(with_affine
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("未使用 coarse residual fallback")));
     }
 
     #[test]
@@ -23692,14 +24822,15 @@ mod tests {
         let stream = snapshot.audio_streams[0].clone();
         let timeline = timelines.get(&stream.stream_index).cloned();
         let input = alignment_audio_input_from_snapshot(&snapshot, stream, true, timeline);
-        let backend_request = resolve_spectral_backend_request().unwrap();
+        let options = test_options();
+        let backend_request = &options.spectral_backend_request;
 
         let coarse = decode_v2_coarse_landmarks_streaming(
             &path_text,
             "真实 fixture",
-            &test_options(),
+            &options,
             &input,
-            &backend_request,
+            backend_request,
             None,
         )
         .unwrap();
@@ -23783,7 +24914,7 @@ mod tests {
             "真实 fixture",
             &must_not_spawn,
             &stale,
-            &backend_request,
+            backend_request,
             None,
         )
         .unwrap_err();
@@ -23813,7 +24944,7 @@ mod tests {
             "真实 fixture",
             &test_options(),
             &input,
-            &backend_request,
+            backend_request,
             Some(&cancelled),
         )
         .unwrap_err();
@@ -23893,6 +25024,7 @@ mod tests {
             source_audio_stream_index: None,
             complete_video_stream_index: None,
             source_video_stream_index: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -24018,6 +25150,7 @@ mod tests {
             ]),
             ffmpeg_path: Some("ffmpeg".to_string()),
             ffprobe_path: Some("ffprobe".to_string()),
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -24203,6 +25336,7 @@ mod tests {
             source_audio_stream_index: None,
             complete_video_stream_index: None,
             source_video_stream_index: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -24311,6 +25445,7 @@ mod tests {
             source_audio_stream_index: None,
             complete_video_stream_index: None,
             source_video_stream_index: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -24903,7 +26038,7 @@ mod tests {
             0,
         )
         .expect("the source candidate set must fit by itself");
-        assert_eq!(source_only.projected_retained_bytes, 624_384_000);
+        assert_eq!(source_only.projected_retained_bytes, 626_688_000);
 
         let mut source_decode_closure_count = 0_usize;
         let error = (|| -> Result<(), String> {
@@ -25013,7 +26148,7 @@ mod tests {
         input.content_identity =
             Some(probe_media_content_identity_cancellable(&path, None).unwrap());
         let options = test_options();
-        let backend_request = resolve_spectral_backend_request().unwrap();
+        let backend_request = &options.spectral_backend_request;
         let cache_key = create_v2_planned_coarse_cache_key(
             &media_path,
             &options,
@@ -25052,7 +26187,7 @@ mod tests {
             &input,
             V2LandmarkExtractionContext {
                 cancel_flag: None,
-                shared_backend_request: Some(&backend_request),
+                shared_backend_request: Some(backend_request),
                 cache_plan: plan.candidates.pop(),
                 retained_artifact_bytes: 0,
             },
@@ -25111,6 +26246,7 @@ mod tests {
         let mut artifact = test_v2_media_artifact(512, 7);
         artifact.fine_features = Some(Arc::new(vec![FineFeatureFrame {
             time_ms: 0,
+            presentation_time_ms: 0,
             values: vec![0.1, 0.2, 0.3],
         }]));
         let mut cache = V2MediaArtifactCache::new(1024 * 1024);
@@ -25129,6 +26265,7 @@ mod tests {
         let mut upgraded = test_v2_media_artifact(512, 7);
         upgraded.fine_features = Some(Arc::new(vec![FineFeatureFrame {
             time_ms: 0,
+            presentation_time_ms: 0,
             values: vec![0.4, 0.5, 0.6],
         }]));
         let upgrade = cache
@@ -25480,6 +26617,7 @@ mod tests {
             source_audio_stream_index: None,
             complete_video_stream_index: None,
             source_video_stream_index: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: Some(8000),
             window_ms: Some(0),
             match_threshold: None,
@@ -25509,6 +26647,132 @@ mod tests {
         assert_eq!(request.complete_audio_stream_index, Some(2));
         assert_eq!(request.source_audio_stream_index, Some(4));
         assert_eq!(options.ffprobe_path, PathBuf::from(r"C:\tools\ffprobe.exe"));
+    }
+
+    #[test]
+    fn spectral_backend_request_serde_accepts_three_values_and_rejects_unknown_policy() {
+        for (value, expected) in [
+            ("auto", SpectralBackendPreference::Auto),
+            ("cuda", SpectralBackendPreference::Cuda),
+            ("cpu", SpectralBackendPreference::Cpu),
+        ] {
+            let request: AudioAlignmentRequest = serde_json::from_value(serde_json::json!({
+                "completePath": "complete.mkv",
+                "sourcePath": "source.mkv",
+                "spectralBackend": value,
+            }))
+            .unwrap();
+            assert_eq!(request.spectral_backend, Some(expected));
+        }
+        assert!(
+            serde_json::from_value::<AudioAlignmentRequest>(serde_json::json!({
+                "completePath": "complete.mkv",
+                "sourcePath": "source.mkv",
+                "spectralBackend": "metal",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AudioAlignmentRequest>(serde_json::json!({
+                "completePath": "complete.mkv",
+                "sourcePath": "source.mkv",
+                "spectralBackend": "cpu",
+                "spectralBackendTypo": "cpu",
+            }))
+            .is_err()
+        );
+
+        let valid_batch = serde_json::json!({
+            "schemaVersion": AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+            "sources": [{"mediaId": "source", "path": "source.mkv"}],
+            "targets": [{"mediaId": "target", "path": "target.mkv"}],
+            "spectralBackend": "cpu",
+            "localizationMode": true,
+        });
+        let parsed: AudioAlignmentBatchRequest =
+            serde_json::from_value(valid_batch.clone()).unwrap();
+        assert_eq!(
+            parsed.spectral_backend,
+            Some(SpectralBackendPreference::Cpu)
+        );
+        let mut unknown_policy = valid_batch.clone();
+        unknown_policy["spectralBackend"] = serde_json::json!("metal");
+        assert!(serde_json::from_value::<AudioAlignmentBatchRequest>(unknown_policy).is_err());
+        let mut unknown_field = valid_batch;
+        unknown_field["spectralBackendTypo"] = serde_json::json!("cpu");
+        assert!(serde_json::from_value::<AudioAlignmentBatchRequest>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn spectral_backend_resolver_keeps_cpu_cuda_and_auto_contracts_explicit() {
+        let cpu = resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        assert_eq!(cpu.requested_backend, "cpu");
+        assert_eq!(cpu.planned_backend_id, CPU_SPECTRAL_BACKEND_ID);
+        assert!(cpu.fallback_reason.is_none());
+
+        let auto = resolve_spectral_backend_preference(SpectralBackendPreference::Auto).unwrap();
+        assert_eq!(auto.requested_backend, "auto");
+        if auto.planned_backend_id == CUDA_FFT_BACKEND_ID {
+            assert!(auto.fallback_reason.is_none());
+        } else {
+            assert_eq!(auto.planned_backend_id, CPU_SPECTRAL_BACKEND_ID);
+            assert!(auto.fallback_reason.is_some());
+        }
+
+        match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+            Ok(cuda) => {
+                assert_eq!(cuda.requested_backend, "cuda");
+                assert_eq!(cuda.planned_backend_id, CUDA_FFT_BACKEND_ID);
+                assert!(cuda.fallback_reason.is_none());
+            }
+            Err(error) => assert!(error.starts_with("blocked:cuda-fft-unavailable")),
+        }
+    }
+
+    #[test]
+    fn explicit_backend_policy_is_frozen_in_options_and_validated_on_artifacts() {
+        let request: AudioAlignmentRequest = serde_json::from_value(serde_json::json!({
+            "completePath": "complete.mkv",
+            "sourcePath": "source.mkv",
+            "spectralBackend": "cpu",
+        }))
+        .unwrap();
+        let options = create_options(&request).unwrap();
+        let cloned = options.clone();
+        assert_eq!(cloned.spectral_backend_request.requested_backend, "cpu");
+        assert_eq!(
+            cloned.spectral_backend_request.planned_backend_id,
+            CPU_SPECTRAL_BACKEND_ID
+        );
+        assert!(cloned.spectral_backend_request.fallback_reason.is_none());
+        let wrong_policy_execution = SpectralBackendExecution {
+            backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: "test".to_string(),
+            fallback_reason: Some("test auto fallback".to_string()),
+        };
+        assert!(verify_v2_spectral_backend_policy(
+            &wrong_policy_execution,
+            &cloned.spectral_backend_request,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn batch_backend_policy_propagates_to_every_pair_and_resolved_plan_snapshot() {
+        let mut request = test_audio_alignment_batch_request(None);
+        request.spectral_backend = Some(SpectralBackendPreference::Cpu);
+        let plan = plan_audio_alignment_batch(request).unwrap();
+
+        assert_eq!(plan.spectral_backend_request.requested_backend, "cpu");
+        assert_eq!(
+            plan.spectral_backend_request.planned_backend_id,
+            CPU_SPECTRAL_BACKEND_ID
+        );
+        assert!(plan
+            .pairs
+            .iter()
+            .all(|pair| { pair.request.spectral_backend == Some(SpectralBackendPreference::Cpu) }));
     }
 
     #[test]
@@ -26028,6 +27292,7 @@ mod tests {
             pairs: None,
             ffmpeg_path: None,
             ffprobe_path: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -26162,6 +27427,7 @@ mod tests {
             ),
             ffmpeg_path: None,
             ffprobe_path: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,
@@ -27612,6 +28878,7 @@ mod tests {
             }),
             ffmpeg_path: None,
             ffprobe_path: None,
+            spectral_backend: Some(SpectralBackendPreference::Cpu),
             sample_rate: None,
             window_ms: None,
             match_threshold: None,

@@ -539,6 +539,7 @@ test.beforeEach(async ({ page }) => {
               emby: { serverUrl: "", pathPrefix: "/emby", username: "" },
               alignment: {
                 ffmpegPath: "C:\\tools\\ffmpeg.exe",
+                spectralBackend: "auto",
                 windowMs: 1000,
                 minGapMs: 3000,
                 matchThreshold: 0.35

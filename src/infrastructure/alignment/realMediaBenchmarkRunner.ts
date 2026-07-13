@@ -13,6 +13,7 @@ import type {
   AlignmentTimeMapStreamIdentity
 } from "../../domain/alignment/types";
 import type { MediaContentIdentity } from "../../domain/project/types";
+import type { SpectralBackendPreference } from "../../domain/alignment/spectralBackendPreference";
 import {
   preflightRealMediaBenchmark,
   type RealMediaBenchmarkPreflightIssue,
@@ -24,10 +25,12 @@ import {
   getTauriAudioAlignmentJob,
   isAudioAlignmentJobFinished,
   startTauriAudioAlignmentJob,
+  normalizeTauriSpectralBackendPreference,
   type AudioAlignmentJobInvoker,
   type AudioAlignmentJobSnapshot,
   type TauriAudioAlignmentRequest
 } from "./tauriAudioAlignment";
+import { discloseKnownAlignmentFailure } from "./safeAlignmentFailureDisclosure";
 
 export const REAL_MEDIA_BENCHMARK_RUN_MANIFEST_SCHEMA_VERSION = 1 as const;
 export const REAL_MEDIA_BENCHMARK_RUN_REPORT_SCHEMA_VERSION = 1 as const;
@@ -79,6 +82,7 @@ export interface RealMediaBenchmarkCaseFailure {
 
 export interface RealMediaBenchmarkParameterSummary {
   localizationMode: true;
+  spectralBackend: SpectralBackendPreference;
   sampleRate: number | null;
   windowMs: number | null;
   matchThreshold: number | null;
@@ -131,6 +135,7 @@ export interface RealMediaBenchmarkRunReportValidationResult {
 export interface RealMediaBenchmarkRunnerOptions {
   ffmpegPath?: string | null;
   ffprobePath?: string | null;
+  spectralBackend?: SpectralBackendPreference;
   sampleRate?: number;
   windowMs?: number;
   matchThreshold?: number;
@@ -495,12 +500,14 @@ async function executeBlindCase(
   let snapshot: AudioAlignmentJobSnapshot;
   try {
     snapshot = await startTauriAudioAlignmentJob(request, options.alignmentInvoker);
-  } catch {
+  } catch (error: unknown) {
+    const disclosure = discloseKnownAlignmentFailure(error);
     return failedExecution(
       benchmarkCase,
       elapsedMs(startedAt, now()),
       "job-start-failed",
-      "生产 Alignment V2 任务启动失败；原始工具错误已从可分享报告移除。",
+      disclosure?.message ??
+        "生产 Alignment V2 任务启动失败；原始工具错误已从可分享报告移除。",
       options
     );
   }
@@ -653,11 +660,13 @@ function finalizeTerminalSnapshot(
     };
   }
   if (snapshot.status === "failed") {
+    const disclosure = discloseKnownAlignmentFailure(snapshot.error);
     return failedExecution(
       benchmarkCase,
       wallElapsedMs,
       "job-reported-failure",
-      "生产 Alignment V2 任务报告失败；原始工具错误已从可分享报告移除。",
+      disclosure?.message ??
+        "生产 Alignment V2 任务报告失败；原始工具错误已从可分享报告移除。",
       dependencies.options
     );
   }
@@ -809,6 +818,7 @@ export function createRealMediaBenchmarkAlignmentRequest(
     sourcePath: benchmarkCase.source.path,
     ffmpegPath: options.ffmpegPath ?? null,
     ffprobePath: options.ffprobePath ?? null,
+    spectralBackend: normalizeTauriSpectralBackendPreference(options.spectralBackend),
     completeAudioStreamIndex: benchmarkCase.target.audioStreamIndex,
     sourceAudioStreamIndex: benchmarkCase.source.audioStreamIndex,
     completeVideoStreamIndex: benchmarkCase.target.videoStreamIndex,
@@ -833,6 +843,7 @@ function createParameterSummary(
 ): RealMediaBenchmarkParameterSummary {
   return {
     localizationMode: true,
+    spectralBackend: normalizeTauriSpectralBackendPreference(options.spectralBackend),
     sampleRate: options.sampleRate ?? null,
     windowMs: options.windowMs ?? null,
     matchThreshold: options.matchThreshold ?? null,
@@ -1178,6 +1189,9 @@ function isParameterSummary(value: unknown): value is RealMediaBenchmarkParamete
   return (
     isRecord(value) &&
     value.localizationMode === true &&
+    (value.spectralBackend === "auto" ||
+      value.spectralBackend === "cuda" ||
+      value.spectralBackend === "cpu") &&
     isOptionalNonNegativeNumber(value.sampleRate) &&
     isOptionalNonNegativeNumber(value.windowMs) &&
     isOptionalUnitNumber(value.matchThreshold) &&

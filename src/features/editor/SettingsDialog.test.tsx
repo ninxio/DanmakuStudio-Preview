@@ -75,8 +75,15 @@ describe("设置中心", () => {
 
     await user.click(screen.getByRole("button", { name: "播放器与工具" }));
     expect(screen.getByRole("button", { name: "检测 4090 / CUDA" })).toBeInTheDocument();
-    expect(screen.getByText(/能力可用且本次粗定位实际由 CUDA 完成时/)).toBeInTheDocument();
+    expect(screen.getByText(/此设置影响之后启动的所有单次和批量匹配/)).toBeInTheDocument();
     expect(screen.getByText(/仅检测到显卡驱动不代表可用/)).toBeInTheDocument();
+    const automatic = screen.getByRole("radio", { name: /自动推荐/ });
+    expect(automatic).toBeChecked();
+    automatic.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("radio", { name: /强制 GPU/ })).toBeChecked();
+    expect(screen.getByText(/不会回退 CPU/)).toBeInTheDocument();
+    expect(screen.getByText(/完全禁用 CUDA/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("FFmpeg 路径"), {
       target: { value: "C:\\tools\\ffmpeg.exe" }
     });
@@ -99,6 +106,7 @@ describe("设置中心", () => {
 
     expect(loadAppSettings().alignment).toEqual({
       ffmpegPath: "C:\\tools\\ffmpeg.exe",
+      spectralBackend: "cuda",
       windowMs: 500,
       minGapMs: 1200,
       matchThreshold: 0.22
@@ -143,7 +151,9 @@ describe("设置中心", () => {
     expect(await screen.findByTestId("cuda-capability-result")).toHaveTextContent(
       "NVIDIA GeForce RTX 4090"
     );
-    expect(screen.getByTestId("cuda-capability-result")).toHaveTextContent("可用于自动模式");
+    expect(screen.getByTestId("cuda-capability-result")).toHaveTextContent(
+      "可用于自动推荐或强制 GPU"
+    );
     expect(cudaMocks.probe).toHaveBeenCalledTimes(1);
   });
 
@@ -186,6 +196,7 @@ describe("设置中心", () => {
       },
       alignment: {
         ffmpegPath: "ffmpeg",
+        spectralBackend: "cuda",
         windowMs: 500,
         minGapMs: 1200,
         matchThreshold: 0.22
@@ -224,6 +235,7 @@ describe("设置中心", () => {
       },
       alignment: {
         ffmpegPath: "ffmpeg",
+        spectralBackend: "auto",
         windowMs: 500,
         minGapMs: 1200,
         matchThreshold: 0.22
@@ -246,6 +258,7 @@ describe("设置中心", () => {
       expect(text).toContain("https://emby.example.test");
       expect(text).toContain("D:\\\\exports");
       expect(text).toContain("mpv.exe");
+      expect(text).toContain('"spectralBackend":"auto"');
       expect(text).not.toContain("secret-pass");
       expect(text).not.toContain("password");
       expect(text).not.toContain("token");
@@ -286,6 +299,7 @@ describe("设置中心", () => {
           },
           alignment: {
             ffmpegPath: " C:\\tools\\ffmpeg.exe ",
+            spectralBackend: "cpu",
             windowMs: "600",
             minGapMs: "1500",
             matchThreshold: "0.3",
@@ -316,6 +330,7 @@ describe("设置中心", () => {
         },
         alignment: {
           ffmpegPath: "C:\\tools\\ffmpeg.exe",
+          spectralBackend: "cpu",
           windowMs: 600,
           minGapMs: 1500,
           matchThreshold: 0.3

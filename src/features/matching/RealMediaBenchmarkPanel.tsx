@@ -32,7 +32,10 @@ import {
   createRealMediaPerformanceWorkloadDigest,
   type RealMediaPerformancePhase
 } from "../../infrastructure/alignment/realMediaPerformanceRunner";
-import { loadAppSettings } from "../../infrastructure/settings/appSettings";
+import {
+  loadAppSettings,
+  type AppSettings
+} from "../../infrastructure/settings/appSettings";
 
 export type RealMediaBenchmarkPanelRunner = (
   manifest: RealMediaBenchmarkManifest,
@@ -42,6 +45,7 @@ export type RealMediaBenchmarkPanelRunner = (
 export interface RealMediaPerformancePanelRunOptions {
   signal: AbortSignal;
   ffmpegPath: string | null;
+  spectralBackend: RealMediaBenchmarkRunnerOptions["spectralBackend"];
   onProgress: (phase: RealMediaPerformancePhase) => void;
 }
 
@@ -126,6 +130,7 @@ export function RealMediaBenchmarkPanel({
       const nextReport = await runner(manifest, {
         signal: controller.signal,
         ffmpegPath: settings.ffmpegPath.trim() || null,
+        spectralBackend: settings.spectralBackend,
         windowMs: settings.windowMs,
         minGapMs: settings.minGapMs,
         matchThreshold: settings.matchThreshold
@@ -135,7 +140,11 @@ export function RealMediaBenchmarkPanel({
       if (!validation.valid) {
         throw new Error(`runner 返回的报告无效：${validation.issues.join("；")}`);
       }
-      assertBenchmarkReportMatchesManifest(nextReport, manifest);
+      assertBenchmarkReportMatchesManifest(
+        nextReport,
+        manifest,
+        settings.spectralBackend
+      );
       assertReportContainsNoManifestSecrets(
         serializeRealMediaBenchmarkRunReport(nextReport),
         manifest
@@ -421,6 +430,7 @@ function PerformanceEvidencePanel({
       const rawEvidence = await runner(manifest, {
         signal: controller.signal,
         ffmpegPath: settings.ffmpegPath.trim() || null,
+        spectralBackend: settings.spectralBackend,
         onProgress: (nextPhase) => {
           if (operationRef.current === operation) setPhase(nextPhase);
         }
@@ -430,7 +440,11 @@ function PerformanceEvidencePanel({
       if (!validation.valid) {
         throw new Error(`raw evidence 严格校验失败：${validation.issues.join("；")}`);
       }
-      assertPerformanceEvidenceMatchesManifest(rawEvidence, manifest);
+      assertPerformanceEvidenceMatchesManifest(
+        rawEvidence,
+        manifest,
+        settings.spectralBackend
+      );
       const serialized = serializeC137PerformanceEvidence(rawEvidence);
       assertReportContainsNoManifestSecrets(serialized, manifest);
       setEvidence(rawEvidence);
@@ -938,13 +952,18 @@ async function defaultPerformancePanelRunner(
 ): Promise<C137PerformanceRawEvidenceV2> {
   const plan = createEngineeringRealMediaPerformancePlan(
     manifest,
-    `performance-${createOpaqueRunId()}`
+    `performance-${createOpaqueRunId()}`,
+    options.spectralBackend
   );
   const journal = await collectRealMediaPerformanceEvidence(manifest, plan, {
     signal: options.signal,
     ffmpegPath: options.ffmpegPath,
+    spectralBackend: options.spectralBackend,
     onProgress: (progress) => options.onProgress(progress.phase)
   });
+  if (journal.failure) {
+    throw new Error(journal.failure.message);
+  }
   if (journal.status === "cancelled") {
     throw new Error("本次性能采集已取消并进入原生清理；上一份完整结果保持不变。");
   }
@@ -972,7 +991,8 @@ function createOpaqueRunId(): string {
 
 function assertPerformanceEvidenceMatchesManifest(
   evidence: C137PerformanceRawEvidence,
-  manifest: RealMediaBenchmarkManifest
+  manifest: RealMediaBenchmarkManifest,
+  expectedSpectralBackend?: AppSettings["alignment"]["spectralBackend"]
 ): void {
   const expectedWorkloadDigest = createRealMediaPerformanceWorkloadDigest(manifest);
   if (evidence.plan.workloadDigest !== expectedWorkloadDigest) {
@@ -984,11 +1004,18 @@ function assertPerformanceEvidenceMatchesManifest(
   if (evidence.plan.expectedCaseCount !== expectedCaseCount) {
     throw new Error("raw evidence 计划 case 数与当前 manifest 的真实关系数不一致。");
   }
+  if (
+    expectedSpectralBackend !== undefined &&
+    evidence.plan.parameters.spectralBackend !== expectedSpectralBackend
+  ) {
+    throw new Error("raw evidence 的声谱计算策略与本次采集请求不一致。");
+  }
 }
 
 function assertBenchmarkReportMatchesManifest(
   report: RealMediaBenchmarkRunReport,
-  manifest: RealMediaBenchmarkManifest
+  manifest: RealMediaBenchmarkManifest,
+  expectedSpectralBackend?: AppSettings["alignment"]["spectralBackend"]
 ): void {
   const expectedDigest = createRealMediaBenchmarkRunManifestDigest(
     projectRealMediaBenchmarkRunManifest(manifest)
@@ -999,6 +1026,15 @@ function assertBenchmarkReportMatchesManifest(
     report.runManifestDigest !== expectedDigest
   ) {
     throw new Error("runner 返回的报告与当前 manifest 的 blind workload 摘要不一致。");
+  }
+  if (
+    expectedSpectralBackend !== undefined &&
+    report.cases.some(
+      (benchmarkCase) =>
+        benchmarkCase.parameters.spectralBackend !== expectedSpectralBackend
+    )
+  ) {
+    throw new Error("runner 返回的报告声谱计算策略与本次运行请求不一致。");
   }
 }
 

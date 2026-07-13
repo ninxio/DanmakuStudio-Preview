@@ -1,5 +1,9 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { isLockedFineSpectralBackendIdentity } from "../../domain/alignment/fineSpectralBackend";
+import {
+  isSpectralBackendPreference,
+  type SpectralBackendPreference
+} from "../../domain/alignment/spectralBackendPreference";
 import type { AlignmentProposal } from "../../domain/alignment/types";
 import { sha256Hex } from "../../domain/shared/sha256";
 
@@ -12,6 +16,7 @@ export interface TauriAudioAlignmentRequest {
   sourceAudioStreamIndex?: number | null;
   completeVideoStreamIndex?: number | null;
   sourceVideoStreamIndex?: number | null;
+  spectralBackend?: SpectralBackendPreference;
   sampleRate?: number;
   windowMs?: number;
   matchThreshold?: number;
@@ -29,12 +34,14 @@ export interface NormalizedTauriAudioAlignmentRequest extends Omit<
   | "sourceAudioStreamIndex"
   | "completeVideoStreamIndex"
   | "sourceVideoStreamIndex"
+  | "spectralBackend"
 > {
   ffprobePath: string | null;
   completeAudioStreamIndex: number | null;
   sourceAudioStreamIndex: number | null;
   completeVideoStreamIndex: number | null;
   sourceVideoStreamIndex: number | null;
+  spectralBackend: SpectralBackendPreference;
 }
 
 export type AudioAlignmentInvoker = (
@@ -99,6 +106,7 @@ export interface TauriAudioAlignmentBatchRequest {
   pairs?: TauriAudioAlignmentBatchPair[];
   ffmpegPath: string | null;
   ffprobePath?: string | null;
+  spectralBackend?: SpectralBackendPreference;
   sampleRate?: number;
   windowMs?: number;
   matchThreshold?: number;
@@ -111,12 +119,13 @@ export interface TauriAudioAlignmentBatchRequest {
 
 export interface NormalizedTauriAudioAlignmentBatchRequest extends Omit<
   TauriAudioAlignmentBatchRequest,
-  "sources" | "targets" | "ffprobePath"
+  "sources" | "targets" | "ffprobePath" | "spectralBackend"
 > {
   schemaVersion: 1;
   sources: Required<TauriAudioAlignmentBatchMedia>[];
   targets: Required<TauriAudioAlignmentBatchMedia>[];
   ffprobePath: string | null;
+  spectralBackend: SpectralBackendPreference;
 }
 
 export interface AudioAlignmentBatchPairSnapshot {
@@ -515,7 +524,8 @@ function normalizeAudioAlignmentRequest(
     sourceVideoStreamIndex: normalizeStreamIndex(
       request.sourceVideoStreamIndex,
       "参考视频流索引"
-    )
+    ),
+    spectralBackend: normalizeTauriSpectralBackendPreference(request.spectralBackend)
   };
 }
 
@@ -546,8 +556,21 @@ function normalizeAudioAlignmentBatchRequest(
     targets,
     ...(pairs ? { pairs } : {}),
     ffprobePath: request.ffprobePath ?? null,
+    spectralBackend: normalizeTauriSpectralBackendPreference(request.spectralBackend),
     localizationMode: true
   };
+}
+
+export function normalizeTauriSpectralBackendPreference(
+  value: unknown
+): SpectralBackendPreference {
+  if (value === undefined) {
+    return "auto";
+  }
+  if (!isSpectralBackendPreference(value)) {
+    throw new Error("声谱计算策略仅支持 auto、cuda 或 cpu。");
+  }
+  return value;
 }
 
 function normalizeBatchPairs(

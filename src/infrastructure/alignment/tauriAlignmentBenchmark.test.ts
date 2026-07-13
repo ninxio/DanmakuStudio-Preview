@@ -108,7 +108,8 @@ describe("C137 原生性能采集 bridge", () => {
         sourceAudioStreamIndex: 3,
         completeVideoStreamIndex: null,
         sourceVideoStreamIndex: null,
-        ffprobePath: null
+        ffprobePath: null,
+        spectralBackend: "auto"
       }
     });
   });
@@ -893,6 +894,44 @@ describe("C137 原生性能采集 bridge", () => {
         })
       )
     ).rejects.toThrow("未得到可信终态");
+  });
+
+  it.each(["blocked:cuda-fft-unavailable", "blocked:cuda-fft-runtime"] as const)(
+    "start 只保留白名单 CUDA 阻断码 %s，不带出原始详情",
+    async (nativeCode) => {
+      const error = await startAlignmentBenchmarkJob(
+        createSession().sessionId,
+        createAlignmentRequest(),
+        createInvoker({
+          startJob: () =>
+            Promise.reject(
+              new Error(`${nativeCode}：C:\\private\\driver.log stdout=SECRET`)
+            )
+        })
+      ).catch((reason: unknown) => String(reason));
+
+      expect(error).toContain(nativeCode);
+      expect(error).not.toContain("driver.log");
+      expect(error).not.toContain("SECRET");
+    }
+  );
+
+  it("start 不披露未知伪 CUDA 阻断码与原始详情", async () => {
+    const error = await startAlignmentBenchmarkJob(
+      createSession().sessionId,
+      createAlignmentRequest(),
+      createInvoker({
+        startJob: () =>
+          Promise.reject(
+            new Error("blocked:cuda-fft-private-extension：C:\\private\\driver.log SECRET")
+          )
+      })
+    ).catch((reason: unknown) => String(reason));
+
+    expect(error).toContain("原生性能任务启动失败");
+    expect(error).not.toContain("blocked:cuda-fft-private-extension");
+    expect(error).not.toContain("driver.log");
+    expect(error).not.toContain("SECRET");
   });
 });
 
