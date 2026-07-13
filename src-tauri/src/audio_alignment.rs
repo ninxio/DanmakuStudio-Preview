@@ -100,10 +100,12 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.2-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-v10";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-v11";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
+const ALIGNMENT_V2_TEMPORAL_WINDOW_SCALE_TOLERANCE: f64 = 0.002;
+const ALIGNMENT_V2_TEMPORAL_WINDOW_MIN_OVERLAP: f64 = 0.80;
 const ALIGNMENT_V2_DP_CHUNK_MS: i64 = 45_000;
 const ALIGNMENT_V2_DP_BAND_RADIUS_MS: i64 = 30_000;
 // The fine window must contain the complete candidate episode plus enough context for the DP
@@ -1304,6 +1306,11 @@ struct V2PairCoarseCandidates {
     candidates: Vec<V2TrackPairCandidate>,
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct V2TemporalWindowGroup {
+    members: Vec<V2TrackPairCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -5878,20 +5885,17 @@ fn collect_v2_pair_coarse_candidates(
                         continue;
                     }
                 };
-                if let Some(existing) = candidates
-                    .iter_mut()
-                    .find(|existing| v2_track_pair_candidates_same_location(existing, &candidate))
-                {
-                    if compare_v2_track_pair_candidates(&candidate, existing).is_lt() {
-                        *existing = candidate;
-                    }
-                } else {
-                    candidates.push(candidate);
-                }
+                candidates.push(candidate);
             }
         }
     }
     candidates.sort_by(compare_v2_track_pair_candidates);
+    let temporal_window_groups = group_v2_pair_coarse_temporal_windows(&candidates);
+    diagnostics.push(format!(
+        "pair coarse temporal-window grouping：完整保留 {} 个跨音轨 affine candidate，并以 complete-link 归入 {} 个不同位置组；当前 native evidence v2 仍按 candidate 计数，尚未把 coarse 分组冒充 fine Top-K。",
+        candidates.len(),
+        temporal_window_groups.len()
+    ));
     alternatives.sort_by(|left, right| {
         right
             .score
@@ -5993,53 +5997,120 @@ fn compare_v2_track_pair_candidates(
                 .cmp(&right.hypothesis.source_start_ms)
         })
         .then_with(|| left.hypothesis.offset_ms.cmp(&right.hypothesis.offset_ms))
+        .then_with(|| {
+            left.global_source_interval
+                .start_ms
+                .cmp(&right.global_source_interval.start_ms)
+        })
+        .then_with(|| {
+            left.global_source_interval
+                .end_ms
+                .cmp(&right.global_source_interval.end_ms)
+        })
+        .then_with(|| {
+            left.global_target_interval
+                .start_ms
+                .cmp(&right.global_target_interval.start_ms)
+        })
+        .then_with(|| {
+            left.global_target_interval
+                .end_ms
+                .cmp(&right.global_target_interval.end_ms)
+        })
+        .then_with(|| {
+            left.hypothesis
+                .source_end_ms
+                .cmp(&right.hypothesis.source_end_ms)
+        })
+        .then_with(|| left.hypothesis.scale.total_cmp(&right.hypothesis.scale))
 }
 
-fn v2_track_pair_candidates_same_location(
+fn group_v2_pair_coarse_temporal_windows(
+    candidates: &[V2TrackPairCandidate],
+) -> Vec<V2TemporalWindowGroup> {
+    let mut ordered = candidates.to_vec();
+    ordered.sort_by(compare_v2_temporal_window_members);
+    let mut groups = Vec::<V2TemporalWindowGroup>::new();
+    for candidate in ordered {
+        // Complete-link membership is deliberate. If A~B and B~C but A!~C, a high-scoring B
+        // cannot bridge two genuinely different locations into one group. Every raw candidate
+        // remains in exactly one group and in the original executable candidate universe.
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group
+                .members
+                .iter()
+                .all(|member| v2_pair_coarse_candidates_same_temporal_window(member, &candidate))
+        }) {
+            group.members.push(candidate);
+        } else {
+            groups.push(V2TemporalWindowGroup {
+                members: vec![candidate],
+            });
+        }
+    }
+    groups.sort_by(|left, right| {
+        compare_v2_track_pair_candidates(&left.members[0], &right.members[0])
+    });
+    groups
+}
+
+fn compare_v2_temporal_window_members(
+    left: &V2TrackPairCandidate,
+    right: &V2TrackPairCandidate,
+) -> std::cmp::Ordering {
+    v2_global_candidate_weight(right)
+        .total_cmp(&v2_global_candidate_weight(left))
+        .then_with(|| compare_v2_track_pair_candidates(left, right))
+}
+
+fn v2_pair_coarse_candidates_same_temporal_window(
     left: &V2TrackPairCandidate,
     right: &V2TrackPairCandidate,
 ) -> bool {
-    if left.source_input.stream.stream_index != right.source_input.stream.stream_index
-        || left.target_input.stream.stream_index != right.target_input.stream.stream_index
-        || (left.hypothesis.scale - right.hypothesis.scale).abs() > 0.002
+    v2_temporal_windows_same_location(
+        left.hypothesis.scale,
+        left.global_source_interval,
+        left.global_target_interval,
+        right.hypothesis.scale,
+        right.global_source_interval,
+        right.global_target_interval,
+    )
+}
+
+fn v2_temporal_windows_same_location(
+    left_scale: f64,
+    left_source: PresentationRangeMs,
+    left_target: PresentationRangeMs,
+    right_scale: f64,
+    right_source: PresentationRangeMs,
+    right_target: PresentationRangeMs,
+) -> bool {
+    if (left_scale - right_scale).abs()
+        > ALIGNMENT_V2_TEMPORAL_WINDOW_SCALE_TOLERANCE + f64::EPSILON * 4.0
     {
         return false;
     }
-    let left_source = v2_hypothesis_source_interval(&left.hypothesis);
-    let right_source = v2_hypothesis_source_interval(&right.hypothesis);
+    let left_source = (left_source.start_ms, left_source.end_ms);
+    let right_source = (right_source.start_ms, right_source.end_ms);
     let source_overlap = v2_interval_overlap_ms(left_source, right_source);
-    let shorter_source = (left_source.1 - left_source.0)
-        .min(right_source.1 - right_source.0)
+    let longer_source = (left_source.1 - left_source.0)
+        .max(right_source.1 - right_source.0)
         .max(1);
-    let left_target = v2_hypothesis_target_interval(&left.hypothesis);
-    let right_target = v2_hypothesis_target_interval(&right.hypothesis);
+    let left_target = (left_target.start_ms, left_target.end_ms);
+    let right_target = (right_target.start_ms, right_target.end_ms);
     let target_overlap = v2_interval_overlap_ms(left_target, right_target);
-    let shorter_target = (left_target.1 - left_target.0)
-        .min(right_target.1 - right_target.0)
+    let longer_target = (left_target.1 - left_target.0)
+        .max(right_target.1 - right_target.0)
         .max(1);
-    source_overlap as f64 / shorter_source as f64 >= 0.80
-        && target_overlap as f64 / shorter_target as f64 >= 0.80
+    source_overlap as f64 / longer_source as f64 >= ALIGNMENT_V2_TEMPORAL_WINDOW_MIN_OVERLAP
+        && target_overlap as f64 / longer_target as f64 >= ALIGNMENT_V2_TEMPORAL_WINDOW_MIN_OVERLAP
 }
 
+#[cfg(test)]
 fn v2_hypothesis_source_interval(hypothesis: &AffineHypothesis) -> (i64, i64) {
     (
         hypothesis.source_start_ms.min(hypothesis.source_end_ms),
         hypothesis.source_start_ms.max(hypothesis.source_end_ms),
-    )
-}
-
-fn v2_hypothesis_target_interval(hypothesis: &AffineHypothesis) -> (i64, i64) {
-    let start = hypothesis.scale * hypothesis.source_start_ms as f64 + hypothesis.offset_ms as f64;
-    let end = hypothesis.scale * hypothesis.source_end_ms as f64 + hypothesis.offset_ms as f64;
-    (
-        start
-            .min(end)
-            .floor()
-            .clamp(i64::MIN as f64, i64::MAX as f64) as i64,
-        start
-            .max(end)
-            .ceil()
-            .clamp(i64::MIN as f64, i64::MAX as f64) as i64,
     )
 }
 
@@ -16928,6 +16999,28 @@ mod tests {
         candidate
     }
 
+    fn v2_test_temporal_window_candidate(
+        source_stream_index: u32,
+        target_stream_index: u32,
+        source_window: PresentationRangeMs,
+        target_window: PresentationRangeMs,
+        scale: f64,
+        score: f64,
+    ) -> V2TrackPairCandidate {
+        let mut candidate = v2_test_pair_candidate();
+        candidate.source_input = test_audio_input(source_stream_index, 0);
+        candidate.target_input = test_audio_input(target_stream_index, 0);
+        candidate.hypothesis.scale = scale;
+        candidate.hypothesis.offset_ms =
+            (target_window.start_ms as f64 - scale * source_window.start_ms as f64).round() as i64;
+        candidate.hypothesis.source_start_ms = source_window.start_ms;
+        candidate.hypothesis.source_end_ms = source_window.end_ms;
+        candidate.score = score;
+        candidate.global_source_interval = source_window;
+        candidate.global_target_interval = target_window;
+        candidate
+    }
+
     fn v2_test_cached_landmarks(bounds: PresentationRangeMs) -> CachedV2Landmarks {
         CachedV2Landmarks {
             landmarks: Arc::new(vec![SpectralLandmark {
@@ -17307,6 +17400,254 @@ mod tests {
             std::process::id(),
             current_time_ms()
         ))
+    }
+
+    #[test]
+    fn pair_coarse_groups_same_temporal_window_without_dropping_audio_tracks() {
+        let source_window = PresentationRangeMs {
+            start_ms: 180_000,
+            end_ms: 240_000,
+        };
+        let target_window = PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 60_000,
+        };
+        let mut higher_raw_score =
+            v2_test_temporal_window_candidate(4, 8, source_window, target_window, 1.0, 0.95);
+        higher_raw_score.hypothesis.unique_source_coverage = 0.05;
+        higher_raw_score.intrinsic_margin = 0.01;
+        higher_raw_score.repeated_content_only = true;
+        let mut higher_global_weight =
+            v2_test_temporal_window_candidate(1, 3, source_window, target_window, 1.002, 0.86);
+        higher_global_weight.hypothesis.unique_source_coverage = 0.95;
+        higher_global_weight.intrinsic_margin = 0.80;
+
+        assert!(v2_pair_coarse_candidates_same_temporal_window(
+            &higher_raw_score,
+            &higher_global_weight
+        ));
+        assert!(
+            v2_global_candidate_weight(&higher_global_weight)
+                > v2_global_candidate_weight(&higher_raw_score)
+        );
+        let candidates = vec![higher_raw_score, higher_global_weight.clone()];
+        let groups = group_v2_pair_coarse_temporal_windows(&candidates);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 2);
+        assert_eq!(groups[0].members[0].source_input.stream.stream_index, 1);
+        assert_eq!(groups[0].members[0].target_input.stream.stream_index, 3);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "grouping must not truncate the executable universe"
+        );
+    }
+
+    #[test]
+    fn pair_coarse_retains_distinct_windows_on_same_or_different_audio_tracks() {
+        let first = v2_test_temporal_window_candidate(
+            1,
+            2,
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            PresentationRangeMs {
+                start_ms: 10_000,
+                end_ms: 70_000,
+            },
+            1.0,
+            0.94,
+        );
+        let same_tracks_different_target = v2_test_temporal_window_candidate(
+            1,
+            2,
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            PresentationRangeMs {
+                start_ms: 120_000,
+                end_ms: 180_000,
+            },
+            1.0,
+            0.90,
+        );
+        let different_tracks_different_source = v2_test_temporal_window_candidate(
+            4,
+            8,
+            PresentationRangeMs {
+                start_ms: 240_000,
+                end_ms: 300_000,
+            },
+            PresentationRangeMs {
+                start_ms: 10_000,
+                end_ms: 70_000,
+            },
+            1.0,
+            0.86,
+        );
+
+        assert!(!v2_pair_coarse_candidates_same_temporal_window(
+            &first,
+            &same_tracks_different_target,
+        ));
+        assert!(!v2_pair_coarse_candidates_same_temporal_window(
+            &first,
+            &different_tracks_different_source,
+        ));
+        let groups = group_v2_pair_coarse_temporal_windows(&[
+            different_tracks_different_source,
+            first,
+            same_tracks_different_target,
+        ]);
+
+        assert_eq!(groups.len(), 3);
+        assert!(groups.iter().all(|group| group.members.len() == 1));
+    }
+
+    #[test]
+    fn pair_coarse_temporal_window_grouping_is_order_independent() {
+        let source_window = PresentationRangeMs {
+            start_ms: 30_000,
+            end_ms: 90_000,
+        };
+        let target_window = PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 60_000,
+        };
+        let canonical =
+            v2_test_temporal_window_candidate(1, 2, source_window, target_window, 1.0, 0.90);
+        let duplicate =
+            v2_test_temporal_window_candidate(5, 6, source_window, target_window, 1.0, 0.90);
+        let distinct = v2_test_temporal_window_candidate(
+            3,
+            4,
+            PresentationRangeMs {
+                start_ms: 150_000,
+                end_ms: 210_000,
+            },
+            target_window,
+            1.0,
+            0.85,
+        );
+        let forward = group_v2_pair_coarse_temporal_windows(&[
+            duplicate.clone(),
+            distinct.clone(),
+            canonical.clone(),
+        ]);
+        let reverse = group_v2_pair_coarse_temporal_windows(&[canonical, distinct, duplicate]);
+        let signature = |candidate: &V2TrackPairCandidate| {
+            (
+                candidate.source_input.stream.stream_index,
+                candidate.target_input.stream.stream_index,
+                candidate.global_source_interval,
+                candidate.global_target_interval,
+                candidate.score.to_bits(),
+            )
+        };
+
+        assert_eq!(
+            forward
+                .iter()
+                .map(|group| group.members.iter().map(signature).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            reverse
+                .iter()
+                .map(|group| group.members.iter().map(signature).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(forward.len(), 2);
+        assert_eq!(
+            forward
+                .iter()
+                .map(|group| group.members.len())
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn pair_coarse_nested_half_length_window_is_not_the_same_location() {
+        let long = v2_test_temporal_window_candidate(
+            1,
+            2,
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 24 * 60_000,
+            },
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 24 * 60_000,
+            },
+            1.0,
+            0.9,
+        );
+        let nested = v2_test_temporal_window_candidate(
+            3,
+            4,
+            PresentationRangeMs {
+                start_ms: 6 * 60_000,
+                end_ms: 18 * 60_000,
+            },
+            PresentationRangeMs {
+                start_ms: 6 * 60_000,
+                end_ms: 18 * 60_000,
+            },
+            1.0,
+            0.85,
+        );
+
+        assert!(!v2_pair_coarse_candidates_same_temporal_window(
+            &long, &nested
+        ));
+        assert_eq!(
+            group_v2_pair_coarse_temporal_windows(&[long, nested]).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn pair_coarse_complete_link_prevents_bridge_window_collapse() {
+        let candidate = |start_ms: i64, score: f64| {
+            v2_test_temporal_window_candidate(
+                1,
+                2,
+                PresentationRangeMs {
+                    start_ms,
+                    end_ms: start_ms + 100_000,
+                },
+                PresentationRangeMs {
+                    start_ms,
+                    end_ms: start_ms + 100_000,
+                },
+                1.0,
+                score,
+            )
+        };
+        let left = candidate(0, 0.80);
+        let bridge = candidate(20_000, 0.95);
+        let right = candidate(40_000, 0.85);
+        assert!(v2_pair_coarse_candidates_same_temporal_window(
+            &left, &bridge
+        ));
+        assert!(v2_pair_coarse_candidates_same_temporal_window(
+            &bridge, &right
+        ));
+        assert!(!v2_pair_coarse_candidates_same_temporal_window(
+            &left, &right
+        ));
+
+        let groups = group_v2_pair_coarse_temporal_windows(&[left, bridge, right]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.members.len())
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]
