@@ -13,6 +13,25 @@ export const VIDEO_FILE_FILTERS = [
   }
 ];
 
+export const XML_FILE_FILTERS = [
+  {
+    name: "B 站弹幕 XML",
+    extensions: ["xml"]
+  }
+];
+
+export async function pickXmlPaths(
+  dialog: NativeOpenDialog = defaultNativeOpenDialog
+): Promise<string[]> {
+  return pickMultipleNativePaths(
+    {
+      title: "选择弹幕 XML",
+      filters: XML_FILE_FILTERS
+    },
+    dialog
+  );
+}
+
 export async function pickMediaPaths(
   role: ProjectMediaRole,
   dialog: NativeOpenDialog = defaultNativeOpenDialog

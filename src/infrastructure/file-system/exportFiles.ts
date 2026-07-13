@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { DanmakuXmlSourceReceipt } from "../../domain/danmaku/types";
 import type { MediaContentIdentity } from "../../domain/project/types";
 import { sha256Hex } from "../../domain/shared/sha256";
 import {
@@ -15,10 +16,10 @@ export interface ExportTextFile {
   content: string;
 }
 
-export interface DesktopExportFileRequest {
+export interface DesktopTextReportFileRequest {
   directoryPath: string;
   fileName: string;
-  contentBytes: number[];
+  content: string;
 }
 
 export interface VerifiedMediaDependency {
@@ -79,9 +80,10 @@ export interface ProjectionDerivationDanmakuItemV1 {
   enabled: boolean;
 }
 
-export interface ProjectionDerivationXmlAssetV1 {
+export interface ProjectionDerivationXmlAssetV2 {
   assetId: string;
   sourceFileName: string;
+  sourceReceipt: DanmakuXmlSourceReceipt | null;
   items: ProjectionDerivationDanmakuItemV1[];
 }
 
@@ -120,14 +122,14 @@ export interface ProjectionDerivationTargetOutputFileV1 {
   fileName: string;
 }
 
-export interface ProjectionDerivationV1 {
-  domain: "projection-derivation-v1";
+export interface ProjectionDerivationV2 {
+  domain: "projection-derivation-v2";
   projectionPolicyVersion: "source-projection-v1";
   serializerVersion: "bilibili-xml-export-v1";
   projectId: string;
   projectUpdatedAt: string;
   media: ProjectionDerivationMediaV1[];
-  xmlAssets: ProjectionDerivationXmlAssetV1[];
+  xmlAssets: ProjectionDerivationXmlAssetV2[];
   sourceBindings: ProjectionDerivationSourceBindingV1[];
   routes: ProjectionDerivationRouteV1[];
   disabledItemIds: string[];
@@ -136,10 +138,10 @@ export interface ProjectionDerivationV1 {
 }
 
 export interface VerifiedExportVerificationSeed {
-  schemaVersion: 2;
+  schemaVersion: 3;
   projectId: string;
   projectUpdatedAt: string;
-  projectionDerivation: ProjectionDerivationV1;
+  projectionDerivation: ProjectionDerivationV2;
   mapProofs: VerifiedExportMapProof[];
   dependencies: VerifiedMediaDependency[];
 }
@@ -151,13 +153,17 @@ export interface VerifiedExportOutput {
 
 export interface VerifiedExportVerification extends VerifiedExportVerificationSeed {
   manifestJson: string;
-  snapshotDigest: string;
+  manifestDigest: string;
+  projectSnapshotDigest: string;
   archiveFileName: string;
   archiveContentDigest: string;
   outputs: VerifiedExportOutput[];
 }
 
-export interface DesktopVerifiedExportFileRequest extends DesktopExportFileRequest {
+export interface DesktopVerifiedProjectedXmlExportRequest {
+  directoryPath: string;
+  fileName: string;
+  contentBytes: number[];
   verification: VerifiedExportVerification;
 }
 
@@ -170,19 +176,20 @@ export interface DesktopExportFileResult {
 
 export interface ExportFilesBridge {
   isAvailable: () => boolean;
-  saveFile: (request: DesktopExportFileRequest) => Promise<DesktopExportFileResult>;
-  saveVerifiedFile?: (
-    request: DesktopVerifiedExportFileRequest
+  saveTextReport: (request: DesktopTextReportFileRequest) => Promise<DesktopExportFileResult>;
+  saveVerifiedProjectedXml?: (
+    request: DesktopVerifiedProjectedXmlExportRequest
   ) => Promise<DesktopExportFileResult>;
   openDirectory: (directoryPath: string) => Promise<void>;
 }
 
-export interface SaveTextExportOptions {
+export interface SaveTextReportOptions {
   directoryPath?: string;
   type?: string;
 }
 
-export interface SaveTextExportsOptions extends SaveTextExportOptions {
+export interface DownloadLegacyXmlOptions {
+  type?: string;
   archiveFileName?: string;
 }
 
@@ -222,12 +229,17 @@ export type SaveProjectedXmlExportsResult = Extract<
 >;
 
 const DEFAULT_TEXT_EXPORT_TYPE = "text/plain;charset=utf-8";
+const MAX_VERIFIED_PROJECTION_ITEMS = 500_000;
+const MAX_VERIFIED_RAW_P_FIELDS = 64;
+const MAX_VERIFIED_RAW_P_CODE_UNITS = 16 * 1024;
+const MAX_VERIFIED_DANMAKU_TEXT_CODE_UNITS = 1024 * 1024;
 
 const defaultExportFilesBridge: ExportFilesBridge = {
   isAvailable: () => isTauri(),
-  saveFile: (request) => invoke<DesktopExportFileResult>("save_export_file", { request }),
-  saveVerifiedFile: (request) =>
-    invoke<DesktopExportFileResult>("save_verified_export_file", { request }),
+  saveTextReport: (request) =>
+    invoke<DesktopExportFileResult>("save_text_report_file", { request }),
+  saveVerifiedProjectedXml: (request) =>
+    invoke<DesktopExportFileResult>("save_verified_projected_xml_export", { request }),
   openDirectory: (directoryPath) => invoke<void>("open_export_directory", { directoryPath })
 };
 
@@ -238,26 +250,29 @@ export function getVerifiedExportUnavailableReason(
   if (!normalizeDirectoryPath(directoryPath)) {
     return "高精度分集导出必须先在设置中选择桌面导出文件夹。";
   }
-  if (!bridge.isAvailable() || !bridge.saveVerifiedFile) {
+  if (!bridge.isAvailable() || !bridge.saveVerifiedProjectedXml) {
     return "高精度分集导出仅可在支持写盘前媒体身份复核的桌面端使用。";
   }
   return null;
 }
 
-export async function saveTextExportFile(
+export async function saveTextReportFile(
   file: ExportTextFile,
-  options: SaveTextExportOptions = {},
+  options: SaveTextReportOptions = {},
   bridge: ExportFilesBridge = defaultExportFilesBridge
 ): Promise<SaveTextExportResult> {
   const directoryPath = normalizeDirectoryPath(options.directoryPath);
-  const safeFileName = sanitizeDownloadFileName(file.fileName, "export.xml");
+  const safeFileName = sanitizeDownloadFileName(file.fileName, "report.txt");
+  if (!hasCaseInsensitiveExtension(safeFileName, ".txt")) {
+    throw new Error("普通文本报告只能保存为 .txt 文件。");
+  }
   if (directoryPath && bridge.isAvailable()) {
-    const request: DesktopExportFileRequest = {
+    const request: DesktopTextReportFileRequest = {
       directoryPath,
       fileName: safeFileName,
-      contentBytes: Array.from(new TextEncoder().encode(file.content))
+      content: file.content
     };
-    const result = await bridge.saveFile(request);
+    const result = await bridge.saveTextReport(request);
     return {
       mode: "directory",
       fileCount: 1,
@@ -281,50 +296,45 @@ export async function saveTextExportFile(
   };
 }
 
-export async function saveTextExportFiles(
-  files: ExportTextFile[],
-  options: SaveTextExportsOptions = {},
-  bridge: ExportFilesBridge = defaultExportFilesBridge
+export function downloadLegacyXmlFile(
+  file: ExportTextFile,
+  options: Pick<DownloadLegacyXmlOptions, "type"> = {}
 ): Promise<SaveTextExportResult> {
-  const directoryPath = normalizeDirectoryPath(options.directoryPath);
+  const safeFileName = sanitizeDownloadFileName(file.fileName, "export.xml");
+  const downloadedFileName = downloadTextFile(
+    safeFileName,
+    file.content,
+    options.type ?? "application/xml;charset=utf-8"
+  );
+  return Promise.resolve({
+    mode: "download",
+    fileCount: 1,
+    fileName: downloadedFileName,
+    archiveFileName: null,
+    downloadedFileName
+  });
+}
+
+export function downloadLegacyXmlFiles(
+  files: ExportTextFile[],
+  options: DownloadLegacyXmlOptions = {}
+): Promise<SaveTextExportResult> {
   if (files.length === 0) {
-    return {
+    return Promise.resolve({
       mode: "download",
       fileCount: 0,
       fileName: null,
       archiveFileName: null,
       downloadedFileName: null
-    };
-  }
-  if (directoryPath && bridge.isAvailable()) {
-    if (files.length === 1) {
-      return saveTextExportFile(files[0], options, bridge);
-    }
-    const archiveFileName = sanitizeDownloadFileName(
-      options.archiveFileName ?? "danmaku-exports.zip",
-      "danmaku-exports.zip"
-    );
-    const logicalFiles = createStoredZipEntries(files);
-    const zipBytes = await blobToBytes(createStoredZip(logicalFiles));
-    const result = await bridge.saveFile({
-      directoryPath,
-      fileName: archiveFileName,
-      contentBytes: Array.from(zipBytes)
     });
-    return {
-      mode: "directory",
-      fileCount: files.length,
-      fileName: result.fileName,
-      filePath: result.filePath,
-      directoryPath: result.directoryPath,
-      wasRenamed: result.wasRenamed
-    };
   }
-  return downloadResultToSaveResult(
-    downloadTextFiles(
-      files,
-      options.type ?? DEFAULT_TEXT_EXPORT_TYPE,
-      options.archiveFileName ?? "danmaku-exports.zip"
+  return Promise.resolve(
+    downloadResultToSaveResult(
+      downloadTextFiles(
+        files,
+        options.type ?? "application/xml;charset=utf-8",
+        options.archiveFileName ?? "danmaku-exports.zip"
+      )
     )
   );
 }
@@ -351,7 +361,7 @@ export async function saveProjectedXmlExports(
     throw new Error("高精度分集导出没有可写入的 XML，已阻断写盘。");
   }
 
-  let request: DesktopExportFileRequest;
+  let request: Omit<DesktopVerifiedProjectedXmlExportRequest, "verification">;
   let logicalFiles: ExportTextFile[];
   if (files.length === 1) {
     const file = files[0];
@@ -379,8 +389,8 @@ export async function saveProjectedXmlExports(
   if (!isSnapshotCurrent()) {
     throw new Error("项目或导出内容在身份核验期间发生变化，已取消写盘；请重新导出。");
   }
-  const saveVerifiedFile = bridge.saveVerifiedFile;
-  if (!saveVerifiedFile) {
+  const saveVerifiedProjectedXml = bridge.saveVerifiedProjectedXml;
+  if (!saveVerifiedProjectedXml) {
     throw new Error("桌面端身份复核写盘能力不可用，高精度分集导出已阻断。");
   }
   const verification = createVerifiedExportVerification(
@@ -389,7 +399,7 @@ export async function saveProjectedXmlExports(
     new Uint8Array(request.contentBytes),
     logicalFiles
   );
-  const result = await saveVerifiedFile({ ...request, verification });
+  const result = await saveVerifiedProjectedXml({ ...request, verification });
   return {
     mode: "directory",
     fileCount: files.length,
@@ -418,13 +428,17 @@ function normalizeDirectoryPath(path: string | undefined): string {
   return path?.trim() ?? "";
 }
 
+function hasCaseInsensitiveExtension(fileName: string, extension: string): boolean {
+  return fileName.toLocaleLowerCase("en-US").endsWith(extension.toLocaleLowerCase("en-US"));
+}
+
 export function createVerifiedExportVerification(
   seed: VerifiedExportVerificationSeed,
   archiveFileName: string,
   archiveBytes: Uint8Array,
   logicalFiles: readonly ExportTextFile[]
 ): VerifiedExportVerification {
-  if (seed.schemaVersion !== 2) {
+  if (seed.schemaVersion !== 3) {
     throw new Error("高精度导出 verification seed 版本不受支持。");
   }
   const projectionDerivation = normalizeProjectionDerivation(seed.projectionDerivation);
@@ -459,11 +473,15 @@ export function createVerifiedExportVerification(
     }))
     .sort((left, right) => compareCanonicalString(left.mediaId, right.mediaId));
   const archiveContentDigest = `sha256:${sha256Hex(archiveBytes)}`;
+  const projectSnapshotDigest = `sha256:${sha256Hex(
+    JSON.stringify(canonicalProjectionDerivation(projectionDerivation))
+  )}`;
   const manifestJson = JSON.stringify([
-    "verified-export-manifest-v2",
+    "verified-export-manifest-v3",
     seed.schemaVersion,
     seed.projectId,
     seed.projectUpdatedAt,
+    projectSnapshotDigest,
     archiveFileName,
     archiveContentDigest,
     outputs.map((output) => [output.fileName, output.contentDigest]),
@@ -492,8 +510,7 @@ export function createVerifiedExportVerification(
       dependency.mediaId,
       canonicalMediaIdentity(dependency.expectedIdentity),
       dependency.mapIds
-    ]),
-    canonicalProjectionDerivation(projectionDerivation)
+    ])
   ]);
   return {
     ...seed,
@@ -501,7 +518,8 @@ export function createVerifiedExportVerification(
     mapProofs,
     dependencies,
     manifestJson,
-    snapshotDigest: `sha256:${sha256Hex(manifestJson)}`,
+    manifestDigest: `sha256:${sha256Hex(manifestJson)}`,
+    projectSnapshotDigest,
     archiveFileName,
     archiveContentDigest,
     outputs
@@ -509,7 +527,7 @@ export function createVerifiedExportVerification(
 }
 
 export function createProjectionDerivationCanonicalJson(
-  derivation: ProjectionDerivationV1
+  derivation: ProjectionDerivationV2
 ): string {
   return JSON.stringify(
     canonicalProjectionDerivation(normalizeProjectionDerivation(derivation))
@@ -517,15 +535,39 @@ export function createProjectionDerivationCanonicalJson(
 }
 
 function normalizeProjectionDerivation(
-  derivation: ProjectionDerivationV1
-): ProjectionDerivationV1 {
+  derivation: ProjectionDerivationV2
+): ProjectionDerivationV2 {
   if (
     !derivation ||
-    derivation.domain !== "projection-derivation-v1" ||
+    derivation.domain !== "projection-derivation-v2" ||
     derivation.projectionPolicyVersion !== "source-projection-v1" ||
     derivation.serializerVersion !== "bilibili-xml-export-v1"
   ) {
-    throw new Error("高精度导出缺少受支持的 projection-derivation-v1 inventory。");
+    throw new Error("高精度导出缺少受支持的 projection-derivation-v2 inventory。");
+  }
+  const projectionItemCount = derivation.xmlAssets.reduce(
+    (count, asset) => count + asset.items.length,
+    0
+  );
+  if (projectionItemCount > MAX_VERIFIED_PROJECTION_ITEMS) {
+    throw new Error(
+      `高精度导出最多处理 ${MAX_VERIFIED_PROJECTION_ITEMS.toLocaleString("en-US")} 条项目弹幕。`
+    );
+  }
+  for (const asset of derivation.xmlAssets) {
+    for (const item of asset.items) {
+      const rawPCodeUnits = item.rawPFields.reduce(
+        (count, field) => count + field.length,
+        0
+      );
+      if (
+        item.rawPFields.length > MAX_VERIFIED_RAW_P_FIELDS ||
+        rawPCodeUnits > MAX_VERIFIED_RAW_P_CODE_UNITS ||
+        item.text.length > MAX_VERIFIED_DANMAKU_TEXT_CODE_UNITS
+      ) {
+        throw new Error(`XML 资产 ${asset.sourceFileName} 含超过安全大小上限的弹幕字段。`);
+      }
+    }
   }
   const itemTimeAdjustments = derivation.itemTimeAdjustments
     .map((adjustment) => ({ ...adjustment }))
@@ -542,6 +584,7 @@ function normalizeProjectionDerivation(
     })),
     xmlAssets: derivation.xmlAssets.map((asset) => ({
       ...asset,
+      sourceReceipt: asset.sourceReceipt ? { ...asset.sourceReceipt } : null,
       items: asset.items.map((item) => ({ ...item, rawPFields: [...item.rawPFields] }))
     })),
     sourceBindings: derivation.sourceBindings.map((binding) => ({ ...binding })),
@@ -556,7 +599,7 @@ function normalizeProjectionDerivation(
 }
 
 function validateProjectionMapBindings(
-  derivation: ProjectionDerivationV1,
+  derivation: ProjectionDerivationV2,
   mapProofs: readonly VerifiedExportMapProof[]
 ): void {
   const proofByMapId = new Map<string, VerifiedExportMapProof>();
@@ -581,7 +624,7 @@ function validateProjectionMapBindings(
 }
 
 function validateLogicalProjectionOutputs(
-  derivation: ProjectionDerivationV1,
+  derivation: ProjectionDerivationV2,
   outputs: readonly VerifiedExportOutput[]
 ): void {
   const targetIds = derivation.targetOutputFiles.map((target) => target.targetMediaId);
@@ -618,7 +661,7 @@ function parseTimeMapCoreIdentity(coreCanonicalJson: string): {
   return { mapId: parsed[1], revision: parsed[2] as number };
 }
 
-function canonicalProjectionDerivation(derivation: ProjectionDerivationV1): readonly unknown[] {
+function canonicalProjectionDerivation(derivation: ProjectionDerivationV2): readonly unknown[] {
   return [
     derivation.domain,
     derivation.projectionPolicyVersion,
@@ -637,6 +680,7 @@ function canonicalProjectionDerivation(derivation: ProjectionDerivationV1): read
     derivation.xmlAssets.map((asset) => [
       asset.assetId,
       asset.sourceFileName,
+      canonicalNullableXmlSourceReceipt(asset.sourceReceipt),
       asset.items.map((item) => [
         item.itemId,
         item.assetId,
@@ -678,6 +722,25 @@ function canonicalProjectionDerivation(derivation: ProjectionDerivationV1): read
     ]),
     derivation.targetOutputFiles.map((output) => [output.targetMediaId, output.fileName])
   ];
+}
+
+function canonicalNullableXmlSourceReceipt(
+  receipt: DanmakuXmlSourceReceipt | null
+): readonly unknown[] | null {
+  return receipt
+    ? [
+        receipt.domain,
+        receipt.version,
+        receipt.receiptId,
+        receipt.contentDigest,
+        receipt.sizeBytes,
+        receipt.parserVersion,
+        receipt.inventoryDigest,
+        receipt.issuerKeyId,
+        receipt.signatureAlgorithm,
+        receipt.signature
+      ]
+    : null;
 }
 
 function assertUniqueValues(values: readonly string[], message: string): void {

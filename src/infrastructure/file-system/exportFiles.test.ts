@@ -4,12 +4,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createProjectionDerivationCanonicalJson,
   createVerifiedExportVerification,
+  downloadLegacyXmlFiles,
   getVerifiedExportUnavailableReason,
   openExportDirectoryPath,
   saveProjectedXmlExports,
-  saveTextExportFile,
-  saveTextExportFiles,
-  type DesktopExportFileRequest,
+  saveTextReportFile,
+  type DesktopTextReportFileRequest,
+  type DesktopVerifiedProjectedXmlExportRequest,
   type ExportFilesBridge,
   type SaveProjectedXmlExportsOptions,
   type VerifiedExportVerificationSeed
@@ -17,48 +18,61 @@ import {
 import { sha256Hex } from "../../domain/shared/sha256";
 
 describe("导出文件服务", () => {
-  it("有桌面目录时写入安全文件名并返回打开目录动作所需路径", async () => {
+  it("有桌面目录时仅通过文本报告命令写入 UTF-8 txt", async () => {
     const bridge = createBridge();
 
-    const result = await saveTextExportFile(
-      { fileName: "导出/XML:项目.xml", content: "<i />" },
-      { directoryPath: " D:\\exports ", type: "application/xml;charset=utf-8" },
+    const result = await saveTextReportFile(
+      { fileName: "检查/报告:项目.txt", content: "健康检查通过" },
+      { directoryPath: " D:\\exports ", type: "text/plain;charset=utf-8" },
       bridge
     );
 
     expect(result).toMatchObject({
       mode: "directory",
-      fileName: "导出_XML_项目.xml",
-      filePath: "D:\\exports\\导出_XML_项目.xml",
+      fileName: "检查_报告_项目.txt",
+      filePath: "D:\\exports\\检查_报告_项目.txt",
       directoryPath: "D:\\exports"
     });
-    expect(bridge.saveFile).toHaveBeenCalledWith({
+    expect(bridge.saveTextReport).toHaveBeenCalledWith({
       directoryPath: "D:\\exports",
-      fileName: "导出_XML_项目.xml",
-      contentBytes: Array.from(new TextEncoder().encode("<i />"))
+      fileName: "检查_报告_项目.txt",
+      content: "健康检查通过"
     });
+    expect(bridge.saveVerifiedProjectedXml).not.toHaveBeenCalled();
   });
 
-  it("多个分集在目录模式下打包为 ZIP", async () => {
+  it("旧式多 XML 即使桌面 bridge 可用也只使用浏览器下载", async () => {
     const bridge = createBridge();
+    await withBrowserDownloadMocks(async () => {
+      const result = await downloadLegacyXmlFiles(
+        [
+          { fileName: "1.xml", content: "<i>1</i>" },
+          { fileName: "2.xml", content: "<i>2</i>" }
+        ],
+        { archiveFileName: "合集/导出.zip" }
+      );
 
-    const result = await saveTextExportFiles(
-      [
-        { fileName: "1.xml", content: "<i>1</i>" },
-        { fileName: "2.xml", content: "<i>2</i>" }
-      ],
-      { directoryPath: "D:\\exports", archiveFileName: "合集/导出.zip" },
-      bridge
-    );
-
-    expect(result).toMatchObject({
-      mode: "directory",
-      fileCount: 2,
-      fileName: "合集_导出.zip"
+      expect(result).toMatchObject({
+        mode: "download",
+        fileCount: 2,
+        archiveFileName: "合集_导出.zip",
+        downloadedFileName: "合集_导出.zip"
+      });
     });
-    const [request] = vi.mocked(bridge.saveFile).mock.calls[0];
-    expect(request.fileName).toBe("合集_导出.zip");
-    expect(request.contentBytes.slice(0, 4)).toEqual([0x50, 0x4b, 0x03, 0x04]);
+    expect(bridge.saveTextReport).not.toHaveBeenCalled();
+    expect(bridge.saveVerifiedProjectedXml).not.toHaveBeenCalled();
+  });
+
+  it("文本报告 API 在进入 native bridge 前拒绝 XML 文件名", async () => {
+    const bridge = createBridge();
+    await expect(
+      saveTextReportFile(
+        { fileName: "projected.xml", content: "<i />" },
+        { directoryPath: "D:\\exports" },
+        bridge
+      )
+    ).rejects.toThrow("只能保存为 .txt");
+    expect(bridge.saveTextReport).not.toHaveBeenCalled();
   });
 
   it("打开目录会调用桌面桥", async () => {
@@ -81,17 +95,20 @@ describe("导出文件服务", () => {
     );
 
     expect(isSnapshotCurrent).toHaveBeenCalledTimes(1);
-    expect(bridge.saveFile).not.toHaveBeenCalled();
-    const [verifiedRequest] = vi.mocked(bridge.saveVerifiedFile!).mock.calls[0];
+    expect(bridge.saveTextReport).not.toHaveBeenCalled();
+    const [verifiedRequest] = vi.mocked(bridge.saveVerifiedProjectedXml!).mock.calls[0];
     expect(verifiedRequest.directoryPath).toBe("D:\\exports");
     expect(verifiedRequest.fileName).toBe("episode.xml");
     expect(verifiedRequest.contentBytes).toEqual(Array.from(new TextEncoder().encode("<i />")));
     expect(verifiedRequest.verification).toMatchObject(verification);
     expect(verifiedRequest.verification.archiveFileName).toBe("episode.xml");
     expect(verifiedRequest.verification.archiveContentDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(verifiedRequest.verification.manifestJson).toContain("verified-export-manifest-v2");
-    expect(verifiedRequest.verification.manifestJson).toContain("projection-derivation-v1");
-    expect(verifiedRequest.verification.snapshotDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(verifiedRequest.verification.manifestJson).toContain("verified-export-manifest-v3");
+    expect(verifiedRequest.verification.manifestJson).not.toContain("projection-derivation-v2");
+    expect(verifiedRequest.verification.manifestDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(verifiedRequest.verification.projectSnapshotDigest).toMatch(
+      /^sha256:[0-9a-f]{64}$/
+    );
     expect(verifiedRequest.verification.outputs).toHaveLength(1);
     expect(verifiedRequest.verification.outputs[0]?.fileName).toBe("episode.xml");
     expect(verifiedRequest.verification.outputs[0]?.contentDigest).toMatch(
@@ -120,7 +137,7 @@ describe("导出文件服务", () => {
       bridge
     );
 
-    const [request] = vi.mocked(bridge.saveVerifiedFile!).mock.calls[0];
+    const [request] = vi.mocked(bridge.saveVerifiedProjectedXml!).mock.calls[0];
     expect(request.fileName).toBe("season.zip");
     expect(request.contentBytes.slice(0, 4)).toEqual([0x50, 0x4b, 0x03, 0x04]);
     expect(request.verification.archiveFileName).toBe("season.zip");
@@ -174,7 +191,7 @@ describe("导出文件服务", () => {
     expect(verification.dependencies[0]?.mapIds).toEqual([`map-${privateUse}`, `map-${emoji}`]);
   });
 
-  it("v2 manifest 以固定数组绑定完整 derivation，并仅规范化 set/object 字段", () => {
+  it("v3 manifest 以固定数组绑定 XML 收据与完整 derivation", () => {
     const seed = createVerification();
     seed.projectionDerivation.disabledItemIds = ["item-z", "item-a", "item-z"];
     seed.projectionDerivation.itemTimeAdjustments = [
@@ -189,19 +206,22 @@ describe("导出文件服务", () => {
       [{ fileName: "episode.xml", content: "<i />" }]
     );
     const manifest = JSON.parse(verification.manifestJson) as unknown[];
-    const derivation = manifest[9] as unknown[];
+    const derivation = JSON.parse(
+      createProjectionDerivationCanonicalJson(verification.projectionDerivation)
+    ) as unknown[];
 
     expect(manifest.slice(0, 4)).toEqual([
-      "verified-export-manifest-v2",
-      2,
+      "verified-export-manifest-v3",
+      3,
       "project-1",
       "2026-07-12T00:00:00.000Z"
     ]);
     expect(manifest).toHaveLength(10);
-    expect(manifest[4]).toBe("episode.xml");
-    expect((manifest[7] as unknown[][])[0]?.[6]).toBe(seed.mapProofs[0].coreCanonicalJson);
+    expect(manifest[4]).toBe(verification.projectSnapshotDigest);
+    expect(manifest[5]).toBe("episode.xml");
+    expect((manifest[8] as unknown[][])[0]?.[6]).toBe(seed.mapProofs[0].coreCanonicalJson);
     expect(derivation.slice(0, 5)).toEqual([
-      "projection-derivation-v1",
+      "projection-derivation-v2",
       "source-projection-v1",
       "bilibili-xml-export-v1",
       "project-1",
@@ -211,7 +231,19 @@ describe("导出文件服务", () => {
       "source-1",
       "target-1"
     ]);
-    expect((derivation[6] as unknown[][])[0]?.[2]).toHaveLength(2);
+    expect((derivation[6] as unknown[][])[0]?.[2]).toEqual([
+      "danmaku-xml-content-receipt-v1",
+      1,
+      `xmlr-sha256:${"a".repeat(64)}`,
+      `sha256:${"b".repeat(64)}`,
+      123,
+      "bilibili-xml-native-v1",
+      `sha256:${"d".repeat(64)}`,
+      "xml-key-1",
+      "hmac-sha256-v1",
+      "e".repeat(64)
+    ]);
+    expect((derivation[6] as unknown[][])[0]?.[3]).toHaveLength(2);
     expect((derivation[8] as unknown[][]).map((route) => route[0])).toEqual([
       "route-content",
       "route-ignored"
@@ -222,19 +254,19 @@ describe("导出文件服务", () => {
       ["item-z", 20]
     ]);
     expect(derivation[11]).toEqual([["target-1", "episode.xml"]]);
-    expect(createProjectionDerivationCanonicalJson(verification.projectionDerivation)).toBe(
-      JSON.stringify(derivation)
+    expect(`sha256:${sha256Hex(JSON.stringify(derivation))}`).toBe(
+      verification.projectSnapshotDigest
     );
   });
 
-  it("v2 verification 对缺失 inventory、快照错配和 TimeMap core 分离全部失败关闭", () => {
+  it("v3 verification 对缺失 inventory、快照错配和 TimeMap core 分离全部失败关闭", () => {
     const create = (seed: VerifiedExportVerificationSeed) =>
       createVerifiedExportVerification(seed, "episode.xml", new TextEncoder().encode("<i />"), [
         { fileName: "episode.xml", content: "<i />" }
       ]);
 
     const unsupported = createVerification();
-    unsupported.schemaVersion = 1 as 2;
+    unsupported.schemaVersion = 1 as 3;
     expect(() => create(unsupported)).toThrow("版本不受支持");
 
     const mismatchedSnapshot = createVerification();
@@ -264,6 +296,44 @@ describe("导出文件服务", () => {
     const mismatchedLogicalOutput = createVerification();
     mismatchedLogicalOutput.projectionDerivation.targetOutputFiles[0].fileName = "other.xml";
     expect(() => create(mismatchedLogicalOutput)).toThrow("没有绑定对应的投影目标");
+
+    const oversizedInventory = createVerification();
+    const repeatedItem = oversizedInventory.projectionDerivation.xmlAssets[0].items[0];
+    oversizedInventory.projectionDerivation.xmlAssets[0].items = Array.from(
+      { length: 500_001 },
+      () => repeatedItem
+    );
+    expect(() => create(oversizedInventory)).toThrow("最多处理 500,000 条");
+
+    const oversizedRawFields = createVerification();
+    oversizedRawFields.projectionDerivation.xmlAssets[0].items[0].rawPFields = Array.from(
+      { length: 65 },
+      () => ""
+    );
+    expect(() => create(oversizedRawFields)).toThrow("安全大小上限");
+  });
+
+  it("XML 内容收据变化会同时改变项目投影摘要与 manifest 摘要", () => {
+    const original = createVerification();
+    const changed = createVerification();
+    changed.projectionDerivation.xmlAssets[0].sourceReceipt!.inventoryDigest =
+      `sha256:${"f".repeat(64)}`;
+
+    const first = createVerifiedExportVerification(
+      original,
+      "episode.xml",
+      new TextEncoder().encode("<i />"),
+      [{ fileName: "episode.xml", content: "<i />" }]
+    );
+    const second = createVerifiedExportVerification(
+      changed,
+      "episode.xml",
+      new TextEncoder().encode("<i />"),
+      [{ fileName: "episode.xml", content: "<i />" }]
+    );
+
+    expect(second.projectSnapshotDigest).not.toBe(first.projectSnapshotDigest);
+    expect(second.manifestDigest).not.toBe(first.manifestDigest);
   });
 
   it("高精度导出在浏览器环境和缺少桌面目录时都严格阻断", async () => {
@@ -310,14 +380,14 @@ describe("导出文件服务", () => {
       )
     ).rejects.toThrow("项目或导出内容在身份核验期间发生变化");
 
-    expect(bridge.saveVerifiedFile).not.toHaveBeenCalled();
-    expect(bridge.saveFile).not.toHaveBeenCalled();
+    expect(bridge.saveVerifiedProjectedXml).not.toHaveBeenCalled();
+    expect(bridge.saveTextReport).not.toHaveBeenCalled();
   });
 
   it("投影 XML 缺少 verified bridge、verification seed 或快照检查时全部失败关闭", async () => {
     const file = [{ fileName: "episode.xml", content: "<i />" }];
 
-    const missingVerifiedBridge = { ...createBridge(), saveVerifiedFile: undefined };
+    const missingVerifiedBridge = { ...createBridge(), saveVerifiedProjectedXml: undefined };
     await expect(
       saveProjectedXmlExports(
         file,
@@ -329,7 +399,7 @@ describe("导出文件服务", () => {
         missingVerifiedBridge
       )
     ).rejects.toThrow("身份复核");
-    expect(missingVerifiedBridge.saveFile).not.toHaveBeenCalled();
+    expect(missingVerifiedBridge.saveTextReport).not.toHaveBeenCalled();
 
     const missingSeedBridge = createBridge();
     await expect(
@@ -342,8 +412,8 @@ describe("导出文件服务", () => {
         missingSeedBridge
       )
     ).rejects.toThrow("缺少必需的映射复核凭据");
-    expect(missingSeedBridge.saveFile).not.toHaveBeenCalled();
-    expect(missingSeedBridge.saveVerifiedFile).not.toHaveBeenCalled();
+    expect(missingSeedBridge.saveTextReport).not.toHaveBeenCalled();
+    expect(missingSeedBridge.saveVerifiedProjectedXml).not.toHaveBeenCalled();
 
     const missingSnapshotCheckBridge = createBridge();
     await expect(
@@ -356,8 +426,8 @@ describe("导出文件服务", () => {
         missingSnapshotCheckBridge
       )
     ).rejects.toThrow("缺少项目快照时效检查");
-    expect(missingSnapshotCheckBridge.saveFile).not.toHaveBeenCalled();
-    expect(missingSnapshotCheckBridge.saveVerifiedFile).not.toHaveBeenCalled();
+    expect(missingSnapshotCheckBridge.saveTextReport).not.toHaveBeenCalled();
+    expect(missingSnapshotCheckBridge.saveVerifiedProjectedXml).not.toHaveBeenCalled();
   });
 
   it("投影导出调用点在架构上只能进入强类型 verified API", () => {
@@ -371,7 +441,27 @@ describe("导出文件服务", () => {
     expect(end).toBeGreaterThan(start);
     const exportProjectionGroupsSource = assetPanelSource.slice(start, end);
     expect(exportProjectionGroupsSource).toContain("saveProjectedXmlExports(");
-    expect(exportProjectionGroupsSource).not.toContain("saveTextExportFiles(");
+    expect(exportProjectionGroupsSource).not.toContain("downloadLegacyXmlFiles(");
+    expect(exportProjectionGroupsSource).not.toContain("saveTextReportFile(");
+  });
+
+  it("native handler 与前端 bridge 都不再暴露 raw export writer", () => {
+    const nativeHandlerSource = readFileSync(
+      join(process.cwd(), "src-tauri", "src", "lib.rs"),
+      "utf8"
+    );
+    const bridgeSource = readFileSync(
+      join(process.cwd(), "src", "infrastructure", "file-system", "exportFiles.ts"),
+      "utf8"
+    );
+    expect(nativeHandlerSource).toContain("export_files::save_text_report_file");
+    expect(nativeHandlerSource).toContain("export_files::save_verified_projected_xml_export");
+    expect(nativeHandlerSource).not.toContain("export_files::save_export_file");
+    expect(nativeHandlerSource).not.toContain("export_files::save_verified_export_file");
+    expect(bridgeSource).not.toContain('"save_export_file"');
+    expect(bridgeSource).not.toContain('"save_verified_export_file"');
+    expect(bridgeSource).toContain('"save_text_report_file"');
+    expect(bridgeSource).toContain('"save_verified_projected_xml_export"');
   });
 
   it("可在点击前解释 verified save 的桌面能力或目录缺口", () => {
@@ -389,7 +479,7 @@ describe("导出文件服务", () => {
 });
 
 function createBridge(): ExportFilesBridge {
-  const createResult = (request: DesktopExportFileRequest) =>
+  const createResult = (request: { directoryPath: string; fileName: string }) =>
     Promise.resolve({
       fileName: request.fileName,
       filePath: `${request.directoryPath}\\${request.fileName}`,
@@ -398,10 +488,44 @@ function createBridge(): ExportFilesBridge {
     });
   return {
     isAvailable: () => true,
-    saveFile: vi.fn(createResult),
-    saveVerifiedFile: vi.fn(createResult),
+    saveTextReport: vi.fn((request: DesktopTextReportFileRequest) => createResult(request)),
+    saveVerifiedProjectedXml: vi.fn((request: DesktopVerifiedProjectedXmlExportRequest) =>
+      createResult(request)
+    ),
     openDirectory: vi.fn(() => Promise.resolve())
   };
+}
+
+async function withBrowserDownloadMocks(run: () => Promise<void>): Promise<void> {
+  const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+  const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+  const click = vi
+    .spyOn(HTMLAnchorElement.prototype, "click")
+    .mockImplementation(() => undefined);
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => "blob:legacy-xml")
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn()
+  });
+  try {
+    await run();
+    expect(click).toHaveBeenCalledTimes(1);
+  } finally {
+    click.mockRestore();
+    if (createDescriptor) {
+      Object.defineProperty(URL, "createObjectURL", createDescriptor);
+    } else {
+      Reflect.deleteProperty(URL, "createObjectURL");
+    }
+    if (revokeDescriptor) {
+      Object.defineProperty(URL, "revokeObjectURL", revokeDescriptor);
+    } else {
+      Reflect.deleteProperty(URL, "revokeObjectURL");
+    }
+  }
 }
 
 function createVerification(): VerifiedExportVerificationSeed {
@@ -444,11 +568,11 @@ function createVerification(): VerifiedExportVerificationSeed {
     "2026-07-12T00:00:00.000Z"
   ]);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     projectId: "project-1",
     projectUpdatedAt: "2026-07-12T00:00:00.000Z",
     projectionDerivation: {
-      domain: "projection-derivation-v1",
+      domain: "projection-derivation-v2",
       projectionPolicyVersion: "source-projection-v1",
       serializerVersion: "bilibili-xml-export-v1",
       projectId: "project-1",
@@ -477,6 +601,18 @@ function createVerification(): VerifiedExportVerificationSeed {
         {
           assetId: "asset-1",
           sourceFileName: "source.xml",
+          sourceReceipt: {
+            domain: "danmaku-xml-content-receipt-v1",
+            version: 1,
+            receiptId: `xmlr-sha256:${"a".repeat(64)}`,
+            contentDigest: `sha256:${"b".repeat(64)}`,
+            sizeBytes: 123,
+            parserVersion: "bilibili-xml-native-v1",
+            inventoryDigest: `sha256:${"d".repeat(64)}`,
+            issuerKeyId: "xml-key-1",
+            signatureAlgorithm: "hmac-sha256-v1",
+            signature: "e".repeat(64)
+          },
           items: [
             createDerivationItem("item-1", 0, 500, "正文"),
             createDerivationItem("item-2", 1, 1_500, "忽略")

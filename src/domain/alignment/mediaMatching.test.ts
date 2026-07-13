@@ -1038,7 +1038,8 @@ function createAsset(id: string, fileName: string) {
     color: "#ffffff",
     items: [],
     warnings: [],
-    importedAt: TIMESTAMP
+    importedAt: TIMESTAMP,
+    sourceReceipt: null
   };
 }
 

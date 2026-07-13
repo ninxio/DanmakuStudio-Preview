@@ -108,7 +108,8 @@ function createResolvedEvent(finalTimeMs: number): ResolvedDanmakuEvent {
     color: "#4cc9f0",
     items: [item],
     warnings: [],
-    importedAt: "now"
+    importedAt: "now",
+    sourceReceipt: null
   };
   const clip: DanmakuClip = {
     id: "clip",

@@ -34,6 +34,10 @@ import {
   cloneMediaContentIdentity,
   isMediaContentIdentity
 } from "./mediaIdentity";
+import {
+  isDanmakuXmlSourceReceipt,
+  type DanmakuAsset
+} from "../danmaku/types";
 
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
@@ -64,6 +68,10 @@ type LegacyMediaTimeMap = Omit<MediaTimeMap, "verification"> & {
   verification?: MediaTimeMapVerificationRecord | null;
 };
 
+type LegacyDanmakuAsset = Omit<DanmakuAsset, "sourceReceipt"> & {
+  sourceReceipt?: DanmakuAsset["sourceReceipt"];
+};
+
 type LegacyEditorProject = Omit<
   EditorProject,
   | "mediaLibrary"
@@ -71,12 +79,14 @@ type LegacyEditorProject = Omit<
   | "danmakuSourceSegments"
   | "mediaMatchCandidates"
   | "mediaTimeMaps"
+  | "assets"
 > & {
   mediaLibrary?: ProjectMediaReference[];
   danmakuSourceBindings?: EditorProject["danmakuSourceBindings"];
   danmakuSourceSegments: LegacyDanmakuSourceSegment[];
   mediaMatchCandidates?: LegacyMediaMatchCandidate[];
   mediaTimeMaps?: LegacyMediaTimeMap[];
+  assets: LegacyDanmakuAsset[];
 };
 
 interface MediaSchemaMigrationResult {
@@ -129,7 +139,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
   ) {
     return { ok: false, version, message: "项目文件缺少必要字段。" };
   }
-  if (!value.assets.every(isDanmakuAsset)) {
+  if (!value.assets.every((asset) => isDanmakuAsset(asset, version))) {
     return { ok: false, version, message: "项目文件中的弹幕资源结构不完整。" };
   }
   if (!value.clips.every(isDanmakuClip)) {
@@ -291,6 +301,9 @@ function migrateProjectToCurrentSchema(
   const migratedProject = migrateProjectToSpanEvidenceV12({
       ...project,
       schemaVersion: CURRENT_SCHEMA_VERSION,
+      // v1-v12 had no native content receipt. Even if an unknown field with
+      // that name is present, migration must not promote it to trusted state.
+      assets: project.assets.map((asset) => ({ ...asset, sourceReceipt: null })),
       clips: legacyClipRanges.clips,
       alignmentProposal: parsedVersion >= 3 ? project.alignmentProposal : null,
       mediaLibrary: mediaMigration.mediaLibrary,
@@ -1605,7 +1618,7 @@ function hasUniqueIds(items: readonly { id: string }[]): boolean {
   return new Set(items.map((item) => item.id)).size === items.length;
 }
 
-function isDanmakuAsset(value: unknown): boolean {
+function isDanmakuAsset(value: unknown, version: number): boolean {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
@@ -1615,6 +1628,9 @@ function isDanmakuAsset(value: unknown): boolean {
     Array.isArray(value.items) &&
     Array.isArray(value.warnings) &&
     typeof value.importedAt === "string" &&
+    (version < 13 ||
+      ("sourceReceipt" in value &&
+        (value.sourceReceipt === null || isDanmakuXmlSourceReceipt(value.sourceReceipt)))) &&
     value.items.every(isDanmakuItem) &&
     value.warnings.every(isImportWarning)
   );

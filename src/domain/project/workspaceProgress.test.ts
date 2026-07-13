@@ -33,7 +33,8 @@ function createAsset(id: string): DanmakuAsset {
     color: "#ffffff",
     items: [createItem(id, 0, 10_000), createItem(id, 1, 600_000)],
     warnings: [],
-    importedAt: "2026-07-11T00:00:00.000Z"
+    importedAt: "2026-07-11T00:00:00.000Z",
+    sourceReceipt: null
   };
 }
 

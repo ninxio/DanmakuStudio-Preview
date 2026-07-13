@@ -101,6 +101,7 @@ function createAsset(): DanmakuAsset {
     color: "#fff",
     warnings: [],
     importedAt: "2026-07-11T00:00:00.000Z",
+    sourceReceipt: null,
     items: [
       {
         id: "item-1",

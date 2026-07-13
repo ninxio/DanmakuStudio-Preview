@@ -4,6 +4,7 @@ import type {
   DanmakuAsset,
   DanmakuClip,
   DanmakuItem,
+  ImportWarning,
   ResolvedDanmakuEvent,
   SyncAnchor
 } from "../domain/danmaku/types";
@@ -85,6 +86,11 @@ import {
   serializeBilibiliXml,
   validateExportedXml
 } from "../infrastructure/xml/bilibiliXml";
+import {
+  importNativeXmlPaths,
+  type NativeXmlImportedFile,
+  type NativeXmlParsedItem
+} from "../infrastructure/xml/nativeXmlReceipt";
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
 import {
   acceptMediaMatchCandidate as acceptProjectMediaMatchCandidate,
@@ -176,6 +182,7 @@ interface EditorStore {
   setWorkspacePage: (page: WorkspacePage) => void;
   newProject: () => void;
   importXmlFiles: (files: FileList | File[]) => Promise<void>;
+  importXmlPaths: (paths: string[]) => Promise<void>;
   importMediaFiles: (files: FileList | File[], role: ProjectMediaRole) => void;
   importMediaPaths: (paths: string[], role: ProjectMediaRole) => void;
   addMediaMatchCandidate: (candidate: MediaMatchCandidate) => void;
@@ -343,7 +350,51 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       set({
         importProgress: null,
         status: {
-          message: `已导入 ${assets.length} 个 XML，共 ${assets.reduce((sum, asset) => sum + asset.items.length, 0)} 条弹幕。`,
+          message: `已预览导入 ${assets.length} 个 XML，共 ${assets.reduce((sum, asset) => sum + asset.items.length, 0)} 条弹幕。此方式没有原生内容收据；正式受验证导出前，请在素材页用“导入 XML”重新选择原文件。`,
+          tone: "warning"
+        }
+      });
+    } catch (error) {
+      set({
+        importProgress: null,
+        status: createErrorStatus("XML 导入失败", error)
+      });
+    }
+  },
+
+  importXmlPaths: async (paths) => {
+    if (paths.length === 0) {
+      set({ status: { message: "请选择 XML 文件。", tone: "warning" } });
+      return;
+    }
+    const projectEpoch = get().projectEpoch;
+    const projectId = get().project.id;
+    set({ importProgress: 0, status: { message: "正在由桌面端验证并读取 XML...", tone: "neutral" } });
+    try {
+      const importedFiles = await importNativeXmlPaths(paths);
+      if (get().projectEpoch !== projectEpoch || get().project.id !== projectId) {
+        set({
+          importProgress: null,
+          status: {
+            message: "XML 读取完成，但项目已切换；为避免导入到错误项目，本次结果未写入。",
+            tone: "warning"
+          }
+        });
+        return;
+      }
+      const currentAssets = get().project.assets;
+      const materialized = materializeNativeXmlBatch(importedFiles, currentAssets);
+      commitProject(set, get, "原生导入 XML", (project) => ({
+        ...project,
+        assets: project.assets
+          .map((asset) => materialized.replacements.get(asset.id) ?? asset)
+          .concat(materialized.additions)
+      }));
+      const itemCount = importedFiles.reduce((sum, file) => sum + file.items.length, 0);
+      set({
+        importProgress: null,
+        status: {
+          message: `已受验证导入 ${importedFiles.length} 个 XML，共 ${itemCount} 条弹幕；认领旧资源 ${materialized.replacements.size} 个，新增 ${materialized.additions.length} 个。`,
           tone: "success"
         }
       });
@@ -2240,6 +2291,114 @@ function createSourceFileErrorStatus(
     return { message: `${prefix}：${detail}`, tone: "error" };
   }
   return { message: `${prefix}：${sourceFileName}：${detail}`, tone: "error" };
+}
+
+interface MaterializedNativeXmlBatch {
+  replacements: Map<string, DanmakuAsset>;
+  additions: DanmakuAsset[];
+}
+
+function materializeNativeXmlBatch(
+  importedFiles: readonly NativeXmlImportedFile[],
+  existingAssets: readonly DanmakuAsset[]
+): MaterializedNativeXmlBatch {
+  const replacements = new Map<string, DanmakuAsset>();
+  const additions: DanmakuAsset[] = [];
+  const claimedAssetIds = new Set<string>();
+  const batchImportedAt = new Date().toISOString();
+
+  importedFiles.forEach((file) => {
+    const matchingLegacyAssets = existingAssets.filter(
+      (asset) =>
+        asset.sourceReceipt === null &&
+        !claimedAssetIds.has(asset.id) &&
+        hasSameNativeXmlInventory(asset, file.items)
+    );
+    if (matchingLegacyAssets.length === 1) {
+      const legacyAsset = matchingLegacyAssets[0];
+      claimedAssetIds.add(legacyAsset.id);
+      replacements.set(
+        legacyAsset.id,
+        createAssetFromNativeXml(file, {
+          assetId: legacyAsset.id,
+          name: legacyAsset.name,
+          color: legacyAsset.color,
+          importedAt: legacyAsset.importedAt
+        })
+      );
+      return;
+    }
+
+    const assetId = createId("asset");
+    additions.push(
+      createAssetFromNativeXml(file, {
+        assetId,
+        name: file.fileName.replace(/\.[^.]+$/, ""),
+        color: pickAssetColor(existingAssets.length + additions.length),
+        importedAt: batchImportedAt
+      })
+    );
+  });
+
+  return { replacements, additions };
+}
+
+function createAssetFromNativeXml(
+  file: NativeXmlImportedFile,
+  metadata: Pick<DanmakuAsset, "name" | "color" | "importedAt"> & { assetId: string }
+): DanmakuAsset {
+  const items: DanmakuItem[] = file.items.map((item) => ({
+    ...item,
+    id: `${metadata.assetId}_item_${item.originalIndex}`,
+    assetId: metadata.assetId,
+    rawPFields: [...item.rawPFields],
+    enabled: true
+  }));
+  const warnings: ImportWarning[] = file.warnings.map((warning) => ({
+    ...warning,
+    id: createId("warning"),
+    assetId: metadata.assetId
+  }));
+  return {
+    id: metadata.assetId,
+    name: metadata.name,
+    fileName: file.fileName,
+    color: metadata.color,
+    items,
+    warnings,
+    importedAt: metadata.importedAt,
+    sourceReceipt: { ...file.receipt }
+  };
+}
+
+function hasSameNativeXmlInventory(
+  asset: DanmakuAsset,
+  nativeItems: readonly NativeXmlParsedItem[]
+): boolean {
+  return (
+    asset.items.length === nativeItems.length &&
+    asset.items.every((item, index) => isSameNativeXmlInventoryItem(item, nativeItems[index]))
+  );
+}
+
+function isSameNativeXmlInventoryItem(
+  item: DanmakuItem,
+  nativeItem: NativeXmlParsedItem
+): boolean {
+  return (
+    item.originalIndex === nativeItem.originalIndex &&
+    item.sourceTimeMs === nativeItem.sourceTimeMs &&
+    item.mode === nativeItem.mode &&
+    item.fontSize === nativeItem.fontSize &&
+    item.color === nativeItem.color &&
+    item.timestamp === nativeItem.timestamp &&
+    item.pool === nativeItem.pool &&
+    item.userHash === nativeItem.userHash &&
+    item.rowId === nativeItem.rowId &&
+    item.text === nativeItem.text &&
+    item.rawPFields.length === nativeItem.rawPFields.length &&
+    item.rawPFields.every((field, index) => field === nativeItem.rawPFields[index])
+  );
 }
 
 function createClipFromAsset(asset: DanmakuAsset, timelineStartMs: Milliseconds): DanmakuClip {

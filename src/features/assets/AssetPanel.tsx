@@ -123,12 +123,12 @@ import {
   readTextFile
 } from "../../infrastructure/file-system/browserFiles";
 import {
+  downloadLegacyXmlFiles,
   formatExportFileError,
   getVerifiedExportUnavailableReason,
   saveProjectedXmlExports,
-  saveTextExportFiles,
   type SaveTextExportResult,
-  type ProjectionDerivationV1,
+  type ProjectionDerivationV2,
   type VerifiedExportMapProof,
   type VerifiedExportVerificationSeed,
   type VerifiedMediaDependency
@@ -136,6 +136,7 @@ import {
 import {
   pickAlignmentMediaPath,
   pickMediaPaths,
+  pickXmlPaths,
   VIDEO_FILE_EXTENSIONS
 } from "../../infrastructure/file-system/nativeDialogs";
 import {
@@ -211,6 +212,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
   const importMediaFiles = useEditorStore((state) => state.importMediaFiles);
   const importMediaPaths = useEditorStore((state) => state.importMediaPaths);
   const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
+  const importXmlPaths = useEditorStore((state) => state.importXmlPaths);
   const setWorkspacePage = useEditorStore((state) => state.setWorkspacePage);
   const addAssetToTimeline = useEditorStore((state) => state.addAssetToTimeline);
   const removeAsset = useEditorStore((state) => state.removeAsset);
@@ -316,6 +318,23 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
     } catch (error) {
       setStatus({
         message: error instanceof Error ? error.message : "视频批量导入失败。",
+        tone: "error"
+      });
+    }
+  };
+  const openXmlImport = async () => {
+    if (!isTauri()) {
+      xmlInputRef.current?.click();
+      return;
+    }
+    try {
+      const paths = await pickXmlPaths();
+      if (paths.length > 0) {
+        await importXmlPaths(paths);
+      }
+    } catch (error) {
+      setStatus({
+        message: error instanceof Error ? error.message : "XML 批量导入失败。",
         tone: "error"
       });
     }
@@ -467,14 +486,14 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
             <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="text-sm font-medium text-slate-100">弹幕 XML</h3>
-                <TextButton tone="primary" onClick={() => xmlInputRef.current?.click()}>
+                <TextButton tone="primary" onClick={() => void openXmlImport()}>
                   <ListPlus size={14} />
                   导入 XML
                 </TextButton>
               </div>
               <p className="mt-2 leading-5 text-slate-500">
                 XML 是要被修正和导出的弹幕来源。导入后，请把每个 XML 关联到它来自的 B
-                站参考视频，后续匹配才可靠。
+                站参考视频，后续匹配才可靠。桌面端会保留原文件内容收据，用于正式受验证导出。
               </p>
               {importProgress !== null ? (
                 <div className="mt-2 rounded border border-panel-line bg-black/15 p-2 text-slate-300">
@@ -517,7 +536,21 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                           <Row label="最早时间" value={formatTimecode(range.earliestMs)} />
                           <Row label="最晚时间" value={formatTimecode(range.latestMs)} />
                           <Row label="导入警告" value={asset.warnings.length.toString()} />
+                          <Row
+                            label="原文件验证"
+                            value={asset.sourceReceipt ? "已受验证" : "仅预览"}
+                          />
                         </dl>
+                        {asset.sourceReceipt ? (
+                          <p className="mt-3 rounded border border-accent-green/30 bg-accent-green/10 p-2 text-[11px] leading-5 text-accent-green">
+                            已由桌面端核验原始 XML 内容，可用于正式受验证导出。
+                          </p>
+                        ) : (
+                          <p className="mt-3 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
+                            此资源仅作预览，没有原始 XML 内容收据。请在桌面端点击“导入
+                            XML”并重新选择原文件；若正式投影引用它，导出会失败关闭。
+                          </p>
+                        )}
                         <div className="mt-3 grid gap-2 rounded border border-panel-line/70 bg-black/15 p-2 text-xs">
                           <label className="grid gap-1">
                             <span className="text-slate-500">弹幕来源视频</span>
@@ -3880,10 +3913,9 @@ async function exportBatchMergePlan(
     return;
   }
   try {
-    const exportResult = await saveTextExportFiles(
+    const exportResult = await downloadLegacyXmlFiles(
       files.map((file) => ({ fileName: file.fileName, content: file.content })),
       {
-        directoryPath: loadAppSettings().export.defaultDirectory,
         type: "application/xml;charset=utf-8",
         archiveFileName: createProjectDownloadFileName(project.name, "-danmaku-exports.zip")
       }
@@ -4113,6 +4145,21 @@ function createVerifiedExportVerificationSeed(
   projection: SourceProjectionResult,
   currentIdentities: Readonly<Record<string, MediaContentIdentity>>
 ): VerifiedExportVerificationSeed {
+  const referencedAssetIds = new Set(
+    projection.groups.flatMap((group) =>
+      group.segments.flatMap((segment) => (segment.assetId ? [segment.assetId] : []))
+    )
+  );
+  const assetsMissingReceipt = project.assets.filter(
+    (asset) => referencedAssetIds.has(asset.id) && asset.sourceReceipt === null
+  );
+  if (assetsMissingReceipt.length > 0) {
+    throw new Error(
+      `正式受验证导出所引用的 XML 缺少原文件内容收据：${assetsMissingReceipt
+        .map((asset) => asset.fileName)
+        .join("、")}。请回到素材页点击“导入 XML”，重新选择原 XML 文件。`
+    );
+  }
   const referencedMapIds = new Set(
     project.danmakuSourceSegments.flatMap((segment) =>
       segment.kind === "content" && segment.timeMapId ? [segment.timeMapId] : []
@@ -4219,7 +4266,7 @@ function createVerifiedExportVerificationSeed(
     throw new Error("被引用时间图与 verified export proofs 未形成一一对应关系。");
   }
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     projectId: project.id,
     projectUpdatedAt: project.updatedAt,
     projectionDerivation: createProjectionDerivation(project, projection),
@@ -4231,7 +4278,7 @@ function createVerifiedExportVerificationSeed(
 function createProjectionDerivation(
   project: EditorProject,
   projection: SourceProjectionResult
-): ProjectionDerivationV1 {
+): ProjectionDerivationV2 {
   const groupsInFileAllocationOrder = [
     ...projection.groups.filter((group) => group.entries.length > 0),
     ...projection.groups.filter((group) => group.entries.length === 0)
@@ -4246,7 +4293,7 @@ function createProjectionDerivation(
     ])
   );
   return {
-    domain: "projection-derivation-v1",
+    domain: "projection-derivation-v2",
     projectionPolicyVersion: "source-projection-v1",
     serializerVersion: "bilibili-xml-export-v1",
     projectId: project.id,
@@ -4263,6 +4310,7 @@ function createProjectionDerivation(
     xmlAssets: project.assets.map((asset) => ({
       assetId: asset.id,
       sourceFileName: asset.fileName,
+      sourceReceipt: asset.sourceReceipt ? { ...asset.sourceReceipt } : null,
       items: asset.items.map((item) => ({
         itemId: item.id,
         assetId: item.assetId,

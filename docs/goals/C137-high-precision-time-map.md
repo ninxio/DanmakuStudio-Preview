@@ -13,7 +13,9 @@
 
 当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、完整 C137 acceptance bundle 的 fail-closed 聚合器、A/B 播放复核证据 v2，以及 native/raw/acceptance 性能证据链第五阶段。性能链现已具备原生独占 session、strict performance raw evidence v2、acceptance protocol v3 / performance report v3、匹配页工程采集入口与 manifest 工作负载绑定；它能从生产调用链记录 session-relative 单调时钟、真实阶段边界、冷/热缓存、取消终态和应用进程树 working set，并在任何工具探测前固定全部 workload media、逐 distinct 文件完整哈希、按实际卷生成 path-free storage receipt。Windows 一次性媒体工具仍由独立 lifecycle Job Object 挂起创建、入 Job 后恢复并有界清理；普通对齐 run 的 source/target media lease、run-start/run-final SHA、TimeMap identity、frame/packet PTS、缓存和音画证据继续绑定同一全文件身份。
 
-当前生产工程模型已升级为 schema v12 / `media-time-map-core-v2`：每个 span 保存稳定 ID、独立训练/真实留出锚点统计、p50/p95/p99/max 残差、独特内容覆盖、左右支持、结构化边界不确定区间、失败原因和备选路径。留出观测在 seed、拟合、排序和 refit 前分区，逐段证据缺失或 blocked 时投影与 verified export 失败关闭；旧项目只会保守补成 `legacy-unverified`，不会从图级平均值伪造逐段测量。
+当前生产工程模型已升级为 schema v13 / `media-time-map-core-v2`：每个 span 保存稳定 ID、独立训练/真实留出锚点统计、p50/p95/p99/max 残差、独特内容覆盖、左右支持、结构化边界不确定区间、失败原因和备选路径。留出观测在 seed、拟合、排序和 refit 前分区，逐段证据缺失或 blocked 时投影与 verified export 失败关闭；旧项目只会保守补成 `legacy-unverified`，不会从图级平均值伪造逐段测量。桌面 XML 导入同时由 native 固定并读取精确字节、独立解析、写入内容寻址存储并签发安装级 HMAC 收据；`verified-export-manifest-v3` 会绑定收据、完整投影 derivation、项目投影摘要和输出摘要，native 在写盘前重读 CAS 并重算不可变弹幕库存。普通原生 writer 只接受有界 `.txt` 报告，投影 `.xml/.zip` 只能走 verified writer。
+
+`projectSnapshotDigest` 当前是 native 可重算的 canonical 投影摘要，不是带单调 revision/head 的 native 项目意图签名。它和 XML 收据足以阻止“修改原始弹幕并同步重算输出/manifest”的项目 JSON 伪造，但仍不能把已完全控制 Tauri invoke 的 renderer 所提交的 routes、ignored、disabled 或 adjustment 证明为用户原始意图；该更强边界仍需 native project snapshot authority、单调 head 和明确 user-gesture capability，不能在当前阶段冒充已解决。
 
 这些能力解决的是“怎样盲跑生产算法、怎样安全拥有和清理媒体进程树、怎样把实际媒体卷绑定到性能记录、怎样防止改字符串/自摘要/跨 workload 复用冒充完整验收”，不代表真实准确率或正式性能验收已经通过。实际 `workload-media-volumes` 回执已经完成，但 lifecycle Job 只负责执行与清理；当前 raw v2 仍如实声明 `windows-toolhelp-working-set-v1`，`assurance` 中的 Job memory、terminal cleanup 与 native attestation 仍为空。故该产物继续固定为 `releaseEligible=false` 的 engineering raw。当前获授权且完成运行的真实冻结关系数仍为 0；实测校准、批准协议与外部信任根、规定目标机的正式性能测量、20 套北极星长合集和真实媒体回归均未完成。
 
@@ -470,7 +472,9 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 
 ### 数据与投影
 
-- [x] schema v12 可校验、保存、重开和迁移四类 TimeMap span、验证来源与逐段证据记录。
+- [x] schema v13 可校验、保存、重开和迁移四类 TimeMap span、验证来源、逐段证据与可空 XML 原生内容收据；v1-v12 只迁移为 `sourceReceipt:null`。
+- [x] 桌面批量 XML 导入由 native 精确字节解析、CAS 与安装级 HMAC 收据闭合；旧资源只有在不可变库存唯一完全一致时才能认领原 asset ID。
+- [x] `verified-export-manifest-v3` 绑定 XML 收据、项目投影摘要和完整 derivation；投影 XML/ZIP 不得使用普通 raw writer。
 - [x] matched span 可准确表达非 1.0 scale，长片投影不以累计浮点运算漂移。
 - [x] source-only 弹幕进入未映射统计，target-only 正确推动后续映射。
 - [x] ambiguous 不被静默插值，并能阻止默认导出。

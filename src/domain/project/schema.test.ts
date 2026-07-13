@@ -24,6 +24,59 @@ import {
 } from "./types";
 
 describe("project schema", () => {
+  it("v13 要求每个弹幕资源显式声明可空的原生来源收据", () => {
+    const withNullReceipt = {
+      ...createEmptyProject("v13 空收据"),
+      assets: [createValidAsset()]
+    };
+    expect(validateProjectSchema(withNullReceipt).ok).toBe(true);
+
+    const assetWithoutReceipt = { ...createValidAsset() } as Record<string, unknown>;
+    delete assetWithoutReceipt.sourceReceipt;
+    expect(
+      validateProjectSchema({ ...createEmptyProject("缺字段"), assets: [assetWithoutReceipt] }).ok
+    ).toBe(false);
+
+    const withNativeReceipt = {
+      ...createEmptyProject("v13 原生收据"),
+      assets: [{ ...createValidAsset(), sourceReceipt: createValidXmlSourceReceipt() }]
+    };
+    expect(validateProjectSchema(withNativeReceipt).ok).toBe(true);
+    expect(parseProjectJson(serializeProject(withNativeReceipt)).assets[0].sourceReceipt).toEqual(
+      createValidXmlSourceReceipt()
+    );
+
+    const receiptWithUnknownField = {
+      ...createValidXmlSourceReceipt(),
+      rendererTrusted: true
+    };
+    expect(
+      validateProjectSchema({
+        ...createEmptyProject("收据未知字段"),
+        assets: [{ ...createValidAsset(), sourceReceipt: receiptWithUnknownField }]
+      }).ok
+    ).toBe(false);
+  });
+
+  it("v1-v12 迁移只补 null，不能从旧 JSON 合成或沿用来源收据", () => {
+    const legacyAsset = { ...createValidAsset() } as Record<string, unknown>;
+    delete legacyAsset.sourceReceipt;
+    const v12WithoutReceipt = {
+      ...createEmptyProject("v12 无收据"),
+      schemaVersion: 12,
+      assets: [legacyAsset]
+    };
+    expect(parseProjectJson(JSON.stringify(v12WithoutReceipt)).assets[0].sourceReceipt).toBeNull();
+
+    const v12WithUntrustedField = {
+      ...v12WithoutReceipt,
+      assets: [{ ...legacyAsset, sourceReceipt: createValidXmlSourceReceipt() }]
+    };
+    expect(
+      parseProjectJson(JSON.stringify(v12WithUntrustedField)).assets[0].sourceReceipt
+    ).toBeNull();
+  });
+
   it("序列化后可重新打开，并清除临时 objectUrl", () => {
     const project = {
       ...createEmptyProject("测试项目"),
@@ -350,7 +403,7 @@ describe("project schema", () => {
     expect(validateProjectSchema(project).ok).toBe(true);
     const result = parseProjectJsonWithMetadata(JSON.stringify(project));
     const parsed = result.project;
-    expect(result.migration).toMatchObject({ fromVersion: 10, toVersion: 12 });
+    expect(result.migration).toMatchObject({ fromVersion: 10, toVersion: CURRENT_SCHEMA_VERSION });
     expect(parsed.mediaTimeMaps[0].quality.level).toBe("legacy-unverified");
     expect(parsed.mediaTimeMaps[0].quality.reasons.join(" ")).toContain(
       "v10 没有可绑定时间图核心"
@@ -402,7 +455,10 @@ describe("project schema", () => {
 
     expect(validateProjectSchema(project).ok).toBe(true);
     const migrated = parseProjectJsonWithMetadata(JSON.stringify(project));
-    expect(migrated.migration).toMatchObject({ fromVersion: 11, toVersion: 12 });
+    expect(migrated.migration).toMatchObject({
+      fromVersion: 11,
+      toVersion: CURRENT_SCHEMA_VERSION
+    });
     expect(migrated.project.mediaTimeMaps[0]).toMatchObject({
       verification: null,
       quality: {
@@ -1590,7 +1646,23 @@ function createValidAsset() {
     color: "#4cc9f0",
     items: [createValidDanmakuItem()],
     warnings: [],
-    importedAt: "2026-07-03T00:00:00.000Z"
+    importedAt: "2026-07-03T00:00:00.000Z",
+    sourceReceipt: null
+  };
+}
+
+function createValidXmlSourceReceipt() {
+  return {
+    domain: "danmaku-xml-content-receipt-v1" as const,
+    version: 1 as const,
+    receiptId: `xmlr-sha256:${"1".repeat(64)}`,
+    contentDigest: `sha256:${"2".repeat(64)}`,
+    sizeBytes: 128,
+    parserVersion: "bilibili-xml-native-v1" as const,
+    inventoryDigest: `sha256:${"3".repeat(64)}`,
+    issuerKeyId: `install-sha256:${"4".repeat(32)}`,
+    signatureAlgorithm: "hmac-sha256-v1" as const,
+    signature: "5".repeat(64)
   };
 }
 

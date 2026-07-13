@@ -103,6 +103,7 @@ function createAsset(fileName: string, itemCount: number, intervalMs: number): D
     fileName,
     color: "#38bdf8",
     importedAt: "2026-07-10T00:00:00.000Z",
+    sourceReceipt: null,
     warnings: [],
     items: Array.from({ length: itemCount }, (_, index): DanmakuItem => {
       const timeMs = index * intervalMs;

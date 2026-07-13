@@ -22,8 +22,9 @@ import {
 import { formatTimecode } from "../../domain/shared/time";
 import { requiresProjectionOnlyExport } from "../../domain/timeline/sourceProjection";
 import {
+  downloadLegacyXmlFile,
   formatExportFileError,
-  saveTextExportFile,
+  saveTextReportFile,
   type SaveTextExportResult
 } from "../../infrastructure/file-system/exportFiles";
 import { pickExportDirectoryPath } from "../../infrastructure/file-system/nativeDialogs";
@@ -73,7 +74,7 @@ export function ExportDialog() {
 
   const downloadHealthReport = async () => {
     try {
-      const result = await saveTextExportFile(
+      const result = await saveTextReportFile(
         {
           fileName: healthReportFileName,
           content: createProjectHealthReport(project.name, healthSummary)
@@ -88,7 +89,7 @@ export function ExportDialog() {
 
   const downloadExportReviewReport = async () => {
     try {
-      const result = await saveTextExportFile(
+      const result = await saveTextReportFile(
         {
           fileName: exportReportFileName,
           content: createCompensationReport(project.name, summary)
@@ -110,12 +111,12 @@ export function ExportDialog() {
       return;
     }
     try {
-      const result = await saveTextExportFile(
+      const result = await downloadLegacyXmlFile(
         {
           fileName: xmlFileName,
           content: exportDraft.xml
         },
-        { directoryPath: exportDirectory, type: "application/xml;charset=utf-8" }
+        { type: "application/xml;charset=utf-8" }
       );
       setExportStatus(createExportSuccessStatus("XML", result));
       clearExport();
@@ -142,10 +143,14 @@ export function ExportDialog() {
           <SummaryRow label="存在导入警告" value={summary.hasImportWarnings ? "是" : "否"} />
           <SummaryRow label="负时间限制为 0" value={`${summary.negativeClampCount} 项`} />
           <SummaryRow label="导出文件名" value={xmlFileName} />
-          <SummaryRow label="导出目录" value={exportDirectory.trim().length > 0 ? exportDirectory : "浏览器下载"} />
+          <SummaryRow
+            label="文本报告目录"
+            value={exportDirectory.trim().length > 0 ? exportDirectory : "浏览器下载"}
+          />
+          <SummaryRow label="旧式 XML 保存方式" value="浏览器下载（不使用桌面写盘）" />
           {exportDirectory.trim().length === 0 ? (
             <div className="rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs leading-5 text-amber-100">
-              未设置默认导出目录，本次会使用浏览器下载。你也可以先选择本次导出目录。
+              未设置默认导出目录，检查报告和复核报告会使用浏览器下载。你也可以先选择本次报告目录。
             </div>
           ) : null}
           {projectionOnlyExport ? (

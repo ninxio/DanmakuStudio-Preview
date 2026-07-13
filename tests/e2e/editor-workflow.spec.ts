@@ -84,7 +84,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await page
     .getByTestId("xml-input")
     .setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
-  await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
+  await expect(page.getByTestId("status-bar")).toContainText("已预览导入 1 个 XML");
   await expect(page.getByTestId("asset-card")).toContainText("normal.xml");
   await page.getByLabel("新手引导").click();
   await expect(page.getByTestId("workflow-overview-dialog")).toContainText(
@@ -327,7 +327,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(page.getByTestId("status-bar")).toContainText("已创建新项目");
   await page.getByTestId("workspace-nav-materials").click();
   await page.getByTestId("xml-input").setInputFiles(exportedXmlPath);
-  await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
+  await expect(page.getByTestId("status-bar")).toContainText("已预览导入 1 个 XML");
   await expect(page.getByTestId("asset-card")).toContainText(
     exportedXmlDownload.suggestedFilename()
   );
@@ -390,7 +390,7 @@ test("导出前检查和导出摘要会展示负时间风险", async ({ page }) 
   await page
     .getByTestId("xml-input")
     .setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
-  await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
+  await expect(page.getByTestId("status-bar")).toContainText("已预览导入 1 个 XML");
   await page.getByTestId("workspace-nav-editing").click();
   await page
     .getByTestId("asset-card")

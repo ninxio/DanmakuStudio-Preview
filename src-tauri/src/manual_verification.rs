@@ -25,6 +25,7 @@ const LEGACY_EVENTS_V1_DIRECTORY: &str = "events";
 const DURABLE_HEAD_FILE: &str = "authority-head-v2.json";
 const LEDGER_MARKER_FILE: &str = "authority-ledger-v2.marker.json";
 const PENDING_COMMIT_FILE: &str = "authority-commit-v2.pending.json";
+const INSTALLATION_DOMAIN_HMAC_PREFIX: &str = "installation-domain-hmac-v1";
 
 static AUTHORITY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -227,6 +228,11 @@ pub(crate) struct ManualVerificationAuthorityGuard {
     _guard: MutexGuard<'static, ()>,
 }
 
+pub(crate) struct InstallationDomainHmacSeal {
+    pub(crate) issuer_key_id: String,
+    pub(crate) signature: String,
+}
+
 pub(crate) fn lock_manual_time_map_verification_authority(
     app: &AppHandle,
 ) -> Result<ManualVerificationAuthorityGuard, String> {
@@ -267,6 +273,72 @@ impl ManualVerificationAuthorityGuard {
             ))
         }
     }
+
+    /// Signs a bounded, caller-owned payload with the installation key while this guard holds
+    /// the authority lock. The explicit domain is included ahead of the payload so a signature
+    /// issued for one native trust boundary cannot be replayed in another.
+    pub(crate) fn sign_domain_payload(
+        &self,
+        domain: &str,
+        payload: &[u8],
+    ) -> Result<InstallationDomainHmacSeal, String> {
+        validate_installation_hmac_input(domain, payload)?;
+        let key = load_or_create_authority_key(&self.root)?;
+        let secret = decode_fixed_hex::<32>(&key.secret_hex, "安装级签名密钥")?;
+        Ok(InstallationDomainHmacSeal {
+            issuer_key_id: key.key_id,
+            signature: hmac_sha256_hex(&secret, &installation_domain_hmac_message(domain, payload)),
+        })
+    }
+
+    /// Requires an installation-domain signature to match the current installation key.
+    pub(crate) fn require_valid_domain_payload(
+        &self,
+        domain: &str,
+        payload: &[u8],
+        issuer_key_id: &str,
+        signature: &str,
+    ) -> Result<(), String> {
+        validate_installation_hmac_input(domain, payload)?;
+        validate_hex("signature", signature, 64)?;
+        let key = load_or_create_authority_key(&self.root)?;
+        if issuer_key_id != key.key_id {
+            return Err("该内容收据由另一安装签发，或本机安装级密钥已丢失。".to_string());
+        }
+        let secret = decode_fixed_hex::<32>(&key.secret_hex, "安装级签名密钥")?;
+        let expected = hmac_sha256_hex(&secret, &installation_domain_hmac_message(domain, payload));
+        if !constant_time_hex_eq(&expected, signature) {
+            return Err("安装级内容收据签名无效，已阻断信任。".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_installation_hmac_input(domain: &str, payload: &[u8]) -> Result<(), String> {
+    if domain.is_empty()
+        || domain.len() > 128
+        || !domain
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("安装级 HMAC 域格式无效。".to_string());
+    }
+    if payload.len() > 16 * 1024 * 1024 {
+        return Err("安装级 HMAC 载荷超过 16 MiB 限制。".to_string());
+    }
+    Ok(())
+}
+
+fn installation_domain_hmac_message(domain: &str, payload: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        INSTALLATION_DOMAIN_HMAC_PREFIX.len() + domain.len() + payload.len() + 2,
+    );
+    message.extend_from_slice(INSTALLATION_DOMAIN_HMAC_PREFIX.as_bytes());
+    message.push(0);
+    message.extend_from_slice(domain.as_bytes());
+    message.push(0);
+    message.extend_from_slice(payload);
+    message
 }
 
 fn authority_root(app: &AppHandle) -> Result<PathBuf, String> {

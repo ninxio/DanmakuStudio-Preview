@@ -16,7 +16,7 @@ test.beforeAll(() => {
 test.beforeEach(async ({ page }) => {
   await page.clock.setFixedTime(new Date("2026-07-11T02:03:04.000Z"));
   await page.addInitScript(
-    ({ sourcePaths, targetPaths }) => {
+    ({ sourcePaths, targetPaths, xmlPaths }) => {
       interface MockTauriWindow extends Window {
         isTauri: boolean;
         __C136_DIALOG_CALLS__: MockDialogCall[];
@@ -287,7 +287,108 @@ test.beforeEach(async ({ page }) => {
             if (options.title === "选择 B 站参考素材") {
               return sourcePaths;
             }
+            if (options.title === "选择弹幕 XML") {
+              return xmlPaths;
+            }
             return null;
+          }
+          if (command === "import_bilibili_xml_files") {
+            const request = (args.request ?? {}) as { paths?: string[] };
+            if (
+              request.paths?.length !== 1 ||
+              request.paths[0]?.toLocaleLowerCase("en-US") !==
+                xmlPaths[0]?.toLocaleLowerCase("en-US")
+            ) {
+              throw new Error("E2E 原生 XML 导入没有收到对话框选中的唯一文件。");
+            }
+            return {
+              files: [
+                {
+                  fileName: "normal.xml",
+                  receipt: {
+                    domain: "danmaku-xml-content-receipt-v1",
+                    version: 1,
+                    receiptId: `xmlr-sha256:${"1".repeat(64)}`,
+                    contentDigest: `sha256:${"2".repeat(64)}`,
+                    sizeBytes: 287,
+                    parserVersion: "bilibili-xml-native-v1",
+                    inventoryDigest: `sha256:${"3".repeat(64)}`,
+                    issuerKeyId: `install-sha256:${"4".repeat(32)}`,
+                    signatureAlgorithm: "hmac-sha256-v1",
+                    signature: "5".repeat(64)
+                  },
+                  items: [
+                    {
+                      originalIndex: 0,
+                      sourceTimeMs: 1_500,
+                      mode: 1,
+                      fontSize: 25,
+                      color: 16_777_215,
+                      timestamp: 1_700_000_000,
+                      pool: 0,
+                      userHash: "userA",
+                      rowId: "row1",
+                      text: "第一条滚动弹幕",
+                      rawPFields: [
+                        "1.500",
+                        "1",
+                        "25",
+                        "16777215",
+                        "1700000000",
+                        "0",
+                        "userA",
+                        "row1"
+                      ]
+                    },
+                    {
+                      originalIndex: 1,
+                      sourceTimeMs: 3_250,
+                      mode: 5,
+                      fontSize: 30,
+                      color: 65_280,
+                      timestamp: 1_700_000_001,
+                      pool: 0,
+                      userHash: "userB",
+                      rowId: "row2",
+                      text: "顶部弹幕",
+                      rawPFields: [
+                        "3.250",
+                        "5",
+                        "30",
+                        "65280",
+                        "1700000001",
+                        "0",
+                        "userB",
+                        "row2"
+                      ]
+                    },
+                    {
+                      originalIndex: 2,
+                      sourceTimeMs: 5_000,
+                      mode: 4,
+                      fontSize: 28,
+                      color: 255,
+                      timestamp: 1_700_000_002,
+                      pool: 0,
+                      userHash: "userC",
+                      rowId: "row3",
+                      text: "底部弹幕",
+                      rawPFields: [
+                        "5.000",
+                        "4",
+                        "28",
+                        "255",
+                        "1700000002",
+                        "0",
+                        "userC",
+                        "row3"
+                      ]
+                    }
+                  ],
+                  warnings: []
+                }
+              ]
+            };
           }
           if (command === "start_audio_alignment_batch_job") {
             const request = (args.request ?? {}) as {
@@ -368,7 +469,8 @@ test.beforeEach(async ({ page }) => {
     },
     {
       sourcePaths: ["C:\\C136\\C136-reference.mkv"],
-      targetPaths: Array.from({ length: 5 }, (_, index) => `C:\\C136\\C136-E0${index + 1}.mkv`)
+      targetPaths: Array.from({ length: 5 }, (_, index) => `C:\\C136\\C136-E0${index + 1}.mkv`),
+      xmlPaths: ["C:\\C136\\normal.xml"]
     }
   );
 });
@@ -384,6 +486,14 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await expect(page.getByText("C136-E05.mkv", { exact: true })).toBeVisible();
   await expect(page.getByText("C136-reference.mkv", { exact: true })).toBeVisible();
 
+  const importXmlButton = page.getByRole("button", { name: "导入 XML" });
+  await expect(importXmlButton).toBeVisible();
+  await importXmlButton.click();
+  await expect(page.getByTestId("status-bar")).toContainText(
+    "已受验证导入 1 个 XML，共 3 条弹幕"
+  );
+  await expect(page.getByText("已受验证", { exact: true })).toBeVisible();
+
   const dialogCalls = await page.evaluate(
     () =>
       (
@@ -394,13 +504,10 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   );
   expect(dialogCalls).toEqual([
     { title: "选择原片素材", multiple: true },
-    { title: "选择 B 站参考素材", multiple: true }
+    { title: "选择 B 站参考素材", multiple: true },
+    { title: "选择弹幕 XML", multiple: true }
   ]);
 
-  await page
-    .getByTestId("xml-input")
-    .setInputFiles(resolve("fixtures", "bilibili", "normal.xml"));
-  await expect(page.getByTestId("status-bar")).toContainText("已导入 1 个 XML");
   await page.getByLabel("normal.xml 弹幕来源视频").selectOption({ label: "C136-reference" });
   await expect(page.getByTestId("status-bar")).toContainText("已绑定 XML 来源");
   await page.getByRole("heading", { name: "原片素材", exact: true }).scrollIntoViewIfNeeded();

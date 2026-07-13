@@ -310,6 +310,7 @@ function createAsset(): DanmakuAsset {
     fileName: "source.xml",
     color: "#4cc9f0",
     importedAt: TIMESTAMP,
+    sourceReceipt: null,
     warnings: [],
     items: []
   };

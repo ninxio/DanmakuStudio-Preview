@@ -104,7 +104,10 @@ export function parseBilibiliXml(xml: string, options: ParseXmlOptions): Danmaku
     color: options.color ?? pickAssetColorByName(options.fileName),
     items,
     warnings,
-    importedAt: options.importedAt ?? new Date().toISOString()
+    importedAt: options.importedAt ?? new Date().toISOString(),
+    // DOMParser/File imports are useful for browser preview, but do not have a
+    // native receipt bound to the original bytes. Never synthesize one here.
+    sourceReceipt: null
   };
 }
 

@@ -58,7 +58,8 @@ function createAsset(id: string, times: number[]): DanmakuAsset {
     color: "#ffffff",
     items: times.map((timeMs, index) => createItem(id, index, timeMs)),
     warnings: [],
-    importedAt: "2026-07-11T00:00:00.000Z"
+    importedAt: "2026-07-11T00:00:00.000Z",
+    sourceReceipt: null
   };
 }
 

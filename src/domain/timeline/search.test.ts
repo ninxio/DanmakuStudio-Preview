@@ -41,7 +41,8 @@ function event(id: string, finalTimeMs: number): ResolvedDanmakuEvent {
       color: "#4cc9f0",
       items: [],
       warnings: [],
-      importedAt: "now"
+      importedAt: "now",
+      sourceReceipt: null
     }
   };
 }

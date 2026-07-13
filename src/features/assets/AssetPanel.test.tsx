@@ -15,22 +15,34 @@ import {
 } from "../../domain/project/types";
 import {
   pickAlignmentMediaPath,
-  pickMediaPaths
+  pickMediaPaths,
+  pickXmlPaths
 } from "../../infrastructure/file-system/nativeDialogs";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "../../stores/editorStore";
 import { AssetPanel } from "./AssetPanel";
 
+const nativeXmlMocks = vi.hoisted(() => ({
+  importPaths: vi.fn()
+}));
+
 vi.mock("../../infrastructure/file-system/nativeDialogs", () => ({
   VIDEO_FILE_EXTENSIONS: ["mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "m2ts"],
   pickMediaPaths: vi.fn(),
+  pickXmlPaths: vi.fn(),
   pickAlignmentMediaPath: vi.fn()
+}));
+vi.mock("../../infrastructure/xml/nativeXmlReceipt", () => ({
+  importNativeXmlPaths: nativeXmlMocks.importPaths
 }));
 
 describe("资源面板", () => {
   beforeEach(() => {
     vi.mocked(pickAlignmentMediaPath).mockReset();
     vi.mocked(pickMediaPaths).mockReset();
+    vi.mocked(pickXmlPaths).mockReset();
+    nativeXmlMocks.importPaths.mockReset();
+    nativeXmlMocks.importPaths.mockRejectedValue(new Error("测试未配置原生 XML 导入"));
     const asset = parseBilibiliXml(
       `<?xml version="1.0" encoding="UTF-8"?><i><d p="0,1,25,16777215,0,0,u,r">测试</d></i>`,
       { fileName: "01 - 1.1.xml" }
@@ -53,6 +65,55 @@ describe("资源面板", () => {
     render(<AssetPanel section="materials" />);
     await user.click(screen.getByRole("button", { name: "删除" }));
     await waitFor(() => expect(useEditorStore.getState().project.assets).toHaveLength(0));
+  });
+
+  it("浏览器预览资源明确提示正式导出前需桌面重新导入", () => {
+    render(<AssetPanel section="materials" />);
+
+    expect(screen.getByText("仅预览")).toBeInTheDocument();
+    expect(screen.getByText(/没有原始 XML 内容收据/)).toBeInTheDocument();
+  });
+
+  it("桌面导入按钮使用原生多选并把权威收据显示为已受验证", async () => {
+    const restoreTauri = enableTauriForTest();
+    const asset = useEditorStore.getState().project.assets[0];
+    vi.mocked(pickXmlPaths).mockResolvedValue(["D:\\danmaku\\verified.xml"]);
+    nativeXmlMocks.importPaths.mockResolvedValue([
+      {
+        fileName: "verified.xml",
+        receipt: createTestXmlSourceReceipt(),
+        items: asset.items.map((item) => ({
+          originalIndex: item.originalIndex,
+          sourceTimeMs: item.sourceTimeMs,
+          mode: item.mode,
+          fontSize: item.fontSize,
+          color: item.color,
+          timestamp: item.timestamp,
+          pool: item.pool,
+          userHash: item.userHash,
+          rowId: item.rowId,
+          text: item.text,
+          rawPFields: [...item.rawPFields]
+        })),
+        warnings: []
+      }
+    ]);
+
+    try {
+      const user = userEvent.setup();
+      render(<AssetPanel section="materials" />);
+      await user.click(screen.getByRole("button", { name: "导入 XML" }));
+
+      await waitFor(() => expect(screen.getByText("已受验证")).toBeInTheDocument());
+      expect(pickXmlPaths).toHaveBeenCalledTimes(1);
+      expect(nativeXmlMocks.importPaths).toHaveBeenCalledWith(["D:\\danmaku\\verified.xml"]);
+      expect(useEditorStore.getState().project.assets).toHaveLength(1);
+      expect(useEditorStore.getState().project.assets[0].sourceReceipt).toEqual(
+        createTestXmlSourceReceipt()
+      );
+    } finally {
+      restoreTauri();
+    }
   });
 
   it("弹幕素材页可以绑定、更换和解除 XML 的 B 站参考素材", async () => {
@@ -1385,6 +1446,21 @@ function createProjectMediaReference(
     episodeLabel: overrides.episodeLabel ?? null,
     createdAt: overrides.createdAt ?? "2026-07-11T00:00:00.000Z",
     updatedAt: overrides.updatedAt ?? "2026-07-11T00:00:00.000Z"
+  };
+}
+
+function createTestXmlSourceReceipt() {
+  return {
+    domain: "danmaku-xml-content-receipt-v1" as const,
+    version: 1 as const,
+    receiptId: `xmlr-sha256:${"1".repeat(64)}`,
+    contentDigest: `sha256:${"2".repeat(64)}`,
+    sizeBytes: 128,
+    parserVersion: "bilibili-xml-native-v1" as const,
+    inventoryDigest: `sha256:${"3".repeat(64)}`,
+    issuerKeyId: `install-sha256:${"4".repeat(32)}`,
+    signatureAlgorithm: "hmac-sha256-v1" as const,
+    signature: "5".repeat(64)
   };
 }
 

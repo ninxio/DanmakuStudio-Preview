@@ -661,7 +661,8 @@ function createAsset(id: string, items: DanmakuItem[]): DanmakuAsset {
     color: "#4cc9f0",
     items,
     warnings: [],
-    importedAt: "2026-07-03T00:00:00.000Z"
+    importedAt: "2026-07-03T00:00:00.000Z",
+    sourceReceipt: null
   };
 }
 

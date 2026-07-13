@@ -15,6 +15,7 @@ describe("导出摘要", () => {
       fileName: "asset.xml",
       color: "#4cc9f0",
       importedAt: "now",
+      sourceReceipt: null,
       warnings: [],
       items: [
         {

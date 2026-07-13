@@ -109,7 +109,8 @@ describe("时间图差异人工分类", () => {
         color: "#ffffff",
         items: [],
         warnings: [],
-        importedAt: "2026-07-12T09:00:00.000Z"
+        importedAt: "2026-07-12T09:00:00.000Z",
+        sourceReceipt: null
       }
     ];
     project.danmakuSourceBindings = [

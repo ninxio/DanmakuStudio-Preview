@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   pickMediaPaths,
+  pickXmlPaths,
   pickMultipleNativePaths,
   pickAlignmentMediaPath,
   pickExportDirectoryPath,
@@ -36,6 +37,24 @@ describe("原生文件选择器封装", () => {
           extensions: ["mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "m2ts"]
         }
       ],
+      multiple: true,
+      directory: false
+    });
+  });
+
+  it("为弹幕 XML 打开原生多选并限制文件类型", async () => {
+    const dialog = vi.fn().mockResolvedValue([
+      " D:\\danmaku\\episode-1.xml ",
+      "D:\\danmaku\\episode-2.xml"
+    ]);
+
+    await expect(pickXmlPaths(dialog)).resolves.toEqual([
+      "D:\\danmaku\\episode-1.xml",
+      "D:\\danmaku\\episode-2.xml"
+    ]);
+    expect(dialog).toHaveBeenCalledWith({
+      title: "选择弹幕 XML",
+      filters: [{ name: "B 站弹幕 XML", extensions: ["xml"] }],
       multiple: true,
       directory: false
     });

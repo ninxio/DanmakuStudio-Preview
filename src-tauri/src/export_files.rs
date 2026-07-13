@@ -11,14 +11,21 @@ use std::{
 };
 use tauri::AppHandle;
 
-use crate::manual_verification::lock_manual_time_map_verification_authority;
+use crate::manual_verification::{
+    lock_manual_time_map_verification_authority, ManualVerificationAuthorityGuard,
+};
 use crate::media_probe::{probe_media_content_identity, MediaContentIdentity};
 use crate::physical_file::{PhysicalFileObjectKey, PinnedPhysicalFile};
+#[cfg(test)]
+use crate::xml_import_receipt::{compute_xml_inventory_digest, XML_CONTENT_RECEIPT_DOMAIN};
+use crate::xml_import_receipt::{
+    verify_xml_content_receipt, XmlContentReceiptV1, XmlImmutableDanmakuItemV1,
+};
 
-const VERIFIED_EXPORT_SCHEMA_VERSION: u8 = 2;
-const VERIFIED_EXPORT_MANIFEST_DOMAIN: &str = "verified-export-manifest-v2";
+const VERIFIED_EXPORT_SCHEMA_VERSION: u8 = 3;
+const VERIFIED_EXPORT_MANIFEST_DOMAIN: &str = "verified-export-manifest-v3";
 const MANUAL_VERIFICATION_REQUEST_DOMAIN: &str = "manual-time-map-verification-request-v1";
-const PROJECTION_DERIVATION_DOMAIN: &str = "projection-derivation-v1";
+const PROJECTION_DERIVATION_DOMAIN: &str = "projection-derivation-v2";
 const PROJECTION_POLICY_VERSION: &str = "source-projection-v1";
 const PROJECTION_SERIALIZER_VERSION: &str = "bilibili-xml-export-v1";
 const MEDIA_TIME_MAP_CORE_DOMAIN: &str = "media-time-map-core-v2";
@@ -26,15 +33,20 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROJECTION_ASSETS: usize = 4_096;
 const MAX_PROJECTION_MEDIA: usize = 8_192;
 const MAX_PROJECTION_ROUTES: usize = 65_536;
-const MAX_PROJECTION_ITEMS: usize = 20_000_000;
+const MAX_PROJECTION_ITEMS: usize = 500_000;
+const MAX_PROJECTION_RAW_P_FIELDS: usize = 64;
+const MAX_PROJECTION_RAW_P_BYTES: usize = 16 * 1024;
+const MAX_PROJECTION_DANMAKU_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_CORE_CANONICAL_JSON_BYTES: usize = 1_048_576;
+const MAX_VERIFIED_MANIFEST_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TEXT_REPORT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SaveExportFileRequest {
+pub struct SaveTextReportFileRequest {
     directory_path: String,
     file_name: String,
-    content_bytes: Vec<u8>,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,7 +65,8 @@ struct VerifiedExportVerification {
     project_id: String,
     project_updated_at: String,
     manifest_json: String,
-    snapshot_digest: String,
+    manifest_digest: String,
+    project_snapshot_digest: String,
     archive_file_name: String,
     archive_content_digest: String,
     outputs: Vec<VerifiedExportOutput>,
@@ -120,6 +133,7 @@ struct ProjectionMediaV1 {
 struct ProjectionXmlAssetV1 {
     asset_id: String,
     source_file_name: String,
+    source_receipt: Option<XmlContentReceiptV1>,
     items: Vec<ProjectionDanmakuItemV1>,
 }
 
@@ -263,10 +277,18 @@ pub struct SaveExportFileResult {
 }
 
 #[tauri::command]
-pub fn save_export_file(request: SaveExportFileRequest) -> Result<SaveExportFileResult, String> {
+pub fn save_text_report_file(
+    request: SaveTextReportFileRequest,
+) -> Result<SaveExportFileResult, String> {
     let directory = validate_export_directory(&request.directory_path)?;
-    let file_name = validate_export_file_name(&request.file_name)?;
-    write_export_file(&directory, &file_name, &request.content_bytes)
+    let file_name = validate_text_report_file_name(&request.file_name)?;
+    if request.content.len() > MAX_TEXT_REPORT_BYTES {
+        return Err(format!(
+            "文本报告超过 {} MiB 上限，已拒绝写入。",
+            MAX_TEXT_REPORT_BYTES / (1024 * 1024)
+        ));
+    }
+    write_export_file(&directory, &file_name, request.content.as_bytes())
 }
 
 /// Saves a time-map-derived export only after re-reading every dependent media identity.
@@ -274,12 +296,17 @@ pub fn save_export_file(request: SaveExportFileRequest) -> Result<SaveExportFile
 /// Keeping verification and the write in one backend command closes the UI/preflight gap: a
 /// browser fallback or an unavailable verification bridge can never silently become approval.
 #[tauri::command]
-pub fn save_verified_export_file(
+pub fn save_verified_projected_xml_export(
     app: AppHandle,
     request: SaveVerifiedExportFileRequest,
 ) -> Result<SaveExportFileResult, String> {
     let authority = lock_manual_time_map_verification_authority(&app)?;
-    save_verified_export_file_with_authority(request, |proof| {
+    verify_projection_xml_receipts(
+        &app,
+        &authority,
+        &request.verification.projection_derivation,
+    )?;
+    save_verified_projected_xml_export_with_authority(request, |proof| {
         let manual = &proof.manual_verification;
         authority.require_active(
             &manual.verification_id,
@@ -291,7 +318,120 @@ pub fn save_verified_export_file(
     })
 }
 
-fn save_verified_export_file_with_authority<F>(
+fn verify_projection_xml_receipts(
+    app: &AppHandle,
+    authority: &ManualVerificationAuthorityGuard,
+    derivation: &ProjectionDerivationV1,
+) -> Result<(), String> {
+    verify_projection_xml_receipts_with(derivation, |receipt, items| {
+        verify_xml_content_receipt(app, authority, receipt, items)
+    })
+}
+
+fn verify_projection_xml_receipts_with(
+    derivation: &ProjectionDerivationV1,
+    mut verify_receipt: impl FnMut(
+        &XmlContentReceiptV1,
+        &[XmlImmutableDanmakuItemV1],
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    let total_items = derivation
+        .xml_assets
+        .iter()
+        .try_fold(0_usize, |total, asset| {
+            total
+                .checked_add(asset.items.len())
+                .ok_or_else(|| "投影重建 inventory 的弹幕总数溢出。".to_string())
+        })?;
+    if total_items > MAX_PROJECTION_ITEMS {
+        return Err(format!(
+            "高精度导出最多处理 {MAX_PROJECTION_ITEMS} 条项目弹幕。"
+        ));
+    }
+    let mut assets_by_id = HashMap::with_capacity(derivation.xml_assets.len());
+    for asset in &derivation.xml_assets {
+        if assets_by_id
+            .insert(asset.asset_id.as_str(), asset)
+            .is_some()
+        {
+            return Err(format!(
+                "投影重建 inventory 含重复 XML assetId：{}。",
+                asset.asset_id
+            ));
+        }
+    }
+
+    let mut verified_asset_ids = HashSet::new();
+    for route in derivation
+        .routes
+        .iter()
+        .filter(|route| route.kind == "content")
+    {
+        let asset_id = route
+            .asset_id
+            .as_deref()
+            .ok_or_else(|| format!("内容 route {} 缺少 XML assetId。", route.route_id))?;
+        if !verified_asset_ids.insert(asset_id) {
+            continue;
+        }
+        let asset = assets_by_id
+            .get(asset_id)
+            .ok_or_else(|| format!("内容 route {} 引用的 XML 资产不存在。", route.route_id))?;
+        let receipt = asset.source_receipt.as_ref().ok_or_else(|| {
+            format!(
+                "XML 资产 {} 没有桌面原生内容收据；请在素材页重新选择原始 XML。",
+                asset.source_file_name
+            )
+        })?;
+        let mut immutable_items = Vec::with_capacity(asset.items.len());
+        for (index, item) in asset.items.iter().enumerate() {
+            let raw_p_bytes = item.raw_p_fields.iter().try_fold(0_usize, |total, field| {
+                total
+                    .checked_add(field.len())
+                    .ok_or_else(|| "XML 弹幕 p 字段总长度溢出。".to_string())
+            })?;
+            if item.raw_p_fields.len() > MAX_PROJECTION_RAW_P_FIELDS
+                || raw_p_bytes > MAX_PROJECTION_RAW_P_BYTES
+                || item.text.len() > MAX_PROJECTION_DANMAKU_TEXT_BYTES
+            {
+                return Err(format!(
+                    "XML 资产 {} 的第 {} 条弹幕超过安全大小上限。",
+                    asset.source_file_name, index
+                ));
+            }
+            let original_index =
+                u64::try_from(index).map_err(|_| "XML 弹幕序号超过原生导出范围。".to_string())?;
+            let expected_item_id = format!("{}_item_{original_index}", asset.asset_id);
+            if item.original_index != original_index
+                || item.asset_id != asset.asset_id
+                || item.item_id != expected_item_id
+                || !item.enabled
+            {
+                return Err(format!(
+                    "XML 资产 {} 的第 {} 条弹幕身份或原始启用状态已被修改，已阻断导出。",
+                    asset.source_file_name, index
+                ));
+            }
+            immutable_items.push(XmlImmutableDanmakuItemV1 {
+                original_index: item.original_index,
+                source_time_ms: item.source_time_ms,
+                mode: item.mode,
+                font_size: item.font_size,
+                color: item.color,
+                timestamp: item.timestamp,
+                pool: item.pool,
+                user_hash: item.user_hash.clone(),
+                row_id: item.row_id.clone(),
+                text: item.text.clone(),
+                raw_p_fields: item.raw_p_fields.clone(),
+            });
+        }
+        verify_receipt(receipt, &immutable_items)?;
+    }
+    Ok(())
+}
+
+fn save_verified_projected_xml_export_with_authority<F>(
     request: SaveVerifiedExportFileRequest,
     mut verify_authority: F,
 ) -> Result<SaveExportFileResult, String>
@@ -403,8 +543,11 @@ where
     for (label, value) in [
         ("projectId", verification.project_id.as_str()),
         ("projectUpdatedAt", verification.project_updated_at.as_str()),
-        ("manifestJson", verification.manifest_json.as_str()),
-        ("snapshotDigest", verification.snapshot_digest.as_str()),
+        ("manifestDigest", verification.manifest_digest.as_str()),
+        (
+            "projectSnapshotDigest",
+            verification.project_snapshot_digest.as_str(),
+        ),
         ("archiveFileName", verification.archive_file_name.as_str()),
         (
             "archiveContentDigest",
@@ -413,7 +556,16 @@ where
     ] {
         validate_nonempty_bounded(label, value, 1_048_576)?;
     }
-    validate_sha256_digest("snapshotDigest", &verification.snapshot_digest)?;
+    validate_nonempty_bounded(
+        "manifestJson",
+        &verification.manifest_json,
+        MAX_VERIFIED_MANIFEST_JSON_BYTES,
+    )?;
+    validate_sha256_digest("manifestDigest", &verification.manifest_digest)?;
+    validate_sha256_digest(
+        "projectSnapshotDigest",
+        &verification.project_snapshot_digest,
+    )?;
     validate_sha256_digest("archiveContentDigest", &verification.archive_content_digest)?;
     if request.file_name != verification.archive_file_name {
         return Err("写盘文件名与高精度导出 manifest 不一致。".to_string());
@@ -432,9 +584,17 @@ where
         return Err("高精度分集导出没有携带媒体身份依赖，已拒绝写入。".to_string());
     }
 
+    validate_projected_export_file_shape(request)?;
     validate_output_content_binding(request)?;
     validate_map_proofs_and_dependencies(verification, verify_authority)?;
     validate_projection_derivation_binding(request)?;
+
+    let canonical_projection = canonical_projection_derivation(&verification.projection_derivation);
+    let canonical_projection_json = serde_json::to_string(&canonical_projection)
+        .map_err(|error| format!("无法重算项目投影快照：{error}"))?;
+    if sha256_digest(canonical_projection_json.as_bytes()) != verification.project_snapshot_digest {
+        return Err("项目投影快照 SHA-256 不匹配。".to_string());
+    }
 
     let canonical = canonical_verified_export_manifest(verification)?;
     let canonical_json = serde_json::to_string(&canonical)
@@ -442,8 +602,29 @@ where
     if canonical_json != verification.manifest_json {
         return Err("高精度导出 manifest 不是固定顺序规范 JSON。".to_string());
     }
-    if sha256_digest(canonical_json.as_bytes()) != verification.snapshot_digest {
+    if sha256_digest(canonical_json.as_bytes()) != verification.manifest_digest {
         return Err("高精度导出 manifest SHA-256 不匹配。".to_string());
+    }
+    Ok(())
+}
+
+fn validate_projected_export_file_shape(
+    request: &SaveVerifiedExportFileRequest,
+) -> Result<(), String> {
+    for output in &request.verification.outputs {
+        if !has_case_insensitive_extension(&output.file_name, "xml") {
+            return Err(format!(
+                "高精度投影的逻辑输出必须使用 .xml 扩展名：{}。",
+                output.file_name
+            ));
+        }
+    }
+    if request.verification.outputs.len() == 1 {
+        if !has_case_insensitive_extension(&request.file_name, "xml") {
+            return Err("高精度投影的单文件写盘目标必须使用 .xml 扩展名。".to_string());
+        }
+    } else if !has_case_insensitive_extension(&request.file_name, "zip") {
+        return Err("高精度投影的多文件写盘目标必须使用 .zip 扩展名。".to_string());
     }
     Ok(())
 }
@@ -2041,12 +2222,12 @@ fn canonical_verified_export_manifest(
         verification.schema_version,
         verification.project_id,
         verification.project_updated_at,
+        verification.project_snapshot_digest,
         verification.archive_file_name,
         verification.archive_content_digest,
         output_values,
         proof_values,
         dependency_values,
-        canonical_projection_derivation(&verification.projection_derivation),
     ]))
 }
 
@@ -2092,7 +2273,21 @@ fn canonical_projection_derivation(derivation: &ProjectionDerivationV1) -> Value
                     ])
                 })
                 .collect::<Vec<_>>();
-            json!([asset.asset_id, asset.source_file_name, items])
+            let receipt = asset.source_receipt.as_ref().map(|receipt| {
+                json!([
+                    receipt.domain,
+                    receipt.version,
+                    receipt.receipt_id,
+                    receipt.content_digest,
+                    receipt.size_bytes,
+                    receipt.parser_version,
+                    receipt.inventory_digest,
+                    receipt.issuer_key_id,
+                    receipt.signature_algorithm,
+                    receipt.signature,
+                ])
+            });
+            json!([asset.asset_id, asset.source_file_name, receipt, items])
         })
         .collect::<Vec<_>>();
     let bindings = derivation
@@ -2453,6 +2648,21 @@ fn validate_export_file_name(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn validate_text_report_file_name(raw: &str) -> Result<String, String> {
+    let file_name = validate_export_file_name(raw)?;
+    if !has_case_insensitive_extension(&file_name, "txt") {
+        return Err("普通文本报告只能写入 .txt 文件。".to_string());
+    }
+    Ok(file_name)
+}
+
+fn has_case_insensitive_extension(file_name: &str, expected: &str) -> bool {
+    Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
 fn split_file_name(file_name: &str) -> (String, String) {
     match file_name.rsplit_once('.') {
         Some((base, extension)) if !base.is_empty() => (base.to_string(), format!(".{extension}")),
@@ -2527,6 +2737,47 @@ mod tests {
             );
         }
         assert!(validate_export_file_name(" ").is_err());
+    }
+
+    #[test]
+    fn text_report_command_only_writes_bounded_utf8_txt_files() {
+        let unique = tempfile_like_path("danmaku-export-text-report");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+
+        let result = save_text_report_file(SaveTextReportFileRequest {
+            directory_path: unique.to_string_lossy().to_string(),
+            file_name: "检查报告.TXT".to_string(),
+            content: "中文 UTF-8 报告".to_string(),
+        })
+        .unwrap();
+        assert_eq!(result.file_name, "检查报告.TXT");
+        assert_eq!(
+            fs::read_to_string(unique.join("检查报告.TXT")).unwrap(),
+            "中文 UTF-8 报告"
+        );
+
+        for file_name in ["projected.xml", "projected.zip", "report.json", "report"] {
+            let error = save_text_report_file(SaveTextReportFileRequest {
+                directory_path: unique.to_string_lossy().to_string(),
+                file_name: file_name.to_string(),
+                content: "not allowed".to_string(),
+            })
+            .unwrap_err();
+            assert!(error.contains("只能写入 .txt"));
+            assert!(!unique.join(file_name).exists());
+        }
+
+        let oversized_name = "oversized.txt";
+        let error = save_text_report_file(SaveTextReportFileRequest {
+            directory_path: unique.to_string_lossy().to_string(),
+            file_name: oversized_name.to_string(),
+            content: "x".repeat(MAX_TEXT_REPORT_BYTES + 1),
+        })
+        .unwrap_err();
+        assert!(error.contains("MiB 上限"));
+        assert!(!unique.join(oversized_name).exists());
+        fs::remove_dir_all(unique).unwrap();
     }
 
     #[test]
@@ -2617,7 +2868,7 @@ mod tests {
         );
 
         let mut authority_checks = 0;
-        let result = save_verified_export_file_with_authority(request, |_| {
+        let result = save_verified_projected_xml_export_with_authority(request, |_| {
             authority_checks += 1;
             Ok(())
         })
@@ -2633,6 +2884,52 @@ mod tests {
     }
 
     #[test]
+    fn projected_export_shape_requires_xml_outputs_and_zip_only_for_multiple_outputs() {
+        let unique = tempfile_like_path("danmaku-export-purpose-shape");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+        let (source_path, target_path, source_identity, target_identity) =
+            create_media_pair(&unique);
+        let base = verified_request(
+            &unique,
+            &source_path,
+            &target_path,
+            source_identity,
+            target_identity,
+        );
+        assert!(validate_projected_export_file_shape(&base).is_ok());
+
+        let mut non_xml_output = clone_request(&base);
+        non_xml_output.verification.outputs[0].file_name = "episode.txt".to_string();
+        assert!(validate_projected_export_file_shape(&non_xml_output)
+            .unwrap_err()
+            .contains("逻辑输出必须使用 .xml"));
+
+        let mut non_xml_outer = clone_request(&base);
+        non_xml_outer.file_name = "episode.txt".to_string();
+        assert!(validate_projected_export_file_shape(&non_xml_outer)
+            .unwrap_err()
+            .contains("单文件写盘目标必须使用 .xml"));
+
+        let mut multiple_with_xml_outer = clone_request(&base);
+        multiple_with_xml_outer
+            .verification
+            .outputs
+            .push(VerifiedExportOutput {
+                file_name: "episode-2.xml".to_string(),
+                content_digest: sha256_digest(b"second"),
+            });
+        assert!(
+            validate_projected_export_file_shape(&multiple_with_xml_outer)
+                .unwrap_err()
+                .contains("多文件写盘目标必须使用 .zip")
+        );
+        multiple_with_xml_outer.file_name = "season.ZIP".to_string();
+        assert!(validate_projected_export_file_shape(&multiple_with_xml_outer).is_ok());
+        fs::remove_dir_all(unique).unwrap();
+    }
+
+    #[test]
     fn verified_save_refuses_a_media_replaced_after_preflight() {
         let unique = tempfile_like_path("danmaku-export-replaced");
         let _ = fs::remove_dir_all(&unique);
@@ -2640,7 +2937,7 @@ mod tests {
         let (source_path, target_path, source_identity, target_identity) =
             create_media_pair(&unique);
         fs::write(&source_path, vec![9_u8; 256 * 1024]).unwrap();
-        let error = save_verified_export_file_with_authority(
+        let error = save_verified_projected_xml_export_with_authority(
             verified_request(
                 &unique,
                 &source_path,
@@ -2675,7 +2972,7 @@ mod tests {
             .verification
             .projection_derivation
             .item_time_adjustments = vec![ProjectionItemTimeAdjustmentV1 {
-            item_id: "item-1".to_string(),
+            item_id: "asset-1_item_0".to_string(),
             adjustment_ms: 50,
         }];
         request.content_bytes = String::from_utf8(request_fixture_xml())
@@ -2687,7 +2984,8 @@ mod tests {
         request.verification.outputs[0].content_digest = digest;
         resign_manifest(&mut request.verification);
 
-        let result = save_verified_export_file_with_authority(request, |_| Ok(())).unwrap();
+        let result =
+            save_verified_projected_xml_export_with_authority(request, |_| Ok(())).unwrap();
         assert_eq!(result.file_name, "episode.xml");
         assert!(String::from_utf8(fs::read(result.file_path).unwrap())
             .unwrap()
@@ -2860,7 +3158,7 @@ mod tests {
         );
 
         let mut manifest = clone_request(&base);
-        manifest.verification.snapshot_digest = sha256_digest(b"not-the-manifest");
+        manifest.verification.manifest_digest = sha256_digest(b"not-the-manifest");
         assert_rejected_without_write(&manifest, &unique, "manifest SHA-256");
 
         let mut dependency = clone_request(&base);
@@ -2868,6 +3166,85 @@ mod tests {
         resign_manifest(&mut dependency.verification);
         assert_rejected_without_write(&dependency, &unique, "没有绑定任何时间图");
 
+        fs::remove_dir_all(unique).unwrap();
+    }
+
+    #[test]
+    fn receipt_bound_projection_rejects_missing_receipt_and_resigned_item_tampering() {
+        let unique = tempfile_like_path("danmaku-export-xml-receipt-binding");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+        let (source_path, target_path, source_identity, target_identity) =
+            create_media_pair(&unique);
+        let mut request = verified_request(
+            &unique,
+            &source_path,
+            &target_path,
+            source_identity,
+            target_identity,
+        );
+
+        let missing = verify_projection_xml_receipts_with(
+            &request.verification.projection_derivation,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(missing.contains("没有桌面原生内容收据"));
+
+        let immutable = XmlImmutableDanmakuItemV1 {
+            original_index: 0,
+            source_time_ms: 100,
+            mode: None,
+            font_size: None,
+            color: None,
+            timestamp: None,
+            pool: None,
+            user_hash: None,
+            row_id: None,
+            text: "fixture & text".to_string(),
+            raw_p_fields: Vec::new(),
+        };
+        let inventory_digest = compute_xml_inventory_digest(&[immutable]).unwrap();
+        request.verification.projection_derivation.xml_assets[0].source_receipt =
+            Some(XmlContentReceiptV1 {
+                domain: XML_CONTENT_RECEIPT_DOMAIN.to_string(),
+                version: 1,
+                receipt_id: format!("xmlr-sha256:{}", "a".repeat(64)),
+                content_digest: format!("sha256:{}", "b".repeat(64)),
+                size_bytes: 123,
+                parser_version: crate::xml_import_receipt::XML_PARSER_VERSION.to_string(),
+                inventory_digest,
+                issuer_key_id: "install-sha256:fixture".to_string(),
+                signature_algorithm: "hmac-sha256-v1".to_string(),
+                signature: "c".repeat(64),
+            });
+        verify_projection_xml_receipts_with(
+            &request.verification.projection_derivation,
+            |receipt, items| {
+                if compute_xml_inventory_digest(items)? == receipt.inventory_digest {
+                    Ok(())
+                } else {
+                    Err("receipt inventory mismatch".to_string())
+                }
+            },
+        )
+        .unwrap();
+
+        request.verification.projection_derivation.xml_assets[0].items[0].text =
+            "forged text".to_string();
+        resign_manifest(&mut request.verification);
+        let error = verify_projection_xml_receipts_with(
+            &request.verification.projection_derivation,
+            |receipt, items| {
+                if compute_xml_inventory_digest(items)? == receipt.inventory_digest {
+                    Ok(())
+                } else {
+                    Err("receipt inventory mismatch".to_string())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "receipt inventory mismatch");
         fs::remove_dir_all(unique).unwrap();
     }
 
@@ -2886,10 +3263,11 @@ mod tests {
             target_identity,
         );
         for reason in ["revoked", "unknown"] {
-            let error = save_verified_export_file_with_authority(clone_request(&request), |_| {
-                Err(reason.to_string())
-            })
-            .unwrap_err();
+            let error =
+                save_verified_projected_xml_export_with_authority(clone_request(&request), |_| {
+                    Err(reason.to_string())
+                })
+                .unwrap_err();
             assert!(error.contains(reason));
             assert!(!unique.join("episode.xml").exists());
         }
@@ -2923,8 +3301,9 @@ mod tests {
         directory: &Path,
         expected: &str,
     ) {
-        let error = save_verified_export_file_with_authority(clone_request(request), |_| Ok(()))
-            .unwrap_err();
+        let error =
+            save_verified_projected_xml_export_with_authority(clone_request(request), |_| Ok(()))
+                .unwrap_err();
         assert!(error.contains(expected), "unexpected error: {error}");
         assert!(!directory.join("episode.xml").exists());
     }
@@ -3104,7 +3483,8 @@ mod tests {
             project_id: "project-1".to_string(),
             project_updated_at: "2026-07-12T00:00:00.000Z".to_string(),
             manifest_json: String::new(),
-            snapshot_digest: sha256_digest(b"pending"),
+            manifest_digest: sha256_digest(b"pending-manifest"),
+            project_snapshot_digest: sha256_digest(b"pending-project"),
             archive_file_name: "episode.xml".to_string(),
             archive_content_digest: sha256_digest(&content_bytes),
             outputs: vec![VerifiedExportOutput {
@@ -3155,8 +3535,9 @@ mod tests {
                 xml_assets: vec![ProjectionXmlAssetV1 {
                     asset_id: "asset-1".to_string(),
                     source_file_name: "source.xml".to_string(),
+                    source_receipt: None,
                     items: vec![ProjectionDanmakuItemV1 {
-                        item_id: "item-1".to_string(),
+                        item_id: "asset-1_item_0".to_string(),
                         asset_id: "asset-1".to_string(),
                         original_index: 0,
                         source_time_ms: 100,
@@ -3219,10 +3600,17 @@ mod tests {
     }
 
     fn resign_manifest(verification: &mut VerifiedExportVerification) {
+        verification.project_snapshot_digest = sha256_digest(
+            serde_json::to_string(&canonical_projection_derivation(
+                &verification.projection_derivation,
+            ))
+            .unwrap()
+            .as_bytes(),
+        );
         verification.manifest_json =
             serde_json::to_string(&canonical_verified_export_manifest(verification).unwrap())
                 .unwrap();
-        verification.snapshot_digest = sha256_digest(verification.manifest_json.as_bytes());
+        verification.manifest_digest = sha256_digest(verification.manifest_json.as_bytes());
     }
 
     fn rebind_signed_core_and_request(request: &mut SaveVerifiedExportFileRequest, core: Value) {
@@ -3248,7 +3636,8 @@ mod tests {
                 project_id: request.verification.project_id.clone(),
                 project_updated_at: request.verification.project_updated_at.clone(),
                 manifest_json: request.verification.manifest_json.clone(),
-                snapshot_digest: request.verification.snapshot_digest.clone(),
+                manifest_digest: request.verification.manifest_digest.clone(),
+                project_snapshot_digest: request.verification.project_snapshot_digest.clone(),
                 archive_file_name: request.verification.archive_file_name.clone(),
                 archive_content_digest: request.verification.archive_content_digest.clone(),
                 outputs: request.verification.outputs.clone(),

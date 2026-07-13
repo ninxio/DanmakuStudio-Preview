@@ -64,6 +64,7 @@ describe("timeline mapping", () => {
       fileName: "a.xml",
       color: "#4cc9f0",
       importedAt: new Date().toISOString(),
+      sourceReceipt: null,
       warnings: [],
       items: [item("late", 3000, 2), item("early", 1000, 0), item("same", 1000, 1)]
     };
@@ -85,6 +86,7 @@ describe("timeline mapping", () => {
       fileName: "a.xml",
       color: "#4cc9f0",
       importedAt: new Date().toISOString(),
+      sourceReceipt: null,
       warnings: [],
       items: [item("before", 999, 0), boundaryItem, item("after", 1999, 2)]
     };

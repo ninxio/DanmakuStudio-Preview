@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const manualVerificationMocks = vi.hoisted(() => ({
   rehydrateProject: vi.fn()
 }));
+const nativeXmlMocks = vi.hoisted(() => ({
+  importPaths: vi.fn()
+}));
 
 vi.mock("../infrastructure/media/manualVerificationAuthority", () => ({
   issuePersistedManualMediaTimeMapVerification: vi.fn(() =>
@@ -13,7 +16,14 @@ vi.mock("../infrastructure/media/manualVerificationAuthority", () => ({
     Promise.reject(new Error("测试未配置人工验证撤销"))
   )
 }));
-import type { DanmakuClip } from "../domain/danmaku/types";
+vi.mock("../infrastructure/xml/nativeXmlReceipt", () => ({
+  importNativeXmlPaths: nativeXmlMocks.importPaths
+}));
+import type {
+  DanmakuAsset,
+  DanmakuClip,
+  DanmakuXmlSourceReceipt
+} from "../domain/danmaku/types";
 import { DEFAULT_CUT_HINT_SEARCH_SETTINGS } from "../domain/danmaku/cutHints";
 import { createHistoryState } from "../domain/history/history";
 import { createMediaMatchCandidate } from "../domain/alignment/mediaMatching";
@@ -31,6 +41,7 @@ import {
 } from "../domain/alignment/timeMapPlaybackReviewEvidence";
 import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../test/manualVerification";
 import { parseBilibiliXml } from "../infrastructure/xml/bilibiliXml";
+import type { NativeXmlImportedFile } from "../infrastructure/xml/nativeXmlReceipt";
 import { useEditorStore } from "./editorStore";
 
 function resetStore(project: EditorProject = createEmptyProject()): void {
@@ -123,6 +134,8 @@ describe("editor store", () => {
     manualVerificationMocks.rehydrateProject.mockImplementation((project: EditorProject) =>
       Promise.resolve(project)
     );
+    nativeXmlMocks.importPaths.mockReset();
+    nativeXmlMocks.importPaths.mockRejectedValue(new Error("测试未配置原生 XML 导入"));
     resetStore();
   });
 
@@ -1226,6 +1239,117 @@ describe("editor store", () => {
       "#4cc9f0",
       "#7bd88f"
     ]);
+    expect(useEditorStore.getState().project.assets.every((asset) => asset.sourceReceipt === null)).toBe(
+      true
+    );
+    expect(useEditorStore.getState().status.tone).toBe("warning");
+    expect(useEditorStore.getState().status.message).toContain("正式受验证导出前");
+  });
+
+  it("原生多文件导入只生成一次原子历史提交并保存收据", async () => {
+    const first = createAsset("native-source-a", "a.xml");
+    const second = createAsset("native-source-b", "b.xml");
+    nativeXmlMocks.importPaths.mockResolvedValue([
+      createNativeImportedFile(first, "a.xml", "1"),
+      createNativeImportedFile(second, "b.xml", "2")
+    ]);
+
+    await useEditorStore
+      .getState()
+      .importXmlPaths(["D:\\danmaku\\a.xml", "D:\\danmaku\\b.xml"]);
+
+    const state = useEditorStore.getState();
+    expect(nativeXmlMocks.importPaths).toHaveBeenCalledTimes(1);
+    expect(state.project.assets).toHaveLength(2);
+    expect(state.project.assets.every((asset) => asset.sourceReceipt !== null)).toBe(true);
+    expect(state.history.past).toHaveLength(1);
+    expect(state.history.past[0].label).toBe("原生导入 XML");
+    expect(state.status.message).toContain("新增 2 个");
+  });
+
+  it("原生重新导入按不可变库存唯一认领旧资源并保留所有项目引用", async () => {
+    const legacyAsset = createAsset("legacy-asset", "old-name.xml");
+    legacyAsset.name = "用户保留名称";
+    legacyAsset.color = "#abcdef";
+    legacyAsset.importedAt = "2026-07-01T00:00:00.000Z";
+    const originalFirstItemId = legacyAsset.items[0].id;
+    resetStore({
+      ...createEmptyProject("旧项目"),
+      assets: [legacyAsset],
+      danmakuSourceBindings: [
+        {
+          id: "binding-1",
+          assetId: legacyAsset.id,
+          sourceMediaId: "source-media",
+          linkedAt: "2026-07-01T00:00:00.000Z",
+          updatedAt: "2026-07-01T00:00:00.000Z"
+        }
+      ],
+      disabledItemIds: [originalFirstItemId],
+      itemTimeAdjustments: { [originalFirstItemId]: 1250 }
+    });
+    nativeXmlMocks.importPaths.mockResolvedValue([
+      createNativeImportedFile(legacyAsset, "reselected.xml", "3")
+    ]);
+
+    await useEditorStore.getState().importXmlPaths(["D:\\danmaku\\reselected.xml"]);
+
+    const project = useEditorStore.getState().project;
+    expect(project.assets).toHaveLength(1);
+    expect(project.assets[0]).toMatchObject({
+      id: "legacy-asset",
+      name: "用户保留名称",
+      fileName: "reselected.xml",
+      color: "#abcdef",
+      importedAt: "2026-07-01T00:00:00.000Z",
+      sourceReceipt: { receiptId: `xmlr-sha256:${"3".repeat(64)}` }
+    });
+    expect(project.assets[0].items.map((item) => item.id)).toEqual([
+      "legacy-asset_item_0",
+      "legacy-asset_item_1"
+    ]);
+    expect(project.assets[0].items.every((item) => item.enabled)).toBe(true);
+    expect(project.danmakuSourceBindings[0].assetId).toBe("legacy-asset");
+    expect(project.disabledItemIds).toEqual([originalFirstItemId]);
+    expect(project.itemTimeAdjustments).toEqual({ [originalFirstItemId]: 1250 });
+    expect(useEditorStore.getState().status.message).toContain("认领旧资源 1 个，新增 0 个");
+  });
+
+  it("多个旧资源库存相同时不猜测认领对象而是新增资源", async () => {
+    const firstLegacy = createAsset("legacy-a", "a.xml");
+    const secondLegacy = createAsset("legacy-b", "b.xml");
+    resetStore({
+      ...createEmptyProject("歧义旧项目"),
+      assets: [firstLegacy, secondLegacy]
+    });
+    nativeXmlMocks.importPaths.mockResolvedValue([
+      createNativeImportedFile(firstLegacy, "reselected.xml", "4")
+    ]);
+
+    await useEditorStore.getState().importXmlPaths(["D:\\danmaku\\reselected.xml"]);
+
+    const assets = useEditorStore.getState().project.assets;
+    expect(assets).toHaveLength(3);
+    expect(assets.filter((asset) => asset.sourceReceipt === null)).toHaveLength(2);
+    expect(assets.filter((asset) => asset.sourceReceipt !== null)).toHaveLength(1);
+    expect(useEditorStore.getState().status.message).toContain("认领旧资源 0 个，新增 1 个");
+  });
+
+  it("原生批量读取失败时不提交任何部分资源", async () => {
+    nativeXmlMocks.importPaths.mockRejectedValue(new Error("第二个 XML 签名失败"));
+
+    await useEditorStore
+      .getState()
+      .importXmlPaths(["D:\\danmaku\\a.xml", "D:\\danmaku\\b.xml"]);
+
+    const state = useEditorStore.getState();
+    expect(state.project.assets).toEqual([]);
+    expect(state.history.past).toEqual([]);
+    expect(state.importProgress).toBeNull();
+    expect(state.status).toEqual({
+      message: "XML 导入失败：第二个 XML 签名失败",
+      tone: "error"
+    });
   });
 
   it("XML 文件读取失败时清除导入进度并显示错误", async () => {
@@ -1745,6 +1869,46 @@ describe("editor store", () => {
     expect(useEditorStore.getState().selection).toEqual({ kind: "none", ids: [] });
   });
 });
+
+function createNativeImportedFile(
+  asset: DanmakuAsset,
+  fileName: string,
+  digestCharacter: string
+): NativeXmlImportedFile {
+  return {
+    fileName,
+    receipt: createTestXmlSourceReceipt(digestCharacter),
+    items: asset.items.map((item) => ({
+      originalIndex: item.originalIndex,
+      sourceTimeMs: item.sourceTimeMs,
+      mode: item.mode,
+      fontSize: item.fontSize,
+      color: item.color,
+      timestamp: item.timestamp,
+      pool: item.pool,
+      userHash: item.userHash,
+      rowId: item.rowId,
+      text: item.text,
+      rawPFields: [...item.rawPFields]
+    })),
+    warnings: []
+  };
+}
+
+function createTestXmlSourceReceipt(digestCharacter: string): DanmakuXmlSourceReceipt {
+  return {
+    domain: "danmaku-xml-content-receipt-v1",
+    version: 1,
+    receiptId: `xmlr-sha256:${digestCharacter.repeat(64)}`,
+    contentDigest: `sha256:${digestCharacter.repeat(64)}`,
+    sizeBytes: 256,
+    parserVersion: "bilibili-xml-native-v1",
+    inventoryDigest: `sha256:${digestCharacter.repeat(64)}`,
+    issuerKeyId: `install-sha256:${digestCharacter.repeat(32)}`,
+    signatureAlgorithm: "hmac-sha256-v1",
+    signature: digestCharacter.repeat(64)
+  };
+}
 
 function createProjectMediaReference(
   id: string,

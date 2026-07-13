@@ -3,7 +3,7 @@ import type { AlignmentProposal } from "../alignment/types";
 import type { TimeMapSpan } from "../alignment/timeMap";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 export interface MediaReference {
   id: string;
