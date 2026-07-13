@@ -44,6 +44,7 @@ export interface VerifiedExportMapProof {
   declaredQuality: "verified";
   spanKinds: Array<"matched" | "sourceOnly" | "targetOnly">;
   coreDigest: string;
+  coreCanonicalJson: string;
   sourceMediaId: string;
   targetMediaId: string;
   sourceIdentity: MediaContentIdentity;
@@ -51,10 +52,94 @@ export interface VerifiedExportMapProof {
   manualVerification: VerifiedExportManualVerification;
 }
 
-export interface VerifiedExportVerificationSeed {
-  schemaVersion: 1;
+export interface ProjectionDerivationMediaV1 {
+  mediaId: string;
+  role: "targetOriginal" | "bilibiliReference";
+  name: string;
+  mediaFileName: string;
+  durationMs: number | null;
+  episodeLabel: string | null;
+  contentIdentity: MediaContentIdentity | null;
+}
+
+export interface ProjectionDerivationDanmakuItemV1 {
+  itemId: string;
+  assetId: string;
+  originalIndex: number;
+  sourceTimeMs: number;
+  mode: number | null;
+  fontSize: number | null;
+  color: number | null;
+  timestamp: number | null;
+  pool: number | null;
+  userHash: string | null;
+  rowId: string | null;
+  text: string;
+  rawPFields: string[];
+  enabled: boolean;
+}
+
+export interface ProjectionDerivationXmlAssetV1 {
+  assetId: string;
+  sourceFileName: string;
+  items: ProjectionDerivationDanmakuItemV1[];
+}
+
+export interface ProjectionDerivationSourceBindingV1 {
+  bindingId: string;
+  assetId: string;
+  sourceMediaId: string;
+}
+
+export interface ProjectionDerivationTimingRuleV1 {
+  ruleId: string;
+  sourceAtMs: number;
+  gapMs: number;
+}
+
+export interface ProjectionDerivationRouteV1 {
+  routeId: string;
+  kind: "content" | "ignored";
+  assetId: string | null;
+  sourceMediaId: string | null;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  targetMediaId: string | null;
+  targetStartMs: number | null;
+  timeMapId: string | null;
+  timingRules: ProjectionDerivationTimingRuleV1[];
+}
+
+export interface ProjectionDerivationItemAdjustmentV1 {
+  itemId: string;
+  adjustmentMs: number;
+}
+
+export interface ProjectionDerivationTargetOutputFileV1 {
+  targetMediaId: string;
+  fileName: string;
+}
+
+export interface ProjectionDerivationV1 {
+  domain: "projection-derivation-v1";
+  projectionPolicyVersion: "source-projection-v1";
+  serializerVersion: "bilibili-xml-export-v1";
   projectId: string;
   projectUpdatedAt: string;
+  media: ProjectionDerivationMediaV1[];
+  xmlAssets: ProjectionDerivationXmlAssetV1[];
+  sourceBindings: ProjectionDerivationSourceBindingV1[];
+  routes: ProjectionDerivationRouteV1[];
+  disabledItemIds: string[];
+  itemTimeAdjustments: ProjectionDerivationItemAdjustmentV1[];
+  targetOutputFiles: ProjectionDerivationTargetOutputFileV1[];
+}
+
+export interface VerifiedExportVerificationSeed {
+  schemaVersion: 2;
+  projectId: string;
+  projectUpdatedAt: string;
+  projectionDerivation: ProjectionDerivationV1;
   mapProofs: VerifiedExportMapProof[];
   dependencies: VerifiedMediaDependency[];
 }
@@ -95,14 +180,23 @@ export interface ExportFilesBridge {
 export interface SaveTextExportOptions {
   directoryPath?: string;
   type?: string;
-  /** Required for time-map-derived exports. Such exports never fall back to browser downloads. */
-  verification?: VerifiedExportVerificationSeed;
-  /** Re-evaluated immediately before the native verified-save request is sent. */
-  isSnapshotCurrent?: () => boolean;
 }
 
 export interface SaveTextExportsOptions extends SaveTextExportOptions {
   archiveFileName?: string;
+}
+
+/**
+ * The complete authority required to write XML derived from a confirmed time map.
+ * This deliberately does not extend the ordinary text-export options: projected XML
+ * must never become an unverified export merely because one optional field was omitted.
+ */
+export interface SaveProjectedXmlExportsOptions {
+  directoryPath: string;
+  archiveFileName?: string;
+  verification: VerifiedExportVerificationSeed;
+  /** Re-evaluated immediately before the native verified-save request is sent. */
+  isSnapshotCurrent: () => boolean;
 }
 
 export type SaveTextExportResult =
@@ -121,6 +215,11 @@ export type SaveTextExportResult =
       archiveFileName: string | null;
       downloadedFileName: string | null;
     };
+
+export type SaveProjectedXmlExportsResult = Extract<
+  SaveTextExportResult,
+  { mode: "directory" }
+>;
 
 const DEFAULT_TEXT_EXPORT_TYPE = "text/plain;charset=utf-8";
 
@@ -152,19 +251,13 @@ export async function saveTextExportFile(
 ): Promise<SaveTextExportResult> {
   const directoryPath = normalizeDirectoryPath(options.directoryPath);
   const safeFileName = sanitizeDownloadFileName(file.fileName, "export.xml");
-  assertVerifiedSaveAvailable(directoryPath, options, bridge);
   if (directoryPath && bridge.isAvailable()) {
     const request: DesktopExportFileRequest = {
       directoryPath,
       fileName: safeFileName,
       contentBytes: Array.from(new TextEncoder().encode(file.content))
     };
-    const result = await saveDesktopExport(
-      request,
-      [{ fileName: safeFileName, content: file.content }],
-      options,
-      bridge
-    );
+    const result = await bridge.saveFile(request);
     return {
       mode: "directory",
       fileCount: 1,
@@ -174,7 +267,11 @@ export async function saveTextExportFile(
       wasRenamed: result.wasRenamed
     };
   }
-  const downloadedFileName = downloadTextFile(safeFileName, file.content, options.type ?? DEFAULT_TEXT_EXPORT_TYPE);
+  const downloadedFileName = downloadTextFile(
+    safeFileName,
+    file.content,
+    options.type ?? DEFAULT_TEXT_EXPORT_TYPE
+  );
   return {
     mode: "download",
     fileCount: 1,
@@ -190,7 +287,6 @@ export async function saveTextExportFiles(
   bridge: ExportFilesBridge = defaultExportFilesBridge
 ): Promise<SaveTextExportResult> {
   const directoryPath = normalizeDirectoryPath(options.directoryPath);
-  assertVerifiedSaveAvailable(directoryPath, options, bridge);
   if (files.length === 0) {
     return {
       mode: "download",
@@ -204,19 +300,17 @@ export async function saveTextExportFiles(
     if (files.length === 1) {
       return saveTextExportFile(files[0], options, bridge);
     }
-    const archiveFileName = sanitizeDownloadFileName(options.archiveFileName ?? "danmaku-exports.zip", "danmaku-exports.zip");
+    const archiveFileName = sanitizeDownloadFileName(
+      options.archiveFileName ?? "danmaku-exports.zip",
+      "danmaku-exports.zip"
+    );
     const logicalFiles = createStoredZipEntries(files);
     const zipBytes = await blobToBytes(createStoredZip(logicalFiles));
-    const result = await saveDesktopExport(
-      {
-        directoryPath,
-        fileName: archiveFileName,
-        contentBytes: Array.from(zipBytes)
-      },
-      logicalFiles,
-      options,
-      bridge
-    );
+    const result = await bridge.saveFile({
+      directoryPath,
+      fileName: archiveFileName,
+      contentBytes: Array.from(zipBytes)
+    });
     return {
       mode: "directory",
       fileCount: files.length,
@@ -227,8 +321,83 @@ export async function saveTextExportFiles(
     };
   }
   return downloadResultToSaveResult(
-    downloadTextFiles(files, options.type ?? DEFAULT_TEXT_EXPORT_TYPE, options.archiveFileName ?? "danmaku-exports.zip")
+    downloadTextFiles(
+      files,
+      options.type ?? DEFAULT_TEXT_EXPORT_TYPE,
+      options.archiveFileName ?? "danmaku-exports.zip"
+    )
   );
+}
+
+export async function saveProjectedXmlExports(
+  files: readonly ExportTextFile[],
+  options: SaveProjectedXmlExportsOptions,
+  bridge: ExportFilesBridge = defaultExportFilesBridge
+): Promise<SaveProjectedXmlExportsResult> {
+  const directoryPath = normalizeDirectoryPath(options?.directoryPath);
+  const verificationSeed = options?.verification;
+  const isSnapshotCurrent = options?.isSnapshotCurrent;
+  if (!verificationSeed) {
+    throw new Error("高精度分集导出缺少必需的映射复核凭据，已阻断写盘。");
+  }
+  if (typeof isSnapshotCurrent !== "function") {
+    throw new Error("高精度分集导出缺少项目快照时效检查，已阻断写盘。");
+  }
+  const unavailableReason = getVerifiedExportUnavailableReason(directoryPath, bridge);
+  if (unavailableReason) {
+    throw new Error(`${unavailableReason}不能降级为普通写盘或浏览器下载。`);
+  }
+  if (files.length === 0) {
+    throw new Error("高精度分集导出没有可写入的 XML，已阻断写盘。");
+  }
+
+  let request: DesktopExportFileRequest;
+  let logicalFiles: ExportTextFile[];
+  if (files.length === 1) {
+    const file = files[0];
+    const fileName = sanitizeDownloadFileName(file.fileName, "export.xml");
+    logicalFiles = [{ fileName, content: file.content }];
+    request = {
+      directoryPath,
+      fileName,
+      contentBytes: Array.from(new TextEncoder().encode(file.content))
+    };
+  } else {
+    const archiveFileName = sanitizeDownloadFileName(
+      options.archiveFileName ?? "danmaku-exports.zip",
+      "danmaku-exports.zip"
+    );
+    logicalFiles = createStoredZipEntries([...files]);
+    const zipBytes = await blobToBytes(createStoredZip(logicalFiles));
+    request = {
+      directoryPath,
+      fileName: archiveFileName,
+      contentBytes: Array.from(zipBytes)
+    };
+  }
+
+  if (!isSnapshotCurrent()) {
+    throw new Error("项目或导出内容在身份核验期间发生变化，已取消写盘；请重新导出。");
+  }
+  const saveVerifiedFile = bridge.saveVerifiedFile;
+  if (!saveVerifiedFile) {
+    throw new Error("桌面端身份复核写盘能力不可用，高精度分集导出已阻断。");
+  }
+  const verification = createVerifiedExportVerification(
+    verificationSeed,
+    request.fileName,
+    new Uint8Array(request.contentBytes),
+    logicalFiles
+  );
+  const result = await saveVerifiedFile({ ...request, verification });
+  return {
+    mode: "directory",
+    fileCount: files.length,
+    fileName: result.fileName,
+    filePath: result.filePath,
+    directoryPath: result.directoryPath,
+    wasRenamed: result.wasRenamed
+  };
 }
 
 export async function openExportDirectoryPath(
@@ -249,53 +418,21 @@ function normalizeDirectoryPath(path: string | undefined): string {
   return path?.trim() ?? "";
 }
 
-function assertVerifiedSaveAvailable(
-  directoryPath: string,
-  options: SaveTextExportOptions,
-  bridge: ExportFilesBridge
-): void {
-  if (!options.verification) {
-    return;
-  }
-  const unavailableReason = getVerifiedExportUnavailableReason(directoryPath, bridge);
-  if (unavailableReason) {
-    throw new Error(`${unavailableReason}不能降级为浏览器下载。`);
-  }
-}
-
-async function saveDesktopExport(
-  request: DesktopExportFileRequest,
-  logicalFiles: ExportTextFile[],
-  options: SaveTextExportOptions,
-  bridge: ExportFilesBridge
-): Promise<DesktopExportFileResult> {
-  if (!options.verification) {
-    return bridge.saveFile(request);
-  }
-  if (!options.isSnapshotCurrent?.()) {
-    throw new Error("项目或导出内容在身份核验期间发生变化，已取消写盘；请重新导出。");
-  }
-  const saveVerifiedFile = bridge.saveVerifiedFile;
-  if (!saveVerifiedFile) {
-    throw new Error("桌面端身份复核写盘能力不可用，高精度分集导出已阻断。");
-  }
-  const verification = createVerifiedExportVerification(
-    options.verification,
-    request.fileName,
-    new Uint8Array(request.contentBytes),
-    logicalFiles
-  );
-  return saveVerifiedFile({ ...request, verification });
-}
-
 export function createVerifiedExportVerification(
   seed: VerifiedExportVerificationSeed,
   archiveFileName: string,
   archiveBytes: Uint8Array,
   logicalFiles: readonly ExportTextFile[]
 ): VerifiedExportVerification {
-  if (seed.schemaVersion !== 1) {
+  if (seed.schemaVersion !== 2) {
     throw new Error("高精度导出 verification seed 版本不受支持。");
+  }
+  const projectionDerivation = normalizeProjectionDerivation(seed.projectionDerivation);
+  if (
+    projectionDerivation.projectId !== seed.projectId ||
+    projectionDerivation.projectUpdatedAt !== seed.projectUpdatedAt
+  ) {
+    throw new Error("投影重建 inventory 与 verification seed 的项目快照不一致。");
   }
   const outputs = logicalFiles
     .map((file) => ({
@@ -303,6 +440,7 @@ export function createVerifiedExportVerification(
       contentDigest: `sha256:${sha256Hex(file.content)}`
     }))
     .sort((left, right) => compareCanonicalString(left.fileName, right.fileName));
+  validateLogicalProjectionOutputs(projectionDerivation, outputs);
   const mapProofs = [...seed.mapProofs]
     .map((proof) => ({
       ...proof,
@@ -312,6 +450,7 @@ export function createVerifiedExportVerification(
       manualVerification: { ...proof.manualVerification }
     }))
     .sort((left, right) => compareCanonicalString(left.mapId, right.mapId));
+  validateProjectionMapBindings(projectionDerivation, mapProofs);
   const dependencies = [...seed.dependencies]
     .map((dependency) => ({
       ...dependency,
@@ -321,7 +460,7 @@ export function createVerifiedExportVerification(
     .sort((left, right) => compareCanonicalString(left.mediaId, right.mediaId));
   const archiveContentDigest = `sha256:${sha256Hex(archiveBytes)}`;
   const manifestJson = JSON.stringify([
-    "verified-export-manifest-v1",
+    "verified-export-manifest-v2",
     seed.schemaVersion,
     seed.projectId,
     seed.projectUpdatedAt,
@@ -335,6 +474,7 @@ export function createVerifiedExportVerification(
       proof.declaredQuality,
       proof.spanKinds,
       proof.coreDigest,
+      proof.coreCanonicalJson,
       proof.sourceMediaId,
       proof.targetMediaId,
       canonicalMediaIdentity(proof.sourceIdentity),
@@ -352,10 +492,12 @@ export function createVerifiedExportVerification(
       dependency.mediaId,
       canonicalMediaIdentity(dependency.expectedIdentity),
       dependency.mapIds
-    ])
+    ]),
+    canonicalProjectionDerivation(projectionDerivation)
   ]);
   return {
     ...seed,
+    projectionDerivation,
     mapProofs,
     dependencies,
     manifestJson,
@@ -364,6 +506,184 @@ export function createVerifiedExportVerification(
     archiveContentDigest,
     outputs
   };
+}
+
+export function createProjectionDerivationCanonicalJson(
+  derivation: ProjectionDerivationV1
+): string {
+  return JSON.stringify(
+    canonicalProjectionDerivation(normalizeProjectionDerivation(derivation))
+  );
+}
+
+function normalizeProjectionDerivation(
+  derivation: ProjectionDerivationV1
+): ProjectionDerivationV1 {
+  if (
+    !derivation ||
+    derivation.domain !== "projection-derivation-v1" ||
+    derivation.projectionPolicyVersion !== "source-projection-v1" ||
+    derivation.serializerVersion !== "bilibili-xml-export-v1"
+  ) {
+    throw new Error("高精度导出缺少受支持的 projection-derivation-v1 inventory。");
+  }
+  const itemTimeAdjustments = derivation.itemTimeAdjustments
+    .map((adjustment) => ({ ...adjustment }))
+    .sort((left, right) => compareCanonicalString(left.itemId, right.itemId));
+  assertUniqueValues(
+    itemTimeAdjustments.map((adjustment) => adjustment.itemId),
+    "投影重建 inventory 含重复的单条时间调整 itemId。"
+  );
+  return {
+    ...derivation,
+    media: derivation.media.map((media) => ({
+      ...media,
+      contentIdentity: media.contentIdentity ? { ...media.contentIdentity } : null
+    })),
+    xmlAssets: derivation.xmlAssets.map((asset) => ({
+      ...asset,
+      items: asset.items.map((item) => ({ ...item, rawPFields: [...item.rawPFields] }))
+    })),
+    sourceBindings: derivation.sourceBindings.map((binding) => ({ ...binding })),
+    routes: derivation.routes.map((route) => ({
+      ...route,
+      timingRules: route.timingRules.map((rule) => ({ ...rule }))
+    })),
+    disabledItemIds: [...new Set(derivation.disabledItemIds)].sort(compareCanonicalString),
+    itemTimeAdjustments,
+    targetOutputFiles: derivation.targetOutputFiles.map((output) => ({ ...output }))
+  };
+}
+
+function validateProjectionMapBindings(
+  derivation: ProjectionDerivationV1,
+  mapProofs: readonly VerifiedExportMapProof[]
+): void {
+  const proofByMapId = new Map<string, VerifiedExportMapProof>();
+  for (const proof of mapProofs) {
+    if (proofByMapId.has(proof.mapId)) {
+      throw new Error(`高精度导出含重复时间图 proof：${proof.mapId}。`);
+    }
+    if (`sha256:${sha256Hex(proof.coreCanonicalJson)}` !== proof.coreDigest) {
+      throw new Error(`时间图 ${proof.mapId} 的 coreCanonicalJson 与 coreDigest 不一致。`);
+    }
+    const parsedCore = parseTimeMapCoreIdentity(proof.coreCanonicalJson);
+    if (parsedCore.mapId !== proof.mapId || parsedCore.revision !== proof.revision) {
+      throw new Error(`时间图 ${proof.mapId} 的 proof 与 coreCanonicalJson 身份不一致。`);
+    }
+    proofByMapId.set(proof.mapId, proof);
+  }
+  for (const route of derivation.routes) {
+    if (route.kind === "content" && route.timeMapId && !proofByMapId.has(route.timeMapId)) {
+      throw new Error(`投影 route ${route.routeId} 引用的时间图没有 verified proof。`);
+    }
+  }
+}
+
+function validateLogicalProjectionOutputs(
+  derivation: ProjectionDerivationV1,
+  outputs: readonly VerifiedExportOutput[]
+): void {
+  const targetIds = derivation.targetOutputFiles.map((target) => target.targetMediaId);
+  const targetFileNames = derivation.targetOutputFiles.map((target) => target.fileName);
+  assertUniqueValues(targetIds, "投影重建 inventory 含重复的 targetMediaId。");
+  assertUniqueValues(targetFileNames, "投影重建 inventory 含重复的目标 XML 文件名。");
+  const declaredFileNames = new Set(targetFileNames);
+  for (const output of outputs) {
+    if (!declaredFileNames.has(output.fileName)) {
+      throw new Error(`逻辑 XML ${output.fileName} 没有绑定对应的投影目标。`);
+    }
+  }
+}
+
+function parseTimeMapCoreIdentity(coreCanonicalJson: string): {
+  mapId: string;
+  revision: number;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(coreCanonicalJson);
+  } catch {
+    throw new Error("时间图 coreCanonicalJson 不是有效 JSON。");
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed[0] !== "media-time-map-core-v1" ||
+    typeof parsed[1] !== "string" ||
+    !Number.isSafeInteger(parsed[2]) ||
+    (parsed[2] as number) < 1
+  ) {
+    throw new Error("时间图 coreCanonicalJson 不符合 media-time-map-core-v1 身份结构。");
+  }
+  return { mapId: parsed[1], revision: parsed[2] as number };
+}
+
+function canonicalProjectionDerivation(derivation: ProjectionDerivationV1): readonly unknown[] {
+  return [
+    derivation.domain,
+    derivation.projectionPolicyVersion,
+    derivation.serializerVersion,
+    derivation.projectId,
+    derivation.projectUpdatedAt,
+    derivation.media.map((media) => [
+      media.mediaId,
+      media.role,
+      media.name,
+      media.mediaFileName,
+      media.durationMs,
+      media.episodeLabel,
+      canonicalNullableMediaIdentity(media.contentIdentity)
+    ]),
+    derivation.xmlAssets.map((asset) => [
+      asset.assetId,
+      asset.sourceFileName,
+      asset.items.map((item) => [
+        item.itemId,
+        item.assetId,
+        item.originalIndex,
+        item.sourceTimeMs,
+        item.mode,
+        item.fontSize,
+        item.color,
+        item.timestamp,
+        item.pool,
+        item.userHash,
+        item.rowId,
+        item.text,
+        item.rawPFields,
+        item.enabled
+      ])
+    ]),
+    derivation.sourceBindings.map((binding) => [
+      binding.bindingId,
+      binding.assetId,
+      binding.sourceMediaId
+    ]),
+    derivation.routes.map((route) => [
+      route.routeId,
+      route.kind,
+      route.assetId,
+      route.sourceMediaId,
+      route.sourceStartMs,
+      route.sourceEndMs,
+      route.targetMediaId,
+      route.targetStartMs,
+      route.timeMapId,
+      route.timingRules.map((rule) => [rule.ruleId, rule.sourceAtMs, rule.gapMs])
+    ]),
+    derivation.disabledItemIds,
+    derivation.itemTimeAdjustments.map((adjustment) => [
+      adjustment.itemId,
+      adjustment.adjustmentMs
+    ]),
+    derivation.targetOutputFiles.map((output) => [output.targetMediaId, output.fileName])
+  ];
+}
+
+function assertUniqueValues(values: readonly string[], message: string): void {
+  if (new Set(values).size !== values.length) {
+    throw new Error(message);
+  }
 }
 
 function canonicalMediaIdentity(identity: MediaContentIdentity): readonly unknown[] {
@@ -375,6 +695,12 @@ function canonicalMediaIdentity(identity: MediaContentIdentity): readonly unknow
     identity.middleSampleDigest,
     identity.lastSampleDigest
   ];
+}
+
+function canonicalNullableMediaIdentity(
+  identity: MediaContentIdentity | null
+): readonly unknown[] | null {
+  return identity ? canonicalMediaIdentity(identity) : null;
 }
 
 function compareCanonicalString(left: string, right: string): number {

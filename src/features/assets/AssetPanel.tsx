@@ -28,6 +28,7 @@ import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCa
 import {
   assessMediaTimeMapVerification,
   computeMediaTimeMapCoreDigest,
+  createMediaTimeMapCoreCanonicalJson,
   createManualMediaTimeMapVerificationRequest
 } from "../../domain/alignment/mediaTimeMap";
 import { serializeAlignmentProposal } from "../../domain/alignment/manualProvider";
@@ -116,12 +117,18 @@ import {
   type TargetProjectionGroup
 } from "../../domain/timeline/sourceProjection";
 import { preflightProjectMediaIdentities } from "../../infrastructure/media/mediaIdentityPreflight";
-import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
+import {
+  createStoredZipEntries,
+  downloadTextFile,
+  readTextFile
+} from "../../infrastructure/file-system/browserFiles";
 import {
   formatExportFileError,
   getVerifiedExportUnavailableReason,
+  saveProjectedXmlExports,
   saveTextExportFiles,
   type SaveTextExportResult,
+  type ProjectionDerivationV1,
   type VerifiedExportMapProof,
   type VerifiedExportVerificationSeed,
   type VerifiedMediaDependency
@@ -944,7 +951,8 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
               </p>
               {projectionOnlyExport ? (
                 <p className="mt-2 rounded border border-accent-red/30 bg-accent-red/10 p-2 leading-5 text-accent-red">
-                  当前项目已包含目标原片或时间映射。为避免导出错位 XML，只可使用上方「按原片分集导出」。
+                  当前项目已包含目标原片或时间映射。为避免导出错位
+                  XML，只可使用上方「按原片分集导出」。
                 </p>
               ) : null}
             </section>
@@ -965,8 +973,8 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                     projectionOnlyExport
                       ? "当前项目必须通过已确认时间图按原片分集导出。"
                       : project.clips.length === 0
-                      ? "编辑页时间轴上还没有弹幕片段。"
-                      : "预览并导出单个 XML"
+                        ? "编辑页时间轴上还没有弹幕片段。"
+                        : "预览并导出单个 XML"
                   }
                 >
                   <Download size={14} />
@@ -1047,9 +1055,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                       <div className="flex justify-end">
                         <TextButton
                           tone="primary"
-                          onClick={() =>
-                            void exportBatchMergePlan(batchMergePlan, project)
-                          }
+                          onClick={() => void exportBatchMergePlan(batchMergePlan, project)}
                           disabled={batchMergePlan.episodes.length === 0}
                           title="按当前批量规则导出多个分集 XML"
                         >
@@ -3530,8 +3536,7 @@ function AlignmentProposalDiagnosticsPanel({
           </div>
         ) : (
           <div className="rounded border border-panel-line bg-[#111318] p-2 leading-5 text-slate-500">
-            暂无已解析的对齐提案。普通匹配无需使用本区；仅在收到外部 JSON
-            或排查旧项目时导入。
+            暂无已解析的对齐提案。普通匹配无需使用本区；仅在收到外部 JSON 或排查旧项目时导入。
           </div>
         )}
       </div>
@@ -3893,7 +3898,10 @@ function setStatus(status: EditorStatus) {
   useEditorStore.setState({ status });
 }
 
-async function exportProjectionGroups(projection: SourceProjectionResult, project: EditorProject) {
+async function exportProjectionGroups(
+  projection: SourceProjectionResult,
+  project: EditorProject
+) {
   const projectSnapshot = project;
   const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
   if (exportableGroups.length === 0) {
@@ -3939,13 +3947,13 @@ async function exportProjectionGroups(projection: SourceProjectionResult, projec
   try {
     const verification = createVerifiedExportVerificationSeed(
       projectSnapshot,
+      projection,
       identityPreflight.currentIdentities
     );
-    const exportResult = await saveTextExportFiles(
+    const exportResult = await saveProjectedXmlExports(
       files.map((file) => ({ fileName: file.fileName, content: file.content })),
       {
         directoryPath: settings.export.defaultDirectory,
-        type: "application/xml;charset=utf-8",
         archiveFileName: createProjectDownloadFileName(project.name, "-target-danmaku.zip"),
         verification,
         isSnapshotCurrent: () => isProjectExportSnapshotCurrent(projectSnapshot)
@@ -3977,14 +3985,13 @@ function ProjectionExportPanel({
     projection.status === "blocked" ||
     exportableGroups.length === 0 ||
     verifiedExportUnavailableReason !== null;
-  const exportDisabledReason =
-    isExporting
-      ? "正在核验媒体身份并导出，请稍候。"
-      : projection.status === "blocked"
+  const exportDisabledReason = isExporting
+    ? "正在核验媒体身份并导出，请稍候。"
+    : projection.status === "blocked"
       ? "先处理下面的阻断问题，再导出分集 XML。"
       : exportableGroups.length === 0
         ? "还没有可导出的分集弹幕。请先在匹配页标出来源段并关联原片。"
-        : verifiedExportUnavailableReason ?? "为每个原片导出一个精准同步的弹幕 XML";
+        : (verifiedExportUnavailableReason ?? "为每个原片导出一个精准同步的弹幕 XML");
   return (
     <section
       className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
@@ -4103,6 +4110,7 @@ function isProjectExportSnapshotCurrent(projectSnapshot: EditorProject): boolean
 
 function createVerifiedExportVerificationSeed(
   project: EditorProject,
+  projection: SourceProjectionResult,
   currentIdentities: Readonly<Record<string, MediaContentIdentity>>
 ): VerifiedExportVerificationSeed {
   const referencedMapIds = new Set(
@@ -4170,6 +4178,7 @@ function createVerifiedExportVerificationSeed(
         throw new Error(`时间图 ${timeMap.id} 缺少两端媒体身份。`);
       }
       const coreDigest = computeMediaTimeMapCoreDigest(timeMap);
+      const coreCanonicalJson = createMediaTimeMapCoreCanonicalJson(timeMap);
       if (record.mapCoreDigest !== coreDigest || record.mapRevision !== timeMap.revision) {
         throw new Error(`时间图 ${timeMap.id} 的人工验证没有绑定当前核心或 revision。`);
       }
@@ -4191,6 +4200,7 @@ function createVerifiedExportVerificationSeed(
           "matched" | "sourceOnly" | "targetOnly"
         >,
         coreDigest,
+        coreCanonicalJson,
         sourceMediaId: timeMap.sourceMediaId,
         targetMediaId: timeMap.targetMediaId,
         sourceIdentity: { ...timeMap.sourceIdentity },
@@ -4209,12 +4219,110 @@ function createVerifiedExportVerificationSeed(
     throw new Error("被引用时间图与 verified export proofs 未形成一一对应关系。");
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     projectId: project.id,
     projectUpdatedAt: project.updatedAt,
+    projectionDerivation: createProjectionDerivation(project, projection),
     mapProofs,
     dependencies
   };
+}
+
+function createProjectionDerivation(
+  project: EditorProject,
+  projection: SourceProjectionResult
+): ProjectionDerivationV1 {
+  const groupsInFileAllocationOrder = [
+    ...projection.groups.filter((group) => group.entries.length > 0),
+    ...projection.groups.filter((group) => group.entries.length === 0)
+  ];
+  const logicalTargetFiles = createStoredZipEntries(
+    groupsInFileAllocationOrder.map((group) => ({ fileName: group.exportFileName, content: "" }))
+  );
+  const logicalFileNameByTarget = new Map(
+    groupsInFileAllocationOrder.map((group, groupIndex) => [
+      group.targetMediaId,
+      logicalTargetFiles[groupIndex].fileName
+    ])
+  );
+  return {
+    domain: "projection-derivation-v1",
+    projectionPolicyVersion: "source-projection-v1",
+    serializerVersion: "bilibili-xml-export-v1",
+    projectId: project.id,
+    projectUpdatedAt: project.updatedAt,
+    media: project.mediaLibrary.map((media) => ({
+      mediaId: media.id,
+      role: media.role,
+      name: media.name,
+      mediaFileName: media.fileName,
+      durationMs: media.durationMs,
+      episodeLabel: media.episodeLabel,
+      contentIdentity: media.contentIdentity ? { ...media.contentIdentity } : null
+    })),
+    xmlAssets: project.assets.map((asset) => ({
+      assetId: asset.id,
+      sourceFileName: asset.fileName,
+      items: asset.items.map((item) => ({
+        itemId: item.id,
+        assetId: item.assetId,
+        originalIndex: item.originalIndex,
+        sourceTimeMs: item.sourceTimeMs,
+        mode: item.mode,
+        fontSize: item.fontSize,
+        color: item.color,
+        timestamp: item.timestamp,
+        pool: item.pool,
+        userHash: item.userHash,
+        rowId: item.rowId,
+        text: item.text,
+        rawPFields: [...item.rawPFields],
+        enabled: item.enabled
+      }))
+    })),
+    sourceBindings: project.danmakuSourceBindings.map((binding) => ({
+      bindingId: binding.id,
+      assetId: binding.assetId,
+      sourceMediaId: binding.sourceMediaId
+    })),
+    routes: project.danmakuSourceSegments.map((segment) => ({
+      routeId: segment.id,
+      kind: segment.kind,
+      assetId: segment.assetId,
+      sourceMediaId: segment.sourceMediaId,
+      sourceStartMs: segment.sourceStartMs,
+      sourceEndMs: segment.sourceEndMs,
+      targetMediaId: segment.targetMediaId,
+      targetStartMs: segment.targetStartMs,
+      timeMapId: segment.timeMapId,
+      timingRules: segment.timingRules.map((rule) => ({
+        ruleId: rule.id,
+        sourceAtMs: rule.sourceAtMs,
+        gapMs: rule.gapMs
+      }))
+    })),
+    disabledItemIds: [...new Set(project.disabledItemIds)].sort(compareUtf8Strings),
+    itemTimeAdjustments: Object.entries(project.itemTimeAdjustments)
+      .map(([itemId, adjustmentMs]) => ({ itemId, adjustmentMs }))
+      .sort((left, right) => compareUtf8Strings(left.itemId, right.itemId)),
+    targetOutputFiles: projection.groups.map((group) => ({
+      targetMediaId: group.targetMediaId,
+      fileName: logicalFileNameByTarget.get(group.targetMediaId) ?? group.exportFileName
+    }))
+  };
+}
+
+function compareUtf8Strings(left: string, right: string): number {
+  const encoder = new TextEncoder();
+  const leftBytes = encoder.encode(left);
+  const rightBytes = encoder.encode(right);
+  const sharedLength = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) {
+      return leftBytes[index] - rightBytes[index];
+    }
+  }
+  return leftBytes.length - rightBytes.length;
 }
 
 function ProjectionGroupRow({ group }: { group: TargetProjectionGroup }) {

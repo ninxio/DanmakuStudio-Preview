@@ -1,14 +1,20 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  createProjectionDerivationCanonicalJson,
   createVerifiedExportVerification,
   getVerifiedExportUnavailableReason,
   openExportDirectoryPath,
+  saveProjectedXmlExports,
   saveTextExportFile,
   saveTextExportFiles,
   type DesktopExportFileRequest,
   type ExportFilesBridge,
+  type SaveProjectedXmlExportsOptions,
   type VerifiedExportVerificationSeed
 } from "./exportFiles";
+import { sha256Hex } from "../../domain/shared/sha256";
 
 describe("导出文件服务", () => {
   it("有桌面目录时写入安全文件名并返回打开目录动作所需路径", async () => {
@@ -68,8 +74,8 @@ describe("导出文件服务", () => {
     const verification = createVerification();
     const isSnapshotCurrent = vi.fn(() => true);
 
-    await saveTextExportFile(
-      { fileName: "episode.xml", content: "<i />" },
+    await saveProjectedXmlExports(
+      [{ fileName: "episode.xml", content: "<i />" }],
       { directoryPath: "D:\\exports", verification, isSnapshotCurrent },
       bridge
     );
@@ -83,7 +89,8 @@ describe("导出文件服务", () => {
     expect(verifiedRequest.verification).toMatchObject(verification);
     expect(verifiedRequest.verification.archiveFileName).toBe("episode.xml");
     expect(verifiedRequest.verification.archiveContentDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(verifiedRequest.verification.manifestJson).toContain("verified-export-manifest-v1");
+    expect(verifiedRequest.verification.manifestJson).toContain("verified-export-manifest-v2");
+    expect(verifiedRequest.verification.manifestJson).toContain("projection-derivation-v1");
     expect(verifiedRequest.verification.snapshotDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(verifiedRequest.verification.outputs).toHaveLength(1);
     expect(verifiedRequest.verification.outputs[0]?.fileName).toBe("episode.xml");
@@ -94,7 +101,12 @@ describe("导出文件服务", () => {
 
   it("高精度多文件导出同时绑定 ZIP bytes 与每个逻辑 XML", async () => {
     const bridge = createBridge();
-    await saveTextExportFiles(
+    const verification = createVerification();
+    verification.projectionDerivation.targetOutputFiles = [
+      { targetMediaId: "target-1", fileName: "1.xml" },
+      { targetMediaId: "target-2", fileName: "2.xml" }
+    ];
+    await saveProjectedXmlExports(
       [
         { fileName: "1.xml", content: "<i>1</i>" },
         { fileName: "2.xml", content: "<i>2</i>" }
@@ -102,7 +114,7 @@ describe("导出文件服务", () => {
       {
         directoryPath: "D:\\exports",
         archiveFileName: "season.zip",
-        verification: createVerification(),
+        verification,
         isSnapshotCurrent: () => true
       },
       bridge
@@ -126,8 +138,13 @@ describe("导出文件服务", () => {
     const emoji = "😀";
     const baseProof = seed.mapProofs[0];
     seed.mapProofs = [
-      { ...baseProof, mapId: `map-${emoji}` },
-      { ...baseProof, mapId: `map-${privateUse}` }
+      createProofForMapId(baseProof, `map-${emoji}`),
+      createProofForMapId(baseProof, `map-${privateUse}`)
+    ];
+    seed.projectionDerivation.routes[0].timeMapId = `map-${emoji}`;
+    seed.projectionDerivation.targetOutputFiles = [
+      { targetMediaId: "target-private-use", fileName: `${privateUse}.xml` },
+      { targetMediaId: "target-emoji", fileName: `${emoji}.xml` }
     ];
     seed.dependencies = [
       {
@@ -154,17 +171,97 @@ describe("导出文件服务", () => {
       `map-${privateUse}`,
       `map-${emoji}`
     ]);
-    expect(verification.dependencies[0]?.mapIds).toEqual([
-      `map-${privateUse}`,
-      `map-${emoji}`
+    expect(verification.dependencies[0]?.mapIds).toEqual([`map-${privateUse}`, `map-${emoji}`]);
+  });
+
+  it("v2 manifest 以固定数组绑定完整 derivation，并仅规范化 set/object 字段", () => {
+    const seed = createVerification();
+    seed.projectionDerivation.disabledItemIds = ["item-z", "item-a", "item-z"];
+    seed.projectionDerivation.itemTimeAdjustments = [
+      { itemId: "item-z", adjustmentMs: 20 },
+      { itemId: "item-a", adjustmentMs: -10 }
+    ];
+
+    const verification = createVerifiedExportVerification(
+      seed,
+      "episode.xml",
+      new TextEncoder().encode("<i />"),
+      [{ fileName: "episode.xml", content: "<i />" }]
+    );
+    const manifest = JSON.parse(verification.manifestJson) as unknown[];
+    const derivation = manifest[9] as unknown[];
+
+    expect(manifest.slice(0, 4)).toEqual([
+      "verified-export-manifest-v2",
+      2,
+      "project-1",
+      "2026-07-12T00:00:00.000Z"
     ]);
+    expect(manifest).toHaveLength(10);
+    expect(manifest[4]).toBe("episode.xml");
+    expect((manifest[7] as unknown[][])[0]?.[6]).toBe(seed.mapProofs[0].coreCanonicalJson);
+    expect(derivation.slice(0, 5)).toEqual([
+      "projection-derivation-v1",
+      "source-projection-v1",
+      "bilibili-xml-export-v1",
+      "project-1",
+      "2026-07-12T00:00:00.000Z"
+    ]);
+    expect((derivation[5] as unknown[][]).map((media) => media[0])).toEqual([
+      "source-1",
+      "target-1"
+    ]);
+    expect((derivation[6] as unknown[][])[0]?.[2]).toHaveLength(2);
+    expect((derivation[8] as unknown[][]).map((route) => route[0])).toEqual([
+      "route-content",
+      "route-ignored"
+    ]);
+    expect(derivation[9]).toEqual(["item-a", "item-z"]);
+    expect(derivation[10]).toEqual([
+      ["item-a", -10],
+      ["item-z", 20]
+    ]);
+    expect(derivation[11]).toEqual([["target-1", "episode.xml"]]);
+    expect(createProjectionDerivationCanonicalJson(verification.projectionDerivation)).toBe(
+      JSON.stringify(derivation)
+    );
+  });
+
+  it("v2 verification 对缺失 inventory、快照错配和 TimeMap core 分离全部失败关闭", () => {
+    const create = (seed: VerifiedExportVerificationSeed) =>
+      createVerifiedExportVerification(seed, "episode.xml", new TextEncoder().encode("<i />"), [
+        { fileName: "episode.xml", content: "<i />" }
+      ]);
+
+    const unsupported = createVerification();
+    unsupported.schemaVersion = 1 as 2;
+    expect(() => create(unsupported)).toThrow("版本不受支持");
+
+    const mismatchedSnapshot = createVerification();
+    mismatchedSnapshot.projectionDerivation.projectUpdatedAt = "2026-07-12T00:00:01.000Z";
+    expect(() => create(mismatchedSnapshot)).toThrow("项目快照不一致");
+
+    const tamperedCore = createVerification();
+    tamperedCore.mapProofs[0].coreCanonicalJson += " ";
+    expect(() => create(tamperedCore)).toThrow("coreCanonicalJson 与 coreDigest 不一致");
+
+    const duplicateAdjustment = createVerification();
+    duplicateAdjustment.projectionDerivation.itemTimeAdjustments.push({
+      itemId: "item-1",
+      adjustmentMs: 99
+    });
+    expect(() => create(duplicateAdjustment)).toThrow("重复的单条时间调整");
+
+    const mismatchedLogicalOutput = createVerification();
+    mismatchedLogicalOutput.projectionDerivation.targetOutputFiles[0].fileName = "other.xml";
+    expect(() => create(mismatchedLogicalOutput)).toThrow("没有绑定对应的投影目标");
   });
 
   it("高精度导出在浏览器环境和缺少桌面目录时都严格阻断", async () => {
     const unavailableBridge = { ...createBridge(), isAvailable: () => false };
     await expect(
-      saveTextExportFile(
-        { fileName: "episode.xml", content: "<i />" },
+      saveProjectedXmlExports(
+        [{ fileName: "episode.xml", content: "<i />" }],
         {
           directoryPath: "D:\\exports",
           verification: createVerification(),
@@ -175,9 +272,12 @@ describe("导出文件服务", () => {
     ).rejects.toThrow("仅可在支持写盘前媒体身份复核的桌面端使用");
 
     await expect(
-      saveTextExportFile(
-        { fileName: "episode.xml", content: "<i />" },
-        { verification: createVerification(), isSnapshotCurrent: () => true },
+      saveProjectedXmlExports(
+        [{ fileName: "episode.xml", content: "<i />" }],
+        {
+          verification: createVerification(),
+          isSnapshotCurrent: () => true
+        } as SaveProjectedXmlExportsOptions,
         createBridge()
       )
     ).rejects.toThrow("必须先在设置中选择桌面导出文件夹");
@@ -187,7 +287,7 @@ describe("导出文件服务", () => {
     const bridge = createBridge();
 
     await expect(
-      saveTextExportFiles(
+      saveProjectedXmlExports(
         [
           { fileName: "1.xml", content: "<i>1</i>" },
           { fileName: "2.xml", content: "<i>2</i>" }
@@ -203,6 +303,66 @@ describe("导出文件服务", () => {
 
     expect(bridge.saveVerifiedFile).not.toHaveBeenCalled();
     expect(bridge.saveFile).not.toHaveBeenCalled();
+  });
+
+  it("投影 XML 缺少 verified bridge、verification seed 或快照检查时全部失败关闭", async () => {
+    const file = [{ fileName: "episode.xml", content: "<i />" }];
+
+    const missingVerifiedBridge = { ...createBridge(), saveVerifiedFile: undefined };
+    await expect(
+      saveProjectedXmlExports(
+        file,
+        {
+          directoryPath: "D:\\exports",
+          verification: createVerification(),
+          isSnapshotCurrent: () => true
+        },
+        missingVerifiedBridge
+      )
+    ).rejects.toThrow("身份复核");
+    expect(missingVerifiedBridge.saveFile).not.toHaveBeenCalled();
+
+    const missingSeedBridge = createBridge();
+    await expect(
+      saveProjectedXmlExports(
+        file,
+        {
+          directoryPath: "D:\\exports",
+          isSnapshotCurrent: () => true
+        } as SaveProjectedXmlExportsOptions,
+        missingSeedBridge
+      )
+    ).rejects.toThrow("缺少必需的映射复核凭据");
+    expect(missingSeedBridge.saveFile).not.toHaveBeenCalled();
+    expect(missingSeedBridge.saveVerifiedFile).not.toHaveBeenCalled();
+
+    const missingSnapshotCheckBridge = createBridge();
+    await expect(
+      saveProjectedXmlExports(
+        file,
+        {
+          directoryPath: "D:\\exports",
+          verification: createVerification()
+        } as SaveProjectedXmlExportsOptions,
+        missingSnapshotCheckBridge
+      )
+    ).rejects.toThrow("缺少项目快照时效检查");
+    expect(missingSnapshotCheckBridge.saveFile).not.toHaveBeenCalled();
+    expect(missingSnapshotCheckBridge.saveVerifiedFile).not.toHaveBeenCalled();
+  });
+
+  it("投影导出调用点在架构上只能进入强类型 verified API", () => {
+    const assetPanelSource = readFileSync(
+      join(process.cwd(), "src", "features", "assets", "AssetPanel.tsx"),
+      "utf8"
+    );
+    const start = assetPanelSource.indexOf("async function exportProjectionGroups");
+    const end = assetPanelSource.indexOf("function ProjectionExportPanel", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const exportProjectionGroupsSource = assetPanelSource.slice(start, end);
+    expect(exportProjectionGroupsSource).toContain("saveProjectedXmlExports(");
+    expect(exportProjectionGroupsSource).not.toContain("saveTextExportFiles(");
   });
 
   it("可在点击前解释 verified save 的桌面能力或目录缺口", () => {
@@ -244,7 +404,8 @@ function createVerification(): VerifiedExportVerificationSeed {
     middleSampleDigest: "a".repeat(64),
     lastSampleDigest: "a".repeat(64)
   };
-  const coreDigest = `sha256:${"b".repeat(64)}`;
+  const coreCanonicalJson = createTimeMapCoreCanonicalJson("map-1", identity);
+  const coreDigest = `sha256:${sha256Hex(coreCanonicalJson)}`;
   const requestPayload = JSON.stringify([
     "manual-time-map-verification-request-v1",
     "manual-review",
@@ -274,9 +435,78 @@ function createVerification(): VerifiedExportVerificationSeed {
     "2026-07-12T00:00:00.000Z"
   ]);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     projectId: "project-1",
     projectUpdatedAt: "2026-07-12T00:00:00.000Z",
+    projectionDerivation: {
+      domain: "projection-derivation-v1",
+      projectionPolicyVersion: "source-projection-v1",
+      serializerVersion: "bilibili-xml-export-v1",
+      projectId: "project-1",
+      projectUpdatedAt: "2026-07-12T00:00:00.000Z",
+      media: [
+        {
+          mediaId: "source-1",
+          role: "bilibiliReference",
+          name: "B 站参考",
+          mediaFileName: "source.mkv",
+          durationMs: 2_000,
+          episodeLabel: null,
+          contentIdentity: identity
+        },
+        {
+          mediaId: "target-1",
+          role: "targetOriginal",
+          name: "原片",
+          mediaFileName: "episode.mkv",
+          durationMs: 1_000,
+          episodeLabel: "第 1 集",
+          contentIdentity: identity
+        }
+      ],
+      xmlAssets: [
+        {
+          assetId: "asset-1",
+          sourceFileName: "source.xml",
+          items: [
+            createDerivationItem("item-1", 0, 500, "正文"),
+            createDerivationItem("item-2", 1, 1_500, "忽略")
+          ]
+        }
+      ],
+      sourceBindings: [
+        { bindingId: "binding-1", assetId: "asset-1", sourceMediaId: "source-1" }
+      ],
+      routes: [
+        {
+          routeId: "route-content",
+          kind: "content",
+          assetId: "asset-1",
+          sourceMediaId: "source-1",
+          sourceStartMs: 0,
+          sourceEndMs: 1_000,
+          targetMediaId: "target-1",
+          targetStartMs: 0,
+          timeMapId: "map-1",
+          timingRules: [{ ruleId: "legacy-rule", sourceAtMs: 500, gapMs: 0 }]
+        },
+        {
+          routeId: "route-ignored",
+          kind: "ignored",
+          assetId: "asset-1",
+          sourceMediaId: "source-1",
+          sourceStartMs: 1_000,
+          sourceEndMs: 2_000,
+          targetMediaId: null,
+          targetStartMs: null,
+          timeMapId: null,
+          timingRules: []
+        }
+      ],
+      disabledItemIds: ["item-2"],
+      itemTimeAdjustments: [{ itemId: "item-1", adjustmentMs: 25 }],
+      targetOutputFiles: [{ targetMediaId: "target-1", fileName: "episode.xml" }]
+    },
     mapProofs: [
       {
         mapId: "map-1",
@@ -285,6 +515,7 @@ function createVerification(): VerifiedExportVerificationSeed {
         declaredQuality: "verified",
         spanKinds: ["matched"],
         coreDigest,
+        coreCanonicalJson,
         sourceMediaId: "source-1",
         targetMediaId: "target-1",
         sourceIdentity: identity,
@@ -313,5 +544,86 @@ function createVerification(): VerifiedExportVerificationSeed {
         mapIds: ["map-1"]
       }
     ]
+  };
+}
+
+function createProofForMapId(
+  baseProof: VerifiedExportVerificationSeed["mapProofs"][number],
+  mapId: string
+): VerifiedExportVerificationSeed["mapProofs"][number] {
+  const coreCanonicalJson = createTimeMapCoreCanonicalJson(mapId, baseProof.sourceIdentity);
+  return {
+    ...baseProof,
+    mapId,
+    coreCanonicalJson,
+    coreDigest: `sha256:${sha256Hex(coreCanonicalJson)}`
+  };
+}
+
+function createTimeMapCoreCanonicalJson(
+  mapId: string,
+  identity: VerifiedExportVerificationSeed["mapProofs"][number]["sourceIdentity"]
+): string {
+  const canonicalIdentity = [
+    identity.algorithm,
+    identity.sizeBytes,
+    identity.modifiedUnixMs,
+    identity.firstSampleDigest,
+    identity.middleSampleDigest,
+    identity.lastSampleDigest
+  ];
+  return JSON.stringify([
+    "media-time-map-core-v1",
+    mapId,
+    1,
+    "source-1",
+    "target-1",
+    null,
+    null,
+    canonicalIdentity,
+    canonicalIdentity,
+    0,
+    1_000,
+    0,
+    1_000,
+    [["matched", 0, 1_000, 0, 1_000]],
+    [0.999, "measured", 1, 0, 0, 0, 0, 1, 1, 1, []],
+    [["audio", "manual"], 1, 0, 1, []],
+    "engine-v1",
+    "feature-v1",
+    "parameters-v1"
+  ]);
+}
+
+function createDerivationItem(
+  itemId: string,
+  originalIndex: number,
+  sourceTimeMs: number,
+  text: string
+): VerifiedExportVerificationSeed["projectionDerivation"]["xmlAssets"][number]["items"][number] {
+  return {
+    itemId,
+    assetId: "asset-1",
+    originalIndex,
+    sourceTimeMs,
+    mode: 1,
+    fontSize: 25,
+    color: 16_777_215,
+    timestamp: 0,
+    pool: 0,
+    userHash: "user",
+    rowId: `row-${originalIndex}`,
+    text,
+    rawPFields: [
+      (sourceTimeMs / 1_000).toFixed(3),
+      "1",
+      "25",
+      "16777215",
+      "0",
+      "0",
+      "user",
+      `row-${originalIndex}`
+    ],
+    enabled: true
   };
 }

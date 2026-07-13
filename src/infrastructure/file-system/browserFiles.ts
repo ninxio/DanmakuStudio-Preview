@@ -175,20 +175,31 @@ function downloadBlob(fileName: string, blob: Blob, type?: string, fallbackName 
 
 /** Returns the exact logical names that `createStoredZip` writes into its deterministic ZIP. */
 export function createStoredZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {
-  const seen = new Map<string, number>();
+  const usedNames = new Set<string>();
   return files.map((file) => {
     const safeName = sanitizeZipFileName(file.fileName);
-    const count = seen.get(safeName) ?? 0;
-    seen.set(safeName, count + 1);
-    if (count === 0) {
+    const safeNameKey = safeName.toLocaleLowerCase("en-US");
+    if (!usedNames.has(safeNameKey)) {
+      usedNames.add(safeNameKey);
       return { ...file, fileName: safeName };
     }
     const dotIndex = safeName.lastIndexOf(".");
     const base = dotIndex > 0 ? safeName.slice(0, dotIndex) : safeName;
     const extension = dotIndex > 0 ? safeName.slice(dotIndex) : "";
+    let duplicateNumber = 2;
+    let allocatedName = appendDuplicateSuffixToDownloadFileName(
+      base,
+      extension,
+      duplicateNumber
+    );
+    while (usedNames.has(allocatedName.toLocaleLowerCase("en-US"))) {
+      duplicateNumber += 1;
+      allocatedName = appendDuplicateSuffixToDownloadFileName(base, extension, duplicateNumber);
+    }
+    usedNames.add(allocatedName.toLocaleLowerCase("en-US"));
     return {
       ...file,
-      fileName: appendDuplicateSuffixToDownloadFileName(base, extension, count + 1)
+      fileName: allocatedName
     };
   });
 }

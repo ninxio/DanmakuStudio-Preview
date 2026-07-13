@@ -8,12 +8,14 @@ import {
   createCandidateTimeMapId,
   createConfirmedTimeMapId,
   createLegacyMediaTimeMap,
+  createMediaTimeMapCoreCanonicalJson,
   createManualMediaTimeMapVerificationRequest,
   reconcileMediaTimeMapQuality,
   registerManualMediaTimeMapVerificationAuthorityResult,
   supersedeMediaTimeMap
 } from "./mediaTimeMap";
 import type { MediaContentIdentity, MediaTimeMap } from "../project/types";
+import { sha256Hex } from "../shared/sha256";
 import { createTimeMapSpanPlaybackReviewToken } from "./timeMapPlaybackReviewEvidence";
 import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../../test/manualVerification";
 
@@ -130,7 +132,16 @@ describe("媒体时间图 revision", () => {
 
   it("canonical digest 会绑定 spans、revision、媒体身份、指标与引擎 provenance", () => {
     const map = createVerificationEligibleMap();
+    const canonicalJson = createMediaTimeMapCoreCanonicalJson(map);
     const digest = computeMediaTimeMapCoreDigest(map);
+    expect((JSON.parse(canonicalJson) as unknown[]).slice(0, 5)).toEqual([
+      "media-time-map-core-v1",
+      map.id,
+      map.revision,
+      map.sourceMediaId,
+      map.targetMediaId
+    ]);
+    expect(digest).toBe(`sha256:${sha256Hex(canonicalJson)}`);
     const mutations: Array<(candidate: MediaTimeMap) => void> = [
       (candidate) => {
         candidate.spans[0].targetEndMs += 1;

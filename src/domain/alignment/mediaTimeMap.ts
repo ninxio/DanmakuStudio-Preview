@@ -235,7 +235,18 @@ export function createConfirmedTimeMapId(candidateId: string, revision: number):
  * 信任诊断不参与，但用户/算法写入的 reasons、notes 和所有映射、指标、证据字段均绑定。
  */
 export function computeMediaTimeMapCoreDigest(map: MediaTimeMap): string {
-  const canonical = JSON.stringify([
+  return `${TIME_MAP_CORE_DIGEST_PREFIX}:${sha256Hex(
+    createMediaTimeMapCoreCanonicalJson(map)
+  )}`;
+}
+
+/**
+ * Returns the exact positional JSON signed by a MediaTimeMap core digest.
+ * Native verified export consumes this same value so it can reconstruct spans without trusting
+ * a second, independently assembled representation of the map.
+ */
+export function createMediaTimeMapCoreCanonicalJson(map: MediaTimeMap): string {
+  return JSON.stringify([
     "media-time-map-core-v1",
     map.id,
     map.revision,
@@ -262,7 +273,6 @@ export function computeMediaTimeMapCoreDigest(map: MediaTimeMap): string {
     map.featureVersion,
     map.parametersHash
   ]);
-  return `${TIME_MAP_CORE_DIGEST_PREFIX}:${sha256Hex(canonical)}`;
 }
 
 /** 检查 record 是否仍精确绑定当前 map，并且其签发来源受信。 */

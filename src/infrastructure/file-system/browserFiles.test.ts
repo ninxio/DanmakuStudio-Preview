@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { createStoredZip, downloadTextFile, downloadTextFiles, readTextFile, sanitizeDownloadFileName } from "./browserFiles";
+import {
+  createStoredZip,
+  createStoredZipEntries,
+  downloadTextFile,
+  downloadTextFiles,
+  readTextFile,
+  sanitizeDownloadFileName
+} from "./browserFiles";
 
 describe("浏览器文件导出", () => {
   it("把多份 XML 打包成包含全部条目的 ZIP", async () => {
@@ -19,6 +26,38 @@ describe("浏览器文件导出", () => {
     ]);
 
     await expect(readCentralDirectoryNames(zip)).resolves.toEqual(["S01_E01.xml", "S01_E01 (2).xml"]);
+  });
+
+  it("链式清理碰撞分配全局唯一且二次规范化保持幂等", async () => {
+    const files = [
+      { fileName: "_CON.xml", content: "一" },
+      { fileName: "CON.xml", content: "二" },
+      { fileName: "_CON (2).xml", content: "三" }
+    ];
+    const firstPass = createStoredZipEntries(files);
+    const secondPass = createStoredZipEntries(firstPass);
+
+    expect(firstPass.map((file) => file.fileName)).toEqual([
+      "_CON.xml",
+      "_CON (2).xml",
+      "_CON (2) (2).xml"
+    ]);
+    expect(secondPass).toEqual(firstPass);
+    await expect(readCentralDirectoryNames(createStoredZip(firstPass))).resolves.toEqual(
+      firstPass.map((file) => file.fileName)
+    );
+  });
+
+  it("按 Windows 大小写不敏感语义隔离清理后的文件名", async () => {
+    const allocated = createStoredZipEntries([
+      { fileName: "CON.xml", content: "一" },
+      { fileName: "_con.xml", content: "二" }
+    ]);
+
+    expect(allocated.map((file) => file.fileName)).toEqual(["_CON.xml", "_con (2).xml"]);
+    await expect(readCentralDirectoryNames(createStoredZip(allocated))).resolves.toEqual(
+      allocated.map((file) => file.fileName)
+    );
   });
 
   it("打包超长重名条目时保留去重后缀并限制长度", async () => {

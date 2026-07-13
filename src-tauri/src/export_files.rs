@@ -15,9 +15,19 @@ use crate::manual_verification::lock_manual_time_map_verification_authority;
 use crate::media_probe::{probe_media_content_identity, MediaContentIdentity};
 use crate::physical_file::{PhysicalFileObjectKey, PinnedPhysicalFile};
 
-const VERIFIED_EXPORT_SCHEMA_VERSION: u8 = 1;
-const VERIFIED_EXPORT_MANIFEST_DOMAIN: &str = "verified-export-manifest-v1";
+const VERIFIED_EXPORT_SCHEMA_VERSION: u8 = 2;
+const VERIFIED_EXPORT_MANIFEST_DOMAIN: &str = "verified-export-manifest-v2";
 const MANUAL_VERIFICATION_REQUEST_DOMAIN: &str = "manual-time-map-verification-request-v1";
+const PROJECTION_DERIVATION_DOMAIN: &str = "projection-derivation-v1";
+const PROJECTION_POLICY_VERSION: &str = "source-projection-v1";
+const PROJECTION_SERIALIZER_VERSION: &str = "bilibili-xml-export-v1";
+const MEDIA_TIME_MAP_CORE_DOMAIN: &str = "media-time-map-core-v1";
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_PROJECTION_ASSETS: usize = 4_096;
+const MAX_PROJECTION_MEDIA: usize = 8_192;
+const MAX_PROJECTION_ROUTES: usize = 65_536;
+const MAX_PROJECTION_ITEMS: usize = 20_000_000;
+const MAX_CORE_CANONICAL_JSON_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +59,7 @@ struct VerifiedExportVerification {
     outputs: Vec<VerifiedExportOutput>,
     map_proofs: Vec<VerifiedExportMapProof>,
     dependencies: Vec<VerifiedMediaDependency>,
+    projection_derivation: ProjectionDerivationV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,11 +78,141 @@ struct VerifiedExportMapProof {
     declared_quality: String,
     span_kinds: Vec<String>,
     core_digest: String,
+    core_canonical_json: String,
     source_media_id: String,
     target_media_id: String,
     source_identity: ExpectedMediaContentIdentity,
     target_identity: ExpectedMediaContentIdentity,
     manual_verification: VerifiedExportManualVerification,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionDerivationV1 {
+    domain: String,
+    projection_policy_version: String,
+    serializer_version: String,
+    project_id: String,
+    project_updated_at: String,
+    media: Vec<ProjectionMediaV1>,
+    xml_assets: Vec<ProjectionXmlAssetV1>,
+    source_bindings: Vec<ProjectionSourceBindingV1>,
+    routes: Vec<ProjectionRouteV1>,
+    disabled_item_ids: Vec<String>,
+    item_time_adjustments: Vec<ProjectionItemTimeAdjustmentV1>,
+    target_output_files: Vec<ProjectionTargetOutputV1>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionMediaV1 {
+    media_id: String,
+    role: String,
+    name: String,
+    media_file_name: String,
+    duration_ms: Option<u64>,
+    episode_label: Option<String>,
+    content_identity: Option<ExpectedMediaContentIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionXmlAssetV1 {
+    asset_id: String,
+    source_file_name: String,
+    items: Vec<ProjectionDanmakuItemV1>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionDanmakuItemV1 {
+    item_id: String,
+    asset_id: String,
+    original_index: u64,
+    source_time_ms: u64,
+    mode: Option<i64>,
+    font_size: Option<i64>,
+    color: Option<i64>,
+    timestamp: Option<i64>,
+    pool: Option<i64>,
+    user_hash: Option<String>,
+    row_id: Option<String>,
+    text: String,
+    raw_p_fields: Vec<String>,
+    enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionSourceBindingV1 {
+    binding_id: String,
+    asset_id: String,
+    source_media_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionRouteV1 {
+    route_id: String,
+    kind: String,
+    asset_id: Option<String>,
+    source_media_id: Option<String>,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_media_id: Option<String>,
+    target_start_ms: Option<u64>,
+    time_map_id: Option<String>,
+    timing_rules: Vec<ProjectionTimingRuleV1>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionTimingRuleV1 {
+    rule_id: String,
+    source_at_ms: u64,
+    gap_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionItemTimeAdjustmentV1 {
+    item_id: String,
+    adjustment_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionTargetOutputV1 {
+    target_media_id: String,
+    file_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct SignedTimeMapCore {
+    map_id: String,
+    revision: u64,
+    source_media_id: String,
+    target_media_id: String,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    spans: Vec<SignedTimeMapSpan>,
+}
+
+#[derive(Clone, Debug)]
+struct SignedTimeMapSpan {
+    kind: String,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+}
+
+#[derive(Debug)]
+struct NativeProjectedEntry<'a> {
+    item: &'a ProjectionDanmakuItemV1,
+    final_time_ms: u64,
+    projection_ordinal: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -287,6 +428,7 @@ where
 
     validate_output_content_binding(request)?;
     validate_map_proofs_and_dependencies(verification, verify_authority)?;
+    validate_projection_derivation_binding(request)?;
 
     let canonical = canonical_verified_export_manifest(verification)?;
     let canonical_json = serde_json::to_string(&canonical)
@@ -306,7 +448,7 @@ fn validate_output_content_binding(request: &SaveVerifiedExportFileRequest) -> R
     for output in outputs {
         validate_export_file_name(&output.file_name)?;
         validate_sha256_digest("output contentDigest", &output.content_digest)?;
-        if !names.insert(output.file_name.clone()) {
+        if !names.insert(output.file_name.to_lowercase()) {
             return Err("高精度导出 manifest 含重复逻辑输出文件名。".to_string());
         }
     }
@@ -358,6 +500,7 @@ where
             ));
         }
         validate_sha256_digest("map coreDigest", &proof.core_digest)?;
+        let signed_core = parse_and_validate_signed_time_map_core(proof)?;
         validate_media_identity_shape(&proof.source_identity)?;
         validate_media_identity_shape(&proof.target_identity)?;
         if proof.span_kinds.is_empty()
@@ -368,6 +511,22 @@ where
         {
             return Err(format!(
                 "时间图 {} 没有可导出的 span，或仍含 ambiguous/未知 span。",
+                proof.map_id
+            ));
+        }
+        let signed_span_kinds = signed_core
+            .spans
+            .iter()
+            .map(|span| span.kind.as_str())
+            .collect::<Vec<_>>();
+        let declared_span_kinds = proof
+            .span_kinds
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if signed_span_kinds != declared_span_kinds {
+            return Err(format!(
+                "时间图 {} 的 spanKinds 与已签核心不一致。",
                 proof.map_id
             ));
         }
@@ -481,6 +640,870 @@ fn validate_manual_request_binding(proof: &VerifiedExportMapProof) -> Result<(),
     Ok(())
 }
 
+fn parse_and_validate_signed_time_map_core(
+    proof: &VerifiedExportMapProof,
+) -> Result<SignedTimeMapCore, String> {
+    validate_nonempty_bounded(
+        "map coreCanonicalJson",
+        &proof.core_canonical_json,
+        MAX_CORE_CANONICAL_JSON_BYTES,
+    )?;
+    if sha256_digest(proof.core_canonical_json.as_bytes()) != proof.core_digest {
+        return Err(format!(
+            "时间图 {} 的 coreCanonicalJson 与已签 coreDigest 不一致。",
+            proof.map_id
+        ));
+    }
+    let value: Value = serde_json::from_str(&proof.core_canonical_json)
+        .map_err(|error| format!("时间图 {} 的已签核心不是有效 JSON：{error}", proof.map_id))?;
+    let fields = value
+        .as_array()
+        .ok_or_else(|| format!("时间图 {} 的已签核心必须是固定顺序数组。", proof.map_id))?;
+    if fields.len() != 19 || fields[0].as_str() != Some(MEDIA_TIME_MAP_CORE_DOMAIN) {
+        return Err(format!(
+            "时间图 {} 的已签核心 domain 或字段数量无效。",
+            proof.map_id
+        ));
+    }
+    let map_id = required_json_string(&fields[1], "signed core mapId")?;
+    let revision = safe_json_u64(&fields[2], "signed core revision")?;
+    let source_media_id = required_json_string(&fields[3], "signed core sourceMediaId")?;
+    let target_media_id = required_json_string(&fields[4], "signed core targetMediaId")?;
+    if map_id != proof.map_id
+        || revision != proof.revision
+        || source_media_id != proof.source_media_id
+        || target_media_id != proof.target_media_id
+        || fields[7] != identity_manifest_value(&proof.source_identity)
+        || fields[8] != identity_manifest_value(&proof.target_identity)
+    {
+        return Err(format!(
+            "时间图 {} 的已签核心未绑定 proof 的 map/revision/两端媒体身份。",
+            proof.map_id
+        ));
+    }
+    let source_start_ms = safe_json_u64(&fields[9], "signed core sourceStartMs")?;
+    let source_end_ms = safe_json_u64(&fields[10], "signed core sourceEndMs")?;
+    let target_start_ms = safe_json_u64(&fields[11], "signed core targetStartMs")?;
+    let target_end_ms = safe_json_u64(&fields[12], "signed core targetEndMs")?;
+    let span_values = fields[13]
+        .as_array()
+        .ok_or_else(|| format!("时间图 {} 的已签核心缺少 spans。", proof.map_id))?;
+    if span_values.is_empty() || span_values.len() > 1_000_000 {
+        return Err(format!(
+            "时间图 {} 的已签核心 spans 为空或超过上限。",
+            proof.map_id
+        ));
+    }
+    let mut spans: Vec<SignedTimeMapSpan> = Vec::with_capacity(span_values.len());
+    for (span_index, value) in span_values.iter().enumerate() {
+        let span_fields = value.as_array().ok_or_else(|| {
+            format!(
+                "时间图 {} 的第 {} 个 span 不是固定数组。",
+                proof.map_id,
+                span_index + 1
+            )
+        })?;
+        if span_fields.len() != 5 {
+            return Err(format!(
+                "时间图 {} 的第 {} 个 span 字段数量无效。",
+                proof.map_id,
+                span_index + 1
+            ));
+        }
+        let span = SignedTimeMapSpan {
+            kind: required_json_string(&span_fields[0], "signed span kind")?,
+            source_start_ms: safe_json_u64(&span_fields[1], "signed span sourceStartMs")?,
+            source_end_ms: safe_json_u64(&span_fields[2], "signed span sourceEndMs")?,
+            target_start_ms: safe_json_u64(&span_fields[3], "signed span targetStartMs")?,
+            target_end_ms: safe_json_u64(&span_fields[4], "signed span targetEndMs")?,
+        };
+        validate_signed_span_shape(&proof.map_id, span_index, &span)?;
+        if let Some(previous) = spans.last() {
+            if previous.source_end_ms != span.source_start_ms
+                || previous.target_end_ms != span.target_start_ms
+            {
+                return Err(format!(
+                    "时间图 {} 的已签 spans 在双轴上不连续。",
+                    proof.map_id
+                ));
+            }
+        }
+        spans.push(span);
+    }
+    let first = &spans[0];
+    let last = &spans[spans.len() - 1];
+    if source_start_ms >= source_end_ms
+        || target_start_ms >= target_end_ms
+        || first.source_start_ms != source_start_ms
+        || first.target_start_ms != target_start_ms
+        || last.source_end_ms != source_end_ms
+        || last.target_end_ms != target_end_ms
+    {
+        return Err(format!(
+            "时间图 {} 的已签范围与 spans 边界不一致。",
+            proof.map_id
+        ));
+    }
+    Ok(SignedTimeMapCore {
+        map_id,
+        revision,
+        source_media_id,
+        target_media_id,
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        spans,
+    })
+}
+
+fn validate_signed_span_shape(
+    map_id: &str,
+    span_index: usize,
+    span: &SignedTimeMapSpan,
+) -> Result<(), String> {
+    if span.source_end_ms < span.source_start_ms || span.target_end_ms < span.target_start_ms {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个已签 span 范围倒置。",
+            span_index + 1
+        ));
+    }
+    let source_duration = span.source_end_ms - span.source_start_ms;
+    let target_duration = span.target_end_ms - span.target_start_ms;
+    let valid = match span.kind.as_str() {
+        "matched" => source_duration > 0 && target_duration > 0,
+        "sourceOnly" => source_duration > 0 && target_duration == 0,
+        "targetOnly" => source_duration == 0 && target_duration > 0,
+        "ambiguous" => false,
+        _ => false,
+    };
+    if !valid {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个已签 span 类型、形状无效或仍含 ambiguous。",
+            span_index + 1
+        ));
+    }
+    Ok(())
+}
+
+fn required_json_string(value: &Value, label: &str) -> Result<String, String> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("高精度导出字段 {label} 不是字符串。"))?;
+    validate_nonempty_bounded(label, text, 1_048_576)?;
+    Ok(text.to_string())
+}
+
+fn safe_json_u64(value: &Value, label: &str) -> Result<u64, String> {
+    let number = value
+        .as_u64()
+        .filter(|number| *number <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| format!("高精度导出字段 {label} 不是非负安全整数毫秒。"))?;
+    Ok(number)
+}
+
+fn validate_projection_derivation_binding(
+    request: &SaveVerifiedExportFileRequest,
+) -> Result<(), String> {
+    let verification = &request.verification;
+    let derivation = &verification.projection_derivation;
+    if derivation.domain != PROJECTION_DERIVATION_DOMAIN
+        || derivation.projection_policy_version != PROJECTION_POLICY_VERSION
+        || derivation.serializer_version != PROJECTION_SERIALIZER_VERSION
+    {
+        return Err(
+            "投影 derivation 的 domain、投影策略或 XML serializer 版本不受支持。".to_string(),
+        );
+    }
+    if derivation.project_id != verification.project_id
+        || derivation.project_updated_at != verification.project_updated_at
+    {
+        return Err("投影 derivation 未绑定当前项目快照。".to_string());
+    }
+    if derivation.media.len() > MAX_PROJECTION_MEDIA
+        || derivation.xml_assets.len() > MAX_PROJECTION_ASSETS
+        || derivation.routes.len() > MAX_PROJECTION_ROUTES
+        || derivation.source_bindings.len() > MAX_PROJECTION_ASSETS
+        || derivation.target_output_files.len() > MAX_PROJECTION_MEDIA
+    {
+        return Err("投影 derivation 超过媒体、资产、绑定、路由或目标数量上限。".to_string());
+    }
+
+    let mut media_by_id = HashMap::<String, &ProjectionMediaV1>::new();
+    for media in &derivation.media {
+        validate_projection_id("mediaId", &media.media_id)?;
+        validate_bounded("media name", &media.name, 1_048_576)?;
+        validate_bounded("media fileName", &media.media_file_name, 1_048_576)?;
+        if !matches!(media.role.as_str(), "targetOriginal" | "bilibiliReference") {
+            return Err(format!("投影媒体 {} 的角色无效。", media.media_id));
+        }
+        validate_optional_safe_milliseconds("media durationMs", media.duration_ms)?;
+        if let Some(identity) = &media.content_identity {
+            validate_media_identity_shape(identity)?;
+        }
+        if media_by_id.insert(media.media_id.clone(), media).is_some() {
+            return Err("投影 derivation 含重复 mediaId。".to_string());
+        }
+    }
+
+    let mut assets_by_id = HashMap::<String, &ProjectionXmlAssetV1>::new();
+    let mut item_ids = HashSet::<String>::new();
+    let mut item_count = 0_usize;
+    for asset in &derivation.xml_assets {
+        validate_projection_id("assetId", &asset.asset_id)?;
+        validate_bounded("source fileName", &asset.source_file_name, 1_048_576)?;
+        item_count = item_count
+            .checked_add(asset.items.len())
+            .ok_or_else(|| "投影弹幕总数溢出。".to_string())?;
+        if item_count > MAX_PROJECTION_ITEMS {
+            return Err("投影弹幕总数超过安全上限。".to_string());
+        }
+        let mut original_indices = HashSet::new();
+        for item in &asset.items {
+            validate_projection_item(asset, item)?;
+            if !item_ids.insert(item.item_id.clone()) {
+                return Err(format!("投影 derivation 含重复 itemId：{}。", item.item_id));
+            }
+            if !original_indices.insert(item.original_index) {
+                return Err(format!(
+                    "弹幕资产 {} 含重复 originalIndex。",
+                    asset.asset_id
+                ));
+            }
+        }
+        if assets_by_id.insert(asset.asset_id.clone(), asset).is_some() {
+            return Err("投影 derivation 含重复 assetId。".to_string());
+        }
+    }
+
+    let mut source_binding_by_asset = HashMap::<String, String>::new();
+    let mut binding_ids = HashSet::new();
+    for binding in &derivation.source_bindings {
+        validate_projection_id("bindingId", &binding.binding_id)?;
+        validate_projection_id("binding assetId", &binding.asset_id)?;
+        validate_projection_id("binding sourceMediaId", &binding.source_media_id)?;
+        if !binding_ids.insert(binding.binding_id.as_str()) {
+            return Err("投影 derivation 含重复 bindingId。".to_string());
+        }
+        if !assets_by_id.contains_key(&binding.asset_id) {
+            return Err(format!("来源绑定引用缺失资产：{}。", binding.asset_id));
+        }
+        let source_media = media_by_id
+            .get(&binding.source_media_id)
+            .ok_or_else(|| format!("来源绑定引用缺失媒体：{}。", binding.source_media_id))?;
+        if source_media.role != "bilibiliReference" {
+            return Err(format!(
+                "来源绑定 {} 未指向 B 站参考素材。",
+                binding.binding_id
+            ));
+        }
+        if source_binding_by_asset
+            .insert(binding.asset_id.clone(), binding.source_media_id.clone())
+            .is_some()
+        {
+            return Err(format!("资产 {} 含重复来源绑定。", binding.asset_id));
+        }
+    }
+
+    let mut proof_cores = HashMap::<String, SignedTimeMapCore>::new();
+    for proof in &verification.map_proofs {
+        let core = parse_and_validate_signed_time_map_core(proof)?;
+        let source_media = media_by_id
+            .get(&core.source_media_id)
+            .ok_or_else(|| format!("时间图 {} 的来源媒体不在投影 inventory。", core.map_id))?;
+        let target_media = media_by_id
+            .get(&core.target_media_id)
+            .ok_or_else(|| format!("时间图 {} 的目标媒体不在投影 inventory。", core.map_id))?;
+        if source_media.role != "bilibiliReference" || target_media.role != "targetOriginal" {
+            return Err(format!("时间图 {} 的两端媒体角色无效。", core.map_id));
+        }
+        if source_media.content_identity.as_ref() != Some(&proof.source_identity)
+            || target_media.content_identity.as_ref() != Some(&proof.target_identity)
+        {
+            return Err(format!(
+                "时间图 {} 的 proof 身份与项目媒体 inventory 不一致。",
+                core.map_id
+            ));
+        }
+        if proof_cores.insert(core.map_id.clone(), core).is_some() {
+            return Err("投影 derivation 含重复已签时间图。".to_string());
+        }
+    }
+
+    validate_projection_routes_and_overlaps(
+        derivation,
+        &assets_by_id,
+        &media_by_id,
+        &source_binding_by_asset,
+        &proof_cores,
+    )?;
+
+    let disabled = normalized_string_set("disabledItemIds", &derivation.disabled_item_ids)?;
+    let adjustments = normalized_adjustment_map(&derivation.item_time_adjustments)?;
+    let target_outputs = validate_target_output_inventory(derivation, &media_by_id)?;
+
+    let mut groups = HashMap::<String, Vec<NativeProjectedEntry<'_>>>::new();
+    let mut covered_item_ids = HashSet::<&str>::new();
+    let mut source_only_item_ids = HashSet::<&str>::new();
+    let mut projection_ordinal = 0_u64;
+    let mut content_target_ids = HashSet::<String>::new();
+
+    for route in derivation
+        .routes
+        .iter()
+        .filter(|route| route.kind == "content")
+    {
+        let asset_id = route
+            .asset_id
+            .as_deref()
+            .expect("validated content assetId");
+        let target_media_id = route
+            .target_media_id
+            .as_deref()
+            .expect("validated content targetMediaId");
+        let map_id = route
+            .time_map_id
+            .as_deref()
+            .expect("validated content timeMapId");
+        let asset = assets_by_id[asset_id];
+        let core = &proof_cores[map_id];
+        content_target_ids.insert(target_media_id.to_string());
+        let group = groups.entry(target_media_id.to_string()).or_default();
+        for item in &asset.items {
+            if item.source_time_ms < route.source_start_ms
+                || item.source_time_ms >= route.source_end_ms
+            {
+                continue;
+            }
+            covered_item_ids.insert(item.item_id.as_str());
+            let Some(mapped_time_ms) = map_signed_source_time(core, item.source_time_ms)? else {
+                source_only_item_ids.insert(item.item_id.as_str());
+                continue;
+            };
+            if !item.enabled || disabled.contains(item.item_id.as_str()) {
+                continue;
+            }
+            let adjustment_ms = i128::from(*adjustments.get(item.item_id.as_str()).unwrap_or(&0));
+            let final_time_ms = i128::from(mapped_time_ms) + adjustment_ms;
+            if !(0..=i128::from(MAX_SAFE_INTEGER)).contains(&final_time_ms) {
+                return Err(format!(
+                    "弹幕 {} 投影后的时间为负或超过安全整数范围，已拒绝导出。",
+                    item.item_id
+                ));
+            }
+            let final_time_ms = u64::try_from(final_time_ms)
+                .map_err(|_| "投影时间无法转换为非负整数。".to_string())?;
+            let target_media = media_by_id[target_media_id];
+            if target_media
+                .duration_ms
+                .is_some_and(|duration| final_time_ms >= duration)
+            {
+                return Err(format!(
+                    "弹幕 {} 投影后超出目标原片时长，已拒绝导出。",
+                    item.item_id
+                ));
+            }
+            group.push(NativeProjectedEntry {
+                item,
+                final_time_ms,
+                projection_ordinal,
+            });
+            projection_ordinal = projection_ordinal
+                .checked_add(1)
+                .ok_or_else(|| "投影顺序计数溢出。".to_string())?;
+        }
+    }
+
+    if content_target_ids.len() != target_outputs.len()
+        || content_target_ids
+            .iter()
+            .any(|target_id| !target_outputs.contains_key(target_id))
+    {
+        return Err("targetOutputFiles 未与全部正片投影目标形成一一对应。".to_string());
+    }
+    let referenced_map_ids = derivation
+        .routes
+        .iter()
+        .filter(|route| route.kind == "content")
+        .filter_map(|route| route.time_map_id.as_ref())
+        .collect::<HashSet<_>>();
+    if referenced_map_ids.len() != proof_cores.len()
+        || proof_cores
+            .keys()
+            .any(|map_id| !referenced_map_ids.contains(map_id))
+    {
+        return Err("正片路由与 verified map proofs 未形成双向完整绑定。".to_string());
+    }
+
+    let ignored_item_ids = collect_ignored_item_ids(derivation, &assets_by_id);
+    let unexpected_unmapped_count = derivation
+        .xml_assets
+        .iter()
+        .flat_map(|asset| asset.items.iter())
+        .filter(|item| {
+            !covered_item_ids.contains(item.item_id.as_str())
+                && !ignored_item_ids.contains(item.item_id.as_str())
+        })
+        .count();
+    let non_ignored_item_count = item_count
+        .saturating_sub(ignored_item_ids.len())
+        .saturating_sub(source_only_item_ids.len());
+    if unexpected_unmapped_count > 5
+        && unexpected_unmapped_count.saturating_mul(100) > non_ignored_item_count
+    {
+        return Err(format!(
+            "有 {unexpected_unmapped_count} 条弹幕未被正片、忽略或 sourceOnly 路由覆盖，超过安全阈值。"
+        ));
+    }
+
+    let mut expected_xml_by_file = HashMap::<String, Vec<u8>>::new();
+    for target_id in content_target_ids {
+        let mut entries = groups.remove(&target_id).unwrap_or_default();
+        entries.sort_by(|left, right| {
+            left.final_time_ms
+                .cmp(&right.final_time_ms)
+                .then(left.item.original_index.cmp(&right.item.original_index))
+                .then(left.projection_ordinal.cmp(&right.projection_ordinal))
+        });
+        if entries.is_empty() {
+            continue;
+        }
+        let file_name = target_outputs[&target_id].file_name.clone();
+        let xml = serialize_native_bilibili_xml(&entries)?;
+        if expected_xml_by_file.insert(file_name, xml).is_some() {
+            return Err("多个投影目标解析为同一逻辑 XML 文件名。".to_string());
+        }
+    }
+
+    if expected_xml_by_file.len() != verification.outputs.len() {
+        return Err("原生投影重建得到的逻辑 XML 数量与 manifest 不一致。".to_string());
+    }
+    let actual_outputs = logical_output_bytes(request)?;
+    for output in &verification.outputs {
+        let expected = expected_xml_by_file
+            .get(&output.file_name)
+            .ok_or_else(|| format!("manifest 声明了原生投影未生成的 XML：{}", output.file_name))?;
+        if sha256_digest(expected) != output.content_digest {
+            return Err(format!(
+                "逻辑 XML {} 的摘要不是由已签时间图和完整投影 inventory 推导所得。",
+                output.file_name
+            ));
+        }
+        let actual = actual_outputs
+            .get(output.file_name.as_str())
+            .ok_or_else(|| format!("待写内容缺少逻辑 XML：{}", output.file_name))?;
+        if *actual != expected.as_slice() {
+            return Err(format!(
+                "逻辑 XML {} 与原生端独立重建结果不一致，已拒绝写盘。",
+                output.file_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_item(
+    asset: &ProjectionXmlAssetV1,
+    item: &ProjectionDanmakuItemV1,
+) -> Result<(), String> {
+    validate_projection_id("itemId", &item.item_id)?;
+    if item.asset_id != asset.asset_id {
+        return Err(format!(
+            "弹幕 {} 的 assetId 与所属资产不一致。",
+            item.item_id
+        ));
+    }
+    if item.original_index > MAX_SAFE_INTEGER || item.source_time_ms > MAX_SAFE_INTEGER {
+        return Err(format!(
+            "弹幕 {} 含超过 JS 安全整数的索引或时间。",
+            item.item_id
+        ));
+    }
+    validate_bounded("danmaku text", &item.text, 16 * 1_048_576)?;
+    validate_xml_10_characters("danmaku text", &item.text)?;
+    if item.raw_p_fields.len() > 256 {
+        return Err(format!("弹幕 {} 的 p 字段数量超过上限。", item.item_id));
+    }
+    for field in &item.raw_p_fields {
+        validate_bounded("danmaku p field", field, 1_048_576)?;
+        validate_xml_10_characters("danmaku p field", field)?;
+    }
+    for value in [
+        item.mode,
+        item.font_size,
+        item.color,
+        item.timestamp,
+        item.pool,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_safe_i64("danmaku metadata", value)?;
+    }
+    if let Some(user_hash) = &item.user_hash {
+        validate_bounded("danmaku userHash", user_hash, 1_048_576)?;
+        validate_xml_10_characters("danmaku userHash", user_hash)?;
+    }
+    if let Some(row_id) = &item.row_id {
+        validate_bounded("danmaku rowId", row_id, 1_048_576)?;
+        validate_xml_10_characters("danmaku rowId", row_id)?;
+    }
+    Ok(())
+}
+
+fn validate_projection_routes_and_overlaps(
+    derivation: &ProjectionDerivationV1,
+    assets_by_id: &HashMap<String, &ProjectionXmlAssetV1>,
+    media_by_id: &HashMap<String, &ProjectionMediaV1>,
+    source_binding_by_asset: &HashMap<String, String>,
+    proof_cores: &HashMap<String, SignedTimeMapCore>,
+) -> Result<(), String> {
+    let mut route_ids = HashSet::new();
+    let mut grouped = HashMap::<(String, String), Vec<&ProjectionRouteV1>>::new();
+    for route in &derivation.routes {
+        validate_projection_id("routeId", &route.route_id)?;
+        if !route_ids.insert(route.route_id.as_str()) {
+            return Err("投影 derivation 含重复 routeId。".to_string());
+        }
+        if !matches!(route.kind.as_str(), "content" | "ignored")
+            || route.source_start_ms > MAX_SAFE_INTEGER
+            || route.source_end_ms > MAX_SAFE_INTEGER
+            || route.source_start_ms >= route.source_end_ms
+            || route
+                .target_start_ms
+                .is_some_and(|value| value > MAX_SAFE_INTEGER)
+        {
+            return Err(format!(
+                "投影路由 {} 的类型或时间范围无效。",
+                route.route_id
+            ));
+        }
+        for rule in &route.timing_rules {
+            validate_projection_id("timing ruleId", &rule.rule_id)?;
+            if rule.source_at_ms > MAX_SAFE_INTEGER {
+                return Err(format!(
+                    "投影路由 {} 的 timing rule 时间无效。",
+                    route.route_id
+                ));
+            }
+            validate_safe_i64("timing gapMs", rule.gap_ms)?;
+        }
+        let asset_id = route
+            .asset_id
+            .as_ref()
+            .ok_or_else(|| format!("投影路由 {} 缺少 assetId。", route.route_id))?;
+        let source_media_id = route
+            .source_media_id
+            .as_ref()
+            .ok_or_else(|| format!("投影路由 {} 缺少 sourceMediaId。", route.route_id))?;
+        if !assets_by_id.contains_key(asset_id)
+            || media_by_id
+                .get(source_media_id)
+                .is_none_or(|media| media.role != "bilibiliReference")
+            || source_binding_by_asset.get(asset_id) != Some(source_media_id)
+        {
+            return Err(format!(
+                "投影路由 {} 的资产、参考媒体或来源绑定无效。",
+                route.route_id
+            ));
+        }
+        grouped
+            .entry((asset_id.clone(), source_media_id.clone()))
+            .or_default()
+            .push(route);
+        if route.kind == "ignored" {
+            continue;
+        }
+        let target_media_id = route
+            .target_media_id
+            .as_ref()
+            .ok_or_else(|| format!("正片路由 {} 缺少 targetMediaId。", route.route_id))?;
+        if media_by_id
+            .get(target_media_id)
+            .is_none_or(|media| media.role != "targetOriginal")
+        {
+            return Err(format!("正片路由 {} 的目标不是原片。", route.route_id));
+        }
+        let map_id = route
+            .time_map_id
+            .as_ref()
+            .ok_or_else(|| format!("正片路由 {} 缺少 timeMapId。", route.route_id))?;
+        let core = proof_cores
+            .get(map_id)
+            .ok_or_else(|| format!("正片路由 {} 缺少已签时间图。", route.route_id))?;
+        if core.map_id != *map_id
+            || core.revision == 0
+            || core.source_media_id != *source_media_id
+            || core.target_media_id != *target_media_id
+            || core.source_start_ms != route.source_start_ms
+            || core.source_end_ms != route.source_end_ms
+            || core.target_start_ms != route.target_start_ms.unwrap_or(0)
+        {
+            return Err(format!(
+                "正片路由 {} 与已签时间图范围或两端媒体不一致。",
+                route.route_id
+            ));
+        }
+    }
+
+    for routes in grouped.values_mut() {
+        routes.sort_by(|left, right| {
+            left.source_start_ms
+                .cmp(&right.source_start_ms)
+                .then(left.source_end_ms.cmp(&right.source_end_ms))
+        });
+        for left_index in 0..routes.len() {
+            let left = routes[left_index];
+            for right in routes.iter().skip(left_index + 1) {
+                if right.source_start_ms >= left.source_end_ms {
+                    break;
+                }
+                let conflict = left.kind == "ignored"
+                    || right.kind == "ignored"
+                    || left.target_media_id == right.target_media_id;
+                if conflict {
+                    return Err(format!(
+                        "投影路由 {} 与 {} 的来源范围冲突。",
+                        left.route_id, right.route_id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_target_output_inventory<'a>(
+    derivation: &'a ProjectionDerivationV1,
+    media_by_id: &HashMap<String, &ProjectionMediaV1>,
+) -> Result<HashMap<String, &'a ProjectionTargetOutputV1>, String> {
+    let mut targets = HashMap::new();
+    let mut file_names = HashSet::new();
+    for target in &derivation.target_output_files {
+        validate_projection_id("target output mediaId", &target.target_media_id)?;
+        validate_export_file_name(&target.file_name)?;
+        if media_by_id
+            .get(&target.target_media_id)
+            .is_none_or(|media| media.role != "targetOriginal")
+        {
+            return Err(format!(
+                "目标输出 {} 未指向原片媒体。",
+                target.target_media_id
+            ));
+        }
+        if !file_names.insert(target.file_name.to_lowercase()) {
+            return Err("targetOutputFiles 含重复逻辑文件名。".to_string());
+        }
+        if targets
+            .insert(target.target_media_id.clone(), target)
+            .is_some()
+        {
+            return Err("targetOutputFiles 含重复 targetMediaId。".to_string());
+        }
+    }
+    Ok(targets)
+}
+
+fn normalized_string_set<'a>(
+    label: &str,
+    values: &'a [String],
+) -> Result<HashSet<&'a str>, String> {
+    let mut result = HashSet::new();
+    for value in values {
+        validate_projection_id(label, value)?;
+        if !result.insert(value.as_str()) {
+            return Err(format!("投影 derivation 字段 {label} 含重复值。"));
+        }
+    }
+    Ok(result)
+}
+
+fn normalized_adjustment_map(
+    adjustments: &[ProjectionItemTimeAdjustmentV1],
+) -> Result<HashMap<&str, i64>, String> {
+    let mut result = HashMap::new();
+    for adjustment in adjustments {
+        validate_projection_id("adjustment itemId", &adjustment.item_id)?;
+        validate_safe_i64("adjustmentMs", adjustment.adjustment_ms)?;
+        if result
+            .insert(adjustment.item_id.as_str(), adjustment.adjustment_ms)
+            .is_some()
+        {
+            return Err("投影 derivation 含重复 itemTimeAdjustment。".to_string());
+        }
+    }
+    Ok(result)
+}
+
+fn collect_ignored_item_ids<'a>(
+    derivation: &'a ProjectionDerivationV1,
+    assets_by_id: &HashMap<String, &'a ProjectionXmlAssetV1>,
+) -> HashSet<&'a str> {
+    let mut ignored = HashSet::new();
+    for route in derivation
+        .routes
+        .iter()
+        .filter(|route| route.kind == "ignored")
+    {
+        let Some(asset_id) = route.asset_id.as_ref() else {
+            continue;
+        };
+        let Some(asset) = assets_by_id.get(asset_id) else {
+            continue;
+        };
+        for item in &asset.items {
+            if item.source_time_ms >= route.source_start_ms
+                && item.source_time_ms < route.source_end_ms
+            {
+                ignored.insert(item.item_id.as_str());
+            }
+        }
+    }
+    ignored
+}
+
+fn map_signed_source_time(
+    core: &SignedTimeMapCore,
+    source_time_ms: u64,
+) -> Result<Option<u64>, String> {
+    for span in &core.spans {
+        if span.source_start_ms <= source_time_ms && source_time_ms < span.source_end_ms {
+            if span.kind == "sourceOnly" {
+                return Ok(None);
+            }
+            if span.kind != "matched" {
+                return Err(format!(
+                    "时间图 {} 在来源时间上命中不可投影 span。",
+                    core.map_id
+                ));
+            }
+            let source_duration = span.source_end_ms - span.source_start_ms;
+            let target_duration = span.target_end_ms - span.target_start_ms;
+            let source_delta = source_time_ms - span.source_start_ms;
+            let numerator = u128::from(source_delta) * u128::from(target_duration);
+            let denominator = u128::from(source_duration);
+            let rounded_delta = (numerator * 2 + denominator) / (denominator * 2);
+            let rounded_delta =
+                u64::try_from(rounded_delta).map_err(|_| "分段仿射插值结果溢出。".to_string())?;
+            let candidate = span
+                .target_start_ms
+                .checked_add(rounded_delta)
+                .ok_or_else(|| "分段仿射插值加法溢出。".to_string())?;
+            return Ok(Some(candidate.min(span.target_end_ms - 1)));
+        }
+    }
+    Err(format!(
+        "时间图 {} 未覆盖正片路由范围内的来源时间 {}。",
+        core.map_id, source_time_ms
+    ))
+}
+
+fn serialize_native_bilibili_xml(entries: &[NativeProjectedEntry<'_>]) -> Result<Vec<u8>, String> {
+    let mut output = String::new();
+    output.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    output.push_str("<i>\n");
+    output.push_str("  <generator>Danmaku Timeline Studio</generator>\n");
+    for entry in entries {
+        let mut fields = if entry.item.raw_p_fields.is_empty() {
+            projection_fallback_p_fields(entry.item, entry.final_time_ms)
+        } else {
+            entry.item.raw_p_fields.clone()
+        };
+        let fallback = projection_fallback_p_fields(entry.item, entry.final_time_ms);
+        fields[0] = format_xml_seconds(entry.final_time_ms);
+        while fields.len() < fallback.len() {
+            fields.push(fallback[fields.len()].clone());
+        }
+        output.push_str("  <d p=\"");
+        output.push_str(&escape_xml_attribute(&fields.join(",")));
+        output.push_str("\">");
+        output.push_str(&escape_xml_text(&entry.item.text));
+        output.push_str("</d>\n");
+    }
+    output.push_str("</i>\n");
+    Ok(output.into_bytes())
+}
+
+fn projection_fallback_p_fields(item: &ProjectionDanmakuItemV1, time_ms: u64) -> Vec<String> {
+    vec![
+        format_xml_seconds(time_ms),
+        item.mode.unwrap_or(1).to_string(),
+        item.font_size.unwrap_or(25).to_string(),
+        item.color.unwrap_or(16_777_215).to_string(),
+        item.timestamp.unwrap_or(0).to_string(),
+        item.pool.unwrap_or(0).to_string(),
+        item.user_hash.clone().unwrap_or_default(),
+        item.row_id.clone().unwrap_or_default(),
+    ]
+}
+
+fn format_xml_seconds(milliseconds: u64) -> String {
+    format!("{}.{:03}", milliseconds / 1000, milliseconds % 1000)
+}
+
+fn escape_xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_xml_attribute(text: &str) -> String {
+    escape_xml_text(text)
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn logical_output_bytes(
+    request: &SaveVerifiedExportFileRequest,
+) -> Result<HashMap<String, &[u8]>, String> {
+    if request.verification.outputs.len() == 1 {
+        return Ok(HashMap::from([(
+            request.verification.outputs[0].file_name.clone(),
+            request.content_bytes.as_slice(),
+        )]));
+    }
+    Ok(parse_and_verify_stored_zip(&request.content_bytes)?
+        .into_iter()
+        .collect())
+}
+
+fn validate_projection_id(label: &str, value: &str) -> Result<(), String> {
+    validate_nonempty_bounded(label, value, 512)
+}
+
+fn validate_bounded(label: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!("高精度导出字段 {label} 超过大小限制。"));
+    }
+    Ok(())
+}
+
+fn validate_optional_safe_milliseconds(label: &str, value: Option<u64>) -> Result<(), String> {
+    if value.is_some_and(|number| number > MAX_SAFE_INTEGER) {
+        return Err(format!("高精度导出字段 {label} 超过安全整数范围。"));
+    }
+    Ok(())
+}
+
+fn validate_safe_i64(label: &str, value: i64) -> Result<(), String> {
+    let max = i64::try_from(MAX_SAFE_INTEGER).expect("MAX_SAFE_INTEGER fits i64");
+    if !(-max..=max).contains(&value) {
+        return Err(format!("高精度导出字段 {label} 超过安全整数范围。"));
+    }
+    Ok(())
+}
+
+fn validate_xml_10_characters(label: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|character| {
+        !matches!(character, '\u{0009}' | '\u{000a}' | '\u{000d}')
+            && !matches!(character as u32, 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
+    }) {
+        return Err(format!(
+            "高精度导出字段 {label} 包含 XML 1.0 不允许的字符。"
+        ));
+    }
+    Ok(())
+}
+
 fn canonical_verified_export_manifest(
     verification: &VerifiedExportVerification,
 ) -> Result<Value, String> {
@@ -505,6 +1528,7 @@ fn canonical_verified_export_manifest(
                 proof.declared_quality,
                 proof.span_kinds,
                 proof.core_digest,
+                proof.core_canonical_json,
                 proof.source_media_id,
                 proof.target_media_id,
                 identity_manifest_value(&proof.source_identity),
@@ -543,7 +1567,113 @@ fn canonical_verified_export_manifest(
         output_values,
         proof_values,
         dependency_values,
+        canonical_projection_derivation(&verification.projection_derivation),
     ]))
+}
+
+fn canonical_projection_derivation(derivation: &ProjectionDerivationV1) -> Value {
+    let media = derivation
+        .media
+        .iter()
+        .map(|media| {
+            json!([
+                media.media_id,
+                media.role,
+                media.name,
+                media.media_file_name,
+                media.duration_ms,
+                media.episode_label,
+                media.content_identity.as_ref().map(identity_manifest_value)
+            ])
+        })
+        .collect::<Vec<_>>();
+    let assets = derivation
+        .xml_assets
+        .iter()
+        .map(|asset| {
+            let items = asset
+                .items
+                .iter()
+                .map(|item| {
+                    json!([
+                        item.item_id,
+                        item.asset_id,
+                        item.original_index,
+                        item.source_time_ms,
+                        item.mode,
+                        item.font_size,
+                        item.color,
+                        item.timestamp,
+                        item.pool,
+                        item.user_hash,
+                        item.row_id,
+                        item.text,
+                        item.raw_p_fields,
+                        item.enabled,
+                    ])
+                })
+                .collect::<Vec<_>>();
+            json!([asset.asset_id, asset.source_file_name, items])
+        })
+        .collect::<Vec<_>>();
+    let bindings = derivation
+        .source_bindings
+        .iter()
+        .map(|binding| {
+            json!([
+                binding.binding_id,
+                binding.asset_id,
+                binding.source_media_id
+            ])
+        })
+        .collect::<Vec<_>>();
+    let routes = derivation
+        .routes
+        .iter()
+        .map(|route| {
+            let timing_rules = route
+                .timing_rules
+                .iter()
+                .map(|rule| json!([rule.rule_id, rule.source_at_ms, rule.gap_ms]))
+                .collect::<Vec<_>>();
+            json!([
+                route.route_id,
+                route.kind,
+                route.asset_id,
+                route.source_media_id,
+                route.source_start_ms,
+                route.source_end_ms,
+                route.target_media_id,
+                route.target_start_ms,
+                route.time_map_id,
+                timing_rules,
+            ])
+        })
+        .collect::<Vec<_>>();
+    let adjustments = derivation
+        .item_time_adjustments
+        .iter()
+        .map(|adjustment| json!([adjustment.item_id, adjustment.adjustment_ms]))
+        .collect::<Vec<_>>();
+    let target_outputs = derivation
+        .target_output_files
+        .iter()
+        .map(|target| json!([target.target_media_id, target.file_name]))
+        .collect::<Vec<_>>();
+    json!([
+        derivation.domain,
+        derivation.projection_policy_version,
+        derivation.serializer_version,
+        derivation.project_id,
+        derivation.project_updated_at,
+        media,
+        assets,
+        bindings,
+        routes,
+        derivation.disabled_item_ids,
+        adjustments,
+        target_outputs,
+    ])
 }
 
 fn identity_manifest_value(identity: &ExpectedMediaContentIdentity) -> Value {
@@ -669,7 +1799,7 @@ fn parse_and_verify_stored_zip(bytes: &[u8]) -> Result<Vec<(String, &[u8])>, Str
             std::str::from_utf8(&bytes[central_cursor + 46..central_cursor + 46 + name_len])
                 .map_err(|_| "ZIP 文件名不是 UTF-8。".to_string())?;
         validate_export_file_name(central_name)?;
-        if !names.insert(central_name.to_string()) {
+        if !names.insert(central_name.to_lowercase()) {
             return Err("ZIP 含重复逻辑文件名。".to_string());
         }
 
@@ -1016,7 +2146,10 @@ mod tests {
 
         assert_eq!(result.file_name, "episode.xml");
         assert_eq!(authority_checks, 1);
-        assert_eq!(fs::read(unique.join("episode.xml")).unwrap(), b"<i />");
+        assert_eq!(
+            fs::read(unique.join("episode.xml")).unwrap(),
+            request_fixture_xml()
+        );
         fs::remove_dir_all(unique).unwrap();
     }
 
@@ -1046,6 +2179,44 @@ mod tests {
     }
 
     #[test]
+    fn native_projection_rebuild_applies_item_adjustments_and_serializer_rules() {
+        let unique = tempfile_like_path("danmaku-export-native-rebuild-adjustment");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+        let (source_path, target_path, source_identity, target_identity) =
+            create_media_pair(&unique);
+        let mut request = verified_request(
+            &unique,
+            &source_path,
+            &target_path,
+            source_identity,
+            target_identity,
+        );
+        request
+            .verification
+            .projection_derivation
+            .item_time_adjustments = vec![ProjectionItemTimeAdjustmentV1 {
+            item_id: "item-1".to_string(),
+            adjustment_ms: 50,
+        }];
+        request.content_bytes = String::from_utf8(request_fixture_xml())
+            .unwrap()
+            .replace("0.100", "0.150")
+            .into_bytes();
+        let digest = sha256_digest(&request.content_bytes);
+        request.verification.archive_content_digest = digest.clone();
+        request.verification.outputs[0].content_digest = digest;
+        resign_manifest(&mut request.verification);
+
+        let result = save_verified_export_file_with_authority(request, |_| Ok(())).unwrap();
+        assert_eq!(result.file_name, "episode.xml");
+        assert!(String::from_utf8(fs::read(result.file_path).unwrap())
+            .unwrap()
+            .contains("p=\"0.150,1,25,16777215,0,0,,\""));
+        fs::remove_dir_all(unique).unwrap();
+    }
+
+    #[test]
     fn verified_envelope_rejects_quality_span_proof_and_request_tampering() {
         let unique = tempfile_like_path("danmaku-export-proof-tamper");
         let _ = fs::remove_dir_all(&unique);
@@ -1071,6 +2242,17 @@ mod tests {
             .push("ambiguous".to_string());
         resign_manifest(&mut ambiguous.verification);
         assert_rejected_without_write(&ambiguous, &unique, "ambiguous/未知 span");
+
+        let mut unsigned_core_change = clone_request(&base);
+        unsigned_core_change.verification.map_proofs[0]
+            .core_canonical_json
+            .push(' ');
+        resign_manifest(&mut unsigned_core_change.verification);
+        assert_rejected_without_write(
+            &unsigned_core_change,
+            &unique,
+            "coreCanonicalJson 与已签 coreDigest 不一致",
+        );
 
         let mut missing_proof = clone_request(&base);
         missing_proof.verification.map_proofs.clear();
@@ -1108,6 +2290,18 @@ mod tests {
         let mut content = clone_request(&base);
         content.content_bytes = b"<i>tampered</i>".to_vec();
         assert_rejected_without_write(&content, &unique, "待写盘内容 SHA-256");
+
+        let mut self_consistent_forgery = clone_request(&base);
+        self_consistent_forgery.content_bytes = b"<i>forged but fully resigned</i>".to_vec();
+        let forged_digest = sha256_digest(&self_consistent_forgery.content_bytes);
+        self_consistent_forgery.verification.outputs[0].content_digest = forged_digest.clone();
+        self_consistent_forgery.verification.archive_content_digest = forged_digest;
+        resign_manifest(&mut self_consistent_forgery.verification);
+        assert_rejected_without_write(
+            &self_consistent_forgery,
+            &unique,
+            "不是由已签时间图和完整投影 inventory 推导所得",
+        );
 
         let mut manifest = clone_request(&base);
         manifest.verification.snapshot_digest = sha256_digest(b"not-the-manifest");
@@ -1160,6 +2354,12 @@ mod tests {
         let byte = tampered.iter_mut().find(|byte| **byte == b'2').unwrap();
         *byte = b'9';
         assert!(parse_and_verify_stored_zip(&tampered).is_err());
+
+        let windows_case_collision = create_test_stored_zip(&[
+            ("Episode.xml", b"<i>1</i>".as_slice()),
+            ("episode.xml", b"<i>2</i>".as_slice()),
+        ]);
+        assert!(parse_and_verify_stored_zip(&windows_case_collision).is_err());
     }
 
     fn assert_rejected_without_write(
@@ -1199,8 +2399,30 @@ mod tests {
         source_identity: ExpectedMediaContentIdentity,
         target_identity: ExpectedMediaContentIdentity,
     ) -> SaveVerifiedExportFileRequest {
-        let content_bytes = b"<i />".to_vec();
-        let core_digest = sha256_digest(b"map-core");
+        let content_bytes = request_fixture_xml();
+        let core_canonical_json = serde_json::to_string(&json!([
+            MEDIA_TIME_MAP_CORE_DOMAIN,
+            "map-1",
+            1,
+            "source-1",
+            "target-1",
+            null,
+            null,
+            identity_manifest_value(&source_identity),
+            identity_manifest_value(&target_identity),
+            0,
+            1000,
+            0,
+            1000,
+            [["matched", 0, 1000, 0, 1000]],
+            [],
+            [],
+            "fixture-engine-v1",
+            "fixture-feature-v1",
+            "sha256:fixture-parameters"
+        ]))
+        .unwrap();
+        let core_digest = sha256_digest(core_canonical_json.as_bytes());
         let review_digest = sha256_digest(b"review-evidence");
         let request_payload = serde_json::to_string(&json!([
             MANUAL_VERIFICATION_REQUEST_DOMAIN,
@@ -1225,6 +2447,7 @@ mod tests {
             declared_quality: "verified".to_string(),
             span_kinds: vec!["matched".to_string()],
             core_digest,
+            core_canonical_json,
             source_media_id: "source-1".to_string(),
             target_media_id: "target-1".to_string(),
             source_identity: source_identity.clone(),
@@ -1255,16 +2478,86 @@ mod tests {
                 VerifiedMediaDependency {
                     media_id: "source-1".to_string(),
                     path: source_path.to_string_lossy().to_string(),
-                    expected_identity: source_identity,
+                    expected_identity: source_identity.clone(),
                     map_ids: vec!["map-1".to_string()],
                 },
                 VerifiedMediaDependency {
                     media_id: "target-1".to_string(),
                     path: target_path.to_string_lossy().to_string(),
-                    expected_identity: target_identity,
+                    expected_identity: target_identity.clone(),
                     map_ids: vec!["map-1".to_string()],
                 },
             ],
+            projection_derivation: ProjectionDerivationV1 {
+                domain: PROJECTION_DERIVATION_DOMAIN.to_string(),
+                projection_policy_version: PROJECTION_POLICY_VERSION.to_string(),
+                serializer_version: PROJECTION_SERIALIZER_VERSION.to_string(),
+                project_id: "project-1".to_string(),
+                project_updated_at: "2026-07-12T00:00:00.000Z".to_string(),
+                media: vec![
+                    ProjectionMediaV1 {
+                        media_id: "source-1".to_string(),
+                        role: "bilibiliReference".to_string(),
+                        name: "source".to_string(),
+                        media_file_name: "source.bin".to_string(),
+                        duration_ms: Some(1000),
+                        episode_label: None,
+                        content_identity: Some(source_identity.clone()),
+                    },
+                    ProjectionMediaV1 {
+                        media_id: "target-1".to_string(),
+                        role: "targetOriginal".to_string(),
+                        name: "target".to_string(),
+                        media_file_name: "target.bin".to_string(),
+                        duration_ms: Some(1000),
+                        episode_label: Some("1".to_string()),
+                        content_identity: Some(target_identity.clone()),
+                    },
+                ],
+                xml_assets: vec![ProjectionXmlAssetV1 {
+                    asset_id: "asset-1".to_string(),
+                    source_file_name: "source.xml".to_string(),
+                    items: vec![ProjectionDanmakuItemV1 {
+                        item_id: "item-1".to_string(),
+                        asset_id: "asset-1".to_string(),
+                        original_index: 0,
+                        source_time_ms: 100,
+                        mode: None,
+                        font_size: None,
+                        color: None,
+                        timestamp: None,
+                        pool: None,
+                        user_hash: None,
+                        row_id: None,
+                        text: "fixture & text".to_string(),
+                        raw_p_fields: Vec::new(),
+                        enabled: true,
+                    }],
+                }],
+                source_bindings: vec![ProjectionSourceBindingV1 {
+                    binding_id: "binding-1".to_string(),
+                    asset_id: "asset-1".to_string(),
+                    source_media_id: "source-1".to_string(),
+                }],
+                routes: vec![ProjectionRouteV1 {
+                    route_id: "route-1".to_string(),
+                    kind: "content".to_string(),
+                    asset_id: Some("asset-1".to_string()),
+                    source_media_id: Some("source-1".to_string()),
+                    source_start_ms: 0,
+                    source_end_ms: 1000,
+                    target_media_id: Some("target-1".to_string()),
+                    target_start_ms: Some(0),
+                    time_map_id: Some("map-1".to_string()),
+                    timing_rules: Vec::new(),
+                }],
+                disabled_item_ids: Vec::new(),
+                item_time_adjustments: Vec::new(),
+                target_output_files: vec![ProjectionTargetOutputV1 {
+                    target_media_id: "target-1".to_string(),
+                    file_name: "episode.xml".to_string(),
+                }],
+            },
         };
         resign_manifest(&mut verification);
         SaveVerifiedExportFileRequest {
@@ -1273,6 +2566,18 @@ mod tests {
             content_bytes,
             verification,
         }
+    }
+
+    fn request_fixture_xml() -> Vec<u8> {
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<i>\n",
+            "  <generator>Danmaku Timeline Studio</generator>\n",
+            "  <d p=\"0.100,1,25,16777215,0,0,,\">fixture &amp; text</d>\n",
+            "</i>\n"
+        )
+        .as_bytes()
+        .to_vec()
     }
 
     fn resign_manifest(verification: &mut VerifiedExportVerification) {
@@ -1298,6 +2603,7 @@ mod tests {
                 outputs: request.verification.outputs.clone(),
                 map_proofs: request.verification.map_proofs.clone(),
                 dependencies: request.verification.dependencies.clone(),
+                projection_derivation: request.verification.projection_derivation.clone(),
             },
         }
     }
