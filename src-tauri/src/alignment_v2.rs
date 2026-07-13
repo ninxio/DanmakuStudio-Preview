@@ -20,6 +20,7 @@ const LANDMARK_DELTA_QUANTUM_MS: i64 = 50;
 const LANDMARK_DELTA_MASK: u64 = 0xff;
 const MAX_MODEL_SEEDS: usize = 768;
 const MAX_OBSERVATIONS: usize = 40_000;
+const AFFINE_HOLDOUT_TIME_BLOCK_MS: i64 = 1_000;
 const MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY: usize = 16_384;
 const MAX_STREAMING_RETAINED_LANDMARKS: usize = 262_144;
 const MAX_STREAMING_WINDOW_SAMPLES: usize = 65_536;
@@ -1465,6 +1466,14 @@ impl Default for AffineMatchConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AffineAnchorEvidence {
+    pub source_time_ms: i64,
+    pub target_time_ms: i64,
+    pub residual_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AffineHypothesis {
     pub scale: f64,
     pub offset_ms: i64,
@@ -1478,6 +1487,9 @@ pub struct AffineHypothesis {
     pub p50_residual_ms: i64,
     pub p95_residual_ms: i64,
     pub max_residual_ms: i64,
+    pub training_anchors: Vec<AffineAnchorEvidence>,
+    pub held_out_anchors: Vec<AffineAnchorEvidence>,
+    pub held_out_within_tolerance_count: usize,
 }
 
 // Production callers use this axis-safe contract to bind windowed FFmpeg PCM back to the
@@ -1673,14 +1685,32 @@ pub fn match_landmarks_affine_with_cancel(
         });
     }
 
-    let seeds = create_model_seeds(&observations, config, cancel_flag)?;
+    let held_out_time_blocks =
+        select_distributed_holdout_time_blocks(&observations, config.min_inliers);
+    let training_observations = observations
+        .iter()
+        .filter(|item| {
+            !held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let (fitting_observations, held_out_time_blocks) =
+        if training_observations.len() >= config.min_inliers {
+            (training_observations.as_slice(), held_out_time_blocks)
+        } else {
+            (observations.as_slice(), HashSet::new())
+        };
+    // The validation partition is fixed before seed generation. Every source landmark in a
+    // selected time block stays together, so alternate frequencies from the same spectral frame
+    // cannot leak into seeds, candidate ranking or least-squares refitting.
+    let seeds = create_model_seeds(fitting_observations, config, cancel_flag)?;
     let mut hypotheses = Vec::new();
     for (seed_index, (seed_scale, seed_offset)) in seeds.into_iter().enumerate() {
         if seed_index % 4 == 0 {
             check_algorithm_cancelled(cancel_flag)?;
         }
         if let Some(hypothesis) = fit_hypothesis(
-            &observations,
+            fitting_observations,
             seed_scale,
             seed_offset,
             unique_source_total,
@@ -1698,6 +1728,19 @@ pub fn match_landmarks_affine_with_cancel(
     }
     hypotheses.sort_by(compare_hypotheses);
     hypotheses.truncate(config.top_k);
+    for hypothesis in &mut hypotheses {
+        hypothesis.held_out_anchors = evaluate_affine_holdout(
+            &observations,
+            &held_out_time_blocks,
+            hypothesis.scale,
+            hypothesis.offset_ms as f64,
+        );
+        hypothesis.held_out_within_tolerance_count = hypothesis
+            .held_out_anchors
+            .iter()
+            .filter(|item| item.residual_ms <= config.residual_tolerance_ms)
+            .count();
+    }
     let top1_top2_margin = calculate_hypothesis_margin(&hypotheses, config);
     Ok(AffineMatchResult {
         hypotheses,
@@ -2868,6 +2911,14 @@ fn fit_hypothesis(
     residuals.sort_unstable();
     let source_start_ms = inliers.iter().map(|item| item.source_time_ms).min()?;
     let source_end_ms = inliers.iter().map(|item| item.source_time_ms).max()?;
+    let training_anchors = inliers
+        .iter()
+        .map(|item| AffineAnchorEvidence {
+            source_time_ms: item.source_time_ms,
+            target_time_ms: item.target_time_ms,
+            residual_ms: item.residual_ms,
+        })
+        .collect::<Vec<_>>();
     Some(AffineHypothesis {
         scale,
         offset_ms: offset.round() as i64,
@@ -2881,7 +2932,119 @@ fn fit_hypothesis(
         p50_residual_ms: percentile(&residuals, 0.50),
         p95_residual_ms: percentile(&residuals, 0.95),
         max_residual_ms: *residuals.last().unwrap_or(&0),
+        training_anchors,
+        held_out_anchors: Vec::new(),
+        held_out_within_tolerance_count: 0,
     })
+}
+
+fn affine_holdout_time_block(source_time_ms: i64) -> i64 {
+    source_time_ms.div_euclid(AFFINE_HOLDOUT_TIME_BLOCK_MS)
+}
+
+fn select_distributed_holdout_time_blocks(
+    observations: &[LandmarkObservation],
+    minimum_training_count: usize,
+) -> HashSet<i64> {
+    let mut source_indices = observations
+        .iter()
+        .map(|item| item.source_index)
+        .collect::<HashSet<_>>();
+    if source_indices.len().saturating_sub(minimum_training_count) < 2 {
+        return HashSet::new();
+    }
+
+    let mut source_indices_by_block = HashMap::<i64, HashSet<usize>>::new();
+    for observation in observations {
+        source_indices_by_block
+            .entry(affine_holdout_time_block(observation.source_time_ms))
+            .or_default()
+            .insert(observation.source_index);
+    }
+    let mut blocks = source_indices_by_block.keys().copied().collect::<Vec<_>>();
+    blocks.sort_unstable();
+    if blocks.len() < 3 {
+        return HashSet::new();
+    }
+
+    let maximum_holdout_block_count = blocks.len().saturating_sub(1).min(32);
+    let holdout_block_count = blocks
+        .len()
+        .div_ceil(5)
+        .max(2)
+        .min(maximum_holdout_block_count);
+    let mut block_indices = (0..holdout_block_count)
+        .map(|slot| ((2 * slot + 1) * blocks.len()) / (2 * holdout_block_count))
+        .map(|index| index.min(blocks.len().saturating_sub(1)))
+        .collect::<Vec<_>>();
+    block_indices.sort_unstable();
+    block_indices.dedup();
+
+    let mut selected_blocks = HashSet::new();
+    for block_index in block_indices {
+        let Some(block) = blocks.get(block_index).copied() else {
+            continue;
+        };
+        let Some(block_source_indices) = source_indices_by_block.get(&block) else {
+            continue;
+        };
+        let removed_source_count = block_source_indices
+            .iter()
+            .filter(|source_index| source_indices.remove(source_index))
+            .count();
+        if source_indices.len() < minimum_training_count {
+            source_indices.extend(block_source_indices.iter().copied());
+            debug_assert_eq!(removed_source_count, block_source_indices.len());
+            continue;
+        }
+        selected_blocks.insert(block);
+    }
+
+    if selected_blocks.len() >= 2 {
+        selected_blocks
+    } else {
+        HashSet::new()
+    }
+}
+
+fn evaluate_affine_holdout(
+    observations: &[LandmarkObservation],
+    held_out_time_blocks: &HashSet<i64>,
+    scale: f64,
+    offset: f64,
+) -> Vec<AffineAnchorEvidence> {
+    let mut best_by_source = HashMap::<usize, AffineAnchorEvidence>::new();
+    for observation in observations.iter().filter(|item| {
+        held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
+    }) {
+        let residual_ms = (observation.target_time_ms as f64
+            - (scale * observation.source_time_ms as f64 + offset))
+            .abs()
+            .round() as i64;
+        let candidate = AffineAnchorEvidence {
+            source_time_ms: observation.source_time_ms,
+            target_time_ms: observation.target_time_ms,
+            residual_ms,
+        };
+        let replace = best_by_source
+            .get(&observation.source_index)
+            .map(|current| {
+                candidate.residual_ms < current.residual_ms
+                    || (candidate.residual_ms == current.residual_ms
+                        && candidate.target_time_ms < current.target_time_ms)
+            })
+            .unwrap_or(true);
+        if replace {
+            best_by_source.insert(observation.source_index, candidate);
+        }
+    }
+    let mut result = best_by_source.into_values().collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        left.source_time_ms
+            .cmp(&right.source_time_ms)
+            .then_with(|| left.target_time_ms.cmp(&right.target_time_ms))
+    });
+    result
 }
 
 fn select_unique_monotonic_inliers(
@@ -3867,12 +4030,100 @@ mod tests {
         let best = result.hypotheses.first().unwrap();
         assert!((best.scale - 1.02).abs() < 0.001);
         assert!(best.offset_ms.abs_diff(5_000) <= 2);
-        assert_eq!(best.unique_source_count, 12);
-        assert!((best.unique_source_coverage - 12.0 / 13.0).abs() < 0.000_1);
-        assert_eq!(best.unique_target_count, 12);
-        assert!((best.unique_target_coverage - 12.0 / 15.0).abs() < 0.000_1);
+        assert_eq!(best.unique_source_count + best.held_out_anchors.len(), 12);
+        assert_eq!(best.held_out_anchors.len(), 3);
+        assert!((best.unique_source_coverage - 9.0 / 13.0).abs() < 0.000_1);
+        assert_eq!(best.unique_target_count, 9);
+        assert!((best.unique_target_coverage - 9.0 / 15.0).abs() < 0.000_1);
         assert!(best.p95_residual_ms <= 1);
+        assert!(best
+            .held_out_anchors
+            .iter()
+            .all(|item| item.residual_ms <= 1));
         assert!(result.top1_top2_margin > 0.4);
+    }
+
+    #[test]
+    fn affine_holdout_keeps_all_frequencies_from_one_time_frame_in_one_partition() {
+        let mut source = Vec::new();
+        let mut target = Vec::new();
+        for time_ordinal in 0..15usize {
+            let source_time_ms = time_ordinal as i64 * AFFINE_HOLDOUT_TIME_BLOCK_MS;
+            for frequency_ordinal in 0..3usize {
+                let family = 300 + time_ordinal * 3 + frequency_ordinal;
+                let hash = ((family as u64) << 8) | 7;
+                source.push(test_landmark(hash, source_time_ms));
+                target.push(test_landmark(hash, source_time_ms + 5_000));
+            }
+        }
+        let observations =
+            create_landmark_observations(&source, &target, &AffineMatchConfig::default(), None)
+                .unwrap();
+        let held_out_time_blocks = select_distributed_holdout_time_blocks(&observations, 4);
+
+        assert_eq!(held_out_time_blocks, HashSet::from([2, 7, 12]));
+        for time_ordinal in 0..15usize {
+            let source_time_ms = time_ordinal as i64 * AFFINE_HOLDOUT_TIME_BLOCK_MS;
+            let frame_observations = observations
+                .iter()
+                .filter(|item| item.source_time_ms == source_time_ms)
+                .collect::<Vec<_>>();
+            assert_eq!(frame_observations.len(), 3);
+            let held_out_count = frame_observations
+                .iter()
+                .filter(|item| {
+                    held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
+                })
+                .count();
+            assert!(held_out_count == 0 || held_out_count == frame_observations.len());
+        }
+    }
+
+    #[test]
+    fn affine_holdout_is_partitioned_before_seed_and_records_out_of_tolerance_failures() {
+        let source = (0..15usize)
+            .map(|index| test_landmark((((200 + index) as u64) << 8) | 7, index as i64 * 1_000))
+            .collect::<Vec<_>>();
+        let baseline_target = source
+            .iter()
+            .map(|item| test_landmark(item.hash, item.time_ms + 5_000))
+            .collect::<Vec<_>>();
+        // For 15 one-second source blocks and min_inliers=4 the deterministic region-centred
+        // partition selects source blocks 2, 7 and 12 before any seed is generated.
+        let held_out_ordinals = [2usize, 7, 12];
+        let shifted_target = source
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let shift = if held_out_ordinals.contains(&index) {
+                    35_000
+                } else {
+                    5_000
+                };
+                test_landmark(item.hash, item.time_ms + shift)
+            })
+            .collect::<Vec<_>>();
+        let config = AffineMatchConfig::default();
+        let baseline = match_landmarks_affine(&source, &baseline_target, &config).unwrap();
+        let shifted = match_landmarks_affine(&source, &shifted_target, &config).unwrap();
+        let baseline = baseline.hypotheses.first().expect("baseline hypothesis");
+        let shifted = shifted.hypotheses.first().expect("shifted hypothesis");
+
+        assert!((baseline.scale - shifted.scale).abs() < f64::EPSILON);
+        assert_eq!(baseline.offset_ms, shifted.offset_ms);
+        assert_eq!(baseline.inlier_count, shifted.inlier_count);
+        assert_eq!(baseline.training_anchors, shifted.training_anchors);
+        assert_eq!(baseline.held_out_anchors.len(), held_out_ordinals.len());
+        assert_eq!(shifted.held_out_anchors.len(), held_out_ordinals.len());
+        assert!(baseline
+            .held_out_anchors
+            .iter()
+            .all(|item| item.residual_ms == 0));
+        assert!(shifted
+            .held_out_anchors
+            .iter()
+            .all(|item| item.residual_ms >= 30_000));
+        assert_eq!(shifted.held_out_within_tolerance_count, 0);
     }
 
     #[test]
@@ -3890,6 +4141,9 @@ mod tests {
             p50_residual_ms: 5,
             p95_residual_ms: 10,
             max_residual_ms: 20,
+            training_anchors: Vec::new(),
+            held_out_anchors: Vec::new(),
+            held_out_within_tolerance_count: 0,
         };
         let windows = derive_affine_fine_decode_windows(
             &hypothesis,
@@ -3945,6 +4199,9 @@ mod tests {
             p50_residual_ms: 0,
             p95_residual_ms: 0,
             max_residual_ms: 0,
+            training_anchors: Vec::new(),
+            held_out_anchors: Vec::new(),
+            held_out_within_tolerance_count: 0,
         };
         let windows = derive_affine_fine_decode_windows(
             &hypothesis,
@@ -3995,6 +4252,9 @@ mod tests {
             p50_residual_ms: 10,
             p95_residual_ms: 30,
             max_residual_ms: 50,
+            training_anchors: Vec::new(),
+            held_out_anchors: Vec::new(),
+            held_out_within_tolerance_count: 0,
         };
         let windows = derive_affine_fine_decode_windows(
             &hypothesis,
@@ -4666,6 +4926,9 @@ mod tests {
             p50_residual_ms: 0,
             p95_residual_ms: 0,
             max_residual_ms: 0,
+            training_anchors: Vec::new(),
+            held_out_anchors: Vec::new(),
+            held_out_within_tolerance_count: 0,
         }
     }
 
@@ -4698,6 +4961,9 @@ mod tests {
             p50_residual_ms: 0,
             p95_residual_ms: 0,
             max_residual_ms: 0,
+            training_anchors: Vec::new(),
+            held_out_anchors: Vec::new(),
+            held_out_within_tolerance_count: 0,
         }
     }
 

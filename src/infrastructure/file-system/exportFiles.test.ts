@@ -245,6 +245,15 @@ describe("导出文件服务", () => {
     tamperedCore.mapProofs[0].coreCanonicalJson += " ";
     expect(() => create(tamperedCore)).toThrow("coreCanonicalJson 与 coreDigest 不一致");
 
+    const legacyCore = createVerification();
+    const legacyCoreFields = JSON.parse(legacyCore.mapProofs[0].coreCanonicalJson) as unknown[];
+    legacyCoreFields[0] = "media-time-map-core-v1";
+    legacyCore.mapProofs[0].coreCanonicalJson = JSON.stringify(legacyCoreFields);
+    legacyCore.mapProofs[0].coreDigest = `sha256:${sha256Hex(
+      legacyCore.mapProofs[0].coreCanonicalJson
+    )}`;
+    expect(() => create(legacyCore)).toThrow("media-time-map-core-v2");
+
     const duplicateAdjustment = createVerification();
     duplicateAdjustment.projectionDerivation.itemTimeAdjustments.push({
       itemId: "item-1",
@@ -573,7 +582,7 @@ function createTimeMapCoreCanonicalJson(
     identity.lastSampleDigest
   ];
   return JSON.stringify([
-    "media-time-map-core-v1",
+    "media-time-map-core-v2",
     mapId,
     1,
     "source-1",
@@ -586,9 +595,67 @@ function createTimeMapCoreCanonicalJson(
     1_000,
     0,
     1_000,
-    [["matched", 0, 1_000, 0, 1_000]],
-    [0.999, "measured", 1, 0, 0, 0, 0, 1, 1, 1, []],
-    [["audio", "manual"], 1, 0, 1, []],
+    [
+      [
+        `${mapId}:span:0001`,
+        "matched",
+        0,
+        1_000,
+        0,
+        1_000,
+        "测试时间图的完整逐段证据。",
+        [
+          "verified",
+          "measured",
+          0.999,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          "supported",
+          "supported",
+          ["used", "blocked", "blocked"],
+          ["测试逐段质量证据。"]
+        ],
+        [
+          [
+            "notApplicable",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "连续匹配段的起点无需删减边界细化。"
+          ],
+          [
+            "notApplicable",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "连续匹配段的终点无需删减边界细化。"
+          ]
+        ],
+        []
+      ]
+    ],
+    [0.999, "measured", 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, ["测试图级质量证据。"]],
+    [["audio", "manual"], 1, 0, 1, 1, 1, false, "测试轨道选择。", [], ["测试证据。"]],
     "engine-v1",
     "feature-v1",
     "parameters-v1"

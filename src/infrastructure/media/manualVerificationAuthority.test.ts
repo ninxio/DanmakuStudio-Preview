@@ -10,6 +10,7 @@ import {
 import type { MediaContentIdentity, MediaTimeMap } from "../../domain/project/types";
 import { createTimeMapSpanPlaybackReviewToken } from "../../domain/alignment/timeMapPlaybackReviewEvidence";
 import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../../test/manualVerification";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import {
   issuePersistedManualMediaTimeMapVerification,
   rehydratePersistedManualMediaTimeMapVerification,
@@ -190,25 +191,28 @@ function createVerificationEligibleMap(): MediaTimeMap {
     targetStartMs: 0,
     targetEndMs: 60_000,
     spans: [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 0,
         sourceEndMs: 60_000,
         targetStartMs: 0,
         targetEndMs: 60_000
-      }
+      })
     ],
     quality: {
       level: "review",
       probability: 0.999,
       metricSource: "measured",
       coverage: 1,
+      uniqueContentCoverage: 1,
       p50ResidualMs: 10,
       p95ResidualMs: 50,
+      p99ResidualMs: 70,
       maxResidualMs: 80,
       boundaryUncertaintyMs: 100,
       alternativeMargin: 0.5,
-      anchorCount: 20,
+      anchorCount: 30,
+      anchorRegionCount: 3,
       heldOutAnchorCount: 5,
       reasons: ["等待明确人工复核。"]
     },
@@ -217,6 +221,11 @@ function createVerificationEligibleMap(): MediaTimeMap {
       audioAnchorCount: 0,
       visualAnchorCount: 0,
       heldOutAnchorCount: 5,
+      top1Top2Margin: 0.5,
+      uniqueContentCoverage: 1,
+      repeatedContentOnly: false,
+      selectedTrackReason: "测试人工轨道。",
+      alternativeTrackScores: [],
       notes: ["A/B 人工复核产物已持久化。"]
     },
     verification: null,

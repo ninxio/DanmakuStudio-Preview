@@ -21,6 +21,11 @@ import type {
 } from "../project/types";
 import type { Milliseconds } from "../shared/time";
 import { cloneMediaContentIdentity } from "../project/mediaIdentity";
+import {
+  invalidateTimeMapSpanEvidenceForManualReview,
+  normalizeLegacyUnverifiedTimeMapSpanEvidence,
+  type TimeMapBoundaryEvidence
+} from "./timeMap";
 
 export interface CreateMediaMatchCandidateInput {
   id: string;
@@ -659,10 +664,77 @@ function translateTimeMapProposal(
       sourceStartMs: span.sourceStartMs + sourceDeltaMs,
       sourceEndMs: span.sourceEndMs + sourceDeltaMs,
       targetStartMs: span.targetStartMs + targetDeltaMs,
-      targetEndMs: span.targetEndMs + targetDeltaMs
+      targetEndMs: span.targetEndMs + targetDeltaMs,
+      boundaries: span.boundaries
+        ? {
+            start: translateTimeMapBoundary(
+              span.boundaries.start,
+              sourceDeltaMs,
+              targetDeltaMs
+            ),
+            end: translateTimeMapBoundary(span.boundaries.end, sourceDeltaMs, targetDeltaMs)
+          }
+        : undefined,
+      alternatives: span.alternatives?.map((alternative) => ({
+        ...alternative,
+        sourceStartMs: alternative.sourceStartMs + sourceDeltaMs,
+        sourceEndMs: alternative.sourceEndMs + sourceDeltaMs,
+        targetStartMs: alternative.targetStartMs + targetDeltaMs,
+        targetEndMs: alternative.targetEndMs + targetDeltaMs
+      }))
     })),
     parametersHash: `${timeMap.parametersHash}:translated:${sourceDeltaMs}:${targetDeltaMs}`
   };
+}
+
+function translateTimeMapBoundary(
+  boundary: TimeMapBoundaryEvidence,
+  sourceDeltaMs: Milliseconds,
+  targetDeltaMs: Milliseconds
+): TimeMapBoundaryEvidence {
+  const coordinateDeltaMs =
+    boundary.axis === "source"
+      ? sourceDeltaMs
+      : boundary.axis === "target"
+        ? targetDeltaMs
+        : boundary.axis === "both" && sourceDeltaMs === targetDeltaMs
+          ? sourceDeltaMs
+          : null;
+  const hasCoordinate =
+    boundary.coarseMs !== null ||
+    boundary.refinedMs !== null ||
+    boundary.uncertaintyStartMs !== null ||
+    boundary.uncertaintyEndMs !== null;
+  if (coordinateDeltaMs === null && hasCoordinate) {
+    return {
+      ...boundary,
+      status: "unsupported",
+      coarseMs: null,
+      refinedMs: null,
+      uncertaintyStartMs: null,
+      uncertaintyEndMs: null,
+      correlation: null,
+      alternativeMargin: null,
+      reason: `${boundary.reason} 独立平移两条时间轴后，both 轴单坐标证据已失效。`
+    };
+  }
+  if (coordinateDeltaMs === null) {
+    return boundary;
+  }
+  return {
+    ...boundary,
+    coarseMs: translateOptionalTime(boundary.coarseMs, coordinateDeltaMs),
+    refinedMs: translateOptionalTime(boundary.refinedMs, coordinateDeltaMs),
+    uncertaintyStartMs: translateOptionalTime(boundary.uncertaintyStartMs, coordinateDeltaMs),
+    uncertaintyEndMs: translateOptionalTime(boundary.uncertaintyEndMs, coordinateDeltaMs)
+  };
+}
+
+function translateOptionalTime(
+  value: Milliseconds | null,
+  deltaMs: Milliseconds
+): Milliseconds | null {
+  return value === null ? null : value + deltaMs;
 }
 
 function doesProposalTimeMapMatchRange(
@@ -699,13 +771,21 @@ function blockTimeMapAfterManualRangeChange(
     targetStartMs: range.targetStartMs,
     targetEndMs: range.targetEndMs,
     spans: [
-      {
-        kind: "ambiguous",
-        sourceStartMs: range.sourceStartMs,
-        sourceEndMs: range.sourceEndMs,
-        targetStartMs: range.targetStartMs,
-        targetEndMs: range.targetEndMs
-      }
+      invalidateTimeMapSpanEvidenceForManualReview(
+        normalizeLegacyUnverifiedTimeMapSpanEvidence({
+          kind: "ambiguous",
+          sourceStartMs: range.sourceStartMs,
+          sourceEndMs: range.sourceEndMs,
+          targetStartMs: range.targetStartMs,
+          targetEndMs: range.targetEndMs
+        }, {
+          id: `manual-range-blocked-${range.sourceStartMs}-${range.targetStartMs}`,
+          blocked: true,
+          reason
+        }),
+        true,
+        reason
+      )
     ],
     quality: {
       ...timeMap.quality,
@@ -991,6 +1071,13 @@ function createCandidateTimeMap(
         audioAnchorCount: reconciledProposal.evidence.audioAnchorCount,
         visualAnchorCount: reconciledProposal.evidence.visualAnchorCount,
         heldOutAnchorCount: reconciledProposal.evidence.heldOutAnchorCount,
+        top1Top2Margin: reconciledProposal.evidence.top1Top2Margin,
+        uniqueContentCoverage: reconciledProposal.evidence.uniqueContentCoverage ?? null,
+        repeatedContentOnly: reconciledProposal.evidence.repeatedContentOnly ?? false,
+        selectedTrackReason: reconciledProposal.evidence.selectedTrackReason ?? "",
+        alternativeTrackScores: structuredClone(
+          reconciledProposal.evidence.alternativeTrackScores ?? []
+        ),
         notes: [
           ...reconciledProposal.evidence.notes,
           ...(reconciledProposal.evidence.selectedTrackReason

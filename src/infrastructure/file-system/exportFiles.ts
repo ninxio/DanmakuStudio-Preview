@@ -608,12 +608,12 @@ function parseTimeMapCoreIdentity(coreCanonicalJson: string): {
   }
   if (
     !Array.isArray(parsed) ||
-    parsed[0] !== "media-time-map-core-v1" ||
+    parsed[0] !== "media-time-map-core-v2" ||
     typeof parsed[1] !== "string" ||
     !Number.isSafeInteger(parsed[2]) ||
     (parsed[2] as number) < 1
   ) {
-    throw new Error("时间图 coreCanonicalJson 不符合 media-time-map-core-v1 身份结构。");
+    throw new Error("时间图 coreCanonicalJson 不符合 media-time-map-core-v2 身份结构。");
   }
   return { mapId: parsed[1], revision: parsed[2] as number };
 }

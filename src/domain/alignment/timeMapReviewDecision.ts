@@ -1,6 +1,9 @@
 import type { EditorProject, MediaTimeMap } from "../project/types";
 import {
   assessTimeMapQuality,
+  invalidateTimeMapSpanEvidenceForManualReview,
+  isCompleteTimeMapSpanEvidence,
+  normalizeLegacyUnverifiedTimeMapSpanEvidence,
   validateTimeMap,
   type TimeMapQualityInput,
   type TimeMapSpan,
@@ -86,7 +89,7 @@ export function describeTimeMapSpanReviewAvailability(
 }
 
 /**
- * 在候选时间图内持久记录人工分类。记录复用 v11 evidence.notes，避免新增一个与
+ * 在候选时间图内持久记录人工分类。记录复用 evidence.notes，避免新增一个与
  * schema 并行的临时状态；项目保存和重开后仍可恢复。任何人工改动都会清除旧验证、
  * 增加 revision 且不提升质量等级。
  */
@@ -110,9 +113,22 @@ export function applyTimeMapSpanReviewDecision(
   if (!availability.allowed) {
     throw new TimeMapSpanReviewError(`${availability.reason} 当前分类未写入。`);
   }
-  const spans = timeMap.spans.map((current, index) =>
-    index === spanIndex ? { ...current, kind: availability.desiredKind } : { ...current }
-  );
+  const spans = timeMap.spans.map((current, index) => {
+    const complete = isCompleteTimeMapSpanEvidence(current)
+      ? { ...current }
+      : normalizeLegacyUnverifiedTimeMapSpanEvidence(current, {
+          id: current.id ?? `${timeMap.id}:span:${String(index + 1).padStart(4, "0")}`,
+          blocked: timeMap.quality.level === "blocked"
+        });
+    if (index !== spanIndex) {
+      return complete;
+    }
+    return invalidateTimeMapSpanEvidenceForManualReview(
+      { ...complete, kind: availability.desiredKind },
+      decision === "unresolved",
+      `第 ${spanIndex + 1} 段由人工分类为“${TIME_MAP_SPAN_REVIEW_LABELS[decision]}”，原算法为旧分类生成的逐段证据已失效。`
+    );
+  });
   const validation = validateTimeMap(spans);
   if (!validation.valid) {
     throw new TimeMapSpanReviewError(
@@ -134,6 +150,9 @@ export function applyTimeMapSpanReviewDecision(
       current.kind === "ambiguous" &&
       readReviewDecisionFromNotes(evidence.notes, index)?.decision !== "replacement"
   );
+  const hasBlockedSpanEvidence = spans.some(
+    (current) => current.quality.level === "blocked"
+  );
   const assessment = assessTimeMapQuality(
     toReviewQualityInput(timeMap, evidence.types, evidence.heldOutAnchorCount)
   );
@@ -143,6 +162,7 @@ export function applyTimeMapSpanReviewDecision(
       : [];
   const remainsBlocked =
     hasUnresolvedAmbiguousSpan ||
+    hasBlockedSpanEvidence ||
     assessment.level === "blocked" ||
     persistentBlockers.length > 0;
   const reasons = uniqueStrings([
@@ -151,6 +171,9 @@ export function applyTimeMapSpanReviewDecision(
     ...assessment.reasons,
     ...(hasUnresolvedAmbiguousSpan
       ? ["仍有尚未分类或被标记为“无法判断”的 ambiguous 分段，继续阻断候选确认。"]
+      : []),
+    ...(hasBlockedSpanEvidence
+      ? ["仍有逐段质量为 blocked 的分段，必须分别处理后才能解除阻断。"]
       : [])
   ]);
   return {
@@ -245,12 +268,15 @@ function toReviewQualityInput(
     probability: timeMap.quality.probability,
     metricSource: timeMap.quality.metricSource,
     coverage: timeMap.quality.coverage,
+    uniqueContentCoverage: timeMap.quality.uniqueContentCoverage,
     p50ResidualMs: timeMap.quality.p50ResidualMs,
     p95ResidualMs: timeMap.quality.p95ResidualMs,
+    p99ResidualMs: timeMap.quality.p99ResidualMs,
     maxResidualMs: timeMap.quality.maxResidualMs,
     boundaryUncertaintyMs: timeMap.quality.boundaryUncertaintyMs,
     alternativeMargin: timeMap.quality.alternativeMargin,
     anchorCount: timeMap.quality.anchorCount,
+    anchorRegionCount: timeMap.quality.anchorRegionCount,
     heldOutAnchorCount: timeMap.quality.heldOutAnchorCount,
     evidenceTypes,
     audioAnchorCount: timeMap.evidence.audioAnchorCount,
@@ -273,6 +299,7 @@ function isReviewResolvableOrDerivedReason(reason: string): boolean {
     reason.includes("金标准校准概率低于") ||
     reason.includes("完整实测指标和独立证据") ||
     reason.includes("保留外部的保守质量声明") ||
+    reason.includes("逐段质量为 blocked") ||
     reason.includes("Pairwise 时间图已被质量闸门阻断，未进入全局组合")
   );
 }

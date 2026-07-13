@@ -9,6 +9,8 @@ import {
   type TimeMapSpanPlaybackEvidence
 } from "../domain/alignment/timeMapPlaybackReviewEvidence";
 import type { MediaTimeMap } from "../domain/project/types";
+import { isCompleteTimeMapSpanEvidence } from "../domain/alignment/timeMap";
+import { createTestCompleteTimeMapSpan } from "./timeMapEvidence";
 
 interface TestManualVerificationInput {
   calibrationArtifactId: string;
@@ -22,10 +24,25 @@ export function applyTestManualMediaTimeMapVerification(
   map: MediaTimeMap,
   input: TestManualVerificationInput
 ): MediaTimeMap {
-  if (map.spans.some((span) => span.kind === "ambiguous")) {
+  const hydratedMap: MediaTimeMap = {
+    ...map,
+    spans: map.spans.map((span, spanIndex) =>
+      isCompleteTimeMapSpanEvidence(span)
+        ? structuredClone(span)
+        : createTestCompleteTimeMapSpan(
+            span,
+            span.id ?? `${map.id}:span:${String(spanIndex + 1).padStart(4, "0")}`
+          )
+    )
+  };
+  if (hydratedMap.spans.some((span) => span.kind === "ambiguous")) {
     // Some projection tests intentionally construct an impossible self-reported verified map to
     // assert that the export path still blocks it. Production issuance rejects this shape.
-    return { ...map, quality: { ...map.quality, level: "verified" }, verification: null };
+    return {
+      ...hydratedMap,
+      quality: { ...hydratedMap.quality, level: "verified" },
+      verification: null
+    };
   }
   const reviewNotes = map.spans.flatMap((span, spanIndex) => {
     if (span.kind === "sourceOnly") {
@@ -37,12 +54,37 @@ export function applyTestManualMediaTimeMapVerification(
     return [];
   });
   const reviewedMap: MediaTimeMap = {
-    ...map,
+    ...hydratedMap,
+    quality: {
+      ...map.quality,
+      uniqueContentCoverage:
+        map.quality.uniqueContentCoverage ??
+        map.evidence.uniqueContentCoverage ??
+        map.quality.coverage,
+      p99ResidualMs: map.quality.p99ResidualMs ?? map.quality.maxResidualMs,
+      anchorCount: Math.max(30, map.quality.anchorCount),
+      anchorRegionCount: map.quality.anchorRegionCount ?? 3
+    },
     evidence: {
       ...map.evidence,
       types: map.evidence.types.includes("manual")
         ? [...map.evidence.types]
         : [...map.evidence.types, "manual"],
+      top1Top2Margin: map.evidence.top1Top2Margin ?? map.quality.alternativeMargin,
+      uniqueContentCoverage:
+        map.quality.uniqueContentCoverage ??
+        map.evidence.uniqueContentCoverage ??
+        map.quality.coverage,
+      repeatedContentOnly: map.evidence.repeatedContentOnly ?? false,
+      selectedTrackReason: map.evidence.selectedTrackReason ?? "测试人工验证轨道。",
+      alternativeTrackScores: (map.evidence.alternativeTrackScores ?? []).map(
+        (alternative) => ({
+          ...alternative,
+          scale: alternative.scale ?? 1,
+          offsetMs: alternative.offsetMs ?? 0,
+          inlierCount: alternative.inlierCount ?? 0
+        })
+      ),
       notes: [...map.evidence.notes, ...reviewNotes]
     }
   };

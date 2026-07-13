@@ -5,10 +5,10 @@ use crate::{
         extract_landmarks_and_fine_features_with_backend_request,
         match_landmarks_affine_with_cancel, refine_boundary_by_correlation_with_cancel,
         refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_request,
-        AffineFineDecodeWindows, AffineFineWindowRequest, AffineHypothesis, AffineMatchConfig,
-        BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig, EditAlignmentMode,
-        EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
-        MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
+        AffineAnchorEvidence, AffineFineDecodeWindows, AffineFineWindowRequest, AffineHypothesis,
+        AffineMatchConfig, BoundaryContextSide, BoundaryRefinementConfig, EditAlignmentConfig,
+        EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame,
+        LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
         SpectralBackendRequest, SpectralLandmark, StreamingLandmarkExtractor,
         STREAMING_CPU_SPECTRAL_BACKEND_ID,
     },
@@ -98,9 +98,9 @@ const OFFSET_PATH_SUPPORT_LOOKAHEAD_MULTIPLIER: usize = 3;
 const OFFSET_PATH_STABLE_SUPPORT_RATIO: f64 = 0.7;
 const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
-const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.1-rust";
+const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.2-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-v9";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-v10";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -310,14 +310,117 @@ pub enum AudioTimeMapSpanKind {
     Ambiguous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioTimeMapSpanSupportStatus {
+    Supported,
+    Unsupported,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioTimeMapSignalStatus {
+    Used,
+    Blocked,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioTimeMapBoundaryStatus {
+    Refined,
+    Ambiguous,
+    Unsupported,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioTimeMapBoundaryAxis {
+    Source,
+    Target,
+    Both,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AudioTimeMapSpanDto {
+pub struct AudioTimeMapSpanSignalsDto {
+    audio: AudioTimeMapSignalStatus,
+    visual: AudioTimeMapSignalStatus,
+    danmaku: AudioTimeMapSignalStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTimeMapSpanQualityDto {
+    level: &'static str,
+    metric_source: &'static str,
+    probability: Option<f64>,
+    coverage: Option<f64>,
+    unique_content_coverage: Option<f64>,
+    alternative_margin: Option<f64>,
+    anchor_count: usize,
+    held_out_anchor_count: usize,
+    p50_residual_ms: Option<u64>,
+    p95_residual_ms: Option<u64>,
+    p99_residual_ms: Option<u64>,
+    max_residual_ms: Option<u64>,
+    boundary_uncertainty_ms: Option<u64>,
+    left_support: AudioTimeMapSpanSupportStatus,
+    right_support: AudioTimeMapSpanSupportStatus,
+    signals: AudioTimeMapSpanSignalsDto,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTimeMapBoundaryEvidenceDto {
+    status: AudioTimeMapBoundaryStatus,
+    axis: AudioTimeMapBoundaryAxis,
+    context_side: Option<&'static str>,
+    coarse_ms: Option<u64>,
+    refined_ms: Option<u64>,
+    uncertainty_start_ms: Option<u64>,
+    uncertainty_end_ms: Option<u64>,
+    support_duration_ms: u64,
+    correlation: Option<f64>,
+    alternative_margin: Option<f64>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTimeMapSpanBoundariesDto {
+    start: AudioTimeMapBoundaryEvidenceDto,
+    end: AudioTimeMapBoundaryEvidenceDto,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTimeMapSpanAlternativeDto {
     kind: AudioTimeMapSpanKind,
     source_start_ms: u64,
     source_end_ms: u64,
     target_start_ms: u64,
     target_end_ms: u64,
+    score: Option<f64>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTimeMapSpanDto {
+    id: String,
+    kind: AudioTimeMapSpanKind,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+    reason: String,
+    quality: AudioTimeMapSpanQualityDto,
+    boundaries: AudioTimeMapSpanBoundariesDto,
+    alternatives: Vec<AudioTimeMapSpanAlternativeDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,12 +447,15 @@ pub struct AudioTimeMapQualityDto {
     metric_source: &'static str,
     probability: Option<f64>,
     coverage: Option<f64>,
+    unique_content_coverage: Option<f64>,
     p50_residual_ms: Option<u64>,
     p95_residual_ms: Option<u64>,
+    p99_residual_ms: Option<u64>,
     max_residual_ms: Option<u64>,
     boundary_uncertainty_ms: Option<u64>,
     alternative_margin: Option<f64>,
     anchor_count: usize,
+    anchor_region_count: usize,
     held_out_anchor_count: usize,
     reasons: Vec<String>,
 }
@@ -7889,6 +7995,128 @@ fn v2_alternative_hypothesis_score(
     }
 }
 
+fn create_v2_span(
+    kind: AudioTimeMapSpanKind,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+) -> AudioTimeMapSpanDto {
+    let reason = match kind {
+        AudioTimeMapSpanKind::Matched => {
+            "edit-aware DP 将该范围识别为双轴共同内容；仍需逐段锚点证据复核。"
+        }
+        AudioTimeMapSpanKind::SourceOnly => {
+            "edit-aware DP 将该范围识别为仅参考视频存在；两侧边界必须分别验证。"
+        }
+        AudioTimeMapSpanKind::TargetOnly => {
+            "edit-aware DP 将该范围识别为仅目标原片存在；两侧边界必须分别验证。"
+        }
+        AudioTimeMapSpanKind::Ambiguous => {
+            "现有证据不能唯一决定该范围的时间映射，禁止把它当作已确认共同内容。"
+        }
+    }
+    .to_string();
+    let boundaries = create_initial_v2_span_boundaries(
+        kind,
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        target_end_ms,
+    );
+    AudioTimeMapSpanDto {
+        id: String::new(),
+        kind,
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        target_end_ms,
+        reason: reason.clone(),
+        quality: AudioTimeMapSpanQualityDto {
+            level: "blocked",
+            metric_source: "measured",
+            probability: None,
+            coverage: None,
+            unique_content_coverage: None,
+            alternative_margin: None,
+            anchor_count: 0,
+            held_out_anchor_count: 0,
+            p50_residual_ms: None,
+            p95_residual_ms: None,
+            p99_residual_ms: None,
+            max_residual_ms: None,
+            boundary_uncertainty_ms: None,
+            left_support: AudioTimeMapSpanSupportStatus::Unsupported,
+            right_support: AudioTimeMapSpanSupportStatus::Unsupported,
+            signals: AudioTimeMapSpanSignalsDto {
+                audio: AudioTimeMapSignalStatus::Blocked,
+                visual: AudioTimeMapSignalStatus::Blocked,
+                danmaku: AudioTimeMapSignalStatus::Blocked,
+            },
+            reasons: vec![reason],
+        },
+        boundaries,
+        alternatives: Vec::new(),
+    }
+}
+
+fn create_initial_v2_span_boundaries(
+    kind: AudioTimeMapSpanKind,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+) -> AudioTimeMapSpanBoundariesDto {
+    let (status, axis, start_ms, end_ms, reason) = match kind {
+        AudioTimeMapSpanKind::SourceOnly => (
+            AudioTimeMapBoundaryStatus::Unsupported,
+            AudioTimeMapBoundaryAxis::Source,
+            Some(source_start_ms),
+            Some(source_end_ms),
+            "尚未获得单侧共同音频支持，粗 DP 边界不能视为精确时间。",
+        ),
+        AudioTimeMapSpanKind::TargetOnly => (
+            AudioTimeMapBoundaryStatus::Unsupported,
+            AudioTimeMapBoundaryAxis::Target,
+            Some(target_start_ms),
+            Some(target_end_ms),
+            "尚未获得单侧共同音频支持，粗 DP 边界不能视为精确时间。",
+        ),
+        AudioTimeMapSpanKind::Ambiguous => (
+            AudioTimeMapBoundaryStatus::Ambiguous,
+            AudioTimeMapBoundaryAxis::Both,
+            None,
+            None,
+            "该 span 本身存在歧义，不能声明精确边界。",
+        ),
+        AudioTimeMapSpanKind::Matched => (
+            AudioTimeMapBoundaryStatus::NotApplicable,
+            AudioTimeMapBoundaryAxis::Both,
+            None,
+            None,
+            "共同内容 span 不把 DP 分块接缝声明为版本差异边界。",
+        ),
+    };
+    let create = |context_side, coarse_ms| AudioTimeMapBoundaryEvidenceDto {
+        status,
+        axis,
+        context_side,
+        coarse_ms,
+        refined_ms: None,
+        uncertainty_start_ms: None,
+        uncertainty_end_ms: None,
+        support_duration_ms: 0,
+        correlation: None,
+        alternative_margin: None,
+        reason: reason.to_string(),
+    };
+    let is_edit = is_v2_edit_span(kind);
+    AudioTimeMapSpanBoundariesDto {
+        start: create(is_edit.then_some("before"), start_ms),
+        end: create(is_edit.then_some("after"), end_ms),
+    }
+}
+
 fn align_v2_feature_chunks(
     source_frames: &[FineFeatureFrame],
     target_frames: &[FineFeatureFrame],
@@ -7982,13 +8210,13 @@ fn align_v2_feature_chunks(
                 .unwrap_or_else(|| target_start_ms.max(0) as u64);
             append_or_merge_v2_span(
                 &mut spans,
-                AudioTimeMapSpanDto {
-                    kind: AudioTimeMapSpanKind::TargetOnly,
-                    source_start_ms: source_cursor,
-                    source_end_ms: source_cursor,
-                    target_start_ms: target_span_start,
-                    target_end_ms: target_end_ms.max(0) as u64,
-                },
+                create_v2_span(
+                    AudioTimeMapSpanKind::TargetOnly,
+                    source_cursor,
+                    source_cursor,
+                    target_span_start,
+                    target_end_ms.max(0) as u64,
+                ),
             );
             target_start_index = target_end_index;
             continue;
@@ -8038,6 +8266,15 @@ fn align_v2_feature_chunks(
     }
     if spans.is_empty() {
         return Err("V2 分块 DP 没有输出 span。".to_string());
+    }
+    for span in &mut spans {
+        span.boundaries = create_initial_v2_span_boundaries(
+            span.kind,
+            span.source_start_ms,
+            span.source_end_ms,
+            span.target_start_ms,
+            span.target_end_ms,
+        );
     }
     validate_v2_time_map_spans(&spans)?;
     Ok(V2ChunkAlignment {
@@ -8135,6 +8372,9 @@ fn inverse_affine_hypothesis(coarse: &AffineHypothesis) -> Result<AffineHypothes
         p50_residual_ms: coarse.p50_residual_ms,
         p95_residual_ms: coarse.p95_residual_ms,
         max_residual_ms: coarse.max_residual_ms,
+        training_anchors: Vec::new(),
+        held_out_anchors: Vec::new(),
+        held_out_within_tolerance_count: 0,
     })
 }
 
@@ -8145,13 +8385,13 @@ fn swap_v2_edit_span_axes(span: &EditTimeSpan) -> Result<AudioTimeMapSpanDto, St
         EditPathKind::TargetOnly => AudioTimeMapSpanKind::SourceOnly,
         EditPathKind::Ambiguous => AudioTimeMapSpanKind::Ambiguous,
     };
-    Ok(AudioTimeMapSpanDto {
+    Ok(create_v2_span(
         kind,
-        source_start_ms: checked_v2_milliseconds(span.target_start_ms)?,
-        source_end_ms: checked_v2_milliseconds(span.target_end_ms)?,
-        target_start_ms: checked_v2_milliseconds(span.source_start_ms)?,
-        target_end_ms: checked_v2_milliseconds(span.source_end_ms)?,
-    })
+        checked_v2_milliseconds(span.target_start_ms)?,
+        checked_v2_milliseconds(span.target_end_ms)?,
+        checked_v2_milliseconds(span.source_start_ms)?,
+        checked_v2_milliseconds(span.source_end_ms)?,
+    ))
 }
 
 fn checked_v2_milliseconds(value: i64) -> Result<u64, String> {
@@ -8181,13 +8421,13 @@ fn append_v2_chunk_spans(
             ));
         }
         if next.source_start_ms > previous.source_end_ms {
-            output.push(AudioTimeMapSpanDto {
-                kind: AudioTimeMapSpanKind::SourceOnly,
-                source_start_ms: previous.source_end_ms,
-                source_end_ms: next.source_start_ms,
-                target_start_ms: previous.target_end_ms,
-                target_end_ms: previous.target_end_ms,
-            });
+            output.push(create_v2_span(
+                AudioTimeMapSpanKind::SourceOnly,
+                previous.source_end_ms,
+                next.source_start_ms,
+                previous.target_end_ms,
+                previous.target_end_ms,
+            ));
         }
     }
     for span in chunk.drain(..) {
@@ -8348,6 +8588,17 @@ fn refine_v2_span_boundaries(
             Ok(result) => result,
             Err(error) => {
                 if let Some((edit_index, _, edit_kind, context_side)) = edit_context {
+                    let side_index = usize::from(context_side == BoundaryContextSide::After);
+                    let support_duration_ms =
+                        v2_adjacent_common_support_ms(spans, edit_index, side_index);
+                    let boundary = v2_span_boundary_mut(&mut spans[edit_index], side_index);
+                    boundary.status = AudioTimeMapBoundaryStatus::Unsupported;
+                    boundary.context_side = Some(v2_context_side_value(context_side));
+                    boundary.support_duration_ms = support_duration_ms;
+                    boundary.reason = format!(
+                        "单侧共同音频相关无法形成有效窗口：{}",
+                        redact_sensitive_media_text(&error)
+                    );
                     summary.evidence_notes.push(format!(
                         "{} span #{} 的{}边界精修失败：{}",
                         format_v2_span_kind(edit_kind),
@@ -8369,6 +8620,18 @@ fn refine_v2_span_boundaries(
         );
         if result.ambiguous {
             if let Some((edit_index, _, edit_kind, context_side)) = edit_context {
+                let side_index = usize::from(context_side == BoundaryContextSide::After);
+                let support_duration_ms =
+                    v2_adjacent_common_support_ms(spans, edit_index, side_index);
+                let boundary = v2_span_boundary_mut(&mut spans[edit_index], side_index);
+                populate_v2_boundary_measurement(
+                    boundary,
+                    AudioTimeMapBoundaryStatus::Ambiguous,
+                    context_side,
+                    &result,
+                    support_duration_ms,
+                    "局部相关峰不唯一、相关不足或不确定区间过宽，粗边界仍未确认。",
+                );
                 summary.evidence_notes.push(format!(
                     "{} span #{} 的{}边界存在多个相关峰：corr {:.3}，margin {:.3}，候选范围 [{}，{}] ms。",
                     format_v2_span_kind(edit_kind),
@@ -8413,6 +8676,17 @@ fn refine_v2_span_boundaries(
             summary.refined_count += 1;
             if let Some((edit_index, edit_side, edit_kind, context_side)) = edit_context {
                 edit_side_refined[edit_index][edit_side] = true;
+                let support_duration_ms =
+                    v2_adjacent_common_support_ms(spans, edit_index, edit_side);
+                let boundary = v2_span_boundary_mut(&mut spans[edit_index], edit_side);
+                populate_v2_boundary_measurement(
+                    boundary,
+                    AudioTimeMapBoundaryStatus::Refined,
+                    context_side,
+                    &result,
+                    support_duration_ms,
+                    "局部单侧共同音频相关峰唯一且稳定，已更新该版本差异边界。",
+                );
                 summary.evidence_notes.push(format!(
                     "{} span #{} 的{}边界已用{}单侧共同音频精修：{} -> {} ms，不确定范围 [{}，{}] ms（corr {:.3}，margin {:.3}）。",
                     format_v2_span_kind(edit_kind),
@@ -8477,6 +8751,68 @@ fn is_v2_edit_span(kind: AudioTimeMapSpanKind) -> bool {
     )
 }
 
+fn v2_span_boundary_mut(
+    span: &mut AudioTimeMapSpanDto,
+    side_index: usize,
+) -> &mut AudioTimeMapBoundaryEvidenceDto {
+    if side_index == 0 {
+        &mut span.boundaries.start
+    } else {
+        &mut span.boundaries.end
+    }
+}
+
+fn populate_v2_boundary_measurement(
+    boundary: &mut AudioTimeMapBoundaryEvidenceDto,
+    status: AudioTimeMapBoundaryStatus,
+    context_side: BoundaryContextSide,
+    result: &crate::alignment_v2::BoundaryRefinementResult,
+    support_duration_ms: u64,
+    reason: &str,
+) {
+    boundary.status = status;
+    boundary.context_side = Some(v2_context_side_value(context_side));
+    boundary.coarse_ms = u64::try_from(result.coarse_target_boundary_ms).ok();
+    boundary.refined_ms = u64::try_from(result.refined_target_boundary_ms).ok();
+    boundary.uncertainty_start_ms = u64::try_from(result.uncertainty_start_ms).ok();
+    boundary.uncertainty_end_ms = u64::try_from(result.uncertainty_end_ms).ok();
+    boundary.support_duration_ms = support_duration_ms;
+    boundary.correlation = Some(result.best_correlation);
+    boundary.alternative_margin = Some(result.alternative_margin);
+    boundary.reason = reason.to_string();
+}
+
+fn v2_adjacent_common_support_ms(
+    spans: &[AudioTimeMapSpanDto],
+    edit_index: usize,
+    side_index: usize,
+) -> u64 {
+    let adjacent = if side_index == 0 {
+        edit_index.checked_sub(1).and_then(|index| spans.get(index))
+    } else {
+        spans.get(edit_index.saturating_add(1))
+    };
+    let Some(adjacent) = adjacent.filter(|span| span.kind == AudioTimeMapSpanKind::Matched) else {
+        return 0;
+    };
+    adjacent
+        .source_end_ms
+        .saturating_sub(adjacent.source_start_ms)
+        .min(
+            adjacent
+                .target_end_ms
+                .saturating_sub(adjacent.target_start_ms),
+        )
+        .min(10_000)
+}
+
+fn v2_context_side_value(side: BoundaryContextSide) -> &'static str {
+    match side {
+        BoundaryContextSide::Before => "before",
+        BoundaryContextSide::After => "after",
+    }
+}
+
 fn v2_boundary_refinement_config(
     fixed_presentation_offset_ms: i64,
     searched_presentation_offset_ms: i64,
@@ -8510,9 +8846,272 @@ fn format_v2_context_side(side: BoundaryContextSide) -> &'static str {
     }
 }
 
+fn finalize_v2_span_evidence(
+    spans: &mut [AudioTimeMapSpanDto],
+    hypothesis: &AffineHypothesis,
+    alternative_margin: f64,
+) {
+    for (index, span) in spans.iter_mut().enumerate() {
+        span.id = format!(
+            "span-{}-{}-{}-{}-{}-{}",
+            index + 1,
+            format_v2_span_kind(span.kind),
+            span.source_start_ms,
+            span.source_end_ms,
+            span.target_start_ms,
+            span.target_end_ms
+        );
+        let training = v2_anchors_in_span(&hypothesis.training_anchors, span);
+        let held_out = v2_anchors_in_span(&hypothesis.held_out_anchors, span);
+        let residuals = if held_out.is_empty() {
+            training
+                .iter()
+                .map(|item| item.residual_ms.max(0) as u64)
+                .collect::<Vec<_>>()
+        } else {
+            held_out
+                .iter()
+                .map(|item| item.residual_ms.max(0) as u64)
+                .collect::<Vec<_>>()
+        };
+        let (p50_residual_ms, p95_residual_ms, p99_residual_ms, max_residual_ms) =
+            v2_residual_statistics(&residuals);
+        let validation_coverage = if held_out.is_empty() {
+            None
+        } else {
+            Some(
+                held_out
+                    .iter()
+                    .filter(|item| {
+                        item.residual_ms <= v2_affine_match_config().residual_tolerance_ms
+                    })
+                    .count() as f64
+                    / held_out.len() as f64,
+            )
+        };
+        let temporal_coverage = v2_anchor_temporal_coverage(&training, span);
+        let left_support = v2_span_side_support(span, &training, true);
+        let right_support = v2_span_side_support(span, &training, false);
+        let boundary_uncertainty_ms = [&span.boundaries.start, &span.boundaries.end]
+            .into_iter()
+            .filter_map(|boundary| {
+                Some(
+                    boundary
+                        .uncertainty_end_ms?
+                        .saturating_sub(boundary.uncertainty_start_ms?),
+                )
+            })
+            .max();
+        let boundary_conflict = [span.boundaries.start.status, span.boundaries.end.status]
+            .into_iter()
+            .any(|status| status == AudioTimeMapBoundaryStatus::Ambiguous);
+        let boundary_blocked = is_v2_edit_span(span.kind)
+            && [&span.boundaries.start, &span.boundaries.end]
+                .into_iter()
+                .any(|boundary| {
+                    boundary.status != AudioTimeMapBoundaryStatus::Refined
+                        || boundary.support_duration_ms == 0
+                });
+        let no_independent_validation =
+            span.kind == AudioTimeMapSpanKind::Matched && held_out.is_empty();
+        let no_training_support = span.kind == AudioTimeMapSpanKind::Matched && training.is_empty();
+        let blocked = span.kind == AudioTimeMapSpanKind::Ambiguous
+            || boundary_conflict
+            || boundary_blocked
+            || no_training_support
+            || no_independent_validation;
+        let mut reasons = vec![span.reason.clone()];
+        if no_independent_validation {
+            reasons
+                .push("该 span 没有不参与 seed、模型选择和重拟合的独立留出 anchor。".to_string());
+        } else if let Some(coverage) = validation_coverage {
+            reasons.push(format!(
+                "该 span 的独立留出 anchor 阈值内覆盖率为 {:.1}%（{} 个）。",
+                coverage * 100.0,
+                held_out.len()
+            ));
+        }
+        if no_training_support {
+            reasons.push("该 matched span 范围内没有真实训练 anchor 支持。".to_string());
+        }
+        if boundary_blocked {
+            reasons.push("版本差异 span 至少一侧缺少可靠的单侧共同音频边界证据。".to_string());
+        }
+        if boundary_conflict {
+            reasons.push("局部边界存在竞争相关峰，不能唯一定位。".to_string());
+        }
+        span.quality = AudioTimeMapSpanQualityDto {
+            level: if blocked { "blocked" } else { "review" },
+            metric_source: "measured",
+            probability: None,
+            coverage: validation_coverage.or(temporal_coverage),
+            unique_content_coverage: temporal_coverage,
+            alternative_margin: Some(alternative_margin),
+            anchor_count: training.len().saturating_add(held_out.len()),
+            held_out_anchor_count: held_out.len(),
+            p50_residual_ms,
+            p95_residual_ms,
+            p99_residual_ms,
+            max_residual_ms,
+            boundary_uncertainty_ms,
+            left_support,
+            right_support,
+            signals: AudioTimeMapSpanSignalsDto {
+                audio: if boundary_conflict || span.kind == AudioTimeMapSpanKind::Ambiguous {
+                    AudioTimeMapSignalStatus::Conflict
+                } else if blocked {
+                    AudioTimeMapSignalStatus::Blocked
+                } else {
+                    AudioTimeMapSignalStatus::Used
+                },
+                visual: AudioTimeMapSignalStatus::Blocked,
+                danmaku: AudioTimeMapSignalStatus::Blocked,
+            },
+            reasons,
+        };
+    }
+}
+
+fn v2_anchors_in_span<'a>(
+    anchors: &'a [AffineAnchorEvidence],
+    span: &AudioTimeMapSpanDto,
+) -> Vec<&'a AffineAnchorEvidence> {
+    if span.kind != AudioTimeMapSpanKind::Matched {
+        return Vec::new();
+    }
+    anchors
+        .iter()
+        .filter(|anchor| {
+            let Ok(source_ms) = u64::try_from(anchor.source_time_ms) else {
+                return false;
+            };
+            source_ms >= span.source_start_ms && source_ms < span.source_end_ms
+        })
+        .collect()
+}
+
+fn v2_anchor_temporal_coverage(
+    anchors: &[&AffineAnchorEvidence],
+    span: &AudioTimeMapSpanDto,
+) -> Option<f64> {
+    let duration = span.source_end_ms.saturating_sub(span.source_start_ms);
+    if anchors.is_empty() || duration == 0 {
+        return None;
+    }
+    let minimum = anchors.iter().map(|item| item.source_time_ms).min()?;
+    let maximum = anchors.iter().map(|item| item.source_time_ms).max()?;
+    Some(((maximum - minimum).max(0) as f64 / duration as f64).clamp(0.0, 1.0))
+}
+
+fn v2_span_side_support(
+    span: &AudioTimeMapSpanDto,
+    training: &[&AffineAnchorEvidence],
+    left: bool,
+) -> AudioTimeMapSpanSupportStatus {
+    if is_v2_edit_span(span.kind) {
+        let boundary = if left {
+            &span.boundaries.start
+        } else {
+            &span.boundaries.end
+        };
+        return match boundary.status {
+            AudioTimeMapBoundaryStatus::Refined if boundary.support_duration_ms > 0 => {
+                AudioTimeMapSpanSupportStatus::Supported
+            }
+            AudioTimeMapBoundaryStatus::Refined => AudioTimeMapSpanSupportStatus::Unsupported,
+            AudioTimeMapBoundaryStatus::NotApplicable => {
+                AudioTimeMapSpanSupportStatus::NotApplicable
+            }
+            AudioTimeMapBoundaryStatus::Ambiguous | AudioTimeMapBoundaryStatus::Unsupported => {
+                AudioTimeMapSpanSupportStatus::Unsupported
+            }
+        };
+    }
+    if span.kind == AudioTimeMapSpanKind::Ambiguous {
+        return AudioTimeMapSpanSupportStatus::Unsupported;
+    }
+    let midpoint = span.source_start_ms.saturating_add(
+        span.source_end_ms
+            .saturating_sub(span.source_start_ms)
+            .div_ceil(2),
+    );
+    let supported = training.iter().any(|anchor| {
+        u64::try_from(anchor.source_time_ms)
+            .ok()
+            .is_some_and(|source_ms| {
+                if left {
+                    source_ms <= midpoint
+                } else {
+                    source_ms >= midpoint
+                }
+            })
+    });
+    if supported {
+        AudioTimeMapSpanSupportStatus::Supported
+    } else {
+        AudioTimeMapSpanSupportStatus::Unsupported
+    }
+}
+
+fn v2_residual_statistics(
+    residuals: &[u64],
+) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    if residuals.is_empty() {
+        return (None, None, None, None);
+    }
+    let mut sorted = residuals.to_vec();
+    sorted.sort_unstable();
+    let at = |quantile: f64| {
+        let index = ((sorted.len().saturating_sub(1)) as f64 * quantile).ceil() as usize;
+        sorted[index.min(sorted.len() - 1)]
+    };
+    (
+        Some(at(0.50)),
+        Some(at(0.95)),
+        Some(at(0.99)),
+        sorted.last().copied(),
+    )
+}
+
+fn v2_anchor_region_count(
+    hypothesis: &AffineHypothesis,
+    source_start_ms: u64,
+    source_end_ms: u64,
+) -> usize {
+    let source_times = hypothesis
+        .training_anchors
+        .iter()
+        .chain(&hypothesis.held_out_anchors)
+        .filter_map(|item| u64::try_from(item.source_time_ms).ok())
+        .collect::<Vec<_>>();
+    v2_source_time_region_count(&source_times, source_start_ms, source_end_ms)
+}
+
+fn v2_source_time_region_count(
+    source_times: &[u64],
+    source_start_ms: u64,
+    source_end_ms: u64,
+) -> usize {
+    let duration = source_end_ms.saturating_sub(source_start_ms);
+    if duration == 0 {
+        return 0;
+    }
+    let mut occupied = [false; 3];
+    for source_ms in source_times
+        .iter()
+        .copied()
+        .filter(|value| *value >= source_start_ms && *value <= source_end_ms)
+    {
+        let relative = source_ms.saturating_sub(source_start_ms);
+        let region = ((relative as u128 * 3) / duration as u128).min(2) as usize;
+        occupied[region] = true;
+    }
+    occupied.into_iter().filter(|value| *value).count()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_v2_alignment_proposal(
-    alignment: V2ChunkAlignment,
+    mut alignment: V2ChunkAlignment,
     boundary: V2BoundarySummary,
     pair: V2TrackPairCandidate,
     top1_top2_margin: f64,
@@ -8521,6 +9120,7 @@ fn create_v2_alignment_proposal(
     alternatives: Vec<AudioAlternativeTrackScoreDto>,
     mut diagnostics: Vec<String>,
 ) -> AudioAlignmentProposal {
+    finalize_v2_span_evidence(&mut alignment.spans, &pair.hypothesis, top1_top2_margin);
     let source_start_ms = alignment
         .spans
         .first()
@@ -8554,9 +9154,42 @@ fn create_v2_alignment_proposal(
         .iter()
         .filter(|span| span.kind == AudioTimeMapSpanKind::Ambiguous)
         .count();
+    let held_out_residuals = pair
+        .hypothesis
+        .held_out_anchors
+        .iter()
+        .map(|item| item.residual_ms.max(0) as u64)
+        .collect::<Vec<_>>();
+    let training_residuals = pair
+        .hypothesis
+        .training_anchors
+        .iter()
+        .map(|item| item.residual_ms.max(0) as u64)
+        .collect::<Vec<_>>();
+    let graph_residuals = if held_out_residuals.is_empty() {
+        training_residuals.as_slice()
+    } else {
+        held_out_residuals.as_slice()
+    };
+    let (
+        graph_p50_residual_ms,
+        graph_p95_residual_ms,
+        graph_p99_residual_ms,
+        graph_max_residual_ms,
+    ) = v2_residual_statistics(graph_residuals);
+    let held_out_validation_coverage = if pair.hypothesis.held_out_anchors.is_empty() {
+        None
+    } else {
+        Some(
+            pair.hypothesis.held_out_within_tolerance_count as f64
+                / pair.hypothesis.held_out_anchors.len() as f64,
+        )
+    };
     let catastrophic = coverage < 0.50
-        || pair.hypothesis.p95_residual_ms > 400
-        || pair.hypothesis.max_residual_ms > 1_000;
+        || graph_p95_residual_ms.is_none_or(|value| value > 400)
+        || graph_p99_residual_ms.is_none_or(|value| value > 500)
+        || graph_max_residual_ms.is_none_or(|value| value > 1_000)
+        || held_out_validation_coverage.is_some_and(|value| value < 0.50);
     let blocked = catastrophic
         || ambiguous_span_count > 0
         || alignment.matched_step_count == 0
@@ -8566,8 +9199,25 @@ fn create_v2_alignment_proposal(
     let mut quality_reasons = Vec::new();
     if catastrophic {
         quality_reasons.push(format!(
-            "灾难性门控：coverage {:.3}、P95 {} ms、max {} ms。",
-            coverage, pair.hypothesis.p95_residual_ms, pair.hypothesis.max_residual_ms
+            "灾难性门控：coverage {:.3}、验证 P95 {:?} ms、P99 {:?} ms、max {:?} ms、留出成功率 {:?}。",
+            coverage,
+            graph_p95_residual_ms,
+            graph_p99_residual_ms,
+            graph_max_residual_ms,
+            held_out_validation_coverage
+        ));
+    }
+    if pair.hypothesis.held_out_anchors.is_empty() {
+        quality_reasons.push(
+            "唯一 source landmark 样本不足，无法建立不参与 seed、模型选择和重拟合的全片留出集。"
+                .to_string(),
+        );
+    } else if let Some(validation_coverage) = held_out_validation_coverage {
+        quality_reasons.push(format!(
+            "独立留出验证覆盖率 {:.1}%（{} / {} 个 source landmark 在残差阈值内）；留出未参与 seed、候选排名或重拟合。",
+            validation_coverage * 100.0,
+            pair.hypothesis.held_out_within_tolerance_count,
+            pair.hypothesis.held_out_anchors.len()
         ));
     }
     if ambiguous_span_count > 0 {
@@ -8602,19 +9252,24 @@ fn create_v2_alignment_proposal(
         coverage * 100.0
     ));
     diagnostics.push(format!(
-        "Affine：scale {:.8}，offset {:+} ms，内点 {}，P50/P95/max={}/{}/{} ms。",
+        "Affine：scale {:.8}，offset {:+} ms，训练内点 {}，留出 {}（阈值内 {}），验证 P50/P95/P99/max={:?}/{:?}/{:?}/{:?} ms。",
         pair.hypothesis.scale,
         pair.hypothesis.offset_ms,
         pair.hypothesis.inlier_count,
-        pair.hypothesis.p50_residual_ms,
-        pair.hypothesis.p95_residual_ms,
-        pair.hypothesis.max_residual_ms
+        pair.hypothesis.held_out_anchors.len(),
+        pair.hypothesis.held_out_within_tolerance_count,
+        graph_p50_residual_ms,
+        graph_p95_residual_ms,
+        graph_p99_residual_ms,
+        graph_max_residual_ms
     ));
     diagnostics.extend(quality_reasons.clone());
     let anchors =
         create_v2_compatibility_anchors(&alignment.spans, pair.hypothesis.p95_residual_ms, blocked);
     let cut_candidates = create_v2_compatibility_cut_candidates(&alignment.spans, blocked);
     let parameters_hash = create_v2_parameters_hash(&pair);
+    let anchor_region_count =
+        v2_anchor_region_count(&pair.hypothesis, source_start_ms, source_end_ms);
     let time_map = AudioAlignmentTimeMapDto {
         source_start_ms,
         source_end_ms,
@@ -8626,20 +9281,29 @@ fn create_v2_alignment_proposal(
             metric_source: "measured",
             probability: None,
             coverage: Some(coverage),
-            p50_residual_ms: Some(pair.hypothesis.p50_residual_ms.max(0) as u64),
-            p95_residual_ms: Some(pair.hypothesis.p95_residual_ms.max(0) as u64),
-            max_residual_ms: Some(pair.hypothesis.max_residual_ms.max(0) as u64),
+            unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
+            p50_residual_ms: graph_p50_residual_ms,
+            p95_residual_ms: graph_p95_residual_ms,
+            p99_residual_ms: graph_p99_residual_ms,
+            max_residual_ms: graph_max_residual_ms,
             boundary_uncertainty_ms: boundary.max_uncertainty_ms,
             alternative_margin: Some(top1_top2_margin),
-            anchor_count: pair.hypothesis.inlier_count,
-            held_out_anchor_count: 0,
+            anchor_count: pair
+                .hypothesis
+                .inlier_count
+                .saturating_add(pair.hypothesis.held_out_anchors.len()),
+            anchor_region_count,
+            held_out_anchor_count: pair.hypothesis.held_out_anchors.len(),
             reasons: quality_reasons,
         },
         evidence: AudioTimeMapEvidenceDto {
             types: vec!["audio"],
-            audio_anchor_count: pair.hypothesis.inlier_count,
+            audio_anchor_count: pair
+                .hypothesis
+                .inlier_count
+                .saturating_add(pair.hypothesis.held_out_anchors.len()),
             visual_anchor_count: 0,
-            held_out_anchor_count: 0,
+            held_out_anchor_count: pair.hypothesis.held_out_anchors.len(),
             top1_top2_margin: Some(top1_top2_margin),
             unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
             repeated_content_only: pair.repeated_content_only,
@@ -8855,37 +9519,82 @@ fn create_blocked_v2_affine_proposal(
         "已定位 B 站参考音轨 #{} 与目标原片音轨 #{}，但结果被质量门控阻断。",
         pair.source_input.stream.stream_index, pair.target_input.stream.stream_index
     );
+    let mut spans = vec![create_v2_span(
+        AudioTimeMapSpanKind::Ambiguous,
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        target_end_ms,
+    )];
+    finalize_v2_span_evidence(&mut spans, &pair.hypothesis, margin);
+    let held_out_residuals = pair
+        .hypothesis
+        .held_out_anchors
+        .iter()
+        .map(|item| item.residual_ms.max(0) as u64)
+        .collect::<Vec<_>>();
+    let training_residuals = pair
+        .hypothesis
+        .training_anchors
+        .iter()
+        .map(|item| item.residual_ms.max(0) as u64)
+        .collect::<Vec<_>>();
+    let residuals = if held_out_residuals.is_empty() {
+        training_residuals.as_slice()
+    } else {
+        held_out_residuals.as_slice()
+    };
+    let (p50_residual_ms, p95_residual_ms, p99_residual_ms, max_residual_ms) =
+        v2_residual_statistics(residuals);
+    let anchor_region_count =
+        v2_anchor_region_count(&pair.hypothesis, source_start_ms, source_end_ms);
+    let mut blocked_reasons = vec![reason.to_string()];
+    if pair.hypothesis.held_out_anchors.is_empty() {
+        blocked_reasons.push("没有可用的独立留出 source landmark。".to_string());
+    } else {
+        blocked_reasons.push(format!(
+            "独立留出验证覆盖率 {:.1}%（{} / {} 个在残差阈值内）。",
+            pair.hypothesis.held_out_within_tolerance_count as f64
+                / pair.hypothesis.held_out_anchors.len() as f64
+                * 100.0,
+            pair.hypothesis.held_out_within_tolerance_count,
+            pair.hypothesis.held_out_anchors.len()
+        ));
+    }
     let time_map = AudioAlignmentTimeMapDto {
         source_start_ms,
         source_end_ms,
         target_start_ms,
         target_end_ms,
-        spans: vec![AudioTimeMapSpanDto {
-            kind: AudioTimeMapSpanKind::Ambiguous,
-            source_start_ms,
-            source_end_ms,
-            target_start_ms,
-            target_end_ms,
-        }],
+        spans,
         quality: AudioTimeMapQualityDto {
             level: "blocked",
             metric_source: "measured",
             probability: None,
             coverage: Some(pair.temporal_coverage.clamp(0.0, 1.0)),
-            p50_residual_ms: Some(pair.hypothesis.p50_residual_ms.max(0) as u64),
-            p95_residual_ms: Some(pair.hypothesis.p95_residual_ms.max(0) as u64),
-            max_residual_ms: Some(pair.hypothesis.max_residual_ms.max(0) as u64),
+            unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
+            p50_residual_ms,
+            p95_residual_ms,
+            p99_residual_ms,
+            max_residual_ms,
             boundary_uncertainty_ms: None,
             alternative_margin: Some(margin),
-            anchor_count: pair.hypothesis.inlier_count,
-            held_out_anchor_count: 0,
-            reasons: vec![reason.to_string()],
+            anchor_count: pair
+                .hypothesis
+                .inlier_count
+                .saturating_add(pair.hypothesis.held_out_anchors.len()),
+            anchor_region_count,
+            held_out_anchor_count: pair.hypothesis.held_out_anchors.len(),
+            reasons: blocked_reasons,
         },
         evidence: AudioTimeMapEvidenceDto {
             types: vec!["audio"],
-            audio_anchor_count: pair.hypothesis.inlier_count,
+            audio_anchor_count: pair
+                .hypothesis
+                .inlier_count
+                .saturating_add(pair.hypothesis.held_out_anchors.len()),
             visual_anchor_count: 0,
-            held_out_anchor_count: 0,
+            held_out_anchor_count: pair.hypothesis.held_out_anchors.len(),
             top1_top2_margin: Some(margin),
             unique_content_coverage: Some(pair.hypothesis.unique_source_coverage.clamp(0.0, 1.0)),
             repeated_content_only: pair.repeated_content_only,
@@ -9260,29 +9969,84 @@ fn create_visual_affine_fallback_proposal(
         "音频不可用后，独立视觉选择参考视频流 #{} → 目标视频流 #{}；Top1/Top2 margin {:.3}。",
         source_input.stream.stream_index, target_input.stream.stream_index, result.top1_top2_margin
     );
+    let mut visual_span = create_v2_span(
+        span_kind,
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        target_end_ms,
+    );
+    visual_span.id = format!(
+        "span-1-{}-{}-{}-{}-{}",
+        format_v2_span_kind(span_kind),
+        source_start_ms,
+        source_end_ms,
+        target_start_ms,
+        target_end_ms
+    );
+    visual_span.reason = if passes_evidence_gate {
+        "独立视觉仿射仅支持粗粒度共同内容定位，不提供精确版本差异边界。".to_string()
+    } else {
+        "独立视觉候选未通过覆盖、竞争位置或时间域门控，该范围保持 ambiguous。".to_string()
+    };
+    visual_span.quality = AudioTimeMapSpanQualityDto {
+        level: "blocked",
+        metric_source: "measured",
+        probability: None,
+        coverage: Some(best.coverage.min(best.temporal_span_coverage)),
+        unique_content_coverage: Some(best.coverage.min(best.temporal_span_coverage)),
+        alternative_margin: Some(result.top1_top2_margin),
+        anchor_count: best.matches.len(),
+        held_out_anchor_count: 0,
+        p50_residual_ms: Some(best.p50_residual_ms),
+        p95_residual_ms: Some(best.p95_residual_ms),
+        p99_residual_ms: None,
+        max_residual_ms: Some(best.max_residual_ms),
+        boundary_uncertainty_ms: Some(interval_ms.saturating_mul(2)),
+        left_support: AudioTimeMapSpanSupportStatus::Unsupported,
+        right_support: AudioTimeMapSpanSupportStatus::Unsupported,
+        signals: AudioTimeMapSpanSignalsDto {
+            audio: AudioTimeMapSignalStatus::Blocked,
+            visual: if passes_evidence_gate {
+                AudioTimeMapSignalStatus::Used
+            } else {
+                AudioTimeMapSignalStatus::Conflict
+            },
+            danmaku: AudioTimeMapSignalStatus::Blocked,
+        },
+        reasons: quality_reasons.clone(),
+    };
+    let visual_source_times = best
+        .matches
+        .iter()
+        .map(|item| item.source_time_ms)
+        .collect::<Vec<_>>();
+    let anchor_region_count =
+        v2_source_time_region_count(&visual_source_times, source_start_ms, source_end_ms);
     let time_map = AudioAlignmentTimeMapDto {
         source_start_ms,
         source_end_ms,
         target_start_ms,
         target_end_ms,
-        spans: vec![AudioTimeMapSpanDto {
-            kind: span_kind,
-            source_start_ms,
-            source_end_ms,
-            target_start_ms,
-            target_end_ms,
-        }],
+        spans: vec![visual_span],
         quality: AudioTimeMapQualityDto {
             level: quality_level,
             metric_source: "measured",
             probability: None,
             coverage: Some(best.coverage.min(best.temporal_span_coverage)),
+            unique_content_coverage: Some(
+                best.coverage
+                    .min(best.temporal_span_coverage)
+                    .clamp(0.0, 1.0),
+            ),
             p50_residual_ms: Some(best.p50_residual_ms),
             p95_residual_ms: Some(best.p95_residual_ms),
+            p99_residual_ms: None,
             max_residual_ms: Some(best.max_residual_ms),
             boundary_uncertainty_ms: Some(interval_ms.saturating_mul(2)),
             alternative_margin: Some(result.top1_top2_margin),
             anchor_count: best.matches.len(),
+            anchor_region_count,
             held_out_anchor_count: 0,
             reasons: quality_reasons,
         },
@@ -15045,6 +15809,26 @@ mod tests {
     }
 
     fn v2_test_hypothesis(scale: f64, offset_ms: i64) -> AffineHypothesis {
+        let training_anchors = (0..24)
+            .map(|index| {
+                let source_time_ms = index * 100;
+                AffineAnchorEvidence {
+                    source_time_ms,
+                    target_time_ms: (scale * source_time_ms as f64).round() as i64 + offset_ms,
+                    residual_ms: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let held_out_anchors = (0..6)
+            .map(|index| {
+                let source_time_ms = index * 400 + 50;
+                AffineAnchorEvidence {
+                    source_time_ms,
+                    target_time_ms: (scale * source_time_ms as f64).round() as i64 + offset_ms,
+                    residual_ms: 0,
+                }
+            })
+            .collect::<Vec<_>>();
         AffineHypothesis {
             scale,
             offset_ms,
@@ -15058,6 +15842,9 @@ mod tests {
             p50_residual_ms: 15,
             p95_residual_ms: 40,
             max_residual_ms: 60,
+            training_anchors,
+            held_out_anchors,
+            held_out_within_tolerance_count: 6,
         }
     }
 
@@ -15429,12 +16216,15 @@ mod tests {
                 metric_source: "measured",
                 probability: None,
                 coverage: Some(1.0),
+                unique_content_coverage: Some(1.0),
                 p50_residual_ms: Some(0),
                 p95_residual_ms: Some(0),
+                p99_residual_ms: Some(0),
                 max_residual_ms: Some(0),
                 boundary_uncertainty_ms: None,
                 alternative_margin: Some(1.0),
                 anchor_count: 10,
+                anchor_region_count: 3,
                 held_out_anchor_count: 0,
                 reasons: Vec::new(),
             },
@@ -16297,20 +17087,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut spans = vec![
-            AudioTimeMapSpanDto {
-                kind: AudioTimeMapSpanKind::Matched,
-                source_start_ms: 100_000,
-                source_end_ms: 101_000,
-                target_start_ms: 200_000,
-                target_end_ms: 201_000,
-            },
-            AudioTimeMapSpanDto {
-                kind: AudioTimeMapSpanKind::Matched,
-                source_start_ms: 101_000,
-                source_end_ms: 102_000,
-                target_start_ms: 201_000,
-                target_end_ms: 202_000,
-            },
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                100_000,
+                101_000,
+                200_000,
+                201_000,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                101_000,
+                102_000,
+                201_000,
+                202_000,
+            ),
         ];
 
         let summary = refine_v2_span_boundaries(&mut spans, &pcm, &pcm, 100_000, 200_000, None);
@@ -16324,27 +17114,21 @@ mod tests {
     #[test]
     fn v2_silent_source_only_boundaries_are_attempted_but_remain_blocking() {
         let mut spans = vec![
-            AudioTimeMapSpanDto {
-                kind: AudioTimeMapSpanKind::Matched,
-                source_start_ms: 0,
-                source_end_ms: 10_000,
-                target_start_ms: 0,
-                target_end_ms: 10_000,
-            },
-            AudioTimeMapSpanDto {
-                kind: AudioTimeMapSpanKind::SourceOnly,
-                source_start_ms: 10_000,
-                source_end_ms: 20_000,
-                target_start_ms: 10_000,
-                target_end_ms: 10_000,
-            },
-            AudioTimeMapSpanDto {
-                kind: AudioTimeMapSpanKind::Matched,
-                source_start_ms: 20_000,
-                source_end_ms: 30_000,
-                target_start_ms: 10_000,
-                target_end_ms: 20_000,
-            },
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 0, 10_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::SourceOnly,
+                10_000,
+                20_000,
+                10_000,
+                10_000,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                20_000,
+                30_000,
+                10_000,
+                20_000,
+            ),
         ];
         let pcm = vec![0i16; ALIGNMENT_V2_SAMPLE_RATE as usize * 31];
         let summary = refine_v2_span_boundaries(&mut spans, &pcm, &pcm, 0, 0, None);
@@ -16357,6 +17141,92 @@ mod tests {
             .evidence_notes
             .iter()
             .any(|note| note.contains("不会把粗 DP 边界冒充精确时间")));
+        assert_eq!(spans[1].boundaries.start.support_duration_ms, 10_000);
+        assert_eq!(spans[1].boundaries.end.support_duration_ms, 10_000);
+        assert_eq!(
+            spans[1].boundaries.start.status,
+            AudioTimeMapBoundaryStatus::Ambiguous
+        );
+    }
+
+    #[test]
+    fn v2_span_anchor_aggregation_is_half_open_and_does_not_double_count_boundaries() {
+        let hypothesis = v2_test_hypothesis(1.0, 0);
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 1_000, 0, 1_000),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 1_000, 2_400, 1_000, 2_400),
+        ];
+
+        finalize_v2_span_evidence(&mut spans, &hypothesis, 1.0);
+
+        assert_eq!(spans[0].quality.anchor_count, 13);
+        assert_eq!(spans[1].quality.anchor_count, 17);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.quality.anchor_count)
+                .sum::<usize>(),
+            hypothesis
+                .training_anchors
+                .len()
+                .saturating_add(hypothesis.held_out_anchors.len())
+        );
+    }
+
+    #[test]
+    fn v2_refined_edit_span_uses_boundary_support_without_fake_internal_anchors() {
+        let mut span = create_v2_span(
+            AudioTimeMapSpanKind::SourceOnly,
+            10_000,
+            20_000,
+            10_000,
+            10_000,
+        );
+        for boundary in [&mut span.boundaries.start, &mut span.boundaries.end] {
+            boundary.status = AudioTimeMapBoundaryStatus::Refined;
+            boundary.support_duration_ms = 10_000;
+            boundary.coarse_ms = Some(10_000);
+            boundary.refined_ms = Some(10_000);
+            boundary.uncertainty_start_ms = Some(9_990);
+            boundary.uncertainty_end_ms = Some(10_010);
+            boundary.correlation = Some(0.9);
+            boundary.alternative_margin = Some(0.2);
+            boundary.reason = "测试中的真实相邻共同内容支持。".to_string();
+        }
+        let mut spans = vec![span];
+        let mut hypothesis = v2_test_hypothesis(1.0, 0);
+        hypothesis.training_anchors.clear();
+        hypothesis.held_out_anchors.clear();
+        hypothesis.held_out_within_tolerance_count = 0;
+
+        finalize_v2_span_evidence(&mut spans, &hypothesis, 1.0);
+
+        assert_eq!(spans[0].quality.level, "review");
+        assert_eq!(spans[0].quality.anchor_count, 0);
+        assert_eq!(spans[0].quality.held_out_anchor_count, 0);
+        assert_eq!(spans[0].quality.p99_residual_ms, None);
+        assert_eq!(
+            spans[0].quality.left_support,
+            AudioTimeMapSpanSupportStatus::Supported
+        );
+        assert_eq!(
+            spans[0].quality.right_support,
+            AudioTimeMapSpanSupportStatus::Supported
+        );
+    }
+
+    #[test]
+    fn v2_p99_and_anchor_regions_use_conservative_real_observations() {
+        let residuals = (0..32_u64).collect::<Vec<_>>();
+        assert_eq!(
+            v2_residual_statistics(&residuals),
+            (Some(16), Some(30), Some(31), Some(31))
+        );
+        assert_eq!(
+            v2_source_time_region_count(&[0, 333, 334, 666, 667, 999], 0, 1_000),
+            3
+        );
+        assert_eq!(v2_source_time_region_count(&[], 0, 1_000), 0);
     }
 
     #[test]
@@ -17203,13 +18073,13 @@ mod tests {
         let target = (0..16)
             .map(|index| visual_signature_frame(index * 5_000, 1_000 + index))
             .collect::<Vec<_>>();
-        let time_map = visual_test_time_map(AudioTimeMapSpanDto {
-            kind: AudioTimeMapSpanKind::Matched,
-            source_start_ms: 0,
-            source_end_ms: 80_000,
-            target_start_ms: 0,
-            target_end_ms: 80_000,
-        });
+        let time_map = visual_test_time_map(create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            0,
+            80_000,
+            0,
+            80_000,
+        ));
 
         let summary = summarize_v2_visual_time_map_validation(&source, &target, &time_map, None)
             .unwrap()
@@ -17220,13 +18090,13 @@ mod tests {
 
         let mut proposal = create_v2_alignment_proposal(
             V2ChunkAlignment {
-                spans: vec![AudioTimeMapSpanDto {
-                    kind: AudioTimeMapSpanKind::Matched,
-                    source_start_ms: 0,
-                    source_end_ms: 120_000,
-                    target_start_ms: 0,
-                    target_end_ms: 120_000,
-                }],
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    120_000,
+                    0,
+                    120_000,
+                )],
                 matched_step_count: 20,
                 ambiguous_step_count: 0,
             },
@@ -17254,13 +18124,13 @@ mod tests {
     fn proposal_time_map_identities_must_match_run_lease_identities() {
         let mut proposal = create_v2_alignment_proposal(
             V2ChunkAlignment {
-                spans: vec![AudioTimeMapSpanDto {
-                    kind: AudioTimeMapSpanKind::Matched,
-                    source_start_ms: 0,
-                    source_end_ms: 120_000,
-                    target_start_ms: 0,
-                    target_end_ms: 120_000,
-                }],
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    120_000,
+                    0,
+                    120_000,
+                )],
                 matched_step_count: 20,
                 ambiguous_step_count: 0,
             },
@@ -17292,13 +18162,13 @@ mod tests {
     fn benchmark_proposal_binding_separates_missing_map_from_identity_mismatch() {
         let mut proposal = create_v2_alignment_proposal(
             V2ChunkAlignment {
-                spans: vec![AudioTimeMapSpanDto {
-                    kind: AudioTimeMapSpanKind::Matched,
-                    source_start_ms: 0,
-                    source_end_ms: 120_000,
-                    target_start_ms: 0,
-                    target_end_ms: 120_000,
-                }],
+                spans: vec![create_v2_span(
+                    AudioTimeMapSpanKind::Matched,
+                    0,
+                    120_000,
+                    0,
+                    120_000,
+                )],
                 matched_step_count: 20,
                 ambiguous_step_count: 0,
             },

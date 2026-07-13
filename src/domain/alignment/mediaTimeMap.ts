@@ -20,8 +20,12 @@ import {
   summarizeTimeMapSpanPlaybackEvidence
 } from "./timeMapPlaybackReviewEvidence";
 import {
+  isCompleteTimeMapSpanEvidence,
   migrateLegacyTimeMap,
+  normalizeLegacyUnverifiedTimeMapSpanEvidence,
   reconcileTimeMapQualityClaim,
+  type CompleteTimeMapSpan,
+  type TimeMapBoundaryEvidence,
   type TimeMapQualityInput,
   type TimeMapSpan
 } from "./timeMap";
@@ -152,7 +156,7 @@ export function createLegacyMediaTimeMap(input: LegacyMediaTimeMapInput): MediaT
     input.expectedTargetEndMs !== null &&
     (!migratedEnd || migratedEnd.targetEndMs !== input.expectedTargetEndMs);
   const blocked = migration.status === "blocked" || expectedRangeMismatch;
-  const spans: TimeMapSpan[] = blocked
+  const rawSpans: TimeMapSpan[] = blocked
     ? [
         {
           kind: "ambiguous",
@@ -164,6 +168,12 @@ export function createLegacyMediaTimeMap(input: LegacyMediaTimeMapInput): MediaT
         }
       ]
     : migratedSpans;
+  const spans = rawSpans.map((span, index) =>
+    normalizeLegacyUnverifiedTimeMapSpanEvidence(span, {
+      id: `${input.id}:span:${String(index + 1).padStart(4, "0")}`,
+      blocked
+    })
+  );
   const finalSpan = spans.at(-1);
   const reasons = ["由旧阶跃规则迁移，未经真实媒体重新分析或精度验证。"];
   migration.issues.forEach((issue) => reasons.push(issue.message));
@@ -192,12 +202,15 @@ export function createLegacyMediaTimeMap(input: LegacyMediaTimeMapInput): MediaT
       probability: null,
       metricSource: input.coverage === null ? "missing" : "estimated",
       coverage: input.coverage,
+      uniqueContentCoverage: null,
       p50ResidualMs: null,
       p95ResidualMs: null,
+      p99ResidualMs: null,
       maxResidualMs: null,
       boundaryUncertaintyMs: null,
       alternativeMargin: null,
       anchorCount: input.anchorCount,
+      anchorRegionCount: 0,
       heldOutAnchorCount: 0,
       reasons
     },
@@ -206,6 +219,11 @@ export function createLegacyMediaTimeMap(input: LegacyMediaTimeMapInput): MediaT
       audioAnchorCount: 0,
       visualAnchorCount: 0,
       heldOutAnchorCount: 0,
+      top1Top2Margin: null,
+      uniqueContentCoverage: null,
+      repeatedContentOnly: false,
+      selectedTrackReason: "旧规则迁移没有保存媒体轨道排序证据。",
+      alternativeTrackScores: [],
       notes: reasons
     },
     verification: null,
@@ -246,8 +264,11 @@ export function computeMediaTimeMapCoreDigest(map: MediaTimeMap): string {
  * a second, independently assembled representation of the map.
  */
 export function createMediaTimeMapCoreCanonicalJson(map: MediaTimeMap): string {
+  if (!map.spans.every(isCompleteTimeMapSpanEvidence)) {
+    throw new Error("时间图缺少完整逐段质量、边界或备选路径证据，不能生成 v2 核心摘要。");
+  }
   return JSON.stringify([
-    "media-time-map-core-v1",
+    "media-time-map-core-v2",
     map.id,
     map.revision,
     map.sourceMediaId,
@@ -260,19 +281,74 @@ export function createMediaTimeMapCoreCanonicalJson(map: MediaTimeMap): string {
     map.sourceEndMs,
     map.targetStartMs,
     map.targetEndMs,
-    map.spans.map((span) => [
-      span.kind,
-      span.sourceStartMs,
-      span.sourceEndMs,
-      span.targetStartMs,
-      span.targetEndMs
-    ]),
+    map.spans.map(canonicalCompleteSpan),
     canonicalQualityMetrics(map.quality),
     canonicalEvidence(map.evidence),
     map.engineVersion,
     map.featureVersion,
     map.parametersHash
   ]);
+}
+
+function canonicalCompleteSpan(span: CompleteTimeMapSpan): readonly unknown[] {
+  return [
+    span.id,
+    span.kind,
+    span.sourceStartMs,
+    span.sourceEndMs,
+    span.targetStartMs,
+    span.targetEndMs,
+    span.reason,
+    [
+      span.quality.level,
+      span.quality.metricSource,
+      span.quality.probability,
+      span.quality.coverage,
+      span.quality.uniqueContentCoverage,
+      span.quality.alternativeMargin,
+      span.quality.anchorCount,
+      span.quality.heldOutAnchorCount,
+      span.quality.p50ResidualMs,
+      span.quality.p95ResidualMs,
+      span.quality.p99ResidualMs,
+      span.quality.maxResidualMs,
+      span.quality.boundaryUncertaintyMs,
+      span.quality.leftSupport,
+      span.quality.rightSupport,
+      [
+        span.quality.signals.audio,
+        span.quality.signals.visual,
+        span.quality.signals.danmaku
+      ],
+      canonicalSignedQualityReasons(span.quality.reasons)
+    ],
+    [canonicalBoundary(span.boundaries.start), canonicalBoundary(span.boundaries.end)],
+    span.alternatives.map((alternative) => [
+      alternative.kind,
+      alternative.score,
+      alternative.sourceStartMs,
+      alternative.sourceEndMs,
+      alternative.targetStartMs,
+      alternative.targetEndMs,
+      alternative.reason
+    ])
+  ];
+}
+
+function canonicalBoundary(boundary: TimeMapBoundaryEvidence): readonly unknown[] {
+  return [
+    boundary.status,
+    boundary.axis,
+    boundary.contextSide,
+    boundary.coarseMs,
+    boundary.refinedMs,
+    boundary.uncertaintyStartMs,
+    boundary.uncertaintyEndMs,
+    boundary.supportDurationMs,
+    boundary.correlation,
+    boundary.alternativeMargin,
+    boundary.reason
+  ];
 }
 
 /** 检查 record 是否仍精确绑定当前 map，并且其签发来源受信。 */
@@ -574,6 +650,14 @@ function assertManualVerificationEligible(
     throw new Error("人工验证字段 verifiedAt 必须是规范 ISO 时间戳。");
   }
   map.spans.forEach((span, spanIndex) => {
+    if (!isCompleteTimeMapSpanEvidence(span)) {
+      throw new Error(`时间图第 ${spanIndex + 1} 段缺少完整逐段证据，不能签发人工验证。`);
+    }
+    if (span.quality.level === "blocked" || span.quality.level === "legacy-unverified") {
+      throw new Error(
+        `时间图第 ${spanIndex + 1} 段仍为${span.quality.level === "blocked" ? "已阻断" : "旧版未验证"}状态，不能签发人工验证。`
+      );
+    }
     if (span.kind === "ambiguous") {
       throw new Error(`时间图第 ${spanIndex + 1} 段仍为 ambiguous，不能签发人工验证。`);
     }
@@ -721,11 +805,44 @@ export function reconcileMediaTimeMapQuality(map: MediaTimeMap): MediaTimeMap {
     toTimeMapQualityInput(map)
   );
   const missingIdentity = map.sourceIdentity === null || map.targetIdentity === null;
+  const inconsistentUniqueCoverage =
+    (map.quality.uniqueContentCoverage ?? null) !==
+    (map.evidence.uniqueContentCoverage ?? null);
   let level =
     reconciliation.level === "verified" && missingIdentity ? "blocked" : reconciliation.level;
   const reasons = [...reconciliation.reasons];
+  const hasIncompleteSpan = map.spans.some((span) => !isCompleteTimeMapSpanEvidence(span));
+  const completeSpans = map.spans.filter(isCompleteTimeMapSpanEvidence);
+  const hasBlockedSpan = completeSpans.some((span) => span.quality.level === "blocked");
+  const hasLegacySpan = completeSpans.some(
+    (span) => span.quality.level === "legacy-unverified"
+  );
+  const hasReviewSpan = completeSpans.some((span) => span.quality.level === "review");
+  const trustedManualVerification =
+    !hasIncompleteSpan &&
+    map.verification?.recordVersion === 2 &&
+    map.verification.method === "manual-review" &&
+    assessMediaTimeMapVerification(map).trusted;
+  if (hasIncompleteSpan || hasBlockedSpan) {
+    level = "blocked";
+    reasons.push(
+      hasIncompleteSpan
+        ? "至少一个片段缺少完整逐段证据，已阻断整张时间图。"
+        : "至少一个片段的逐段质量为 blocked，已阻断整张时间图。"
+    );
+  } else if (hasLegacySpan && level !== "blocked") {
+    level = "legacy-unverified";
+    reasons.push("至少一个片段只有旧版未验证证据，整张时间图必须重新分析或复核。");
+  } else if (hasReviewSpan && level === "verified" && !trustedManualVerification) {
+    level = "review";
+    reasons.push("至少一个片段仍需复核，自动图级指标不能绕过逐段质量门禁。");
+  }
   if (level === "blocked" && reconciliation.level === "verified" && missingIdentity) {
     reasons.push("时间图缺少源文件或目标文件的内容身份快照，不能确认它仍对应当前媒体文件。");
+  }
+  if (inconsistentUniqueCoverage) {
+    level = "blocked";
+    reasons.push("图级质量与轨道证据的独特内容覆盖率不一致，已阻断该时间图。");
   }
   if (map.quality.level === "verified") {
     const verification = assessMediaTimeMapVerification(map);
@@ -773,12 +890,15 @@ function toTimeMapQualityInput(map: MediaTimeMap): TimeMapQualityInput {
     probability: map.quality.probability,
     metricSource: map.quality.metricSource,
     coverage: map.quality.coverage,
+    uniqueContentCoverage: map.quality.uniqueContentCoverage,
     p50ResidualMs: map.quality.p50ResidualMs,
     p95ResidualMs: map.quality.p95ResidualMs,
+    p99ResidualMs: map.quality.p99ResidualMs,
     maxResidualMs: map.quality.maxResidualMs,
     boundaryUncertaintyMs: map.quality.boundaryUncertaintyMs,
     alternativeMargin: map.quality.alternativeMargin,
     anchorCount: map.quality.anchorCount,
+    anchorRegionCount: map.quality.anchorRegionCount,
     heldOutAnchorCount: map.quality.heldOutAnchorCount,
     evidenceTypes: map.evidence.types,
     audioAnchorCount: map.evidence.audioAnchorCount,
@@ -829,12 +949,15 @@ function canonicalQualityMetrics(quality: MediaTimeMapQuality): readonly unknown
     quality.probability,
     quality.metricSource,
     quality.coverage,
+    quality.uniqueContentCoverage ?? null,
     quality.p50ResidualMs,
     quality.p95ResidualMs,
+    quality.p99ResidualMs ?? null,
     quality.maxResidualMs,
     quality.boundaryUncertaintyMs,
     quality.alternativeMargin,
     quality.anchorCount,
+    quality.anchorRegionCount ?? 0,
     quality.heldOutAnchorCount,
     canonicalSignedQualityReasons(quality.reasons)
   ];
@@ -846,6 +969,18 @@ function canonicalEvidence(evidence: CompactMediaTimeMapEvidence): readonly unkn
     evidence.audioAnchorCount,
     evidence.visualAnchorCount,
     evidence.heldOutAnchorCount,
+    evidence.top1Top2Margin ?? null,
+    evidence.uniqueContentCoverage ?? null,
+    evidence.repeatedContentOnly ?? false,
+    evidence.selectedTrackReason ?? "",
+    (evidence.alternativeTrackScores ?? []).map((alternative) => [
+      alternative.sourceStreamIndex,
+      alternative.targetStreamIndex,
+      alternative.score,
+      alternative.scale ?? null,
+      alternative.offsetMs ?? null,
+      alternative.inlierCount ?? null
+    ]),
     [...new Set(evidence.notes.map((note) => note.trim()).filter(Boolean))].sort()
   ];
 }
@@ -919,6 +1054,10 @@ function isRuntimeVerificationReason(reason: string): boolean {
     reason.startsWith("本机验证机构返回的签发请求摘要") ||
     reason.startsWith("本机撤销注册表") ||
     reason.startsWith("当前时间图已不满足签发门槛")
+    || reason.startsWith("至少一个片段缺少完整逐段证据")
+    || reason.startsWith("至少一个片段的逐段质量为 blocked")
+    || reason.startsWith("至少一个片段只有旧版未验证证据")
+    || reason.startsWith("至少一个片段仍需复核")
   );
 }
 

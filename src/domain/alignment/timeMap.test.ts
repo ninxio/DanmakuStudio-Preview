@@ -3,8 +3,10 @@ import {
   assessTimeMapQuality,
   assertValidTimeMap,
   compileTimeMap,
+  isCompleteTimeMapSpanEvidence,
   mapSourceTime,
   migrateLegacyTimeMap,
+  normalizeLegacyUnverifiedTimeMapSpanEvidence,
   reconcileTimeMapQualityClaim,
   validateTimeMap,
   type LegacyTimingRuleInput,
@@ -12,6 +14,34 @@ import {
 } from "./timeMap";
 
 describe("分段时间映射", () => {
+  it("只把缺失的旧逐段证据显式迁移为 legacy-unverified", () => {
+    const plain = matched(0, 10_000, 0, 10_000);
+    expect(isCompleteTimeMapSpanEvidence(plain)).toBe(false);
+
+    const migrated = normalizeLegacyUnverifiedTimeMapSpanEvidence(plain, {
+      id: "map-1:span:0001",
+      blocked: false
+    });
+
+    expect(isCompleteTimeMapSpanEvidence(migrated)).toBe(true);
+    expect(migrated).toMatchObject({
+      id: "map-1:span:0001",
+      reason: "legacyUnverified",
+      quality: {
+        level: "legacy-unverified",
+        metricSource: "missing",
+        p99ResidualMs: null,
+        leftSupport: "legacyUnverified",
+        rightSupport: "legacyUnverified"
+      },
+      boundaries: {
+        start: { status: "legacyUnverified" },
+        end: { status: "legacyUnverified" }
+      },
+      alternatives: []
+    });
+  });
+
   it("按 matched 段的独立斜率执行整数毫秒仿射投影", () => {
     const spans: TimeMapSpan[] = [
       matched(0, 10_000, 5_000, 15_000),
@@ -302,12 +332,15 @@ describe("时间映射质量门槛", () => {
   const excellentMetrics = {
     probability: 0.999,
     coverage: 0.97,
+    uniqueContentCoverage: 0.9,
     p50ResidualMs: 30,
     p95ResidualMs: 70,
+    p99ResidualMs: 100,
     maxResidualMs: 130,
     boundaryUncertaintyMs: 180,
     alternativeMargin: 0.35,
     anchorCount: 40,
+    anchorRegionCount: 3,
     heldOutAnchorCount: 8,
     audioAnchorCount: 32,
     visualAnchorCount: 8,
@@ -338,6 +371,16 @@ describe("时间映射质量门槛", () => {
         ...excellentMetrics,
         metricSource: "measured",
         evidenceTypes: ["audio"]
+      }).level
+    ).toBe("review");
+
+    expect(
+      assessTimeMapQuality({
+        ...excellentMetrics,
+        p99ResidualMs: 501,
+        maxResidualMs: 600,
+        metricSource: "measured",
+        evidenceTypes: ["audio", "visual"]
       }).level
     ).toBe("review");
   });

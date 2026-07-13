@@ -18,6 +18,7 @@ import type { MediaContentIdentity, MediaTimeMap } from "../project/types";
 import { sha256Hex } from "../shared/sha256";
 import { createTimeMapSpanPlaybackReviewToken } from "./timeMapPlaybackReviewEvidence";
 import { createTestCompleteTimeMapSpanPlaybackEvidence } from "../../test/manualVerification";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 
 const TIMESTAMP = "2026-07-12T00:00:00.000Z";
 
@@ -135,7 +136,7 @@ describe("媒体时间图 revision", () => {
     const canonicalJson = createMediaTimeMapCoreCanonicalJson(map);
     const digest = computeMediaTimeMapCoreDigest(map);
     expect((JSON.parse(canonicalJson) as unknown[]).slice(0, 5)).toEqual([
-      "media-time-map-core-v1",
+      "media-time-map-core-v2",
       map.id,
       map.revision,
       map.sourceMediaId,
@@ -248,13 +249,13 @@ describe("媒体时间图 revision", () => {
   it("拒绝 ambiguous 与没有逐段人工分类的单侧差异，分类 note 会进入签名摘要", () => {
     const ambiguous = createVerificationEligibleMap();
     ambiguous.spans = [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "ambiguous",
         sourceStartMs: 0,
         sourceEndMs: 60_000,
         targetStartMs: 0,
         targetEndMs: 60_000
-      }
+      })
     ];
     expect(() =>
       createManualMediaTimeMapVerificationRequest(ambiguous, verificationInput())
@@ -263,27 +264,27 @@ describe("媒体时间图 revision", () => {
     const oneSided = createVerificationEligibleMap();
     oneSided.targetEndMs = 55_000;
     oneSided.spans = [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 0,
         sourceEndMs: 20_000,
         targetStartMs: 0,
         targetEndMs: 20_000
-      },
-      {
+      }, "one-sided:span:0001"),
+      createTestCompleteTimeMapSpan({
         kind: "sourceOnly",
         sourceStartMs: 20_000,
         sourceEndMs: 25_000,
         targetStartMs: 20_000,
         targetEndMs: 20_000
-      },
-      {
+      }, "one-sided:span:0002"),
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 25_000,
         sourceEndMs: 60_000,
         targetStartMs: 20_000,
         targetEndMs: 55_000
-      }
+      }, "one-sided:span:0003")
     ];
     attachTestPlaybackReviews(oneSided);
     expect(() =>
@@ -353,25 +354,28 @@ function createVerificationEligibleMap(): MediaTimeMap {
     targetStartMs: 0,
     targetEndMs: 60_000,
     spans: [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 0,
         sourceEndMs: 60_000,
         targetStartMs: 0,
         targetEndMs: 60_000
-      }
+      })
     ],
     quality: {
       level: "review",
       probability: 0.999,
       metricSource: "measured",
       coverage: 1,
+      uniqueContentCoverage: 1,
       p50ResidualMs: 10,
       p95ResidualMs: 50,
+      p99ResidualMs: 70,
       maxResidualMs: 80,
       boundaryUncertaintyMs: 100,
       alternativeMargin: 0.5,
-      anchorCount: 20,
+      anchorCount: 40,
+      anchorRegionCount: 3,
       heldOutAnchorCount: 5,
       reasons: ["等待明确人工复核。"]
     },
@@ -380,6 +384,11 @@ function createVerificationEligibleMap(): MediaTimeMap {
       audioAnchorCount: 0,
       visualAnchorCount: 0,
       heldOutAnchorCount: 5,
+      top1Top2Margin: 0.5,
+      uniqueContentCoverage: 1,
+      repeatedContentOnly: false,
+      selectedTrackReason: "测试人工复核轨道。",
+      alternativeTrackScores: [],
       notes: ["测试人工复核证据。"]
     },
     verification: null,

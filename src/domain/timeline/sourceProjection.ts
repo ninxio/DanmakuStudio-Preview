@@ -1,5 +1,6 @@
 import {
   compileTimeMap,
+  isCompleteTimeMapSpanEvidence,
   validateTimeMap,
   type CompiledTimeMap
 } from "../alignment/timeMap";
@@ -474,6 +475,25 @@ function findTimeMapBlocker(
       ? "时间图没有任何分段"
       : validation.issues.map((issue) => issue.message).join("；");
     return `${segment.label} 的时间图结构无效：${detail}。`;
+  }
+  const incompleteSpanIndex = timeMap.spans.findIndex(
+    (span) => !isCompleteTimeMapSpanEvidence(span)
+  );
+  if (incompleteSpanIndex >= 0) {
+    return `${segment.label} 的时间图第 ${incompleteSpanIndex + 1} 段缺少独立质量或边界证据，不能用整图平均值替代逐段验证。`;
+  }
+  const blockedSpanIndex = timeMap.spans.findIndex(
+    (span) => isCompleteTimeMapSpanEvidence(span) && span.quality.level === "blocked"
+  );
+  if (blockedSpanIndex >= 0) {
+    return `${segment.label} 的时间图第 ${blockedSpanIndex + 1} 段质量评估已阻断，必须先重新分析或完成复核。`;
+  }
+  const legacySpanIndex = timeMap.spans.findIndex(
+    (span) =>
+      isCompleteTimeMapSpanEvidence(span) && span.quality.level === "legacy-unverified"
+  );
+  if (legacySpanIndex >= 0) {
+    return `${segment.label} 的时间图第 ${legacySpanIndex + 1} 段只有旧版未验证证据，必须重新分析。`;
   }
 
   const firstSpan = timeMap.spans[0];

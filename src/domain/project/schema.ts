@@ -10,7 +10,12 @@ import {
   type SegmentTimingRule,
   type ProjectValidationResult
 } from "./types";
-import { validateTimeMap, type TimeMapSpan } from "../alignment/timeMap";
+import {
+  isCompleteTimeMapSpanEvidence,
+  normalizeLegacyUnverifiedTimeMapSpanEvidence,
+  validateTimeMap,
+  type TimeMapSpan
+} from "../alignment/timeMap";
 import {
   createLegacyMediaTimeMap as createLegacyMediaTimeMapRecord,
   reconcileMediaTimeMapQuality
@@ -114,7 +119,7 @@ export function validateProjectSchema(value: unknown): ProjectValidationResult {
     !isIntegerMilliseconds(value.globalOffsetMs) ||
     !Array.isArray(value.cutMarkers) ||
     !Array.isArray(value.syncAnchors) ||
-    (version >= 3 && !isAlignmentProposalOrNull(value.alignmentProposal)) ||
+    (version >= 3 && !isAlignmentProposalOrNull(value.alignmentProposal, version)) ||
     !isMillisecondsRecord(value.itemTimeAdjustments) ||
     !isStringArray(value.disabledItemIds) ||
     !isTimelineState(value.timeline) ||
@@ -272,17 +277,18 @@ function migrateProjectToCurrentSchema(
     parsedVersion >= 9 && project.mediaMatchCandidates ? project.mediaMatchCandidates : [];
   const timeMapMigration =
     parsedVersion >= 10
-      ? migrateVersion10ProjectTimeMaps(
+      ? migrateExistingProjectTimeMaps(
           migratedSegments,
           legacyCandidates,
-          project.mediaTimeMaps ?? []
+          project.mediaTimeMaps ?? [],
+          parsedVersion
         )
       : migrateLegacyProjectTimeMaps(
           migratedSegments,
           legacyCandidates,
           normalizeMigrationTimestamp(project.updatedAt, project.createdAt)
         );
-  const migratedProject: EditorProject = {
+  const migratedProject = migrateProjectToSpanEvidenceV12({
       ...project,
       schemaVersion: CURRENT_SCHEMA_VERSION,
       clips: legacyClipRanges.clips,
@@ -294,7 +300,7 @@ function migrateProjectToCurrentSchema(
       danmakuSourceSegments: timeMapMigration.segments,
       mediaMatchCandidates: timeMapMigration.candidates,
       mediaTimeMaps: timeMapMigration.mediaTimeMaps
-    };
+    });
   return {
     project: reconcileProjectTimeMapQualities(migratedProject),
     migration: {
@@ -422,10 +428,11 @@ interface LegacyProjectTimeMapMigrationResult {
 const V10_VERIFIED_PROVENANCE_BLOCKER =
   "v10 没有可绑定时间图核心、revision、媒体身份与 calibration artifact 的验证记录；原 verified 声明已降级为 review。";
 
-function migrateVersion10ProjectTimeMaps(
+function migrateExistingProjectTimeMaps(
   segments: LegacyDanmakuSourceSegment[],
   candidates: LegacyMediaMatchCandidate[],
-  maps: LegacyMediaTimeMap[]
+  maps: LegacyMediaTimeMap[],
+  parsedVersion: number
 ): LegacyProjectTimeMapMigrationResult {
   return {
     segments: segments.map((segment) => ({ ...segment, timeMapId: segment.timeMapId ?? null })),
@@ -435,17 +442,121 @@ function migrateVersion10ProjectTimeMaps(
       confirmedTimeMapId: candidate.confirmedTimeMapId ?? null
     })),
     mediaTimeMaps: maps.map((map) => {
-      const wasVerified = map.quality.level === "verified";
+      const needsV10VerificationBlocker = parsedVersion < 11 && map.quality.level === "verified";
       return {
         ...map,
-        verification: null,
+        verification: parsedVersion < 11 ? null : (map.verification ?? null),
         quality: {
           ...map.quality,
-          level: wasVerified ? "review" : map.quality.level,
-          reasons: wasVerified
+          level: needsV10VerificationBlocker ? "review" : map.quality.level,
+          reasons: needsV10VerificationBlocker
             ? [...new Set([...map.quality.reasons, V10_VERIFIED_PROVENANCE_BLOCKER])]
             : [...map.quality.reasons]
         }
+      };
+    })
+  };
+}
+
+const V12_SPAN_EVIDENCE_MIGRATION_REASON =
+  "项目早于 v12，没有保存可独立复核的逐段残差、留出锚点、边界支持和备选路径；原验证已失效，必须重新分析或人工复核。";
+
+function migrateProjectToSpanEvidenceV12(project: EditorProject): EditorProject {
+  const migrateProposal = (
+    proposal: EditorProject["alignmentProposal"],
+    ownerId: string
+  ): EditorProject["alignmentProposal"] => {
+    if (!proposal?.timeMap) {
+      return proposal;
+    }
+    const blocked = proposal.timeMap.quality.level === "blocked";
+    return {
+      ...proposal,
+      timeMap: {
+        ...proposal.timeMap,
+        spans: proposal.timeMap.spans.map((span, index) =>
+          normalizeLegacyUnverifiedTimeMapSpanEvidence(span, {
+            id: `${ownerId}:span:${String(index + 1).padStart(4, "0")}`,
+            blocked,
+            reason: V12_SPAN_EVIDENCE_MIGRATION_REASON
+          })
+        ),
+        quality: {
+          ...proposal.timeMap.quality,
+          level: blocked ? "blocked" : "legacy-unverified",
+          probability: null,
+          uniqueContentCoverage: null,
+          p99ResidualMs: null,
+          anchorRegionCount: 0,
+          reasons: [
+            ...new Set([
+              ...proposal.timeMap.quality.reasons,
+              V12_SPAN_EVIDENCE_MIGRATION_REASON
+            ])
+          ]
+        },
+        evidence: {
+          ...proposal.timeMap.evidence,
+          types: [...new Set([...proposal.timeMap.evidence.types, "legacy" as const])],
+          top1Top2Margin: proposal.timeMap.evidence.top1Top2Margin ?? null,
+          uniqueContentCoverage: null,
+          repeatedContentOnly: false,
+          selectedTrackReason: "旧项目没有保存可复核的轨道排序与独特内容覆盖证据。",
+          alternativeTrackScores: [],
+          notes: [
+            ...new Set([
+              ...proposal.timeMap.evidence.notes,
+              V12_SPAN_EVIDENCE_MIGRATION_REASON
+            ])
+          ]
+        }
+      }
+    };
+  };
+
+  return {
+    ...project,
+    alignmentProposal: migrateProposal(
+      project.alignmentProposal,
+      `project:${project.id}:alignment-time-map`
+    ),
+    mediaMatchCandidates: project.mediaMatchCandidates.map((candidate) => ({
+      ...candidate,
+      proposal: migrateProposal(candidate.proposal, candidate.timeMapId) as MediaMatchCandidate["proposal"]
+    })),
+    mediaTimeMaps: project.mediaTimeMaps.map((map) => {
+      const blocked = map.quality.level === "blocked";
+      return {
+        ...map,
+        spans: map.spans.map((span, index) =>
+          normalizeLegacyUnverifiedTimeMapSpanEvidence(span, {
+            id: `${map.id}:span:${String(index + 1).padStart(4, "0")}`,
+            blocked,
+            reason: V12_SPAN_EVIDENCE_MIGRATION_REASON
+          })
+        ),
+        quality: {
+          ...map.quality,
+          level: blocked ? "blocked" : "legacy-unverified",
+          probability: null,
+          uniqueContentCoverage: null,
+          p99ResidualMs: null,
+          anchorRegionCount: 0,
+          reasons: [
+            ...new Set([...map.quality.reasons, V12_SPAN_EVIDENCE_MIGRATION_REASON])
+          ]
+        },
+        evidence: {
+          ...map.evidence,
+          types: [...new Set([...map.evidence.types, "legacy" as const])],
+          top1Top2Margin: map.evidence.top1Top2Margin ?? null,
+          uniqueContentCoverage: null,
+          repeatedContentOnly: false,
+          selectedTrackReason: "旧项目没有保存可复核的轨道排序与独特内容覆盖证据。",
+          alternativeTrackScores: [],
+          notes: [...new Set([...map.evidence.notes, V12_SPAN_EVIDENCE_MIGRATION_REASON])]
+        },
+        verification: null
       };
     })
   };
@@ -1036,7 +1147,7 @@ function isMediaMatchCandidate(value: unknown, version: number): boolean {
     !Array.isArray(value.timingRules) ||
     !value.timingRules.every(isSegmentTimingRule) ||
     !isUnitNumber(value.confidence) ||
-    !isAlignmentProposal(value.proposal) ||
+    !isAlignmentProposal(value.proposal, version) ||
     !isRecord(value.proposal) ||
     !isRecord(value.proposal.matchRange) ||
     value.proposal.matchRange.sourceStartMs !== value.sourceStartMs ||
@@ -1100,9 +1211,9 @@ function isMediaTimeMap(value: unknown, version: number): boolean {
     value.targetEndMs < value.targetStartMs ||
     !Array.isArray(value.spans) ||
     value.spans.length === 0 ||
-    !value.spans.every(isTimeMapSpan) ||
-    !isMediaTimeMapQuality(value.quality) ||
-    !isCompactMediaTimeMapEvidence(value.evidence) ||
+    !value.spans.every((span) => isTimeMapSpan(span, version >= 12)) ||
+    !isMediaTimeMapQuality(value.quality, version >= 12) ||
+    !isCompactMediaTimeMapEvidence(value.evidence, version >= 12) ||
     (version >= 11 && !isMediaTimeMapVerificationRecordOrNull(value.verification)) ||
     !isNonEmptyString(value.engineVersion) ||
     !isNonEmptyString(value.featureVersion) ||
@@ -1123,10 +1234,13 @@ function isMediaTimeMap(value: unknown, version: number): boolean {
     return false;
   }
   const spans = value.spans as TimeMapSpan[];
+  const quality = value.quality;
+  const evidence = value.evidence as MediaTimeMap["evidence"];
   const firstSpan = spans[0];
   const lastSpan = spans[spans.length - 1];
   return (
     validateTimeMap(spans).valid &&
+    (version < 12 || quality.uniqueContentCoverage === evidence.uniqueContentCoverage) &&
     firstSpan.sourceStartMs === value.sourceStartMs &&
     firstSpan.targetStartMs === value.targetStartMs &&
     lastSpan.sourceEndMs === value.sourceEndMs &&
@@ -1215,8 +1329,8 @@ function isLowerHex(value: unknown, length: number): value is string {
   return typeof value === "string" && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
 }
 
-function isTimeMapSpan(value: unknown): boolean {
-  return (
+function isTimeMapSpan(value: unknown, requireCompleteEvidence: boolean): boolean {
+  const validCoordinates =
     isRecord(value) &&
     (value.kind === "matched" ||
       value.kind === "sourceOnly" ||
@@ -1225,7 +1339,10 @@ function isTimeMapSpan(value: unknown): boolean {
     isNonNegativeIntegerMilliseconds(value.sourceStartMs) &&
     isNonNegativeIntegerMilliseconds(value.sourceEndMs) &&
     isNonNegativeIntegerMilliseconds(value.targetStartMs) &&
-    isNonNegativeIntegerMilliseconds(value.targetEndMs)
+    isNonNegativeIntegerMilliseconds(value.targetEndMs);
+  return (
+    validCoordinates &&
+    (!requireCompleteEvidence || isCompleteTimeMapSpanEvidence(value))
   );
 }
 
@@ -1254,7 +1371,10 @@ function isMediaTimeMapStreamIdentityOrNull(value: unknown): boolean {
     : value.sampleRate === null && value.channels === null;
 }
 
-function isMediaTimeMapQuality(value: unknown): value is MediaTimeMap["quality"] {
+function isMediaTimeMapQuality(
+  value: unknown,
+  requireV12Fields: boolean
+): value is MediaTimeMap["quality"] {
   if (
     !isRecord(value) ||
     (value.level !== "verified" &&
@@ -1266,21 +1386,48 @@ function isMediaTimeMapQuality(value: unknown): value is MediaTimeMap["quality"]
       value.metricSource !== "estimated" &&
       value.metricSource !== "missing") ||
     !isUnitNumberOrNull(value.coverage) ||
+    (value.uniqueContentCoverage !== undefined &&
+      !isUnitNumberOrNull(value.uniqueContentCoverage)) ||
     !isNonNegativeIntegerMillisecondsOrNull(value.p50ResidualMs) ||
     !isNonNegativeIntegerMillisecondsOrNull(value.p95ResidualMs) ||
+    (value.p99ResidualMs !== undefined &&
+      !isNonNegativeIntegerMillisecondsOrNull(value.p99ResidualMs)) ||
     !isNonNegativeIntegerMillisecondsOrNull(value.maxResidualMs) ||
     !isNonNegativeIntegerMillisecondsOrNull(value.boundaryUncertaintyMs) ||
     !isUnitNumberOrNull(value.alternativeMargin) ||
     !isNonNegativeInteger(value.anchorCount) ||
+    (value.anchorRegionCount !== undefined &&
+      (!isNonNegativeInteger(value.anchorRegionCount) || value.anchorRegionCount > 3)) ||
     !isNonNegativeInteger(value.heldOutAnchorCount) ||
     !isNonEmptyStringArray(value.reasons)
   ) {
     return false;
   }
-  return value.heldOutAnchorCount <= value.anchorCount;
+  return (
+    (!requireV12Fields ||
+      ("uniqueContentCoverage" in value &&
+        "p99ResidualMs" in value &&
+        "anchorRegionCount" in value)) &&
+    value.heldOutAnchorCount <= value.anchorCount &&
+    (value.p50ResidualMs === undefined ||
+      value.p50ResidualMs === null ||
+      value.p95ResidualMs === undefined ||
+      value.p95ResidualMs === null ||
+      value.p50ResidualMs <= value.p95ResidualMs) &&
+    (value.p95ResidualMs === undefined ||
+      value.p95ResidualMs === null ||
+      value.p99ResidualMs === undefined ||
+      value.p99ResidualMs === null ||
+      value.p95ResidualMs <= value.p99ResidualMs) &&
+    (value.p99ResidualMs === undefined ||
+      value.p99ResidualMs === null ||
+      value.maxResidualMs === undefined ||
+      value.maxResidualMs === null ||
+      value.p99ResidualMs <= value.maxResidualMs)
+  );
 }
 
-function isCompactMediaTimeMapEvidence(value: unknown): boolean {
+function isCompactMediaTimeMapEvidence(value: unknown, requireV12Fields: boolean): boolean {
   if (
     !isRecord(value) ||
     !Array.isArray(value.types) ||
@@ -1296,11 +1443,46 @@ function isCompactMediaTimeMapEvidence(value: unknown): boolean {
     !isNonNegativeInteger(value.audioAnchorCount) ||
     !isNonNegativeInteger(value.visualAnchorCount) ||
     !isNonNegativeInteger(value.heldOutAnchorCount) ||
+    (value.top1Top2Margin !== undefined && !isUnitNumberOrNull(value.top1Top2Margin)) ||
+    (value.uniqueContentCoverage !== undefined &&
+      !isUnitNumberOrNull(value.uniqueContentCoverage)) ||
+    (value.repeatedContentOnly !== undefined &&
+      typeof value.repeatedContentOnly !== "boolean") ||
+    (value.selectedTrackReason !== undefined && typeof value.selectedTrackReason !== "string") ||
+    (value.alternativeTrackScores !== undefined &&
+      (!Array.isArray(value.alternativeTrackScores) ||
+        !value.alternativeTrackScores.every((alternative) =>
+          isMediaTimeMapTrackAlternative(alternative, requireV12Fields)
+        ))) ||
     !isStringArray(value.notes)
   ) {
     return false;
   }
-  return value.types.length > 0;
+  return (
+    value.types.length > 0 &&
+    (!requireV12Fields ||
+      ("top1Top2Margin" in value &&
+        "uniqueContentCoverage" in value &&
+        "repeatedContentOnly" in value &&
+        "selectedTrackReason" in value &&
+        "alternativeTrackScores" in value))
+  );
+}
+
+function isMediaTimeMapTrackAlternative(value: unknown, requireV12Fields: boolean): boolean {
+  return (
+    isRecord(value) &&
+    isNonNegativeInteger(value.sourceStreamIndex) &&
+    isNonNegativeInteger(value.targetStreamIndex) &&
+    isUnitNumber(value.score) &&
+    (value.scale === undefined ||
+      (typeof value.scale === "number" && Number.isFinite(value.scale) && value.scale > 0)) &&
+    (value.offsetMs === undefined ||
+      (typeof value.offsetMs === "number" && Number.isSafeInteger(value.offsetMs))) &&
+    (value.inlierCount === undefined || isNonNegativeInteger(value.inlierCount)) &&
+    (!requireV12Fields ||
+      ("scale" in value && "offsetMs" in value && "inlierCount" in value))
+  );
 }
 
 function hasValidTimeMapReferences(project: EditorProject): boolean {
@@ -1508,11 +1690,11 @@ function isSyncAnchor(value: unknown): boolean {
   );
 }
 
-function isAlignmentProposalOrNull(value: unknown): boolean {
-  return value === null || isAlignmentProposal(value);
+function isAlignmentProposalOrNull(value: unknown, version: number): boolean {
+  return value === null || isAlignmentProposal(value, version);
 }
 
-function isAlignmentProposal(value: unknown): boolean {
+function isAlignmentProposal(value: unknown, version: number): boolean {
   return (
     isRecord(value) &&
     Array.isArray(value.anchors) &&
@@ -1524,7 +1706,8 @@ function isAlignmentProposal(value: unknown): boolean {
     value.diagnostics.every((diagnostic) => typeof diagnostic === "string") &&
     (value.evidence === undefined || isAlignmentEvidence(value.evidence)) &&
     (value.matchRange === undefined || isAlignmentMatchRange(value.matchRange)) &&
-    (value.timeMap === undefined || isAlignmentTimeMapProposal(value.timeMap))
+    (value.timeMap === undefined ||
+      isAlignmentTimeMapProposal(value.timeMap, version >= 12))
   );
 }
 

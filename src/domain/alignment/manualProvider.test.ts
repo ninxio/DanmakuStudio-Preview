@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseAlignmentProposal } from "./manualProvider";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 
 describe("manual alignment provider", () => {
   it("解析合法的手动对齐提案", () => {
@@ -112,39 +113,42 @@ function createTimeMapProposal() {
       targetStartMs: 0,
       targetEndMs: 25_000,
       spans: [
-        {
+        createTestCompleteTimeMapSpan({
           kind: "matched" as const,
           sourceStartMs: 0,
           sourceEndMs: 10_000,
           targetStartMs: 0,
           targetEndMs: 10_000
-        },
-        {
+        }, "manual:span:0001"),
+        createTestCompleteTimeMapSpan({
           kind: "targetOnly" as const,
           sourceStartMs: 10_000,
           sourceEndMs: 10_000,
           targetStartMs: 10_000,
           targetEndMs: 15_000
-        },
-        {
+        }, "manual:span:0002"),
+        createTestCompleteTimeMapSpan({
           kind: "matched" as const,
           sourceStartMs: 10_000,
           sourceEndMs: 20_000,
           targetStartMs: 15_000,
           targetEndMs: 25_000
-        }
+        }, "manual:span:0003")
       ],
       quality: {
         level: "review" as const,
         probability: null,
         metricSource: "measured" as const,
         coverage: 0.9,
+        uniqueContentCoverage: 0.82,
         p50ResidualMs: 30,
         p95ResidualMs: 80,
+        p99ResidualMs: 100,
         maxResidualMs: 120,
         boundaryUncertaintyMs: 200,
         alternativeMargin: 0.2,
         anchorCount: 20,
+        anchorRegionCount: 3,
         heldOutAnchorCount: 4,
         reasons: ["尚未通过真实冻结基准。"]
       },
@@ -156,6 +160,8 @@ function createTimeMapProposal() {
         top1Top2Margin: 0.2,
         uniqueContentCoverage: 0.82,
         repeatedContentOnly: true,
+        selectedTrackReason: "测试轨道排序。",
+        alternativeTrackScores: [],
         notes: []
       },
       sourceStream: null,

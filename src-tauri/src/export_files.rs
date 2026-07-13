@@ -21,7 +21,7 @@ const MANUAL_VERIFICATION_REQUEST_DOMAIN: &str = "manual-time-map-verification-r
 const PROJECTION_DERIVATION_DOMAIN: &str = "projection-derivation-v1";
 const PROJECTION_POLICY_VERSION: &str = "source-projection-v1";
 const PROJECTION_SERIALIZER_VERSION: &str = "bilibili-xml-export-v1";
-const MEDIA_TIME_MAP_CORE_DOMAIN: &str = "media-time-map-core-v1";
+const MEDIA_TIME_MAP_CORE_DOMAIN: &str = "media-time-map-core-v2";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROJECTION_ASSETS: usize = 4_096;
 const MAX_PROJECTION_MEDIA: usize = 8_192;
@@ -206,6 +206,12 @@ struct SignedTimeMapSpan {
     source_end_ms: u64,
     target_start_ms: u64,
     target_end_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SignedVerifiedGraphQuality {
+    unique_content_coverage: f64,
+    held_out_anchor_count: u64,
 }
 
 #[derive(Debug)]
@@ -694,7 +700,10 @@ fn parse_and_validate_signed_time_map_core(
             proof.map_id
         ));
     }
+    let graph_quality = validate_signed_graph_quality(&proof.map_id, &fields[14])?;
+    validate_signed_compact_evidence(&proof.map_id, &fields[15], graph_quality)?;
     let mut spans: Vec<SignedTimeMapSpan> = Vec::with_capacity(span_values.len());
+    let mut span_ids = HashSet::with_capacity(span_values.len());
     for (span_index, value) in span_values.iter().enumerate() {
         let span_fields = value.as_array().ok_or_else(|| {
             format!(
@@ -703,20 +712,33 @@ fn parse_and_validate_signed_time_map_core(
                 span_index + 1
             )
         })?;
-        if span_fields.len() != 5 {
+        if span_fields.len() != 10 {
             return Err(format!(
                 "时间图 {} 的第 {} 个 span 字段数量无效。",
                 proof.map_id,
                 span_index + 1
             ));
         }
+        let id = required_json_string(&span_fields[0], "signed span id")?;
+        if !span_ids.insert(id.clone()) {
+            return Err(format!(
+                "时间图 {} 的第 {} 个 span id 重复。",
+                proof.map_id,
+                span_index + 1
+            ));
+        }
+        let reason = required_json_string(&span_fields[6], "signed span reason")?;
+        validate_signed_span_quality(&proof.map_id, span_index, &span_fields[7])?;
+        validate_signed_span_boundaries(&proof.map_id, span_index, &span_fields[8])?;
+        validate_signed_span_alternatives(&proof.map_id, span_index, &span_fields[9])?;
         let span = SignedTimeMapSpan {
-            kind: required_json_string(&span_fields[0], "signed span kind")?,
-            source_start_ms: safe_json_u64(&span_fields[1], "signed span sourceStartMs")?,
-            source_end_ms: safe_json_u64(&span_fields[2], "signed span sourceEndMs")?,
-            target_start_ms: safe_json_u64(&span_fields[3], "signed span targetStartMs")?,
-            target_end_ms: safe_json_u64(&span_fields[4], "signed span targetEndMs")?,
+            kind: required_json_string(&span_fields[1], "signed span kind")?,
+            source_start_ms: safe_json_u64(&span_fields[2], "signed span sourceStartMs")?,
+            source_end_ms: safe_json_u64(&span_fields[3], "signed span sourceEndMs")?,
+            target_start_ms: safe_json_u64(&span_fields[4], "signed span targetStartMs")?,
+            target_end_ms: safe_json_u64(&span_fields[5], "signed span targetEndMs")?,
         };
+        debug_assert!(!reason.is_empty());
         validate_signed_span_shape(&proof.map_id, span_index, &span)?;
         if let Some(previous) = spans.last() {
             if previous.source_end_ms != span.source_start_ms
@@ -783,6 +805,463 @@ fn validate_signed_span_shape(
         ));
     }
     Ok(())
+}
+
+fn validate_signed_graph_quality(
+    map_id: &str,
+    value: &Value,
+) -> Result<SignedVerifiedGraphQuality, String> {
+    let fields = value
+        .as_array()
+        .ok_or_else(|| format!("时间图 {map_id} 的图级 quality 不是固定数组。"))?;
+    if fields.len() != 14 {
+        return Err(format!("时间图 {map_id} 的图级 quality 字段数量无效。"));
+    }
+    let probability = safe_json_optional_unit_f64(&fields[0], "signed quality probability")?;
+    let metric_source = validate_json_enum(
+        &fields[1],
+        "signed quality metricSource",
+        &["measured", "estimated", "missing"],
+    )?;
+    let coverage = safe_json_optional_unit_f64(&fields[2], "signed quality coverage")?;
+    let unique_content_coverage =
+        safe_json_optional_unit_f64(&fields[3], "signed quality uniqueContentCoverage")?;
+    validate_residual_sequence(&fields[4..=7], "signed graph quality residuals")?;
+    let p50_residual_ms = safe_json_optional_u64(&fields[4], "signed quality p50ResidualMs")?;
+    let p95_residual_ms = safe_json_optional_u64(&fields[5], "signed quality p95ResidualMs")?;
+    let p99_residual_ms = safe_json_optional_u64(&fields[6], "signed quality p99ResidualMs")?;
+    let max_residual_ms = safe_json_optional_u64(&fields[7], "signed quality maxResidualMs")?;
+    let boundary_uncertainty_ms =
+        safe_json_optional_u64(&fields[8], "signed quality boundaryUncertaintyMs")?;
+    let alternative_margin =
+        safe_json_optional_unit_f64(&fields[9], "signed quality alternativeMargin")?;
+    let anchor_count = safe_json_u64(&fields[10], "signed quality anchorCount")?;
+    let anchor_region_count = safe_json_u64(&fields[11], "signed quality anchorRegionCount")?;
+    let held_out_anchor_count = safe_json_u64(&fields[12], "signed quality heldOutAnchorCount")?;
+    if anchor_region_count > 3 || held_out_anchor_count > anchor_count {
+        return Err(format!(
+            "时间图 {map_id} 的图级 anchorRegionCount 或 heldOutAnchorCount 无效。"
+        ));
+    }
+    validate_json_reasons(&fields[13], "signed graph quality reasons")?;
+
+    let meets_verified_contract = metric_source == "measured"
+        && probability.is_some_and(|number| number >= 0.995)
+        && coverage.is_some_and(|number| number >= 0.90)
+        && unique_content_coverage.is_some_and(|number| number >= 0.80)
+        && p50_residual_ms.is_some()
+        && p95_residual_ms.is_some_and(|milliseconds| milliseconds <= 100)
+        && p99_residual_ms.is_some_and(|milliseconds| milliseconds <= 500)
+        && max_residual_ms.is_some()
+        && boundary_uncertainty_ms.is_some_and(|milliseconds| milliseconds <= 250)
+        && alternative_margin.is_some_and(|margin| margin >= 0.25)
+        && anchor_count >= 30
+        && anchor_region_count >= 3
+        && held_out_anchor_count > 0;
+    if !meets_verified_contract {
+        return Err(format!(
+            "时间图 {map_id} 的已签图级质量低于 verified 最低契约。"
+        ));
+    }
+
+    Ok(SignedVerifiedGraphQuality {
+        unique_content_coverage: unique_content_coverage.expect("verified contract checked"),
+        held_out_anchor_count,
+    })
+}
+
+fn validate_signed_span_quality(
+    map_id: &str,
+    span_index: usize,
+    value: &Value,
+) -> Result<(), String> {
+    let fields = value.as_array().ok_or_else(|| {
+        format!(
+            "时间图 {map_id} 的第 {} 个 span quality 不是固定数组。",
+            span_index + 1
+        )
+    })?;
+    if fields.len() != 17 {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个 span quality 字段数量无效。",
+            span_index + 1
+        ));
+    }
+    let level = validate_json_enum(
+        &fields[0],
+        "signed span quality level",
+        &["verified", "review", "blocked", "legacy-unverified"],
+    )?;
+    if matches!(level, "blocked" | "legacy-unverified") {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个已签 span 仍为 {level}，不能冒充 verified 导出。",
+            span_index + 1
+        ));
+    }
+    validate_json_enum(
+        &fields[1],
+        "signed span quality metricSource",
+        &["measured", "estimated", "missing"],
+    )?;
+    safe_json_optional_unit_f64(&fields[2], "signed span probability")?;
+    safe_json_optional_unit_f64(&fields[3], "signed span coverage")?;
+    safe_json_optional_unit_f64(&fields[4], "signed span uniqueContentCoverage")?;
+    safe_json_optional_unit_f64(&fields[5], "signed span alternativeMargin")?;
+    let anchor_count = safe_json_u64(&fields[6], "signed span anchorCount")?;
+    let held_out_anchor_count = safe_json_u64(&fields[7], "signed span heldOutAnchorCount")?;
+    if held_out_anchor_count > anchor_count {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个 span heldOutAnchorCount 超过 anchorCount。",
+            span_index + 1
+        ));
+    }
+    validate_residual_sequence(&fields[8..=11], "signed span residuals")?;
+    safe_json_optional_u64(&fields[12], "signed span boundaryUncertaintyMs")?;
+    for (field, label) in [
+        (&fields[13], "signed span leftSupport"),
+        (&fields[14], "signed span rightSupport"),
+    ] {
+        validate_json_enum(
+            field,
+            label,
+            &[
+                "supported",
+                "unsupported",
+                "notApplicable",
+                "legacyUnverified",
+            ],
+        )?;
+    }
+    let signals = fields[15]
+        .as_array()
+        .filter(|signals| signals.len() == 3)
+        .ok_or_else(|| format!("时间图 {map_id} 的逐段 signals 形状无效。"))?;
+    for signal in signals {
+        validate_json_enum(
+            signal,
+            "signed span signal",
+            &["used", "blocked", "conflict"],
+        )?;
+    }
+    validate_json_reasons(&fields[16], "signed span quality reasons")
+}
+
+fn validate_signed_compact_evidence(
+    map_id: &str,
+    value: &Value,
+    graph_quality: SignedVerifiedGraphQuality,
+) -> Result<(), String> {
+    let fields = value
+        .as_array()
+        .filter(|fields| fields.len() == 10)
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 evidence 字段数量无效。"))?;
+    let evidence_types = fields[0]
+        .as_array()
+        .filter(|types| !types.is_empty())
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 evidence types 为空或无效。"))?;
+    let mut unique_types = HashSet::with_capacity(evidence_types.len());
+    for evidence_type in evidence_types {
+        let evidence_type = validate_json_enum(
+            evidence_type,
+            "signed evidence type",
+            &["audio", "visual", "manual", "danmaku", "legacy"],
+        )?;
+        if !unique_types.insert(evidence_type) {
+            return Err(format!("时间图 {map_id} 的已签 evidence types 重复。"));
+        }
+    }
+    if !unique_types.contains("manual") {
+        return Err(format!(
+            "时间图 {map_id} 的 verified proof 使用人工验证凭据，但已签核心缺少 manual 复核证据。"
+        ));
+    }
+    if unique_types.contains("legacy") {
+        return Err(format!(
+            "时间图 {map_id} 的已签核心仍含 legacy 证据，不能冒充 verified 导出。"
+        ));
+    }
+
+    let audio_anchor_count = safe_json_u64(&fields[1], "signed evidence audioAnchorCount")?;
+    let visual_anchor_count = safe_json_u64(&fields[2], "signed evidence visualAnchorCount")?;
+    let held_out_anchor_count = safe_json_u64(&fields[3], "signed evidence heldOutAnchorCount")?;
+    safe_json_optional_unit_f64(&fields[4], "signed evidence top1Top2Margin")?;
+    let unique_content_coverage =
+        safe_json_optional_unit_f64(&fields[5], "signed evidence uniqueContentCoverage")?;
+    let repeated_content_only = fields[6]
+        .as_bool()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 repeatedContentOnly 不是布尔值。"))?;
+    fields[7]
+        .as_str()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 selectedTrackReason 不是字符串。"))?;
+    fields[8]
+        .as_array()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 alternativeTrackScores 不是数组。"))?;
+    fields[9]
+        .as_array()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 evidence notes 不是数组。"))?;
+
+    if unique_types.contains("audio") && audio_anchor_count == 0 {
+        return Err(format!("时间图 {map_id} 声明 audio 证据但没有音频锚点。"));
+    }
+    if unique_types.contains("visual") && visual_anchor_count == 0 {
+        return Err(format!("时间图 {map_id} 声明 visual 证据但没有视觉锚点。"));
+    }
+    if repeated_content_only {
+        return Err(format!(
+            "时间图 {map_id} 的已签证据只有重复内容，不能满足 verified 独特内容契约。"
+        ));
+    }
+    if held_out_anchor_count != graph_quality.held_out_anchor_count
+        || unique_content_coverage != Some(graph_quality.unique_content_coverage)
+    {
+        return Err(format!(
+            "时间图 {map_id} 的已签图级质量与 evidence 留出锚点或独特内容覆盖率不一致。"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_signed_span_boundaries(
+    map_id: &str,
+    span_index: usize,
+    value: &Value,
+) -> Result<(), String> {
+    let boundaries = value
+        .as_array()
+        .filter(|boundaries| boundaries.len() == 2)
+        .ok_or_else(|| {
+            format!(
+                "时间图 {map_id} 的第 {} 个 span boundaries 形状无效。",
+                span_index + 1
+            )
+        })?;
+    for (side, boundary) in ["start", "end"].into_iter().zip(boundaries) {
+        validate_signed_boundary(map_id, span_index, side, boundary)?;
+    }
+    Ok(())
+}
+
+fn validate_signed_boundary(
+    map_id: &str,
+    span_index: usize,
+    side: &str,
+    value: &Value,
+) -> Result<(), String> {
+    let fields = value
+        .as_array()
+        .filter(|fields| fields.len() == 11)
+        .ok_or_else(|| {
+            format!(
+                "时间图 {map_id} 的第 {} 个 span {side} boundary 字段数量无效。",
+                span_index + 1
+            )
+        })?;
+    let status = validate_json_enum(
+        &fields[0],
+        "signed boundary status",
+        &[
+            "refined",
+            "ambiguous",
+            "unsupported",
+            "notApplicable",
+            "legacyUnverified",
+        ],
+    )?;
+    if !fields[1].is_null() {
+        validate_json_enum(
+            &fields[1],
+            "signed boundary axis",
+            &["source", "target", "both"],
+        )?;
+    }
+    if !fields[2].is_null() {
+        validate_json_enum(
+            &fields[2],
+            "signed boundary contextSide",
+            &["before", "after"],
+        )?;
+    }
+    let coarse_ms = safe_json_optional_u64(&fields[3], "signed boundary coarseMs")?;
+    let refined_ms = safe_json_optional_u64(&fields[4], "signed boundary refinedMs")?;
+    let uncertainty_start_ms =
+        safe_json_optional_u64(&fields[5], "signed boundary uncertaintyStartMs")?;
+    let uncertainty_end_ms =
+        safe_json_optional_u64(&fields[6], "signed boundary uncertaintyEndMs")?;
+    let support_duration_ms =
+        safe_json_optional_u64(&fields[7], "signed boundary supportDurationMs")?;
+    safe_json_optional_correlation(&fields[8], "signed boundary correlation")?;
+    safe_json_optional_unit_f64(&fields[9], "signed boundary alternativeMargin")?;
+    required_json_string(&fields[10], "signed boundary reason")?;
+    if uncertainty_start_ms.is_some() != uncertainty_end_ms.is_some()
+        || uncertainty_start_ms
+            .zip(uncertainty_end_ms)
+            .is_some_and(|(start, end)| end < start)
+    {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个 span {side} boundary 不确定区间无效。",
+            span_index + 1
+        ));
+    }
+    if status == "refined"
+        && (fields[1].is_null()
+            || coarse_ms.is_none()
+            || refined_ms.is_none()
+            || uncertainty_start_ms.is_none()
+            || uncertainty_end_ms.is_none()
+            || support_duration_ms.is_none())
+    {
+        return Err(format!(
+            "时间图 {map_id} 的第 {} 个 span {side} refined boundary 缺少实测字段。",
+            span_index + 1
+        ));
+    }
+    Ok(())
+}
+
+fn validate_signed_span_alternatives(
+    map_id: &str,
+    span_index: usize,
+    value: &Value,
+) -> Result<(), String> {
+    let alternatives = value.as_array().ok_or_else(|| {
+        format!(
+            "时间图 {map_id} 的第 {} 个 span alternatives 不是数组。",
+            span_index + 1
+        )
+    })?;
+    if alternatives.len() > 1_000_000 {
+        return Err(format!("时间图 {map_id} 的逐段 alternatives 超过上限。"));
+    }
+    for alternative in alternatives {
+        let fields = alternative
+            .as_array()
+            .filter(|fields| fields.len() == 7)
+            .ok_or_else(|| format!("时间图 {map_id} 的逐段 alternative 形状无效。"))?;
+        let kind = validate_json_enum(
+            &fields[0],
+            "signed span alternative kind",
+            &["matched", "sourceOnly", "targetOnly", "ambiguous"],
+        )?;
+        safe_json_optional_unit_f64(&fields[1], "signed span alternative score")?;
+        let source_start_ms = safe_json_u64(&fields[2], "alternative sourceStartMs")?;
+        let source_end_ms = safe_json_u64(&fields[3], "alternative sourceEndMs")?;
+        let target_start_ms = safe_json_u64(&fields[4], "alternative targetStartMs")?;
+        let target_end_ms = safe_json_u64(&fields[5], "alternative targetEndMs")?;
+        required_json_string(&fields[6], "signed span alternative reason")?;
+        if !has_valid_span_shape(
+            kind,
+            source_start_ms,
+            source_end_ms,
+            target_start_ms,
+            target_end_ms,
+            true,
+        ) {
+            return Err(format!(
+                "时间图 {map_id} 的逐段 alternative 范围或类型无效。"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn has_valid_span_shape(
+    kind: &str,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+    allow_ambiguous: bool,
+) -> bool {
+    let Some(source_duration) = source_end_ms.checked_sub(source_start_ms) else {
+        return false;
+    };
+    let Some(target_duration) = target_end_ms.checked_sub(target_start_ms) else {
+        return false;
+    };
+    match kind {
+        "matched" => source_duration > 0 && target_duration > 0,
+        "sourceOnly" => source_duration > 0 && target_duration == 0,
+        "targetOnly" => source_duration == 0 && target_duration > 0,
+        "ambiguous" => allow_ambiguous && (source_duration > 0 || target_duration > 0),
+        _ => false,
+    }
+}
+
+fn validate_residual_sequence(values: &[Value], label: &str) -> Result<(), String> {
+    if values.len() != 4 {
+        return Err(format!("高精度导出字段 {label} 数量无效。"));
+    }
+    let residuals = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| safe_json_optional_u64(value, &format!("{label}[{index}]")))
+        .collect::<Result<Vec<_>, _>>()?;
+    for pair in residuals.windows(2) {
+        if pair[0]
+            .zip(pair[1])
+            .is_some_and(|(left, right)| left > right)
+        {
+            return Err(format!("高精度导出字段 {label} 不是单调残差分位数。"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_reasons(value: &Value, label: &str) -> Result<(), String> {
+    let reasons = value
+        .as_array()
+        .filter(|reasons| !reasons.is_empty())
+        .ok_or_else(|| format!("高精度导出字段 {label} 为空或不是数组。"))?;
+    let mut unique = HashSet::with_capacity(reasons.len());
+    for reason in reasons {
+        let reason = required_json_string(reason, label)?;
+        if !unique.insert(reason) {
+            return Err(format!("高精度导出字段 {label} 包含重复原因。"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_enum<'a>(
+    value: &'a Value,
+    label: &str,
+    allowed: &[&str],
+) -> Result<&'a str, String> {
+    let text = value
+        .as_str()
+        .filter(|text| allowed.contains(text))
+        .ok_or_else(|| format!("高精度导出字段 {label} 枚举值无效。"))?;
+    Ok(text)
+}
+
+fn safe_json_optional_u64(value: &Value, label: &str) -> Result<Option<u64>, String> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        safe_json_u64(value, label).map(Some)
+    }
+}
+
+fn safe_json_optional_unit_f64(value: &Value, label: &str) -> Result<Option<f64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite() && (0.0..=1.0).contains(number))
+        .ok_or_else(|| format!("高精度导出字段 {label} 不是 0..1 有限数或 null。"))?;
+    Ok(Some(number))
+}
+
+fn safe_json_optional_correlation(value: &Value, label: &str) -> Result<Option<f64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite() && (-1.0..=1.0).contains(number))
+        .ok_or_else(|| format!("高精度导出字段 {label} 不是 -1..1 有限数或 null。"))?;
+    Ok(Some(number))
 }
 
 fn required_json_string(value: &Value, label: &str) -> Result<String, String> {
@@ -2243,6 +2722,36 @@ mod tests {
         resign_manifest(&mut ambiguous.verification);
         assert_rejected_without_write(&ambiguous, &unique, "ambiguous/未知 span");
 
+        let mut self_consistent_low_metrics = clone_request(&base);
+        let mut low_metrics_core: Value = serde_json::from_str(
+            &self_consistent_low_metrics.verification.map_proofs[0].core_canonical_json,
+        )
+        .unwrap();
+        low_metrics_core.as_array_mut().unwrap()[14]
+            .as_array_mut()
+            .unwrap()[0] = json!(0.99);
+        rebind_signed_core_and_request(&mut self_consistent_low_metrics, low_metrics_core);
+        assert_rejected_without_write(
+            &self_consistent_low_metrics,
+            &unique,
+            "低于 verified 最低契约",
+        );
+
+        let mut self_consistent_blocked_span = clone_request(&base);
+        let mut blocked_span_core: Value = serde_json::from_str(
+            &self_consistent_blocked_span.verification.map_proofs[0].core_canonical_json,
+        )
+        .unwrap();
+        blocked_span_core.as_array_mut().unwrap()[13]
+            .as_array_mut()
+            .unwrap()[0]
+            .as_array_mut()
+            .unwrap()[7]
+            .as_array_mut()
+            .unwrap()[0] = json!("blocked");
+        rebind_signed_core_and_request(&mut self_consistent_blocked_span, blocked_span_core);
+        assert_rejected_without_write(&self_consistent_blocked_span, &unique, "仍为 blocked");
+
         let mut unsigned_core_change = clone_request(&base);
         unsigned_core_change.verification.map_proofs[0]
             .core_canonical_json
@@ -2268,6 +2777,53 @@ mod tests {
             .request_digest = sha256_digest(b"[]");
         resign_manifest(&mut forged_request.verification);
         assert_rejected_without_write(&forged_request, &unique, "未绑定当前 map/revision/core");
+
+        fs::remove_dir_all(unique).unwrap();
+    }
+
+    #[test]
+    fn signed_v2_core_rejects_incomplete_span_evidence_and_optimistic_p99() {
+        let unique = tempfile_like_path("danmaku-export-v2-span-evidence");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+        let (source_path, target_path, source_identity, target_identity) =
+            create_media_pair(&unique);
+        let request = verified_request(
+            &unique,
+            &source_path,
+            &target_path,
+            source_identity,
+            target_identity,
+        );
+        let mut proof = request.verification.map_proofs[0].clone();
+        let original: Value = serde_json::from_str(&proof.core_canonical_json).unwrap();
+
+        let mut incomplete = original.clone();
+        incomplete.as_array_mut().unwrap()[13]
+            .as_array_mut()
+            .unwrap()[0]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        proof.core_canonical_json = serde_json::to_string(&incomplete).unwrap();
+        proof.core_digest = sha256_digest(proof.core_canonical_json.as_bytes());
+        assert!(parse_and_validate_signed_time_map_core(&proof)
+            .unwrap_err()
+            .contains("span 字段数量无效"));
+
+        let mut optimistic_p99 = original;
+        optimistic_p99.as_array_mut().unwrap()[13]
+            .as_array_mut()
+            .unwrap()[0]
+            .as_array_mut()
+            .unwrap()[7]
+            .as_array_mut()
+            .unwrap()[10] = json!(5);
+        proof.core_canonical_json = serde_json::to_string(&optimistic_p99).unwrap();
+        proof.core_digest = sha256_digest(proof.core_canonical_json.as_bytes());
+        assert!(parse_and_validate_signed_time_map_core(&proof)
+            .unwrap_err()
+            .contains("不是单调残差分位数"));
 
         fs::remove_dir_all(unique).unwrap();
     }
@@ -2414,9 +2970,91 @@ mod tests {
             1000,
             0,
             1000,
-            [["matched", 0, 1000, 0, 1000]],
-            [],
-            [],
+            [[
+                "span-1-matched-0-1000-0-1000",
+                "matched",
+                0,
+                1000,
+                0,
+                1000,
+                "fixture matched span",
+                [
+                    "verified",
+                    "measured",
+                    0.995,
+                    1.0,
+                    1.0,
+                    1.0,
+                    30,
+                    6,
+                    10,
+                    20,
+                    30,
+                    40,
+                    0,
+                    "supported",
+                    "supported",
+                    ["used", "blocked", "blocked"],
+                    ["fixture span evidence"]
+                ],
+                [
+                    [
+                        "notApplicable",
+                        "both",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        0,
+                        null,
+                        null,
+                        "fixture start boundary"
+                    ],
+                    [
+                        "notApplicable",
+                        "both",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        0,
+                        null,
+                        null,
+                        "fixture end boundary"
+                    ]
+                ],
+                []
+            ]],
+            [
+                0.995,
+                "measured",
+                1.0,
+                1.0,
+                10,
+                20,
+                30,
+                40,
+                0,
+                1.0,
+                30,
+                3,
+                6,
+                ["fixture graph evidence"]
+            ],
+            [
+                ["audio", "manual"],
+                30,
+                0,
+                6,
+                1.0,
+                1.0,
+                false,
+                "fixture track",
+                [],
+                ["fixture"]
+            ],
             "fixture-engine-v1",
             "fixture-feature-v1",
             "sha256:fixture-parameters"
@@ -2585,6 +3223,19 @@ mod tests {
             serde_json::to_string(&canonical_verified_export_manifest(verification).unwrap())
                 .unwrap();
         verification.snapshot_digest = sha256_digest(verification.manifest_json.as_bytes());
+    }
+
+    fn rebind_signed_core_and_request(request: &mut SaveVerifiedExportFileRequest, core: Value) {
+        let proof = &mut request.verification.map_proofs[0];
+        proof.core_canonical_json = serde_json::to_string(&core).unwrap();
+        proof.core_digest = sha256_digest(proof.core_canonical_json.as_bytes());
+        let mut manual_request: Value =
+            serde_json::from_str(&proof.manual_verification.request_payload).unwrap();
+        manual_request.as_array_mut().unwrap()[4] = json!(proof.core_digest);
+        proof.manual_verification.request_payload = serde_json::to_string(&manual_request).unwrap();
+        proof.manual_verification.request_digest =
+            sha256_digest(proof.manual_verification.request_payload.as_bytes());
+        resign_manifest(&mut request.verification);
     }
 
     fn clone_request(request: &SaveVerifiedExportFileRequest) -> SaveVerifiedExportFileRequest {

@@ -22,6 +22,8 @@ import {
   assessMediaTimeMapVerification
 } from "../../domain/alignment/mediaTimeMap";
 import {
+  isCompleteTimeMapSpanEvidence,
+  normalizeLegacyUnverifiedTimeMapSpanEvidence,
   validateTimeMap,
   type TimeMapSpan,
   type TimeMapSpanKind
@@ -1036,25 +1038,32 @@ function createLegacyGlobalBlockTimeMap(
     targetStartMs: candidate.targetStartMs,
     targetEndMs: candidate.targetEndMs,
     spans: [
-      {
+      normalizeLegacyUnverifiedTimeMapSpanEvidence({
         kind: "ambiguous",
         sourceStartMs: candidate.sourceStartMs,
         sourceEndMs: candidate.sourceEndMs,
         targetStartMs: candidate.targetStartMs,
         targetEndMs: candidate.targetEndMs
-      }
+      }, {
+        id: `${candidate.id}:global-guard:span:0001`,
+        blocked: true,
+        reason
+      })
     ],
     quality: {
       level: "blocked",
       probability: null,
       metricSource: coverage === null ? "missing" : "estimated",
       coverage,
+      uniqueContentCoverage: null,
       p50ResidualMs: null,
       p95ResidualMs: null,
+      p99ResidualMs: null,
       maxResidualMs: null,
       boundaryUncertaintyMs: null,
       alternativeMargin: null,
       anchorCount: candidate.proposal.anchors.length,
+      anchorRegionCount: 0,
       heldOutAnchorCount: 0,
       reasons: [reason]
     },
@@ -1064,6 +1073,10 @@ function createLegacyGlobalBlockTimeMap(
       visualAnchorCount: 0,
       heldOutAnchorCount: 0,
       top1Top2Margin: null,
+      uniqueContentCoverage: null,
+      repeatedContentOnly: false,
+      selectedTrackReason: "旧式全局保护候选没有可信音轨选择证据。",
+      alternativeTrackScores: [],
       notes: [reason]
     },
     sourceStream: null,
@@ -1642,9 +1655,16 @@ function TimeMapQualitySummary({
             </div>
             <div>
               覆盖率：{formatQualityRatio(timeMap.quality.coverage)} · P95 残差：
-              {formatQualityMilliseconds(timeMap.quality.p95ResidualMs)} · 边界不确定度：
+              {formatQualityMilliseconds(timeMap.quality.p95ResidualMs)} · P99 残差：
+              {formatQualityMilliseconds(timeMap.quality.p99ResidualMs ?? null)} · 最大残差：
+              {formatQualityMilliseconds(timeMap.quality.maxResidualMs)} · 边界不确定度：
               {formatQualityMilliseconds(timeMap.quality.boundaryUncertaintyMs)} · Top1/Top2
               差距：{formatQualityRatio(timeMap.quality.alternativeMargin)}
+            </div>
+            <div>
+              独特内容覆盖：{formatQualityRatio(timeMap.quality.uniqueContentCoverage ?? null)} · 锚点：
+              {timeMap.quality.anchorCount}（真实留出 {timeMap.quality.heldOutAnchorCount}） ·
+              全片支持区域：{timeMap.quality.anchorRegionCount ?? 0}/3
             </div>
             <div>
               时间图片段：matched {spanCounts.matched} · sourceOnly {spanCounts.sourceOnly} ·
@@ -1883,7 +1903,7 @@ function TimeMapReview({
 
         <ol className="grid gap-1.5" aria-label="时间图分段复核列表">
           {timeMap.spans.map((span, spanIndex) => (
-            <li key={`${timeMap.id}-review-span-${spanIndex}`}>
+            <li key={`${timeMap.id}-review-span-${span.id ?? spanIndex}`}>
               <button
                 type="button"
                 className={`grid w-full gap-1 rounded border px-2.5 py-2 text-left text-slate-300 transition-colors hover:border-slate-500 hover:bg-white/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan ${
@@ -1907,11 +1927,7 @@ function TimeMapReview({
                   参考 {formatTimeMapRange(span.sourceStartMs, span.sourceEndMs)} ↔ 原片{" "}
                   {formatTimeMapRange(span.targetStartMs, span.targetEndMs)}
                 </span>
-                <span className="text-slate-500">
-                  边界不确定度：
-                  {formatQualityMilliseconds(timeMap.quality.boundaryUncertaintyMs)} · P95
-                  残差：{formatQualityMilliseconds(timeMap.quality.p95ResidualMs)}
-                </span>
+                <TimeMapSpanEvidenceSummary span={span} />
                 {span.kind === "ambiguous" ? (
                   <span className="text-red-200">
                     阻断原因：{blockingReason ?? "这一段无法唯一判断，不能安全投影弹幕。"}
@@ -1934,6 +1950,82 @@ function TimeMapReview({
       </div>
     </details>
   );
+}
+
+function TimeMapSpanEvidenceSummary({ span }: { span: TimeMapSpan }) {
+  if (!isCompleteTimeMapSpanEvidence(span)) {
+    return (
+      <span className="text-red-200">
+        逐段证据缺失：当前只知道坐标，不能用整图平均值冒充这一段的准确度。
+      </span>
+    );
+  }
+  const quality = span.quality;
+  const startBoundary = span.boundaries.start;
+  const endBoundary = span.boundaries.end;
+  return (
+    <span className="grid gap-0.5 text-slate-500" data-testid={`time-map-span-evidence-${span.id}`}>
+      <span>
+        逐段 P95 / P99 / 最大残差：{formatQualityMilliseconds(quality.p95ResidualMs)} /{" "}
+        {formatQualityMilliseconds(quality.p99ResidualMs)} /{" "}
+        {formatQualityMilliseconds(quality.maxResidualMs)} · 锚点 {quality.anchorCount}（真实留出{" "}
+        {quality.heldOutAnchorCount}）
+      </span>
+      <span>
+        边界不确定度：{formatQualityMilliseconds(quality.boundaryUncertaintyMs)} · 左右支持：
+        {formatTimeMapSupportStatus(quality.leftSupport)} /{" "}
+        {formatTimeMapSupportStatus(quality.rightSupport)}
+      </span>
+      <span>
+        起点 {formatTimeMapBoundaryEvidence(startBoundary)}；终点{" "}
+        {formatTimeMapBoundaryEvidence(endBoundary)}
+      </span>
+      <span>
+        证据：音频 {formatTimeMapSignalStatus(quality.signals.audio)} · 视觉{" "}
+        {formatTimeMapSignalStatus(quality.signals.visual)} · 弹幕辅助{" "}
+        {formatTimeMapSignalStatus(quality.signals.danmaku)} · 原因 {span.reason}
+      </span>
+    </span>
+  );
+}
+
+function formatTimeMapSupportStatus(status: NonNullable<TimeMapSpan["quality"]>["leftSupport"]): string {
+  if (status === "supported") return "已支持";
+  if (status === "unsupported") return "缺少支持";
+  if (status === "legacyUnverified") return "旧项目未记录";
+  return "不适用";
+}
+
+function formatTimeMapSignalStatus(
+  status: NonNullable<TimeMapSpan["quality"]>["signals"]["audio"]
+): string {
+  if (status === "used") return "已使用";
+  if (status === "conflict") return "冲突";
+  return "不可用";
+}
+
+function formatTimeMapBoundaryEvidence(
+  boundary: NonNullable<TimeMapSpan["boundaries"]>["start"]
+): string {
+  const status =
+    boundary.status === "refined"
+      ? "已精修"
+      : boundary.status === "ambiguous"
+        ? "仍有歧义"
+        : boundary.status === "unsupported"
+          ? "缺少共同内容"
+          : boundary.status === "legacyUnverified"
+            ? "旧项目未记录"
+            : "不适用";
+  const support =
+    boundary.supportDurationMs === null
+      ? ""
+      : `，稳定支持 ${formatQualityMilliseconds(boundary.supportDurationMs)}`;
+  const uncertainty =
+    boundary.uncertaintyStartMs === null || boundary.uncertaintyEndMs === null
+      ? ""
+      : `，候选 ${formatTimeMapRange(boundary.uncertaintyStartMs, boundary.uncertaintyEndMs)}`;
+  return `${status}${support}${uncertainty}`;
 }
 
 const TIME_MAP_REVIEW_DECISIONS: readonly TimeMapSpanReviewDecision[] = [

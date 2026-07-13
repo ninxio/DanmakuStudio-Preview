@@ -68,6 +68,84 @@ test.beforeEach(async ({ page }) => {
             targetEndMs: 61_000
           }
         ];
+        const completeSpan = (span: (typeof fourKindSpans)[number], spanIndex: number) => {
+          const isMatched = span.kind === "matched";
+          const isSourceOnly = span.kind === "sourceOnly";
+          const isTargetOnly = span.kind === "targetOnly";
+          const boundaryAxis = isSourceOnly ? "source" : isTargetOnly ? "target" : "both";
+          const boundaryStatus = isMatched
+            ? "notApplicable"
+            : span.kind === "ambiguous"
+              ? "ambiguous"
+              : "unsupported";
+          const boundaryCoordinate = (side: "start" | "end") => {
+            if (isSourceOnly) {
+              return side === "start" ? span.sourceStartMs : span.sourceEndMs;
+            }
+            if (isTargetOnly) {
+              return side === "start" ? span.targetStartMs : span.targetEndMs;
+            }
+            return null;
+          };
+          const boundary = (side: "start" | "end") => ({
+            status: boundaryStatus,
+            axis: boundaryAxis,
+            contextSide: isMatched || span.kind === "ambiguous" ? null : side === "start" ? "before" : "after",
+            coarseMs: boundaryCoordinate(side),
+            refinedMs: null,
+            uncertaintyStartMs: null,
+            uncertaintyEndMs: null,
+            supportDurationMs: 0,
+            correlation: null,
+            alternativeMargin: null,
+            reason: isMatched
+              ? "E2E 共同内容段不声明版本差异边界。"
+              : "E2E 没有真实媒体边界测量，必须人工复核。"
+          });
+          return {
+            ...span,
+            id: `e2e-map-${currentIndex + 1}:span:${String(spanIndex + 1).padStart(4, "0")}`,
+            reason: span.kind === "ambiguous" ? "insufficientEvidence" : "e2eMeasured",
+            quality: {
+              level: span.kind === "ambiguous" ? "blocked" : "review",
+              metricSource: "measured",
+              probability: null,
+              coverage: isMatched ? 0.96 : 0.72,
+              uniqueContentCoverage: 0.9,
+              alternativeMargin: 0.32,
+              anchorCount: isMatched ? 12 : 4,
+              heldOutAnchorCount: isMatched ? 3 : 1,
+              p50ResidualMs: 35,
+              p95ResidualMs: 80,
+              p99ResidualMs: 120,
+              maxResidualMs: 140,
+              boundaryUncertaintyMs: 180,
+              leftSupport: isMatched ? "supported" : "unsupported",
+              rightSupport: isMatched ? "supported" : "unsupported",
+              signals: { audio: "used", visual: "used", danmaku: "blocked" },
+              reasons: [
+                span.kind === "ambiguous"
+                  ? "E2E 保留无法判断段，必须人工分类。"
+                  : "E2E 逐段证据仅用于验证产品门禁。"
+              ]
+            },
+            boundaries: { start: boundary("start"), end: boundary("end") },
+            alternatives:
+              span.kind === "ambiguous"
+                ? [
+                    {
+                      kind: "ambiguous",
+                      score: 0.48,
+                      sourceStartMs: span.sourceStartMs,
+                      sourceEndMs: span.sourceEndMs,
+                      targetStartMs: span.targetStartMs,
+                      targetEndMs: span.targetEndMs,
+                      reason: "E2E 无法区分删减与替换。"
+                    }
+                  ]
+                : []
+          };
+        };
         return {
           sourceStartMs,
           sourceEndMs,
@@ -75,7 +153,7 @@ test.beforeEach(async ({ page }) => {
           targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
           spans:
             currentIndex === 0
-              ? fourKindSpans
+              ? fourKindSpans.map(completeSpan)
               : [
                   {
                     kind: "matched",
@@ -84,18 +162,21 @@ test.beforeEach(async ({ page }) => {
                     targetStartMs: 0,
                     targetEndMs: 60_000
                   }
-                ],
+                ].map(completeSpan),
           quality: {
             level: currentIndex === 0 ? "blocked" : "review",
             probability: null,
             metricSource: "measured",
             coverage: currentIndex === 0 ? 0.72 : 0.96,
+            uniqueContentCoverage: 0.94,
             p50ResidualMs: 35,
             p95ResidualMs: 80,
+            p99ResidualMs: 120,
             maxResidualMs: 140,
             boundaryUncertaintyMs: 180,
             alternativeMargin: 0.32,
-            anchorCount: 24,
+            anchorCount: 36,
+            anchorRegionCount: 3,
             heldOutAnchorCount: 6,
             reasons:
               currentIndex === 0
@@ -112,8 +193,22 @@ test.beforeEach(async ({ page }) => {
             repeatedContentOnly: false,
             selectedTrackReason: "国语音轨覆盖完整且残差最低。",
             alternativeTrackScores: [
-              { sourceStreamIndex: 1, targetStreamIndex: 2, score: 0.92 },
-              { sourceStreamIndex: 1, targetStreamIndex: 3, score: 0.6 }
+              {
+                sourceStreamIndex: 1,
+                targetStreamIndex: 2,
+                score: 0.92,
+                scale: 1,
+                offsetMs: -sourceStartMs,
+                inlierCount: 36
+              },
+              {
+                sourceStreamIndex: 1,
+                targetStreamIndex: 3,
+                score: 0.6,
+                scale: 1,
+                offsetMs: -sourceStartMs + 5_000,
+                inlierCount: 18
+              }
             ],
             notes: []
           },

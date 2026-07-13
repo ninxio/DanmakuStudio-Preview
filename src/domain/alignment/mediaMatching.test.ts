@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AlignmentProposal } from "./types";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import { createEmptyProject } from "../project/factory";
 import { createDanmakuSourceBinding } from "../project/mediaLibrary";
 import { createDanmakuSourceSegment } from "../project/sourceTimeline";
@@ -209,6 +210,92 @@ describe("media matching candidates", () => {
       sourceRangeEndMs: 51_000
     });
     expect(candidate.timingRules[0].sourceAtMs).toBe(50_000);
+  });
+
+  it("整体平移 v12 时间图时按双轴同步平移逐段边界和备选路径", () => {
+    const project = createMatchingProject();
+    const timeMap = createVerifiedTimeMapProposal();
+    const firstSpan = timeMap.spans[0];
+    const editSpan = timeMap.spans[1];
+    if (!firstSpan?.boundaries || !editSpan?.boundaries) {
+      throw new Error("测试时间图缺少完整逐段边界证据。");
+    }
+    firstSpan.boundaries.start = {
+      status: "refined",
+      axis: "source",
+      contextSide: "before",
+      coarseMs: 10_000,
+      refinedMs: 10_100,
+      uncertaintyStartMs: 10_050,
+      uncertaintyEndMs: 10_150,
+      supportDurationMs: 5_000,
+      correlation: 0.9,
+      alternativeMargin: 0.4,
+      reason: "参考轴边界测试证据。"
+    };
+    firstSpan.alternatives = [
+      {
+        kind: "matched",
+        score: 0.8,
+        sourceStartMs: 11_000,
+        sourceEndMs: 39_000,
+        targetStartMs: 31_000,
+        targetEndMs: 62_000,
+        reason: "备选路径测试证据。"
+      }
+    ];
+    editSpan.boundaries.start = {
+      status: "refined",
+      axis: "target",
+      contextSide: "before",
+      coarseMs: 63_000,
+      refinedMs: 63_100,
+      uncertaintyStartMs: 63_050,
+      uncertaintyEndMs: 63_150,
+      supportDurationMs: 5_000,
+      correlation: 0.9,
+      alternativeMargin: 0.4,
+      reason: "目标轴边界测试证据。"
+    };
+    project.mediaMatchCandidates = [
+      createMediaMatchCandidate(project, {
+        id: "candidate-v12-shift",
+        batchId: "batch",
+        sourceMediaId: "source-1",
+        targetMediaId: "target-1",
+        proposal: {
+          ...createProposal({ targetStartMs: 30_000, targetEndMs: 95_000 }),
+          timeMap
+        }
+      })
+    ];
+
+    const updated = updateMediaMatchCandidateRange(project, "candidate-v12-shift", {
+      sourceStartMs: 20_000,
+      sourceEndMs: 80_000,
+      targetStartMs: 50_000,
+      targetEndMs: 115_000
+    });
+    const shiftedSpans = updated.mediaMatchCandidates[0].proposal.timeMap?.spans;
+
+    expect(shiftedSpans?.[0]?.boundaries?.start).toMatchObject({
+      coarseMs: 20_000,
+      refinedMs: 20_100,
+      uncertaintyStartMs: 20_050,
+      uncertaintyEndMs: 20_150
+    });
+    expect(shiftedSpans?.[1]?.boundaries?.start).toMatchObject({
+      coarseMs: 83_000,
+      refinedMs: 83_100,
+      uncertaintyStartMs: 83_050,
+      uncertaintyEndMs: 83_150
+    });
+    expect(shiftedSpans?.[0]?.alternatives?.[0]).toMatchObject({
+      sourceStartMs: 21_000,
+      sourceEndMs: 49_000,
+      targetStartMs: 51_000,
+      targetEndMs: 82_000
+    });
   });
 
   it("只调整范围边界时保留范围内证据，并排除被裁出的旧证据", () => {
@@ -602,7 +689,7 @@ describe("media matching candidates", () => {
     const projection = projectDanmakuToTargets(project);
     expect(projection.status).toBe("blocked");
     expect(projection.groups).toEqual([]);
-    expect(projection.issues.some((issue) => issue.message.includes("未经验证"))).toBe(true);
+    expect(projection.issues.some((issue) => issue.message.includes("旧版未验证"))).toBe(true);
   });
 
   it("Alignment V2 候选保留分段仿射图，但没有校准 record 时不能伪装 verified 导出", () => {
@@ -829,39 +916,42 @@ function createVerifiedTimeMapProposal(): NonNullable<AlignmentProposal["timeMap
     targetStartMs: 30_000,
     targetEndMs: 95_000,
     spans: [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 10_000,
         sourceEndMs: 40_000,
         targetStartMs: 30_000,
         targetEndMs: 63_000
-      },
-      {
+      }, "verified-proposal:span:0001"),
+      createTestCompleteTimeMapSpan({
         kind: "targetOnly",
         sourceStartMs: 40_000,
         sourceEndMs: 40_000,
         targetStartMs: 63_000,
         targetEndMs: 68_000
-      },
-      {
+      }, "verified-proposal:span:0002"),
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 40_000,
         sourceEndMs: 70_000,
         targetStartMs: 68_000,
         targetEndMs: 95_000
-      }
+      }, "verified-proposal:span:0003")
     ],
     quality: {
       level: "verified",
       probability: 0.999,
       metricSource: "measured",
       coverage: 0.96,
+      uniqueContentCoverage: 0.9,
       p50ResidualMs: 25,
       p95ResidualMs: 80,
+      p99ResidualMs: 120,
       maxResidualMs: 140,
       boundaryUncertaintyMs: 180,
       alternativeMargin: 0.4,
       anchorCount: 40,
+      anchorRegionCount: 3,
       heldOutAnchorCount: 8,
       reasons: ["测试中的独立音画证据已验证。"]
     },
@@ -871,6 +961,10 @@ function createVerifiedTimeMapProposal(): NonNullable<AlignmentProposal["timeMap
       visualAnchorCount: 8,
       heldOutAnchorCount: 8,
       top1Top2Margin: 0.4,
+      uniqueContentCoverage: 0.9,
+      repeatedContentOnly: false,
+      selectedTrackReason: "测试轨道排序。",
+      alternativeTrackScores: [],
       notes: ["测试证据"]
     },
     sourceStream: createAlignmentAudioStreamIdentity(0),

@@ -3,7 +3,7 @@ import type { AlignmentProposal } from "../alignment/types";
 import type { TimeMapSpan } from "../alignment/timeMap";
 import type { Milliseconds } from "../shared/time";
 
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 export interface MediaReference {
   id: string;
@@ -166,14 +166,28 @@ export interface MediaTimeMapQuality {
   probability: number | null;
   metricSource: MediaTimeMapMetricSource;
   coverage: number | null;
+  uniqueContentCoverage?: number | null;
   p50ResidualMs: Milliseconds | null;
   p95ResidualMs: Milliseconds | null;
+  /** v12 项目必填；旧内存夹具省略时按缺失处理。 */
+  p99ResidualMs?: Milliseconds | null;
   maxResidualMs: Milliseconds | null;
   boundaryUncertaintyMs: Milliseconds | null;
   alternativeMargin: number | null;
   anchorCount: number;
+  /** v12 项目必填；覆盖开头、中段、结尾时为 3。 */
+  anchorRegionCount?: number;
   heldOutAnchorCount: number;
   reasons: string[];
+}
+
+export interface MediaTimeMapTrackAlternative {
+  sourceStreamIndex: number;
+  targetStreamIndex: number;
+  score: number;
+  scale?: number;
+  offsetMs?: number;
+  inlierCount?: number;
 }
 
 export interface CompactMediaTimeMapEvidence {
@@ -181,6 +195,11 @@ export interface CompactMediaTimeMapEvidence {
   audioAnchorCount: number;
   visualAnchorCount: number;
   heldOutAnchorCount: number;
+  top1Top2Margin?: number | null;
+  uniqueContentCoverage?: number | null;
+  repeatedContentOnly?: boolean;
+  selectedTrackReason?: string;
+  alternativeTrackScores?: MediaTimeMapTrackAlternative[];
   notes: string[];
 }
 
@@ -270,7 +289,7 @@ export interface MediaTimeMap {
   spans: TimeMapSpan[];
   quality: MediaTimeMapQuality;
   evidence: CompactMediaTimeMapEvidence;
-  /** v11 验证凭据；null 表示尚无可信校准/人工复核闭环。 */
+  /** v12 验证凭据；null 表示尚无可信校准/人工复核闭环。 */
   verification: MediaTimeMapVerificationRecord | null;
   engineVersion: string;
   featureVersion: string;

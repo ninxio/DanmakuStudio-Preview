@@ -87,12 +87,18 @@ export interface AlignmentTimeMapQuality {
   probability: number | null;
   metricSource: "measured" | "estimated" | "missing";
   coverage: number | null;
+  /** v12 图级独特内容覆盖率，必须与 evidence 中同值。 */
+  uniqueContentCoverage?: number | null;
   p50ResidualMs: number | null;
   p95ResidualMs: number | null;
+  /** Alignment V2 v12 响应必填；旧夹具省略时按缺失处理。 */
+  p99ResidualMs?: number | null;
   maxResidualMs: number | null;
   boundaryUncertaintyMs: number | null;
   alternativeMargin: number | null;
   anchorCount: number;
+  /** Alignment V2 v12 响应必填；0..3 个时间区域。 */
+  anchorRegionCount?: number;
   heldOutAnchorCount: number;
   reasons: string[];
 }
@@ -101,6 +107,9 @@ export interface AlignmentTrackAlternative {
   sourceStreamIndex: number;
   targetStreamIndex: number;
   score: number;
+  scale?: number;
+  offsetMs?: number;
+  inlierCount?: number;
 }
 
 export interface AlignmentTimeMapEvidence {

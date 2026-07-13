@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { migrateLegacyTimeMap, type TimeMapSpan } from "../alignment/timeMap";
 import { applyTestManualMediaTimeMapVerification as applyManualMediaTimeMapVerification } from "../../test/manualVerification";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import type { DanmakuAsset, DanmakuItem } from "../danmaku/types";
 import { createEmptyProject } from "../project/factory";
 import { createDanmakuSourceBinding } from "../project/mediaLibrary";
@@ -139,18 +140,26 @@ function attachTimeMap(
     sourceEndMs: segment.sourceEndMs,
     targetStartMs: segment.targetStartMs ?? 0,
     targetEndMs: lastSpan.targetEndMs,
-    spans,
+    spans: spans.map((span, spanIndex) =>
+      createTestCompleteTimeMapSpan(
+        span,
+        `time_map_${segment.id}:span:${String(spanIndex + 1).padStart(4, "0")}`
+      )
+    ),
     quality: {
       level: qualityLevel,
       probability: qualityLevel === "verified" ? 0.999 : null,
       metricSource: "measured",
       coverage: 0.98,
+      uniqueContentCoverage: 0.9,
       p50ResidualMs: 20,
       p95ResidualMs: 50,
+      p99ResidualMs: 70,
       maxResidualMs: 90,
       boundaryUncertaintyMs: 100,
       alternativeMargin: 0.5,
-      anchorCount: 20,
+      anchorCount: 30,
+      anchorRegionCount: 3,
       heldOutAnchorCount: 5,
       reasons: []
     },
@@ -159,6 +168,11 @@ function attachTimeMap(
       audioAnchorCount: 20,
       visualAnchorCount: 20,
       heldOutAnchorCount: 5,
+      top1Top2Margin: 0.5,
+      uniqueContentCoverage: 0.9,
+      repeatedContentOnly: false,
+      selectedTrackReason: "测试轨道。",
+      alternativeTrackScores: [],
       notes: []
     },
     verification: null,

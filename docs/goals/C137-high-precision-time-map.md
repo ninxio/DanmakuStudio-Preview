@@ -13,6 +13,8 @@
 
 当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、完整 C137 acceptance bundle 的 fail-closed 聚合器、A/B 播放复核证据 v2，以及 native/raw/acceptance 性能证据链第五阶段。性能链现已具备原生独占 session、strict performance raw evidence v2、acceptance protocol v3 / performance report v3、匹配页工程采集入口与 manifest 工作负载绑定；它能从生产调用链记录 session-relative 单调时钟、真实阶段边界、冷/热缓存、取消终态和应用进程树 working set，并在任何工具探测前固定全部 workload media、逐 distinct 文件完整哈希、按实际卷生成 path-free storage receipt。Windows 一次性媒体工具仍由独立 lifecycle Job Object 挂起创建、入 Job 后恢复并有界清理；普通对齐 run 的 source/target media lease、run-start/run-final SHA、TimeMap identity、frame/packet PTS、缓存和音画证据继续绑定同一全文件身份。
 
+当前生产工程模型已升级为 schema v12 / `media-time-map-core-v2`：每个 span 保存稳定 ID、独立训练/真实留出锚点统计、p50/p95/p99/max 残差、独特内容覆盖、左右支持、结构化边界不确定区间、失败原因和备选路径。留出观测在 seed、拟合、排序和 refit 前分区，逐段证据缺失或 blocked 时投影与 verified export 失败关闭；旧项目只会保守补成 `legacy-unverified`，不会从图级平均值伪造逐段测量。
+
 这些能力解决的是“怎样盲跑生产算法、怎样安全拥有和清理媒体进程树、怎样把实际媒体卷绑定到性能记录、怎样防止改字符串/自摘要/跨 workload 复用冒充完整验收”，不代表真实准确率或正式性能验收已经通过。实际 `workload-media-volumes` 回执已经完成，但 lifecycle Job 只负责执行与清理；当前 raw v2 仍如实声明 `windows-toolhelp-working-set-v1`，`assurance` 中的 Job memory、terminal cleanup 与 native attestation 仍为空。故该产物继续固定为 `releaseEligible=false` 的 engineering raw。当前获授权且完成运行的真实冻结关系数仍为 0；实测校准、批准协议与外部信任根、规定目标机的正式性能测量、20 套北极星长合集和真实媒体回归均未完成。
 
 ## 产品目标
@@ -86,9 +88,9 @@ P0 的完成不代表对齐变准确，只代表产品不再把未经验证的�
 6. 自动候选与已确认映射严格分离；候选变化不得静默改写已确认映射。
 7. 原始高体积音视频特征只保存在可重建缓存中；项目文件只保存紧凑时间图、证据摘要、素材签名和算法版本。
 
-## Schema v11：分段仿射 TimeMap 与验证来源
+## Schema v12：分段仿射 TimeMap、验证来源与逐段证据
 
-v10 首次新增 `mediaTimeMaps`，把时间关系从 `DanmakuSourceSegment.targetStartMs + timingRules` 升级为可表达双边编辑和连续伸缩的正式模型；v11 进一步新增验证来源记录，防止外部项目仅靠自报指标伪装成 `verified`。`MediaMatchCandidate` 保存候选 TimeMap；用户接受后生成不可变的已确认 revision，来源段通过 `timeMapId` 引用它。
+v10 首次新增 `mediaTimeMaps`，把时间关系从 `DanmakuSourceSegment.targetStartMs + timingRules` 升级为可表达双边编辑和连续伸缩的正式模型；v11 进一步新增验证来源记录，防止外部项目仅靠自报指标伪装成 `verified`；v12 为每个 span 增加稳定身份、独立质量、边界与 alternatives，禁止用图级平均值掩盖局部失败。`MediaMatchCandidate` 保存候选 TimeMap；用户接受后生成不可变的已确认 revision，来源段通过 `timeMapId` 引用它。
 
 `verified` 不是一个可由项目 JSON 自由填写的标签。v11 的验证记录必须绑定规范化时间图摘要、revision、双端媒体身份、验证方式和校准产物版本；摘要或身份不匹配、自动校准产物不在内置受信清单、人工记录不是由当前运行时明确签发时，一律降为 `review`。在真实冻结集和受信校准产物尚未形成前，自动校准白名单保持为空。
 
@@ -188,7 +190,7 @@ interface AmbiguousTimeMapSpan {
 - 校准后的质量等级和概率；
 - Top-1/Top-2 候选差距；
 - 锚点数量、时间覆盖率和独特内容覆盖率；
-- 拟合/保留验证锚点的 p50、p95、最大残差；
+- 训练/真实留出锚点数量，以及留出观测的 p50、p95、p99、最大残差；
 - 边界左右支持时长和不确定范围；
 - 音频、视觉、弹幕辅助信号各自的 `used` / `blocked` / `conflict`；
 - 阻塞原因码，不以一个平均 confidence 掩盖局部失败。
@@ -353,7 +355,7 @@ A/B 复核不再以“用户点过播放按钮”作为完成证据，而是按�
 
 导出页需按目标显示：“使用 4 个 matched span、2 处原片多出内容、1 处参考片头已忽略，验证残差 p95 126ms”，而不是只显示累计补偿秒数。
 
-## v9 → v10 → v11 迁移
+## v9 → v10 → v11 → v12 迁移
 
 迁移必须保留数据且诚实表达信息损失：
 
@@ -363,9 +365,10 @@ A/B 复核不再以“用户点过播放按钮”作为完成证据，而是按�
 4. 负 gap、零长度、越界、来源不明或无法恢复插入区间的旧规则不得伪造精确 `sourceOnly`；保留旧值并生成 `ambiguous:legacyRule` 或阻塞的兼容记录，要求重新分析/人工转换。
 5. 已接受候选和已生成 segment 的引用关系保持幂等；迁移不得重复创建来源段。
 6. 新 V2 候选被确认后，以新 revision 取代兼容 map，旧 revision 标记 `superseded`，用于撤销和审计。
-7. 保存为 v11 前后必须进行 schema 验证；打开、保存、撤销、重做和再次打开后映射语义一致。
+7. 保存为 v12 前后必须进行 schema 验证；打开、保存、撤销、重做和再次打开后映射语义一致。
 8. 旧投影器仅作为受控兼容路径存在，不能接收 V2 分段仿射结果，也不能成为新项目默认路径。
 9. v10 中自报为 `verified` 但没有 v11 验证来源记录的时间图必须降为 `review`；迁移不得根据 JSON 内的概率、残差或证据字符串自行补签可信记录。
+10. v11 及更早项目没有逐段实测证据；v12 迁移必须生成稳定 span ID，但质量、边界和 alternatives 只能标记为 `legacy-unverified` / `blocked`，不得复制图级指标冒充逐段测量。
 
 ## 真实媒体基准
 
@@ -467,7 +470,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 
 ### 数据与投影
 
-- [x] schema v11 可校验、保存、重开和迁移四类 TimeMap span 与验证来源记录。
+- [x] schema v12 可校验、保存、重开和迁移四类 TimeMap span、验证来源与逐段证据记录。
 - [x] matched span 可准确表达非 1.0 scale，长片投影不以累计浮点运算漂移。
 - [x] source-only 弹幕进入未映射统计，target-only 正确推动后续映射。
 - [x] ambiguous 不被静默插值，并能阻止默认导出。
@@ -486,6 +489,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] edit-aware DP 对称识别 source-only、target-only 和替换区间。
 - [x] 局部精修输出双侧证据和边界不确定范围。
 - [x] 音画冲突会降级或阻塞，不会被平均 confidence 掩盖。
+- [x] 生产 landmark 在拟合前做确定性真实留出，并按 span 输出 p50/p95/p99/max、覆盖、边界支持、原因和 alternatives；同一时间帧不得跨训练/留出分区。
 
 ### 质量、UX 与导出
 
@@ -511,11 +515,11 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] native benchmark v2 在任何工具探测前会话级固定全部 workload media、distinct 文件只完整哈希一次、支持 mounted-folder 实际卷去重，并拒绝未注册/跨 case/流错配 job。
 - [x] 匹配页高级诊断提供工程性能采集与取消入口，复用同一 manifest、二次校验 workload/case binding，并在下载前执行路径与媒体秘密扫描。
 
-当前剩余限制：双侧证据、不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷回执和 fail-closed acceptance v3 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；实测校准、批准的 production protocol / trust root、Job working-set/terminal cleanup/native attestation 正式证据和 20 套北极星长合集均未完成，不能据此宣称准确率或性能达标。
+当前剩余限制：逐段真实留出证据、双侧边界不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷回执和 fail-closed acceptance v3 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；概率仍必须保持 null，实测校准、批准的 production protocol / trust root、Job working-set/terminal cleanup/native attestation 正式证据和 20 套北极星长合集均未完成，不能据此宣称准确率或性能达标。
 
 性能执行已完成新的生产切片：匹配页把 1×N、N×1、N×M 一次提交为原生批任务；worker 按 distinct media 只建立一次媒体 lease、全文件身份、timeline/逐帧 PTS、候选音轨与 coarse landmark，再让全部 pair 完成 coarse scoring。每个合理音轨组合的去重 Top-K 会先经过有界 fine-window 与活动内存检查，然后由不使用文件名、数组顺序或剧集号先验的 exact branch-and-bound 选择项目级非冲突组合；搜索超过确定性硬上限时整批失败关闭，未入选或全批 coarse 不完整的候选不会进入 fine。长媒体以有界 CPU 流建立 coarse 索引；候选只有在至少一侧能提供完整的分集级查询轴，并且完整候选逆投影、全部 coarse inlier support、edit-aware DP 与边界精修所需 guard 都能同时装入两侧各自不超过 60 分钟的精解码窗口、活动内存预算也允许时，才会按仿射窗口进入 fine。双侧都超过 60 分钟且没有完整短轴只是其中一个明确阻断分支；任何窗口内容、必需 guard 或内存预算不满足的候选也会 fail-closed，不会截断后冒充完整时间图。批次 proposal 在最终媒体身份复核前只存在于 worker 私有 staging，完成或取消都必须复核后才原子发布。
 
-本机 RTX 4090 已接入可选 CUDA/cuFFT 声谱后端：capability probe 会验证 CUDA driver、cuFFT、context 和真实 R2C 计算，短媒体共享声谱 FFT 可由 4090 执行，失败自动完整重算 CPU；强制 CUDA 模式则失败关闭。当前长媒体 streaming coarse、FFmpeg 音频解码、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修与项目级搜索仍在 CPU，尚未实现 GPU 批量相关；普通产品 batch 也尚未像 benchmark session 一样对整批 FFmpeg/FFprobe 建立二进制只读 pin 并把 tool digest 纳入普通制品缓存键。同一物理文件被不同 mediaId/路径别名重复提交时，全局冲突仍按计划媒体节点识别。上述剩余项和真实冻结集缺口意味着当前只能宣称工程能力与资源边界，不能宣称准确率或正式性能达标。视觉 NVDEC 只可作为视觉帧解码优化，不得冒充音频计算加速。
+本机 RTX 4090 已接入可选 CUDA/cuFFT 声谱后端：capability probe 会验证 CUDA driver、cuFFT、context 和真实 R2C 计算，短媒体与长媒体 streaming coarse 均可按 4096 帧有界 batch 执行 FFT，失败自动完整重算 CPU；强制 CUDA 模式则失败关闭。普通产品 batch 已在整批执行前固定 FFmpeg/FFprobe 二进制并把 tool digest 纳入缓存身份，同一物理文件的路径/hard-link 别名也按 FileId 合并。FFmpeg 音频解码、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修与项目级搜索仍使用 CPU；这些剩余 CPU 阶段和真实冻结集缺口意味着当前只能宣称工程能力与资源边界，不能宣称准确率或正式性能达标。视觉 NVDEC 只可作为视觉帧解码优化，不得冒充音频计算加速。
 
 ### 真实准确率与发布
 
@@ -525,7 +529,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] V2.1 中间性能层将 PCM/landmark/fine 合并为 768 MiB 字节 LRU 制品，同一主音轨冷路径只解码一次、landmark/fine 每帧只做一次 FFT；以 1 GiB 单任务预算和 native 并发 1 保持总资源有界，并用 exact/FFmpeg 回归证明语义不变。
 - [x] N×M 产品执行已改为 distinct-media 一次预处理、全 pair coarse-before-fine、精确且资源有界的项目级 Top-K 非冲突选择，并只让入选候选进入 fine；长参考不再要求整段 PCM，但仿射窗口 fine 是条件能力：必须存在完整分集级查询轴，完整逆投影、全部 coarse support、DP/边界 guard 均装入每侧不超过 60 分钟的窗口且活动内存预算通过，否则明确阻断。
 - [x] 可选 CUDA/cuFFT 声谱后端、4090 能力诊断、CPU 容差等价校验和失败自动回退已落地；安装包在 runtime 或真实 smoke 不可用时不会报告 GPU ready。
-- [ ] 为长媒体 coarse / 批量相关提供 GPU 后端，并完成普通产品 batch 的 FFmpeg/FFprobe 整批只读 pin、tool digest 缓存绑定与同物理媒体别名合并；CPU 保持确定性基线。
+- [x] 长媒体 streaming coarse 使用有界 CUDA/cuFFT batch；普通产品 batch 完成 FFmpeg/FFprobe 整批只读 pin、tool digest 缓存绑定与同物理媒体别名合并，CPU 保持确定性基线。
 - [ ] 正式性能采集在现有 lifecycle Job 之上实现诚实限定覆盖范围的 Job working-set receipt、终态 cleanup receipt 与独立 attestation；在规定 4 核目标机按获批协议重复运行并形成受信原始报告。
 - [ ] 所有上线准确率、校准和性能门槛通过并有可重复报告。
 - [ ] 北极星 20 套长合集 5/5 定位和完整导出通过。

@@ -6,12 +6,223 @@ import type { Milliseconds } from "../shared/time";
  */
 export type TimeMapSpanKind = "matched" | "sourceOnly" | "targetOnly" | "ambiguous";
 
+export type TimeMapSpanSignalStatus = "used" | "blocked" | "conflict";
+export type TimeMapSpanSupportStatus =
+  | "supported"
+  | "unsupported"
+  | "notApplicable"
+  | "legacyUnverified";
+export type TimeMapBoundaryStatus =
+  | "refined"
+  | "ambiguous"
+  | "unsupported"
+  | "notApplicable"
+  | "legacyUnverified";
+export type TimeMapBoundaryAxis = "source" | "target" | "both";
+export type TimeMapBoundaryContextSide = "before" | "after";
+
+export interface TimeMapSpanSignalAssessment {
+  audio: TimeMapSpanSignalStatus;
+  visual: TimeMapSpanSignalStatus;
+  danmaku: TimeMapSpanSignalStatus;
+}
+
+/**
+ * 一段时间图自己的质量证据。逐段指标不能由整图指标复制或推导；没有真实逐段测量时
+ * 必须使用 missing / null，并保守进入 legacy-unverified、review 或 blocked。
+ */
+export interface TimeMapSpanQuality {
+  level: TimeMapQualityLevel;
+  metricSource: TimeMapMetricSource;
+  probability: number | null;
+  coverage: number | null;
+  uniqueContentCoverage: number | null;
+  alternativeMargin: number | null;
+  anchorCount: number;
+  heldOutAnchorCount: number;
+  p50ResidualMs: Milliseconds | null;
+  p95ResidualMs: Milliseconds | null;
+  p99ResidualMs: Milliseconds | null;
+  maxResidualMs: Milliseconds | null;
+  boundaryUncertaintyMs: Milliseconds | null;
+  leftSupport: TimeMapSpanSupportStatus;
+  rightSupport: TimeMapSpanSupportStatus;
+  signals: TimeMapSpanSignalAssessment;
+  reasons: string[];
+}
+
+export interface TimeMapBoundaryEvidence {
+  status: TimeMapBoundaryStatus;
+  axis: TimeMapBoundaryAxis | null;
+  contextSide: TimeMapBoundaryContextSide | null;
+  coarseMs: Milliseconds | null;
+  refinedMs: Milliseconds | null;
+  uncertaintyStartMs: Milliseconds | null;
+  uncertaintyEndMs: Milliseconds | null;
+  supportDurationMs: Milliseconds | null;
+  correlation: number | null;
+  alternativeMargin: number | null;
+  reason: string;
+}
+
+export interface TimeMapSpanBoundaries {
+  start: TimeMapBoundaryEvidence;
+  end: TimeMapBoundaryEvidence;
+}
+
+export interface TimeMapSpanAlternative {
+  kind: TimeMapSpanKind;
+  score: number | null;
+  sourceStartMs: Milliseconds;
+  sourceEndMs: Milliseconds;
+  targetStartMs: Milliseconds;
+  targetEndMs: Milliseconds;
+  reason: string;
+}
+
 export interface TimeMapSpan {
   kind: TimeMapSpanKind;
   sourceStartMs: Milliseconds;
   sourceEndMs: Milliseconds;
   targetStartMs: Milliseconds;
   targetEndMs: Milliseconds;
+  /** 算法内部片段可以省略；进入 MediaTimeMap / 项目 v12 前必须完整。 */
+  id?: string;
+  reason?: string;
+  quality?: TimeMapSpanQuality;
+  boundaries?: TimeMapSpanBoundaries;
+  alternatives?: TimeMapSpanAlternative[];
+}
+
+export interface CompleteTimeMapSpan extends TimeMapSpan {
+  id: string;
+  reason: string;
+  quality: TimeMapSpanQuality;
+  boundaries: TimeMapSpanBoundaries;
+  alternatives: TimeMapSpanAlternative[];
+}
+
+export interface LegacyTimeMapSpanEvidenceOptions {
+  id: string;
+  blocked: boolean;
+  reason?: string;
+}
+
+const LEGACY_SPAN_EVIDENCE_REASON =
+  "旧项目没有保存可独立复核的逐段残差、留出锚点、边界支持和备选路径；必须重新分析或人工复核。";
+
+/** 项目 v11 -> v12 专用：只补齐“缺失证据”的显式记录，绝不伪造测量值或提升等级。 */
+export function normalizeLegacyUnverifiedTimeMapSpanEvidence(
+  span: TimeMapSpan,
+  options: LegacyTimeMapSpanEvidenceOptions
+): CompleteTimeMapSpan {
+  if (options.id.trim().length === 0) {
+    throw new RangeError("旧时间图片段的稳定 ID 不能为空。");
+  }
+  const reason = options.reason?.trim() || LEGACY_SPAN_EVIDENCE_REASON;
+  const boundary = (): TimeMapBoundaryEvidence => ({
+    status: "legacyUnverified",
+    axis: null,
+    contextSide: null,
+    coarseMs: null,
+    refinedMs: null,
+    uncertaintyStartMs: null,
+    uncertaintyEndMs: null,
+    supportDurationMs: null,
+    correlation: null,
+    alternativeMargin: null,
+    reason
+  });
+  return {
+    ...span,
+    id: options.id,
+    reason: "legacyUnverified",
+    quality: {
+      level: options.blocked ? "blocked" : "legacy-unverified",
+      metricSource: "missing",
+      probability: null,
+      coverage: null,
+      uniqueContentCoverage: null,
+      alternativeMargin: null,
+      anchorCount: 0,
+      heldOutAnchorCount: 0,
+      p50ResidualMs: null,
+      p95ResidualMs: null,
+      p99ResidualMs: null,
+      maxResidualMs: null,
+      boundaryUncertaintyMs: null,
+      leftSupport: "legacyUnverified",
+      rightSupport: "legacyUnverified",
+      signals: { audio: "blocked", visual: "blocked", danmaku: "blocked" },
+      reasons: [reason]
+    },
+    boundaries: { start: boundary(), end: boundary() },
+    alternatives: []
+  };
+}
+
+/**
+ * 人工改写片段分类后，旧算法为原分类生成的逐段证据已经不再适用。保留稳定 ID 和坐标，
+ * 但清空算法指标、边界测量和备选路径，并显式要求重新复核。
+ */
+export function invalidateTimeMapSpanEvidenceForManualReview(
+  span: CompleteTimeMapSpan,
+  blocked: boolean,
+  explanation: string
+): CompleteTimeMapSpan {
+  const reason = explanation.trim() || "人工改写了片段分类，原算法逐段证据已失效。";
+  const boundary = (): TimeMapBoundaryEvidence => ({
+    status: "unsupported",
+    axis: null,
+    contextSide: null,
+    coarseMs: null,
+    refinedMs: null,
+    uncertaintyStartMs: null,
+    uncertaintyEndMs: null,
+    supportDurationMs: null,
+    correlation: null,
+    alternativeMargin: null,
+    reason
+  });
+  return {
+    ...span,
+    reason: "manualReview",
+    quality: {
+      level: blocked ? "blocked" : "review",
+      metricSource: "missing",
+      probability: null,
+      coverage: null,
+      uniqueContentCoverage: null,
+      alternativeMargin: null,
+      anchorCount: 0,
+      heldOutAnchorCount: 0,
+      p50ResidualMs: null,
+      p95ResidualMs: null,
+      p99ResidualMs: null,
+      maxResidualMs: null,
+      boundaryUncertaintyMs: null,
+      leftSupport: "unsupported",
+      rightSupport: "unsupported",
+      signals: { audio: "blocked", visual: "blocked", danmaku: "blocked" },
+      reasons: [reason]
+    },
+    boundaries: { start: boundary(), end: boundary() },
+    alternatives: []
+  };
+}
+
+export function isCompleteTimeMapSpanEvidence(value: unknown): value is CompleteTimeMapSpan {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    isNonEmptyString(value.id) &&
+    isNonEmptyString(value.reason) &&
+    isTimeMapSpanQuality(value.quality) &&
+    isTimeMapSpanBoundaries(value.boundaries) &&
+    Array.isArray(value.alternatives) &&
+    value.alternatives.every(isTimeMapSpanAlternative)
+  );
 }
 
 export type TimeMapValidationIssueCode =
@@ -465,12 +676,16 @@ export type TimeMapQualityLevel = "verified" | "review" | "blocked" | "legacy-un
 export interface TimeMapQualityInput {
   probability: number | null;
   coverage: number | null;
+  uniqueContentCoverage?: number | null;
   p50ResidualMs: Milliseconds | null;
   p95ResidualMs: Milliseconds | null;
+  /** v12 必填；旧调用方省略时按缺失处理，绝不能进入 verified。 */
+  p99ResidualMs?: Milliseconds | null;
   maxResidualMs: Milliseconds | null;
   boundaryUncertaintyMs: Milliseconds | null;
   alternativeMargin: number | null;
   anchorCount: number;
+  anchorRegionCount?: number;
   heldOutAnchorCount: number;
   metricSource: TimeMapMetricSource;
   evidenceTypes: readonly TimeMapEvidenceType[];
@@ -538,6 +753,9 @@ export function assessTimeMapQuality(input: TimeMapQualityInput): TimeMapQuality
 
   const coverage = input.coverage;
   const p95ResidualMs = input.p95ResidualMs;
+  const p99ResidualMs = input.p99ResidualMs ?? null;
+  const uniqueContentCoverage = input.uniqueContentCoverage ?? null;
+  const anchorRegionCount = input.anchorRegionCount ?? 0;
   const boundaryUncertaintyMs = input.boundaryUncertaintyMs;
   const alternativeMargin = input.alternativeMargin;
   const probability = input.probability;
@@ -548,8 +766,13 @@ export function assessTimeMapQuality(input: TimeMapQualityInput): TimeMapQuality
     probability >= 0.995 &&
     coverage >= 0.9 &&
     p95ResidualMs <= 100 &&
+    p99ResidualMs <= 500 &&
     boundaryUncertaintyMs <= 250 &&
-    alternativeMargin >= 0.25;
+    alternativeMargin >= 0.25 &&
+    input.anchorCount >= 30 &&
+    anchorRegionCount >= 3 &&
+    uniqueContentCoverage !== null &&
+    uniqueContentCoverage >= 0.8;
   if (
     input.metricSource === "measured" &&
     hasIndependentVerificationEvidence &&
@@ -707,6 +930,200 @@ function isNonNegativeIntegerMilliseconds(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
+function isTimeMapSpanQuality(value: unknown): value is TimeMapSpanQuality {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const residuals = [
+    value.p50ResidualMs,
+    value.p95ResidualMs,
+    value.p99ResidualMs,
+    value.maxResidualMs
+  ];
+  return (
+    isTimeMapQualityLevel(value.level) &&
+    (value.metricSource === "measured" ||
+      value.metricSource === "estimated" ||
+      value.metricSource === "missing") &&
+    isUnitNumberOrNull(value.probability) &&
+    isUnitNumberOrNull(value.coverage) &&
+    isUnitNumberOrNull(value.uniqueContentCoverage) &&
+    isUnitNumberOrNull(value.alternativeMargin) &&
+    isNonNegativeIntegerValue(value.anchorCount) &&
+    isNonNegativeIntegerValue(value.heldOutAnchorCount) &&
+    value.heldOutAnchorCount <= value.anchorCount &&
+    residuals.every(isNonNegativeIntegerOrNullValue) &&
+    isNonNegativeIntegerOrNullValue(value.boundaryUncertaintyMs) &&
+    isTimeMapSpanSupportStatus(value.leftSupport) &&
+    isTimeMapSpanSupportStatus(value.rightSupport) &&
+    isTimeMapSpanSignals(value.signals) &&
+    isNonEmptyStringArray(value.reasons) &&
+    (value.p50ResidualMs === undefined ||
+      value.p50ResidualMs === null ||
+      value.p95ResidualMs === undefined ||
+      value.p95ResidualMs === null ||
+      value.p50ResidualMs <= value.p95ResidualMs) &&
+    (value.p95ResidualMs === undefined ||
+      value.p95ResidualMs === null ||
+      value.p99ResidualMs === undefined ||
+      value.p99ResidualMs === null ||
+      value.p95ResidualMs <= value.p99ResidualMs) &&
+    (value.p99ResidualMs === undefined ||
+      value.p99ResidualMs === null ||
+      value.maxResidualMs === undefined ||
+      value.maxResidualMs === null ||
+      value.p99ResidualMs <= value.maxResidualMs) &&
+    (value.p95ResidualMs === undefined ||
+      value.p95ResidualMs === null ||
+      value.maxResidualMs === undefined ||
+      value.maxResidualMs === null ||
+      value.p95ResidualMs <= value.maxResidualMs)
+  );
+}
+
+function isTimeMapSpanBoundaries(value: unknown): value is TimeMapSpanBoundaries {
+  return isRecord(value) && isTimeMapBoundaryEvidence(value.start) && isTimeMapBoundaryEvidence(value.end);
+}
+
+function isTimeMapBoundaryEvidence(value: unknown): value is TimeMapBoundaryEvidence {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const hasUncertaintyPair =
+    (value.uncertaintyStartMs === null && value.uncertaintyEndMs === null) ||
+    (isNonNegativeIntegerValue(value.uncertaintyStartMs) &&
+      isNonNegativeIntegerValue(value.uncertaintyEndMs) &&
+      value.uncertaintyEndMs >= value.uncertaintyStartMs);
+  const refinedFieldsPresent =
+    value.status !== "refined" ||
+    (value.axis !== null &&
+      isNonNegativeIntegerValue(value.coarseMs) &&
+      isNonNegativeIntegerValue(value.refinedMs) &&
+      isNonNegativeIntegerValue(value.uncertaintyStartMs) &&
+      isNonNegativeIntegerValue(value.uncertaintyEndMs) &&
+      isNonNegativeIntegerValue(value.supportDurationMs));
+  return (
+    isTimeMapBoundaryStatus(value.status) &&
+    (value.axis === null ||
+      value.axis === "source" ||
+      value.axis === "target" ||
+      value.axis === "both") &&
+    (value.contextSide === null || value.contextSide === "before" || value.contextSide === "after") &&
+    isNonNegativeIntegerOrNullValue(value.coarseMs) &&
+    isNonNegativeIntegerOrNullValue(value.refinedMs) &&
+    hasUncertaintyPair &&
+    isNonNegativeIntegerOrNullValue(value.supportDurationMs) &&
+    isCorrelationOrNull(value.correlation) &&
+    isUnitNumberOrNull(value.alternativeMargin) &&
+    isNonEmptyString(value.reason) &&
+    refinedFieldsPresent
+  );
+}
+
+function isTimeMapSpanAlternative(value: unknown): value is TimeMapSpanAlternative {
+  if (!isRecord(value) || !isTimeMapSpanKind(value.kind)) {
+    return false;
+  }
+  const sourceStartMs = value.sourceStartMs;
+  const sourceEndMs = value.sourceEndMs;
+  const targetStartMs = value.targetStartMs;
+  const targetEndMs = value.targetEndMs;
+  return (
+    isUnitNumberOrNull(value.score) &&
+    isNonNegativeIntegerValue(sourceStartMs) &&
+    isNonNegativeIntegerValue(sourceEndMs) &&
+    isNonNegativeIntegerValue(targetStartMs) &&
+    isNonNegativeIntegerValue(targetEndMs) &&
+    sourceEndMs >= sourceStartMs &&
+    targetEndMs >= targetStartMs &&
+    hasValidKindShape(value.kind, sourceEndMs - sourceStartMs, targetEndMs - targetStartMs) &&
+    isNonEmptyString(value.reason)
+  );
+}
+
+function isTimeMapQualityLevel(value: unknown): value is TimeMapQualityLevel {
+  return (
+    value === "verified" ||
+    value === "review" ||
+    value === "blocked" ||
+    value === "legacy-unverified"
+  );
+}
+
+function isTimeMapSpanSupportStatus(value: unknown): value is TimeMapSpanSupportStatus {
+  return (
+    value === "supported" ||
+    value === "unsupported" ||
+    value === "notApplicable" ||
+    value === "legacyUnverified"
+  );
+}
+
+function isTimeMapBoundaryStatus(value: unknown): value is TimeMapBoundaryStatus {
+  return (
+    value === "refined" ||
+    value === "ambiguous" ||
+    value === "unsupported" ||
+    value === "notApplicable" ||
+    value === "legacyUnverified"
+  );
+}
+
+function isTimeMapSpanSignals(value: unknown): value is TimeMapSpanSignalAssessment {
+  return (
+    isRecord(value) &&
+    isTimeMapSpanSignalStatus(value.audio) &&
+    isTimeMapSpanSignalStatus(value.visual) &&
+    isTimeMapSpanSignalStatus(value.danmaku)
+  );
+}
+
+function isTimeMapSpanSignalStatus(value: unknown): value is TimeMapSpanSignalStatus {
+  return value === "used" || value === "blocked" || value === "conflict";
+}
+
+function isTimeMapSpanKind(value: unknown): value is TimeMapSpanKind {
+  return (
+    value === "matched" ||
+    value === "sourceOnly" ||
+    value === "targetOnly" ||
+    value === "ambiguous"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 && value.every(isNonEmptyString);
+}
+
+function isNonNegativeIntegerValue(value: unknown): value is number {
+  return typeof value === "number" && isNonNegativeIntegerMilliseconds(value);
+}
+
+function isNonNegativeIntegerOrNullValue(value: unknown): value is number | null {
+  return value === null || isNonNegativeIntegerValue(value);
+}
+
+function isUnitNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function isUnitNumberOrNull(value: unknown): value is number | null {
+  return value === null || isUnitNumber(value);
+}
+
+function isCorrelationOrNull(value: unknown): value is number | null {
+  return value === null ||
+    (typeof value === "number" && Number.isFinite(value) && value >= -1 && value <= 1);
+}
+
 function assertNonNegativeIntegerMilliseconds(value: number, label: string): void {
   if (!isNonNegativeIntegerMilliseconds(value)) {
     throw new RangeError(`${label}必须是非负安全整数毫秒。`);
@@ -798,11 +1215,27 @@ function validateQualityMetrics(input: TimeMapQualityInput): string[] {
   ) {
     problems.push("coverage 必须位于 0 到 1。");
   }
+  if (
+    input.uniqueContentCoverage !== undefined &&
+    input.uniqueContentCoverage !== null &&
+    (!Number.isFinite(input.uniqueContentCoverage) ||
+      input.uniqueContentCoverage < 0 ||
+      input.uniqueContentCoverage > 1)
+  ) {
+    problems.push("独特内容覆盖率必须位于 0 到 1。");
+  }
   if (input.p50ResidualMs !== null && !isNonNegativeIntegerMilliseconds(input.p50ResidualMs)) {
     problems.push("P50 残差必须是非负安全整数毫秒。");
   }
   if (input.p95ResidualMs !== null && !isNonNegativeIntegerMilliseconds(input.p95ResidualMs)) {
     problems.push("P95 残差必须是非负安全整数毫秒。");
+  }
+  if (
+    input.p99ResidualMs !== undefined &&
+    input.p99ResidualMs !== null &&
+    !isNonNegativeIntegerMilliseconds(input.p99ResidualMs)
+  ) {
+    problems.push("P99 残差必须是非负安全整数毫秒。");
   }
   if (input.maxResidualMs !== null && !isNonNegativeIntegerMilliseconds(input.maxResidualMs)) {
     problems.push("最大残差必须是非负安全整数毫秒。");
@@ -823,6 +1256,14 @@ function validateQualityMetrics(input: TimeMapQualityInput): string[] {
   }
   if (!Number.isSafeInteger(input.anchorCount) || input.anchorCount < 0) {
     problems.push("锚点数必须是非负安全整数。");
+  }
+  if (
+    input.anchorRegionCount !== undefined &&
+    (!Number.isSafeInteger(input.anchorRegionCount) ||
+      input.anchorRegionCount < 0 ||
+      input.anchorRegionCount > 3)
+  ) {
+    problems.push("锚点时间区域数必须是 0 到 3 的安全整数。");
   }
   if (
     !Number.isSafeInteger(input.heldOutAnchorCount) ||
@@ -846,10 +1287,19 @@ function validateQualityMetrics(input: TimeMapQualityInput): string[] {
   }
   if (
     input.p95ResidualMs !== null &&
-    input.maxResidualMs !== null &&
-    input.p95ResidualMs > input.maxResidualMs
+    input.p99ResidualMs !== undefined &&
+    input.p99ResidualMs !== null &&
+    input.p95ResidualMs > input.p99ResidualMs
   ) {
-    problems.push("P95 残差不能大于最大残差。");
+    problems.push("P95 残差不能大于 P99 残差。");
+  }
+  if (
+    input.p99ResidualMs !== undefined &&
+    input.p99ResidualMs !== null &&
+    input.maxResidualMs !== null &&
+    input.p99ResidualMs > input.maxResidualMs
+  ) {
+    problems.push("P99 残差不能大于最大残差。");
   }
   return problems;
 }
@@ -876,6 +1326,7 @@ function hasCompleteQualityMetrics(input: TimeMapQualityInput): input is TimeMap
   coverage: number;
   p50ResidualMs: Milliseconds;
   p95ResidualMs: Milliseconds;
+  p99ResidualMs: Milliseconds;
   maxResidualMs: Milliseconds;
   boundaryUncertaintyMs: Milliseconds;
   alternativeMargin: number;
@@ -885,6 +1336,8 @@ function hasCompleteQualityMetrics(input: TimeMapQualityInput): input is TimeMap
     input.coverage !== null &&
     input.p50ResidualMs !== null &&
     input.p95ResidualMs !== null &&
+    input.p99ResidualMs !== undefined &&
+    input.p99ResidualMs !== null &&
     input.maxResidualMs !== null &&
     input.boundaryUncertaintyMs !== null &&
     input.alternativeMargin !== null &&

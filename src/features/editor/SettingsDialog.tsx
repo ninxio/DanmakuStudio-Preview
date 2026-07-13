@@ -32,6 +32,10 @@ import {
 import { downloadTextFile, readTextFile } from "../../infrastructure/file-system/browserFiles";
 import { formatExportFileError } from "../../infrastructure/file-system/exportFiles";
 import {
+  probeCudaFftCapability,
+  type CudaFftCapability
+} from "../../infrastructure/alignment/cudaFftCapability";
+import {
   pickExportDirectoryPath,
   pickFfmpegExecutablePath,
   pickMpvExecutablePath
@@ -447,6 +451,8 @@ function PlayerToolsSettingsPanel({
   onChange: (settings: AppSettings) => void;
 }) {
   const [checkingTool, setCheckingTool] = useState<MediaToolKind | null>(null);
+  const [checkingCuda, setCheckingCuda] = useState(false);
+  const [cudaCapability, setCudaCapability] = useState<CudaFftCapability | null>(null);
   const [toolResults, setToolResults] = useState<Record<MediaToolKind, MediaToolDetectionResult | null>>({
     ffmpeg: null,
     mpv: null
@@ -509,6 +515,24 @@ function PlayerToolsSettingsPanel({
     }
   };
 
+  const checkCuda = async () => {
+    setCheckingCuda(true);
+    try {
+      const capability = await probeCudaFftCapability();
+      setCudaCapability(capability);
+      setStatus(
+        capability.available
+          ? `CUDA/cuFFT 已就绪：${capability.selectedDeviceName ?? "NVIDIA GPU"}。高精度匹配会在自动模式下使用它。`
+          : `CUDA/cuFFT 尚不可用：${capability.reason}`,
+        capability.available ? "success" : "warning"
+      );
+    } catch (error) {
+      setStatus(`检测 CUDA/cuFFT 失败：${formatMpvSidecarError(error)}`, "warning");
+    } finally {
+      setCheckingCuda(false);
+    }
+  };
+
   return (
     <SettingsSection title="播放器与工具" description="管理本机 FFmpeg、mpv 和预览后端；这些路径只保存在本机设置中。">
       <Field
@@ -533,6 +557,22 @@ function PlayerToolsSettingsPanel({
         </TextButton>
       </div>
       <ToolDetectionRow result={toolResults.ffmpeg} fallback="尚未检测 FFmpeg；留空时会尝试使用 PATH 中的 ffmpeg。" />
+      <div className="rounded border border-panel-line/70 bg-black/15 p-3">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <div className="text-xs font-medium text-slate-200">NVIDIA CUDA/cuFFT 加速</div>
+            <p className="mt-1 text-xs leading-5 text-slate-500">
+              高精度匹配默认自动检测 GPU；CUDA 只加速声谱 FFT，FFmpeg 音频解码、全局分配、DP
+              和边界判定仍由 CPU 完成。
+            </p>
+          </div>
+          <TextButton onClick={() => void checkCuda()} disabled={checkingCuda}>
+            <RefreshCw size={14} />
+            {checkingCuda ? "检测中" : "检测 4090 / CUDA"}
+          </TextButton>
+        </div>
+        <CudaCapabilityRow capability={cudaCapability} />
+      </div>
       <Field
         label="mpv 路径"
         value={settings.player.mpvPath}
@@ -623,6 +663,35 @@ function PlayerToolsSettingsPanel({
       <InfoBox>窗口越小越容易靠近真实边界，但特征数量和运算量也会增加。</InfoBox>
     </SettingsSection>
   );
+}
+
+function CudaCapabilityRow({ capability }: { capability: CudaFftCapability | null }) {
+  if (!capability) {
+    return (
+      <p className="mt-2 text-xs leading-5 text-slate-500">
+        尚未运行完整 CUDA context + 512 点 cuFFT smoke test；仅检测到显卡驱动不代表可用。
+      </p>
+    );
+  }
+  const Icon = capability.available ? CircleCheck : CircleAlert;
+  return (
+    <div
+      className={`mt-2 flex items-start gap-2 text-xs leading-5 ${capability.available ? "text-accent-green" : "text-accent-yellow"}`}
+      role="status"
+      data-testid="cuda-capability-result"
+    >
+      <Icon size={14} className="mt-0.5 shrink-0" />
+      <span>
+        {capability.available
+          ? `${capability.selectedDeviceName ?? "NVIDIA GPU"} · ${capability.cufftLibraryName ?? "cuFFT"} · 单批显存上界 ${formatMemoryMiB(capability.defaultBatchMemory.worstCaseTotalDeviceBytes)} MiB · 自动模式已启用`
+          : `${capability.reason}${capability.remediation ? `；${capability.remediation}` : ""}`}
+      </span>
+    </div>
+  );
+}
+
+function formatMemoryMiB(bytes: number): string {
+  return Number.isFinite(bytes) && bytes >= 0 ? (bytes / (1024 * 1024)).toFixed(0) : "未知";
 }
 
 function ToolDetectionRow({

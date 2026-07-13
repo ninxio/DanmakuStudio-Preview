@@ -17,6 +17,14 @@ import {
 import { useEditorStore } from "../../stores/editorStore";
 import { SettingsDialog } from "./SettingsDialog";
 
+const cudaMocks = vi.hoisted(() => ({
+  probe: vi.fn()
+}));
+
+vi.mock("../../infrastructure/alignment/cudaFftCapability", () => ({
+  probeCudaFftCapability: cudaMocks.probe
+}));
+
 describe("设置中心", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -27,6 +35,7 @@ describe("设置中心", () => {
       selection: { kind: "none", ids: [] },
       exportDraft: null
     });
+    cudaMocks.probe.mockReset();
   });
 
   it("保存 Emby 非敏感连接设置，不保存密码或 token", async () => {
@@ -65,6 +74,8 @@ describe("设置中心", () => {
     render(<SettingsDialog onClose={() => undefined} />);
 
     await user.click(screen.getByRole("button", { name: "播放器与工具" }));
+    expect(screen.getByRole("button", { name: "检测 4090 / CUDA" })).toBeInTheDocument();
+    expect(screen.getByText(/仅检测到显卡驱动不代表可用/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("FFmpeg 路径"), {
       target: { value: "C:\\tools\\ffmpeg.exe" }
     });
@@ -95,6 +106,44 @@ describe("设置中心", () => {
       mpvPath: "C:\\tools\\mpv.exe",
       preferredBackend: "nativeMpv"
     });
+  });
+
+  it("用原生 context 与 cuFFT smoke test 显示 4090 真实可用状态", async () => {
+    const user = userEvent.setup();
+    cudaMocks.probe.mockResolvedValue({
+      backendId: "cuda-cufft-r2c-512-v1",
+      bindingsVersion: "CUDA 13.x ABI via cudarc 0.19.8",
+      available: true,
+      status: "ready",
+      reason: "smoke transform succeeded",
+      remediation: null,
+      driverLibraryLoaded: true,
+      driverLibraryName: "nvcuda.dll",
+      cufftLibraryLoaded: true,
+      cufftLibraryName: "cufft64_12.dll",
+      driverRuntimeVersion: 13030,
+      cufftRuntimeVersion: 12300,
+      deviceCount: 1,
+      selectedDeviceOrdinal: 0,
+      selectedDeviceName: "NVIDIA GeForce RTX 4090",
+      defaultBatchMemory: {
+        batchFrames: 4096,
+        inputBytes: 8_388_608,
+        outputBytes: 8_421_376,
+        worstCaseCufftWorkspaceBytes: 134_217_728,
+        worstCaseTotalDeviceBytes: 151_027_712
+      }
+    });
+    render(<SettingsDialog onClose={() => undefined} />);
+
+    await user.click(screen.getByRole("button", { name: "播放器与工具" }));
+    await user.click(screen.getByRole("button", { name: "检测 4090 / CUDA" }));
+
+    expect(await screen.findByTestId("cuda-capability-result")).toHaveTextContent(
+      "NVIDIA GeForce RTX 4090"
+    );
+    expect(screen.getByTestId("cuda-capability-result")).toHaveTextContent("自动模式已启用");
+    expect(cudaMocks.probe).toHaveBeenCalledTimes(1);
   });
 
   it("保存默认导出目录", async () => {

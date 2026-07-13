@@ -7,6 +7,7 @@ import {
   readTimeMapSpanReviewDecision,
   reviewCandidateTimeMapSpan
 } from "./timeMapReviewDecision";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 
 describe("时间图差异人工分类", () => {
   it("把兼容形状的参考独有分类写回候选并在项目保存状态中保留", () => {
@@ -22,6 +23,16 @@ describe("时间图差异人工分类", () => {
     expect(reviewed.revision).toBe(2);
     expect(reviewed.verification).toBeNull();
     expect(reviewed.quality.level).toBe("blocked");
+    expect(reviewed.spans[1]).toMatchObject({
+      id: `${map.id}:span:0002`,
+      reason: "manualReview",
+      quality: { level: "review", metricSource: "missing", p99ResidualMs: null },
+      boundaries: {
+        start: { status: "unsupported" },
+        end: { status: "unsupported" }
+      },
+      alternatives: []
+    });
     expect(reviewed.evidence.types).toContain("manual");
     expect(readTimeMapSpanReviewDecision(reviewed, 1)).toEqual({
       spanIndex: 1,
@@ -154,33 +165,46 @@ function createMap(): MediaTimeMap {
     targetStartMs: 0,
     targetEndMs: 31_000,
     spans: [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 0,
         sourceEndMs: 10_000,
         targetStartMs: 0,
         targetEndMs: 10_000
-      },
-      {
+      }, "map-review:span:0001"),
+      createTestCompleteTimeMapSpan({
         kind: "sourceOnly",
         sourceStartMs: 10_000,
         sourceEndMs: 12_000,
         targetStartMs: 10_000,
         targetEndMs: 10_000
-      },
-      {
+      }, "map-review:span:0002"),
+      createTestCompleteTimeMapSpan({
         kind: "targetOnly",
         sourceStartMs: 12_000,
         sourceEndMs: 12_000,
         targetStartMs: 10_000,
         targetEndMs: 13_000
-      },
+      }, "map-review:span:0003"),
       {
+        ...createTestCompleteTimeMapSpan({
         kind: "ambiguous",
         sourceStartMs: 12_000,
         sourceEndMs: 30_000,
         targetStartMs: 13_000,
         targetEndMs: 31_000
+        }, "map-review:span:0004"),
+        quality: {
+          ...createTestCompleteTimeMapSpan({
+            kind: "ambiguous",
+            sourceStartMs: 12_000,
+            sourceEndMs: 30_000,
+            targetStartMs: 13_000,
+            targetEndMs: 31_000
+          }, "map-review:span:0004").quality,
+          level: "blocked",
+          reasons: ["存在无法唯一解释的歧义区间。"]
+        }
       }
     ],
     quality: {
@@ -188,12 +212,15 @@ function createMap(): MediaTimeMap {
       probability: null,
       metricSource: "measured",
       coverage: 0.8,
+      uniqueContentCoverage: 0.8,
       p50ResidualMs: 50,
       p95ResidualMs: 100,
+      p99ResidualMs: 130,
       maxResidualMs: 150,
       boundaryUncertaintyMs: 300,
       alternativeMargin: 0.1,
-      anchorCount: 10,
+      anchorCount: 30,
+      anchorRegionCount: 3,
       heldOutAnchorCount: 2,
       reasons: ["存在无法唯一解释的歧义区间。"]
     },
@@ -202,6 +229,11 @@ function createMap(): MediaTimeMap {
       audioAnchorCount: 10,
       visualAnchorCount: 0,
       heldOutAnchorCount: 2,
+      top1Top2Margin: 0.1,
+      uniqueContentCoverage: 0.8,
+      repeatedContentOnly: false,
+      selectedTrackReason: "测试轨道。",
+      alternativeTrackScores: [],
       notes: []
     },
     verification: null,

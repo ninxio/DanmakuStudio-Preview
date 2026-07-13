@@ -24,6 +24,15 @@ import type {
   ProjectMediaRole
 } from "../../domain/project/types";
 import type { AlignmentProposal } from "../../domain/alignment/types";
+import {
+  isCompleteTimeMapSpanEvidence,
+  type TimeMapSpan
+} from "../../domain/alignment/timeMap";
+import {
+  isAlignmentTimeMapProposal,
+  reconcileAlignmentTimeMapProposalQuality
+} from "../../domain/alignment/timeMapProposal";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import { readTimeMapSpanReviewDecision } from "../../domain/alignment/timeMapReviewDecision";
 import {
   applyAuthorityIssuedManualMediaTimeMapVerification,
@@ -246,6 +255,16 @@ function createTestBatchPair(
 }
 
 describe("多媒体自动匹配工作台", () => {
+  it("测试 V2 fixture 满足 v12 逐段证据契约", () => {
+    const proposal = createV2Proposal(0, "verified").timeMap;
+    expect(proposal).toBeDefined();
+    expect(proposal?.spans.every(isCompleteTimeMapSpanEvidence)).toBe(true);
+    expect(isAlignmentTimeMapProposal(proposal)).toBe(true);
+    if (!proposal) throw new Error("测试提案缺失");
+    expect(isAlignmentTimeMapProposal(reconcileAlignmentTimeMapProposalQuality(proposal))).toBe(
+      true
+    );
+  });
   beforeEach(() => {
     const project = createMatchingProject();
     useEditorStore.setState({
@@ -964,7 +983,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(review).toHaveTextContent("伸缩比例：1.000×");
     expect(review).toHaveTextContent("伸缩比例：不适用");
     expect(review).toHaveTextContent("边界不确定度：180 毫秒");
-    expect(review).toHaveTextContent("P95 残差：80 毫秒");
+    expect(review).toHaveTextContent("逐段 P95 / P99 / 最大残差：80 毫秒 / 120 毫秒 / 140 毫秒");
     expect(review).toHaveTextContent("导出阻断原因：存在无法唯一解释的歧义区间。");
 
     const matchedButton = within(review).getByRole("button", {
@@ -1986,31 +2005,34 @@ function createV2Proposal(
       targetStartMs: 0,
       targetEndMs: 60_000,
       spans: [
-        {
+        createProposalSpan({
           kind: "matched",
           sourceStartMs,
           sourceEndMs,
           targetStartMs: 0,
           targetEndMs: 60_000
-        }
+        }, `v2-${level}:span:0001`, level)
       ],
       quality: {
         level,
         probability: level === "verified" ? 0.999 : null,
         metricSource: level === "legacy-unverified" ? "estimated" : "measured",
         coverage: 0.96,
+        uniqueContentCoverage: 0.94,
         p50ResidualMs: 35,
         p95ResidualMs: 80,
+        p99ResidualMs: 120,
         maxResidualMs: 140,
         boundaryUncertaintyMs: 180,
         alternativeMargin: 0.32,
-        anchorCount: 24,
+        anchorCount: 36,
+        anchorRegionCount: 3,
         heldOutAnchorCount: 6,
         reasons: qualityReasons[level]
       },
       evidence: {
         types: level === "legacy-unverified" ? ["legacy"] : ["audio", "visual"],
-        audioAnchorCount: 24,
+        audioAnchorCount: 36,
         visualAnchorCount: level === "legacy-unverified" ? 0 : 12,
         heldOutAnchorCount: 6,
         top1Top2Margin: 0.32,
@@ -2018,8 +2040,22 @@ function createV2Proposal(
         repeatedContentOnly: false,
         selectedTrackReason: "国语音轨覆盖完整且残差最低。",
         alternativeTrackScores: [
-          { sourceStreamIndex: 1, targetStreamIndex: 2, score: 0.92 },
-          { sourceStreamIndex: 1, targetStreamIndex: 3, score: 0.6 }
+          {
+            sourceStreamIndex: 1,
+            targetStreamIndex: 2,
+            score: 0.92,
+            scale: 1,
+            offsetMs: 0,
+            inlierCount: 36
+          },
+          {
+            sourceStreamIndex: 1,
+            targetStreamIndex: 3,
+            score: 0.6,
+            scale: 1,
+            offsetMs: 500,
+            inlierCount: 20
+          }
         ],
         notes: []
       },
@@ -2095,34 +2131,34 @@ function createFourKindV2Proposal(): AlignmentProposal {
       targetStartMs: 0,
       targetEndMs: 21_000,
       spans: [
-        {
+        createProposalSpan({
           kind: "matched",
           sourceStartMs: 5_000,
           sourceEndMs: 15_000,
           targetStartMs: 0,
           targetEndMs: 10_000
-        },
-        {
+        }, "four-kind:span:0001", "review"),
+        createProposalSpan({
           kind: "sourceOnly",
           sourceStartMs: 15_000,
           sourceEndMs: 17_000,
           targetStartMs: 10_000,
           targetEndMs: 10_000
-        },
-        {
+        }, "four-kind:span:0002", "review"),
+        createProposalSpan({
           kind: "targetOnly",
           sourceStartMs: 17_000,
           sourceEndMs: 17_000,
           targetStartMs: 10_000,
           targetEndMs: 13_000
-        },
-        {
+        }, "four-kind:span:0003", "review"),
+        createProposalSpan({
           kind: "ambiguous",
           sourceStartMs: 17_000,
           sourceEndMs: 25_000,
           targetStartMs: 13_000,
           targetEndMs: 21_000
-        }
+        }, "four-kind:span:0004", "blocked")
       ],
       quality: {
         ...proposal.timeMap.quality,
@@ -2132,6 +2168,33 @@ function createFourKindV2Proposal(): AlignmentProposal {
         reasons: ["存在无法唯一解释的歧义区间。"]
       },
       parametersHash: "v2-test-four-span-kinds"
+    }
+  };
+}
+
+function createProposalSpan(
+  span: TimeMapSpan,
+  id: string,
+  level: MediaTimeMapQualityLevel
+) {
+  const complete = createTestCompleteTimeMapSpan(span, id);
+  return {
+    ...complete,
+    quality: {
+      ...complete.quality,
+      level,
+      metricSource: "measured" as const,
+      coverage: 0.96,
+      uniqueContentCoverage: 0.94,
+      alternativeMargin: 0.32,
+      anchorCount: span.kind === "matched" ? 12 : 0,
+      heldOutAnchorCount: span.kind === "matched" ? 3 : 0,
+      p50ResidualMs: span.kind === "matched" ? 35 : null,
+      p95ResidualMs: span.kind === "matched" ? 80 : null,
+      p99ResidualMs: span.kind === "matched" ? 120 : null,
+      maxResidualMs: span.kind === "matched" ? 140 : null,
+      boundaryUncertaintyMs: 180,
+      reasons: [`测试逐段质量：${level}`]
     }
   };
 }

@@ -7,6 +7,7 @@ import {
   computeMediaTimeMapCoreDigest
 } from "../alignment/mediaTimeMap";
 import { applyTestManualMediaTimeMapVerification } from "../../test/manualVerification";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import { readTimeMapSpanPlaybackReview } from "../alignment/timeMapPlaybackReviewEvidence";
 import { createEmptyProject } from "./factory";
 import {
@@ -349,21 +350,106 @@ describe("project schema", () => {
     expect(validateProjectSchema(project).ok).toBe(true);
     const result = parseProjectJsonWithMetadata(JSON.stringify(project));
     const parsed = result.project;
-    expect(result.migration).toMatchObject({ fromVersion: 10, toVersion: 11 });
-    expect(parsed.mediaTimeMaps[0].quality.level).toBe("review");
+    expect(result.migration).toMatchObject({ fromVersion: 10, toVersion: 12 });
+    expect(parsed.mediaTimeMaps[0].quality.level).toBe("legacy-unverified");
     expect(parsed.mediaTimeMaps[0].quality.reasons.join(" ")).toContain(
       "v10 没有可绑定时间图核心"
     );
     expect(parsed.mediaTimeMaps[0].verification).toBeNull();
-    expect(parsed.mediaTimeMaps[1].quality.level).toBe("review");
+    expect(parsed.mediaTimeMaps[1].quality.level).toBe("legacy-unverified");
+    expect(parsed.mediaTimeMaps[0].spans[0]).toMatchObject({
+      id: "map-overclaimed:span:0001",
+      reason: "legacyUnverified",
+      quality: { level: "legacy-unverified", p99ResidualMs: null },
+      alternatives: []
+    });
 
     const reopened = parseProjectJson(serializeProject(parsed));
-    expect(reopened.mediaTimeMaps[0].quality.level).toBe("review");
+    expect(reopened.mediaTimeMaps[0].quality.level).toBe("legacy-unverified");
     expect(
       reopened.mediaTimeMaps[0].quality.reasons.filter((reason) =>
         reason.includes("v10 没有可绑定时间图核心")
       )
     ).toHaveLength(1);
+  });
+
+  it("v11 缺失逐段证据时确定性迁移到 v12 并清除旧验证", () => {
+    const map = createValidMediaTimeMap({ id: "legacy-v11-map" });
+    map.spans.forEach((span) => {
+      delete span.id;
+      delete span.reason;
+      delete span.quality;
+      delete span.boundaries;
+      delete span.alternatives;
+    });
+    delete map.quality.uniqueContentCoverage;
+    delete map.quality.p99ResidualMs;
+    delete map.quality.anchorRegionCount;
+    delete map.evidence.top1Top2Margin;
+    delete map.evidence.uniqueContentCoverage;
+    delete map.evidence.repeatedContentOnly;
+    delete map.evidence.selectedTrackReason;
+    delete map.evidence.alternativeTrackScores;
+    const project = {
+      ...createEmptyProject("v11 逐段证据迁移"),
+      schemaVersion: 11,
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [map]
+    };
+
+    expect(validateProjectSchema(project).ok).toBe(true);
+    const migrated = parseProjectJsonWithMetadata(JSON.stringify(project));
+    expect(migrated.migration).toMatchObject({ fromVersion: 11, toVersion: 12 });
+    expect(migrated.project.mediaTimeMaps[0]).toMatchObject({
+      verification: null,
+      quality: {
+        level: "legacy-unverified",
+        probability: null,
+        uniqueContentCoverage: null,
+        p99ResidualMs: null,
+        anchorRegionCount: 0
+      },
+      evidence: {
+        uniqueContentCoverage: null,
+        repeatedContentOnly: false,
+        alternativeTrackScores: []
+      }
+    });
+    expect(migrated.project.mediaTimeMaps[0].spans[0]).toMatchObject({
+      id: "legacy-v11-map:span:0001",
+      reason: "legacyUnverified",
+      quality: { level: "legacy-unverified" }
+    });
+  });
+
+  it("v12 持久化拒绝缺少逐段证据或 P99 的时间图", () => {
+    const map = createValidMediaTimeMap();
+    const project = {
+      ...createEmptyProject("v12 严格验证"),
+      mediaLibrary: [
+        createValidProjectMediaReference({ id: "source-media", role: "bilibiliReference" }),
+        createValidProjectMediaReference({ id: "target-media", role: "targetOriginal" })
+      ],
+      mediaTimeMaps: [map]
+    };
+    delete map.spans[0].boundaries;
+    expect(validateProjectSchema(project).ok).toBe(false);
+
+    map.spans[0] = createTestCompleteTimeMapSpan(
+      {
+        kind: "matched",
+        sourceStartMs: 10_000,
+        sourceEndMs: 40_000,
+        targetStartMs: 0,
+        targetEndMs: 30_000
+      },
+      "candidate-map-1:span:0001"
+    );
+    delete map.quality.p99ResidualMs;
+    expect(validateProjectSchema(project).ok).toBe(false);
   });
 
   it("v11 导入的自报 manual record 即使摘要正确也不会自动成为 trusted", () => {
@@ -1239,6 +1325,11 @@ describe("project schema", () => {
         audioAnchorCount: 50,
         visualAnchorCount: 0,
         heldOutAnchorCount: 10,
+        top1Top2Margin: 0.3,
+        uniqueContentCoverage: 0.9,
+        repeatedContentOnly: false,
+        selectedTrackReason: "测试轨道得分最高。",
+        alternativeTrackScores: [],
         notes: ["测试音频证据。", legacyPlaybackNote]
       }
     });
@@ -1641,39 +1732,42 @@ function createValidMediaTimeMap(overrides: Partial<MediaTimeMap> = {}): MediaTi
     targetStartMs: 0,
     targetEndMs: 65_000,
     spans: [
-      {
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 10_000,
         sourceEndMs: 40_000,
         targetStartMs: 0,
         targetEndMs: 30_000
-      },
-      {
+      }, "candidate-map-1:span:0001"),
+      createTestCompleteTimeMapSpan({
         kind: "targetOnly",
         sourceStartMs: 40_000,
         sourceEndMs: 40_000,
         targetStartMs: 30_000,
         targetEndMs: 35_000
-      },
-      {
+      }, "candidate-map-1:span:0002"),
+      createTestCompleteTimeMapSpan({
         kind: "matched",
         sourceStartMs: 40_000,
         sourceEndMs: 70_000,
         targetStartMs: 35_000,
         targetEndMs: 65_000
-      }
+      }, "candidate-map-1:span:0003")
     ],
     quality: {
       level: "review",
       probability: null,
       metricSource: "measured",
       coverage: 0.95,
+      uniqueContentCoverage: 0.9,
       p50ResidualMs: 40,
       p95ResidualMs: 120,
+      p99ResidualMs: 180,
       maxResidualMs: 240,
       boundaryUncertaintyMs: 200,
       alternativeMargin: 0.3,
       anchorCount: 50,
+      anchorRegionCount: 3,
       heldOutAnchorCount: 10,
       reasons: ["测试映射仍需人工复核。"]
     },
@@ -1682,6 +1776,11 @@ function createValidMediaTimeMap(overrides: Partial<MediaTimeMap> = {}): MediaTi
       audioAnchorCount: 50,
       visualAnchorCount: 0,
       heldOutAnchorCount: 10,
+      top1Top2Margin: 0.3,
+      uniqueContentCoverage: 0.9,
+      repeatedContentOnly: false,
+      selectedTrackReason: "测试轨道得分最高。",
+      alternativeTrackScores: [],
       notes: ["测试音频证据。"]
     },
     engineVersion: "alignment-v2-test",
