@@ -96,6 +96,20 @@ describe("C137 fail-closed acceptance gate", () => {
     });
   });
 
+  it("关系排名未绑定 native blind receipt 时即使调用方补齐 trustContext 也不能放行", () => {
+    const bundle = createCompleteBundle();
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(gate.checks.find((check) => check.id === "native-blind-ranking-provenance"))
+      .toMatchObject({
+        status: "incomplete",
+        actual: "not-verifiable-in-acceptance-v1"
+      });
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
   it("旧 protocol v2 缺少正式 raw schema 绑定时严格拒绝", () => {
     const legacy = structuredClone(createCompleteBundle()) as unknown as {
       protocol: Record<string, unknown>;
@@ -198,6 +212,30 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(gate.status).toBe("incomplete-evidence");
     expect(gate.reasons.join("\n")).toContain("external-trust-authority");
     expect(gate.reasons.join("\n")).toContain("ranking-top-k-reported");
+  });
+
+  it("Top-K 数量完整但不含 gold 时，即使重签全部 report 也必须失败", () => {
+    const bundle = createCompleteBundle();
+    const decision = bundle.reports.relationshipRanking!.decisions[0];
+    decision.rankedCandidateIds = decision.rankedCandidateIds.map((candidateId, index) =>
+      candidateId === decision.goldCandidateId ? `wrong-candidate-${index}` : candidateId
+    );
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(decision.rankedCandidateIds).toHaveLength(bundle.protocol.topK);
+    expect(decision.rankedCandidateIds).not.toContain(decision.goldCandidateId);
+    expect(gate.checks.find((check) => check.id === "ranking-top-k-reported")).toMatchObject({
+      status: "pass",
+      actual: 1_000
+    });
+    expect(gate.checks.find((check) => check.id === "ranking-top-k-hit")).toMatchObject({
+      status: "fail",
+      actual: 999
+    });
+    expect(gate.status).toBe("incomplete-evidence");
   });
 
   it.each([

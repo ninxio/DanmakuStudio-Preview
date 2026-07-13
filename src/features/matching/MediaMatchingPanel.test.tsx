@@ -192,6 +192,8 @@ function createLegacyBatchSnapshot(
   jobId: string,
   pairs: readonly LegacyBatchPairState[]
 ): AudioAlignmentBatchJobSnapshot {
+  const sourceMediaIds = [...new Set(pairs.map((pair) => pair.sourceMediaId))];
+  const targetMediaIds = [...new Set(pairs.map((pair) => pair.targetMediaId))];
   const hasActivePair = pairs.some(
     (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
   );
@@ -202,7 +204,11 @@ function createLegacyBatchSnapshot(
   ).length;
   return {
     schemaVersion: 1,
+    evidenceVersion: 1,
     jobId,
+    pairingMode: "explicit",
+    sourceMediaIds,
+    targetMediaIds,
     status,
     progress:
       status === "running"
@@ -217,17 +223,99 @@ function createLegacyBatchSnapshot(
         (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
       ) + 1 || null,
     pairs: pairs.map((pair, index) => ({
+      pairIndex: index,
       pairOrdinal: index + 1,
       sourceMediaId: pair.sourceMediaId,
       targetMediaId: pair.targetMediaId,
       status: pair.snapshot.status,
       progress: pair.snapshot.progress,
       message: pair.snapshot.message,
+      globalSelection: createTestBatchGlobalSelection(
+        pair.snapshot.status,
+        pair.snapshot.proposal
+      ),
       proposal: pair.snapshot.proposal,
       error: pair.snapshot.error
     })),
     error: null,
     updatedAtMs: Math.max(1, ...pairs.map((pair) => pair.snapshot.updatedAtMs))
+  };
+}
+
+function createTestBatchGlobalSelection(
+  status: AudioAlignmentJobSnapshot["status"],
+  proposal: AlignmentProposal | null
+) {
+  if (status === "completed") {
+    const blocked = proposal?.timeMap?.quality.level === "blocked";
+    if (!blocked) {
+      const sourceStartMs = proposal?.timeMap?.sourceStartMs ?? 0;
+      const sourceEndMs = Math.max(sourceStartMs + 1, proposal?.timeMap?.sourceEndMs ?? 1);
+      const targetStartMs = proposal?.timeMap?.targetStartMs ?? 0;
+      const targetEndMs = Math.max(targetStartMs + 1, proposal?.timeMap?.targetEndMs ?? 1);
+      const candidate = {
+        rank: 1,
+        sourceStreamIndex: proposal?.timeMap?.sourceStream?.index ?? 0,
+        targetStreamIndex: proposal?.timeMap?.targetStream?.index ?? 0,
+        score: 0.9,
+        globalScore: 0.8,
+        scale: 1,
+        offsetMs: targetStartMs - sourceStartMs,
+        sourceStartMs,
+        sourceEndMs,
+        targetStartMs,
+        targetEndMs,
+        inlierCount: 20,
+        temporalCoverage: 0.8,
+        uniqueSourceCoverage: 0.7,
+        eligible: true,
+        globalSelected: true
+      };
+      return {
+        state: "selected" as const,
+        selected: true,
+        selectedRank: 1,
+        selectedScore: 0.8,
+        decisionRank: 1,
+        decisionScore: 0.8,
+        margin: 1,
+        candidateCount: 1,
+        eligibleCandidateCount: 1,
+        topK: [candidate],
+        decisionCandidate: candidate
+      };
+    }
+    return {
+      state: "blocked" as const,
+      selected: false,
+      selectedRank: null,
+      selectedScore: null,
+      decisionRank: null,
+      decisionScore: null,
+      margin: 0,
+      candidateCount: 0,
+      eligibleCandidateCount: 0,
+      topK: [],
+      decisionCandidate: null
+    };
+  }
+  return {
+    state:
+      status === "failed"
+        ? ("failed" as const)
+        : status === "cancelled"
+          ? ("cancelled" as const)
+          : ("pending" as const),
+    selected: false,
+    selectedRank: null,
+    selectedScore: null,
+    decisionRank: null,
+    decisionScore: null,
+    margin: null,
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    topK: [],
+    decisionCandidate: null
   };
 }
 

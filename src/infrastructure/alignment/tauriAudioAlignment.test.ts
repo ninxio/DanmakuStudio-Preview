@@ -10,6 +10,7 @@ import {
   startTauriAudioAlignmentBatchJob,
   startTauriAudioAlignmentJob,
   type AudioAlignmentBatchJobInvoker,
+  type AudioAlignmentBatchJobSnapshot,
   type AudioAlignmentInvoker,
   type AudioAlignmentJobInvoker,
   type NormalizedTauriAudioAlignmentRequest,
@@ -321,7 +322,11 @@ describe("Tauri 音频对齐调用", () => {
   it("批任务一次发送全部媒体并规范化流索引", async () => {
     tauriMocks.invoke.mockResolvedValue({
       schemaVersion: 1,
+      evidenceVersion: 1,
       jobId: "batch-1",
+      pairingMode: "fullCartesian",
+      sourceMediaIds: ["source"],
+      targetMediaIds: ["target-1", "target-2"],
       status: "queued",
       progress: 0,
       message: "已排队",
@@ -440,13 +445,39 @@ describe("Tauri 音频对齐调用", () => {
         jobInvoker
       )
     ).rejects.toThrow("最多分析 256 个素材组合");
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [{ mediaId: "集".repeat(257), path: "source.mkv" }],
+          targets: [{ mediaId: "target", path: "target.mkv" }],
+          ffmpegPath: null,
+          localizationMode: true
+        },
+        jobInvoker
+      )
+    ).rejects.toThrow("最多 512 UTF-8 bytes");
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [{ mediaId: "source", path: "source.mkv", audioStreamIndex: 0x1_0000_0000 }],
+          targets: [{ mediaId: "target", path: "target.mkv" }],
+          ffmpegPath: null,
+          localizationMode: true
+        },
+        jobInvoker
+      )
+    ).rejects.toThrow("u32");
     expect(invoker).not.toHaveBeenCalled();
   });
 
   it("批任务可显式指定未完成 pair，并拒绝重复或越界引用", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
+      evidenceVersion: 1 as const,
       jobId: "batch-explicit",
+      pairingMode: "explicit" as const,
+      sourceMediaIds: ["source"],
+      targetMediaIds: ["target"],
       status: "queued" as const,
       progress: 0,
       message: "已排队",
@@ -512,7 +543,11 @@ describe("Tauri 音频对齐调用", () => {
   it("支持读取和取消原生批任务", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
+      evidenceVersion: 1 as const,
       jobId: "batch-2",
+      pairingMode: "fullCartesian" as const,
+      sourceMediaIds: ["source"],
+      targetMediaIds: ["target-1", "target-2"],
       status: "cancelled" as const,
       progress: 1,
       message: "已取消",
@@ -540,7 +575,11 @@ describe("Tauri 音频对齐调用", () => {
   it("拒绝计数矛盾或 jobId 不匹配的原生批任务响应", async () => {
     const invalidSnapshot = {
       schemaVersion: 1 as const,
+      evidenceVersion: 1 as const,
       jobId: "wrong-job",
+      pairingMode: "fullCartesian" as const,
+      sourceMediaIds: ["source"],
+      targetMediaIds: ["target"],
       status: "running" as const,
       progress: 0.5,
       message: "运行中",
@@ -573,6 +612,114 @@ describe("Tauri 音频对齐调用", () => {
       )
     ).rejects.toThrow("processed/failed 计数与 pair 状态不一致");
   });
+
+  it("启动响应必须绑定请求 inventory，completed 终态不得夹带 cancelled pair", async () => {
+    const wrongInventory = {
+      schemaVersion: 1 as const,
+      evidenceVersion: 1 as const,
+      jobId: "batch-boundary",
+      pairingMode: "fullCartesian" as const,
+      sourceMediaIds: ["other-source"],
+      targetMediaIds: ["target"],
+      status: "queued" as const,
+      progress: 0,
+      message: "queued",
+      totalPairCount: 1,
+      processedPairCount: 0,
+      failedPairCount: 0,
+      currentPairOrdinal: null,
+      pairs: [batchPairSnapshot(1, "other-source", "target", "queued")],
+      error: null,
+      updatedAtMs: 1
+    };
+    const inventoryInvoker: AudioAlignmentBatchJobInvoker = {
+      start: () => Promise.resolve(wrongInventory),
+      get: vi.fn(),
+      cancel: vi.fn()
+    };
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [{ mediaId: "source", path: "source.mkv" }],
+          targets: [{ mediaId: "target", path: "target.mkv" }],
+          ffmpegPath: null,
+          localizationMode: true
+        },
+        inventoryInvoker
+      )
+    ).rejects.toThrow("未绑定本次请求");
+
+    const inconsistentCompleted = {
+      ...wrongInventory,
+      jobId: "batch-completed",
+      sourceMediaIds: ["source"],
+      status: "completed" as const,
+      progress: 1,
+      pairs: [batchPairSnapshot(1, "source", "target", "cancelled")]
+    };
+    const terminalInvoker: AudioAlignmentBatchJobInvoker = {
+      start: vi.fn(),
+      get: () => Promise.resolve(inconsistentCompleted),
+      cancel: vi.fn()
+    };
+    await expect(getTauriAudioAlignmentBatchJob("batch-completed", terminalInvoker)).rejects.toThrow(
+      "标记 completed"
+    );
+  });
+
+  it("接受 fine 失败后保留的 coarse 证据，并严格校验失败状态与完整 Top-K", async () => {
+    const failedSnapshot: AudioAlignmentBatchJobSnapshot = {
+      schemaVersion: 1,
+      evidenceVersion: 1,
+      jobId: "batch-fine-failed",
+      pairingMode: "fullCartesian",
+      sourceMediaIds: ["source"],
+      targetMediaIds: ["target"],
+      status: "failed",
+      progress: 1,
+      message: "fine failed",
+      totalPairCount: 1,
+      processedPairCount: 1,
+      failedPairCount: 1,
+      currentPairOrdinal: null,
+      pairs: [
+        {
+          ...batchPairSnapshot(1, "source", "target", "failed"),
+          globalSelection: failedBatchGlobalSelectionWithCoarseEvidence()
+        }
+      ],
+      error: "batch failed",
+      updatedAtMs: 4
+    };
+    const read = (snapshot: AudioAlignmentBatchJobSnapshot) =>
+      getTauriAudioAlignmentBatchJob("batch-fine-failed", {
+        start: vi.fn(),
+        get: () => Promise.resolve(snapshot),
+        cancel: vi.fn()
+      });
+
+    await expect(read(failedSnapshot)).resolves.toEqual(failedSnapshot);
+
+    const completedWithErrors = structuredClone(failedSnapshot);
+    completedWithErrors.status = "completed";
+    completedWithErrors.message = "batch completed with one failed pair";
+    completedWithErrors.error = null;
+    await expect(read(completedWithErrors)).resolves.toEqual(completedWithErrors);
+
+    const wrongState = structuredClone(failedSnapshot);
+    wrongState.pairs[0].globalSelection.state = "blocked";
+    await expect(read(wrongState)).rejects.toThrow("失败 pair 必须发布 failed");
+
+    const truncatedTopK = structuredClone(failedSnapshot);
+    truncatedTopK.pairs[0].globalSelection.topK = [];
+    await expect(read(truncatedTopK)).rejects.toThrow("topK 数量无效");
+
+    const mismatchedDecision = structuredClone(failedSnapshot);
+    const decisionCandidate = mismatchedDecision.pairs[0].globalSelection.decisionCandidate;
+    if (decisionCandidate === null) throw new Error("fixture decision candidate missing");
+    decisionCandidate.offsetMs = 1;
+    await expect(read(mismatchedDecision)).rejects.toThrow("与 Top-K 同 rank 候选不一致");
+  });
 });
 
 function batchPairSnapshot(
@@ -582,13 +729,82 @@ function batchPairSnapshot(
   status: "queued" | "running" | "completed" | "failed" | "cancelled"
 ) {
   return {
+    pairIndex: pairOrdinal - 1,
     pairOrdinal,
     sourceMediaId,
     targetMediaId,
     status,
     progress: status === "queued" ? 0 : status === "running" ? 0.5 : 1,
     message: status,
+    globalSelection: batchGlobalSelection(status),
     proposal: status === "completed" ? emptyProposal : null,
     error: status === "failed" ? "pair failed" : null
+  };
+}
+
+function batchGlobalSelection(
+  status: "queued" | "running" | "completed" | "failed" | "cancelled"
+) {
+  if (status === "completed") {
+    const candidate = {
+      rank: 1,
+      sourceStreamIndex: 0,
+      targetStreamIndex: 0,
+      score: 0.9,
+      globalScore: 0.8,
+      scale: 1,
+      offsetMs: 0,
+      sourceStartMs: 0,
+      sourceEndMs: 1_000,
+      targetStartMs: 0,
+      targetEndMs: 1_000,
+      inlierCount: 20,
+      temporalCoverage: 0.8,
+      uniqueSourceCoverage: 0.7,
+      eligible: true,
+      globalSelected: true
+    };
+    return {
+      state: "selected" as const,
+      selected: true,
+      selectedRank: 1,
+      selectedScore: 0.8,
+      decisionRank: 1,
+      decisionScore: 0.8,
+      margin: 1,
+      candidateCount: 1,
+      eligibleCandidateCount: 1,
+      topK: [candidate],
+      decisionCandidate: candidate
+    };
+  }
+  return {
+    state: status === "failed" ? ("failed" as const) : status === "cancelled" ? ("cancelled" as const) : ("pending" as const),
+    selected: false,
+    selectedRank: null,
+    selectedScore: null,
+    decisionRank: null,
+    decisionScore: null,
+    margin: null,
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    topK: [],
+    decisionCandidate: null
+  };
+}
+
+function failedBatchGlobalSelectionWithCoarseEvidence() {
+  const completed = batchGlobalSelection("completed");
+  if (completed.decisionCandidate === null) {
+    throw new Error("测试 fixture 缺少 coarse decision candidate。");
+  }
+  return {
+    ...completed,
+    state: "failed" as const,
+    selected: false,
+    selectedRank: null,
+    selectedScore: null,
+    topK: completed.topK.map((candidate) => ({ ...candidate, globalSelected: false })),
+    decisionCandidate: { ...completed.decisionCandidate, globalSelected: false }
   };
 }

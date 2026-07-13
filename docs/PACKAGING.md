@@ -25,7 +25,7 @@ corepack pnpm tauri:build
 
 最终用户安装和运行 NSIS 包时不需要 Node.js、pnpm、Rust 或 Visual Studio Build Tools。Windows 10/11 通常已预装 WebView2 Runtime；若目标机器缺失 WebView2，应按安装器提示或微软官方运行时安装指引补齐。
 
-当前安装包已包含可选 CUDA/cuFFT 声谱后端，但不随应用分发 CUDA Toolkit 或 cuFFT runtime。目标机器只有在 NVIDIA driver、cuFFT 动态库、CUDA context 和真实 R2C smoke 全部通过时才会报告 GPU ready；默认 auto 模式下初始化或执行失败会丢弃 GPU 中间结果并从头使用 CPU 重算，强制 CUDA 模式则 fail-closed。4090 当前只加速不超过 60 分钟短媒体的共享声谱 FFT；FFmpeg `-vn` 音频解码、长媒体 streaming coarse、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修和项目级搜索仍使用 CPU，也尚未实现 GPU 批量相关。FFmpeg 显示 CUDA/NVDEC 硬件解码能力不等于音频匹配已获得这些加速。
+当前安装包已包含可选 CUDA/cuFFT 声谱后端，但不随应用分发 CUDA Toolkit 或 cuFFT runtime。目标机器只有在 NVIDIA driver、cuFFT 动态库、CUDA context 和真实 R2C smoke 全部通过时才会报告 GPU ready；默认 auto 模式下初始化或执行失败会丢弃 GPU 中间结果并从头使用 CPU 重算，强制 CUDA 模式则 fail-closed。短媒体共享声谱与长媒体 streaming coarse FFT 都可按 4096 帧有界 batch 使用 4090；FFmpeg `-vn` 音频解码、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修和项目级搜索仍使用 CPU，也尚未实现 GPU 批量相关。FFmpeg 显示 CUDA/NVDEC 硬件解码能力不等于整条音频匹配流水线都已 GPU 化。
 
 ## C137 安装级人工验证状态
 
@@ -55,9 +55,11 @@ corepack pnpm tauri:build
 
 从高级入口下载的 JSON 采用独立 schema 和 validator，固定标记 `scope: "time-map-component"`、`releaseEligible: false`。报告不包含本地媒体路径、单媒体 SHA-256、生产参数 hash 或原始诊断；但其中的 manifest、dataset 与 evidence 稳定摘要仍可把同一数据集或多次运行关联起来，因此它是“移除直接本地标识的稳定报告”，不是不可关联的匿名报告。组件子闸门即使通过，也不等于 release 通过，不会改变项目的人工签发状态或授予 `verified`。
 
+原生 N×M batch 另有完整 source-major receipt：包含 source/target inventory、全部 pair、每 pair 的候选数、Top-10、决策候选、shortlist 状态和 TimeMap，并在最终身份复核后原子发布。该原始 receipt 仍含内容身份和流元数据，只供本机内部协调器使用，不是可直接分享的匿名报告。私有 blind 编译边界用 salted media commitment、projection digest 和 raw prediction 绑定运行并事后重算指标；公开报告不携带 projection、raw prediction、逐 case ID/gold/pair 排名、media binding、suite/manifest 标识或私有运行摘要，只保留纯聚合指标。关系查询轴、视觉模式与 K 都在运行前固定，每侧最多 64 个媒体、总数最多 256 pair，候选数必须严格大于 K；视觉关闭时仅视频流不同不能冒充新候选，正式视觉模式则禁止 `null/auto` 流。其结果固定为 `scope: "cross-media-relationship-and-known-pair-anchor-component"`、`releaseEligible: false`、`trustStatus: "untrusted-self-consistent-evidence"`；v1 也不评测同一 pair 内窗口 Top-K、编辑/删减分类或边界准确度。
+
 同一高级区内的性能工程采集复用已导入 manifest 中的媒体引用，不会再要求选择第二组路径。native v2 在任何工具探测前校验 canonical blind manifest，为全部 distinct 媒体取得会话级只读 pin，只完整哈希一次，并从固定句柄探测实际卷；每个 job 只能使用注册 case 的配对和显式流。随后严格按 cold → warmup → hot → cancel 计划运行生产对齐核心。导出的 strict raw v2 保存 path-free `workloadStorage`、Rust 单调时钟、阶段边界、缓存计数、ToolHelp RSS 和取消终态，并固定标记 `releaseEligible: false`、`trustStatus: "untrusted-raw-evidence"`。它不会保存路径、卷 GUID/serial 或单媒体 SHA，但稳定的 run manifest、workload、media-set 与 receipt 摘要仍可跨运行关联同一工作负载。组件报告里的协调器 wall time 不属于性能证据。
 
-完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部信任。acceptance protocol v3 / performance report v3 只接受 formal raw schema v2，并独立检查当前冻结 manifest、实际媒体卷 receipt 的结构与工作负载绑定、Job memory receipt、terminal cleanup receipt 与 native attestation；storage 自摘要本身不证明原生来源，来源真实性仍依赖后两者及 authority。统计 evidence 还逐项核对协议 Top-K、calibration↔ranking decision、dataset gold 事件↔TimeMap 事件、全部 frozen time-stretch 漂移和跨报告 case metadata，重签摘要不能掩盖选择性漏报。当前 raw v2 的后三项 assurance 必须为 `null`，所以即使调用方改写 sampler 字符串、重算全部摘要并自建 `trustContext`，结果仍是 `incomplete-evidence`。`trustContext` 只是一份调用方提供的摘要快照，可用于发现内容变化，不能证明签发者身份；当前 `external-trust-authority` 检查固定为未完成，直到存在可独立验证的签名或受信封装。安装包默认也不携带审批白名单或可自行签发的外部 authority。
+完整 release 验收另需严格的 `C137AcceptanceBundle` 和外部信任。acceptance protocol v3 / performance report v3 只接受 formal raw schema v2，并独立检查当前冻结 manifest、实际媒体卷 receipt 的结构与工作负载绑定、Job memory receipt、terminal cleanup receipt 与 native attestation；storage 自摘要本身不证明原生来源，来源真实性仍依赖后两者及 authority。统计 evidence 还逐项核对协议 Top-K、calibration↔ranking decision、dataset gold 事件↔TimeMap 事件、全部 frozen time-stretch 漂移和跨报告 case metadata，重签摘要不能掩盖选择性漏报。当前 raw v2 的后三项 assurance 必须为 `null`，且 `native-blind-ranking-provenance` 固定为未完成，直到 formal bundle 能直接消费并重算 full-Cartesian blind projection/execution/native-receipt envelope，而不是信任调用方自报字符串；所以结果仍是 `incomplete-evidence`。`trustContext` 只是一份调用方提供的摘要快照，可用于发现内容变化，不能证明签发者身份；当前 `external-trust-authority` 检查也固定为未完成，直到存在可独立验证的签名或受信封装。安装包默认不携带审批白名单或可自行签发的外部 authority。
 
 release 不携带真实媒体、gold、许可材料或 raw 性能记录。当前仓库已能生成冷/热缓存耗时、ToolHelp 进程树峰值 RSS、取消延迟和实际 workload 卷回执，但仍没有采集/冻结合法真实关系的生成器。正式证据还必须实现诚实限定覆盖范围的 Job working-set receipt、终态 cleanup receipt 与独立外部 attestation，再用真实授权数据按获批协议重新采集；实际媒体卷回执或 lifecycle Job 不能单独替代这些要求。
 
@@ -82,5 +84,6 @@ corepack pnpm build
 - release 不打包真实媒体 benchmark。仓库中的 manifest v2 文件是 `isExample=true` 的 placeholder；实际数据集路径、全文件身份和授权说明由评测者保留在本机，运行前通过 Tauri preflight 重新核对媒体身份和显式流索引。
 - 当前真实媒体关系数仍为 0，尚未完成统计校准、规定硬件性能报告、20 套北极星长合集验收。A/B v2 token 已要求共同内容和单侧差异达到 2000/1500 ms 有效/覆盖时长、边界达到 1500/1000 ms，但这些门槛也尚未在授权真实冻结集上完成充分性校准。因此现阶段安装包是 fail-closed 的工程预览，不能作为准确率、性能或人工观看充分性的验收证明。
 - 当前 1×N、N×1 和 N×M 会作为一个原生 batch job 执行：worker 按计划中的 distinct media 节点各建立一次媒体 lease、完整身份、FFprobe timeline/逐帧 PTS、候选音轨与 coarse landmark，全部 pair 完成 coarse scoring 后，再用 exact branch-and-bound 选择项目级 Top-K 非冲突组合。candidate、状态或展开数超过硬上限，或任一可执行 pair 的 coarse 不完整时会整批 fail-closed，不会截断搜索后宣称全局最优。
-- 超过 60 分钟的媒体可以用有界 CPU 流建立 coarse 索引，但窗口 fine 不是任意长媒体保证。候选必须存在完整分集级查询轴，且完整候选逆投影、全部 coarse inlier support、DP/边界 guard 都能同时装入两侧各自不超过 60 分钟的窗口，活动内存预算也必须通过；双侧都超过 60 分钟且没有完整短轴只是其中一个阻断分支。4090 仅在 capability probe 通过后加速不超过 60 分钟短媒体的共享声谱 FFT，不能把它理解为整条匹配流水线或长合集已经 GPU 化。
-- V2.1 在进程内保留最多 768 MiB 的 PCM/landmark/fine 制品 LRU，自动候选的活动制品上限为 1 GiB，native 同时只运行一个普通重型对齐任务；结束应用会释放这些内存，benchmark 的 cold reset 与 session release 也会清空同一缓存槽。普通产品 batch 尚未像 benchmark session 一样固定整批 FFmpeg/FFprobe 二进制并把 tool digest 纳入普通缓存键；同一物理文件若以不同 `mediaId` 或路径别名重复提交，也仍会被当作不同计划节点而不会合并。
+- 超过 60 分钟的媒体可以用有界 CPU 或 CUDA/cuFFT 流建立 coarse 索引，但窗口 fine 不是任意长媒体保证。候选必须存在完整分集级查询轴，且完整候选逆投影、全部 coarse inlier support、DP/边界 guard 都能同时装入两侧各自不超过 60 分钟的窗口，活动内存预算也必须通过；双侧都超过 60 分钟且没有完整短轴只是其中一个阻断分支。4090 只加速声谱 FFT，不能把它理解为整条匹配流水线都已 GPU 化。
+- V2.1 在进程内保留最多 768 MiB 的 PCM/landmark/fine 制品 LRU，自动候选的活动制品上限为 1 GiB，native 同时只运行一个普通重型对齐任务；结束应用会释放这些内存，benchmark 的 cold reset 与 session release 也会清空同一缓存槽。普通产品 batch 已固定整批 FFmpeg/FFprobe、绑定 tool digest，并按物理 FileId 合并路径/hard-link 别名；不同音轨仍保留为独立视图。
+- 全局冲突规则会阻止同一物理内容区间同时分配给多个对端，blocked pair 不运行 fine。因此当前可处理长参考中非重叠分集的 many-to-one / one-to-many，不支持同一片段对应多个版本的真正 same-segment many-to-many fine alignment。

@@ -245,6 +245,40 @@ test.beforeEach(async ({ page }) => {
           parametersHash: `c137-e2e-${currentIndex + 1}`
         };
       };
+      const createGlobalSelection = (currentIndex: number) => {
+        const sourceStartMs = currentIndex * 60_000;
+        const candidate = {
+          rank: 1,
+          sourceStreamIndex: 1,
+          targetStreamIndex: 2,
+          score: 0.94,
+          globalScore: 0.9,
+          scale: 1,
+          offsetMs: -sourceStartMs,
+          sourceStartMs,
+          sourceEndMs: sourceStartMs + 60_000,
+          targetStartMs: 0,
+          targetEndMs: currentIndex === 0 ? 61_000 : 60_000,
+          inlierCount: 36,
+          temporalCoverage: currentIndex === 0 ? 0.72 : 0.96,
+          uniqueSourceCoverage: 0.94,
+          eligible: true,
+          globalSelected: true
+        };
+        return {
+          state: "selected",
+          selected: true,
+          selectedRank: 1,
+          selectedScore: candidate.globalScore,
+          decisionRank: 1,
+          decisionScore: candidate.globalScore,
+          margin: 1,
+          candidateCount: 1,
+          eligibleCandidateCount: 1,
+          topK: [candidate],
+          decisionCandidate: candidate
+        };
+      };
 
       const mockWindow = window as unknown as MockTauriWindow;
       let batchJobIndex = 0;
@@ -392,14 +426,30 @@ test.beforeEach(async ({ page }) => {
           }
           if (command === "start_audio_alignment_batch_job") {
             const request = (args.request ?? {}) as {
+              sources?: Array<{ mediaId: string }>;
+              targets?: Array<{ mediaId: string }>;
               pairs?: Array<{ sourceMediaId: string; targetMediaId: string }>;
             };
-            const pairs = request.pairs ?? [];
+            const sources = request.sources ?? [];
+            const targets = request.targets ?? [];
+            const pairingMode = request.pairs === undefined ? "fullCartesian" : "explicit";
+            const pairs =
+              request.pairs ??
+              sources.flatMap((source) =>
+                targets.map((target) => ({
+                  sourceMediaId: source.mediaId,
+                  targetMediaId: target.mediaId
+                }))
+              );
             batchJobIndex += 1;
             const jobId = `c137-batch-job-${batchJobIndex}`;
             const snapshot = {
               schemaVersion: 1,
+              evidenceVersion: 1,
               jobId,
+              pairingMode,
+              sourceMediaIds: sources.map((media) => media.mediaId),
+              targetMediaIds: targets.map((media) => media.mediaId),
               status: "completed",
               progress: 1,
               message: "批量分析完成",
@@ -408,12 +458,14 @@ test.beforeEach(async ({ page }) => {
               failedPairCount: 0,
               currentPairOrdinal: null,
               pairs: pairs.map((pair, currentIndex) => ({
+                pairIndex: currentIndex,
                 pairOrdinal: currentIndex + 1,
                 sourceMediaId: pair.sourceMediaId,
                 targetMediaId: pair.targetMediaId,
                 status: "completed",
                 progress: 1,
                 message: "已定位对应片段",
+                globalSelection: createGlobalSelection(currentIndex),
                 proposal: {
                   anchors: [
                     {

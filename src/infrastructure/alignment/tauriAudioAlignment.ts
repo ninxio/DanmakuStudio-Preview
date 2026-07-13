@@ -118,19 +118,66 @@ export interface NormalizedTauriAudioAlignmentBatchRequest extends Omit<
 }
 
 export interface AudioAlignmentBatchPairSnapshot {
+  pairIndex: number;
   pairOrdinal: number;
   sourceMediaId: string;
   targetMediaId: string;
   status: AudioAlignmentJobStatus;
   progress: number;
   message: string;
+  globalSelection: AudioAlignmentBatchGlobalSelectionSnapshot;
   proposal: AlignmentProposal | null;
   error: string | null;
 }
 
+export type AudioAlignmentBatchPairingMode = "fullCartesian" | "explicit";
+export type AudioAlignmentBatchGlobalSelectionState =
+  | "pending"
+  | "selected"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+export interface AudioAlignmentBatchGlobalCandidateSnapshot {
+  rank: number;
+  sourceStreamIndex: number;
+  targetStreamIndex: number;
+  score: number;
+  globalScore: number;
+  scale: number;
+  offsetMs: number;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  targetStartMs: number;
+  targetEndMs: number;
+  inlierCount: number;
+  temporalCoverage: number;
+  uniqueSourceCoverage: number;
+  eligible: boolean;
+  globalSelected: boolean;
+}
+
+export interface AudioAlignmentBatchGlobalSelectionSnapshot {
+  state: AudioAlignmentBatchGlobalSelectionState;
+  selected: boolean;
+  selectedRank: number | null;
+  selectedScore: number | null;
+  decisionRank: number | null;
+  decisionScore: number | null;
+  margin: number | null;
+  candidateCount: number;
+  eligibleCandidateCount: number;
+  topK: AudioAlignmentBatchGlobalCandidateSnapshot[];
+  decisionCandidate: AudioAlignmentBatchGlobalCandidateSnapshot | null;
+}
+
 export interface AudioAlignmentBatchJobSnapshot {
   schemaVersion: 1;
+  evidenceVersion: 1;
   jobId: string;
+  pairingMode: AudioAlignmentBatchPairingMode;
+  sourceMediaIds: string[];
+  targetMediaIds: string[];
   status: AudioAlignmentJobStatus;
   progress: number;
   message: string;
@@ -214,7 +261,9 @@ export async function startTauriAudioAlignmentBatchJob(
   ensureDesktopAudioAlignment(invoker === defaultAudioAlignmentBatchJobInvoker);
   const normalizedRequest = normalizeAudioAlignmentBatchRequest(request);
   try {
-    return validateAudioAlignmentBatchJobSnapshot(await invoker.start(normalizedRequest));
+    const snapshot = validateAudioAlignmentBatchJobSnapshot(await invoker.start(normalizedRequest));
+    validateStartedAudioAlignmentBatchSnapshot(snapshot, normalizedRequest);
+    return snapshot;
   } catch (error: unknown) {
     throw new Error(`批量音频对齐任务启动失败：${formatAudioAlignmentFailure(error)}`);
   }
@@ -368,6 +417,12 @@ function normalizeBatchMedia(
     if (!mediaId) {
       throw new Error(`${label}第 ${index + 1} 项的媒体 ID 不能为空。`);
     }
+    if (
+      new TextEncoder().encode(mediaId).byteLength > 512 ||
+      containsInvalidMediaIdCharacter(mediaId)
+    ) {
+      throw new Error(`${label}第 ${index + 1} 项的媒体 ID 必须是最多 512 UTF-8 bytes 的无路径标识。`);
+    }
     if (ids.has(mediaId)) {
       throw new Error(`${label}包含重复媒体 ID：${mediaId}`);
     }
@@ -382,6 +437,46 @@ function normalizeBatchMedia(
       videoStreamIndex: normalizeStreamIndex(item.videoStreamIndex, `${label}视频流索引`)
     };
   });
+}
+
+function validateStartedAudioAlignmentBatchSnapshot(
+  snapshot: AudioAlignmentBatchJobSnapshot,
+  request: NormalizedTauriAudioAlignmentBatchRequest
+): void {
+  const expectedPairingMode = request.pairs === undefined ? "fullCartesian" : "explicit";
+  const expectedSourceIds = request.sources.map((media) => media.mediaId);
+  const expectedTargetIds = request.targets.map((media) => media.mediaId);
+  if (
+    snapshot.pairingMode !== expectedPairingMode ||
+    !sameOrderedStrings(snapshot.sourceMediaIds, expectedSourceIds) ||
+    !sameOrderedStrings(snapshot.targetMediaIds, expectedTargetIds)
+  ) {
+    throw new Error(
+      "原生批任务启动响应未绑定本次请求的 fullCartesian pairingMode 或媒体 inventory。"
+    );
+  }
+  const expectedPairs =
+    request.pairs ??
+    request.sources.flatMap((source) =>
+      request.targets.map((target) => ({
+        sourceMediaId: source.mediaId,
+        targetMediaId: target.mediaId
+      }))
+    );
+  if (
+    snapshot.pairs.length !== expectedPairs.length ||
+    snapshot.pairs.some(
+      (pair, index) =>
+        pair.sourceMediaId !== expectedPairs[index]?.sourceMediaId ||
+        pair.targetMediaId !== expectedPairs[index]?.targetMediaId
+    )
+  ) {
+    throw new Error("原生批任务启动响应未绑定本次请求的完整 pair inventory。");
+  }
+}
+
+function sameOrderedStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 const AUDIO_ALIGNMENT_JOB_STATUSES = new Set<AudioAlignmentJobStatus>([
@@ -399,9 +494,44 @@ function validateAudioAlignmentBatchJobSnapshot(
   if (!isRecord(value) || value.schemaVersion !== 1) {
     throw new Error("原生批任务返回了不支持的响应结构或 schemaVersion。");
   }
+  requireRuntimeExactKeys(
+    value,
+    [
+      "schemaVersion",
+      "evidenceVersion",
+      "jobId",
+      "pairingMode",
+      "sourceMediaIds",
+      "targetMediaIds",
+      "status",
+      "progress",
+      "message",
+      "totalPairCount",
+      "processedPairCount",
+      "failedPairCount",
+      "currentPairOrdinal",
+      "pairs",
+      "error",
+      "updatedAtMs"
+    ],
+    "原生批任务响应"
+  );
+  if (value.evidenceVersion !== 1) {
+    throw new Error("原生批任务返回了不支持的 evidenceVersion。");
+  }
   const jobId = requireRuntimeText(value.jobId, "批任务 jobId");
   if (expectedJobId !== undefined && jobId !== expectedJobId) {
     throw new Error("原生批任务响应的 jobId 与请求不一致。");
+  }
+  const pairingMode = requireRuntimeEnum(
+    value.pairingMode,
+    ["fullCartesian", "explicit"] as const,
+    "批任务 pairingMode"
+  );
+  const sourceMediaIds = requireRuntimeIdArray(value.sourceMediaIds, "批任务来源媒体 inventory");
+  const targetMediaIds = requireRuntimeIdArray(value.targetMediaIds, "批任务目标媒体 inventory");
+  if (sourceMediaIds.some((mediaId) => targetMediaIds.includes(mediaId))) {
+    throw new Error("原生批任务响应的两侧媒体 inventory 必须全局唯一。");
   }
   const status = requireRuntimeJobStatus(value.status, "批任务状态");
   requireRuntimeProgress(value.progress, "批任务进度");
@@ -422,10 +552,38 @@ function validateAudioAlignmentBatchJobSnapshot(
   if (!Array.isArray(value.pairs) || value.pairs.length !== totalPairCount) {
     throw new Error("原生批任务响应的 pairs 数量与 totalPairCount 不一致。");
   }
+  const cartesianPairCount = sourceMediaIds.length * targetMediaIds.length;
+  if (
+    totalPairCount > cartesianPairCount ||
+    (pairingMode === "fullCartesian" && totalPairCount !== cartesianPairCount)
+  ) {
+    throw new Error("原生批任务响应的 pair 数量与 pairingMode/inventory 不一致。");
+  }
   const pairOrdinals = new Set<number>();
+  const pairKeys = new Set<string>();
   const pairs = value.pairs.map((pair, index) =>
-    validateAudioAlignmentBatchPairSnapshot(pair, index, totalPairCount, pairOrdinals)
+    validateAudioAlignmentBatchPairSnapshot(
+      pair,
+      index,
+      totalPairCount,
+      pairOrdinals,
+      pairKeys,
+      new Set(sourceMediaIds),
+      new Set(targetMediaIds)
+    )
   );
+  if (pairingMode === "fullCartesian") {
+    pairs.forEach((pair, index) => {
+      const sourceIndex = Math.floor(index / targetMediaIds.length);
+      const targetIndex = index % targetMediaIds.length;
+      if (
+        pair.sourceMediaId !== sourceMediaIds[sourceIndex] ||
+        pair.targetMediaId !== targetMediaIds[targetIndex]
+      ) {
+        throw new Error("原生 fullCartesian 批任务响应未按 source-major 完整顺序返回 pair。");
+      }
+    });
+  }
   const actualProcessed = pairs.filter(
     (pair) => pair.status === "completed" || pair.status === "failed"
   ).length;
@@ -455,6 +613,14 @@ function validateAudioAlignmentBatchJobSnapshot(
   if (value.error !== null && typeof value.error !== "string") {
     throw new Error("原生批任务响应的 error 必须是字符串或 null。");
   }
+  if (
+    status === "completed" &&
+    (value.error !== null ||
+      processedPairCount !== totalPairCount ||
+      pairs.some((pair) => pair.status !== "completed" && pair.status !== "failed"))
+  ) {
+    throw new Error("原生批任务标记 completed 时全部 pair 必须处理完毕且 error 为空。");
+  }
   requireRuntimeInteger(value.updatedAtMs, "批任务更新时间", 0, Number.MAX_SAFE_INTEGER);
   return value as unknown as AudioAlignmentBatchJobSnapshot;
 }
@@ -463,38 +629,316 @@ function validateAudioAlignmentBatchPairSnapshot(
   value: unknown,
   index: number,
   totalPairCount: number,
-  pairOrdinals: Set<number>
+  pairOrdinals: Set<number>,
+  pairKeys: Set<string>,
+  sourceMediaIds: ReadonlySet<string>,
+  targetMediaIds: ReadonlySet<string>
 ): AudioAlignmentBatchPairSnapshot {
   if (!isRecord(value)) {
     throw new Error(`原生批任务第 ${index + 1} 个 pair 响应不是对象。`);
   }
+  requireRuntimeExactKeys(
+    value,
+    [
+      "pairIndex",
+      "pairOrdinal",
+      "sourceMediaId",
+      "targetMediaId",
+      "status",
+      "progress",
+      "message",
+      "globalSelection",
+      "proposal",
+      "error"
+    ],
+    `原生批任务第 ${index + 1} 个 pair 响应`
+  );
+  const pairIndex = requireRuntimeInteger(
+    value.pairIndex,
+    `第 ${index + 1} 个 pair 索引`,
+    0,
+    totalPairCount - 1
+  );
   const pairOrdinal = requireRuntimeInteger(
     value.pairOrdinal,
     `第 ${index + 1} 个 pair 序号`,
     1,
     totalPairCount
   );
-  if (pairOrdinals.has(pairOrdinal)) {
-    throw new Error("原生批任务响应包含重复 pairOrdinal。");
+  if (pairIndex !== index || pairOrdinal !== index + 1 || pairOrdinals.has(pairOrdinal)) {
+    throw new Error("原生批任务响应的 pairIndex/pairOrdinal 不是连续 canonical 顺序。");
   }
   pairOrdinals.add(pairOrdinal);
-  requireRuntimeText(value.sourceMediaId, `第 ${index + 1} 个 pair 来源媒体 ID`);
-  requireRuntimeText(value.targetMediaId, `第 ${index + 1} 个 pair 目标媒体 ID`);
+  const sourceMediaId = requireRuntimeText(
+    value.sourceMediaId,
+    `第 ${index + 1} 个 pair 来源媒体 ID`
+  );
+  const targetMediaId = requireRuntimeText(
+    value.targetMediaId,
+    `第 ${index + 1} 个 pair 目标媒体 ID`
+  );
+  if (!sourceMediaIds.has(sourceMediaId) || !targetMediaIds.has(targetMediaId)) {
+    throw new Error("原生批任务 pair 引用了 inventory 外的媒体 ID。");
+  }
+  const pairKey = `${sourceMediaId}\u0000${targetMediaId}`;
+  if (pairKeys.has(pairKey)) {
+    throw new Error("原生批任务响应包含重复媒体 pair。");
+  }
+  pairKeys.add(pairKey);
   const status = requireRuntimeJobStatus(value.status, `第 ${index + 1} 个 pair 状态`);
   requireRuntimeProgress(value.progress, `第 ${index + 1} 个 pair 进度`);
   requireRuntimeText(value.message, `第 ${index + 1} 个 pair 消息`);
+  const globalSelection = validateAudioAlignmentBatchGlobalSelection(
+    value.globalSelection,
+    `第 ${index + 1} 个 pair globalSelection`
+  );
   if (status === "completed") {
     if (!isRecord(value.proposal) || value.error !== null) {
       throw new Error("已完成 pair 必须包含 proposal 且不能包含 error。");
+    }
+    if (globalSelection.state !== "selected" && globalSelection.state !== "blocked") {
+      throw new Error("已完成 pair 必须发布 selected 或 blocked 的全局选择证据。");
     }
   } else if (status === "failed") {
     if (value.proposal !== null || typeof value.error !== "string" || !value.error.trim()) {
       throw new Error("失败 pair 必须包含 error 且不能包含 proposal。");
     }
+    if (globalSelection.state !== "failed") {
+      throw new Error("失败 pair 必须发布 failed 的全局选择证据。");
+    }
   } else if (value.proposal !== null || value.error !== null) {
     throw new Error("未完成或已取消 pair 不能包含 proposal/error。");
   }
+  if (
+    ((status === "queued" || status === "running") && globalSelection.state !== "pending") ||
+    (status === "cancelled" && globalSelection.state !== "cancelled")
+  ) {
+    throw new Error("原生批任务 pair 状态与全局选择证据状态不一致。");
+  }
   return value as unknown as AudioAlignmentBatchPairSnapshot;
+}
+
+const AUDIO_ALIGNMENT_BATCH_SELECTION_STATES = [
+  "pending",
+  "selected",
+  "blocked",
+  "failed",
+  "cancelled"
+] as const;
+
+function validateAudioAlignmentBatchGlobalSelection(
+  value: unknown,
+  label: string
+): AudioAlignmentBatchGlobalSelectionSnapshot {
+  if (!isRecord(value)) {
+    throw new Error(`${label} 不是对象。`);
+  }
+  requireRuntimeExactKeys(
+    value,
+    [
+      "state",
+      "selected",
+      "selectedRank",
+      "selectedScore",
+      "decisionRank",
+      "decisionScore",
+      "margin",
+      "candidateCount",
+      "eligibleCandidateCount",
+      "topK",
+      "decisionCandidate"
+    ],
+    label
+  );
+  const state = requireRuntimeEnum(value.state, AUDIO_ALIGNMENT_BATCH_SELECTION_STATES, `${label}.state`);
+  if (typeof value.selected !== "boolean") {
+    throw new Error(`${label}.selected 必须是布尔值。`);
+  }
+  const candidateCount = requireRuntimeInteger(
+    value.candidateCount,
+    `${label}.candidateCount`,
+    0,
+    Number.MAX_SAFE_INTEGER
+  );
+  const eligibleCandidateCount = requireRuntimeInteger(
+    value.eligibleCandidateCount,
+    `${label}.eligibleCandidateCount`,
+    0,
+    candidateCount
+  );
+  if (
+    !Array.isArray(value.topK) ||
+    value.topK.length !== Math.min(candidateCount, 10)
+  ) {
+    throw new Error(`${label}.topK 数量无效。`);
+  }
+  const topK = value.topK.map((candidate, index) =>
+    validateAudioAlignmentBatchGlobalCandidate(candidate, `${label}.topK[${index}]`, index + 1)
+  );
+  const selectedRank = requireRuntimeNullableInteger(
+    value.selectedRank,
+    `${label}.selectedRank`,
+    1,
+    candidateCount
+  );
+  const selectedScore = requireRuntimeNullableFinite(value.selectedScore, `${label}.selectedScore`);
+  const decisionRank = requireRuntimeNullableInteger(
+    value.decisionRank,
+    `${label}.decisionRank`,
+    1,
+    candidateCount
+  );
+  const decisionScore = requireRuntimeNullableFinite(value.decisionScore, `${label}.decisionScore`);
+  const margin = requireRuntimeNullableUnit(value.margin, `${label}.margin`);
+  const decisionCandidate =
+    value.decisionCandidate === null
+      ? null
+      : validateAudioAlignmentBatchGlobalCandidate(
+          value.decisionCandidate,
+          `${label}.decisionCandidate`,
+          decisionRank ?? undefined
+        );
+
+  if (
+    (decisionRank === null) !== (decisionScore === null) ||
+    (decisionRank === null) !== (decisionCandidate === null)
+  ) {
+    throw new Error(`${label} 的 decision rank/score/candidate 必须同时存在或同时为空。`);
+  }
+  if (
+    decisionCandidate !== null &&
+    (decisionCandidate.rank !== decisionRank || decisionCandidate.globalScore !== decisionScore)
+  ) {
+    throw new Error(`${label} 的 decision candidate 未绑定 rank/score。`);
+  }
+  if (
+    decisionCandidate !== null &&
+    decisionRank !== null &&
+    decisionRank <= topK.length &&
+    globalCandidateKey(decisionCandidate) !== globalCandidateKey(topK[decisionRank - 1])
+  ) {
+    throw new Error(`${label} 的 decision candidate 与 Top-K 同 rank 候选不一致。`);
+  }
+  const selectedCandidates = [
+    ...topK.filter((candidate) => candidate.globalSelected),
+    ...(decisionCandidate?.globalSelected &&
+    !topK.some((candidate) => globalCandidateKey(candidate) === globalCandidateKey(decisionCandidate))
+      ? [decisionCandidate]
+      : [])
+  ];
+  if (state === "selected") {
+    if (
+      value.selected !== true ||
+      selectedRank === null ||
+      selectedScore === null ||
+      decisionCandidate === null ||
+      selectedRank !== decisionRank ||
+      selectedScore !== decisionScore ||
+      !decisionCandidate.globalSelected ||
+      !decisionCandidate.eligible ||
+      selectedCandidates.length !== 1
+    ) {
+      throw new Error(`${label} 的 selected 证据不闭合。`);
+    }
+  } else if (
+    value.selected !== false ||
+    selectedRank !== null ||
+    selectedScore !== null ||
+    selectedCandidates.length !== 0
+  ) {
+    throw new Error(`${label} 的非 selected 状态夹带了选择结果。`);
+  }
+  if (
+    (state === "pending" || state === "cancelled") &&
+    (candidateCount !== 0 ||
+      eligibleCandidateCount !== 0 ||
+      topK.length !== 0 ||
+      decisionRank !== null ||
+      margin !== null)
+  ) {
+    throw new Error(`${label} 的 ${state} 状态不能夹带候选证据。`);
+  }
+  return value as unknown as AudioAlignmentBatchGlobalSelectionSnapshot;
+}
+
+function validateAudioAlignmentBatchGlobalCandidate(
+  value: unknown,
+  label: string,
+  expectedRank?: number
+): AudioAlignmentBatchGlobalCandidateSnapshot {
+  if (!isRecord(value)) {
+    throw new Error(`${label} 不是对象。`);
+  }
+  requireRuntimeExactKeys(
+    value,
+    [
+      "rank",
+      "sourceStreamIndex",
+      "targetStreamIndex",
+      "score",
+      "globalScore",
+      "scale",
+      "offsetMs",
+      "sourceStartMs",
+      "sourceEndMs",
+      "targetStartMs",
+      "targetEndMs",
+      "inlierCount",
+      "temporalCoverage",
+      "uniqueSourceCoverage",
+      "eligible",
+      "globalSelected"
+    ],
+    label
+  );
+  const rank = requireRuntimeInteger(value.rank, `${label}.rank`, 1, Number.MAX_SAFE_INTEGER);
+  if (expectedRank !== undefined && rank !== expectedRank) {
+    throw new Error(`${label}.rank 不是连续 canonical 排名。`);
+  }
+  requireRuntimeInteger(value.sourceStreamIndex, `${label}.sourceStreamIndex`, 0, Number.MAX_SAFE_INTEGER);
+  requireRuntimeInteger(value.targetStreamIndex, `${label}.targetStreamIndex`, 0, Number.MAX_SAFE_INTEGER);
+  requireRuntimeFinite(value.score, `${label}.score`);
+  requireRuntimeFinite(value.globalScore, `${label}.globalScore`);
+  const scale = requireRuntimeFinite(value.scale, `${label}.scale`);
+  if (scale <= 0) throw new Error(`${label}.scale 必须大于 0。`);
+  requireRuntimeInteger(value.offsetMs, `${label}.offsetMs`, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+  const sourceStartMs = requireRuntimeInteger(
+    value.sourceStartMs,
+    `${label}.sourceStartMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  const sourceEndMs = requireRuntimeInteger(
+    value.sourceEndMs,
+    `${label}.sourceEndMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  const targetStartMs = requireRuntimeInteger(
+    value.targetStartMs,
+    `${label}.targetStartMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  const targetEndMs = requireRuntimeInteger(
+    value.targetEndMs,
+    `${label}.targetEndMs`,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER
+  );
+  if (sourceEndMs <= sourceStartMs || targetEndMs <= targetStartMs) {
+    throw new Error(`${label} 的候选区间必须为正长度。`);
+  }
+  requireRuntimeInteger(value.inlierCount, `${label}.inlierCount`, 0, Number.MAX_SAFE_INTEGER);
+  requireRuntimeUnit(value.temporalCoverage, `${label}.temporalCoverage`);
+  requireRuntimeUnit(value.uniqueSourceCoverage, `${label}.uniqueSourceCoverage`);
+  if (typeof value.eligible !== "boolean" || typeof value.globalSelected !== "boolean") {
+    throw new Error(`${label} 的 eligible/globalSelected 必须为布尔值。`);
+  }
+  if (value.globalSelected && !value.eligible) {
+    throw new Error(`${label} 不能选择不合格候选。`);
+  }
+  return value as unknown as AudioAlignmentBatchGlobalCandidateSnapshot;
 }
 
 function requireRuntimeJobStatus(value: unknown, label: string): AudioAlignmentJobStatus {
@@ -521,6 +965,116 @@ function requireRuntimeInteger(
     throw new Error(`${label}无效。`);
   }
   return value as number;
+}
+
+function requireRuntimeNullableInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number
+): number | null {
+  return value === null ? null : requireRuntimeInteger(value, label, minimum, maximum);
+}
+
+function requireRuntimeFinite(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${label} 必须是有限数值。`);
+  }
+  return value;
+}
+
+function requireRuntimeNullableFinite(value: unknown, label: string): number | null {
+  return value === null ? null : requireRuntimeFinite(value, label);
+}
+
+function requireRuntimeUnit(value: unknown, label: string): number {
+  const number = requireRuntimeFinite(value, label);
+  if (number < 0 || number > 1) {
+    throw new Error(`${label} 必须位于 0 到 1。`);
+  }
+  return number;
+}
+
+function requireRuntimeNullableUnit(value: unknown, label: string): number | null {
+  return value === null ? null : requireRuntimeUnit(value, label);
+}
+
+function requireRuntimeEnum<const T extends readonly string[]>(
+  value: unknown,
+  allowed: T,
+  label: string
+): T[number] {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    throw new Error(`${label} 无效。`);
+  }
+  return value;
+}
+
+function requireRuntimeIdArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    throw new Error(`${label} 必须包含 1–64 个媒体 ID。`);
+  }
+  const ids = value.map((item, index) => {
+    const id = requireRuntimeText(item, `${label}[${index}]`);
+    if (id.length > 512 || containsInvalidMediaIdCharacter(id)) {
+      throw new Error(`${label}[${index}] 不是有界无路径媒体 ID。`);
+    }
+    return id;
+  });
+  if (new Set(ids).size !== ids.length) {
+    throw new Error(`${label} 包含重复媒体 ID。`);
+  }
+  return ids;
+}
+
+function containsInvalidMediaIdCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (
+      character === "\\" ||
+      character === "/" ||
+      codePoint <= 0x1f ||
+      (codePoint >= 0x7f && codePoint <= 0x9f)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function requireRuntimeExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  label: string
+): void {
+  const actual = Object.keys(value).sort();
+  const canonicalExpected = [...expected].sort();
+  if (
+    actual.length !== canonicalExpected.length ||
+    actual.some((key, index) => key !== canonicalExpected[index])
+  ) {
+    throw new Error(`${label} 缺少必需字段或包含未知字段。`);
+  }
+}
+
+function globalCandidateKey(candidate: AudioAlignmentBatchGlobalCandidateSnapshot): string {
+  return JSON.stringify([
+    candidate.rank,
+    candidate.sourceStreamIndex,
+    candidate.targetStreamIndex,
+    candidate.score,
+    candidate.globalScore,
+    candidate.scale,
+    candidate.offsetMs,
+    candidate.sourceStartMs,
+    candidate.sourceEndMs,
+    candidate.targetStartMs,
+    candidate.targetEndMs,
+    candidate.inlierCount,
+    candidate.temporalCoverage,
+    candidate.uniqueSourceCoverage,
+    candidate.eligible
+  ]);
 }
 
 function requireRuntimeText(value: unknown, label: string): string {
@@ -550,6 +1104,9 @@ function normalizeStreamIndex(
   }
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${label}必须是非负安全整数或 null。`);
+  }
+  if (value > 0xffff_ffff) {
+    throw new Error(`${label}必须位于 Rust u32 的 0–4294967295 范围或为 null。`);
   }
   return value;
 }

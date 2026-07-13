@@ -525,6 +525,12 @@ function evaluateEvidenceCompleteness(
   const checks: C137AcceptanceCheck[] = [
     ...evaluateExternalTrust(bundle, trustContext),
     createCheck(
+      "native-blind-ranking-provenance",
+      "incomplete",
+      "not-verifiable-in-acceptance-v1",
+      "当前 acceptance v1 的关系 Top-K 仍是调用方报告，尚未严格绑定完整 blind projection、实际关系轴/视觉模式、native full-Cartesian receipt 与候选全集；在升级 schema 并由独立 authority 验证前不得放行"
+    ),
+    createCheck(
       "certification-class",
       bundle.certificationClass === "real-frozen" ? "pass" : "incomplete",
       bundle.certificationClass,
@@ -1088,6 +1094,9 @@ function evaluateRelationshipThresholds(
   const topKReported = frozen.filter(
     (item) => item.rankedCandidateIds.length === protocol.topK
   ).length;
+  const topKHitCount = frozen.filter((item) =>
+    item.rankedCandidateIds.includes(item.goldCandidateId)
+  ).length;
   return [
     thresholdCheck(
       "ranking-frozen-decisions",
@@ -1116,6 +1125,12 @@ function evaluateRelationshipThresholds(
       topKReported === frozen.length && frozen.length > 0,
       topKReported,
       `每个 frozen-test 判断必须恰好保存 ${protocol.topK} 个不重复的有序候选，以便报告协议锁定的 Top-K`
+    ),
+    thresholdCheck(
+      "ranking-top-k-hit",
+      topKHitCount === frozen.length && frozen.length > 0,
+      topKHitCount,
+      "每个 frozen-test 判断的正确关系都必须实际出现在协议锁定的 Top-K 中"
     )
   ];
 }

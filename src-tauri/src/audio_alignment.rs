@@ -536,6 +536,8 @@ pub struct AudioAlignmentJobSnapshot {
 }
 
 const AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION: u8 = 1;
+const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 1;
+const AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K: usize = 10;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE: usize = 64;
 const MAX_AUDIO_ALIGNMENT_BATCH_PAIRS: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_ID_BYTES: usize = 512;
@@ -576,15 +578,117 @@ pub struct AudioAlignmentBatchRequest {
     localization_mode: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioAlignmentBatchPairingMode {
+    FullCartesian,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioAlignmentBatchGlobalSelectionState {
+    Pending,
+    Selected,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioAlignmentBatchGlobalCandidateSnapshot {
+    rank: usize,
+    source_stream_index: u32,
+    target_stream_index: u32,
+    score: f64,
+    global_score: f64,
+    scale: f64,
+    offset_ms: i64,
+    source_start_ms: i64,
+    source_end_ms: i64,
+    target_start_ms: i64,
+    target_end_ms: i64,
+    inlier_count: usize,
+    temporal_coverage: f64,
+    unique_source_coverage: f64,
+    eligible: bool,
+    global_selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioAlignmentBatchGlobalSelectionSnapshot {
+    state: AudioAlignmentBatchGlobalSelectionState,
+    selected: bool,
+    selected_rank: Option<usize>,
+    selected_score: Option<f64>,
+    decision_rank: Option<usize>,
+    decision_score: Option<f64>,
+    margin: Option<f64>,
+    candidate_count: usize,
+    eligible_candidate_count: usize,
+    top_k: Vec<AudioAlignmentBatchGlobalCandidateSnapshot>,
+    decision_candidate: Option<AudioAlignmentBatchGlobalCandidateSnapshot>,
+}
+
+impl AudioAlignmentBatchGlobalSelectionSnapshot {
+    fn pending() -> Self {
+        Self {
+            state: AudioAlignmentBatchGlobalSelectionState::Pending,
+            selected: false,
+            selected_rank: None,
+            selected_score: None,
+            decision_rank: None,
+            decision_score: None,
+            margin: None,
+            candidate_count: 0,
+            eligible_candidate_count: 0,
+            top_k: Vec::new(),
+            decision_candidate: None,
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            state: AudioAlignmentBatchGlobalSelectionState::Failed,
+            ..Self::pending()
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            state: AudioAlignmentBatchGlobalSelectionState::Cancelled,
+            ..Self::pending()
+        }
+    }
+
+    fn mark_failed(mut self) -> Self {
+        self.state = AudioAlignmentBatchGlobalSelectionState::Failed;
+        self.selected = false;
+        self.selected_rank = None;
+        self.selected_score = None;
+        for candidate in &mut self.top_k {
+            candidate.global_selected = false;
+        }
+        if let Some(candidate) = &mut self.decision_candidate {
+            candidate.global_selected = false;
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioAlignmentBatchPairSnapshot {
+    pair_index: usize,
     pair_ordinal: usize,
     source_media_id: String,
     target_media_id: String,
     status: AudioAlignmentJobStatus,
     progress: f64,
     message: String,
+    global_selection: AudioAlignmentBatchGlobalSelectionSnapshot,
     proposal: Option<AudioAlignmentProposal>,
     error: Option<String>,
 }
@@ -593,7 +697,11 @@ pub struct AudioAlignmentBatchPairSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct AudioAlignmentBatchJobSnapshot {
     schema_version: u8,
+    evidence_version: u8,
     job_id: String,
+    pairing_mode: AudioAlignmentBatchPairingMode,
+    source_media_ids: Vec<String>,
+    target_media_ids: Vec<String>,
     status: AudioAlignmentJobStatus,
     progress: f64,
     message: String,
@@ -1262,6 +1370,7 @@ struct AudioAlignmentJobEntry {
 
 #[derive(Clone)]
 struct PlannedAudioAlignmentBatchPair {
+    pair_index: usize,
     pair_ordinal: usize,
     source_media_id: String,
     target_media_id: String,
@@ -1269,6 +1378,7 @@ struct PlannedAudioAlignmentBatchPair {
     target_media_index: usize,
     source_physical_media_index: usize,
     target_physical_media_index: usize,
+    global_selection: AudioAlignmentBatchGlobalSelectionSnapshot,
     request: AudioAlignmentRequest,
 }
 
@@ -1282,6 +1392,9 @@ struct PlannedAudioAlignmentBatchMedia {
 
 #[derive(Clone)]
 struct PlannedAudioAlignmentBatch {
+    pairing_mode: AudioAlignmentBatchPairingMode,
+    source_media_ids: Vec<String>,
+    target_media_ids: Vec<String>,
     media: Vec<PlannedAudioAlignmentBatchMedia>,
     pairs: Vec<PlannedAudioAlignmentBatchPair>,
 }
@@ -1327,6 +1440,7 @@ enum StagedAudioAlignmentBatchPairOutcome {
 
 struct StagedAudioAlignmentBatchPairResult {
     pair_index: usize,
+    global_selection: AudioAlignmentBatchGlobalSelectionSnapshot,
     outcome: StagedAudioAlignmentBatchPairOutcome,
 }
 
@@ -6037,6 +6151,9 @@ fn select_v2_global_shortlist_with_limits(
             Vec::new().into_iter()
         } else {
             let subplan = PlannedAudioAlignmentBatch {
+                pairing_mode: plan.pairing_mode.clone(),
+                source_media_ids: plan.source_media_ids.clone(),
+                target_media_ids: plan.target_media_ids.clone(),
                 media: plan.media.clone(),
                 pairs: unaffected_indices
                     .iter()
@@ -6344,6 +6461,163 @@ fn annotate_v2_component_level_decision(decision: &mut V2GlobalShortlistDecision
         }
         V2GlobalShortlistDecision::Failed(_) => {}
     }
+}
+
+fn create_audio_alignment_batch_global_selection_evidence(
+    coarse: &Result<V2PairCoarseCandidates, String>,
+    decision: &V2GlobalShortlistDecision,
+    batch_retained_artifact_bytes: usize,
+) -> Result<AudioAlignmentBatchGlobalSelectionSnapshot, String> {
+    let Ok(coarse) = coarse else {
+        return Ok(AudioAlignmentBatchGlobalSelectionSnapshot::failed());
+    };
+    if coarse.candidates.iter().any(|candidate| {
+        !candidate.score.is_finite()
+            || !candidate.temporal_coverage.is_finite()
+            || !candidate.hypothesis.scale.is_finite()
+            || !candidate.hypothesis.unique_source_coverage.is_finite()
+            || !v2_global_candidate_weight(candidate).is_finite()
+    }) {
+        return Err(
+            "批次级 Top-K evidence 含有非有限数值；拒绝发布不可序列化的 blind 结果。".to_string(),
+        );
+    }
+    let affine_config = v2_affine_match_config();
+    let eligible = coarse
+        .candidates
+        .iter()
+        .map(|candidate| {
+            candidate.temporal_coverage >= ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE
+                && candidate.hypothesis.inlier_count >= affine_config.min_inliers
+                && v2_global_candidate_weight(candidate) > 0.0
+                && ensure_v2_active_artifact_budget(
+                    batch_retained_artifact_bytes,
+                    candidate.fine_working_set_bytes,
+                )
+                .is_ok()
+        })
+        .collect::<Vec<_>>();
+    let (state, selected, decision_candidate, margin) = match decision {
+        V2GlobalShortlistDecision::Selected(selected) => (
+            AudioAlignmentBatchGlobalSelectionState::Selected,
+            true,
+            Some(&selected.candidate),
+            Some(selected.global_margin),
+        ),
+        V2GlobalShortlistDecision::Blocked {
+            candidate, margin, ..
+        } => (
+            AudioAlignmentBatchGlobalSelectionState::Blocked,
+            false,
+            candidate.as_ref(),
+            Some(*margin),
+        ),
+        V2GlobalShortlistDecision::Failed(_) => (
+            AudioAlignmentBatchGlobalSelectionState::Failed,
+            false,
+            None,
+            None,
+        ),
+    };
+    let decision_rank = decision_candidate.and_then(|candidate| {
+        coarse
+            .candidates
+            .iter()
+            .position(|item| v2_batch_evidence_candidate_eq(item, candidate))
+            .map(|index| index + 1)
+    });
+    let decision_score = decision_candidate.map(v2_global_candidate_weight);
+    if decision_candidate.is_some() && decision_rank.is_none() {
+        return Err(
+            "批次级 Top-K decision candidate 无法回溯到当前 pair 的完整候选表。".to_string(),
+        );
+    }
+    if selected
+        && decision_rank
+            .and_then(|rank| eligible.get(rank.saturating_sub(1)))
+            .copied()
+            != Some(true)
+    {
+        return Err("批次级 Top-K selected candidate 不在可执行候选集中。".to_string());
+    }
+    if margin.is_some_and(|value| !value.is_finite()) {
+        return Err("批次级 Top-K margin 不是有限数值。".to_string());
+    }
+    let top_k = coarse
+        .candidates
+        .iter()
+        .take(AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K)
+        .enumerate()
+        .map(|(index, candidate)| {
+            create_audio_alignment_batch_global_candidate_snapshot(
+                index + 1,
+                candidate,
+                eligible[index],
+                selected && decision_rank == Some(index + 1),
+            )
+        })
+        .collect::<Vec<_>>();
+    let decision_candidate = decision_candidate
+        .zip(decision_rank)
+        .map(|(candidate, rank)| {
+            create_audio_alignment_batch_global_candidate_snapshot(
+                rank,
+                candidate,
+                eligible[rank - 1],
+                selected,
+            )
+        });
+    Ok(AudioAlignmentBatchGlobalSelectionSnapshot {
+        state,
+        selected,
+        selected_rank: if selected { decision_rank } else { None },
+        selected_score: if selected { decision_score } else { None },
+        decision_rank,
+        decision_score,
+        margin,
+        candidate_count: coarse.candidates.len(),
+        eligible_candidate_count: eligible.iter().filter(|value| **value).count(),
+        top_k,
+        decision_candidate,
+    })
+}
+
+fn create_audio_alignment_batch_global_candidate_snapshot(
+    rank: usize,
+    candidate: &V2TrackPairCandidate,
+    eligible: bool,
+    global_selected: bool,
+) -> AudioAlignmentBatchGlobalCandidateSnapshot {
+    AudioAlignmentBatchGlobalCandidateSnapshot {
+        rank,
+        source_stream_index: candidate.source_input.stream.stream_index,
+        target_stream_index: candidate.target_input.stream.stream_index,
+        score: candidate.score,
+        global_score: v2_global_candidate_weight(candidate),
+        scale: candidate.hypothesis.scale,
+        offset_ms: candidate.hypothesis.offset_ms,
+        source_start_ms: candidate.global_source_interval.start_ms,
+        source_end_ms: candidate.global_source_interval.end_ms,
+        target_start_ms: candidate.global_target_interval.start_ms,
+        target_end_ms: candidate.global_target_interval.end_ms,
+        inlier_count: candidate.hypothesis.inlier_count,
+        temporal_coverage: candidate.temporal_coverage,
+        unique_source_coverage: candidate.hypothesis.unique_source_coverage,
+        eligible,
+        global_selected,
+    }
+}
+
+fn v2_batch_evidence_candidate_eq(
+    left: &V2TrackPairCandidate,
+    right: &V2TrackPairCandidate,
+) -> bool {
+    left.source_input.stream.stream_index == right.source_input.stream.stream_index
+        && left.target_input.stream.stream_index == right.target_input.stream.stream_index
+        && left.hypothesis == right.hypothesis
+        && left.score.to_bits() == right.score.to_bits()
+        && left.global_source_interval == right.global_source_interval
+        && left.global_target_interval == right.global_target_interval
 }
 
 fn compare_v2_global_assignment_states(
@@ -10699,6 +10973,11 @@ fn plan_audio_alignment_batch(
     }
     validate_audio_alignment_batch_side_count("参考素材", request.sources.len())?;
     validate_audio_alignment_batch_side_count("目标原片", request.targets.len())?;
+    let pairing_mode = if request.pairs.is_some() {
+        AudioAlignmentBatchPairingMode::Explicit
+    } else {
+        AudioAlignmentBatchPairingMode::FullCartesian
+    };
     let pair_count = if let Some(pairs) = &request.pairs {
         if pairs.is_empty() {
             return Err("显式批量 pair 列表不能为空。".to_string());
@@ -10731,6 +11010,14 @@ fn plan_audio_alignment_batch(
         .iter()
         .map(|media| normalize_audio_alignment_batch_media(media, &mut media_ids))
         .collect::<Result<Vec<_>, _>>()?;
+    let source_media_ids = sources
+        .iter()
+        .map(|media| media.media_id.clone())
+        .collect::<Vec<_>>();
+    let target_media_ids = targets
+        .iter()
+        .map(|media| media.media_id.clone())
+        .collect::<Vec<_>>();
 
     let mut media = sources
         .iter()
@@ -10780,6 +11067,7 @@ fn plan_audio_alignment_batch(
                 return Err("显式批量 pair 不允许重复。".to_string());
             }
             pairs.push(create_planned_audio_alignment_batch_pair(
+                pairs.len(),
                 pairs.len() + 1,
                 source_media_index,
                 target_media_index,
@@ -10792,6 +11080,7 @@ fn plan_audio_alignment_batch(
         for (source_media_index, source) in sources.iter().enumerate() {
             for (target_index, target) in targets.iter().enumerate() {
                 pairs.push(create_planned_audio_alignment_batch_pair(
+                    pairs.len(),
                     pairs.len() + 1,
                     source_media_index,
                     target_media_offset.saturating_add(target_index),
@@ -10830,10 +11119,17 @@ fn plan_audio_alignment_batch(
         .first()
         .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())?;
     create_options(&first.request)?;
-    Ok(PlannedAudioAlignmentBatch { media, pairs })
+    Ok(PlannedAudioAlignmentBatch {
+        pairing_mode,
+        source_media_ids,
+        target_media_ids,
+        media,
+        pairs,
+    })
 }
 
 fn create_planned_audio_alignment_batch_pair(
+    pair_index: usize,
     pair_ordinal: usize,
     source_media_index: usize,
     target_media_index: usize,
@@ -10842,6 +11138,7 @@ fn create_planned_audio_alignment_batch_pair(
     batch: &AudioAlignmentBatchRequest,
 ) -> PlannedAudioAlignmentBatchPair {
     PlannedAudioAlignmentBatchPair {
+        pair_index,
         pair_ordinal,
         source_media_id: source.media_id.clone(),
         target_media_id: target.media_id.clone(),
@@ -10849,6 +11146,7 @@ fn create_planned_audio_alignment_batch_pair(
         target_media_index,
         source_physical_media_index: source_media_index,
         target_physical_media_index: target_media_index,
+        global_selection: AudioAlignmentBatchGlobalSelectionSnapshot::pending(),
         request: AudioAlignmentRequest {
             complete_path: target.path.clone(),
             source_path: source.path.clone(),
@@ -10924,12 +11222,14 @@ fn insert_audio_alignment_batch_job(
         .pairs
         .iter()
         .map(|pair| AudioAlignmentBatchPairSnapshot {
+            pair_index: pair.pair_index,
             pair_ordinal: pair.pair_ordinal,
             source_media_id: pair.source_media_id.clone(),
             target_media_id: pair.target_media_id.clone(),
             status: AudioAlignmentJobStatus::Queued,
             progress: 0.0,
             message: "等待执行。".to_string(),
+            global_selection: AudioAlignmentBatchGlobalSelectionSnapshot::pending(),
             proposal: None,
             error: None,
         })
@@ -10937,7 +11237,11 @@ fn insert_audio_alignment_batch_job(
     let total_pair_count = pairs.len();
     let snapshot = AudioAlignmentBatchJobSnapshot {
         schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+        evidence_version: AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION,
         job_id: job_id.to_string(),
+        pairing_mode: plan.pairing_mode.clone(),
+        source_media_ids: plan.source_media_ids.clone(),
+        target_media_ids: plan.target_media_ids.clone(),
         status: AudioAlignmentJobStatus::Queued,
         progress: 0.0,
         message: "批量音频对齐任务已加入队列。".to_string(),
@@ -11498,6 +11802,28 @@ fn run_audio_alignment_batch_job(
         }
         Err(error) => vec![V2GlobalShortlistDecision::Failed(error); plan.pairs.len()],
     };
+    if shortlist.len() != plan.pairs.len() || coarse_by_pair.len() != plan.pairs.len() {
+        let _ = fail_audio_alignment_batch_worker_with_error(
+            &job_id,
+            0,
+            "批次级 Top-K evidence 数量与 pair 计划不一致。",
+        );
+        return;
+    }
+    for pair_index in 0..plan.pairs.len() {
+        let evidence = match create_audio_alignment_batch_global_selection_evidence(
+            &coarse_by_pair[pair_index],
+            &shortlist[pair_index],
+            batch_retained_artifact_bytes,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                let _ = fail_audio_alignment_batch_worker_with_error(&job_id, pair_index, &error);
+                return;
+            }
+        };
+        plan.pairs[pair_index].global_selection = evidence;
+    }
     let media_indices_by_pair = plan
         .pairs
         .iter()
@@ -11602,11 +11928,13 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
         {
             return;
         }
+        let global_selection = pair.global_selection.clone();
         let result = execute_pair(&job_id, pair_index, pair, cancel_flag.as_ref());
         match result {
             Ok(proposal) => {
                 staged_results.push(StagedAudioAlignmentBatchPairResult {
                     pair_index,
+                    global_selection,
                     outcome: StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(proposal)),
                 });
             }
@@ -11627,6 +11955,7 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
                 }
                 staged_results.push(StagedAudioAlignmentBatchPairResult {
                     pair_index,
+                    global_selection: global_selection.mark_failed(),
                     outcome: StagedAudioAlignmentBatchPairOutcome::Failed(error),
                 });
             }
@@ -11718,6 +12047,93 @@ fn finish_cancelled_audio_alignment_batch_with_staging<G>(
     }
 }
 
+fn validate_audio_alignment_batch_global_selection_evidence(
+    evidence: &AudioAlignmentBatchGlobalSelectionSnapshot,
+    proposal_outcome: bool,
+) -> Result<(), String> {
+    let terminal_state_matches = if proposal_outcome {
+        matches!(
+            evidence.state,
+            AudioAlignmentBatchGlobalSelectionState::Selected
+                | AudioAlignmentBatchGlobalSelectionState::Blocked
+        )
+    } else {
+        evidence.state == AudioAlignmentBatchGlobalSelectionState::Failed
+    };
+    if !terminal_state_matches {
+        return Err("批量音频对齐 staged outcome 与 global selection 状态不一致。".to_string());
+    }
+    if evidence.top_k.len()
+        != evidence
+            .candidate_count
+            .min(AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K)
+        || evidence.eligible_candidate_count > evidence.candidate_count
+        || evidence
+            .top_k
+            .iter()
+            .enumerate()
+            .any(|(index, candidate)| candidate.rank != index + 1)
+    {
+        return Err("批量音频对齐 global selection 的候选计数或 rank 不完整。".to_string());
+    }
+    if evidence
+        .decision_rank
+        .is_some_and(|rank| rank == 0 || rank > evidence.candidate_count)
+        || evidence
+            .decision_candidate
+            .as_ref()
+            .map(|candidate| Some(candidate.rank) != evidence.decision_rank)
+            .unwrap_or(evidence.decision_rank.is_some())
+    {
+        return Err("批量音频对齐 global selection 的 decision rank 不一致。".to_string());
+    }
+    let candidate_has_non_finite_value =
+        |candidate: &AudioAlignmentBatchGlobalCandidateSnapshot| {
+            !candidate.score.is_finite()
+                || !candidate.global_score.is_finite()
+                || !candidate.scale.is_finite()
+                || !candidate.temporal_coverage.is_finite()
+                || !candidate.unique_source_coverage.is_finite()
+        };
+    if evidence.margin.is_some_and(|value| !value.is_finite())
+        || evidence
+            .decision_score
+            .is_some_and(|value| !value.is_finite())
+        || evidence
+            .selected_score
+            .is_some_and(|value| !value.is_finite())
+        || evidence.top_k.iter().any(candidate_has_non_finite_value)
+        || evidence
+            .decision_candidate
+            .as_ref()
+            .is_some_and(candidate_has_non_finite_value)
+    {
+        return Err("批量音频对齐 global selection 含非有限数值。".to_string());
+    }
+    let selected_state = evidence.state == AudioAlignmentBatchGlobalSelectionState::Selected;
+    if evidence.selected != selected_state
+        || selected_state
+            && (evidence.selected_rank.is_none()
+                || evidence.selected_rank != evidence.decision_rank
+                || evidence.selected_score.is_none()
+                || evidence.selected_score.map(f64::to_bits)
+                    != evidence.decision_score.map(f64::to_bits))
+        || !selected_state
+            && (evidence.selected_rank.is_some() || evidence.selected_score.is_some())
+        || evidence
+            .decision_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.global_selected != selected_state)
+        || evidence.top_k.iter().any(|candidate| {
+            candidate.global_selected
+                != (selected_state && Some(candidate.rank) == evidence.selected_rank)
+        })
+    {
+        return Err("批量音频对齐 global selection 的 selected 证据不一致。".to_string());
+    }
+    Ok(())
+}
+
 fn commit_staged_audio_alignment_batch_results(
     job_id: &str,
     staged_results: Vec<StagedAudioAlignmentBatchPairResult>,
@@ -11744,6 +12160,13 @@ fn commit_staged_audio_alignment_batch_results(
             return Err("批量音频对齐 staged pair 结果重复。".to_string());
         }
         *committed_slot = true;
+        validate_audio_alignment_batch_global_selection_evidence(
+            &staged.global_selection,
+            matches!(
+                staged.outcome,
+                StagedAudioAlignmentBatchPairOutcome::Proposal(_)
+            ),
+        )?;
     }
     let cancelled = force_cancelled || entry.cancel_flag.load(Ordering::Acquire);
     if !cancelled && committed.iter().any(|committed| !committed) {
@@ -11756,6 +12179,7 @@ fn commit_staged_audio_alignment_batch_results(
             .get_mut(staged.pair_index)
             .ok_or_else(|| "批量音频对齐 pair 索引越界。".to_string())?;
         pair.progress = 1.0;
+        pair.global_selection = staged.global_selection;
         match staged.outcome {
             StagedAudioAlignmentBatchPairOutcome::Proposal(proposal) => {
                 pair.status = AudioAlignmentJobStatus::Completed;
@@ -11885,6 +12309,14 @@ fn complete_audio_alignment_batch_pair(
     } else {
         "当前 pair 已完成。".to_string()
     };
+    pair.global_selection = if failed {
+        AudioAlignmentBatchGlobalSelectionSnapshot::failed()
+    } else {
+        AudioAlignmentBatchGlobalSelectionSnapshot {
+            state: AudioAlignmentBatchGlobalSelectionState::Blocked,
+            ..AudioAlignmentBatchGlobalSelectionSnapshot::pending()
+        }
+    };
     pair.proposal = proposal;
     pair.error = error;
     entry.snapshot.processed_pair_count = entry
@@ -11976,6 +12408,7 @@ fn mark_audio_alignment_batch_cancelled(entry: &mut AudioAlignmentBatchJobEntry)
             pair.status = AudioAlignmentJobStatus::Cancelled;
             pair.progress = 1.0;
             pair.message = "批次已取消；当前或未开始的 pair 未产生结果。".to_string();
+            pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::cancelled();
             pair.proposal = None;
             pair.error = None;
         }
@@ -12067,12 +12500,19 @@ fn fail_audio_alignment_batch_worker(
             pair.status = AudioAlignmentJobStatus::Failed;
             pair.progress = 1.0;
             pair.message = "底层媒体进程未能可信收尾；当前 pair 已失败。".to_string();
+            pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
             pair.proposal = None;
             pair.error = Some("受监督媒体进程清理状态不可信。".to_string());
-        } else if pair.status == AudioAlignmentJobStatus::Queued {
+        } else if matches!(
+            pair.status,
+            AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+        ) {
             pair.status = AudioAlignmentJobStatus::Cancelled;
             pair.progress = 1.0;
             pair.message = "批次生命周期失败；该 pair 未执行。".to_string();
+            pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::cancelled();
+            pair.proposal = None;
+            pair.error = None;
         }
     }
     entry.snapshot.status = AudioAlignmentJobStatus::Failed;
@@ -12141,12 +12581,19 @@ fn fail_audio_alignment_batch_worker_with_error(
             pair.status = AudioAlignmentJobStatus::Failed;
             pair.progress = 1.0;
             pair.message = safe_message.clone();
+            pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
             pair.proposal = None;
             pair.error = Some(safe_message.clone());
-        } else if pair.status == AudioAlignmentJobStatus::Queued {
+        } else if matches!(
+            pair.status,
+            AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+        ) {
             pair.status = AudioAlignmentJobStatus::Cancelled;
             pair.progress = 1.0;
             pair.message = "批次初始化失败；该 pair 未执行。".to_string();
+            pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::cancelled();
+            pair.proposal = None;
+            pair.error = None;
         }
     }
     entry.snapshot.status = AudioAlignmentJobStatus::Failed;
@@ -12180,6 +12627,7 @@ fn invalidate_audio_alignment_batch_after_final_identity_failure(
         pair.status = AudioAlignmentJobStatus::Failed;
         pair.progress = 1.0;
         pair.message = "批次结束前媒体身份复核失败；该 pair 的结果已作废。".to_string();
+        pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
         pair.proposal = None;
         pair.error = Some("批次级 distinct-media 身份绑定失效。".to_string());
     }
@@ -18920,22 +19368,29 @@ mod tests {
     fn audio_alignment_batch_planner_preserves_explicit_pair_order_and_cartesian_fallback() {
         let cartesian = plan_audio_alignment_batch(test_audio_alignment_batch_request(None))
             .expect("省略 pairs 时应规划笛卡尔积");
+        assert_eq!(
+            cartesian.pairing_mode,
+            AudioAlignmentBatchPairingMode::FullCartesian
+        );
+        assert_eq!(cartesian.source_media_ids, ["source-1", "source-2"]);
+        assert_eq!(cartesian.target_media_ids, ["target-1", "target-2"]);
         assert_eq!(cartesian.pairs.len(), 4);
         assert_eq!(
             cartesian
                 .pairs
                 .iter()
                 .map(|pair| (
+                    pair.pair_index,
                     pair.pair_ordinal,
                     pair.source_media_id.as_str(),
                     pair.target_media_id.as_str()
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                (1, "source-1", "target-1"),
-                (2, "source-1", "target-2"),
-                (3, "source-2", "target-1"),
-                (4, "source-2", "target-2"),
+                (0, 1, "source-1", "target-1"),
+                (1, 2, "source-1", "target-2"),
+                (2, 3, "source-2", "target-1"),
+                (3, 4, "source-2", "target-2"),
             ]
         );
 
@@ -18944,7 +19399,12 @@ mod tests {
             ("source-1", "target-2"),
         ])))
         .expect("显式 pairs 应按请求顺序规划");
+        assert_eq!(
+            explicit.pairing_mode,
+            AudioAlignmentBatchPairingMode::Explicit
+        );
         assert_eq!(explicit.pairs.len(), 2);
+        assert_eq!(explicit.pairs[0].pair_index, 0);
         assert_eq!(explicit.pairs[0].pair_ordinal, 1);
         assert_eq!(explicit.pairs[0].source_media_id, "source-2");
         assert_eq!(explicit.pairs[0].target_media_id, "target-1");
@@ -18954,9 +19414,197 @@ mod tests {
             Some(11)
         );
         assert_eq!(explicit.pairs[1].pair_ordinal, 2);
+        assert_eq!(explicit.pairs[1].pair_index, 1);
         assert_eq!(explicit.pairs[1].source_media_id, "source-1");
         assert_eq!(explicit.pairs[1].target_media_id, "target-2");
         assert_eq!(explicit.media.len(), 4);
+    }
+
+    #[test]
+    fn audio_alignment_batch_full_cartesian_snapshot_is_complete_ordered_and_path_free() {
+        let plan = test_plan_with_selected_global_evidence(
+            plan_audio_alignment_batch(test_audio_alignment_batch_request(None)).unwrap(),
+        );
+        let job_id = format!("test-audio-batch-cartesian-evidence-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+
+        let queued = get_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(queued.schema_version, AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION);
+        assert_eq!(
+            queued.evidence_version,
+            AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION
+        );
+        assert_eq!(
+            queued.pairing_mode,
+            AudioAlignmentBatchPairingMode::FullCartesian
+        );
+        assert_eq!(queued.source_media_ids, ["source-1", "source-2"]);
+        assert_eq!(queued.target_media_ids, ["target-1", "target-2"]);
+        assert!(queued.pairs.iter().all(|pair| {
+            pair.global_selection.state == AudioAlignmentBatchGlobalSelectionState::Pending
+                && pair.global_selection.top_k.is_empty()
+        }));
+
+        run_audio_alignment_batch_job_with_pair_executor(
+            job_id.clone(),
+            cancel_flag,
+            plan,
+            |_job_id, pair_index, _pair, _cancel_flag| {
+                Ok(test_audio_alignment_batch_proposal(&format!(
+                    "cartesian-pair-{pair_index}"
+                )))
+            },
+        );
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Completed);
+        assert_eq!(terminal.pairs.len(), 4);
+        assert_eq!(
+            terminal
+                .pairs
+                .iter()
+                .map(|pair| (
+                    pair.pair_index,
+                    pair.pair_ordinal,
+                    pair.source_media_id.as_str(),
+                    pair.target_media_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1, "source-1", "target-1"),
+                (1, 2, "source-1", "target-2"),
+                (2, 3, "source-2", "target-1"),
+                (3, 4, "source-2", "target-2"),
+            ]
+        );
+        assert!(terminal.pairs.iter().all(|pair| {
+            pair.status == AudioAlignmentJobStatus::Completed
+                && pair.proposal.is_some()
+                && pair.global_selection.state == AudioAlignmentBatchGlobalSelectionState::Selected
+                && pair.global_selection.selected_rank == Some(1)
+                && pair.global_selection.top_k.len() == 1
+        }));
+        let json = serde_json::to_string(&terminal).unwrap();
+        assert!(json.contains("\"pairingMode\":\"fullCartesian\""));
+        assert!(json.contains("\"pairIndex\":0"));
+        assert!(json.contains("\"globalSelection\""));
+        assert!(!json.contains("source-1.mkv"));
+        assert!(!json.contains("target-1.mkv"));
+        assert!(!json.contains("C:\\\\"));
+    }
+
+    #[test]
+    fn audio_alignment_batch_global_selection_evidence_keeps_rank_score_and_hides_paths() {
+        let candidates = (0..12)
+            .map(|index| {
+                let start_ms = index as i64 * 100_000;
+                v2_test_global_candidate(
+                    PresentationRangeMs {
+                        start_ms: 0,
+                        end_ms: 90_000,
+                    },
+                    PresentationRangeMs {
+                        start_ms,
+                        end_ms: start_ms + 90_000,
+                    },
+                    0.99 - index as f64 * 0.01,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let coarse = Ok(V2PairCoarseCandidates {
+            candidates: candidates.clone(),
+            alternatives: Vec::new(),
+            diagnostics: vec![r"C:\private\source-1.mkv".to_string()],
+        });
+        let selected_candidate = candidates[10].clone();
+        let selected = create_audio_alignment_batch_global_selection_evidence(
+            &coarse,
+            &V2GlobalShortlistDecision::Selected(PreparedV2SelectedCandidate {
+                candidate: selected_candidate.clone(),
+                alternatives: Vec::new(),
+                global_margin: 0.25,
+                global_diagnostic: r"C:\private\target-1.mkv".to_string(),
+            }),
+            0,
+        )
+        .unwrap();
+        validate_audio_alignment_batch_global_selection_evidence(&selected, true).unwrap();
+        assert_eq!(
+            selected.state,
+            AudioAlignmentBatchGlobalSelectionState::Selected
+        );
+        assert_eq!(selected.candidate_count, 12);
+        assert_eq!(selected.eligible_candidate_count, 12);
+        assert_eq!(selected.top_k.len(), AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K);
+        assert_eq!(selected.selected_rank, Some(11));
+        assert_eq!(selected.decision_rank, Some(11));
+        assert_eq!(
+            selected.selected_score.map(f64::to_bits),
+            Some(v2_global_candidate_weight(&selected_candidate).to_bits())
+        );
+        assert!(selected
+            .top_k
+            .iter()
+            .all(|candidate| !candidate.global_selected));
+        assert_eq!(
+            selected
+                .decision_candidate
+                .as_ref()
+                .map(|candidate| candidate.rank),
+            Some(11)
+        );
+        assert!(selected
+            .decision_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.global_selected));
+        let selected_json = serde_json::to_string(&selected).unwrap();
+        assert!(!selected_json.contains("private"));
+        assert!(!selected_json.contains(".mkv"));
+
+        let blocked = create_audio_alignment_batch_global_selection_evidence(
+            &coarse,
+            &V2GlobalShortlistDecision::Blocked {
+                candidate: Some(candidates[1].clone()),
+                alternatives: Vec::new(),
+                margin: 0.01,
+                reason: r"C:\private\must-not-leak.mkv".to_string(),
+                diagnostics: vec![r"C:\private\diagnostic.mkv".to_string()],
+            },
+            0,
+        )
+        .unwrap();
+        validate_audio_alignment_batch_global_selection_evidence(&blocked, true).unwrap();
+        assert_eq!(
+            blocked.state,
+            AudioAlignmentBatchGlobalSelectionState::Blocked
+        );
+        assert!(!blocked.selected);
+        assert_eq!(blocked.decision_rank, Some(2));
+        assert!(blocked
+            .top_k
+            .iter()
+            .all(|candidate| !candidate.global_selected));
+        let blocked_json = serde_json::to_string(&blocked).unwrap();
+        assert!(!blocked_json.contains("private"));
+        assert!(!blocked_json.contains(".mkv"));
+
+        let failed_coarse: Result<V2PairCoarseCandidates, String> =
+            Err(r"C:\private\coarse-failure.mkv".to_string());
+        let failed = create_audio_alignment_batch_global_selection_evidence(
+            &failed_coarse,
+            &V2GlobalShortlistDecision::Failed(r"C:\private\shortlist-failure.mkv".to_string()),
+            0,
+        )
+        .unwrap();
+        validate_audio_alignment_batch_global_selection_evidence(&failed, false).unwrap();
+        assert_eq!(
+            failed.state,
+            AudioAlignmentBatchGlobalSelectionState::Failed
+        );
+        let failed_json = serde_json::to_string(&failed).unwrap();
+        assert!(!failed_json.contains("private"));
+        assert!(!failed_json.contains(".mkv"));
     }
 
     #[test]
@@ -19692,7 +20340,8 @@ mod tests {
             audio_stream_index: Some(13),
             video_stream_index: Some(15),
         });
-        let plan = plan_audio_alignment_batch(request).unwrap();
+        let plan =
+            test_plan_with_selected_global_evidence(plan_audio_alignment_batch(request).unwrap());
         assert_eq!(plan.media.len(), 5);
         assert_eq!(plan.pairs.len(), 6);
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -19918,10 +20567,12 @@ mod tests {
 
     #[test]
     fn audio_alignment_batch_final_identity_failure_clears_every_completed_proposal() {
-        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
-            "source-1", "target-1",
-        )])))
-        .unwrap();
+        let plan = test_plan_with_selected_global_evidence(
+            plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+                "source-1", "target-1",
+            )])))
+            .unwrap(),
+        );
         let job_id = format!("test-audio-batch-final-identity-{}", current_time_ms());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
@@ -19943,6 +20594,14 @@ mod tests {
                     AudioAlignmentJobStatus::Running
                 );
                 assert!(before_final_verification.pairs[0].proposal.is_none());
+                assert_eq!(
+                    before_final_verification.pairs[0].global_selection.state,
+                    AudioAlignmentBatchGlobalSelectionState::Pending
+                );
+                assert!(before_final_verification.pairs[0]
+                    .global_selection
+                    .top_k
+                    .is_empty());
                 assert_ne!(
                     before_final_verification.pairs[0].status,
                     AudioAlignmentJobStatus::Completed
@@ -19959,15 +20618,22 @@ mod tests {
             .pairs
             .iter()
             .all(|pair| pair.status == AudioAlignmentJobStatus::Failed));
+        assert!(terminal.pairs.iter().all(|pair| {
+            pair.global_selection.state == AudioAlignmentBatchGlobalSelectionState::Failed
+                && !pair.global_selection.selected
+                && pair.global_selection.top_k.is_empty()
+        }));
     }
 
     #[test]
     fn audio_alignment_batch_polling_never_exposes_staged_proposals_before_final_verification() {
-        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
-            ("source-1", "target-1"),
-            ("source-2", "target-2"),
-        ])))
-        .unwrap();
+        let plan = test_plan_with_selected_global_evidence(
+            plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+                ("source-1", "target-1"),
+                ("source-2", "target-2"),
+            ])))
+            .unwrap(),
+        );
         let job_id = format!("test-audio-batch-staging-{}", current_time_ms());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
@@ -19982,6 +20648,11 @@ mod tests {
                         get_audio_alignment_batch_job(running_job_id.to_string()).unwrap();
                     assert_eq!(in_flight.status, AudioAlignmentJobStatus::Running);
                     assert!(in_flight.pairs.iter().all(|pair| pair.proposal.is_none()));
+                    assert!(in_flight.pairs.iter().all(|pair| {
+                        pair.global_selection.state
+                            == AudioAlignmentBatchGlobalSelectionState::Pending
+                            && pair.global_selection.top_k.is_empty()
+                    }));
                     assert!(in_flight
                         .pairs
                         .iter()
@@ -20000,6 +20671,11 @@ mod tests {
             .iter()
             .all(|pair| pair.status == AudioAlignmentJobStatus::Completed));
         assert!(terminal.pairs.iter().all(|pair| pair.proposal.is_some()));
+        assert!(terminal.pairs.iter().all(|pair| {
+            pair.global_selection.state == AudioAlignmentBatchGlobalSelectionState::Selected
+                && pair.global_selection.selected
+                && pair.global_selection.selected_rank == Some(1)
+        }));
     }
 
     #[test]
@@ -20051,8 +20727,10 @@ mod tests {
         request.sources[1].path = valid_source.to_string_lossy().into_owned();
         request.targets[0].path = valid_target.to_string_lossy().into_owned();
         request.targets[1].path = valid_target.to_string_lossy().into_owned();
-        let plan = plan_audio_alignment_batch(request)
-            .expect("缺失的本地文件应在 pair worker 内失败，而不是阻止批次规划");
+        let plan = test_plan_with_selected_global_evidence(
+            plan_audio_alignment_batch(request)
+                .expect("缺失的本地文件应在 pair worker 内失败，而不是阻止批次规划"),
+        );
         let job_id = format!("test-audio-batch-path-isolation-{suffix}");
         let cancel_flag = Arc::new(AtomicBool::new(false));
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
@@ -20076,8 +20754,22 @@ mod tests {
         assert_eq!(terminal.failed_pair_count, 1);
         assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Failed);
         assert!(terminal.pairs[0].proposal.is_none());
+        assert_eq!(
+            terminal.pairs[0].global_selection.state,
+            AudioAlignmentBatchGlobalSelectionState::Failed
+        );
+        assert!(!terminal.pairs[0].global_selection.selected);
+        assert!(terminal.pairs[0]
+            .global_selection
+            .top_k
+            .iter()
+            .all(|candidate| !candidate.global_selected));
         assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Completed);
         assert!(terminal.pairs[1].proposal.is_some());
+        assert_eq!(
+            terminal.pairs[1].global_selection.state,
+            AudioAlignmentBatchGlobalSelectionState::Selected
+        );
 
         std::fs::remove_file(valid_source).unwrap();
         std::fs::remove_file(valid_target).unwrap();
@@ -20085,11 +20777,13 @@ mod tests {
 
     #[test]
     fn audio_alignment_batch_cancel_waits_for_worker_and_preserves_completed_pairs() {
-        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
-            ("source-1", "target-1"),
-            ("source-2", "target-2"),
-        ])))
-        .unwrap();
+        let plan = test_plan_with_selected_global_evidence(
+            plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+                ("source-1", "target-1"),
+                ("source-2", "target-2"),
+            ])))
+            .unwrap(),
+        );
         let job_id = format!("test-audio-batch-cancel-{}", current_time_ms());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
@@ -20130,17 +20824,28 @@ mod tests {
         assert_eq!(terminal.processed_pair_count, 1);
         assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Completed);
         assert!(terminal.pairs[0].proposal.is_some());
+        assert_eq!(
+            terminal.pairs[0].global_selection.state,
+            AudioAlignmentBatchGlobalSelectionState::Selected
+        );
         assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Cancelled);
         assert!(terminal.pairs[1].proposal.is_none());
+        assert_eq!(
+            terminal.pairs[1].global_selection.state,
+            AudioAlignmentBatchGlobalSelectionState::Cancelled
+        );
+        assert!(!terminal.pairs[1].global_selection.selected);
     }
 
     #[test]
     fn audio_alignment_batch_cancel_discards_staging_when_final_identity_verification_fails() {
-        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
-            ("source-1", "target-1"),
-            ("source-2", "target-2"),
-        ])))
-        .unwrap();
+        let plan = test_plan_with_selected_global_evidence(
+            plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+                ("source-1", "target-1"),
+                ("source-2", "target-2"),
+            ])))
+            .unwrap(),
+        );
         let job_id = format!("test-audio-batch-cancel-identity-{}", current_time_ms());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
@@ -20173,6 +20878,11 @@ mod tests {
             .pairs
             .iter()
             .all(|pair| pair.status == AudioAlignmentJobStatus::Failed));
+        assert!(terminal.pairs.iter().all(|pair| {
+            pair.global_selection.state == AudioAlignmentBatchGlobalSelectionState::Failed
+                && !pair.global_selection.selected
+                && pair.global_selection.top_k.is_empty()
+        }));
     }
 
     #[test]
@@ -20508,6 +21218,45 @@ mod tests {
         }
     }
 
+    fn test_plan_with_selected_global_evidence(
+        mut plan: PlannedAudioAlignmentBatch,
+    ) -> PlannedAudioAlignmentBatch {
+        for (pair_index, pair) in plan.pairs.iter_mut().enumerate() {
+            let candidate = AudioAlignmentBatchGlobalCandidateSnapshot {
+                rank: 1,
+                source_stream_index: pair.request.source_audio_stream_index.unwrap_or(0),
+                target_stream_index: pair.request.complete_audio_stream_index.unwrap_or(0),
+                score: 0.9,
+                global_score: 0.8,
+                scale: 1.0,
+                offset_ms: pair_index as i64 * 1_000,
+                source_start_ms: pair_index as i64 * 10_000,
+                source_end_ms: pair_index as i64 * 10_000 + 9_000,
+                target_start_ms: pair_index as i64 * 10_000,
+                target_end_ms: pair_index as i64 * 10_000 + 9_000,
+                inlier_count: 12,
+                temporal_coverage: 0.9,
+                unique_source_coverage: 0.85,
+                eligible: true,
+                global_selected: true,
+            };
+            pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot {
+                state: AudioAlignmentBatchGlobalSelectionState::Selected,
+                selected: true,
+                selected_rank: Some(1),
+                selected_score: Some(candidate.global_score),
+                decision_rank: Some(1),
+                decision_score: Some(candidate.global_score),
+                margin: Some(0.5),
+                candidate_count: 1,
+                eligible_candidate_count: 1,
+                top_k: vec![candidate.clone()],
+                decision_candidate: Some(candidate),
+            };
+        }
+        plan
+    }
+
     fn test_audio_alignment_batch_job_entry(
         job_id: &str,
         status: AudioAlignmentJobStatus,
@@ -20516,7 +21265,11 @@ mod tests {
         AudioAlignmentBatchJobEntry {
             snapshot: AudioAlignmentBatchJobSnapshot {
                 schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+                evidence_version: AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION,
                 job_id: job_id.to_string(),
+                pairing_mode: AudioAlignmentBatchPairingMode::FullCartesian,
+                source_media_ids: Vec::new(),
+                target_media_ids: Vec::new(),
                 status,
                 progress: 0.0,
                 message: String::new(),

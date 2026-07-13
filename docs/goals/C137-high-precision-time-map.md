@@ -518,10 +518,17 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] acceptance protocol v3 与 performance report v3 只接受 formal raw schema v2，并独立检查当前 manifest、storage 结构/绑定、Job memory、terminal cleanup 与 native attestation；Top-K、calibration、gold 编辑计数、全量 drift 与 case metadata 跨报告闭合，改字符串、自摘要、选择性漏报、自建 trustContext 或跨 workload 重签均不能通过。
 - [x] native benchmark v2 在任何工具探测前会话级固定全部 workload media、distinct 文件只完整哈希一次、支持 mounted-folder 实际卷去重，并拒绝未注册/跨 case/流错配 job。
 - [x] 匹配页高级诊断提供工程性能采集与取消入口，复用同一 manifest、二次校验 workload/case binding，并在下载前执行路径与媒体秘密扫描。
+- [x] 原生 N×M batch evidence v1 固定完整 source-major 笛卡尔积、候选数/Top-10/决策候选和原子终态；blind compiler 用显式关系轴、实际视觉模式、两侧独立 salted commitment、严格 `candidateCount > K` 与 projection digest 阻断 gold 编号泄漏、伪候选和跨 manifest 重放，并让公开报告只保留纯聚合指标。
+- [ ] formal acceptance 直接消费并重算 full-Cartesian blind projection/execution/native-receipt provenance；当前 `native-blind-ranking-provenance` 固定为 incomplete，调用方自报 Top-K 不能形成 release 证据。
+- [ ] pair-local 多窗口 Top-K、编辑/删减分类 F1、双侧边界误差和同一片段多版本 many-to-many fine alignment 进入同一冻结 gold 证据链；当前跨媒体关系 Top-K 不得冒充这些指标。
 
 当前剩余限制：逐段真实留出证据、双侧边界不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷回执和 fail-closed acceptance v3 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；概率仍必须保持 null，实测校准、批准的 production protocol / trust root、Job working-set/terminal cleanup/native attestation 正式证据和 20 套北极星长合集均未完成，不能据此宣称准确率或性能达标。
 
-性能执行已完成新的生产切片：匹配页把 1×N、N×1、N×M 一次提交为原生批任务；worker 按 distinct media 只建立一次媒体 lease、全文件身份、timeline/逐帧 PTS、候选音轨与 coarse landmark，再让全部 pair 完成 coarse scoring。每个合理音轨组合的去重 Top-K 会先经过有界 fine-window 与活动内存检查，然后由不使用文件名、数组顺序或剧集号先验的 exact branch-and-bound 选择项目级非冲突组合；搜索超过确定性硬上限时整批失败关闭，未入选或全批 coarse 不完整的候选不会进入 fine。长媒体以有界 CPU 流建立 coarse 索引；候选只有在至少一侧能提供完整的分集级查询轴，并且完整候选逆投影、全部 coarse inlier support、edit-aware DP 与边界精修所需 guard 都能同时装入两侧各自不超过 60 分钟的精解码窗口、活动内存预算也允许时，才会按仿射窗口进入 fine。双侧都超过 60 分钟且没有完整短轴只是其中一个明确阻断分支；任何窗口内容、必需 guard 或内存预算不满足的候选也会 fail-closed，不会截断后冒充完整时间图。批次 proposal 在最终媒体身份复核前只存在于 worker 私有 staging，完成或取消都必须复核后才原子发布。
+性能执行已完成新的生产切片：匹配页把 1×N、N×1、N×M 一次提交为原生批任务；worker 按 distinct media 只建立一次媒体 lease、全文件身份、timeline/逐帧 PTS、候选音轨与 coarse landmark，再让全部 pair 完成 coarse scoring。每个合理音轨组合的去重 Top-K 会先经过有界 fine-window 与活动内存检查，然后由不使用文件名、数组顺序或剧集号先验的 exact branch-and-bound 选择项目级非冲突组合；搜索超过确定性硬上限时整批失败关闭，未入选或全批 coarse 不完整的候选不会进入 fine。长媒体以有界 CPU 或 CUDA/cuFFT 流建立 coarse 索引；候选只有在至少一侧能提供完整的分集级查询轴，并且完整候选逆投影、全部 coarse inlier support、edit-aware DP 与边界精修所需 guard 都能同时装入两侧各自不超过 60 分钟的精解码窗口、活动内存预算也允许时，才会按仿射窗口进入 fine。双侧都超过 60 分钟且没有完整短轴只是其中一个明确阻断分支；任何窗口内容、必需 guard 或内存预算不满足的候选也会 fail-closed，不会截断后冒充完整时间图。批次 proposal 在最终媒体身份复核前只存在于 worker 私有 staging，完成或取消都必须复核后才原子发布。
+
+本切片又补齐了可审计的 N×M blind 组件证据：native snapshot 对全部 pair 输出 rank/score/margin、候选总数、Top-10 和 shortlist；TypeScript bridge 严格复核计数、rank、TimeMap identity、请求 inventory 与 source-major 顺序。冻结 compiler 的媒体编号不再按 gold case 顺序生成，而是两侧独立 salted 排列，并用 full identity + 实际消费流的 commitment 和 projection digest 绑定运行；视觉关闭时未消费的视频流统一归一为空，不能虚增候选，formal visual 则要求所有 selected media 显式固定非空视频流。compiler 与 runner/native 的上限一致为每侧 64、总计 256 pair，并在任何媒体探测前拒绝 65×1 或 17×17。每个查询只允许一个 frozen gold，候选数必须严格大于 K，只有完整 native receipt 通过后才揭示 gold。projection、raw prediction、逐 case gold/rank、suite/manifest 标识和私有运行摘要只留在本机编译边界，公开 DTO 仅包含聚合指标。该结果固定为不可信自洽组件证据，只覆盖跨媒体关系 Top-1/Top-K 和已知 pair 的 mapped-anchor coverage/error；原始 receipt 仍含媒体身份，仅供内部使用。formal acceptance 尚未直接绑定这条 provenance，固定 incomplete 门禁会阻止其冒充 release 证据。
+
+当前全局分配的非冲突定义会拒绝把同一物理内容区间同时映射到多个对端，并且被阻断的 pair 不进入 fine。这能表达一个长参考中互不重叠分集对应多个原片，但还不能表达同一片段同时对应多个剪辑版本的真正 same-segment many-to-many。它也没有保存 pair-local 多定位窗口的评测 Top-K，因此不能据此宣称长合集跨集错窗、删减分类或边界精度已经通过。
 
 本机 RTX 4090 已接入可选 CUDA/cuFFT 声谱后端：capability probe 会验证 CUDA driver、cuFFT、context 和真实 R2C 计算，短媒体与长媒体 streaming coarse 均可按 4096 帧有界 batch 执行 FFT，失败自动完整重算 CPU；强制 CUDA 模式则失败关闭。普通产品 batch 已在整批执行前固定 FFmpeg/FFprobe 二进制并把 tool digest 纳入缓存身份，同一物理文件的路径/hard-link 别名也按 FileId 合并。FFmpeg 音频解码、全文件 SHA-256、landmark 配对、edit-aware DP、边界精修与项目级搜索仍使用 CPU；这些剩余 CPU 阶段和真实冻结集缺口意味着当前只能宣称工程能力与资源边界，不能宣称准确率或正式性能达标。视觉 NVDEC 只可作为视觉帧解码优化，不得冒充音频计算加速。
 
@@ -534,6 +541,8 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] N×M 产品执行已改为 distinct-media 一次预处理、全 pair coarse-before-fine、精确且资源有界的项目级 Top-K 非冲突选择，并只让入选候选进入 fine；长参考不再要求整段 PCM，但仿射窗口 fine 是条件能力：必须存在完整分集级查询轴，完整逆投影、全部 coarse support、DP/边界 guard 均装入每侧不超过 60 分钟的窗口且活动内存预算通过，否则明确阻断。
 - [x] 可选 CUDA/cuFFT 声谱后端、4090 能力诊断、CPU 容差等价校验和失败自动回退已落地；安装包在 runtime 或真实 smoke 不可用时不会报告 GPU ready。
 - [x] 长媒体 streaming coarse 使用有界 CUDA/cuFFT batch；普通产品 batch 完成 FFmpeg/FFprobe 整批只读 pin、tool digest 缓存绑定与同物理媒体别名合并，CPU 保持确定性基线。
+- [x] 完整 N×M native snapshot 与 blind cross-media relationship compiler 已落地；输出恒为不可发布、不受信的组件证据，并明确排除 pair-local window/edit/boundary 指标。
+- [ ] 同一 pair 内多窗口 Top-K、编辑事件 F1/边界误差及 same-segment many-to-many 形成真实冻结证据并达到批准门槛。
 - [ ] 正式性能采集在现有 lifecycle Job 之上实现诚实限定覆盖范围的 Job working-set receipt、终态 cleanup receipt 与独立 attestation；在规定 4 核目标机按获批协议重复运行并形成受信原始报告。
 - [ ] 所有上线准确率、校准和性能门槛通过并有可重复报告。
 - [ ] 北极星 20 套长合集 5/5 定位和完整导出通过。

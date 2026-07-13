@@ -1,0 +1,1039 @@
+import { describe, expect, it, vi } from "vitest";
+import type { AlignmentProposal, AlignmentTimeMapProposal } from "../../domain/alignment/types";
+import type { MediaContentIdentity } from "../../domain/project/types";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
+import type {
+  AudioAlignmentBatchGlobalCandidateSnapshot,
+  AudioAlignmentBatchGlobalSelectionSnapshot,
+  AudioAlignmentBatchJobInvoker,
+  AudioAlignmentBatchJobSnapshot,
+  AudioAlignmentBatchPairSnapshot,
+  NormalizedTauriAudioAlignmentBatchRequest
+} from "./tauriAudioAlignment";
+import {
+  createRealMediaBlindBatchExecutionDigest,
+  createRealMediaBlindBatchRunReceiptDigest,
+  runRealMediaBlindBatchSuite,
+  validateRealMediaBlindBatchExecutionSuite,
+  validateRealMediaBlindBatchRunReceipt,
+  type RealMediaBlindBatchExecutionMedia,
+  type RealMediaBlindBatchExecutionSuite,
+  type RealMediaBlindBatchRunReceipt
+} from "./realMediaBlindBatchRunner";
+
+describe("C137 real-media blind full-Cartesian batch runner", () => {
+  it("一次启动真实 N×M batch、轮询到终态，并输出 path-free pair/排名/原生全局选择收据", async () => {
+    const suite = createSuite();
+    const running = createRunningSnapshot(suite);
+    const completed = createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]);
+    const invoker = createInvoker({ start: running, get: [completed] });
+
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: invoker,
+      pollIntervalMs: 0,
+      wait: () => Promise.resolve(),
+      now: () => 100
+    });
+
+    expect(invoker.start).toHaveBeenCalledTimes(1);
+    expect(invoker.get).toHaveBeenCalledTimes(1);
+    expect(invoker.cancel).not.toHaveBeenCalled();
+    const nativeRequest = vi.mocked(invoker.start).mock.calls[0]?.[0];
+    expect(nativeRequest).toMatchObject({
+      schemaVersion: 1,
+      sources: suite.sources.map((media) => ({
+        mediaId: media.mediaId,
+        path: media.path,
+        audioStreamIndex: media.audioStreamIndex,
+        videoStreamIndex: media.videoStreamIndex
+      })),
+      targets: suite.targets.map((media) => ({
+        mediaId: media.mediaId,
+        path: media.path,
+        audioStreamIndex: media.audioStreamIndex,
+        videoStreamIndex: media.videoStreamIndex
+      })),
+      localizationMode: true
+    });
+    expect(nativeRequest).not.toHaveProperty("pairs");
+
+    expect(receipt).toMatchObject({
+      schemaVersion: 1,
+      receiptKind: "c137-real-media-blind-batch-run",
+      suiteId: suite.suiteId,
+      datasetVersion: suite.datasetVersion,
+      executionDigest: createRealMediaBlindBatchExecutionDigest(suite),
+      nativeEvidenceVersion: 1,
+      pairingMode: "fullCartesian",
+      status: "completed",
+      terminationReason: "native-terminal",
+      sourceCount: 2,
+      targetCount: 2,
+      pairCount: 4,
+      topK: 2
+    });
+    expect(receipt.pairOutcomes).toHaveLength(4);
+    expect(receipt.pairOutcomes.map((outcome) => outcome.globalSelected)).toEqual([
+      true,
+      false,
+      false,
+      true
+    ]);
+    expect(receipt.pairOutcomes[0]?.globalSelection.selectedRank).toBe(1);
+    expect(receipt.pairOutcomes[0]?.proposalTimeMap?.engineVersion).toContain("alignment-v2");
+    expect(receipt.sourceRankings).toEqual([
+      expect.objectContaining({
+        sourceMediaId: "source-1",
+        candidates: [
+          expect.objectContaining({
+            relationRank: 1,
+            targetMediaId: "target-1",
+            decisionScore: 0.93
+          }),
+          expect.objectContaining({
+            relationRank: 2,
+            targetMediaId: "target-2",
+            decisionScore: 0.71
+          })
+        ]
+      }),
+      expect.objectContaining({
+        sourceMediaId: "source-2",
+        candidates: [
+          expect.objectContaining({
+            relationRank: 1,
+            targetMediaId: "target-2",
+            decisionScore: 0.88
+          }),
+          expect.objectContaining({
+            relationRank: 2,
+            targetMediaId: "target-1",
+            decisionScore: 0.62
+          })
+        ]
+      })
+    ]);
+    expect(receipt.sourceRankings[0]?.topK.map((candidate) => candidate.targetMediaId)).toEqual(
+      ["target-1", "target-2"]
+    );
+    expect(receipt.targetRankings).toEqual([
+      expect.objectContaining({
+        targetMediaId: "target-1",
+        candidates: [
+          expect.objectContaining({ relationRank: 1, sourceMediaId: "source-1" }),
+          expect.objectContaining({ relationRank: 2, sourceMediaId: "source-2" })
+        ]
+      }),
+      expect.objectContaining({
+        targetMediaId: "target-2",
+        candidates: [
+          expect.objectContaining({ relationRank: 1, sourceMediaId: "source-2" }),
+          expect.objectContaining({ relationRank: 2, sourceMediaId: "source-1" })
+        ]
+      })
+    ]);
+    const serialized = JSON.stringify(receipt);
+    for (const media of [...suite.sources, ...suite.targets]) {
+      expect(serialized).not.toContain(media.path);
+    }
+    expect(serialized).not.toContain(suite.parameters.ffmpegPath);
+    expect(serialized).not.toContain(suite.parameters.ffprobePath);
+    expect(receipt.receiptDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
+  });
+
+  it("注入 receipt 时复算两个 digest，并拒绝 pair/双向排名/TimeMap exact-key 篡改", async () => {
+    const suite = createSuite();
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({
+        start: createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]),
+        get: []
+      })
+    });
+
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt({ ...receipt, gold: null }, suite)
+    ).toThrow("字段不完整或含 gold/额外字段");
+
+    const wrongExecution = rehashReceipt({
+      ...receipt,
+      executionDigest: `sha256:${"f".repeat(64)}`
+    });
+    expect(() => validateRealMediaBlindBatchRunReceipt(wrongExecution, suite)).toThrow(
+      "executionDigest"
+    );
+
+    const wrongPairs = structuredClone(receipt);
+    [wrongPairs.pairOutcomes[0], wrongPairs.pairOutcomes[1]] = [
+      wrongPairs.pairOutcomes[1],
+      wrongPairs.pairOutcomes[0]
+    ];
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(wrongPairs), suite)
+    ).toThrow("source-major");
+
+    const missingRanking = structuredClone(receipt);
+    missingRanking.sourceRankings[0].candidates.pop();
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(missingRanking), suite)
+    ).toThrow("sourceRankings");
+
+    const extraTimeMapField = structuredClone(receipt);
+    const timeMap = extraTimeMapField.pairOutcomes[0].proposalTimeMap;
+    if (!timeMap) throw new Error("fixture TimeMap missing");
+    const timeMapWithGold: AlignmentTimeMapProposal & { goldLeak: boolean } = {
+      ...timeMap,
+      goldLeak: true
+    };
+    extraTimeMapField.pairOutcomes[0].proposalTimeMap = timeMapWithGold;
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(rehashReceipt(extraTimeMapField), suite)
+    ).toThrow("字段不完整或含 gold/额外字段");
+
+    expect(() =>
+      validateRealMediaBlindBatchRunReceipt(
+        { ...receipt, receiptDigest: `sha256:${"0".repeat(64)}` },
+        suite
+      )
+    ).toThrow("receiptDigest");
+  });
+
+  it("canonical execution digest 对对象字段顺序稳定，并绑定媒体路径与全笛卡尔注册", () => {
+    const suite = createSuite();
+    const reordered = {
+      parameters: { ...suite.parameters },
+      pairs: suite.pairs.map((pair) => ({ ...pair })),
+      targets: suite.targets.map((media) => ({ ...media })),
+      sources: suite.sources.map((media) => ({ ...media })),
+      topK: suite.topK,
+      datasetVersion: suite.datasetVersion,
+      suiteId: suite.suiteId,
+      schemaVersion: suite.schemaVersion
+    };
+    expect(createRealMediaBlindBatchExecutionDigest(reordered)).toBe(
+      createRealMediaBlindBatchExecutionDigest(suite)
+    );
+    const changedPath = structuredClone(suite);
+    changedPath.sources[0].path = "D:\\other\\source-1.mkv";
+    expect(createRealMediaBlindBatchExecutionDigest(changedPath)).not.toBe(
+      createRealMediaBlindBatchExecutionDigest(suite)
+    );
+  });
+
+  it.each([
+    ["single pair", () => createSuite(1, 1), "single-pair"],
+    [
+      "root gold field",
+      () => ({ ...createSuite(), gold: { sourceMediaId: "source-1" } }),
+      "gold/额外字段"
+    ],
+    [
+      "nested gold field",
+      () => {
+        const suite = createSuite() as RealMediaBlindBatchExecutionSuite & {
+          sources: Array<RealMediaBlindBatchExecutionMedia & { gold?: string }>;
+        };
+        suite.sources[0].gold = "target-1";
+        return suite;
+      },
+      "gold/额外字段"
+    ],
+    [
+      "missing Cartesian pair",
+      () => {
+        const suite = createSuite();
+        suite.pairs.pop();
+        return suite;
+      },
+      "完整注册"
+    ],
+    [
+      "duplicate/reordered Cartesian pair",
+      () => {
+        const suite = createSuite();
+        suite.pairs[1] = { ...suite.pairs[0], pairOrdinal: 2 };
+        return suite;
+      },
+      "source-major"
+    ],
+    [
+      "duplicate media id",
+      () => {
+        const suite = createSuite();
+        suite.targets[0].mediaId = suite.sources[0].mediaId;
+        return suite;
+      },
+      "ID 重复"
+    ],
+    [
+      "duplicate media path",
+      () => {
+        const suite = createSuite();
+        suite.targets[0].path = suite.sources[0].path.toUpperCase();
+        return suite;
+      },
+      "同一本地路径声明了不同内容身份"
+    ],
+    [
+      "duplicate media identity",
+      () => {
+        const suite = createSuite();
+        suite.targets[0].contentIdentity = { ...suite.sources[0].contentIdentity };
+        suite.targets[0].audioStreamIndex = suite.sources[0].audioStreamIndex;
+        suite.targets[0].videoStreamIndex = suite.sources[0].videoStreamIndex;
+        return suite;
+      },
+      "重复的内容身份与有效流视图"
+    ]
+  ])(
+    "在 native 启动前拒绝不严格的 gold-free execution suite：%s",
+    async (_label, create, message) => {
+      const invoker = createInvoker({ start: createRunningSnapshot(createSuite()), get: [] });
+      await expect(
+        runRealMediaBlindBatchSuite(create(), { alignmentInvoker: invoker })
+      ).rejects.toThrow(message);
+      expect(invoker.start).not.toHaveBeenCalled();
+    }
+  );
+
+  it("允许同一物理媒体以不同显式流视图进入盲测批次", () => {
+    const suite = createSuite();
+    suite.targets[0].path = suite.sources[0].path;
+    suite.targets[0].contentIdentity = { ...suite.sources[0].contentIdentity };
+    suite.targets[0].audioStreamIndex = suite.sources[0].audioStreamIndex + 1;
+
+    expect(validateRealMediaBlindBatchExecutionSuite(suite).targets[0]).toMatchObject({
+      path: suite.sources[0].path,
+      contentIdentity: suite.sources[0].contentIdentity,
+      audioStreamIndex: suite.sources[0].audioStreamIndex + 1
+    });
+  });
+
+  it("关闭视觉证据时拒绝同物理内容同音轨仅视频流不同的伪独立视图", () => {
+    const suite = createSuite();
+    suite.sources[0].videoStreamIndex = 0;
+    suite.targets[0].path = suite.sources[0].path;
+    suite.targets[0].contentIdentity = { ...suite.sources[0].contentIdentity };
+    suite.targets[0].audioStreamIndex = suite.sources[0].audioStreamIndex;
+    suite.targets[0].videoStreamIndex = 1;
+
+    expect(() => validateRealMediaBlindBatchExecutionSuite(suite)).toThrow(
+      "关闭视觉证据时，仅视频流不同不能形成独立候选"
+    );
+  });
+
+  it("开启视觉证据时允许同物理内容同音轨以不同显式视频流形成独立视图", () => {
+    const suite = createSuite();
+    suite.parameters.enableVisualEvidence = true;
+    suite.sources[0].videoStreamIndex = 0;
+    suite.targets[0].path = suite.sources[0].path;
+    suite.targets[0].contentIdentity = { ...suite.sources[0].contentIdentity };
+    suite.targets[0].audioStreamIndex = suite.sources[0].audioStreamIndex;
+    suite.targets[0].videoStreamIndex = 1;
+
+    expect(validateRealMediaBlindBatchExecutionSuite(suite).targets[0]).toMatchObject({
+      contentIdentity: suite.sources[0].contentIdentity,
+      audioStreamIndex: suite.sources[0].audioStreamIndex,
+      videoStreamIndex: 1
+    });
+  });
+
+  it("视觉 auto 模式要求 native 实际回报视频流，并接受任一实际流索引", async () => {
+    const suite = createSuite();
+    suite.parameters.enableVisualEvidence = true;
+    const completed = createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]);
+    for (const pair of completed.pairs) {
+      const timeMap = pair.proposal?.timeMap;
+      if (!timeMap) throw new Error("fixture TimeMap missing");
+      timeMap.sourceVisualStream = createVideoStream(20 + pair.pairIndex);
+      timeMap.targetVisualStream = createVideoStream(40 + pair.pairIndex);
+      timeMap.evidence.types = ["audio", "visual"];
+      timeMap.evidence.visualAnchorCount = 8;
+    }
+
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({ start: completed, get: [] })
+    });
+
+    expect(receipt.pairOutcomes[0].proposalTimeMap?.sourceVisualStream?.index).toBe(20);
+    expect(receipt.pairOutcomes[0].proposalTimeMap?.targetVisualStream?.index).toBe(40);
+  });
+
+  it("视觉开启但 native 未实际消费视频流时整批失败关闭", async () => {
+    const suite = createSuite();
+    suite.parameters.enableVisualEvidence = true;
+
+    await expect(
+      runRealMediaBlindBatchSuite(suite, {
+        alignmentInvoker: createInvoker({
+          start: createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]),
+          get: []
+        })
+      })
+    ).rejects.toThrow("未证明视觉证据实际消费了视频流");
+  });
+
+  it("视觉关闭时拒绝 native 意外混入视觉流", async () => {
+    const suite = createSuite();
+    const completed = createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]);
+    const timeMap = completed.pairs[0].proposal?.timeMap;
+    if (!timeMap) throw new Error("fixture TimeMap missing");
+    timeMap.sourceVisualStream = createVideoStream(0);
+
+    await expect(
+      runRealMediaBlindBatchSuite(suite, {
+        alignmentInvoker: createInvoker({ start: completed, get: [] })
+      })
+    ).rejects.toThrow("关闭视觉证据时意外存在");
+  });
+
+  it("允许 Top-K 绑定 source 或 target 任一显式关系查询轴", () => {
+    const targetQuerySuite = createSuite(5, 2);
+    targetQuerySuite.topK = 5;
+
+    expect(validateRealMediaBlindBatchExecutionSuite(targetQuerySuite).topK).toBe(5);
+  });
+
+  it.each([
+    [
+      "explicit pairing mode",
+      (snapshot: AudioAlignmentBatchJobSnapshot) => ({
+        ...snapshot,
+        pairingMode: "explicit" as const
+      }),
+      "fullCartesian"
+    ],
+    [
+      "wrong source inventory order",
+      (snapshot: AudioAlignmentBatchJobSnapshot) => ({
+        ...snapshot,
+        sourceMediaIds: [...snapshot.sourceMediaIds].reverse()
+      }),
+      "fullCartesian"
+    ],
+    [
+      "missing pair",
+      (snapshot: AudioAlignmentBatchJobSnapshot) => ({
+        ...snapshot,
+        totalPairCount: snapshot.totalPairCount - 1,
+        pairs: snapshot.pairs.slice(0, -1)
+      }),
+      "pair"
+    ],
+    [
+      "wrong pair index",
+      (snapshot: AudioAlignmentBatchJobSnapshot) => ({
+        ...snapshot,
+        pairs: snapshot.pairs.map((pair, index) =>
+          index === 1 ? { ...pair, pairIndex: 2 } : pair
+        )
+      }),
+      "pairIndex"
+    ],
+    [
+      "wrong pair media",
+      (snapshot: AudioAlignmentBatchJobSnapshot) => ({
+        ...snapshot,
+        pairs: snapshot.pairs.map((pair, index) =>
+          index === 1 ? { ...pair, targetMediaId: "target-1" } : pair
+        )
+      }),
+      "pair"
+    ]
+  ])(
+    "拒绝 native full-Cartesian 证明缺失、增删或 ordinal/身份错配：%s",
+    async (_label, mutate, message) => {
+      const suite = createSuite();
+      const malformed = mutate(createRunningSnapshot(suite));
+      const invoker = createInvoker({ start: malformed, get: [] });
+      await expect(
+        runRealMediaBlindBatchSuite(suite, { alignmentInvoker: invoker })
+      ).rejects.toThrow(message);
+      expect(invoker.start).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each([
+    [
+      "non V2 engine",
+      (proposal: AlignmentProposal) => ({
+        ...proposal,
+        timeMap: { ...proposal.timeMap!, engineVersion: "legacy-v9" }
+      }),
+      "Alignment V2"
+    ],
+    [
+      "identity mismatch",
+      (proposal: AlignmentProposal) => ({
+        ...proposal,
+        timeMap: { ...proposal.timeMap!, sourceIdentity: createIdentity(9) }
+      }),
+      "媒体身份错配"
+    ],
+    [
+      "stream mismatch",
+      (proposal: AlignmentProposal) => ({
+        ...proposal,
+        timeMap: {
+          ...proposal.timeMap!,
+          sourceStream: { ...proposal.timeMap!.sourceStream!, index: 63 }
+        }
+      }),
+      "音轨索引错配"
+    ]
+  ])(
+    "拒绝 completed native pair 的非 V2 proposal 或媒体/索引错配：%s",
+    async (_label, mutate, message) => {
+      const suite = createSuite();
+      const snapshot = createCompletedSnapshot(suite, [0.9, 0.8, 0.7, 0.6]);
+      snapshot.pairs[0] = {
+        ...snapshot.pairs[0],
+        proposal: mutate(snapshot.pairs[0].proposal!)
+      };
+      const invoker = createInvoker({ start: snapshot, get: [] });
+      await expect(
+        runRealMediaBlindBatchSuite(suite, { alignmentInvoker: invoker })
+      ).rejects.toThrow(message);
+    }
+  );
+
+  it("严格要求结构化 globalSelection，且不从 proposal quality/诊断文案推断 selected", async () => {
+    const suite = createSuite();
+    const snapshot = createCompletedSnapshot(suite, [0.9, 0.8, 0.7, 0.6]);
+    const decisionCandidate = snapshot.pairs[0].globalSelection.decisionCandidate;
+    if (!decisionCandidate) throw new Error("fixture decision candidate missing");
+    snapshot.pairs[0] = {
+      ...snapshot.pairs[0],
+      globalSelection: {
+        ...snapshot.pairs[0].globalSelection,
+        state: "blocked",
+        selected: false,
+        selectedRank: null,
+        selectedScore: null,
+        topK: snapshot.pairs[0].globalSelection.topK.map((candidate) => ({
+          ...candidate,
+          globalSelected: false
+        })),
+        decisionCandidate: {
+          ...decisionCandidate,
+          globalSelected: false
+        }
+      }
+    };
+    const invoker = createInvoker({ start: snapshot, get: [] });
+    const receipt = await runRealMediaBlindBatchSuite(suite, { alignmentInvoker: invoker });
+    expect(receipt.pairOutcomes[0]?.proposalTimeMap?.quality.level).toBe("review");
+    expect(receipt.pairOutcomes[0]?.globalSelected).toBe(false);
+  });
+
+  it("fine 失败时保留严格闭合的 coarse Top-K，但绝不保留 selected", async () => {
+    const suite = createSuite();
+    const snapshot = createCompletedSnapshot(suite, [0.9, 0.8, 0.7, 0.6]);
+    const pair = snapshot.pairs[0];
+    const failedSelection: AudioAlignmentBatchGlobalSelectionSnapshot = {
+      ...pair.globalSelection,
+      state: "failed",
+      selected: false,
+      selectedRank: null,
+      selectedScore: null,
+      topK: pair.globalSelection.topK.map((candidate) => ({
+        ...candidate,
+        globalSelected: false
+      })),
+      decisionCandidate: pair.globalSelection.decisionCandidate
+        ? { ...pair.globalSelection.decisionCandidate, globalSelected: false }
+        : null
+    };
+    snapshot.pairs[0] = {
+      ...pair,
+      status: "failed",
+      globalSelection: failedSelection,
+      proposal: null,
+      error: "fine failed"
+    };
+    snapshot.failedPairCount = 1;
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({ start: snapshot, get: [] })
+    });
+    expect(receipt.status).toBe("completed-with-errors");
+    expect(receipt.pairOutcomes[0]).toMatchObject({
+      nativeStatus: "failed",
+      failureCode: "native-pair-failed",
+      globalSelected: false,
+      proposalTimeMap: null,
+      globalSelection: {
+        state: "failed",
+        candidateCount: 1,
+        decisionScore: 0.9
+      }
+    });
+    expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
+  });
+
+  it("AbortSignal 会取消同一个 job、等待终态，并保留完整 cancelled outcomes", async () => {
+    const suite = createSuite();
+    const controller = new AbortController();
+    const running = createRunningSnapshot(suite);
+    const cancelled = createCancelledSnapshot(suite);
+    const invoker = createInvoker({ start: running, get: [running], cancel: cancelled });
+    let now = 0;
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: invoker,
+      signal: controller.signal,
+      pollIntervalMs: 1,
+      now: () => now,
+      wait: () => {
+        now += 1;
+        controller.abort();
+        return Promise.resolve();
+      }
+    });
+    expect(invoker.start).toHaveBeenCalledTimes(1);
+    expect(invoker.cancel).toHaveBeenCalledTimes(1);
+    expect(invoker.cancel).toHaveBeenCalledWith("blind-batch-job");
+    expect(receipt.status).toBe("cancelled");
+    expect(receipt.terminationReason).toBe("abort-signal");
+    expect(receipt.pairOutcomes).toHaveLength(4);
+    expect(receipt.pairOutcomes.every((outcome) => outcome.nativeStatus === "cancelled")).toBe(
+      true
+    );
+  });
+
+  it("超过 wall timeout 后请求取消，并把已清理终态记录为 timed-out", async () => {
+    const suite = createSuite();
+    const running = createRunningSnapshot(suite);
+    const invoker = createInvoker({
+      start: running,
+      get: [running],
+      cancel: createCancelledSnapshot(suite)
+    });
+    let now = 0;
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: invoker,
+      maxJobWallMs: 10,
+      pollIntervalMs: 10,
+      now: () => now,
+      wait: (milliseconds) => {
+        now += milliseconds;
+        return Promise.resolve();
+      }
+    });
+    expect(invoker.cancel).toHaveBeenCalledTimes(1);
+    expect(receipt.status).toBe("timed-out");
+    expect(receipt.terminationReason).toBe("job-timeout");
+  });
+
+  it("取消后超过 grace 仍非终态会 fail-close", async () => {
+    const suite = createSuite();
+    const controller = new AbortController();
+    const running = createRunningSnapshot(suite);
+    const invoker = createInvoker({ start: running, get: [running, running], cancel: running });
+    let now = 0;
+    await expect(
+      runRealMediaBlindBatchSuite(suite, {
+        alignmentInvoker: invoker,
+        signal: controller.signal,
+        pollIntervalMs: 5,
+        cancellationGraceMs: 5,
+        now: () => now,
+        wait: (milliseconds) => {
+          now += milliseconds;
+          controller.abort();
+          return Promise.resolve();
+        }
+      })
+    ).rejects.toThrow("取消宽限期");
+    expect(invoker.cancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+function createSuite(sourceCount = 2, targetCount = 2): RealMediaBlindBatchExecutionSuite {
+  const sources = Array.from({ length: sourceCount }, (_, index) =>
+    createMedia("source", index + 1, index + 1)
+  );
+  const targets = Array.from({ length: targetCount }, (_, index) =>
+    createMedia("target", index + 1, sourceCount + index + 1)
+  );
+  return {
+    schemaVersion: 1,
+    suiteId: "blind-suite-1",
+    datasetVersion: "frozen-v1",
+    topK: Math.min(2, targetCount),
+    sources,
+    targets,
+    pairs: sources.flatMap((source) =>
+      targets.map((target, targetIndex) => ({
+        pairOrdinal:
+          sources.findIndex((candidate) => candidate.mediaId === source.mediaId) *
+            targets.length +
+          targetIndex +
+          1,
+        sourceMediaId: source.mediaId,
+        targetMediaId: target.mediaId
+      }))
+    ),
+    parameters: {
+      ffmpegPath: "C:\\tools\\ffmpeg.exe",
+      ffprobePath: "C:\\tools\\ffprobe.exe",
+      sampleRate: 16_000,
+      windowMs: 50,
+      matchThreshold: 0.72,
+      minGapMs: 500,
+      maxCells: 2_000_000,
+      enableVisualEvidence: false,
+      visualSampleIntervalMs: null
+    }
+  };
+}
+
+function createMedia(
+  side: "source" | "target",
+  ordinal: number,
+  identitySeed: number
+): RealMediaBlindBatchExecutionMedia {
+  return {
+    mediaId: `${side}-${ordinal}`,
+    path: `D:\\media\\${side}-${ordinal}.mkv`,
+    contentIdentity: createIdentity(identitySeed),
+    audioStreamIndex: side === "source" ? ordinal : ordinal + 10,
+    videoStreamIndex: null
+  };
+}
+
+function createIdentity(seed: number): MediaContentIdentity {
+  const hex = seed.toString(16).padStart(2, "0").repeat(32).slice(0, 64);
+  return {
+    algorithm: "sha256-full-file-v2",
+    sizeBytes: seed * 1_000_000,
+    modifiedUnixMs: seed * 1_000,
+    firstSampleDigest: hex,
+    middleSampleDigest: hex,
+    lastSampleDigest: hex
+  };
+}
+
+function createRunningSnapshot(
+  suite: RealMediaBlindBatchExecutionSuite
+): AudioAlignmentBatchJobSnapshot {
+  const pairs = suite.pairs.map((pair, pairIndex): AudioAlignmentBatchPairSnapshot => ({
+    pairIndex,
+    pairOrdinal: pair.pairOrdinal,
+    sourceMediaId: pair.sourceMediaId,
+    targetMediaId: pair.targetMediaId,
+    status: pairIndex === 0 ? "running" : "queued",
+    progress: 0,
+    message: pairIndex === 0 ? "running" : "queued",
+    globalSelection: createPendingSelection(),
+    proposal: null,
+    error: null
+  }));
+  return {
+    schemaVersion: 1,
+    evidenceVersion: 1,
+    jobId: "blind-batch-job",
+    pairingMode: "fullCartesian",
+    sourceMediaIds: suite.sources.map((media) => media.mediaId),
+    targetMediaIds: suite.targets.map((media) => media.mediaId),
+    status: "running",
+    progress: 0,
+    message: "running",
+    totalPairCount: pairs.length,
+    processedPairCount: 0,
+    failedPairCount: 0,
+    currentPairOrdinal: 1,
+    pairs,
+    error: null,
+    updatedAtMs: 1
+  };
+}
+
+function createCompletedSnapshot(
+  suite: RealMediaBlindBatchExecutionSuite,
+  scores: readonly number[]
+): AudioAlignmentBatchJobSnapshot {
+  const selectedPairIndexes = new Set([0, suite.pairs.length - 1]);
+  const pairs = suite.pairs.map((pair, pairIndex): AudioAlignmentBatchPairSnapshot => {
+    const source = suite.sources.find((media) => media.mediaId === pair.sourceMediaId)!;
+    const target = suite.targets.find((media) => media.mediaId === pair.targetMediaId)!;
+    const selected = selectedPairIndexes.has(pairIndex);
+    const score = scores[pairIndex] ?? 0.5;
+    return {
+      pairIndex,
+      pairOrdinal: pair.pairOrdinal,
+      sourceMediaId: pair.sourceMediaId,
+      targetMediaId: pair.targetMediaId,
+      status: "completed",
+      progress: 1,
+      message: "completed",
+      globalSelection: createSelection(source, target, score, selected),
+      proposal: createProposal(source, target, selected ? "review" : "blocked"),
+      error: null
+    };
+  });
+  return {
+    schemaVersion: 1,
+    evidenceVersion: 1,
+    jobId: "blind-batch-job",
+    pairingMode: "fullCartesian",
+    sourceMediaIds: suite.sources.map((media) => media.mediaId),
+    targetMediaIds: suite.targets.map((media) => media.mediaId),
+    status: "completed",
+    progress: 1,
+    message: "completed",
+    totalPairCount: pairs.length,
+    processedPairCount: pairs.length,
+    failedPairCount: 0,
+    currentPairOrdinal: null,
+    pairs,
+    error: null,
+    updatedAtMs: 2
+  };
+}
+
+function createCancelledSnapshot(
+  suite: RealMediaBlindBatchExecutionSuite
+): AudioAlignmentBatchJobSnapshot {
+  const pairs = suite.pairs.map((pair, pairIndex): AudioAlignmentBatchPairSnapshot => ({
+    pairIndex,
+    pairOrdinal: pair.pairOrdinal,
+    sourceMediaId: pair.sourceMediaId,
+    targetMediaId: pair.targetMediaId,
+    status: "cancelled",
+    progress: 0,
+    message: "cancelled",
+    globalSelection: { ...createPendingSelection(), state: "cancelled" },
+    proposal: null,
+    error: null
+  }));
+  return {
+    schemaVersion: 1,
+    evidenceVersion: 1,
+    jobId: "blind-batch-job",
+    pairingMode: "fullCartesian",
+    sourceMediaIds: suite.sources.map((media) => media.mediaId),
+    targetMediaIds: suite.targets.map((media) => media.mediaId),
+    status: "cancelled",
+    progress: 1,
+    message: "cancelled",
+    totalPairCount: pairs.length,
+    processedPairCount: 0,
+    failedPairCount: 0,
+    currentPairOrdinal: null,
+    pairs,
+    error: null,
+    updatedAtMs: 3
+  };
+}
+
+function createPendingSelection(): AudioAlignmentBatchGlobalSelectionSnapshot {
+  return {
+    state: "pending",
+    selected: false,
+    selectedRank: null,
+    selectedScore: null,
+    decisionRank: null,
+    decisionScore: null,
+    margin: null,
+    candidateCount: 0,
+    eligibleCandidateCount: 0,
+    topK: [],
+    decisionCandidate: null
+  };
+}
+
+function createSelection(
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  score: number,
+  selected: boolean
+): AudioAlignmentBatchGlobalSelectionSnapshot {
+  const candidate = createGlobalCandidate(source, target, score, selected);
+  return {
+    state: selected ? "selected" : "blocked",
+    selected,
+    selectedRank: selected ? 1 : null,
+    selectedScore: selected ? score : null,
+    decisionRank: 1,
+    decisionScore: score,
+    margin: 0.25,
+    candidateCount: 1,
+    eligibleCandidateCount: 1,
+    topK: [{ ...candidate }],
+    decisionCandidate: { ...candidate }
+  };
+}
+
+function createGlobalCandidate(
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  score: number,
+  selected: boolean
+): AudioAlignmentBatchGlobalCandidateSnapshot {
+  return {
+    rank: 1,
+    sourceStreamIndex: source.audioStreamIndex,
+    targetStreamIndex: target.audioStreamIndex,
+    score: Math.max(0, score - 0.05),
+    globalScore: score,
+    scale: 1,
+    offsetMs: 0,
+    sourceStartMs: 0,
+    sourceEndMs: 60_000,
+    targetStartMs: 0,
+    targetEndMs: 60_000,
+    inlierCount: 40,
+    temporalCoverage: 0.95,
+    uniqueSourceCoverage: 0.9,
+    eligible: true,
+    globalSelected: selected
+  };
+}
+
+function createProposal(
+  source: RealMediaBlindBatchExecutionMedia,
+  target: RealMediaBlindBatchExecutionMedia,
+  level: "review" | "blocked"
+): AlignmentProposal {
+  const timeMap: AlignmentTimeMapProposal = {
+    sourceStartMs: 0,
+    sourceEndMs: 60_000,
+    targetStartMs: 0,
+    targetEndMs: 60_000,
+    spans: [
+      createTestCompleteTimeMapSpan(
+        {
+          kind: level === "blocked" ? "ambiguous" : "matched",
+          sourceStartMs: 0,
+          sourceEndMs: 60_000,
+          targetStartMs: 0,
+          targetEndMs: 60_000
+        },
+        `${source.mediaId}-${target.mediaId}-span`
+      )
+    ],
+    quality: {
+      level,
+      probability: level === "review" ? 0.91 : null,
+      metricSource: "measured",
+      coverage: 0.95,
+      uniqueContentCoverage: 0.9,
+      p50ResidualMs: 30,
+      p95ResidualMs: 80,
+      p99ResidualMs: 120,
+      maxResidualMs: 150,
+      boundaryUncertaintyMs: 200,
+      alternativeMargin: 0.25,
+      anchorCount: 40,
+      anchorRegionCount: 3,
+      heldOutAnchorCount: 8,
+      reasons: [level === "review" ? "需要复核。" : "全局候选被阻断。"]
+    },
+    evidence: {
+      types: ["audio"],
+      audioAnchorCount: 40,
+      visualAnchorCount: 0,
+      heldOutAnchorCount: 8,
+      top1Top2Margin: 0.25,
+      uniqueContentCoverage: 0.9,
+      repeatedContentOnly: false,
+      selectedTrackReason: "blind test",
+      alternativeTrackScores: [
+        {
+          sourceStreamIndex: source.audioStreamIndex,
+          targetStreamIndex: target.audioStreamIndex,
+          score: 0.9,
+          scale: 1,
+          offsetMs: 0,
+          inlierCount: 40
+        }
+      ],
+      notes: []
+    },
+    sourceStream: createAudioStream(source.audioStreamIndex),
+    targetStream: createAudioStream(target.audioStreamIndex),
+    sourceVisualStream: null,
+    targetVisualStream: null,
+    sourceIdentity: { ...source.contentIdentity },
+    targetIdentity: { ...target.contentIdentity },
+    engineVersion: "alignment-v2.0-rust",
+    featureVersion: "c137-test-features-v1",
+    parametersHash: "sha256:test-parameters"
+  };
+  return {
+    anchors: [],
+    cutCandidates: [],
+    confidence: level === "review" ? 0.91 : 0,
+    diagnostics: ["fixture"],
+    matchRange: {
+      sourceStartMs: 0,
+      sourceEndMs: 60_000,
+      targetStartMs: 0,
+      targetEndMs: 60_000,
+      coverage: 0.95
+    },
+    timeMap
+  };
+}
+
+function createAudioStream(index: number) {
+  return {
+    type: "audio" as const,
+    index,
+    codec: "flac",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/48000",
+    sampleRate: 48_000,
+    channels: 2,
+    frameRate: null,
+    language: "zh",
+    title: "main"
+  };
+}
+
+function createVideoStream(index: number) {
+  return {
+    type: "video" as const,
+    index,
+    codec: "h264",
+    startMs: 0,
+    timelineOffsetMs: 0,
+    timeBase: "1/90000",
+    sampleRate: null,
+    channels: null,
+    frameRate: 24,
+    language: null,
+    title: null
+  };
+}
+
+function createInvoker(options: {
+  start: AudioAlignmentBatchJobSnapshot;
+  get: AudioAlignmentBatchJobSnapshot[];
+  cancel?: AudioAlignmentBatchJobSnapshot;
+}): AudioAlignmentBatchJobInvoker {
+  const reads = [...options.get];
+  const start = vi.fn<
+    (
+      request: NormalizedTauriAudioAlignmentBatchRequest
+    ) => Promise<AudioAlignmentBatchJobSnapshot>
+  >(() => Promise.resolve(structuredClone(options.start)));
+  const get = vi.fn<(jobId: string) => Promise<AudioAlignmentBatchJobSnapshot>>(() => {
+    const snapshot = reads.shift();
+    if (!snapshot) return Promise.reject(new Error("unexpected get"));
+    return Promise.resolve(structuredClone(snapshot));
+  });
+  const cancel = vi.fn<(jobId: string) => Promise<AudioAlignmentBatchJobSnapshot>>(() =>
+    Promise.resolve(structuredClone(options.cancel ?? options.start))
+  );
+  return { start, get, cancel };
+}
+
+function rehashReceipt(receipt: RealMediaBlindBatchRunReceipt): RealMediaBlindBatchRunReceipt {
+  const { receiptDigest: _previousDigest, ...withoutDigest } = receipt;
+  void _previousDigest;
+  return {
+    ...withoutDigest,
+    receiptDigest: createRealMediaBlindBatchRunReceiptDigest(withoutDigest)
+  };
+}
