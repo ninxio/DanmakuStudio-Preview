@@ -389,7 +389,12 @@ describe("Tauri 音频对齐调用", () => {
 
     await expect(
       startTauriAudioAlignmentBatchJob(
-        { sources: [], targets: [{ mediaId: "target", path: "target.mkv" }], ffmpegPath: null },
+        {
+          sources: [],
+          targets: [{ mediaId: "target", path: "target.mkv" }],
+          ffmpegPath: null,
+          localizationMode: true
+        },
         jobInvoker
       )
     ).rejects.toThrow("B 站参考素材不能为空");
@@ -401,7 +406,8 @@ describe("Tauri 音频对齐调用", () => {
             { mediaId: " source ", path: "b.mkv" }
           ],
           targets: [{ mediaId: "target", path: "target.mkv" }],
-          ffmpegPath: null
+          ffmpegPath: null,
+          localizationMode: true
         },
         jobInvoker
       )
@@ -411,7 +417,8 @@ describe("Tauri 音频对齐调用", () => {
         {
           sources: [{ mediaId: "shared", path: "source.mkv" }],
           targets: [{ mediaId: "shared", path: "target.mkv" }],
-          ffmpegPath: null
+          ffmpegPath: null,
+          localizationMode: true
         },
         jobInvoker
       )
@@ -427,7 +434,8 @@ describe("Tauri 音频对齐调用", () => {
             mediaId: `target-${index}`,
             path: `${index}.mkv`
           })),
-          ffmpegPath: null
+          ffmpegPath: null,
+          localizationMode: true
         },
         jobInvoker
       )
@@ -461,7 +469,8 @@ describe("Tauri 音频对齐调用", () => {
     const base = {
       sources: [{ mediaId: "source", path: "source.mkv" }],
       targets: [{ mediaId: "target", path: "target.mkv" }],
-      ffmpegPath: null
+      ffmpegPath: null,
+      localizationMode: true as const
     };
 
     await startTauriAudioAlignmentBatchJob(
@@ -557,7 +566,8 @@ describe("Tauri 音频对齐调用", () => {
         {
           sources: [{ mediaId: "source", path: "source.mkv" }],
           targets: [{ mediaId: "target", path: "target.mkv" }],
-          ffmpegPath: null
+          ffmpegPath: null,
+          localizationMode: true
         },
         invoker
       )

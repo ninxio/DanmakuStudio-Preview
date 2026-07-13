@@ -1,7 +1,9 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { MediaContentIdentity } from "../../domain/project/types";
+import { sha256Hex } from "../../domain/shared/sha256";
 import {
   createStoredZip,
+  createStoredZipEntries,
   downloadTextFile,
   downloadTextFiles,
   sanitizeDownloadFileName,
@@ -26,11 +28,48 @@ export interface VerifiedMediaDependency {
   mapIds: string[];
 }
 
-export interface VerifiedExportVerification {
+export interface VerifiedExportManualVerification {
+  verificationId: string;
+  issuerKeyId: string;
+  signatureAlgorithm: "hmac-sha256-v1";
+  signature: string;
+  requestPayload: string;
+  requestDigest: string;
+}
+
+export interface VerifiedExportMapProof {
+  mapId: string;
+  revision: number;
+  state: "confirmed";
+  declaredQuality: "verified";
+  spanKinds: Array<"matched" | "sourceOnly" | "targetOnly">;
+  coreDigest: string;
+  sourceMediaId: string;
+  targetMediaId: string;
+  sourceIdentity: MediaContentIdentity;
+  targetIdentity: MediaContentIdentity;
+  manualVerification: VerifiedExportManualVerification;
+}
+
+export interface VerifiedExportVerificationSeed {
+  schemaVersion: 1;
   projectId: string;
   projectUpdatedAt: string;
-  snapshotDigest: string;
+  mapProofs: VerifiedExportMapProof[];
   dependencies: VerifiedMediaDependency[];
+}
+
+export interface VerifiedExportOutput {
+  fileName: string;
+  contentDigest: string;
+}
+
+export interface VerifiedExportVerification extends VerifiedExportVerificationSeed {
+  manifestJson: string;
+  snapshotDigest: string;
+  archiveFileName: string;
+  archiveContentDigest: string;
+  outputs: VerifiedExportOutput[];
 }
 
 export interface DesktopVerifiedExportFileRequest extends DesktopExportFileRequest {
@@ -57,7 +96,7 @@ export interface SaveTextExportOptions {
   directoryPath?: string;
   type?: string;
   /** Required for time-map-derived exports. Such exports never fall back to browser downloads. */
-  verification?: VerifiedExportVerification;
+  verification?: VerifiedExportVerificationSeed;
   /** Re-evaluated immediately before the native verified-save request is sent. */
   isSnapshotCurrent?: () => boolean;
 }
@@ -120,7 +159,12 @@ export async function saveTextExportFile(
       fileName: safeFileName,
       contentBytes: Array.from(new TextEncoder().encode(file.content))
     };
-    const result = await saveDesktopExport(request, options, bridge);
+    const result = await saveDesktopExport(
+      request,
+      [{ fileName: safeFileName, content: file.content }],
+      options,
+      bridge
+    );
     return {
       mode: "directory",
       fileCount: 1,
@@ -161,13 +205,15 @@ export async function saveTextExportFiles(
       return saveTextExportFile(files[0], options, bridge);
     }
     const archiveFileName = sanitizeDownloadFileName(options.archiveFileName ?? "danmaku-exports.zip", "danmaku-exports.zip");
-    const zipBytes = await blobToBytes(createStoredZip(files));
+    const logicalFiles = createStoredZipEntries(files);
+    const zipBytes = await blobToBytes(createStoredZip(logicalFiles));
     const result = await saveDesktopExport(
       {
         directoryPath,
         fileName: archiveFileName,
         contentBytes: Array.from(zipBytes)
       },
+      logicalFiles,
       options,
       bridge
     );
@@ -219,6 +265,7 @@ function assertVerifiedSaveAvailable(
 
 async function saveDesktopExport(
   request: DesktopExportFileRequest,
+  logicalFiles: ExportTextFile[],
   options: SaveTextExportOptions,
   bridge: ExportFilesBridge
 ): Promise<DesktopExportFileResult> {
@@ -232,7 +279,115 @@ async function saveDesktopExport(
   if (!saveVerifiedFile) {
     throw new Error("桌面端身份复核写盘能力不可用，高精度分集导出已阻断。");
   }
-  return saveVerifiedFile({ ...request, verification: options.verification });
+  const verification = createVerifiedExportVerification(
+    options.verification,
+    request.fileName,
+    new Uint8Array(request.contentBytes),
+    logicalFiles
+  );
+  return saveVerifiedFile({ ...request, verification });
+}
+
+export function createVerifiedExportVerification(
+  seed: VerifiedExportVerificationSeed,
+  archiveFileName: string,
+  archiveBytes: Uint8Array,
+  logicalFiles: readonly ExportTextFile[]
+): VerifiedExportVerification {
+  if (seed.schemaVersion !== 1) {
+    throw new Error("高精度导出 verification seed 版本不受支持。");
+  }
+  const outputs = logicalFiles
+    .map((file) => ({
+      fileName: file.fileName,
+      contentDigest: `sha256:${sha256Hex(file.content)}`
+    }))
+    .sort((left, right) => compareCanonicalString(left.fileName, right.fileName));
+  const mapProofs = [...seed.mapProofs]
+    .map((proof) => ({
+      ...proof,
+      spanKinds: [...proof.spanKinds],
+      sourceIdentity: { ...proof.sourceIdentity },
+      targetIdentity: { ...proof.targetIdentity },
+      manualVerification: { ...proof.manualVerification }
+    }))
+    .sort((left, right) => compareCanonicalString(left.mapId, right.mapId));
+  const dependencies = [...seed.dependencies]
+    .map((dependency) => ({
+      ...dependency,
+      expectedIdentity: { ...dependency.expectedIdentity },
+      mapIds: [...dependency.mapIds].sort(compareCanonicalString)
+    }))
+    .sort((left, right) => compareCanonicalString(left.mediaId, right.mediaId));
+  const archiveContentDigest = `sha256:${sha256Hex(archiveBytes)}`;
+  const manifestJson = JSON.stringify([
+    "verified-export-manifest-v1",
+    seed.schemaVersion,
+    seed.projectId,
+    seed.projectUpdatedAt,
+    archiveFileName,
+    archiveContentDigest,
+    outputs.map((output) => [output.fileName, output.contentDigest]),
+    mapProofs.map((proof) => [
+      proof.mapId,
+      proof.revision,
+      proof.state,
+      proof.declaredQuality,
+      proof.spanKinds,
+      proof.coreDigest,
+      proof.sourceMediaId,
+      proof.targetMediaId,
+      canonicalMediaIdentity(proof.sourceIdentity),
+      canonicalMediaIdentity(proof.targetIdentity),
+      [
+        proof.manualVerification.verificationId,
+        proof.manualVerification.issuerKeyId,
+        proof.manualVerification.signatureAlgorithm,
+        proof.manualVerification.signature,
+        proof.manualVerification.requestPayload,
+        proof.manualVerification.requestDigest
+      ]
+    ]),
+    dependencies.map((dependency) => [
+      dependency.mediaId,
+      canonicalMediaIdentity(dependency.expectedIdentity),
+      dependency.mapIds
+    ])
+  ]);
+  return {
+    ...seed,
+    mapProofs,
+    dependencies,
+    manifestJson,
+    snapshotDigest: `sha256:${sha256Hex(manifestJson)}`,
+    archiveFileName,
+    archiveContentDigest,
+    outputs
+  };
+}
+
+function canonicalMediaIdentity(identity: MediaContentIdentity): readonly unknown[] {
+  return [
+    identity.algorithm,
+    identity.sizeBytes,
+    identity.modifiedUnixMs,
+    identity.firstSampleDigest,
+    identity.middleSampleDigest,
+    identity.lastSampleDigest
+  ];
+}
+
+function compareCanonicalString(left: string, right: string): number {
+  const encoder = new TextEncoder();
+  const leftBytes = encoder.encode(left);
+  const rightBytes = encoder.encode(right);
+  const sharedLength = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) {
+      return leftBytes[index] - rightBytes[index];
+    }
+  }
+  return leftBytes.length - rightBytes.length;
 }
 
 function downloadResultToSaveResult(result: DownloadTextFilesResult): SaveTextExportResult {

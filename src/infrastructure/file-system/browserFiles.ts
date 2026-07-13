@@ -137,7 +137,7 @@ export function downloadTextFiles(
 
 export function createStoredZip(files: TextDownloadFile[]): Blob {
   const encoder = new TextEncoder();
-  const entries = createUniqueZipEntries(files).map((file) => {
+  const entries = createStoredZipEntries(files).map((file) => {
     const nameBytes = encoder.encode(file.fileName);
     const data = encoder.encode(file.content);
     return {
@@ -173,7 +173,8 @@ function downloadBlob(fileName: string, blob: Blob, type?: string, fallbackName 
   return safeFileName;
 }
 
-function createUniqueZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {
+/** Returns the exact logical names that `createStoredZip` writes into its deterministic ZIP. */
+export function createStoredZipEntries(files: TextDownloadFile[]): TextDownloadFile[] {
   const seen = new Map<string, number>();
   return files.map((file) => {
     const safeName = sanitizeZipFileName(file.fileName);

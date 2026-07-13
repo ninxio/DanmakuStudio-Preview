@@ -18,6 +18,8 @@ use crate::{
         resolve_ffprobe_path, select_audio_stream, AudioDecodeTimelineProbe, AudioStreamProbe,
         MediaContentIdentity, MediaProbeSnapshot, VideoStreamProbe,
     },
+    media_toolchain::PinnedMediaToolchain,
+    physical_file::{PhysicalFileObjectKey, PinnedPhysicalFile},
     process_supervision::{
         process_supervision_cleanup_faulted, resolve_supervised_executable, SupervisedCommand,
         SupervisedOutput, SupervisedOutputLimits, SupervisedProcessErrorKind,
@@ -29,7 +31,7 @@ use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs::File,
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -98,7 +100,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.1-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-coarse-affine-window-fine-cuda-batch-dual-boundary-v7";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-v9";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -177,7 +179,7 @@ const DIRECTION_SKIP_COMPLETE: u8 = 1;
 const DIRECTION_SKIP_SOURCE: u8 = 2;
 const DIRECTION_MATCH: u8 = 3;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioAlignmentRequest {
     complete_path: String,
@@ -449,7 +451,7 @@ struct AudioAlignmentBatchPairRequest {
     target_media_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioAlignmentBatchRequest {
     schema_version: u8,
@@ -775,6 +777,7 @@ struct AudioAlignmentOptions {
     max_cells: usize,
     ffmpeg_path: String,
     ffprobe_path: PathBuf,
+    toolchain_cache_identity: Option<String>,
     enable_visual_evidence: bool,
     visual_sample_interval_ms: u64,
     localization_mode: bool,
@@ -839,6 +842,7 @@ struct V2MediaArtifact {
 struct DecodedV2CoarseLandmarks {
     index: MediaCoarseIndexResult,
     decoded_sample_count: u64,
+    spectral_backend: SpectralBackendExecution,
 }
 
 #[derive(Debug, Clone)]
@@ -960,6 +964,7 @@ struct V2TrackPairCandidate {
     target_landmark_count: usize,
     source_spectral_backend_id: String,
     target_spectral_backend_id: String,
+    toolchain_cache_identity: String,
     global_source_interval: PresentationRangeMs,
     global_target_interval: PresentationRangeMs,
     fine_working_set_bytes: usize,
@@ -1149,12 +1154,15 @@ struct AudioAlignmentJobEntry {
     cancel_flag: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 struct PlannedAudioAlignmentBatchPair {
     pair_ordinal: usize,
     source_media_id: String,
     target_media_id: String,
     source_media_index: usize,
     target_media_index: usize,
+    source_physical_media_index: usize,
+    target_physical_media_index: usize,
     request: AudioAlignmentRequest,
 }
 
@@ -1166,6 +1174,7 @@ struct PlannedAudioAlignmentBatchMedia {
     role_label: &'static str,
 }
 
+#[derive(Clone)]
 struct PlannedAudioAlignmentBatch {
     media: Vec<PlannedAudioAlignmentBatchMedia>,
     pairs: Vec<PlannedAudioAlignmentBatchPair>,
@@ -1177,18 +1186,24 @@ struct PreparedV2BatchMediaEvidence {
     landmarks: HashMap<u32, CachedV2Landmarks>,
     extraction_notes: Vec<String>,
     retained_artifact_bytes: usize,
+    toolchain_cache_identity: String,
 }
 
 struct PreparedAudioAlignmentBatchMedia {
-    _read_lease: File,
+    physical_pin: Arc<PinnedPhysicalFile>,
     path: String,
+    physical_group_index: usize,
+    physical_object_key: PhysicalFileObjectKey,
     expected_identity: MediaContentIdentity,
     evidence: PreparedV2BatchMediaEvidence,
 }
 
 enum PreparedAudioAlignmentBatchMediaState {
-    Ready(Box<PreparedAudioAlignmentBatchMedia>),
-    Failed(String),
+    Ready(Arc<PreparedAudioAlignmentBatchMedia>),
+    Failed {
+        error: String,
+        physical_group_index: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -4727,6 +4742,29 @@ where
     F: FnMut(f64, &str) -> Result<(), String>,
 {
     ensure_alignment_process_supervision_clean()?;
+    let (options, toolchain) = create_pinned_audio_alignment_options(&request)?;
+    align_audio_files_with_pinned_toolchain(
+        request,
+        &options,
+        &toolchain,
+        update_progress,
+        cancel_flag,
+    )
+}
+
+fn align_audio_files_with_pinned_toolchain<F>(
+    request: AudioAlignmentRequest,
+    options: &AudioAlignmentOptions,
+    toolchain: &PinnedMediaToolchain,
+    update_progress: &mut F,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<AudioAlignmentProposal, String>
+where
+    F: FnMut(f64, &str) -> Result<(), String>,
+{
+    ensure_alignment_process_supervision_clean()?;
+    toolchain.verify_at_start()?;
+    audio_alignment_toolchain_cache_identity(options)?;
     validate_media_input(&request.complete_path, "目标原片")?;
     validate_media_input(&request.source_path, "B 站参考")?;
     let _media_read_lease =
@@ -4737,11 +4775,13 @@ where
         probe_alignment_run_expected_identity(&request.source_path, cancel_flag, "B 站参考")?;
     let target_path = request.complete_path.clone();
     let source_path = request.source_path.clone();
-    let result = align_audio_files_with_progress_impl(request, update_progress, cancel_flag);
+    let result =
+        align_audio_files_with_progress_impl(request, options, update_progress, cancel_flag);
     // A lower layer may deliberately downgrade ordinary evidence failures, but a process-tree
     // cleanup failure is never evidence. It invalidates the current run even if a fallback later
     // managed to construct a proposal.
     ensure_alignment_process_supervision_clean()?;
+    toolchain.verify_at_finalization()?;
     if let Ok(proposal) = &result {
         verify_media_content_identity_after_tool_output(
             &source_path,
@@ -4766,6 +4806,7 @@ where
 
 fn align_audio_files_with_progress_impl<F>(
     request: AudioAlignmentRequest,
+    options: &AudioAlignmentOptions,
     update_progress: &mut F,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<AudioAlignmentProposal, String>
@@ -4777,11 +4818,10 @@ where
     update_progress(0.05, "正在校验本地媒体路径。")?;
     validate_media_input(&request.complete_path, "完整版")?;
     validate_media_input(&request.source_path, "当前视频")?;
-    let options = create_options(&request)?;
     if options.localization_mode {
         return align_audio_files_v2_with_progress(
             &request,
-            &options,
+            options,
             update_progress,
             cancel_flag,
             None,
@@ -4792,7 +4832,7 @@ where
         &request.complete_path,
         "完整版",
         request.complete_audio_stream_index,
-        &options,
+        options,
         cancel_flag,
     )?;
     check_cancelled(cancel_flag)?;
@@ -4800,7 +4840,7 @@ where
         &request.source_path,
         "当前视频",
         request.source_audio_stream_index,
-        &options,
+        options,
         cancel_flag,
     )?;
     update_progress(0.10, "已确认媒体展示时间线、音轨和对齐参数。")?;
@@ -4810,7 +4850,7 @@ where
     let complete_features = get_audio_features(
         &request.complete_path,
         "完整版",
-        &options,
+        options,
         &complete_audio_input,
         cancel_flag,
     )?;
@@ -4824,7 +4864,7 @@ where
     let source_features = get_audio_features(
         &request.source_path,
         "当前视频",
-        &options,
+        options,
         &source_audio_input,
         cancel_flag,
     )?;
@@ -4842,14 +4882,14 @@ where
             get_visual_features(
                 &request.complete_path,
                 "完整版",
-                &options,
+                options,
                 complete_audio_input.content_identity.as_ref(),
                 cancel_flag,
             ),
             get_visual_features(
                 &request.source_path,
                 "当前视频",
-                &options,
+                options,
                 source_audio_input.content_identity.as_ref(),
                 cancel_flag,
             ),
@@ -4880,7 +4920,7 @@ where
     let mut proposal = create_audio_alignment_proposal(
         &complete_features.frames,
         &source_features.frames,
-        &options,
+        options,
     )?;
     update_progress(0.94, "正在精修候选版本差异。")?;
     check_cancelled(cancel_flag)?;
@@ -5105,6 +5145,7 @@ where
                 &target_inputs,
                 &source_landmarks,
                 &target_landmarks,
+                audio_alignment_toolchain_cache_identity(options)?,
                 request.source_audio_stream_index.is_some()
                     || request.complete_audio_stream_index.is_some(),
                 cancel_flag,
@@ -5378,6 +5419,7 @@ fn collect_v2_pair_coarse_candidates(
     target_inputs: &[AlignmentAudioInput],
     source_landmarks: &HashMap<u32, CachedV2Landmarks>,
     target_landmarks: &HashMap<u32, CachedV2Landmarks>,
+    toolchain_cache_identity: &str,
     has_explicit_selection: bool,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<V2PairCoarseCandidates, String> {
@@ -5477,6 +5519,7 @@ fn collect_v2_pair_coarse_candidates(
                     target_landmark_count: result.target_landmark_count,
                     source_spectral_backend_id: source_artifact.spectral_backend.backend_id.clone(),
                     target_spectral_backend_id: target_artifact.spectral_backend.backend_id.clone(),
+                    toolchain_cache_identity: toolchain_cache_identity.to_string(),
                     global_source_interval: source_artifact.presentation_bounds,
                     global_target_interval: target_artifact.presentation_bounds,
                     fine_working_set_bytes: 0,
@@ -5701,6 +5744,7 @@ struct V2GlobalExactSearch<'a> {
     expansion_count: usize,
     limits: V2GlobalExactLimits,
     cancel_flag: Option<&'a AtomicBool>,
+    competitor_of: Option<&'a [Option<usize>]>,
 }
 
 impl V2GlobalExactSearch<'_> {
@@ -5719,10 +5763,14 @@ impl V2GlobalExactSearch<'_> {
             self.record_solution(state);
             return Ok(());
         }
-        if self.best_states.len() >= 2
-            && state.total_score + self.remaining_score_upper_bound[depth]
-                < self.best_states[1].total_score
-        {
+        let pruning_score = if self.competitor_of.is_some() {
+            self.best_states.first().map(|best| best.total_score)
+        } else {
+            self.best_states.get(1).map(|runner| runner.total_score)
+        };
+        if pruning_score.is_some_and(|score| {
+            state.total_score + self.remaining_score_upper_bound[depth] < score
+        }) {
             return Ok(());
         }
 
@@ -5772,6 +5820,11 @@ impl V2GlobalExactSearch<'_> {
     }
 
     fn record_solution(&mut self, state: &V2GlobalAssignmentState) {
+        if self.competitor_of.is_some_and(|best_choices| {
+            !v2_global_assignment_is_nontrivial_competitor(best_choices, &state.choices)
+        }) {
+            return;
+        }
         self.best_states.push(state.clone());
         self.best_states
             .sort_by(compare_v2_global_assignment_states);
@@ -5781,14 +5834,15 @@ impl V2GlobalExactSearch<'_> {
     }
 }
 
-fn v2_global_runner_up<'a>(
-    states: &'a [V2GlobalAssignmentState],
+fn v2_global_assignment_is_nontrivial_competitor(
     best_choices: &[Option<usize>],
-) -> Option<&'a V2GlobalAssignmentState> {
-    states
-        .iter()
-        .skip(1)
-        .find(|state| state.choices != best_choices)
+    competitor_choices: &[Option<usize>],
+) -> bool {
+    best_choices.len() == competitor_choices.len()
+        && competitor_choices
+            .iter()
+            .zip(best_choices)
+            .any(|(competitor, best)| competitor.is_some() && competitor != best)
 }
 
 fn block_v2_global_shortlist_for_resource_limit(
@@ -5839,18 +5893,90 @@ fn select_v2_global_shortlist_with_limits(
     check_cancelled(cancel_flag)?;
     let coarse_incomplete = coarse_by_pair.iter().any(Result::is_err);
     if coarse_incomplete {
+        let mut affected = coarse_by_pair
+            .iter()
+            .map(Result::is_err)
+            .collect::<Vec<_>>();
+        loop {
+            let mut changed = false;
+            for pair_index in 0..plan.pairs.len() {
+                if affected[pair_index] {
+                    continue;
+                }
+                let pair = &plan.pairs[pair_index];
+                let shares_affected_physical_axis =
+                    plan.pairs.iter().enumerate().any(|(other_index, other)| {
+                        affected[other_index]
+                            && (pair.source_physical_media_index
+                                == other.source_physical_media_index
+                                || pair.target_physical_media_index
+                                    == other.target_physical_media_index)
+                    });
+                if shares_affected_physical_axis {
+                    affected[pair_index] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let unaffected_indices = affected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, affected)| (!*affected).then_some(index))
+            .collect::<Vec<_>>();
+        let mut unaffected_decisions = if unaffected_indices.is_empty() {
+            Vec::new().into_iter()
+        } else {
+            let subplan = PlannedAudioAlignmentBatch {
+                media: plan.media.clone(),
+                pairs: unaffected_indices
+                    .iter()
+                    .map(|index| plan.pairs[*index].clone())
+                    .collect(),
+            };
+            let subcoarse = unaffected_indices
+                .iter()
+                .map(|index| {
+                    Ok(coarse_by_pair[*index]
+                        .as_ref()
+                        .expect("unaffected coarse result checked")
+                        .clone())
+                })
+                .collect::<Vec<_>>();
+            select_v2_global_shortlist_with_limits(
+                &subplan,
+                &subcoarse,
+                batch_retained_artifact_bytes,
+                cancel_flag,
+                limits,
+            )?
+            .into_iter()
+        };
         return Ok(coarse_by_pair
             .iter()
-            .map(|coarse| match coarse {
-                Err(error) => V2GlobalShortlistDecision::Failed(error.clone()),
-                Ok(coarse) => V2GlobalShortlistDecision::Blocked {
-                    candidate: coarse.candidates.first().cloned(),
-                    alternatives: coarse.alternatives.clone(),
-                    margin: 0.0,
-                    reason: "批次至少一个可执行 pair 未完成 coarse scoring；项目级全局最优不成立，所有已评分候选均未进入 fine。"
-                        .to_string(),
-                    diagnostics: coarse.diagnostics.clone(),
-                },
+            .enumerate()
+            .map(|(pair_index, coarse)| {
+                if !affected[pair_index] {
+                    let mut decision = unaffected_decisions
+                        .next()
+                        .expect("unaffected shortlist decision count must match");
+                    annotate_v2_component_level_decision(&mut decision);
+                    return decision;
+                }
+                match coarse {
+                    Err(error) => V2GlobalShortlistDecision::Failed(error.clone()),
+                    Ok(coarse) => V2GlobalShortlistDecision::Blocked {
+                        candidate: coarse.candidates.first().cloned(),
+                        alternatives: coarse.alternatives.clone(),
+                        margin: 0.0,
+                        reason: "该物理媒体冲突 component 内至少一个 pair 未完成 coarse scoring；仅本 component 未进入 fine。"
+                            .to_string(),
+                        diagnostics: coarse.diagnostics.clone(),
+                    },
+                }
             })
             .collect());
     }
@@ -5944,6 +6070,7 @@ fn select_v2_global_shortlist_with_limits(
         expansion_count: 0,
         limits,
         cancel_flag,
+        competitor_of: None,
     };
     if let Err(error) = exact.search(0, &mut initial_state) {
         if error.starts_with("blocked:resource-limit") {
@@ -5953,13 +6080,91 @@ fn select_v2_global_shortlist_with_limits(
         }
         return Err(error);
     }
-    let Some(best) = exact.best_states.first() else {
+    let Some(best) = exact.best_states.first().cloned() else {
         return Err("批次级 Top-K exact branch-and-bound 没有产生任何完整状态。".to_string());
     };
-    let runner_up = v2_global_runner_up(&exact.best_states, &best.choices);
+    let first_pass_state_count = exact.state_count;
+    let first_pass_expansion_count = exact.expansion_count;
+    let has_possible_nontrivial_competitor =
+        eligible_indices
+            .iter()
+            .enumerate()
+            .any(|(pair_index, candidates)| match best.choices[pair_index] {
+                Some(best_candidate) => candidates
+                    .iter()
+                    .any(|candidate| *candidate != best_candidate),
+                None => !candidates.is_empty(),
+            });
+    let mut competitor_states = Vec::new();
+    let mut competitor_state_count = 0usize;
+    let mut competitor_expansion_count = 0usize;
+    if has_possible_nontrivial_competitor {
+        let mut competitor_initial = V2GlobalAssignmentState {
+            choices: vec![None; plan.pairs.len()],
+            selected_count: 0,
+            total_score: 0.0,
+        };
+        let mut competitor_exact = V2GlobalExactSearch {
+            plan,
+            coarse: &coarse,
+            eligible_indices: &eligible_indices,
+            processing_order: &processing_order,
+            remaining_score_upper_bound: exact.remaining_score_upper_bound.clone(),
+            best_states: Vec::new(),
+            state_count: 0,
+            expansion_count: 0,
+            limits,
+            cancel_flag,
+            competitor_of: Some(&best.choices),
+        };
+        if let Err(error) = competitor_exact.search(0, &mut competitor_initial) {
+            if error.starts_with("blocked:resource-limit") {
+                return Ok(block_v2_global_shortlist_for_resource_limit(
+                    &coarse, &error,
+                ));
+            }
+            return Err(error);
+        }
+        competitor_state_count = competitor_exact.state_count;
+        competitor_expansion_count = competitor_exact.expansion_count;
+        competitor_states = competitor_exact.best_states;
+    }
+    let runner_up = competitor_states.first();
+    let competing_pair_indices = runner_up
+        .map(|runner| {
+            best.choices
+                .iter()
+                .zip(&runner.choices)
+                .enumerate()
+                .filter_map(|(pair_index, (best_choice, runner_choice))| {
+                    (best_choice != runner_choice).then_some(pair_index)
+                })
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     let global_margin = runner_up
         .map(|runner| {
-            ((best.total_score - runner.total_score) / best.total_score.max(0.001)).clamp(0.0, 1.0)
+            let competing_score = competing_pair_indices
+                .iter()
+                .map(|pair_index| {
+                    let best_weight = best.choices[*pair_index]
+                        .map(|candidate_index| {
+                            v2_global_candidate_weight(
+                                &coarse[*pair_index].candidates[candidate_index],
+                            )
+                        })
+                        .unwrap_or(0.0);
+                    let runner_weight = runner.choices[*pair_index]
+                        .map(|candidate_index| {
+                            v2_global_candidate_weight(
+                                &coarse[*pair_index].candidates[candidate_index],
+                            )
+                        })
+                        .unwrap_or(0.0);
+                    best_weight.max(runner_weight)
+                })
+                .sum::<f64>();
+            ((best.total_score - runner.total_score) / competing_score.max(0.001)).clamp(0.0, 1.0)
         })
         .unwrap_or(1.0);
     let close_competition =
@@ -5968,8 +6173,8 @@ fn select_v2_global_shortlist_with_limits(
         "项目级 Top-K shortlist：{} 个 pair、{} 个合格 candidate，exact branch-and-bound 访问 {} 个状态、展开 {} 次；best 选择 {}/{} 个 pair，总分 {:.4}，runner-up margin {:.3}；未静默截断，未使用文件名、数组顺序或剧集号先验。",
         plan.pairs.len(),
         total_candidate_count,
-        exact.state_count,
-        exact.expansion_count,
+        first_pass_state_count.saturating_add(competitor_state_count),
+        first_pass_expansion_count.saturating_add(competitor_expansion_count),
         best.selected_count,
         plan.pairs.len(),
         best.total_score,
@@ -5981,21 +6186,28 @@ fn select_v2_global_shortlist_with_limits(
         .map(|(pair_index, coarse)| {
             let mut diagnostics = coarse.diagnostics.clone();
             diagnostics.push(global_summary.clone());
+            let pair_has_close_competition =
+                close_competition && competing_pair_indices.contains(&pair_index);
+            let pair_margin = if competing_pair_indices.contains(&pair_index) {
+                global_margin
+            } else {
+                1.0
+            };
             match best.choices[pair_index] {
-                Some(candidate_index) if !close_competition => {
+                Some(candidate_index) if !pair_has_close_competition => {
                     V2GlobalShortlistDecision::Selected(PreparedV2SelectedCandidate {
                         candidate: coarse.candidates[candidate_index].clone(),
                         alternatives: coarse.alternatives.clone(),
-                        global_margin,
+                        global_margin: pair_margin,
                         global_diagnostic: diagnostics.join("；"),
                     })
                 }
                 Some(candidate_index) => V2GlobalShortlistDecision::Blocked {
                     candidate: Some(coarse.candidates[candidate_index].clone()),
                     alternatives: coarse.alternatives.clone(),
-                    margin: global_margin,
+                    margin: pair_margin,
                     reason: format!(
-                        "项目级 Top-K best/runner-up margin {global_margin:.3} 低于 {:.3}；竞争接近，未执行 fine。",
+                        "项目级 Top-K best/非平凡竞争解 margin {pair_margin:.3} 低于 {:.3}；该 pair 参与竞争，未执行 fine。",
                         ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN
                     ),
                     diagnostics,
@@ -6003,7 +6215,7 @@ fn select_v2_global_shortlist_with_limits(
                 None => V2GlobalShortlistDecision::Blocked {
                     candidate: coarse.candidates.first().cloned(),
                     alternatives: coarse.alternatives.clone(),
-                    margin: global_margin,
+                    margin: pair_margin,
                     reason: "该 pair 的 Top-K 候选与同一物理媒体上已选区间冲突，未进入项目级 shortlist，也未执行 fine。"
                         .to_string(),
                     diagnostics,
@@ -6011,6 +6223,21 @@ fn select_v2_global_shortlist_with_limits(
             }
         })
         .collect())
+}
+
+fn annotate_v2_component_level_decision(decision: &mut V2GlobalShortlistDecision) {
+    const NOTE: &str =
+        "批次含其他失败 component；本结果仅声明当前独立 physical-media component 内的全局最优。";
+    match decision {
+        V2GlobalShortlistDecision::Selected(selected) => {
+            selected.global_diagnostic.push('；');
+            selected.global_diagnostic.push_str(NOTE);
+        }
+        V2GlobalShortlistDecision::Blocked { diagnostics, .. } => {
+            diagnostics.push(NOTE.to_string());
+        }
+        V2GlobalShortlistDecision::Failed(_) => {}
+    }
 }
 
 fn compare_v2_global_assignment_states(
@@ -6065,7 +6292,7 @@ fn v2_global_candidates_conflict(
     right_pair: &PlannedAudioAlignmentBatchPair,
     right: &V2TrackPairCandidate,
 ) -> bool {
-    (left_pair.source_media_index == right_pair.source_media_index
+    (left_pair.source_physical_media_index == right_pair.source_physical_media_index
         && v2_interval_overlap_ms(
             (
                 left.global_source_interval.start_ms,
@@ -6076,7 +6303,7 @@ fn v2_global_candidates_conflict(
                 right.global_source_interval.end_ms,
             ),
         ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
-        || (left_pair.target_media_index == right_pair.target_media_index
+        || (left_pair.target_physical_media_index == right_pair.target_physical_media_index
             && v2_interval_overlap_ms(
                 (
                     left.global_target_interval.start_ms,
@@ -6628,16 +6855,14 @@ fn get_v2_landmarks(
         owned_backend_request = resolve_spectral_backend_request()?;
         Some(&owned_backend_request)
     };
-    if streaming_coarse
-        && backend_request.is_some_and(|request| request.requested_backend == "cuda")
-    {
-        return Err(
-            "blocked:cuda-fft-unsupported：长媒体流式粗定位尚未组成跨 stdout chunk 的 CUDA 批次，强制 CUDA 时不允许假装加速。"
-                .to_string(),
-        );
-    }
     let planned_backend_id = if streaming_coarse {
-        STREAMING_CPU_SPECTRAL_BACKEND_ID
+        if backend_request.is_some_and(|request| {
+            request.planned_backend_id == crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
+        }) {
+            crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
+        } else {
+            STREAMING_CPU_SPECTRAL_BACKEND_ID
+        }
     } else {
         backend_request
             .expect("short-media cache lookup must resolve a spectral backend")
@@ -6683,8 +6908,14 @@ fn get_v2_landmarks(
         .unwrap_or(0);
     let (pcm, landmarks, fine_features, spectral_backend, presentation_bounds) = if streaming_coarse
     {
-        let coarse =
-            decode_v2_coarse_landmarks_streaming(media_path, label, options, input, cancel_flag)?;
+        let coarse = decode_v2_coarse_landmarks_streaming(
+            media_path,
+            label,
+            options,
+            input,
+            backend_request.expect("streaming extraction must resolve a spectral backend"),
+            cancel_flag,
+        )?;
         let presentation_bounds = v2_presentation_bounds_for_samples(
             presentation_offset_ms,
             coarse.decoded_sample_count,
@@ -6693,15 +6924,7 @@ fn get_v2_landmarks(
             None,
             Arc::new(coarse.index.landmarks),
             None,
-            SpectralBackendExecution {
-                backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
-                requested_backend: "streaming-cpu".to_string(),
-                backend_detail: "CPU 流式 radix-2 f64 FFT".to_string(),
-                fallback_reason: Some(
-                    "长媒体流式粗定位尚未跨 stdout chunk 组成 CUDA 批次，本次仅使用有界 CPU 索引。"
-                        .to_string(),
-                ),
-            },
+            coarse.spectral_backend,
             presentation_bounds,
         )
     } else {
@@ -6791,10 +7014,13 @@ fn create_v2_audio_cache_key(
     input: &AlignmentAudioInput,
     artifact: &str,
 ) -> Result<String, String> {
-    let backend_id = if should_stream_v2_coarse_only(input) {
+    let request = resolve_spectral_backend_request()?;
+    let backend_id = if should_stream_v2_coarse_only(input)
+        && request.planned_backend_id != crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
+    {
         STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string()
     } else {
-        resolve_spectral_backend_request()?.planned_backend_id
+        request.planned_backend_id
     };
     create_v2_audio_cache_key_for_backend(media_path, options, input, artifact, &backend_id)
 }
@@ -7253,13 +7479,28 @@ struct V2S16LeLandmarkStream {
 }
 
 impl V2S16LeLandmarkStream {
+    #[cfg(test)]
     fn new(config: LandmarkConfig) -> Result<Self, String> {
+        Self::from_extractor(StreamingLandmarkExtractor::new(config)?)
+    }
+
+    fn new_with_backend_request(
+        config: LandmarkConfig,
+        backend_request: &SpectralBackendRequest,
+    ) -> Result<Self, String> {
+        Self::from_extractor(StreamingLandmarkExtractor::new_with_backend_request(
+            config,
+            backend_request,
+        )?)
+    }
+
+    fn from_extractor(extractor: StreamingLandmarkExtractor) -> Result<Self, String> {
         let mut sample_buffer = Vec::new();
         sample_buffer
             .try_reserve_exact(ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES / 2 + 1)
             .map_err(|_| "blocked:resource-limit：无法为流式 PCM 小块保留工作内存。".to_string())?;
         Ok(Self {
-            extractor: StreamingLandmarkExtractor::new(config)?,
+            extractor,
             pending_low_byte: None,
             sample_buffer,
             decoded_samples: 0,
@@ -7332,19 +7573,22 @@ impl V2S16LeLandmarkStream {
             ));
         }
         let decoded_sample_count = self.decoded_samples;
-        let index = self
+        let extraction = self
             .extractor
-            .finish_with_cancel(cancel_flag)
+            .finish_with_backend_and_cancel(cancel_flag)
             .map_err(map_v2_streaming_algorithm_error)?;
         Ok(DecodedV2CoarseLandmarks {
-            index,
+            index: extraction.index,
             decoded_sample_count,
+            spectral_backend: extraction.spectral_backend,
         })
     }
 }
 
 fn map_v2_streaming_algorithm_error(error: String) -> String {
-    if error.contains("已取消") {
+    if error.starts_with("blocked:") {
+        error
+    } else if error.contains("已取消") {
         AUDIO_ALIGNMENT_CANCELLED.to_string()
     } else if error.contains("上限") || error.contains("保留内存") || error.contains("溢出")
     {
@@ -7359,6 +7603,7 @@ fn decode_v2_coarse_landmarks_streaming(
     label: &str,
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
+    backend_request: &SpectralBackendRequest,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<DecodedV2CoarseLandmarks, String> {
     check_cancelled(cancel_flag)?;
@@ -7376,14 +7621,17 @@ fn decode_v2_coarse_landmarks_streaming(
         .as_ref()
         .map(|item| item.normalized_pcm_origin_ms)
         .unwrap_or(0);
-    let mut consumer = V2S16LeLandmarkStream::new(LandmarkConfig {
-        sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-        presentation_offset_ms,
-        window_ms: 50,
-        hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
-        max_hash_occurrences: 64,
-        ..LandmarkConfig::default()
-    })?;
+    let mut consumer = V2S16LeLandmarkStream::new_with_backend_request(
+        LandmarkConfig {
+            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+            presentation_offset_ms,
+            window_ms: 50,
+            hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
+            max_hash_occurrences: 64,
+            ..LandmarkConfig::default()
+        },
+        backend_request,
+    )?;
     let mut consumer_error = None;
     let output_result = run_supervised_ffmpeg_streaming(
         &options.ffmpeg_path,
@@ -9568,6 +9816,7 @@ fn create_v2_parameters_hash(pair: &V2TrackPairCandidate) -> String {
         Some(&pair.target_input),
         Some(&pair.source_spectral_backend_id),
         Some(&pair.target_spectral_backend_id),
+        Some(&pair.toolchain_cache_identity),
     )
 }
 
@@ -9576,9 +9825,10 @@ fn create_v2_optional_parameters_hash(
     target: Option<&AlignmentAudioInput>,
     source_spectral_backend_id: Option<&str>,
     target_spectral_backend_id: Option<&str>,
+    toolchain_cache_identity: Option<&str>,
 ) -> String {
     let parameters = format!(
-        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|sampleRate={ALIGNMENT_V2_SAMPLE_RATE}|landmarkHop={ALIGNMENT_V2_LANDMARK_HOP_MS}|fineHop={ALIGNMENT_V2_FINE_HOP_MS}|chunk={ALIGNMENT_V2_DP_CHUNK_MS}|band={ALIGNMENT_V2_DP_BAND_RADIUS_MS}|sourceSpectralBackend={source_spectral_backend_id:?}|targetSpectralBackend={target_spectral_backend_id:?}|source={:?}|target={:?}",
+        "engine={ALIGNMENT_V2_ENGINE_VERSION}|feature={ALIGNMENT_V2_FEATURE_VERSION}|sampleRate={ALIGNMENT_V2_SAMPLE_RATE}|landmarkHop={ALIGNMENT_V2_LANDMARK_HOP_MS}|fineHop={ALIGNMENT_V2_FINE_HOP_MS}|chunk={ALIGNMENT_V2_DP_CHUNK_MS}|band={ALIGNMENT_V2_DP_BAND_RADIUS_MS}|sourceSpectralBackend={source_spectral_backend_id:?}|targetSpectralBackend={target_spectral_backend_id:?}|toolchain={toolchain_cache_identity:?}|source={:?}|target={:?}",
         source.map(|input| (
             input.stream.stream_index,
             input.presentation_origin_ms,
@@ -9676,6 +9926,12 @@ fn plan_audio_alignment_batch(
         return Err(format!(
             "批量音频对齐 schemaVersion 必须为 {AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION}。"
         ));
+    }
+    if request.localization_mode != Some(true) {
+        return Err(
+            "批量音频对齐只接受显式 localizationMode=true 的 Alignment V2 请求；旧逐 pair 引擎不再通过公共 batch API 静默启用。"
+                .to_string(),
+        );
     }
     validate_audio_alignment_batch_side_count("参考素材", request.sources.len())?;
     validate_audio_alignment_batch_side_count("目标原片", request.targets.len())?;
@@ -9800,6 +10056,8 @@ fn plan_audio_alignment_batch(
     for pair in &mut pairs {
         pair.source_media_index = media_index_remap[pair.source_media_index];
         pair.target_media_index = media_index_remap[pair.target_media_index];
+        pair.source_physical_media_index = pair.source_media_index;
+        pair.target_physical_media_index = pair.target_media_index;
         debug_assert_ne!(pair.source_media_index, usize::MAX);
         debug_assert_ne!(pair.target_media_index, usize::MAX);
     }
@@ -9825,6 +10083,8 @@ fn create_planned_audio_alignment_batch_pair(
         target_media_id: target.media_id.clone(),
         source_media_index,
         target_media_index,
+        source_physical_media_index: source_media_index,
+        target_physical_media_index: target_media_index,
         request: AudioAlignmentRequest {
             complete_path: target.path.clone(),
             source_path: source.path.clone(),
@@ -9948,107 +10208,155 @@ fn prepare_audio_alignment_batch_media(
     options: &AudioAlignmentOptions,
     cancel_flag: &AtomicBool,
 ) -> Result<Vec<PreparedAudioAlignmentBatchMediaState>, String> {
+    let toolchain_cache_identity = audio_alignment_toolchain_cache_identity(options)?.to_string();
     let spectral_backend_request = match resolve_spectral_backend_request() {
         Ok(request) => request,
         Err(error) => {
             return Ok(plan
                 .media
                 .iter()
-                .map(|_| PreparedAudioAlignmentBatchMediaState::Failed(error.clone()))
+                .map(|_| PreparedAudioAlignmentBatchMediaState::Failed {
+                    error: error.clone(),
+                    physical_group_index: None,
+                })
                 .collect());
         }
     };
     let mut batch_retained_artifact_bytes = 0_usize;
+    let mut physical_groups =
+        HashMap::<PhysicalFileObjectKey, (usize, Arc<PinnedPhysicalFile>)>::new();
+    let mut physical_group_by_media_id = HashMap::<String, usize>::new();
+    let mut prepared_views = HashMap::<
+        (PhysicalFileObjectKey, Option<u32>),
+        Result<Arc<PreparedAudioAlignmentBatchMedia>, String>,
+    >::new();
     let prepared = prepare_distinct_audio_alignment_batch_media_with(
         &plan.media,
         cancel_flag,
         |media| {
             validate_media_input(&media.path, media.role_label)?;
-            let read_lease = open_alignment_media_read_lease(Path::new(&media.path))?;
-            let inputs = probe_alignment_audio_candidates(
-                &media.path,
-                media.role_label,
-                media.requested_audio_stream_index,
-                options,
-                Some(cancel_flag),
-            )?;
-            if inputs.is_empty() {
-                return Err(format!(
-                    "{}没有可用的非 commentary 音轨。",
-                    media.role_label
-                ));
+            let candidate_pin = PinnedPhysicalFile::open(Path::new(&media.path))?;
+            candidate_pin.verify_handle_and_path()?;
+            let physical_object_key = candidate_pin.object_key();
+            let (physical_group_index, physical_pin) =
+                if let Some((group_index, existing)) = physical_groups.get(&physical_object_key) {
+                    (*group_index, Arc::clone(existing))
+                } else {
+                    let group_index = physical_groups.len();
+                    physical_groups.insert(
+                        physical_object_key,
+                        (group_index, Arc::clone(&candidate_pin)),
+                    );
+                    (group_index, candidate_pin)
+                };
+            physical_group_by_media_id.insert(media.media_id.clone(), physical_group_index);
+            let view_key = (physical_object_key, media.requested_audio_stream_index);
+            if let Some(cached) = prepared_views.get(&view_key) {
+                return cached.clone();
             }
-            let expected_identity = inputs
-                .first()
-                .and_then(|input| input.content_identity.clone())
-                .ok_or_else(|| {
-                    format!(
-                        "blocked:media-identity-missing：{}批次预处理缺少完整媒体身份。",
+
+            let stable_path = physical_pin
+                .handle_final_path()
+                .to_string_lossy()
+                .into_owned();
+            let result = (|| {
+                let inputs = probe_alignment_audio_candidates(
+                    &stable_path,
+                    media.role_label,
+                    media.requested_audio_stream_index,
+                    options,
+                    Some(cancel_flag),
+                )?;
+                if inputs.is_empty() {
+                    return Err(format!(
+                        "{}没有可用的非 commentary 音轨。",
                         media.role_label
-                    )
-                })?;
-            require_full_file_media_content_identity(Some(&expected_identity))?;
-            if inputs
-                .iter()
-                .any(|input| input.content_identity.as_ref() != Some(&expected_identity))
-            {
-                return Err(format!(
-                    "blocked:media-identity-changed：{}候选音轨没有绑定到同一批次媒体身份。",
-                    media.role_label
-                ));
-            }
-            let mut extraction_notes = vec![format!(
-                "批次级 distinct-media 预处理：素材 {} 的 timeline、全量音频 PTS 与候选音轨只建立一次。",
-                media.media_id
-            )];
-            let media_retained_baseline = batch_retained_artifact_bytes;
-            let mut combined_retained_artifact_bytes = media_retained_baseline;
-            let landmarks = execute_after_v2_candidate_reservation(
-                media_retained_baseline,
-                &inputs,
-                &[],
-                || {
-                    extract_v2_landmark_candidates(
-                        &media.path,
-                        media.role_label,
-                        options,
-                        &inputs,
-                        Some(cancel_flag),
-                        &mut V2CandidateExtractionState {
-                            notes: &mut extraction_notes,
-                            retained_artifact_bytes: &mut combined_retained_artifact_bytes,
-                            spectral_backend_request: &spectral_backend_request,
-                        },
-                    )
-                },
-            )?;
-            if landmarks.is_empty() {
-                return Err(format!("{}候选音轨未产生可用 landmark。", media.role_label));
-            }
-            let media_retained_artifact_bytes = combined_retained_artifact_bytes
-                .checked_sub(media_retained_baseline)
-                .ok_or_else(|| {
-                    "blocked:resource-limit：批次级媒体制品驻留计数发生回退。".to_string()
-                })?;
-            batch_retained_artifact_bytes = combined_retained_artifact_bytes;
-            Ok(PreparedAudioAlignmentBatchMedia {
-                _read_lease: read_lease,
-                path: media.path.clone(),
-                expected_identity,
-                evidence: PreparedV2BatchMediaEvidence {
-                    inputs,
-                    landmarks,
-                    extraction_notes,
-                    retained_artifact_bytes: media_retained_artifact_bytes,
-                },
-            })
+                    ));
+                }
+                let expected_identity = inputs
+                    .first()
+                    .and_then(|input| input.content_identity.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "blocked:media-identity-missing：{}批次预处理缺少完整媒体身份。",
+                            media.role_label
+                        )
+                    })?;
+                require_full_file_media_content_identity(Some(&expected_identity))?;
+                if inputs
+                    .iter()
+                    .any(|input| input.content_identity.as_ref() != Some(&expected_identity))
+                {
+                    return Err(format!(
+                        "blocked:media-identity-changed：{}候选音轨没有绑定到同一批次媒体身份。",
+                        media.role_label
+                    ));
+                }
+                let mut extraction_notes = vec![format!(
+                    "批次级 physical-media 预处理：素材 {} 绑定物理组 {}；相同文件对象与音轨视图只建立一次 timeline、全量音频 PTS 和 coarse landmark。",
+                    media.media_id,
+                    physical_group_index + 1
+                )];
+                let media_retained_baseline = batch_retained_artifact_bytes;
+                let mut combined_retained_artifact_bytes = media_retained_baseline;
+                let landmarks = execute_after_v2_candidate_reservation(
+                    media_retained_baseline,
+                    &inputs,
+                    &[],
+                    || {
+                        extract_v2_landmark_candidates(
+                            &stable_path,
+                            media.role_label,
+                            options,
+                            &inputs,
+                            Some(cancel_flag),
+                            &mut V2CandidateExtractionState {
+                                notes: &mut extraction_notes,
+                                retained_artifact_bytes: &mut combined_retained_artifact_bytes,
+                                spectral_backend_request: &spectral_backend_request,
+                            },
+                        )
+                    },
+                )?;
+                if landmarks.is_empty() {
+                    return Err(format!("{}候选音轨未产生可用 landmark。", media.role_label));
+                }
+                let media_retained_artifact_bytes = combined_retained_artifact_bytes
+                    .checked_sub(media_retained_baseline)
+                    .ok_or_else(|| {
+                        "blocked:resource-limit：批次级媒体制品驻留计数发生回退。".to_string()
+                    })?;
+                batch_retained_artifact_bytes = combined_retained_artifact_bytes;
+                Ok(Arc::new(PreparedAudioAlignmentBatchMedia {
+                    physical_pin: Arc::clone(&physical_pin),
+                    path: stable_path,
+                    physical_group_index,
+                    physical_object_key,
+                    expected_identity,
+                    evidence: PreparedV2BatchMediaEvidence {
+                        inputs,
+                        landmarks,
+                        extraction_notes,
+                        retained_artifact_bytes: media_retained_artifact_bytes,
+                        toolchain_cache_identity: toolchain_cache_identity.clone(),
+                    },
+                }))
+            })();
+            prepared_views.insert(view_key, result.clone());
+            result
         },
     )?;
     Ok(prepared
         .into_iter()
-        .map(|result| match result {
-            Ok(media) => PreparedAudioAlignmentBatchMediaState::Ready(Box::new(media)),
-            Err(error) => PreparedAudioAlignmentBatchMediaState::Failed(error),
+        .enumerate()
+        .map(|(media_index, result)| match result {
+            Ok(media) => PreparedAudioAlignmentBatchMediaState::Ready(media),
+            Err(error) => PreparedAudioAlignmentBatchMediaState::Failed {
+                error,
+                physical_group_index: physical_group_by_media_id
+                    .get(&plan.media[media_index].media_id)
+                    .copied(),
+            },
         })
         .collect())
 }
@@ -10080,6 +10388,41 @@ where
     Ok(prepared)
 }
 
+fn bind_audio_alignment_batch_physical_groups(
+    plan: &mut PlannedAudioAlignmentBatch,
+    prepared: &[PreparedAudioAlignmentBatchMediaState],
+) -> Result<(), String> {
+    for pair in &mut plan.pairs {
+        let source = prepared
+            .get(pair.source_media_index)
+            .ok_or_else(|| "批次物理媒体绑定的参考索引越界。".to_string())?;
+        pair.source_physical_media_index = match source {
+            PreparedAudioAlignmentBatchMediaState::Ready(media) => media.physical_group_index,
+            PreparedAudioAlignmentBatchMediaState::Failed {
+                physical_group_index: Some(group),
+                ..
+            } => *group,
+            PreparedAudioAlignmentBatchMediaState::Failed { .. } => {
+                prepared.len().saturating_add(pair.source_media_index)
+            }
+        };
+        let target = prepared
+            .get(pair.target_media_index)
+            .ok_or_else(|| "批次物理媒体绑定的目标索引越界。".to_string())?;
+        pair.target_physical_media_index = match target {
+            PreparedAudioAlignmentBatchMediaState::Ready(media) => media.physical_group_index,
+            PreparedAudioAlignmentBatchMediaState::Failed {
+                physical_group_index: Some(group),
+                ..
+            } => *group,
+            PreparedAudioAlignmentBatchMediaState::Failed { .. } => {
+                prepared.len().saturating_add(pair.target_media_index)
+            }
+        };
+    }
+    Ok(())
+}
+
 fn prepared_audio_alignment_batch_media<'a>(
     prepared: &'a [PreparedAudioAlignmentBatchMediaState],
     index: usize,
@@ -10087,7 +10430,7 @@ fn prepared_audio_alignment_batch_media<'a>(
 ) -> Result<&'a PreparedAudioAlignmentBatchMedia, String> {
     match prepared.get(index) {
         Some(PreparedAudioAlignmentBatchMediaState::Ready(media)) => Ok(media.as_ref()),
-        Some(PreparedAudioAlignmentBatchMediaState::Failed(error)) => Err(format!(
+        Some(PreparedAudioAlignmentBatchMediaState::Failed { error, .. }) => Err(format!(
             "{role}批次级预处理失败；只有引用该素材的 pair 被阻断：{error}"
         )),
         None => Err(format!("{role}批次级预处理索引越界。")),
@@ -10104,11 +10447,18 @@ fn score_prepared_audio_alignment_batch_pair_coarse(
         prepared_audio_alignment_batch_media(prepared, pair.source_media_index, "B 站参考")?;
     let target =
         prepared_audio_alignment_batch_media(prepared, pair.target_media_index, "目标原片")?;
+    if source.evidence.toolchain_cache_identity != target.evidence.toolchain_cache_identity {
+        return Err(
+            "blocked:media-toolchain-integrity：同一 pair 的两端预处理制品未绑定同一工具链。"
+                .to_string(),
+        );
+    }
     collect_v2_pair_coarse_candidates(
         &source.evidence.inputs,
         &target.evidence.inputs,
         &source.evidence.landmarks,
         &target.evidence.landmarks,
+        &source.evidence.toolchain_cache_identity,
         pair.request.source_audio_stream_index.is_some()
             || pair.request.complete_audio_stream_index.is_some(),
         Some(cancel_flag),
@@ -10133,8 +10483,9 @@ where
         prepared_audio_alignment_batch_media(prepared, pair.source_media_index, "B 站参考")?;
     let target =
         prepared_audio_alignment_batch_media(prepared, pair.target_media_index, "目标原片")?;
+    let stable_request = create_prepared_audio_alignment_batch_pair_request(pair, source, target);
     let result = align_audio_files_v2_with_progress(
-        &pair.request,
+        &stable_request,
         options,
         update_progress,
         Some(cancel_flag),
@@ -10166,6 +10517,19 @@ where
         )?;
     }
     result
+}
+
+fn create_prepared_audio_alignment_batch_pair_request(
+    pair: &PlannedAudioAlignmentBatchPair,
+    source: &PreparedAudioAlignmentBatchMedia,
+    target: &PreparedAudioAlignmentBatchMedia,
+) -> AudioAlignmentRequest {
+    let mut request = pair.request.clone();
+    // Coarse, fine and visual work must all reopen the same handle-derived Volume-GUID paths.
+    // The user-facing logical path is deliberately never reused after the physical lease exists.
+    request.source_path = source.path.clone();
+    request.complete_path = target.path.clone();
+    request
 }
 
 fn create_v2_global_shortlist_blocked_proposal(
@@ -10236,6 +10600,7 @@ fn verify_prepared_audio_alignment_batch_media(
             .ok_or_else(|| "批次最终身份复核的目标媒体索引越界。".to_string())?;
         *target = true;
     }
+    let mut verified_physical_media = HashSet::<PhysicalFileObjectKey>::new();
     for (media_index, state) in prepared.iter().enumerate() {
         check_cancelled(cancel_flag)?;
         if !referenced_media[media_index] {
@@ -10244,11 +10609,15 @@ fn verify_prepared_audio_alignment_batch_media(
         let PreparedAudioAlignmentBatchMediaState::Ready(media) = state else {
             continue;
         };
+        if !verified_physical_media.insert(media.physical_object_key) {
+            continue;
+        }
+        media.physical_pin.verify_handle_and_path()?;
         verify_media_content_identity_after_tool_output(
             &media.path,
             Some(&media.expected_identity),
             cancel_flag,
-            "批次结束前 distinct-media 身份复核",
+            "批次结束前 physical-media 身份复核",
         )?;
     }
     ensure_alignment_process_supervision_clean()
@@ -10257,45 +10626,25 @@ fn verify_prepared_audio_alignment_batch_media(
 fn run_audio_alignment_batch_job(
     job_id: String,
     cancel_flag: Arc<AtomicBool>,
-    plan: PlannedAudioAlignmentBatch,
+    mut plan: PlannedAudioAlignmentBatch,
 ) {
-    let localization_mode = plan
-        .pairs
-        .first()
-        .and_then(|pair| pair.request.localization_mode)
-        .unwrap_or(false);
-    if !localization_mode {
-        run_audio_alignment_batch_job_with_pair_executor(
-            job_id,
-            cancel_flag,
-            plan,
-            |job_id, pair_index, pair, cancel_flag| {
-                let mut update = |progress: f64, message: &str| {
-                    if cancel_flag.load(Ordering::Acquire) {
-                        return Err(AUDIO_ALIGNMENT_CANCELLED.to_string());
-                    }
-                    update_audio_alignment_batch_pair_progress(
-                        job_id, pair_index, progress, message,
-                    )
-                };
-                align_audio_files_with_progress(pair.request, &mut update, Some(cancel_flag))
-            },
-        );
+    if ensure_alignment_process_supervision_clean().is_err() {
+        let _ = fail_audio_alignment_batch_worker(&job_id, 0);
         return;
     }
-
-    let options = match plan
+    let pinned = match plan
         .pairs
         .first()
         .ok_or_else(|| "批量音频对齐没有可执行 pair。".to_string())
-        .and_then(|pair| create_options(&pair.request))
+        .and_then(|pair| create_pinned_audio_alignment_options(&pair.request))
     {
-        Ok(options) => options,
-        Err(_) => {
-            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+        Ok(pinned) => pinned,
+        Err(error) => {
+            let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
             return;
         }
     };
+    let (options, toolchain) = pinned;
     let prepared = match prepare_audio_alignment_batch_media(&plan, &options, cancel_flag.as_ref())
     {
         Ok(prepared) => prepared,
@@ -10310,28 +10659,37 @@ fn run_audio_alignment_batch_job(
             let _ = fail_audio_alignment_batch_worker(&job_id, 0);
             return;
         }
-        Err(_) => {
-            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+        Err(error) => {
+            let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
             return;
         }
     };
+    if let Err(error) = bind_audio_alignment_batch_physical_groups(&mut plan, &prepared) {
+        let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
+        return;
+    }
 
+    let mut counted_prepared_views = HashSet::<usize>::new();
     let batch_retained_artifact_bytes =
         prepared
             .iter()
             .try_fold(0_usize, |retained, state| match state {
                 PreparedAudioAlignmentBatchMediaState::Ready(media) => {
+                    let prepared_view = Arc::as_ptr(media) as usize;
+                    if !counted_prepared_views.insert(prepared_view) {
+                        return Ok(retained);
+                    }
                     ensure_v2_active_artifact_budget(
                         retained,
                         media.evidence.retained_artifact_bytes,
                     )
                 }
-                PreparedAudioAlignmentBatchMediaState::Failed(_) => Ok(retained),
+                PreparedAudioAlignmentBatchMediaState::Failed { .. } => Ok(retained),
             });
     let batch_retained_artifact_bytes = match batch_retained_artifact_bytes {
         Ok(bytes) => bytes,
-        Err(_) => {
-            let _ = fail_audio_alignment_batch_worker(&job_id, 0);
+        Err(error) => {
+            let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
             return;
         }
     };
@@ -10416,11 +10774,13 @@ fn run_audio_alignment_batch_job(
                 &media_indices_by_pair,
                 completed_pair_indices,
                 (!ignore_cancel).then_some(cancel_flag.as_ref()),
-            )
+            )?;
+            toolchain.verify_at_finalization()
         },
     );
 }
 
+#[cfg(test)]
 fn run_audio_alignment_batch_job_with_pair_executor<F>(
     job_id: String,
     cancel_flag: Arc<AtomicBool>,
@@ -10980,6 +11340,69 @@ fn fail_audio_alignment_batch_worker(
     Ok(())
 }
 
+fn fail_audio_alignment_batch_worker_with_error(
+    job_id: &str,
+    current_pair_index: usize,
+    error: &str,
+) -> Result<(), String> {
+    let safe_message = if error.starts_with("blocked:media-toolchain")
+        || error.starts_with("unsupported:media-toolchain")
+    {
+        "FFmpeg/FFprobe 工具链无法固定或已变化；请检查工具安装后重试。"
+    } else if error.starts_with("blocked:cuda") || error.starts_with("blocked:spectral-backend") {
+        "CUDA/cuFFT 后端不可用或配置无效；请检查 NVIDIA 驱动与 CUDA 环境。"
+    } else if error.starts_with("blocked:resource-limit") {
+        "批量匹配超过当前内存或计算资源上限；请缩小批次后重试。"
+    } else if error.starts_with("blocked:physical-file")
+        || error.starts_with("unsupported:physical-file")
+    {
+        "媒体文件无法取得稳定只读 lease；请确认文件位于受支持的本地磁盘且未被修改。"
+    } else {
+        "批量匹配初始化失败；本地路径与工具输出已隐藏，请检查素材和媒体工具配置。"
+    }
+    .to_string();
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    for (index, pair) in entry.snapshot.pairs.iter_mut().enumerate() {
+        if index == current_pair_index
+            && matches!(
+                pair.status,
+                AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+            )
+        {
+            pair.status = AudioAlignmentJobStatus::Failed;
+            pair.progress = 1.0;
+            pair.message = safe_message.clone();
+            pair.proposal = None;
+            pair.error = Some(safe_message.clone());
+        } else if pair.status == AudioAlignmentJobStatus::Queued {
+            pair.status = AudioAlignmentJobStatus::Cancelled;
+            pair.progress = 1.0;
+            pair.message = "批次初始化失败；该 pair 未执行。".to_string();
+        }
+    }
+    entry.snapshot.status = AudioAlignmentJobStatus::Failed;
+    entry.snapshot.progress = 1.0;
+    entry.snapshot.processed_pair_count = entry
+        .snapshot
+        .pairs
+        .iter()
+        .filter(|pair| pair.status == AudioAlignmentJobStatus::Failed)
+        .count();
+    entry.snapshot.failed_pair_count = entry.snapshot.processed_pair_count;
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.message = safe_message.clone();
+    entry.snapshot.error = Some(safe_message);
+    entry.snapshot.updated_at_ms = current_time_ms();
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
+}
+
 fn invalidate_audio_alignment_batch_after_final_identity_failure(
     job_id: &str,
 ) -> Result<(), String> {
@@ -11052,9 +11475,36 @@ fn create_options(request: &AudioAlignmentRequest) -> Result<AudioAlignmentOptio
         max_cells,
         ffmpeg_path,
         ffprobe_path,
+        toolchain_cache_identity: None,
         enable_visual_evidence: request.enable_visual_evidence.unwrap_or(false),
         visual_sample_interval_ms,
         localization_mode: request.localization_mode.unwrap_or(false),
+    })
+}
+
+fn create_pinned_audio_alignment_options(
+    request: &AudioAlignmentRequest,
+) -> Result<(AudioAlignmentOptions, PinnedMediaToolchain), String> {
+    let mut options = create_options(request)?;
+    let toolchain = PinnedMediaToolchain::pin(
+        request.ffmpeg_path.as_deref(),
+        request.ffprobe_path.as_deref(),
+    )?;
+    options.ffmpeg_path = toolchain
+        .ffmpeg()
+        .launch_path()
+        .to_string_lossy()
+        .into_owned();
+    options.ffprobe_path = toolchain.ffprobe().launch_path().to_path_buf();
+    options.toolchain_cache_identity = Some(toolchain.cache_identity_fragment().to_string());
+    Ok((options, toolchain))
+}
+
+fn audio_alignment_toolchain_cache_identity(
+    options: &AudioAlignmentOptions,
+) -> Result<&str, String> {
+    options.toolchain_cache_identity.as_deref().ok_or_else(|| {
+        "blocked:media-toolchain-unbound：媒体工具链尚未固定，禁止探测、缓存或解码。".to_string()
     })
 }
 
@@ -11425,6 +11875,7 @@ fn create_audio_feature_cache_key(
     options: &AudioAlignmentOptions,
     audio_input: &AlignmentAudioInput,
 ) -> Result<String, String> {
+    let toolchain = audio_alignment_toolchain_cache_identity(options)?;
     let content_identity = alignment_audio_content_identity_cache_fragment(audio_input)?;
     let stream_identity = format!(
         "{}|channelLayout={}",
@@ -11432,24 +11883,13 @@ fn create_audio_feature_cache_key(
             .map_err(|error| format!("无法序列化音轨缓存身份：{error}"))?,
         audio_input.stream.channel_layout.as_deref().unwrap_or("")
     );
-    let metadata = fs::metadata(media_path)
-        .map_err(|error| format!("无法读取音频特征缓存文件信息：{error}"))?;
-    let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
+    let _ = media_path;
     Ok(format!(
-        "{}|len={}|modified={modified_ms}|{content_identity}|presentationOriginMs={}|audioStream={}|sampleRate={}|windowMs={}|ffmpeg={}",
-        canonical_path.to_string_lossy(),
-        metadata.len(),
+        "{content_identity}|presentationOriginMs={}|audioStream={}|sampleRate={}|windowMs={}|{toolchain}",
         audio_input.presentation_origin_ms,
         stream_identity,
         options.sample_rate,
         options.window_ms,
-        options.ffmpeg_path
     ))
 }
 
@@ -11612,11 +12052,11 @@ fn create_v2_visual_feature_cache_key(
     input: &AlignmentVisualInput,
     interval_ms: u64,
 ) -> Result<String, String> {
-    let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
+    let toolchain = audio_alignment_toolchain_cache_identity(options)?;
+    let _ = media_path;
     let identity = require_full_file_media_content_identity(input.content_identity.as_ref())?;
     Ok(format!(
-        "feature={ALIGNMENT_V2_VISUAL_FEATURE_VERSION}|path={}|identity={}:{}:{}:{}:{}:{}|presentationOrigin={}|stream={}:{}:{}:{:?}|interval={interval_ms}|ffmpeg={}",
-        canonical_path.to_string_lossy(),
+        "feature={ALIGNMENT_V2_VISUAL_FEATURE_VERSION}|identity={}:{}:{}:{}:{}:{}|presentationOrigin={}|stream={}:{}:{}:{:?}|interval={interval_ms}|{toolchain}",
         identity.algorithm,
         identity.size_bytes,
         identity.modified_unix_ms,
@@ -11628,7 +12068,6 @@ fn create_v2_visual_feature_cache_key(
         input.stream.start_time_ms,
         input.stream.timeline_offset_ms,
         input.stream.time_base,
-        options.ffmpeg_path,
     ))
 }
 
@@ -11748,6 +12187,7 @@ fn create_visual_feature_cache_key(
     options: &AudioAlignmentOptions,
     expected_identity: Option<&MediaContentIdentity>,
 ) -> Result<String, String> {
+    let toolchain = audio_alignment_toolchain_cache_identity(options)?;
     let identity = require_full_file_media_content_identity(expected_identity)?;
     let content_identity = format!(
         "contentIdentity={}:{}:{}:{}:{}:{}",
@@ -11758,21 +12198,10 @@ fn create_visual_feature_cache_key(
         identity.middle_sample_digest,
         identity.last_sample_digest,
     );
-    let metadata = fs::metadata(media_path)
-        .map_err(|error| format!("无法读取视觉特征缓存文件信息：{error}"))?;
-    let canonical_path = fs::canonicalize(media_path).unwrap_or_else(|_| PathBuf::from(media_path));
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
+    let _ = media_path;
     Ok(format!(
-        "{}|len={}|modified={modified_ms}|{content_identity}|visualInterval={}|ffmpeg={}",
-        canonical_path.to_string_lossy(),
-        metadata.len(),
+        "{content_identity}|visualInterval={}|{toolchain}",
         options.visual_sample_interval_ms,
-        options.ffmpeg_path
     ))
 }
 
@@ -14415,7 +14844,10 @@ mod tests {
     use crate::media_probe::{
         probe_audio_decode_timelines_with_ffprobe, probe_media_timeline_with_ffprobe,
     };
-    use std::process::{Command, Stdio};
+    use std::{
+        fs,
+        process::{Command, Stdio},
+    };
 
     #[test]
     #[ignore = "process-supervision sticky cleanup helper"]
@@ -14466,6 +14898,7 @@ mod tests {
             max_cells: 1_000_000,
             ffmpeg_path: "ffmpeg".to_string(),
             ffprobe_path: PathBuf::from("ffprobe"),
+            toolchain_cache_identity: Some("toolchain=test-fixture-v1".to_string()),
             enable_visual_evidence: false,
             visual_sample_interval_ms: DEFAULT_VISUAL_SAMPLE_INTERVAL_MS,
             localization_mode: false,
@@ -14645,6 +15078,7 @@ mod tests {
             target_landmark_count: 72,
             source_spectral_backend_id: "test-cpu-spectral-v1".to_string(),
             target_spectral_backend_id: "test-cpu-spectral-v1".to_string(),
+            toolchain_cache_identity: "toolchain=test-fixture-v1".to_string(),
             global_source_interval: PresentationRangeMs {
                 start_ms: 0,
                 end_ms: 120_000,
@@ -15477,6 +15911,35 @@ mod tests {
     }
 
     #[test]
+    fn audio_cache_keys_bind_toolchain_digest_but_not_logical_path_alias() {
+        let input = test_audio_input(1, 80);
+        let first = create_audio_feature_cache_key(
+            r"C:\logical-alias-a\episode.mkv",
+            &test_options(),
+            &input,
+        )
+        .unwrap();
+        let alias = create_audio_feature_cache_key(
+            r"D:\logical-alias-b\episode.mkv",
+            &test_options(),
+            &input,
+        )
+        .unwrap();
+        assert_eq!(first, alias, "路径别名不得分裂同一内容制品缓存");
+
+        let mut replaced_toolchain = test_options();
+        replaced_toolchain.toolchain_cache_identity =
+            Some("toolchain=test-fixture-replaced-v2".to_string());
+        let replaced = create_audio_feature_cache_key(
+            r"C:\logical-alias-a\episode.mkv",
+            &replaced_toolchain,
+            &input,
+        )
+        .unwrap();
+        assert_ne!(first, replaced, "任一媒体工具被替换后必须隔离缓存");
+    }
+
+    #[test]
     fn v2_explicit_video_stream_overrides_default_and_changes_cache_key() {
         let snapshot = MediaProbeSnapshot {
             path: "hidden-test-path.mkv".to_string(),
@@ -15942,12 +16405,14 @@ mod tests {
         let stream = snapshot.audio_streams[0].clone();
         let timeline = timelines.get(&stream.stream_index).cloned();
         let input = alignment_audio_input_from_snapshot(&snapshot, stream, true, timeline);
+        let backend_request = resolve_spectral_backend_request().unwrap();
 
         let coarse = decode_v2_coarse_landmarks_streaming(
             &path_text,
             "真实 fixture",
             &test_options(),
             &input,
+            &backend_request,
             None,
         )
         .unwrap();
@@ -16021,6 +16486,7 @@ mod tests {
             "真实 fixture",
             &must_not_spawn,
             &stale,
+            &backend_request,
             None,
         )
         .unwrap_err();
@@ -16050,6 +16516,7 @@ mod tests {
             "真实 fixture",
             &test_options(),
             &input,
+            &backend_request,
             Some(&cancelled),
         )
         .unwrap_err();
@@ -16188,6 +16655,147 @@ mod tests {
         let cached_diagnostics = cached_proposal.diagnostics.join("\n");
         assert!(cached_diagnostics.contains("缓存命中"));
         assert!(cached_diagnostics.contains(expected_backend));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn public_ffmpeg_batch_pins_tools_deduplicates_hardlink_alias_and_returns_time_map() {
+        if !ffmpeg_test_tools_available() {
+            eprintln!("跳过真实普通 batch 集成测试：ffmpeg/ffprobe 不可用。");
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "alignment-v2-public-batch-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.mka");
+        let source_alias_path = directory.join("source-hardlink-alias.mka");
+        let target_path = directory.join("target.mka");
+        generate_v2_ffmpeg_fixture(&source_path, "[0:a]anull[main]", "0", "440");
+        generate_v2_ffmpeg_fixture(&target_path, "[0:a]anull[main]", "0.5", "660");
+        std::fs::hard_link(&source_path, &source_alias_path).unwrap();
+
+        let request = AudioAlignmentBatchRequest {
+            schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+            sources: vec![
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "source-primary".to_string(),
+                    path: source_path.to_string_lossy().into_owned(),
+                    audio_stream_index: None,
+                    video_stream_index: None,
+                },
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "source-alias".to_string(),
+                    path: source_alias_path.to_string_lossy().into_owned(),
+                    audio_stream_index: None,
+                    video_stream_index: None,
+                },
+                AudioAlignmentBatchMediaRequest {
+                    media_id: "source-alias-invalid-stream".to_string(),
+                    path: source_alias_path.to_string_lossy().into_owned(),
+                    audio_stream_index: Some(999),
+                    video_stream_index: None,
+                },
+            ],
+            targets: vec![AudioAlignmentBatchMediaRequest {
+                media_id: "target".to_string(),
+                path: target_path.to_string_lossy().into_owned(),
+                audio_stream_index: None,
+                video_stream_index: None,
+            }],
+            pairs: Some(vec![
+                AudioAlignmentBatchPairRequest {
+                    source_media_id: "source-primary".to_string(),
+                    target_media_id: "target".to_string(),
+                },
+                AudioAlignmentBatchPairRequest {
+                    source_media_id: "source-alias".to_string(),
+                    target_media_id: "target".to_string(),
+                },
+                AudioAlignmentBatchPairRequest {
+                    source_media_id: "source-alias-invalid-stream".to_string(),
+                    target_media_id: "target".to_string(),
+                },
+            ]),
+            ffmpeg_path: Some("ffmpeg".to_string()),
+            ffprobe_path: Some("ffprobe".to_string()),
+            sample_rate: None,
+            window_ms: None,
+            match_threshold: None,
+            min_gap_ms: None,
+            max_cells: Some(ALIGNMENT_V2_MAX_DP_CELLS),
+            enable_visual_evidence: Some(false),
+            visual_sample_interval_ms: None,
+            localization_mode: Some(true),
+        };
+
+        let mut alias_plan = plan_audio_alignment_batch(request.clone()).unwrap();
+        let (options, toolchain) =
+            create_pinned_audio_alignment_options(&alias_plan.pairs[0].request).unwrap();
+        let prepared =
+            prepare_audio_alignment_batch_media(&alias_plan, &options, &AtomicBool::new(false))
+                .unwrap();
+        let PreparedAudioAlignmentBatchMediaState::Ready(first_source) = &prepared[0] else {
+            panic!("primary source preparation failed");
+        };
+        let PreparedAudioAlignmentBatchMediaState::Ready(alias_source) = &prepared[1] else {
+            panic!("hard-link source alias preparation failed");
+        };
+        let PreparedAudioAlignmentBatchMediaState::Failed {
+            physical_group_index: Some(failed_alias_group),
+            ..
+        } = &prepared[2]
+        else {
+            panic!("invalid-stream hard-link alias must retain its physical group");
+        };
+        assert!(
+            Arc::ptr_eq(first_source, alias_source),
+            "同一 physical file + stream 的逻辑别名必须复用一次 FFprobe/FFT 制品"
+        );
+        bind_audio_alignment_batch_physical_groups(&mut alias_plan, &prepared).unwrap();
+        assert_eq!(
+            alias_plan.pairs[0].source_physical_media_index,
+            alias_plan.pairs[1].source_physical_media_index
+        );
+        assert_eq!(
+            alias_plan.pairs[0].source_physical_media_index,
+            *failed_alias_group
+        );
+        assert_eq!(
+            alias_plan.pairs[0].source_physical_media_index,
+            alias_plan.pairs[2].source_physical_media_index
+        );
+        drop(prepared);
+        toolchain.verify_at_finalization().unwrap();
+        drop(toolchain);
+
+        let mut public_request = request;
+        public_request.sources.truncate(1);
+        public_request.pairs = Some(vec![AudioAlignmentBatchPairRequest {
+            source_media_id: "source-primary".to_string(),
+            target_media_id: "target".to_string(),
+        }]);
+        let plan = plan_audio_alignment_batch(public_request).unwrap();
+        let job_id = format!("test-public-ffmpeg-batch-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone()).unwrap();
+        run_audio_alignment_batch_job(job_id.clone(), cancel_flag, plan);
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Completed);
+        assert_eq!(terminal.failed_pair_count, 0);
+        let proposal = terminal.pairs[0]
+            .proposal
+            .as_ref()
+            .expect("普通 batch 必须返回可复核 proposal");
+        let time_map = proposal
+            .time_map
+            .as_ref()
+            .expect("真实相同主音轨应由普通 batch 返回 timeMap");
+        assert_eq!(time_map.feature_version, ALIGNMENT_V2_FEATURE_VERSION);
+        assert_ne!(time_map.quality.level, "verified");
+        assert!(time_map.quality.probability.is_none());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -17482,6 +18090,20 @@ mod tests {
     }
 
     #[test]
+    fn audio_alignment_batch_planner_rejects_missing_or_disabled_v2_mode() {
+        for localization_mode in [None, Some(false)] {
+            let mut request = test_audio_alignment_batch_request(None);
+            request.localization_mode = localization_mode;
+            let error = match plan_audio_alignment_batch(request) {
+                Ok(_) => panic!("缺失或关闭 V2 的 batch 请求不得被规划"),
+                Err(error) => error,
+            };
+            assert!(error.contains("localizationMode=true"));
+            assert!(error.contains("旧逐 pair 引擎不再"));
+        }
+    }
+
+    #[test]
     fn global_shortlist_selects_three_non_overlapping_episodes_before_fine() {
         let plan = test_one_source_three_target_batch_plan();
         let mut coarse_by_pair = Vec::new();
@@ -17548,6 +18170,129 @@ mod tests {
             .unwrap();
         }
         assert_eq!(fine_invocations, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn global_shortlist_does_not_treat_dropping_one_of_twenty_clear_pairs_as_ambiguity() {
+        let pair_count = 20usize;
+        let request = AudioAlignmentBatchRequest {
+            schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+            sources: (0..pair_count)
+                .map(|index| AudioAlignmentBatchMediaRequest {
+                    media_id: format!("source-{index}"),
+                    path: format!("source-{index}.mkv"),
+                    audio_stream_index: Some(0),
+                    video_stream_index: None,
+                })
+                .collect(),
+            targets: (0..pair_count)
+                .map(|index| AudioAlignmentBatchMediaRequest {
+                    media_id: format!("target-{index}"),
+                    path: format!("target-{index}.mkv"),
+                    audio_stream_index: Some(0),
+                    video_stream_index: None,
+                })
+                .collect(),
+            pairs: Some(
+                (0..pair_count)
+                    .map(|index| AudioAlignmentBatchPairRequest {
+                        source_media_id: format!("source-{index}"),
+                        target_media_id: format!("target-{index}"),
+                    })
+                    .collect(),
+            ),
+            ffmpeg_path: None,
+            ffprobe_path: None,
+            sample_rate: None,
+            window_ms: None,
+            match_threshold: None,
+            min_gap_ms: None,
+            max_cells: Some(DEFAULT_MAX_CELLS),
+            enable_visual_evidence: Some(false),
+            visual_sample_interval_ms: None,
+            localization_mode: Some(true),
+        };
+        let plan = plan_audio_alignment_batch(request).unwrap();
+        let coarse = (0..pair_count)
+            .map(|index| {
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![v2_test_global_candidate(
+                        PresentationRangeMs {
+                            start_ms: index as i64 * 120_000,
+                            end_ms: index as i64 * 120_000 + 60_000,
+                        },
+                        PresentationRangeMs {
+                            start_ms: 0,
+                            end_ms: 60_000,
+                        },
+                        0.9,
+                        false,
+                    )],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let decisions = select_v2_global_shortlist(&plan, &coarse, 0, None).unwrap();
+        assert_eq!(decisions.len(), pair_count);
+        assert!(decisions.iter().all(|decision| matches!(
+            decision,
+            V2GlobalShortlistDecision::Selected(PreparedV2SelectedCandidate {
+                global_margin,
+                ..
+            }) if (*global_margin - 1.0).abs() < f64::EPSILON
+        )));
+    }
+
+    #[test]
+    fn global_shortlist_finds_close_candidate_hidden_behind_low_weight_omission() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let candidate = |score| {
+            v2_test_global_candidate(
+                PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 60_000,
+                },
+                PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: 60_000,
+                },
+                score,
+                false,
+            )
+        };
+        let decisions = select_v2_global_shortlist(
+            &plan,
+            &[
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![candidate(0.90), candidate(0.89)],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![candidate(0.001)],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decisions[0],
+            V2GlobalShortlistDecision::Blocked { .. }
+        ));
+        assert!(matches!(
+            decisions[1],
+            V2GlobalShortlistDecision::Selected(_)
+        ));
     }
 
     #[test]
@@ -17684,21 +18429,20 @@ mod tests {
     }
 
     #[test]
-    fn global_runner_up_accepts_any_complete_choice_vector_different_from_best() {
-        let best = V2GlobalAssignmentState {
-            choices: vec![Some(0), Some(1)],
-            selected_count: 2,
-            total_score: 2.0,
-        };
-        let duplicate_best = best.clone();
-        let different_choices = V2GlobalAssignmentState {
-            choices: vec![Some(0), None],
-            selected_count: 1,
-            total_score: 1.0,
-        };
-        let states = vec![best.clone(), duplicate_best, different_choices.clone()];
-        let runner_up = v2_global_runner_up(&states, &best.choices).unwrap();
-        assert_eq!(runner_up.choices, different_choices.choices);
+    fn global_competitor_ignores_pure_omission_but_keeps_swap_or_addition() {
+        let best = vec![Some(0), Some(1), None];
+        assert!(!v2_global_assignment_is_nontrivial_competitor(
+            &best,
+            &[Some(0), None, None]
+        ));
+        assert!(v2_global_assignment_is_nontrivial_competitor(
+            &best,
+            &[Some(1), Some(1), None]
+        ));
+        assert!(v2_global_assignment_is_nontrivial_competitor(
+            &best,
+            &[None, None, Some(0)]
+        ));
     }
 
     #[test]
@@ -17740,6 +18484,48 @@ mod tests {
             });
         }
         assert_eq!(fine_invocations, 0);
+    }
+
+    #[test]
+    fn failed_coarse_component_does_not_poison_disconnected_physical_media() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let decisions = select_v2_global_shortlist(
+            &plan,
+            &[
+                Err("fixture disconnected coarse failure".to_string()),
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![v2_test_global_candidate(
+                        PresentationRangeMs {
+                            start_ms: 0,
+                            end_ms: 60_000,
+                        },
+                        PresentationRangeMs {
+                            start_ms: 0,
+                            end_ms: 60_000,
+                        },
+                        0.9,
+                        false,
+                    )],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(decisions[0], V2GlobalShortlistDecision::Failed(_)));
+        let V2GlobalShortlistDecision::Selected(selected) = &decisions[1] else {
+            panic!("disconnected healthy component must remain selectable");
+        };
+        assert!(selected
+            .global_diagnostic
+            .contains("独立 physical-media component"));
     }
 
     #[test]
@@ -17810,6 +18596,42 @@ mod tests {
                 < 2,
             "same complete episode must never select both local supports"
         );
+    }
+
+    #[test]
+    fn global_shortlist_conflicts_on_physical_alias_even_when_media_ids_differ() {
+        let mut plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let left = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 100_000,
+                end_ms: 220_000,
+            },
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            0.9,
+            false,
+        );
+        let right = left.clone();
+        assert!(!v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &left,
+            &plan.pairs[1],
+            &right,
+        ));
+
+        plan.pairs[1].source_physical_media_index = plan.pairs[0].source_physical_media_index;
+        assert!(v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &left,
+            &plan.pairs[1],
+            &right,
+        ));
     }
 
     #[test]
@@ -18206,6 +19028,7 @@ mod tests {
             landmarks: HashMap::new(),
             extraction_notes: Vec::new(),
             retained_artifact_bytes,
+            toolchain_cache_identity: "toolchain=test-fixture-v1".to_string(),
         };
         let evidence = PreparedV2PairEvidence {
             source: empty_evidence(32),
@@ -18617,6 +19440,30 @@ mod tests {
         assert!(terminal.pairs[0].proposal.is_some());
         assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Failed);
         assert!(terminal.pairs[1].proposal.is_none());
+    }
+
+    #[test]
+    fn audio_alignment_batch_initialization_error_is_actionable_and_not_misreported_as_cleanup() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+            "source-1", "target-1",
+        )])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-init-error-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&job_id, &plan, Arc::new(AtomicBool::new(false))).unwrap();
+
+        fail_audio_alignment_batch_worker_with_error(
+            &job_id,
+            0,
+            r"blocked:media-toolchain-integrity C:\Users\alice\private\ffmpeg.exe",
+        )
+        .unwrap();
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Failed);
+        assert!(terminal.message.contains("FFmpeg/FFprobe"));
+        assert!(!terminal.message.contains("进程清理"));
+        assert!(!terminal.message.contains("alice"));
+        assert!(!terminal.message.contains("private"));
     }
 
     #[test]

@@ -32,6 +32,8 @@ const STATE_NONE: u8 = u8::MAX;
 const ALIGNMENT_V2_CANCELLED: &str = "Alignment V2 算法已取消。";
 pub const CPU_SPECTRAL_BACKEND_ID: &str = "cpu-radix2-f64-r2c-512-v1";
 pub const STREAMING_CPU_SPECTRAL_BACKEND_ID: &str = "cpu-streaming-radix2-f64-r2c-512-v1";
+pub const STREAMING_HYBRID_SPECTRAL_BACKEND_ID: &str =
+    "cuda-cufft-r2c-512+cpu-streaming-radix2-f64-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpectralBackendPreference {
@@ -228,6 +230,39 @@ struct StreamingAnchorFrame {
     peaks: Vec<StreamingAnchorPeak>,
 }
 
+struct StreamingCudaBatch {
+    session: CudaFftR2c512Session,
+    input_frames: Vec<f32>,
+    source_frames: Vec<i16>,
+    frame_indices: Vec<usize>,
+    frame_rms: Vec<f64>,
+    completed_frame_count: usize,
+}
+
+enum StreamingSpectralProcessor {
+    Cpu,
+    Cuda(StreamingCudaBatch),
+}
+
+impl std::fmt::Debug for StreamingSpectralProcessor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => formatter.write_str("Cpu"),
+            Self::Cuda(batch) => formatter
+                .debug_struct("Cuda")
+                .field("pending_frames", &batch.frame_indices.len())
+                .field("completed_frame_count", &batch.completed_frame_count)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingLandmarkExtraction {
+    pub index: MediaCoarseIndexResult,
+    pub spectral_backend: SpectralBackendExecution,
+}
+
 #[derive(Debug)]
 struct CoarseFamilySample {
     seen: u64,
@@ -385,6 +420,8 @@ impl MediaCoarseIndex {
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct StreamingLandmarkStateUsage {
     pub stft_tail_samples: usize,
+    pub pending_spectral_frames: usize,
+    pub pending_cuda_input_samples: usize,
     pub temporal_spectrum_count: usize,
     pub pending_anchor_frames: usize,
     pub pending_anchor_peaks: usize,
@@ -407,10 +444,21 @@ pub struct StreamingLandmarkExtractor {
     pending_frame: Option<StreamingSpectralFrame>,
     pending_anchors: VecDeque<StreamingAnchorFrame>,
     coarse_index: MediaCoarseIndex,
+    spectral_processor: StreamingSpectralProcessor,
+    spectral_backend: SpectralBackendExecution,
 }
 
 impl StreamingLandmarkExtractor {
+    #[cfg(test)]
     pub fn new(config: LandmarkConfig) -> Result<Self, String> {
+        let cpu_request = resolve_spectral_backend_preference(SpectralBackendPreference::Cpu)?;
+        Self::new_with_backend_request(config, &cpu_request)
+    }
+
+    pub fn new_with_backend_request(
+        config: LandmarkConfig,
+        backend_request: &SpectralBackendRequest,
+    ) -> Result<Self, String> {
         validate_landmark_config(&config)?;
         let window_samples = milliseconds_to_samples(config.window_ms as i64, config.sample_rate)?;
         let hop_samples = milliseconds_to_samples(config.hop_ms as i64, config.sample_rate)?;
@@ -439,6 +487,8 @@ impl StreamingLandmarkExtractor {
             .map_err(|error| {
                 format!("StreamingLandmarkExtractor 无法为 STFT tail 保留内存：{error}")
             })?;
+        let (spectral_processor, spectral_backend) =
+            create_streaming_spectral_processor(&config, window_samples, backend_request)?;
         Ok(Self {
             config,
             window_samples,
@@ -449,6 +499,8 @@ impl StreamingLandmarkExtractor {
             pending_frame: None,
             pending_anchors: VecDeque::new(),
             coarse_index,
+            spectral_processor,
+            spectral_backend,
         })
     }
 
@@ -472,7 +524,7 @@ impl StreamingLandmarkExtractor {
                 .extend_from_slice(&pcm[offset..offset + take]);
             offset += take;
             if self.stft_tail.len() == self.window_samples {
-                self.process_complete_stft_frame()?;
+                self.process_complete_stft_frame(cancel_flag)?;
                 self.stft_tail.drain(..self.hop_samples);
                 processed_frames += 1;
                 if processed_frames.is_multiple_of(64) {
@@ -489,10 +541,24 @@ impl StreamingLandmarkExtractor {
     }
 
     pub fn finish_with_cancel(
-        mut self,
+        self,
         cancel_flag: Option<&AtomicBool>,
     ) -> Result<MediaCoarseIndexResult, String> {
+        self.finish_with_backend_and_cancel(cancel_flag)
+            .map(|extraction| extraction.index)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn finish_with_backend(self) -> Result<StreamingLandmarkExtraction, String> {
+        self.finish_with_backend_and_cancel(None)
+    }
+
+    pub fn finish_with_backend_and_cancel(
+        mut self,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<StreamingLandmarkExtraction, String> {
         check_algorithm_cancelled(cancel_flag)?;
+        self.flush_pending_cuda_batch(cancel_flag)?;
         if let Some(pending) = self.pending_frame.take() {
             let peaks = extract_spectral_peaks(
                 &pending.spectrum,
@@ -504,13 +570,29 @@ impl StreamingLandmarkExtractor {
             self.consume_finalized_peaks(pending.frame_index, peaks)?;
         }
         check_algorithm_cancelled(cancel_flag)?;
-        self.coarse_index.finish()
+        Ok(StreamingLandmarkExtraction {
+            index: self.coarse_index.finish()?,
+            spectral_backend: self.spectral_backend,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn spectral_backend(&self) -> &SpectralBackendExecution {
+        &self.spectral_backend
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn state_usage(&self) -> StreamingLandmarkStateUsage {
+        let (pending_spectral_frames, pending_cuda_input_samples) = match &self.spectral_processor {
+            StreamingSpectralProcessor::Cpu => (0, 0),
+            StreamingSpectralProcessor::Cuda(batch) => {
+                (batch.frame_indices.len(), batch.input_frames.len())
+            }
+        };
         StreamingLandmarkStateUsage {
             stft_tail_samples: self.stft_tail.len(),
+            pending_spectral_frames,
+            pending_cuda_input_samples,
             temporal_spectrum_count: usize::from(self.previous_spectrum.is_some())
                 + usize::from(self.pending_frame.is_some()),
             pending_anchor_frames: self.pending_anchors.len(),
@@ -524,18 +606,41 @@ impl StreamingLandmarkExtractor {
         }
     }
 
-    fn process_complete_stft_frame(&mut self) -> Result<(), String> {
+    fn process_complete_stft_frame(
+        &mut self,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(), String> {
         let frame_index = self.next_frame_index;
         self.next_frame_index = self
             .next_frame_index
             .checked_add(1)
             .ok_or_else(|| "StreamingLandmarkExtractor frame 计数溢出。".to_string())?;
-        let rms = normalized_rms(&self.stft_tail);
-        let current = StreamingSpectralFrame {
-            frame_index,
-            spectrum: calculate_spectrum(&self.stft_tail, self.config.sample_rate),
-            active: rms >= self.config.silence_rms,
-        };
+        match &mut self.spectral_processor {
+            StreamingSpectralProcessor::Cpu => {
+                let rms = normalized_rms(&self.stft_tail);
+                let current = StreamingSpectralFrame {
+                    frame_index,
+                    spectrum: calculate_spectrum(&self.stft_tail, self.config.sample_rate),
+                    active: rms >= self.config.silence_rms,
+                };
+                self.consume_spectral_frame(current)?;
+            }
+            StreamingSpectralProcessor::Cuda(batch) => {
+                enqueue_streaming_cuda_frame(
+                    batch,
+                    &self.stft_tail,
+                    frame_index,
+                    self.config.sample_rate,
+                )?;
+                if batch.frame_indices.len() >= CUDA_FFT_DEFAULT_BATCH_FRAMES {
+                    self.flush_pending_cuda_batch(cancel_flag)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn consume_spectral_frame(&mut self, current: StreamingSpectralFrame) -> Result<(), String> {
         if let Some(pending) = self.pending_frame.take() {
             let peaks = extract_spectral_peaks(
                 &pending.spectrum,
@@ -549,6 +654,162 @@ impl StreamingLandmarkExtractor {
         }
         self.pending_frame = Some(current);
         Ok(())
+    }
+
+    fn flush_pending_cuda_batch(&mut self, cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
+        check_algorithm_cancelled(cancel_flag)?;
+        let forced_cuda = self.spectral_backend.requested_backend == "cuda";
+        let sample_rate = self.config.sample_rate;
+        let silence_rms = self.config.silence_rms;
+        let window_samples = self.window_samples;
+        let local_cancellation = AtomicBool::new(false);
+        let cancellation = cancel_flag.unwrap_or(&local_cancellation);
+
+        enum FlushOutcome {
+            Nothing,
+            Cuda(Vec<StreamingSpectralFrame>),
+            CpuFallback {
+                frames: Vec<StreamingSpectralFrame>,
+                completed_cuda_frames: usize,
+                reason: String,
+            },
+        }
+
+        let outcome = match &mut self.spectral_processor {
+            StreamingSpectralProcessor::Cpu => FlushOutcome::Nothing,
+            StreamingSpectralProcessor::Cuda(batch) if batch.frame_indices.is_empty() => {
+                FlushOutcome::Nothing
+            }
+            StreamingSpectralProcessor::Cuda(batch) => {
+                let transform = batch
+                    .session
+                    .transform_batch(&batch.input_frames, cancellation);
+                match transform {
+                    Ok(output)
+                        if output.frame_count == batch.frame_indices.len()
+                            && output.bins_per_frame == CUDA_FFT_BINS_PER_FRAME =>
+                    {
+                        let decimation = spectral_decimation(sample_rate);
+                        let selected_bins =
+                            spectral_fft_bins(sample_rate, decimation, CUDA_FFT_FRAME_LEN);
+                        let mut frames = Vec::new();
+                        frames
+                            .try_reserve_exact(batch.frame_indices.len())
+                            .map_err(|error| {
+                                format!("Streaming CUDA 声谱结果内存预留失败：{error}")
+                            })?;
+                        for (batch_index, frame_index) in
+                            batch.frame_indices.iter().copied().enumerate()
+                        {
+                            if batch_index.is_multiple_of(64) {
+                                check_algorithm_cancelled(cancel_flag)?;
+                            }
+                            let output_offset = batch_index * output.bins_per_frame;
+                            let spectrum = selected_bins
+                                .iter()
+                                .map(|bin| {
+                                    let value = output.spectra[output_offset + *bin];
+                                    f64::from(value.real).hypot(f64::from(value.imaginary))
+                                })
+                                .collect();
+                            frames.push(StreamingSpectralFrame {
+                                frame_index,
+                                spectrum,
+                                active: batch.frame_rms[batch_index] >= silence_rms,
+                            });
+                        }
+                        batch.completed_frame_count = batch
+                            .completed_frame_count
+                            .checked_add(batch.frame_indices.len())
+                            .ok_or_else(|| "Streaming CUDA 已完成 frame 计数溢出。".to_string())?;
+                        batch.input_frames.clear();
+                        batch.source_frames.clear();
+                        batch.frame_indices.clear();
+                        batch.frame_rms.clear();
+                        FlushOutcome::Cuda(frames)
+                    }
+                    Ok(_) if forced_cuda => {
+                        return Err(
+                            "blocked:cuda-fft-runtime：已强制 CUDA 流式声谱后端，但批次输出形状与请求不一致。"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) if error.code == CudaFftBatchErrorCode::Cancelled => {
+                        return Err(ALIGNMENT_V2_CANCELLED.to_string());
+                    }
+                    Err(error) if forced_cuda => {
+                        return Err(format!(
+                            "blocked:cuda-fft-runtime：已强制 CUDA 流式声谱后端，但批量 FFT 失败：{:?}: {}",
+                            error.code, error.message
+                        ));
+                    }
+                    transform_result => {
+                        let reason = match transform_result {
+                            Ok(_) => "CUDA 流式批次输出形状与请求不一致".to_string(),
+                            Err(error) => format!("{:?}: {}", error.code, error.message),
+                        };
+                        let mut frames = Vec::new();
+                        frames
+                            .try_reserve_exact(batch.frame_indices.len())
+                            .map_err(|error| {
+                                format!("Streaming CPU 回退结果内存预留失败：{error}")
+                            })?;
+                        for (batch_index, (frame_index, frame)) in batch
+                            .frame_indices
+                            .iter()
+                            .copied()
+                            .zip(batch.source_frames.chunks_exact(window_samples))
+                            .enumerate()
+                        {
+                            if batch_index.is_multiple_of(64) {
+                                check_algorithm_cancelled(cancel_flag)?;
+                            }
+                            frames.push(StreamingSpectralFrame {
+                                frame_index,
+                                spectrum: calculate_spectrum(frame, sample_rate),
+                                active: batch.frame_rms[batch_index] >= silence_rms,
+                            });
+                        }
+                        FlushOutcome::CpuFallback {
+                            frames,
+                            completed_cuda_frames: batch.completed_frame_count,
+                            reason,
+                        }
+                    }
+                }
+            }
+        };
+
+        let frames = match outcome {
+            FlushOutcome::Nothing => return Ok(()),
+            FlushOutcome::Cuda(frames) => frames,
+            FlushOutcome::CpuFallback {
+                frames,
+                completed_cuda_frames,
+                reason,
+            } => {
+                self.spectral_processor = StreamingSpectralProcessor::Cpu;
+                let used_cuda = completed_cuda_frames > 0;
+                self.spectral_backend.backend_id = if used_cuda {
+                    STREAMING_HYBRID_SPECTRAL_BACKEND_ID.to_string()
+                } else {
+                    STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string()
+                };
+                self.spectral_backend.backend_detail = if used_cuda {
+                    "CUDA/cuFFT 流式批次后回退 CPU radix-2 f64 FFT".to_string()
+                } else {
+                    "CPU 流式 radix-2 f64 FFT".to_string()
+                };
+                self.spectral_backend.fallback_reason = Some(format!(
+                    "CUDA 流式批量 FFT 运行失败，后续批次显式回退 CPU：{reason}"
+                ));
+                frames
+            }
+        };
+        for frame in frames {
+            self.consume_spectral_frame(frame)?;
+        }
+        check_algorithm_cancelled(cancel_flag)
     }
 
     fn consume_finalized_peaks(
@@ -611,6 +872,139 @@ impl StreamingLandmarkExtractor {
         }
         Ok(())
     }
+}
+
+fn create_streaming_spectral_processor(
+    config: &LandmarkConfig,
+    window_samples: usize,
+    backend_request: &SpectralBackendRequest,
+) -> Result<(StreamingSpectralProcessor, SpectralBackendExecution), String> {
+    if backend_request.planned_backend_id != CUDA_FFT_BACKEND_ID {
+        return Ok((
+            StreamingSpectralProcessor::Cpu,
+            SpectralBackendExecution {
+                backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
+                requested_backend: backend_request.requested_backend.clone(),
+                backend_detail: "CPU 流式 radix-2 f64 FFT".to_string(),
+                fallback_reason: backend_request.fallback_reason.clone(),
+            },
+        ));
+    }
+
+    let decimation = spectral_decimation(config.sample_rate);
+    let decimated_len = window_samples.div_ceil(decimation);
+    let fft_len = decimated_len.max(8).next_power_of_two();
+    if fft_len != CUDA_FFT_FRAME_LEN {
+        let reason = format!(
+            "当前流式声谱网格需要 {fft_len} 点 FFT，CUDA 后端只实现 {CUDA_FFT_FRAME_LEN} 点 R2C"
+        );
+        return streaming_cuda_initialization_fallback(backend_request, reason);
+    }
+
+    let session = match CudaFftR2c512Session::new(0) {
+        Ok(session) => session,
+        Err(error) => {
+            return streaming_cuda_initialization_fallback(
+                backend_request,
+                format!("{:?}: {}", error.code, error.message),
+            );
+        }
+    };
+    let frame_capacity = CUDA_FFT_DEFAULT_BATCH_FRAMES;
+    let input_capacity = frame_capacity
+        .checked_mul(CUDA_FFT_FRAME_LEN)
+        .ok_or_else(|| "Streaming CUDA 输入批次容量溢出。".to_string())?;
+    let source_capacity = frame_capacity
+        .checked_mul(window_samples)
+        .ok_or_else(|| "Streaming CUDA 原始 frame 批次容量溢出。".to_string())?;
+    let mut input_frames = Vec::new();
+    input_frames
+        .try_reserve_exact(input_capacity)
+        .map_err(|error| format!("Streaming CUDA 输入批次内存预留失败：{error}"))?;
+    let mut source_frames = Vec::new();
+    source_frames
+        .try_reserve_exact(source_capacity)
+        .map_err(|error| format!("Streaming CUDA 原始 frame 批次内存预留失败：{error}"))?;
+    let mut frame_indices = Vec::new();
+    frame_indices
+        .try_reserve_exact(frame_capacity)
+        .map_err(|error| format!("Streaming CUDA frame 索引内存预留失败：{error}"))?;
+    let mut frame_rms = Vec::new();
+    frame_rms
+        .try_reserve_exact(frame_capacity)
+        .map_err(|error| format!("Streaming CUDA RMS 内存预留失败：{error}"))?;
+    Ok((
+        StreamingSpectralProcessor::Cuda(StreamingCudaBatch {
+            session,
+            input_frames,
+            source_frames,
+            frame_indices,
+            frame_rms,
+            completed_frame_count: 0,
+        }),
+        SpectralBackendExecution {
+            backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: backend_request.requested_backend.clone(),
+            backend_detail: format!(
+                "{}（跨 PCM chunk 流式批次）",
+                backend_request.backend_detail
+            ),
+            fallback_reason: backend_request.fallback_reason.clone(),
+        },
+    ))
+}
+
+fn streaming_cuda_initialization_fallback(
+    backend_request: &SpectralBackendRequest,
+    reason: String,
+) -> Result<(StreamingSpectralProcessor, SpectralBackendExecution), String> {
+    if backend_request.preference == SpectralBackendPreference::Cuda {
+        return Err(format!(
+            "blocked:cuda-fft-runtime：已强制 CUDA 流式声谱后端，但初始化失败：{reason}"
+        ));
+    }
+    Ok((
+        StreamingSpectralProcessor::Cpu,
+        SpectralBackendExecution {
+            backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
+            requested_backend: backend_request.requested_backend.clone(),
+            backend_detail: "CPU 流式 radix-2 f64 FFT".to_string(),
+            fallback_reason: Some(format!("CUDA 流式声谱初始化失败，显式回退 CPU：{reason}")),
+        },
+    ))
+}
+
+fn enqueue_streaming_cuda_frame(
+    batch: &mut StreamingCudaBatch,
+    frame: &[i16],
+    frame_index: usize,
+    sample_rate: u32,
+) -> Result<(), String> {
+    if batch.frame_indices.len() >= CUDA_FFT_DEFAULT_BATCH_FRAMES {
+        return Err("Streaming CUDA 批次已满但尚未提交。".to_string());
+    }
+    let decimation = spectral_decimation(sample_rate);
+    let decimated_len = frame.len().div_ceil(decimation);
+    let fft_len = decimated_len.max(8).next_power_of_two();
+    if fft_len != CUDA_FFT_FRAME_LEN {
+        return Err(format!(
+            "Streaming CUDA frame 需要 {fft_len} 点 FFT，与 {CUDA_FFT_FRAME_LEN} 点会话不一致。"
+        ));
+    }
+    let input_start = batch.input_frames.len();
+    batch
+        .input_frames
+        .resize(input_start + CUDA_FFT_FRAME_LEN, 0.0);
+    let denominator = decimated_len.saturating_sub(1).max(1) as f64;
+    for (index, sample) in frame.iter().step_by(decimation).enumerate() {
+        let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / denominator).cos();
+        batch.input_frames[input_start + index] =
+            (*sample as f64 / i16::MAX as f64 * window) as f32;
+    }
+    batch.source_frames.extend_from_slice(frame);
+    batch.frame_indices.push(frame_index);
+    batch.frame_rms.push(normalized_rms(frame));
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3074,6 +3468,159 @@ mod tests {
     }
 
     #[test]
+    fn streaming_cuda_landmarks_match_cpu_across_pcm_chunk_seams() {
+        let require_cuda = std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1")
+            || std::env::var("C137_SPECTRAL_BACKEND").as_deref() == Ok("cuda");
+        let cuda_request =
+            match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+                Ok(request) => request,
+                Err(error) if !require_cuda => {
+                    eprintln!("skip streaming CUDA equivalence: {error}");
+                    return;
+                }
+                Err(error) => panic!("CUDA was required for streaming equivalence: {error}"),
+            };
+        let cpu_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        let config = LandmarkConfig {
+            sample_rate: 16_000,
+            presentation_offset_ms: 417,
+            window_ms: 40,
+            hop_ms: 25,
+            max_hash_occurrences: 10_000,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(
+            config.sample_rate,
+            &[173, 331, 719, 1_237, 2_411, 283, 467, 881, 1_661],
+        );
+        let chunks = pseudo_random_chunk_sizes(137, pcm.len());
+        let cpu = stream_landmarks_with_backend_chunks(&pcm, &config, &chunks, &cpu_request);
+        let cuda = stream_landmarks_with_backend_chunks(&pcm, &config, &chunks, &cuda_request);
+
+        assert_eq!(
+            cpu.spectral_backend.backend_id,
+            STREAMING_CPU_SPECTRAL_BACKEND_ID
+        );
+        assert_eq!(cuda.spectral_backend.backend_id, CUDA_FFT_BACKEND_ID);
+        assert_eq!(cuda.spectral_backend.requested_backend, "cuda");
+        assert_eq!(cuda.index, cpu.index);
+    }
+
+    #[test]
+    fn streaming_cuda_batches_stay_bounded_across_pcm_and_gpu_batch_seams() {
+        let request = match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("skip streaming CUDA state bound: {error}");
+                return;
+            }
+        };
+        let config = LandmarkConfig {
+            sample_rate: 16_000,
+            window_ms: 40,
+            hop_ms: 25,
+            ..LandmarkConfig::default()
+        };
+        let window_samples =
+            milliseconds_to_samples(config.window_ms as i64, config.sample_rate).unwrap();
+        let hop_samples =
+            milliseconds_to_samples(config.hop_ms as i64, config.sample_rate).unwrap();
+        let expected_frames = CUDA_FFT_DEFAULT_BATCH_FRAMES + 17;
+        let sample_count = window_samples + (expected_frames - 1) * hop_samples;
+        let pcm = synth_streaming_chirp(config.sample_rate, sample_count);
+        let mut extractor =
+            StreamingLandmarkExtractor::new_with_backend_request(config, &request).unwrap();
+        let mut previous_pending = 0usize;
+        let mut observed_gpu_batch_flush = false;
+        for chunk in pcm.chunks(997) {
+            extractor.push_pcm(chunk).unwrap();
+            let usage = extractor.state_usage();
+            assert!(usage.pending_spectral_frames <= CUDA_FFT_DEFAULT_BATCH_FRAMES);
+            assert_eq!(
+                usage.pending_cuda_input_samples,
+                usage.pending_spectral_frames * CUDA_FFT_FRAME_LEN
+            );
+            observed_gpu_batch_flush |= usage.pending_spectral_frames < previous_pending;
+            previous_pending = usage.pending_spectral_frames;
+        }
+        assert!(observed_gpu_batch_flush);
+        assert_eq!(extractor.next_frame_index, expected_frames);
+        assert_eq!(extractor.spectral_backend().backend_id, CUDA_FFT_BACKEND_ID);
+        let result = extractor.finish_with_backend().unwrap();
+        assert_eq!(result.spectral_backend.backend_id, CUDA_FFT_BACKEND_ID);
+    }
+
+    #[test]
+    fn streaming_cuda_policy_falls_back_only_for_auto_and_forced_cuda_is_fail_closed() {
+        let config = LandmarkConfig {
+            sample_rate: 4_000,
+            window_ms: 50,
+            hop_ms: 50,
+            ..LandmarkConfig::default()
+        };
+        let auto_request = SpectralBackendRequest {
+            preference: SpectralBackendPreference::Auto,
+            planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: "test CUDA".to_string(),
+            fallback_reason: None,
+        };
+        let auto =
+            StreamingLandmarkExtractor::new_with_backend_request(config.clone(), &auto_request)
+                .unwrap();
+        assert_eq!(
+            auto.spectral_backend().backend_id,
+            STREAMING_CPU_SPECTRAL_BACKEND_ID
+        );
+        assert!(auto
+            .spectral_backend()
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("显式回退 CPU")));
+
+        let forced_request = SpectralBackendRequest {
+            preference: SpectralBackendPreference::Cuda,
+            planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "cuda".to_string(),
+            backend_detail: "test CUDA".to_string(),
+            fallback_reason: None,
+        };
+        let error = StreamingLandmarkExtractor::new_with_backend_request(config, &forced_request)
+            .unwrap_err();
+        assert!(error.starts_with("blocked:cuda-fft-runtime"));
+    }
+
+    #[test]
+    fn streaming_cuda_finish_observes_cancellation_before_flushing_pending_batch() {
+        let request = match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("skip streaming CUDA cancellation: {error}");
+                return;
+            }
+        };
+        let config = LandmarkConfig {
+            sample_rate: 16_000,
+            window_ms: 40,
+            hop_ms: 25,
+            ..LandmarkConfig::default()
+        };
+        let pcm = synth_tone_bursts(config.sample_rate, &[310, 470, 690, 930]);
+        let mut extractor =
+            StreamingLandmarkExtractor::new_with_backend_request(config, &request).unwrap();
+        extractor.push_pcm(&pcm).unwrap();
+        assert!(extractor.state_usage().pending_spectral_frames > 0);
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            extractor
+                .finish_with_backend_and_cancel(Some(&cancelled))
+                .unwrap_err(),
+            ALIGNMENT_V2_CANCELLED
+        );
+    }
+
+    #[test]
     fn streaming_landmark_state_stays_within_declared_bounds() {
         let config = LandmarkConfig {
             sample_rate: 8_000,
@@ -4042,6 +4589,45 @@ mod tests {
             chunk_index += 1;
         }
         extractor.finish().unwrap()
+    }
+
+    fn stream_landmarks_with_backend_chunks(
+        pcm: &[i16],
+        config: &LandmarkConfig,
+        chunk_sizes: &[usize],
+        backend_request: &SpectralBackendRequest,
+    ) -> StreamingLandmarkExtraction {
+        let mut extractor =
+            StreamingLandmarkExtractor::new_with_backend_request(config.clone(), backend_request)
+                .unwrap();
+        let mut offset = 0usize;
+        let mut chunk_index = 0usize;
+        while offset < pcm.len() {
+            let requested = chunk_sizes
+                .get(chunk_index % chunk_sizes.len().max(1))
+                .copied()
+                .unwrap_or(pcm.len())
+                .max(1);
+            let end = offset.saturating_add(requested).min(pcm.len());
+            extractor.push_pcm(&pcm[offset..end]).unwrap();
+            offset = end;
+            chunk_index += 1;
+        }
+        extractor.finish_with_backend().unwrap()
+    }
+
+    fn synth_streaming_chirp(sample_rate: u32, sample_count: usize) -> Vec<i16> {
+        (0..sample_count)
+            .map(|sample_index| {
+                let time = sample_index as f64 / sample_rate as f64;
+                let block = sample_index / (sample_rate as usize / 2).max(1);
+                let frequency = 180.0 + (block % 29) as f64 * 83.0;
+                let overtone = frequency * 1.73 + (block % 11) as f64 * 17.0;
+                let signal = (2.0 * std::f64::consts::PI * frequency * time).sin() * 0.68
+                    + (2.0 * std::f64::consts::PI * overtone * time).sin() * 0.27;
+                (signal * 24_000.0) as i16
+            })
+            .collect()
     }
 
     fn pseudo_random_chunk_sizes(mut state: u64, total_samples: usize) -> Vec<usize> {

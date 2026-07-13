@@ -13,7 +13,9 @@ pub mod cuda_fft_backend;
 mod export_files;
 mod manual_verification;
 mod media_probe;
+mod media_toolchain;
 mod media_tools;
+mod physical_file;
 mod process_supervision;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

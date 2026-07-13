@@ -25,6 +25,11 @@ import {
   createAlignmentReviewStatusSummary
 } from "../../domain/alignment/alignmentReport";
 import { createAnchorCalibrationProposal } from "../../domain/alignment/anchorCalibration";
+import {
+  assessMediaTimeMapVerification,
+  computeMediaTimeMapCoreDigest,
+  createManualMediaTimeMapVerificationRequest
+} from "../../domain/alignment/mediaTimeMap";
 import { serializeAlignmentProposal } from "../../domain/alignment/manualProvider";
 import { buildAlignmentPreview } from "../../domain/alignment/preview";
 import type { AlignmentProposal } from "../../domain/alignment/types";
@@ -117,7 +122,8 @@ import {
   getVerifiedExportUnavailableReason,
   saveTextExportFiles,
   type SaveTextExportResult,
-  type VerifiedExportVerification,
+  type VerifiedExportMapProof,
+  type VerifiedExportVerificationSeed,
   type VerifiedMediaDependency
 } from "../../infrastructure/file-system/exportFiles";
 import {
@@ -3931,11 +3937,9 @@ async function exportProjectionGroups(projection: SourceProjectionResult, projec
     return;
   }
   try {
-    const snapshotDigest = createProjectionExportSnapshotDigest(projectSnapshot, files);
-    const verification = createVerifiedExportVerification(
+    const verification = createVerifiedExportVerificationSeed(
       projectSnapshot,
-      identityPreflight.currentIdentities,
-      snapshotDigest
+      identityPreflight.currentIdentities
     );
     const exportResult = await saveTextExportFiles(
       files.map((file) => ({ fileName: file.fileName, content: file.content })),
@@ -4097,46 +4101,10 @@ function isProjectExportSnapshotCurrent(projectSnapshot: EditorProject): boolean
   );
 }
 
-function createProjectionExportSnapshotDigest(
+function createVerifiedExportVerificationSeed(
   project: EditorProject,
-  files: readonly { fileName: string; content: string }[]
-): string {
-  let hash = 0x811c9dc5;
-  const append = (value: string | number) => {
-    const text = String(value);
-    for (let index = 0; index < text.length; index += 1) {
-      hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
-    }
-    hash = Math.imul(hash ^ 0xff, 0x01000193) >>> 0;
-  };
-  append(project.id);
-  append(project.updatedAt);
-  for (const segment of project.danmakuSourceSegments) {
-    if (segment.kind !== "content" || !segment.timeMapId) {
-      continue;
-    }
-    append(segment.id);
-    append(segment.updatedAt);
-    append(segment.timeMapId);
-  }
-  for (const timeMap of project.mediaTimeMaps) {
-    append(timeMap.id);
-    append(timeMap.revision);
-    append(timeMap.updatedAt);
-    append(timeMap.state);
-  }
-  for (const file of files) {
-    append(file.fileName);
-    append(file.content);
-  }
-  return `fnv1a32:${hash.toString(16).padStart(8, "0")}`;
-}
-
-function createVerifiedExportVerification(
-  project: EditorProject,
-  currentIdentities: Readonly<Record<string, MediaContentIdentity>>,
-  snapshotDigest: string
-): VerifiedExportVerification {
+  currentIdentities: Readonly<Record<string, MediaContentIdentity>>
+): VerifiedExportVerificationSeed {
   const referencedMapIds = new Set(
     project.danmakuSourceSegments.flatMap((segment) =>
       segment.kind === "content" && segment.timeMapId ? [segment.timeMapId] : []
@@ -4176,10 +4144,75 @@ function createVerifiedExportVerification(
   if (dependencies.length === 0) {
     throw new Error("导出结果没有可复核的已确认时间图媒体依赖。");
   }
+  const mapProofs = project.mediaTimeMaps
+    .filter((timeMap) => timeMap.state === "confirmed" && referencedMapIds.has(timeMap.id))
+    .map((timeMap): VerifiedExportMapProof => {
+      if (
+        timeMap.quality.level !== "verified" ||
+        timeMap.spans.some((span) => span.kind === "ambiguous")
+      ) {
+        throw new Error(`时间图 ${timeMap.id} 尚未达到 verified 或仍含 ambiguous span。`);
+      }
+      const record = timeMap.verification;
+      if (
+        !record ||
+        record.recordVersion !== 2 ||
+        record.method !== "manual-review" ||
+        record.revocation !== null ||
+        record.signatureAlgorithm !== "hmac-sha256-v1"
+      ) {
+        throw new Error(`时间图 ${timeMap.id} 缺少有效的签名人工验证记录。`);
+      }
+      if (!assessMediaTimeMapVerification(timeMap).trusted) {
+        throw new Error(`时间图 ${timeMap.id} 的人工验证尚未通过本机信任复核。`);
+      }
+      if (!timeMap.sourceIdentity || !timeMap.targetIdentity) {
+        throw new Error(`时间图 ${timeMap.id} 缺少两端媒体身份。`);
+      }
+      const coreDigest = computeMediaTimeMapCoreDigest(timeMap);
+      if (record.mapCoreDigest !== coreDigest || record.mapRevision !== timeMap.revision) {
+        throw new Error(`时间图 ${timeMap.id} 的人工验证没有绑定当前核心或 revision。`);
+      }
+      const manualRequest = createManualMediaTimeMapVerificationRequest(timeMap, {
+        calibrationArtifactId: record.calibrationArtifactId,
+        calibrationArtifactVersion: record.calibrationArtifactVersion,
+        verifier: record.verifier,
+        verifiedAt: record.verifiedAt
+      });
+      if (manualRequest.requestDigest !== record.requestDigest) {
+        throw new Error(`时间图 ${timeMap.id} 的人工验证请求摘要不一致。`);
+      }
+      return {
+        mapId: timeMap.id,
+        revision: timeMap.revision,
+        state: "confirmed",
+        declaredQuality: "verified",
+        spanKinds: timeMap.spans.map((span) => span.kind) as Array<
+          "matched" | "sourceOnly" | "targetOnly"
+        >,
+        coreDigest,
+        sourceMediaId: timeMap.sourceMediaId,
+        targetMediaId: timeMap.targetMediaId,
+        sourceIdentity: { ...timeMap.sourceIdentity },
+        targetIdentity: { ...timeMap.targetIdentity },
+        manualVerification: {
+          verificationId: record.verificationId,
+          issuerKeyId: record.issuerKeyId,
+          signatureAlgorithm: record.signatureAlgorithm,
+          signature: record.signature,
+          requestPayload: manualRequest.payload,
+          requestDigest: manualRequest.requestDigest
+        }
+      };
+    });
+  if (mapProofs.length !== referencedMapIds.size) {
+    throw new Error("被引用时间图与 verified export proofs 未形成一一对应关系。");
+  }
   return {
+    schemaVersion: 1,
     projectId: project.id,
     projectUpdatedAt: project.updatedAt,
-    snapshotDigest,
+    mapProofs,
     dependencies
   };
 }

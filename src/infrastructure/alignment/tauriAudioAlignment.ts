@@ -104,7 +104,7 @@ export interface TauriAudioAlignmentBatchRequest {
   maxCells?: number;
   enableVisualEvidence?: boolean;
   visualSampleIntervalMs?: number;
-  localizationMode?: boolean;
+  localizationMode: true;
 }
 
 export interface NormalizedTauriAudioAlignmentBatchRequest extends Omit<
@@ -323,7 +323,8 @@ function normalizeAudioAlignmentBatchRequest(
     sources,
     targets,
     ...(pairs ? { pairs } : {}),
-    ffprobePath: request.ffprobePath ?? null
+    ffprobePath: request.ffprobePath ?? null,
+    localizationMode: true
   };
 }
 

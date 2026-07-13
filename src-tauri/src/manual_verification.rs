@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tauri::{AppHandle, Manager};
 
 const AUTHORITY_VERSION: u8 = 1;
@@ -132,6 +132,55 @@ pub fn revoke_manual_time_map_verification(
 ) -> Result<ManualVerificationRevocationSeal, String> {
     let root = authority_root(&app)?;
     with_authority_lock(|| revoke_at(&root, request))
+}
+
+/// Holds the installation authority lock across verification and the caller's final publish.
+/// Concurrent revoke/issue commands cannot cross this guard's check-to-use boundary.
+pub(crate) struct ManualVerificationAuthorityGuard {
+    root: PathBuf,
+    _guard: MutexGuard<'static, ()>,
+}
+
+pub(crate) fn lock_manual_time_map_verification_authority(
+    app: &AppHandle,
+) -> Result<ManualVerificationAuthorityGuard, String> {
+    let root = authority_root(app)?;
+    let guard = AUTHORITY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "人工验证机构锁已损坏；verified 导出已阻断。".to_string())?;
+    Ok(ManualVerificationAuthorityGuard {
+        root,
+        _guard: guard,
+    })
+}
+
+impl ManualVerificationAuthorityGuard {
+    pub(crate) fn require_active(
+        &self,
+        verification_id: &str,
+        issuer_key_id: &str,
+        signature: &str,
+        request_payload: &str,
+        request_digest: &str,
+    ) -> Result<(), String> {
+        let request = VerifyManualVerificationRequest {
+            verification_id: verification_id.to_string(),
+            issuer_key_id: issuer_key_id.to_string(),
+            signature: signature.to_string(),
+            request_payload: request_payload.to_string(),
+            request_digest: request_digest.to_string(),
+        };
+        let result = verify_at(&self.root, request)?;
+        if result.status == "active" {
+            Ok(())
+        } else {
+            Err(format!(
+                "人工验证凭据未通过本机签发/撤销注册表复核（{}）：{}",
+                result.status, result.reason
+            ))
+        }
+    }
 }
 
 fn authority_root(app: &AppHandle) -> Result<PathBuf, String> {
