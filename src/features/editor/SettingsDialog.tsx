@@ -562,8 +562,9 @@ function PlayerToolsSettingsPanel({
           <div>
             <div className="text-xs font-medium text-slate-200">NVIDIA CUDA/cuFFT 加速</div>
             <p className="mt-1 text-xs leading-5 text-slate-500">
-              高精度匹配默认自动检测 GPU；CUDA 只加速声谱 FFT，FFmpeg 音频解码、全局分配、DP
-              和边界判定仍由 CPU 完成。
+              高精度匹配默认使用自动策略；能力可用且本次粗定位实际由 CUDA 完成时，选中候选窗口的声谱
+              FFT 会继续锁定 CUDA。若粗定位回退 CPU 或混合后端，细匹配保持 CPU；FFmpeg
+              音频解码、候选决策、DP 和边界判定始终由 CPU 完成。
             </p>
           </div>
           <TextButton onClick={() => void checkCuda()} disabled={checkingCuda}>
@@ -683,7 +684,7 @@ function CudaCapabilityRow({ capability }: { capability: CudaFftCapability | nul
       <Icon size={14} className="mt-0.5 shrink-0" />
       <span>
         {capability.available
-          ? `${capability.selectedDeviceName ?? "NVIDIA GPU"} · ${capability.cufftLibraryName ?? "cuFFT"} · 单批显存上界 ${formatMemoryMiB(capability.defaultBatchMemory.worstCaseTotalDeviceBytes)} MiB · 自动模式已启用`
+          ? `${capability.selectedDeviceName ?? "NVIDIA GPU"} · ${capability.cufftLibraryName ?? "cuFFT"} · 单批显存上界 ${formatMemoryMiB(capability.defaultBatchMemory.worstCaseTotalDeviceBytes)} MiB · 可用于自动模式`
           : `${capability.reason}${capability.remediation ? `；${capability.remediation}` : ""}`}
       </span>
     </div>

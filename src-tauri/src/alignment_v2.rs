@@ -31,6 +31,8 @@ const STATE_MATCHED: u8 = 0;
 const STATE_SOURCE_ONLY: u8 = 1;
 const STATE_TARGET_ONLY: u8 = 2;
 const STATE_NONE: u8 = u8::MAX;
+const EDIT_DP_NORM_CANCEL_INTERVAL: usize = 256;
+const EDIT_DP_WIDE_LOOP_CANCEL_INTERVAL: usize = 4_096;
 const ALIGNMENT_V2_CANCELLED: &str = "Alignment V2 算法已取消。";
 pub const CPU_SPECTRAL_BACKEND_ID: &str = "cpu-radix2-f64-r2c-512-v1";
 pub const STREAMING_CPU_SPECTRAL_BACKEND_ID: &str = "cpu-streaming-radix2-f64-r2c-512-v1";
@@ -158,6 +160,47 @@ fn resolve_spectral_backend_preference(
             }
         }
     }
+}
+
+/// Lock bounded fine extraction to the backend identity that completed coarse extraction.
+///
+/// A coarse CUDA result makes fine CUDA mandatory, so a later runtime fault is fail-closed instead
+/// of producing a mixed coarse/fine artifact. CPU and hybrid streaming results lock fine work to
+/// CPU. The original request label and fallback reason remain visible in the fine execution
+/// identity for diagnostics and receipt binding.
+pub fn lock_fine_spectral_backend_request(
+    coarse_execution: &SpectralBackendExecution,
+) -> Result<SpectralBackendRequest, String> {
+    let (preference, planned_backend_id, backend_detail) = match coarse_execution.backend_id.as_str()
+    {
+        CUDA_FFT_BACKEND_ID => (
+            SpectralBackendPreference::Cuda,
+            CUDA_FFT_BACKEND_ID.to_string(),
+            coarse_execution.backend_detail.clone(),
+        ),
+        CPU_SPECTRAL_BACKEND_ID
+        | STREAMING_CPU_SPECTRAL_BACKEND_ID
+        | STREAMING_HYBRID_SPECTRAL_BACKEND_ID => (
+            SpectralBackendPreference::Cpu,
+            CPU_SPECTRAL_BACKEND_ID.to_string(),
+            format!(
+                "CPU radix-2 f64 FFT; fineBackendLock=cpu-after-coarse; coarseBackend={}; coarseDetail={}",
+                coarse_execution.backend_id, coarse_execution.backend_detail
+            ),
+        ),
+        backend_id => {
+            return Err(format!(
+                "blocked:spectral-backend-continuity：无法从未知 coarse 声谱后端 {backend_id:?} 锁定 fine 后端。"
+            ));
+        }
+    };
+    Ok(SpectralBackendRequest {
+        preference,
+        planned_backend_id,
+        requested_backend: coarse_execution.requested_backend.clone(),
+        backend_detail,
+        fallback_reason: coarse_execution.fallback_reason.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -1245,6 +1288,138 @@ impl CudaSpectralAnalysisError {
     }
 }
 
+/// CUDA fine-only extraction keeps only the final fine frames plus one bounded FFT batch.
+/// Unlike landmark analysis it never retains a media-duration-sized `Vec<Vec<f64>>` of spectra.
+fn extract_fine_features_cuda_bounded(
+    pcm: &[i16],
+    config: &FineFeatureConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<FineFeatureFrame>, CudaSpectralAnalysisError> {
+    let window_samples = milliseconds_to_samples(config.window_ms as i64, config.sample_rate)
+        .map_err(CudaSpectralAnalysisError::Runtime)?;
+    let hop_samples = milliseconds_to_samples(config.hop_ms as i64, config.sample_rate)
+        .map_err(CudaSpectralAnalysisError::Runtime)?;
+    if pcm.len() < window_samples || window_samples < 8 || hop_samples == 0 {
+        return Ok(Vec::new());
+    }
+    let frame_count = 1 + (pcm.len() - window_samples) / hop_samples;
+    let decimation = spectral_decimation(config.sample_rate);
+    let decimated_len = window_samples.div_ceil(decimation);
+    let fft_len = decimated_len.max(8).next_power_of_two();
+    if fft_len != CUDA_FFT_FRAME_LEN {
+        return Err(CudaSpectralAnalysisError::Unsupported(format!(
+            "当前 fine 声谱网格需要 {fft_len} 点 FFT，CUDA 后端只实现 {CUDA_FFT_FRAME_LEN} 点 R2C"
+        )));
+    }
+    let mut fine_features = Vec::new();
+    fine_features
+        .try_reserve_exact(frame_count)
+        .map_err(|error| {
+            CudaSpectralAnalysisError::Runtime(format!(
+                "CUDA fine feature 结果内存预留失败：{error}"
+            ))
+        })?;
+    let denominator = decimated_len.saturating_sub(1).max(1) as f64;
+    let local_cancellation = AtomicBool::new(false);
+    let cancellation = cancel_flag.unwrap_or(&local_cancellation);
+    let mut cuda_session = CudaFftR2c512Session::new(0).map_err(|error| {
+        if error.code == CudaFftBatchErrorCode::Cancelled {
+            CudaSpectralAnalysisError::Cancelled
+        } else {
+            CudaSpectralAnalysisError::Runtime(format!("{:?}: {}", error.code, error.message))
+        }
+    })?;
+    let selected_bins = spectral_fft_bins(config.sample_rate, decimation, fft_len);
+
+    for batch_start in (0..frame_count).step_by(CUDA_FFT_DEFAULT_BATCH_FRAMES) {
+        check_algorithm_cancelled(cancel_flag).map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+        let batch_frame_count = (frame_count - batch_start).min(CUDA_FFT_DEFAULT_BATCH_FRAMES);
+        let input_len = batch_frame_count
+            .checked_mul(CUDA_FFT_FRAME_LEN)
+            .ok_or_else(|| {
+                CudaSpectralAnalysisError::Runtime("CUDA fine FFT 批次输入长度溢出。".to_string())
+            })?;
+        let mut input_frames = Vec::new();
+        input_frames.try_reserve_exact(input_len).map_err(|error| {
+            CudaSpectralAnalysisError::Runtime(format!(
+                "CUDA fine FFT 批次输入内存预留失败：{error}"
+            ))
+        })?;
+        input_frames.resize(input_len, 0.0f32);
+        let mut batch_rms = Vec::new();
+        batch_rms
+            .try_reserve_exact(batch_frame_count)
+            .map_err(|error| {
+                CudaSpectralAnalysisError::Runtime(format!(
+                    "CUDA fine FFT 批次 RMS 内存预留失败：{error}"
+                ))
+            })?;
+        for batch_index in 0..batch_frame_count {
+            if batch_index.is_multiple_of(64) {
+                check_algorithm_cancelled(cancel_flag)
+                    .map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+            }
+            let frame_index = batch_start + batch_index;
+            let start = frame_index * hop_samples;
+            let frame = &pcm[start..start + window_samples];
+            batch_rms.push(normalized_rms(frame));
+            let input_offset = batch_index * CUDA_FFT_FRAME_LEN;
+            for (index, sample) in frame.iter().step_by(decimation).enumerate() {
+                let window =
+                    0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / denominator).cos();
+                input_frames[input_offset + index] =
+                    (*sample as f64 / i16::MAX as f64 * window) as f32;
+            }
+        }
+        let output = cuda_session
+            .transform_batch(&input_frames, cancellation)
+            .map_err(|error| {
+                if error.code == CudaFftBatchErrorCode::Cancelled {
+                    CudaSpectralAnalysisError::Cancelled
+                } else {
+                    CudaSpectralAnalysisError::Runtime(format!(
+                        "{:?}: {}",
+                        error.code, error.message
+                    ))
+                }
+            })?;
+        check_algorithm_cancelled(cancel_flag).map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+        if output.frame_count != batch_frame_count
+            || output.bins_per_frame != CUDA_FFT_BINS_PER_FRAME
+        {
+            return Err(CudaSpectralAnalysisError::Runtime(
+                "CUDA fine FFT 批次输出形状与请求不一致。".to_string(),
+            ));
+        }
+        for (batch_index, rms) in batch_rms.iter().copied().enumerate() {
+            if batch_index.is_multiple_of(64) {
+                check_algorithm_cancelled(cancel_flag)
+                    .map_err(|_| CudaSpectralAnalysisError::Cancelled)?;
+            }
+            let frame_index = batch_start + batch_index;
+            let start = frame_index * hop_samples;
+            let frame = &pcm[start..start + window_samples];
+            let output_offset = batch_index * output.bins_per_frame;
+            let spectrum = selected_bins
+                .iter()
+                .map(|bin| {
+                    let value = output.spectra[output_offset + *bin];
+                    f64::from(value.real).hypot(f64::from(value.imaginary))
+                })
+                .collect::<Vec<_>>();
+            fine_features.push(create_fine_feature_frame(
+                frame,
+                &spectrum,
+                rms,
+                start,
+                window_samples,
+                config,
+            ));
+        }
+    }
+    Ok(fine_features)
+}
+
 fn analyze_landmark_spectral_frames_cuda(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
@@ -1875,6 +2050,17 @@ pub struct FineFeatureFrame {
     pub values: Vec<f32>,
 }
 
+/// Fine-only feature extraction together with the spectral backend that actually completed it.
+///
+/// This is intentionally separate from [`LandmarkFineFeatureExtraction`]: bounded fine windows
+/// do not need to retain or rank landmark families, but they still share the production
+/// CPU/CUDA spectral grid and its failover identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FineFeatureExtraction {
+    pub fine_features: Vec<FineFeatureFrame>,
+    pub spectral_backend: SpectralBackendExecution,
+}
+
 /// Landmark 与细粒度特征共享同一组声谱帧的纯算法结果。
 ///
 /// 调用方只有在两套配置使用相同 sample rate、window 和 hop 时才能共享遍历；两者的
@@ -1956,6 +2142,73 @@ pub fn extract_landmarks_and_fine_features_with_backend_request(
             fine_features: analysis.fine_features,
         },
         spectral_backend,
+    })
+}
+
+/// Extract a bounded fine-feature window with an already resolved production backend request.
+///
+/// CUDA requests reuse the same bounded batched cuFFT implementation as shared landmark/fine
+/// extraction. In auto mode any CUDA runtime failure discards the partial analysis and recomputes
+/// the complete window on CPU; an explicitly forced CUDA request remains fail-closed. Each CUDA
+/// batch is reduced directly into final fine frames, so the function never extracts landmarks or
+/// retains a media-duration-sized spectrum matrix.
+pub fn extract_fine_features_with_backend_request(
+    pcm: &[i16],
+    config: &FineFeatureConfig,
+    cancel_flag: Option<&AtomicBool>,
+    backend_request: &SpectralBackendRequest,
+) -> Result<FineFeatureExtraction, String> {
+    check_algorithm_cancelled(cancel_flag)?;
+    validate_fine_feature_config(config)?;
+    if backend_request.planned_backend_id == CUDA_FFT_BACKEND_ID {
+        match extract_fine_features_cuda_bounded(pcm, config, cancel_flag) {
+            Ok(fine_features) => {
+                return Ok(FineFeatureExtraction {
+                    fine_features,
+                    spectral_backend: SpectralBackendExecution {
+                        backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+                        requested_backend: backend_request.requested_backend.clone(),
+                        backend_detail: backend_request.backend_detail.clone(),
+                        fallback_reason: backend_request.fallback_reason.clone(),
+                    },
+                });
+            }
+            Err(CudaSpectralAnalysisError::Cancelled) => {
+                return Err(ALIGNMENT_V2_CANCELLED.to_string());
+            }
+            Err(error) if backend_request.preference == SpectralBackendPreference::Cuda => {
+                return Err(format!(
+                    "blocked:cuda-fft-runtime：已锁定 CUDA fine 声谱后端，但有界批量 FFT 失败：{}",
+                    error.message()
+                ));
+            }
+            Err(error) => {
+                let fine_features = extract_fine_features_with_cancel(pcm, config, cancel_flag)?;
+                return Ok(FineFeatureExtraction {
+                    fine_features,
+                    spectral_backend: SpectralBackendExecution {
+                        backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+                        requested_backend: backend_request.requested_backend.clone(),
+                        backend_detail: "CPU radix-2 f64 FFT".to_string(),
+                        fallback_reason: Some(format!(
+                            "CUDA 有界 fine 批量 FFT 运行失败，本次完整窗口按 CPU 身份重算：{}",
+                            error.message()
+                        )),
+                    },
+                });
+            }
+        }
+    }
+
+    let fine_features = extract_fine_features_with_cancel(pcm, config, cancel_flag)?;
+    Ok(FineFeatureExtraction {
+        fine_features,
+        spectral_backend: SpectralBackendExecution {
+            backend_id: CPU_SPECTRAL_BACKEND_ID.to_string(),
+            requested_backend: backend_request.requested_backend.clone(),
+            backend_detail: backend_request.backend_detail.clone(),
+            fallback_reason: backend_request.fallback_reason.clone(),
+        },
     })
 }
 
@@ -2153,6 +2406,259 @@ pub fn align_features_edit_aware_with_cancel(
             config.max_dp_cells
         ));
     }
+    let mut matched_parents = vec![STATE_NONE; cell_count];
+    let mut source_only_parents = vec![STATE_NONE; cell_count];
+    let mut target_only_parents = vec![STATE_NONE; cell_count];
+    let mut previous_matched = vec![COST_INFINITY; width];
+    let mut previous_source_only = vec![COST_INFINITY; width];
+    let mut previous_target_only = vec![COST_INFINITY; width];
+    let mut current_matched = vec![COST_INFINITY; width];
+    let mut current_source_only = vec![COST_INFINITY; width];
+    let mut current_target_only = vec![COST_INFINITY; width];
+    previous_matched[0] = 0;
+
+    if config.mode == EditAlignmentMode::SemiGlobal {
+        for cost in previous_matched.iter_mut().take(target_len + 1).skip(1) {
+            *cost = 0;
+        }
+    } else {
+        for (target_index, target_cost) in previous_target_only
+            .iter_mut()
+            .enumerate()
+            .take(target_len + 1)
+            .skip(1)
+        {
+            *target_cost = config.gap_open_cost
+                + config.gap_extend_cost * (target_index.saturating_sub(1) as i64);
+            target_only_parents[target_index] = if target_index == 1 {
+                STATE_MATCHED
+            } else {
+                STATE_TARGET_ONLY
+            };
+        }
+    }
+    for source_index in 1..=source_len {
+        if source_index % 8 == 0 {
+            check_algorithm_cancelled(cancel_flag)?;
+        }
+        let index = source_index * width;
+        source_only_parents[index] = if source_index == 1 {
+            STATE_MATCHED
+        } else {
+            STATE_SOURCE_ONLY
+        };
+    }
+
+    let source_norms = precompute_feature_norms(source, cancel_flag)?;
+    let target_norms = precompute_feature_norms(target, cancel_flag)?;
+
+    for source_index in 1..=source_len {
+        if source_index % 8 == 0 {
+            check_algorithm_cancelled(cancel_flag)?;
+        }
+        current_matched.fill(COST_INFINITY);
+        current_source_only.fill(COST_INFINITY);
+        current_target_only.fill(COST_INFINITY);
+        current_source_only[0] =
+            config.gap_open_cost + config.gap_extend_cost * (source_index.saturating_sub(1) as i64);
+        let (target_start, target_end) = target_band_range(
+            target,
+            coarse.scale * source[source_index - 1].time_ms as f64 + coarse.offset_ms as f64,
+            config.band_radius_ms,
+        );
+        for target_index in target_start..target_end {
+            if target_index.is_multiple_of(EDIT_DP_WIDE_LOOP_CANCEL_INTERVAL) {
+                check_algorithm_cancelled(cancel_flag)?;
+            }
+            if !is_inside_affine_band(
+                &source[source_index - 1],
+                &target[target_index - 1],
+                coarse,
+                config.band_radius_ms,
+            ) {
+                continue;
+            }
+            let index = source_index * width + target_index;
+            let feature_cost = feature_distance_cost_with_norms(
+                &source[source_index - 1].values,
+                &target[target_index - 1].values,
+                source_norms[source_index - 1],
+                target_norms[target_index - 1],
+            );
+            let (matched_parent, matched_base) = select_min_state(
+                previous_matched[target_index - 1],
+                previous_source_only[target_index - 1],
+                previous_target_only[target_index - 1],
+            );
+            current_matched[target_index] = add_cost(matched_base, feature_cost);
+            matched_parents[index] = matched_parent;
+
+            let source_candidates = [
+                (
+                    STATE_MATCHED,
+                    add_cost(previous_matched[target_index], config.gap_open_cost),
+                ),
+                (
+                    STATE_SOURCE_ONLY,
+                    add_cost(previous_source_only[target_index], config.gap_extend_cost),
+                ),
+                (
+                    STATE_TARGET_ONLY,
+                    add_cost(previous_target_only[target_index], config.gap_open_cost),
+                ),
+            ];
+            let (source_parent, source_cost) = select_min_candidate(&source_candidates);
+            current_source_only[target_index] = source_cost;
+            source_only_parents[index] = source_parent;
+
+            let target_candidates = [
+                (
+                    STATE_MATCHED,
+                    add_cost(current_matched[target_index - 1], config.gap_open_cost),
+                ),
+                (
+                    STATE_SOURCE_ONLY,
+                    add_cost(current_source_only[target_index - 1], config.gap_open_cost),
+                ),
+                (
+                    STATE_TARGET_ONLY,
+                    add_cost(
+                        current_target_only[target_index - 1],
+                        config.gap_extend_cost,
+                    ),
+                ),
+            ];
+            let (target_parent, target_cost) = select_min_candidate(&target_candidates);
+            current_target_only[target_index] = target_cost;
+            target_only_parents[index] = target_parent;
+        }
+        std::mem::swap(&mut previous_matched, &mut current_matched);
+        std::mem::swap(&mut previous_source_only, &mut current_source_only);
+        std::mem::swap(&mut previous_target_only, &mut current_target_only);
+    }
+
+    let (mut source_index, mut target_index, mut state, total_cost) =
+        select_alignment_endpoint_from_final_row(
+            source_len,
+            target_len,
+            config.mode,
+            &previous_matched,
+            &previous_source_only,
+            &previous_target_only,
+            cancel_flag,
+        )?;
+    let source_bounds = create_frame_boundaries(source)?;
+    let target_bounds = create_frame_boundaries(target)?;
+    let mut reversed_path = Vec::new();
+    let mut backtrack_steps = 0usize;
+    while source_index > 0 || (config.mode == EditAlignmentMode::Global && target_index > 0) {
+        if backtrack_steps.is_multiple_of(256) {
+            check_algorithm_cancelled(cancel_flag)?;
+        }
+        backtrack_steps = backtrack_steps.saturating_add(1);
+        let index = source_index * width + target_index;
+        match state {
+            STATE_MATCHED if source_index > 0 && target_index > 0 => {
+                let local_cost = feature_distance_cost_with_norms(
+                    &source[source_index - 1].values,
+                    &target[target_index - 1].values,
+                    source_norms[source_index - 1],
+                    target_norms[target_index - 1],
+                );
+                let kind = if local_cost >= config.ambiguous_match_cost {
+                    EditPathKind::Ambiguous
+                } else {
+                    EditPathKind::Matched
+                };
+                reversed_path.push(EditPathStep {
+                    kind,
+                    source_start_ms: source_bounds[source_index - 1],
+                    source_end_ms: source_bounds[source_index],
+                    target_start_ms: target_bounds[target_index - 1],
+                    target_end_ms: target_bounds[target_index],
+                    local_cost,
+                });
+                state = matched_parents[index];
+                source_index -= 1;
+                target_index -= 1;
+            }
+            STATE_SOURCE_ONLY if source_index > 0 => {
+                reversed_path.push(EditPathStep {
+                    kind: EditPathKind::SourceOnly,
+                    source_start_ms: source_bounds[source_index - 1],
+                    source_end_ms: source_bounds[source_index],
+                    target_start_ms: target_bounds[target_index],
+                    target_end_ms: target_bounds[target_index],
+                    local_cost: config.gap_extend_cost,
+                });
+                state = source_only_parents[index];
+                source_index -= 1;
+            }
+            STATE_TARGET_ONLY if target_index > 0 => {
+                reversed_path.push(EditPathStep {
+                    kind: EditPathKind::TargetOnly,
+                    source_start_ms: source_bounds[source_index],
+                    source_end_ms: source_bounds[source_index],
+                    target_start_ms: target_bounds[target_index - 1],
+                    target_end_ms: target_bounds[target_index],
+                    local_cost: config.gap_extend_cost,
+                });
+                state = target_only_parents[index];
+                target_index -= 1;
+            }
+            _ if config.mode == EditAlignmentMode::SemiGlobal && source_index == 0 => break,
+            _ => return Err("细粒度 DP 回溯遇到不可达状态。".to_string()),
+        }
+    }
+    reversed_path.reverse();
+    let path = collapse_opposite_gap_runs(reversed_path);
+    let spans = merge_path_to_spans(&path);
+    validate_monotonic_spans(&spans)?;
+    let matched_step_count = path
+        .iter()
+        .filter(|step| step.kind == EditPathKind::Matched)
+        .count();
+    let ambiguous_step_count = path
+        .iter()
+        .filter(|step| step.kind == EditPathKind::Ambiguous)
+        .count();
+    // Cancellation can arrive while the completed path is being collapsed or validated. Do not
+    // publish a seemingly successful fine result after the caller has cancelled the job.
+    check_algorithm_cancelled(cancel_flag)?;
+    Ok(EditAlignmentResult {
+        total_cost,
+        matched_step_count,
+        ambiguous_step_count,
+        path,
+        spans,
+    })
+}
+
+#[cfg(test)]
+fn align_features_edit_aware_full_matrix_reference(
+    source: &[FineFeatureFrame],
+    target: &[FineFeatureFrame],
+    coarse: &AffineHypothesis,
+    config: &EditAlignmentConfig,
+) -> Result<EditAlignmentResult, String> {
+    validate_feature_sequences(source, target)?;
+    validate_edit_config(config)?;
+    if source.is_empty() || target.is_empty() {
+        return Err("细粒度对齐要求来源与目标特征都非空。".to_string());
+    }
+
+    let source_len = source.len();
+    let target_len = target.len();
+    let width = target_len + 1;
+    let cell_count = (source_len + 1)
+        .checked_mul(width)
+        .ok_or_else(|| "细粒度 DP 尺寸溢出。".to_string())?;
+    if cell_count > config.max_dp_cells {
+        return Err(format!(
+            "细粒度 DP 需要 {cell_count} 个索引单元，超过 maxDpCells={}；请先分块或提高特征 hop。",
+            config.max_dp_cells
+        ));
+    }
     let mut matched_costs = vec![COST_INFINITY; cell_count];
     let mut source_only_costs = vec![COST_INFINITY; cell_count];
     let mut target_only_costs = vec![COST_INFINITY; cell_count];
@@ -2178,9 +2684,6 @@ pub fn align_features_edit_aware_with_cancel(
         }
     }
     for source_index in 1..=source_len {
-        if source_index % 8 == 0 {
-            check_algorithm_cancelled(cancel_flag)?;
-        }
         let index = source_index * width;
         source_only_costs[index] =
             config.gap_open_cost + config.gap_extend_cost * (source_index.saturating_sub(1) as i64);
@@ -2192,9 +2695,6 @@ pub fn align_features_edit_aware_with_cancel(
     }
 
     for source_index in 1..=source_len {
-        if source_index % 8 == 0 {
-            check_algorithm_cancelled(cancel_flag)?;
-        }
         let (target_start, target_end) = target_band_range(
             target,
             coarse.scale * source[source_index - 1].time_ms as f64 + coarse.offset_ms as f64,
@@ -2275,12 +2775,7 @@ pub fn align_features_edit_aware_with_cancel(
     let source_bounds = create_frame_boundaries(source)?;
     let target_bounds = create_frame_boundaries(target)?;
     let mut reversed_path = Vec::new();
-    let mut backtrack_steps = 0usize;
     while source_index > 0 || (config.mode == EditAlignmentMode::Global && target_index > 0) {
-        if backtrack_steps.is_multiple_of(256) {
-            check_algorithm_cancelled(cancel_flag)?;
-        }
-        backtrack_steps = backtrack_steps.saturating_add(1);
         let index = source_index * width + target_index;
         match state {
             STATE_MATCHED if source_index > 0 && target_index > 0 => {
@@ -3551,22 +4046,58 @@ fn is_inside_affine_band(
     (target.time_ms as f64 - predicted).abs() <= band_radius_ms as f64
 }
 
-fn feature_distance_cost(left: &[f32], right: &[f32]) -> i64 {
-    let dot = left
-        .iter()
+fn precompute_feature_norms(
+    frames: &[FineFeatureFrame],
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<Vec<f64>, String> {
+    let mut norms = Vec::new();
+    norms
+        .try_reserve_exact(frames.len())
+        .map_err(|error| format!("细粒度 DP feature norm 内存预留失败：{error}"))?;
+    for (index, frame) in frames.iter().enumerate() {
+        if index.is_multiple_of(EDIT_DP_NORM_CANCEL_INTERVAL) {
+            check_algorithm_cancelled(cancel_flag)?;
+        }
+        norms.push(feature_norm(&frame.values));
+    }
+    Ok(norms)
+}
+
+fn feature_dot(left: &[f32], right: &[f32]) -> f64 {
+    left.iter()
         .zip(right)
         .map(|(left, right)| *left as f64 * *right as f64)
-        .sum::<f64>();
-    let left_norm = left
+        .sum::<f64>()
+}
+
+fn feature_norm(values: &[f32]) -> f64 {
+    values
         .iter()
         .map(|value| (*value as f64).powi(2))
         .sum::<f64>()
-        .sqrt();
-    let right_norm = right
-        .iter()
-        .map(|value| (*value as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
+        .sqrt()
+}
+
+fn feature_distance_cost_with_norms(
+    left: &[f32],
+    right: &[f32],
+    left_norm: f64,
+    right_norm: f64,
+) -> i64 {
+    let dot = feature_dot(left, right);
+    if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
+        return 1_000;
+    }
+    ((1.0 - dot / (left_norm * right_norm)).clamp(0.0, 2.0) * 1_000.0).round() as i64
+}
+
+#[cfg(test)]
+fn feature_distance_cost(left: &[f32], right: &[f32]) -> i64 {
+    // Preserve the original operation order for the full-matrix parity oracle: dot first, then
+    // each norm, then the norm product/division/clamp/round sequence.
+    let dot = feature_dot(left, right);
+    let left_norm = feature_norm(left);
+    let right_norm = feature_norm(right);
     if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
         return 1_000;
     }
@@ -3597,6 +4128,57 @@ fn add_cost(base: i64, addition: i64) -> i64 {
     }
 }
 
+fn select_alignment_endpoint_from_final_row(
+    source_len: usize,
+    target_len: usize,
+    mode: EditAlignmentMode,
+    matched_costs: &[i64],
+    source_only_costs: &[i64],
+    target_only_costs: &[i64],
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<(usize, usize, u8, i64), String> {
+    let target_range = if mode == EditAlignmentMode::Global {
+        target_len..=target_len
+    } else {
+        0..=target_len
+    };
+    let mut endpoint = None::<(usize, usize, u8, i64)>;
+    for target_index in target_range {
+        if target_index.is_multiple_of(EDIT_DP_WIDE_LOOP_CANCEL_INTERVAL) {
+            check_algorithm_cancelled(cancel_flag)?;
+        }
+        for (state, cost) in [
+            (STATE_MATCHED, matched_costs[target_index]),
+            (STATE_SOURCE_ONLY, source_only_costs[target_index]),
+            (STATE_TARGET_ONLY, target_only_costs[target_index]),
+        ] {
+            let candidate = (source_len, target_index, state, cost);
+            if endpoint
+                .as_ref()
+                .is_none_or(|current| compare_alignment_endpoints(&candidate, current).is_lt())
+            {
+                endpoint = Some(candidate);
+            }
+        }
+    }
+    let endpoint = endpoint.ok_or_else(|| "细粒度 DP 没有终点。".to_string())?;
+    if endpoint.3 >= COST_INFINITY {
+        return Err("粗仿射窄带内不存在完整单调路径。".to_string());
+    }
+    Ok(endpoint)
+}
+
+fn compare_alignment_endpoints(
+    left: &(usize, usize, u8, i64),
+    right: &(usize, usize, u8, i64),
+) -> std::cmp::Ordering {
+    left.3
+        .cmp(&right.3)
+        .then_with(|| right.1.cmp(&left.1))
+        .then_with(|| left.2.cmp(&right.2))
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn select_alignment_endpoint(
     source_len: usize,
@@ -3631,12 +4213,7 @@ fn select_alignment_endpoint(
     }
     let endpoint = endpoints
         .into_iter()
-        .min_by(|left, right| {
-            left.3
-                .cmp(&right.3)
-                .then_with(|| right.1.cmp(&left.1))
-                .then_with(|| left.2.cmp(&right.2))
-        })
+        .min_by(compare_alignment_endpoints)
         .ok_or_else(|| "细粒度 DP 没有终点。".to_string())?;
     if endpoint.3 >= COST_INFINITY {
         return Err("粗仿射窄带内不存在完整单调路径。".to_string());
@@ -4868,6 +5445,228 @@ mod tests {
     }
 
     #[test]
+    fn fine_only_cpu_backend_is_exactly_equivalent_to_legacy_cpu_extraction() {
+        let pcm = synth_tone_bursts(16_000, &[211, 347, 613, 997, 1_541, 2_303]);
+        let config = FineFeatureConfig {
+            presentation_offset_ms: 375,
+            window_ms: 50,
+            hop_ms: 25,
+            ..FineFeatureConfig::default()
+        };
+        let expected = extract_fine_features_with_cancel(&pcm, &config, None).unwrap();
+        let cpu_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+
+        let actual =
+            extract_fine_features_with_backend_request(&pcm, &config, None, &cpu_request).unwrap();
+
+        assert_eq!(actual.fine_features, expected);
+        assert_eq!(actual.spectral_backend.backend_id, CPU_SPECTRAL_BACKEND_ID);
+        assert_eq!(actual.spectral_backend.requested_backend, "cpu");
+        assert!(actual.spectral_backend.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn fine_only_cuda_backend_matches_cpu_without_per_frame_cpu_fft() {
+        let require_cuda = std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1")
+            || std::env::var("C137_SPECTRAL_BACKEND").as_deref() == Ok("cuda");
+        let cuda_request =
+            match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+                Ok(request) => request,
+                Err(error) if !require_cuda => {
+                    eprintln!("skip fine-only CUDA equivalence: {error}");
+                    return;
+                }
+                Err(error) => panic!("CUDA was required for fine-only equivalence: {error}"),
+            };
+        let cpu_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        let pcm = synth_tone_bursts(16_000, &[173, 331, 719, 1_237, 2_411]);
+        let config = FineFeatureConfig {
+            presentation_offset_ms: -225,
+            window_ms: 50,
+            hop_ms: 25,
+            ..FineFeatureConfig::default()
+        };
+        let cpu =
+            extract_fine_features_with_backend_request(&pcm, &config, None, &cpu_request).unwrap();
+        TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(0));
+
+        let cuda =
+            extract_fine_features_with_backend_request(&pcm, &config, None, &cuda_request).unwrap();
+
+        assert_eq!(cuda.spectral_backend.backend_id, CUDA_FFT_BACKEND_ID);
+        assert_eq!(cuda.spectral_backend.requested_backend, "cuda");
+        assert!(cuda.spectral_backend.fallback_reason.is_none());
+        assert_eq!(
+            TEST_SPECTRUM_CALCULATION_COUNT.with(std::cell::Cell::get),
+            0,
+            "a successful CUDA fine-only extraction must not call the per-frame CPU FFT"
+        );
+        assert_eq!(cpu.fine_features.len(), cuda.fine_features.len());
+        for (cpu_frame, cuda_frame) in cpu.fine_features.iter().zip(&cuda.fine_features) {
+            assert_eq!(cpu_frame.time_ms, cuda_frame.time_ms);
+            assert_eq!(cpu_frame.values.len(), cuda_frame.values.len());
+            for (cpu_value, cuda_value) in cpu_frame.values.iter().zip(&cuda_frame.values) {
+                assert!((cpu_value - cuda_value).abs() <= 2.0e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn fine_only_cuda_crosses_bounded_batch_seam_without_retaining_cpu_spectra() {
+        let require_cuda = std::env::var("C137_REQUIRE_CUDA_FFT").as_deref() == Ok("1")
+            || std::env::var("C137_SPECTRAL_BACKEND").as_deref() == Ok("cuda");
+        let cuda_request =
+            match resolve_spectral_backend_preference(SpectralBackendPreference::Cuda) {
+                Ok(request) => request,
+                Err(error) if !require_cuda => {
+                    eprintln!("skip bounded fine-only CUDA batches: {error}");
+                    return;
+                }
+                Err(error) => panic!("CUDA was required for bounded fine-only batches: {error}"),
+            };
+        let config = FineFeatureConfig {
+            window_ms: 50,
+            hop_ms: 25,
+            ..FineFeatureConfig::default()
+        };
+        let window_samples =
+            milliseconds_to_samples(config.window_ms as i64, config.sample_rate).unwrap();
+        let hop_samples =
+            milliseconds_to_samples(config.hop_ms as i64, config.sample_rate).unwrap();
+        let expected_frames = CUDA_FFT_DEFAULT_BATCH_FRAMES + 17;
+        let sample_count = window_samples + (expected_frames - 1) * hop_samples;
+        let pcm = synth_streaming_chirp(config.sample_rate, sample_count);
+        TEST_SPECTRUM_CALCULATION_COUNT.with(|count| count.set(0));
+
+        let extraction =
+            extract_fine_features_with_backend_request(&pcm, &config, None, &cuda_request).unwrap();
+
+        assert_eq!(extraction.fine_features.len(), expected_frames);
+        assert_eq!(extraction.spectral_backend.backend_id, CUDA_FFT_BACKEND_ID);
+        assert_eq!(
+            TEST_SPECTRUM_CALCULATION_COUNT.with(std::cell::Cell::get),
+            0
+        );
+    }
+
+    #[test]
+    fn fine_only_empty_and_cancelled_inputs_preserve_fail_closed_contract() {
+        let config = FineFeatureConfig::default();
+        let cpu_request =
+            resolve_spectral_backend_preference(SpectralBackendPreference::Cpu).unwrap();
+        let empty =
+            extract_fine_features_with_backend_request(&[], &config, None, &cpu_request).unwrap();
+        assert!(empty.fine_features.is_empty());
+        assert_eq!(empty.spectral_backend.backend_id, CPU_SPECTRAL_BACKEND_ID);
+        assert_eq!(empty.spectral_backend.requested_backend, "cpu");
+
+        let cancelled = AtomicBool::new(true);
+        let error = extract_fine_features_with_backend_request(
+            &[0; 800],
+            &config,
+            Some(&cancelled),
+            &cpu_request,
+        )
+        .unwrap_err();
+        assert_eq!(error, ALIGNMENT_V2_CANCELLED);
+    }
+
+    #[test]
+    fn fine_only_auto_cuda_failure_recomputes_all_on_cpu_and_forced_cuda_blocks() {
+        let pcm = synth_tone_bursts(4_000, &[173, 331, 719, 1_237]);
+        let config = FineFeatureConfig {
+            sample_rate: 4_000,
+            window_ms: 50,
+            hop_ms: 50,
+            ..FineFeatureConfig::default()
+        };
+        let expected = extract_fine_features_with_cancel(&pcm, &config, None).unwrap();
+        let auto_request = SpectralBackendRequest {
+            preference: SpectralBackendPreference::Auto,
+            planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: "test CUDA device".to_string(),
+            fallback_reason: None,
+        };
+
+        let auto =
+            extract_fine_features_with_backend_request(&pcm, &config, None, &auto_request).unwrap();
+        assert_eq!(auto.fine_features, expected);
+        assert_eq!(auto.spectral_backend.backend_id, CPU_SPECTRAL_BACKEND_ID);
+        assert_eq!(auto.spectral_backend.requested_backend, "auto");
+        assert!(auto
+            .spectral_backend
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("512 点 R2C")));
+
+        let forced_request = SpectralBackendRequest {
+            preference: SpectralBackendPreference::Cuda,
+            planned_backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "cuda".to_string(),
+            backend_detail: "test CUDA device".to_string(),
+            fallback_reason: None,
+        };
+        let error =
+            extract_fine_features_with_backend_request(&pcm, &config, None, &forced_request)
+                .unwrap_err();
+        assert!(error.starts_with("blocked:cuda-fft-runtime"));
+    }
+
+    #[test]
+    fn fine_backend_lock_follows_actual_coarse_execution_and_preserves_diagnostics() {
+        let cuda_execution = SpectralBackendExecution {
+            backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: "CUDA/cuFFT device #0 RTX 4090".to_string(),
+            fallback_reason: None,
+        };
+        let cuda_request = lock_fine_spectral_backend_request(&cuda_execution).unwrap();
+        assert_eq!(cuda_request.preference, SpectralBackendPreference::Cuda);
+        assert_eq!(cuda_request.planned_backend_id, CUDA_FFT_BACKEND_ID);
+        assert_eq!(cuda_request.requested_backend, "auto");
+        assert_eq!(cuda_request.backend_detail, cuda_execution.backend_detail);
+        assert!(cuda_request.fallback_reason.is_none());
+
+        for backend_id in [
+            CPU_SPECTRAL_BACKEND_ID,
+            STREAMING_CPU_SPECTRAL_BACKEND_ID,
+            STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
+        ] {
+            let cpu_execution = SpectralBackendExecution {
+                backend_id: backend_id.to_string(),
+                requested_backend: "auto".to_string(),
+                backend_detail: format!("coarse detail for {backend_id}"),
+                fallback_reason: Some("coarse fallback diagnostic".to_string()),
+            };
+            let cpu_request = lock_fine_spectral_backend_request(&cpu_execution).unwrap();
+            assert_eq!(cpu_request.preference, SpectralBackendPreference::Cpu);
+            assert_eq!(cpu_request.planned_backend_id, CPU_SPECTRAL_BACKEND_ID);
+            assert_eq!(cpu_request.requested_backend, "auto");
+            assert_eq!(
+                cpu_request.fallback_reason.as_deref(),
+                Some("coarse fallback diagnostic")
+            );
+            assert!(cpu_request.backend_detail.contains(backend_id));
+            assert!(cpu_request
+                .backend_detail
+                .contains(&cpu_execution.backend_detail));
+        }
+
+        let unknown = SpectralBackendExecution {
+            backend_id: "unknown-spectral-backend".to_string(),
+            requested_backend: "auto".to_string(),
+            backend_detail: "unknown".to_string(),
+            fallback_reason: None,
+        };
+        assert!(lock_fine_spectral_backend_request(&unknown)
+            .unwrap_err()
+            .starts_with("blocked:spectral-backend-continuity"));
+    }
+
+    #[test]
     fn shared_spectral_extraction_is_exactly_equivalent_and_runs_one_fft_per_frame() {
         let pcm = synth_tone_bursts(16_000, &[310, 470, 690, 930, 1_270, 1_610]);
         let landmark_config = LandmarkConfig {
@@ -5200,6 +5999,157 @@ mod tests {
             .all(|step| step.kind == EditPathKind::Matched));
         assert_eq!(result.spans[0].target_start_ms, 100);
         assert_eq!(result.spans[0].target_end_ms, 400);
+    }
+
+    #[test]
+    fn rolling_edit_dp_is_bit_exact_with_full_matrix_reference() {
+        fn label_sequences(length: usize) -> Vec<Vec<usize>> {
+            let sequence_count = 3_usize.pow(length as u32);
+            (0..sequence_count)
+                .map(|mut encoded| {
+                    let mut sequence = vec![0_usize; length];
+                    for label in &mut sequence {
+                        *label = encoded % 3;
+                        encoded /= 3;
+                    }
+                    sequence
+                })
+                .collect()
+        }
+
+        let configurations = [
+            (
+                AffineHypothesis {
+                    offset_ms: 0,
+                    ..identity_hypothesis()
+                },
+                EditAlignmentConfig {
+                    mode: EditAlignmentMode::Global,
+                    band_radius_ms: 1_000,
+                    gap_open_cost: 250,
+                    gap_extend_cost: 40,
+                    ambiguous_match_cost: 700,
+                    ..EditAlignmentConfig::default()
+                },
+            ),
+            (
+                AffineHypothesis {
+                    offset_ms: 0,
+                    ..identity_hypothesis()
+                },
+                EditAlignmentConfig {
+                    mode: EditAlignmentMode::SemiGlobal,
+                    band_radius_ms: 1_000,
+                    gap_open_cost: 250,
+                    gap_extend_cost: 40,
+                    ambiguous_match_cost: 700,
+                    ..EditAlignmentConfig::default()
+                },
+            ),
+            (
+                AffineHypothesis {
+                    offset_ms: 100,
+                    ..identity_hypothesis()
+                },
+                EditAlignmentConfig {
+                    mode: EditAlignmentMode::Global,
+                    band_radius_ms: 75,
+                    gap_open_cost: 500,
+                    gap_extend_cost: 500,
+                    ambiguous_match_cost: 700,
+                    ..EditAlignmentConfig::default()
+                },
+            ),
+            (
+                AffineHypothesis {
+                    offset_ms: -100,
+                    ..identity_hypothesis()
+                },
+                EditAlignmentConfig {
+                    mode: EditAlignmentMode::SemiGlobal,
+                    band_radius_ms: 125,
+                    gap_open_cost: 300,
+                    gap_extend_cost: 60,
+                    ambiguous_match_cost: 1_000,
+                    ..EditAlignmentConfig::default()
+                },
+            ),
+        ];
+
+        for source_len in 1..=3 {
+            for target_len in 1..=3 {
+                for source_labels in label_sequences(source_len) {
+                    for target_labels in label_sequences(target_len) {
+                        let source = feature_sequence(&source_labels, 0, 100);
+                        let target = feature_sequence(&target_labels, 0, 100);
+                        for (coarse, config) in &configurations {
+                            let expected = align_features_edit_aware_full_matrix_reference(
+                                &source, &target, coarse, config,
+                            );
+                            let actual = align_features_edit_aware_with_cancel(
+                                &source, &target, coarse, config, None,
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "source={source_labels:?}, target={target_labels:?}, mode={:?}, offset={}, band={}",
+                                config.mode, coarse.offset_ms, config.band_radius_ms
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let source = vec![
+            FineFeatureFrame {
+                time_ms: 0,
+                values: vec![0.25, -0.75, 1.5, 0.0],
+            },
+            FineFeatureFrame {
+                time_ms: 100,
+                values: vec![0.0, 0.0, 0.0, 0.0],
+            },
+            FineFeatureFrame {
+                time_ms: 200,
+                values: vec![3.5, -2.25, 0.125, 0.5],
+            },
+        ];
+        let target = vec![
+            FineFeatureFrame {
+                time_ms: 0,
+                values: vec![0.5, -1.25, 0.75, 0.25],
+            },
+            FineFeatureFrame {
+                time_ms: 100,
+                values: vec![0.0, 0.0, 0.0, 0.0],
+            },
+            FineFeatureFrame {
+                time_ms: 200,
+                values: vec![2.0, -1.0, 0.375, -0.75],
+            },
+        ];
+        for mode in [EditAlignmentMode::Global, EditAlignmentMode::SemiGlobal] {
+            let config = EditAlignmentConfig {
+                mode,
+                band_radius_ms: 1_000,
+                ..EditAlignmentConfig::default()
+            };
+            assert_eq!(
+                align_features_edit_aware_with_cancel(
+                    &source,
+                    &target,
+                    &identity_hypothesis(),
+                    &config,
+                    None,
+                ),
+                align_features_edit_aware_full_matrix_reference(
+                    &source,
+                    &target,
+                    &identity_hypothesis(),
+                    &config,
+                )
+            );
+        }
     }
 
     #[test]

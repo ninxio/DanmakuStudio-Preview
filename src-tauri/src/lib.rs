@@ -11,6 +11,7 @@ mod app_settings;
 mod audio_alignment;
 pub mod cuda_fft_backend;
 mod export_files;
+pub mod fine_frontier;
 mod manual_verification;
 mod media_probe;
 mod media_toolchain;

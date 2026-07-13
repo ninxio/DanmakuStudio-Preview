@@ -125,7 +125,7 @@ impl CudaFftMemoryBudget {
         let worst_case_total_device_bytes = input_bytes
             .checked_add(output_bytes)
             .and_then(|value| value.checked_add(worst_case_cufft_workspace_bytes))
-            .ok_or_else(|| CudaFftBatchError::invalid("device memory budget overflow"))?;
+            .ok_or_else(|| CudaFftBatchError::invalid("CUDA 设备内存预算计算溢出"))?;
 
         Ok(Self {
             batch_frames,
@@ -184,7 +184,7 @@ pub fn probe_cuda_fft_capability(device_ordinal: usize) -> CudaFftCapability {
             CudaFftCapabilityStatus::DriverLibraryMissing,
             driver_probe.reason.clone(),
             driver_probe,
-            DynamicLibraryProbe::not_attempted("cuFFT probe skipped because CUDA driver is absent"),
+            DynamicLibraryProbe::not_attempted("CUDA 驱动缺失，因此未继续检测 cuFFT。"),
             default_batch_memory,
         );
     }
@@ -194,7 +194,7 @@ pub fn probe_cuda_fft_capability(device_ordinal: usize) -> CudaFftCapability {
         return capability_unavailable(
             CudaFftCapabilityStatus::CufftLibraryMissing,
             format!(
-                "{} NVIDIA driver presence alone does not enable GPU FFT; a newly launched application must inherit CUDA Toolkit 13.x bin and bin\\x64 on PATH.",
+                "{} 仅有 NVIDIA 驱动不能启用 GPU FFT；请确认 CUDA Toolkit 13.x 的 bin 与 bin\\x64 已写入 PATH，然后完全退出并重新启动应用。",
                 cufft_probe.reason
             ),
             driver_probe,
@@ -210,7 +210,7 @@ pub fn probe_cuda_fft_capability(device_ordinal: usize) -> CudaFftCapability {
             bindings_version: CUDA_FFT_BINDINGS_VERSION.to_owned(),
             available: true,
             status: CudaFftCapabilityStatus::Ready,
-            reason: "CUDA context and 512-point cuFFT R2C smoke transform succeeded".to_owned(),
+            reason: "CUDA context 与 512 点 cuFFT R2C smoke transform 均已通过。".to_owned(),
             remediation: None,
             driver_library_loaded: true,
             driver_library_name: driver_probe.loaded_name,
@@ -239,7 +239,7 @@ pub fn probe_cuda_fft_capability(device_ordinal: usize) -> CudaFftCapability {
         Err(payload) => capability_unavailable(
             CudaFftCapabilityStatus::RuntimePanicked,
             format!(
-                "CUDA/cuFFT dynamic call panicked and was contained: {}",
+                "CUDA/cuFFT 动态调用发生异常，已安全拦截：{}",
                 panic_payload_message(payload)
             ),
             driver_probe,
@@ -333,7 +333,7 @@ impl CudaFftR2c512Session {
             let device_count = CudaContext::device_count().map_err(|error| {
                 CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::DriverFailure,
-                    format!("CUDA driver initialization failed: {error}"),
+                    format!("CUDA 驱动初始化失败：{error}"),
                     0,
                 )
             })?;
@@ -341,7 +341,7 @@ impl CudaFftR2c512Session {
                 return Err(CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::BackendUnavailable,
                     format!(
-                        "CUDA device ordinal {device_ordinal} is unavailable; detected {device_count} device(s)"
+                        "CUDA 设备序号 {device_ordinal} 不可用；当前检测到 {device_count} 个设备"
                     ),
                     0,
                 ));
@@ -349,7 +349,7 @@ impl CudaFftR2c512Session {
             let context = CudaContext::new(device_ordinal).map_err(|error| {
                 CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::DriverFailure,
-                    format!("failed to open CUDA device {device_ordinal}: {error}"),
+                    format!("无法打开 CUDA 设备 {device_ordinal}：{error}"),
                     0,
                 )
             })?;
@@ -366,7 +366,7 @@ impl CudaFftR2c512Session {
             Err(payload) => Err(CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::RuntimePanicked,
                 format!(
-                    "CUDA session initialization panicked and was contained: {}",
+                    "CUDA 会话初始化发生异常，已安全拦截：{}",
                     panic_payload_message(payload)
                 ),
                 0,
@@ -389,14 +389,14 @@ impl CudaFftR2c512Session {
         if self.poisoned {
             return Err(CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::RuntimePanicked,
-                "CUDA FFT session is poisoned after an earlier contained panic",
+                "CUDA FFT 会话此前发生异常，当前会话已停止继续使用",
                 0,
             ));
         }
         if cancellation.load(Ordering::Acquire) {
             return Err(CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::Cancelled,
-                "CUDA FFT batch was cancelled before allocation",
+                "CUDA FFT 批次在分配内存前已取消",
                 0,
             ));
         }
@@ -410,7 +410,7 @@ impl CudaFftR2c512Session {
                 Err(CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::RuntimePanicked,
                     format!(
-                        "CUDA/cuFFT batch panicked and was contained: {}",
+                        "CUDA/cuFFT 批次发生异常，已安全拦截：{}",
                         panic_payload_message(payload)
                     ),
                     0,
@@ -429,7 +429,7 @@ impl CudaFftR2c512Session {
         let input_device = self.stream.clone_htod(input_frames).map_err(|error| {
             CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::DriverFailure,
-                format!("failed to upload CUDA FFT batch: {error}"),
+                format!("CUDA FFT 批次上传失败：{error}"),
                 0,
             )
         })?;
@@ -439,7 +439,7 @@ impl CudaFftR2c512Session {
             .map_err(|error| {
                 CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::DriverFailure,
-                    format!("failed to allocate CUDA FFT output: {error}"),
+                    format!("CUDA FFT 输出内存分配失败：{error}"),
                     0,
                 )
             })?;
@@ -449,7 +449,7 @@ impl CudaFftR2c512Session {
             .ok_or_else(|| {
                 CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::CufftFailure,
-                    "cuFFT plan was not retained for execution",
+                    "cuFFT 执行计划未被正确保留",
                     0,
                 )
             })?
@@ -458,21 +458,21 @@ impl CudaFftR2c512Session {
             .map_err(|error| {
                 CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::CufftFailure,
-                    format!("cuFFT R2C execution failed: {error}"),
+                    format!("cuFFT R2C 执行失败：{error}"),
                     0,
                 )
             })?;
         self.stream.synchronize().map_err(|error| {
             CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::DriverFailure,
-                format!("CUDA FFT stream synchronization failed: {error}"),
+                format!("CUDA FFT 流同步失败：{error}"),
                 0,
             )
         })?;
         if cancellation.load(Ordering::Acquire) {
             return Err(CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::Cancelled,
-                "CUDA FFT batch was cancelled after GPU completion",
+                "CUDA FFT 批次在 GPU 完成计算后已取消",
                 batch_frames,
             ));
         }
@@ -480,14 +480,14 @@ impl CudaFftR2c512Session {
             self.stream.clone_dtoh(&output_device).map_err(|error| {
                 CudaFftBatchError::runtime(
                     CudaFftBatchErrorCode::DriverFailure,
-                    format!("failed to download CUDA FFT output: {error}"),
+                    format!("CUDA FFT 输出下载失败：{error}"),
                     0,
                 )
             })?;
         if cancellation.load(Ordering::Acquire) {
             return Err(CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::Cancelled,
-                "CUDA FFT batch was cancelled after output transfer",
+                "CUDA FFT 批次在输出传输后已取消",
                 batch_frames,
             ));
         }
@@ -530,7 +530,7 @@ impl CudaFftR2c512Session {
         .map_err(|error| {
             CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::CufftFailure,
-                format!("failed to create batched cuFFT plan: {error}"),
+                format!("批量 cuFFT 执行计划创建失败：{error}"),
                 0,
             )
         })?;
@@ -559,7 +559,7 @@ pub fn r2c_512_batched(
     if cancellation.load(Ordering::Acquire) {
         return Err(CudaFftBatchError::runtime(
             CudaFftBatchErrorCode::Cancelled,
-            "CUDA FFT request was cancelled before allocation",
+            "CUDA FFT 请求在分配内存前已取消",
             0,
         ));
     }
@@ -567,7 +567,7 @@ pub fn r2c_512_batched(
     let frame_count = input_frames.len() / CUDA_FFT_FRAME_LEN;
     let output_len = frame_count
         .checked_mul(CUDA_FFT_BINS_PER_FRAME)
-        .ok_or_else(|| CudaFftBatchError::invalid("FFT output length overflow"))?;
+        .ok_or_else(|| CudaFftBatchError::invalid("FFT 输出长度计算溢出"))?;
     let mut spectra = Vec::with_capacity(output_len);
     let mut completed_frames = 0usize;
 
@@ -575,7 +575,7 @@ pub fn r2c_512_batched(
         if cancellation.load(Ordering::Acquire) {
             return Err(CudaFftBatchError::runtime(
                 CudaFftBatchErrorCode::Cancelled,
-                "CUDA FFT request was cancelled at a batch boundary",
+                "CUDA FFT 请求在批次边界已取消",
                 completed_frames,
             ));
         }
@@ -650,11 +650,11 @@ fn probe_dynamic_library(logical_names: &[&str], required_symbols: &[&str]) -> D
                     return DynamicLibraryProbe {
                         loaded: true,
                         loaded_name: Some(candidate.clone()),
-                        reason: format!("loaded {candidate} and found every required symbol"),
+                        reason: format!("已加载 {candidate}，并找到全部必需符号。"),
                     };
                 }
                 load_errors.push(format!(
-                    "{candidate} is missing symbols {}",
+                    "{candidate} 缺少符号 {}",
                     missing_symbols.join(", ")
                 ));
             }
@@ -667,10 +667,10 @@ fn probe_dynamic_library(logical_names: &[&str], required_symbols: &[&str]) -> D
         loaded: false,
         loaded_name: None,
         reason: if load_errors.is_empty() {
-            format!("no dynamic-library candidates were generated for {logical_label}")
+            format!("没有为 {logical_label} 生成可检测的动态库候选。")
         } else {
             format!(
-                "could not load a usable {logical_label} library ({} candidates checked)",
+                "无法加载可用的 {logical_label} 动态库（已检测 {} 个候选）。",
                 candidates.len()
             )
         },
@@ -693,14 +693,14 @@ struct StackProbeError {
 fn probe_cudarc_stack(device_ordinal: usize) -> Result<ReadyStackProbe, StackProbeError> {
     let device_count = CudaContext::device_count().map_err(|error| StackProbeError {
         status: CudaFftCapabilityStatus::DriverInitializationFailed,
-        reason: format!("CUDA driver initialization failed: {error}"),
+        reason: format!("CUDA 驱动初始化失败：{error}"),
         device_count: None,
     })?;
     if device_count <= 0 || device_ordinal >= device_count as usize {
         return Err(StackProbeError {
             status: CudaFftCapabilityStatus::DeviceUnavailable,
             reason: format!(
-                "CUDA device ordinal {device_ordinal} is unavailable; detected {device_count} device(s)"
+                "CUDA 设备序号 {device_ordinal} 不可用；检测到 {device_count} 个设备。"
             ),
             device_count: Some(device_count),
         });
@@ -708,12 +708,12 @@ fn probe_cudarc_stack(device_ordinal: usize) -> Result<ReadyStackProbe, StackPro
 
     let context = CudaContext::new(device_ordinal).map_err(|error| StackProbeError {
         status: CudaFftCapabilityStatus::DriverInitializationFailed,
-        reason: format!("failed to open CUDA device {device_ordinal}: {error}"),
+        reason: format!("无法打开 CUDA 设备 {device_ordinal}：{error}"),
         device_count: Some(device_count),
     })?;
     let device_name = context.name().map_err(|error| StackProbeError {
         status: CudaFftCapabilityStatus::DriverInitializationFailed,
-        reason: format!("failed to query CUDA device name: {error}"),
+        reason: format!("无法读取 CUDA 设备名称：{error}"),
         device_count: Some(device_count),
     })?;
 
@@ -724,7 +724,7 @@ fn probe_cudarc_stack(device_ordinal: usize) -> Result<ReadyStackProbe, StackPro
     if driver_status != driver_sys::CUresult::CUDA_SUCCESS {
         return Err(StackProbeError {
             status: CudaFftCapabilityStatus::DriverInitializationFailed,
-            reason: format!("cuDriverGetVersion failed with {driver_status:?}"),
+            reason: format!("cuDriverGetVersion 调用失败：{driver_status:?}"),
             device_count: Some(device_count),
         });
     }
@@ -735,7 +735,7 @@ fn probe_cudarc_stack(device_ordinal: usize) -> Result<ReadyStackProbe, StackPro
     if cufft_status != cufft_sys::cufftResult::CUFFT_SUCCESS {
         return Err(StackProbeError {
             status: CudaFftCapabilityStatus::CufftInitializationFailed,
-            reason: format!("cufftGetVersion failed with {cufft_status:?}"),
+            reason: format!("cufftGetVersion 调用失败：{cufft_status:?}"),
             device_count: Some(device_count),
         });
     }
@@ -745,14 +745,14 @@ fn probe_cudarc_stack(device_ordinal: usize) -> Result<ReadyStackProbe, StackPro
         .clone_htod(&[0.0f32; CUDA_FFT_FRAME_LEN])
         .map_err(|error| StackProbeError {
             status: CudaFftCapabilityStatus::DriverInitializationFailed,
-            reason: format!("CUDA smoke-test upload failed: {error}"),
+            reason: format!("CUDA smoke test 上传失败：{error}"),
             device_count: Some(device_count),
         })?;
     let mut output = stream
         .alloc_zeros::<cufft_sys::float2>(CUDA_FFT_BINS_PER_FRAME)
         .map_err(|error| StackProbeError {
             status: CudaFftCapabilityStatus::DriverInitializationFailed,
-            reason: format!("CUDA smoke-test allocation failed: {error}"),
+            reason: format!("CUDA smoke test 显存分配失败：{error}"),
             device_count: Some(device_count),
         })?;
     let plan = CudaFft::plan_1d(
@@ -763,18 +763,18 @@ fn probe_cudarc_stack(device_ordinal: usize) -> Result<ReadyStackProbe, StackPro
     )
     .map_err(|error| StackProbeError {
         status: CudaFftCapabilityStatus::CufftInitializationFailed,
-        reason: format!("512-point cuFFT plan creation failed: {error}"),
+        reason: format!("512 点 cuFFT plan 创建失败：{error}"),
         device_count: Some(device_count),
     })?;
     plan.exec_r2c(&input, &mut output)
         .map_err(|error| StackProbeError {
             status: CudaFftCapabilityStatus::CufftInitializationFailed,
-            reason: format!("512-point cuFFT smoke transform failed: {error}"),
+            reason: format!("512 点 cuFFT smoke transform 失败：{error}"),
             device_count: Some(device_count),
         })?;
     stream.synchronize().map_err(|error| StackProbeError {
         status: CudaFftCapabilityStatus::DriverInitializationFailed,
-        reason: format!("CUDA smoke-test synchronization failed: {error}"),
+        reason: format!("CUDA smoke test 同步失败：{error}"),
         device_count: Some(device_count),
     })?;
 
@@ -816,24 +816,24 @@ fn capability_unavailable(
 
 fn capability_remediation(status: CudaFftCapabilityStatus) -> &'static str {
     match status {
-        CudaFftCapabilityStatus::Ready => "No action required.",
+        CudaFftCapabilityStatus::Ready => "无需操作。",
         CudaFftCapabilityStatus::DriverLibraryMissing => {
-            "Install or update the NVIDIA display driver so nvcuda.dll is available."
+            "请安装或更新 NVIDIA 显卡驱动，确保系统可加载 nvcuda.dll。"
         }
         CudaFftCapabilityStatus::CufftLibraryMissing => {
-            "Install NVIDIA CUDA Toolkit 13.x with cuFFT, add its bin and bin\\x64 directories to PATH, then restart the application."
+            "请安装包含 cuFFT 的 CUDA Toolkit 13.x，把 bin 与 bin\\x64 加入 PATH，然后完全退出并重启应用。"
         }
         CudaFftCapabilityStatus::DeviceUnavailable => {
-            "Select an existing CUDA device ordinal and ensure the NVIDIA GPU is enabled."
+            "请选择存在的 CUDA 设备序号，并确认 NVIDIA GPU 已启用。"
         }
         CudaFftCapabilityStatus::DriverInitializationFailed => {
-            "Restart the application after updating the NVIDIA driver; CPU fallback remains available."
+            "更新 NVIDIA 驱动后请重启应用；自动模式仍可回退 CPU。"
         }
         CudaFftCapabilityStatus::CufftInitializationFailed => {
-            "Repair the CUDA Toolkit/cuFFT installation and its runtime dependencies, then restart the application."
+            "请修复 CUDA Toolkit/cuFFT 及其运行依赖，然后重启应用。"
         }
         CudaFftCapabilityStatus::RuntimePanicked => {
-            "Keep CPU fallback enabled and inspect CUDA/cuFFT runtime compatibility before retrying."
+            "请保留 CPU 自动回退，并检查 CUDA/cuFFT 运行时兼容性后再试。"
         }
     }
 }
@@ -844,7 +844,7 @@ fn preflight_cuda_fft_runtime() -> Result<(), CudaFftBatchError> {
         return Err(CudaFftBatchError::runtime(
             CudaFftBatchErrorCode::BackendUnavailable,
             format!(
-                "CUDA driver library is unavailable: {} {}",
+                "CUDA 驱动库不可用：{} {}",
                 driver_probe.reason,
                 capability_remediation(CudaFftCapabilityStatus::DriverLibraryMissing)
             ),
@@ -856,7 +856,7 @@ fn preflight_cuda_fft_runtime() -> Result<(), CudaFftBatchError> {
         return Err(CudaFftBatchError::runtime(
             CudaFftBatchErrorCode::BackendUnavailable,
             format!(
-                "cuFFT runtime is unavailable even though the NVIDIA driver is present: {} {}",
+                "已检测到 NVIDIA 驱动，但 cuFFT runtime 不可用：{} {}",
                 cufft_probe.reason,
                 capability_remediation(CudaFftCapabilityStatus::CufftLibraryMissing)
             ),
@@ -869,7 +869,7 @@ fn preflight_cuda_fft_runtime() -> Result<(), CudaFftBatchError> {
 fn validate_batch_size(batch_frames: usize) -> Result<(), CudaFftBatchError> {
     if batch_frames == 0 || batch_frames > CUDA_FFT_MAX_BATCH_FRAMES {
         return Err(CudaFftBatchError::invalid(format!(
-            "GPU batch size must be between 1 and {CUDA_FFT_MAX_BATCH_FRAMES} frames"
+            "GPU 批次帧数必须位于 1–{CUDA_FFT_MAX_BATCH_FRAMES}。"
         )));
     }
     Ok(())
@@ -881,13 +881,13 @@ fn validate_input_frames(
 ) -> Result<(), CudaFftBatchError> {
     if input_frames.is_empty() || !input_frames.len().is_multiple_of(CUDA_FFT_FRAME_LEN) {
         return Err(CudaFftBatchError::invalid(format!(
-            "input must contain a non-empty whole number of {CUDA_FFT_FRAME_LEN}-sample frames"
+            "输入必须包含非空且完整的 {CUDA_FFT_FRAME_LEN} 采样点帧"
         )));
     }
     let frame_count = input_frames.len() / CUDA_FFT_FRAME_LEN;
     if maximum_frames.is_some_and(|maximum| frame_count > maximum) {
         return Err(CudaFftBatchError::invalid(format!(
-            "one reusable-session batch may contain at most {CUDA_FFT_MAX_BATCH_FRAMES} frames"
+            "单个可复用会话批次最多可包含 {CUDA_FFT_MAX_BATCH_FRAMES} 帧"
         )));
     }
     Ok(())
@@ -897,7 +897,7 @@ fn checked_product(values: &[usize]) -> Result<usize, CudaFftBatchError> {
     values.iter().try_fold(1usize, |product, value| {
         product
             .checked_mul(*value)
-            .ok_or_else(|| CudaFftBatchError::invalid("device memory budget overflow"))
+            .ok_or_else(|| CudaFftBatchError::invalid("CUDA 设备内存预算计算溢出"))
     })
 }
 
@@ -907,7 +907,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     } else if let Some(message) = payload.downcast_ref::<String>() {
         message.clone()
     } else {
-        "non-string panic payload".to_owned()
+        "异常信息不是字符串".to_owned()
     }
 }
 
@@ -960,7 +960,7 @@ mod tests {
 
         assert!(!probe.loaded);
         assert!(probe.loaded_name.is_none());
-        assert!(probe.reason.contains("could not load"));
+        assert!(probe.reason.contains("无法加载可用的"));
     }
 
     #[test]

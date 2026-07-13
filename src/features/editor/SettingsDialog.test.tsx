@@ -75,6 +75,7 @@ describe("设置中心", () => {
 
     await user.click(screen.getByRole("button", { name: "播放器与工具" }));
     expect(screen.getByRole("button", { name: "检测 4090 / CUDA" })).toBeInTheDocument();
+    expect(screen.getByText(/能力可用且本次粗定位实际由 CUDA 完成时/)).toBeInTheDocument();
     expect(screen.getByText(/仅检测到显卡驱动不代表可用/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("FFmpeg 路径"), {
       target: { value: "C:\\tools\\ffmpeg.exe" }
@@ -142,7 +143,7 @@ describe("设置中心", () => {
     expect(await screen.findByTestId("cuda-capability-result")).toHaveTextContent(
       "NVIDIA GeForce RTX 4090"
     );
-    expect(screen.getByTestId("cuda-capability-result")).toHaveTextContent("自动模式已启用");
+    expect(screen.getByTestId("cuda-capability-result")).toHaveTextContent("可用于自动模式");
     expect(cudaMocks.probe).toHaveBeenCalledTimes(1);
   });
 

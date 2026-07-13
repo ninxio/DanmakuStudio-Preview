@@ -3,9 +3,9 @@ use crate::alignment_v2::match_landmarks_affine_with_cancel;
 use crate::{
     alignment_v2::{
         align_features_edit_aware_with_cancel, derive_affine_fine_decode_windows,
-        extract_fine_features_with_cancel,
+        extract_fine_features_with_backend_request,
         extract_landmarks_and_fine_features_with_backend_request,
-        match_landmarks_affine_coarse_universe_with_cancel,
+        lock_fine_spectral_backend_request, match_landmarks_affine_coarse_universe_with_cancel,
         materialize_affine_hypothesis_with_cancel, refine_boundary_by_correlation_with_cancel,
         refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_request,
         AffineAnchorEvidence, AffineFineDecodeWindows, AffineFineWindowRequest, AffineHypothesis,
@@ -13,7 +13,11 @@ use crate::{
         EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
         FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs,
         SpectralBackendExecution, SpectralBackendRequest, SpectralLandmark,
-        StreamingLandmarkExtractor, STREAMING_CPU_SPECTRAL_BACKEND_ID,
+        StreamingLandmarkExtractor, CPU_SPECTRAL_BACKEND_ID, STREAMING_CPU_SPECTRAL_BACKEND_ID,
+        STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
+    },
+    cuda_fft_backend::{
+        CudaFftMemoryBudget, CUDA_FFT_BACKEND_ID, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
     },
     media_probe::{
         probe_audio_decode_timelines_with_ffprobe_cancellable,
@@ -103,7 +107,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.2-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-v12";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-batch-tool-pin-heldout-span-exhaustive-coarse-cuda-fine-v13";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -119,6 +123,9 @@ const ALIGNMENT_V2_FINE_WINDOW_GUARD_MS: i64 = ALIGNMENT_V2_DP_BAND_RADIUS_MS + 
 // At most one 50 ms fine-feature hop may be lost to codec/frame rounding. Larger shortfall means
 // the requested presentation interval was not fully decoded and must block.
 const ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS: u64 = 50;
+// Full short-media coarse decode runs to EOF. Container and selected-stream probes may differ by
+// codec/container rounding, so both feed one explicit allowance before the 60-minute hard cap.
+const ALIGNMENT_V2_SHORT_DECODE_DURATION_SLACK_MS: u64 = 1_000;
 // After the first target chunk, keep bounded source-axis lookahead so a reference-side insert
 // (opening, advertisement, or uncensored material) can be consumed as sourceOnly instead of
 // pushing every later target chunk into a false targetOnly path. At the production 50 ms hop,
@@ -128,23 +135,37 @@ const ALIGNMENT_V2_PENDING_RECOVERY_MIN_MATCH_MS: u64 = 5_000;
 const ALIGNMENT_V2_PENDING_RECOVERY_ABSOLUTE_FLOOR_MS: u64 = 500;
 const ALIGNMENT_V2_PENDING_RECOVERY_CURSOR_TOLERANCE_MS: u64 = 100;
 const ALIGNMENT_V2_MAX_DP_CELLS: usize = 4_000_000;
-// The edit-aware solver owns three i64 cost planes and three u8 parent planes. Charge that
-// workspace, plus a conservative path/span reconstruction allowance, before allocating any DP
-// plane. This closes the previous gap where a nominally 1 GiB fine run could allocate another
-// ~108 MiB at the 4M-cell limit outside the active-artifact ledger.
-const ALIGNMENT_V2_DP_BYTES_PER_CELL: usize =
-    3 * std::mem::size_of::<i64>() + 3 * std::mem::size_of::<u8>();
+// The edit-aware solver retains three full u8 parent planes for exact traceback, while its three
+// i64 cost states use previous/current rolling rows. Charge both explicitly; the rolling width is
+// the target argument passed to align_features_edit_aware_with_cancel, not an interchangeable
+// matrix dimension because semi-global axis semantics forbid transposition.
+const ALIGNMENT_V2_DP_PARENT_BYTES_PER_CELL: usize = 3 * std::mem::size_of::<u8>();
+const ALIGNMENT_V2_DP_ROLLING_COST_ROW_COUNT: usize = 6;
 const ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP: usize = 128;
 const ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES: usize = 1024 * 1024;
 const ALIGNMENT_V2_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
-const ALIGNMENT_V2_MAX_PCM_BYTES: usize =
-    ALIGNMENT_V2_SAMPLE_RATE as usize * (ALIGNMENT_V2_MAX_DURATION_MS as usize / 1_000) * 2;
 const ALIGNMENT_V2_MAX_STDERR_BYTES: usize = 1024 * 1024;
 const ALIGNMENT_V2_COARSE_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
 const ALIGNMENT_V2_COARSE_DURATION_SLACK_MS: u64 = 60_000;
 const ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES: usize = 32 * 1024;
 const ALIGNMENT_V2_COARSE_STDOUT_BUFFERED_CHUNKS: usize = 2;
-const ALIGNMENT_V2_COARSE_MAX_LANDMARKS: usize = 48 * 48 * 64;
+const SUPERVISED_READ_BOUNDED_INITIAL_CAPACITY_BYTES: usize = 64 * 1024;
+const ALIGNMENT_V2_SPECTRAL_BIN_COUNT: usize = 48;
+const ALIGNMENT_V2_FINE_FEATURE_VALUE_COUNT: usize = 14;
+const ALIGNMENT_V2_MAX_SPECTRAL_PEAKS_PER_FRAME: usize = 4;
+const ALIGNMENT_V2_SPECTRAL_PEAK_UPPER_BYTES: usize = 24;
+const ALIGNMENT_V2_LANDMARK_FANOUT: usize = 5;
+const ALIGNMENT_V2_COARSE_WINDOW_MS: usize = 50;
+const ALIGNMENT_V2_COARSE_WINDOW_SAMPLES: usize =
+    ALIGNMENT_V2_SAMPLE_RATE as usize * ALIGNMENT_V2_COARSE_WINDOW_MS / 1_000;
+const ALIGNMENT_V2_COARSE_FAMILY_COUNT: usize =
+    ALIGNMENT_V2_SPECTRAL_BIN_COUNT * ALIGNMENT_V2_SPECTRAL_BIN_COUNT;
+const ALIGNMENT_V2_COARSE_MAX_LANDMARKS: usize = ALIGNMENT_V2_COARSE_FAMILY_COUNT * 64;
+// `MediaCoarseIndex` retains a private ranked wrapper around each landmark. Sixty-four bytes per
+// item safely covers its current scalar payload, alignment and Vec capacity. The fixed family
+// allowance covers the 2,304 HashMap buckets, control bytes and short pending-anchor queues.
+const ALIGNMENT_V2_STREAMING_RANKED_LANDMARK_UPPER_BYTES: usize = 64;
+const ALIGNMENT_V2_STREAMING_FAMILY_OVERHEAD_BYTES: usize = 1024 * 1024;
 const ALIGNMENT_V2_MIN_TRACK_MARGIN: f64 = 0.10;
 const ALIGNMENT_V2_MIN_TEMPORAL_COVERAGE: f64 = 0.20;
 const ALIGNMENT_V2_MAX_UNSELECTED_STREAMS: usize = 12;
@@ -1177,9 +1198,36 @@ struct V2CandidateExtractionState<'a> {
 }
 
 #[derive(Debug)]
+enum V2CoarseCandidateCachePlan {
+    Hit(CachedV2Landmarks),
+    Miss { expected_cache_key: String },
+}
+
+#[derive(Debug)]
+struct V2CandidateSetCachePlan {
+    candidates: Vec<V2CoarseCandidateCachePlan>,
+    planned_baseline_bytes: usize,
+    projected_retained_bytes: usize,
+}
+
+#[derive(Debug)]
+struct V2OrdinaryCandidateCachePlans {
+    source: V2CandidateSetCachePlan,
+    target: V2CandidateSetCachePlan,
+}
+
+struct V2LandmarkExtractionContext<'a> {
+    cancel_flag: Option<&'a AtomicBool>,
+    shared_backend_request: Option<&'a SpectralBackendRequest>,
+    cache_plan: Option<V2CoarseCandidateCachePlan>,
+    retained_artifact_bytes: usize,
+}
+
+#[derive(Debug)]
 struct DecodedV2Audio {
     pcm: Arc<Vec<i16>>,
     fine_features: Arc<Vec<FineFeatureFrame>>,
+    fine_spectral_backend: SpectralBackendExecution,
     presentation_offset_ms: i64,
 }
 
@@ -5440,13 +5488,6 @@ where
             cancel_flag,
         );
     }
-    // Reserve the worst-case candidate payload before the first FFmpeg decode. This makes
-    // the auto-track path transactional with respect to the active-memory guard: an input
-    // with too many long tracks is rejected without leaving a partially warmed artifact set.
-    if prepared.is_none() {
-        ensure_v2_candidate_set_active_budget(&source_inputs, &target_inputs)?;
-    }
-    check_cancelled(cancel_flag)?;
     // Resolve capability once for the whole alignment run; candidate tracks and both media then
     // share the same planned backend identity during cache lookup and extraction.
     let spectral_backend_request = if prepared.is_none() {
@@ -5454,6 +5495,28 @@ where
     } else {
         None
     };
+    let initial_retained_artifact_bytes = v2_prepared_retained_artifact_baseline(prepared.as_ref());
+    // Ordinary source/target extraction is one transactional admission boundary. Plan both media
+    // before the first FFmpeg decode, retain every prefetched hit Arc, and charge the target from
+    // the source plan's conservative projected prefix.
+    let ordinary_cache_plans = if let Some(backend_request) = spectral_backend_request.as_ref() {
+        Some(plan_v2_ordinary_candidate_sets_cache_aware(
+            &request.source_path,
+            &request.complete_path,
+            options,
+            &source_inputs,
+            &target_inputs,
+            &backend_request.planned_backend_id,
+            initial_retained_artifact_bytes,
+        )?)
+    } else {
+        None
+    };
+    let (source_cache_plan, target_cache_plan) = match ordinary_cache_plans {
+        Some(plans) => (Some(plans.source), Some(plans.target)),
+        None => (None, None),
+    };
+    check_cancelled(cancel_flag)?;
 
     benchmark_stage("extracting-source", "提取参考音轨 landmark");
     update_progress(0.12, "正在为 B 站参考候选音轨提取 16 kHz landmark。")?;
@@ -5469,16 +5532,20 @@ where
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut retained_artifact_bytes = v2_prepared_retained_artifact_baseline(prepared.as_ref());
+    let mut retained_artifact_bytes = initial_retained_artifact_bytes;
     let source_landmarks = if let Some(prepared) = prepared.as_ref() {
         prepared.source.landmarks.clone()
     } else {
+        let cache_plan = source_cache_plan.ok_or_else(|| {
+            "blocked:resource-limit：普通 V2 source 缺少联合预建缓存计划。".to_string()
+        })?;
         extract_v2_landmark_candidates(
             &request.source_path,
             "B 站参考",
             options,
             &source_inputs,
             cancel_flag,
+            Some(cache_plan),
             &mut V2CandidateExtractionState {
                 notes: &mut extraction_notes,
                 retained_artifact_bytes: &mut retained_artifact_bytes,
@@ -5497,12 +5564,16 @@ where
         );
         prepared.target.landmarks.clone()
     } else {
+        let cache_plan = target_cache_plan.ok_or_else(|| {
+            "blocked:resource-limit：普通 V2 target 缺少联合预建缓存计划。".to_string()
+        })?;
         extract_v2_landmark_candidates(
             &request.complete_path,
             "目标原片",
             options,
             &target_inputs,
             cancel_flag,
+            Some(cache_plan),
             &mut V2CandidateExtractionState {
                 notes: &mut extraction_notes,
                 retained_artifact_bytes: &mut retained_artifact_bytes,
@@ -5701,6 +5772,45 @@ where
             fine_active_artifact_bytes.div_ceil(1024 * 1024)
         ));
     }
+    let cuda_fine_transient_bytes = match v2_selected_fine_cuda_transient_upper_bound(
+        source_landmark_artifact,
+        target_landmark_artifact,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            extraction_notes.push(error);
+            return Ok(create_blocked_v2_affine_proposal(
+                "所选候选无法建立连续、可信的 fine 声谱后端与显存上界。",
+                &best_pair,
+                top1_top2_margin,
+                alternatives,
+                extraction_notes,
+            ));
+        }
+    };
+    if cuda_fine_transient_bytes > 0 {
+        let fine_extraction_peak_bytes = match ensure_v2_active_artifact_budget(
+            fine_active_artifact_bytes,
+            cuda_fine_transient_bytes,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                extraction_notes.push(error);
+                return Ok(create_blocked_v2_affine_proposal(
+                    "所选候选的 CUDA fine 主机批次与 cuFFT 显存工作区超过单任务合计预算。",
+                    &best_pair,
+                    top1_top2_margin,
+                    alternatives,
+                    extraction_notes,
+                ));
+            }
+        };
+        extraction_notes.push(format!(
+            "选中窗口 fine 声谱锁定 CUDA/cuFFT；4096 帧有界批次的 pageable host、device input/output 与最坏 cuFFT workspace 合计按 {} MiB 计入 1 GiB 活跃预算，阶段峰值 {} MiB。",
+            cuda_fine_transient_bytes.div_ceil(1024 * 1024),
+            fine_extraction_peak_bytes.div_ceil(1024 * 1024)
+        ));
+    }
 
     benchmark_stage("extracting-source", "解码参考音轨细粒度特征");
     update_progress(
@@ -5758,6 +5868,26 @@ where
             ));
         }
     };
+    for (label, coarse_backend, fine_backend) in [
+        (
+            "B 站参考",
+            &source_landmark_artifact.spectral_backend,
+            &source_audio.fine_spectral_backend,
+        ),
+        (
+            "目标原片",
+            &target_landmark_artifact.spectral_backend,
+            &target_audio.fine_spectral_backend,
+        ),
+    ] {
+        extraction_notes.push(format!(
+            "{label} fine 声谱后端 {}（由 coarse 后端 {} 连续锁定；{}）。",
+            fine_backend.backend_id, coarse_backend.backend_id, fine_backend.backend_detail
+        ));
+        if let Some(reason) = &fine_backend.fallback_reason {
+            extraction_notes.push(format!("{label} fine 声谱后端说明：{reason}"));
+        }
+    }
 
     benchmark_stage("fitting", "执行分块 edit-aware DP");
     update_progress(0.89, "正在沿最佳 affine 走廊执行分块 edit-aware DP。")?;
@@ -5771,6 +5901,9 @@ where
     ) {
         Ok(result) => result,
         Err(error) => {
+            // The fine algorithm reports cancellation through the shared token. Preserve the
+            // batch lifecycle terminal state instead of disguising it as a reviewable proposal.
+            check_cancelled(cancel_flag)?;
             extraction_notes.push(error);
             return Ok(create_blocked_v2_affine_proposal(
                 "细粒度 DP 未能形成完整、单调的双轴路径；已安全阻断旧引擎回退。",
@@ -7614,17 +7747,49 @@ fn extract_v2_landmark_candidates(
     options: &AudioAlignmentOptions,
     inputs: &[AlignmentAudioInput],
     cancel_flag: Option<&AtomicBool>,
+    prebuilt_cache_plan: Option<V2CandidateSetCachePlan>,
     state: &mut V2CandidateExtractionState<'_>,
 ) -> Result<HashMap<u32, CachedV2Landmarks>, String> {
+    // Snapshot every warm artifact as an Arc-backed plan before extraction. Cache hits are charged
+    // by their actual retained payload and remain reusable even if a later miss evicts their LRU
+    // entry; only misses reserve a decode/analysis phase peak.
+    let cache_plan = match prebuilt_cache_plan {
+        Some(plan) => {
+            if plan.candidates.len() != inputs.len() {
+                return Err(
+                    "blocked:resource-limit：预建 coarse 缓存计划与候选音轨数量不一致。"
+                        .to_string(),
+                );
+            }
+            if *state.retained_artifact_bytes > plan.planned_baseline_bytes {
+                return Err(
+                    "blocked:resource-limit：执行时驻留制品已超过预建 coarse 缓存计划基线。"
+                        .to_string(),
+                );
+            }
+            plan
+        }
+        None => plan_v2_candidate_set_cache_aware(
+            media_path,
+            options,
+            inputs,
+            &state.spectral_backend_request.planned_backend_id,
+            *state.retained_artifact_bytes,
+        )?,
+    };
     let mut output = HashMap::new();
-    for input in inputs {
+    for (input, candidate_plan) in inputs.iter().zip(cache_plan.candidates) {
         match get_v2_landmarks(
             media_path,
             label,
             options,
             input,
-            cancel_flag,
-            Some(state.spectral_backend_request),
+            V2LandmarkExtractionContext {
+                cancel_flag,
+                shared_backend_request: Some(state.spectral_backend_request),
+                cache_plan: Some(candidate_plan),
+                retained_artifact_bytes: *state.retained_artifact_bytes,
+            },
         ) {
             Ok(artifact) if !artifact.landmarks.is_empty() => {
                 let artifact_bytes = cached_v2_landmark_retained_bytes(&artifact);
@@ -7700,6 +7865,68 @@ fn v2_pcm_bytes_for_duration_ms(duration_ms: u64) -> Option<usize> {
     usize::try_from(bytes).ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2PcmDecodeBudget {
+    duration_budget_ms: u64,
+    stdout_hard_limit_bytes: usize,
+}
+
+fn v2_short_pcm_decode_budget(input: &AlignmentAudioInput) -> Result<V2PcmDecodeBudget, String> {
+    let container_duration_ms = input.media_duration_ms.ok_or_else(|| {
+        "blocked:resource-limit：短媒体完整 PCM 解码要求已知容器时长。".to_string()
+    })?;
+    if container_duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
+        return Err("blocked:resource-limit：长媒体不能使用短媒体完整 PCM 解码预算。".to_string());
+    }
+    let probed_duration_ms = input
+        .stream
+        .duration_ms
+        .unwrap_or(container_duration_ms)
+        .max(container_duration_ms);
+    let duration_budget_ms = probed_duration_ms
+        .checked_add(ALIGNMENT_V2_SHORT_DECODE_DURATION_SLACK_MS)
+        .ok_or_else(|| "blocked:resource-limit：短媒体 PCM 时长预算溢出。".to_string())?
+        .min(ALIGNMENT_V2_MAX_DURATION_MS);
+    let stdout_hard_limit_bytes = v2_pcm_bytes_for_duration_ms(duration_budget_ms)
+        .ok_or_else(|| "blocked:resource-limit：短媒体 PCM stdout 上界无法表示。".to_string())?;
+    Ok(V2PcmDecodeBudget {
+        duration_budget_ms,
+        stdout_hard_limit_bytes,
+    })
+}
+
+fn v2_fine_window_pcm_decode_budget(
+    range: PresentationRangeMs,
+) -> Result<V2PcmDecodeBudget, String> {
+    let duration_ms = v2_presentation_range_duration_ms(range)?;
+    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
+        return Err(format!(
+            "blocked:resource-limit：精解码窗口超过 {} 分钟硬上限。",
+            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
+        ));
+    }
+    let duration_budget_ms = duration_ms
+        .checked_add(ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS)
+        .ok_or_else(|| "blocked:resource-limit：精解码 stdout 时长预算溢出。".to_string())?;
+    let stdout_hard_limit_bytes = v2_pcm_bytes_for_duration_ms(duration_budget_ms)
+        .ok_or_else(|| "blocked:resource-limit：精解码 stdout 字节预算无法表示。".to_string())?;
+    Ok(V2PcmDecodeBudget {
+        duration_budget_ms,
+        stdout_hard_limit_bytes,
+    })
+}
+
+fn supervised_read_bounded_vec_capacity_upper_bound(hard_limit: usize) -> Result<usize, String> {
+    hard_limit
+        .checked_mul(2)
+        .map(|doubled| doubled.max(SUPERVISED_READ_BOUNDED_INITIAL_CAPACITY_BYTES))
+        .ok_or_else(|| "blocked:resource-limit：受监督 reader Vec capacity 上界溢出。".to_string())
+}
+
+fn supervised_read_bounded_stderr_capacity_upper_bound() -> Result<usize, String> {
+    supervised_read_bounded_vec_capacity_upper_bound(ALIGNMENT_V2_MAX_STDERR_BYTES)
+}
+
 fn v2_presentation_bounds_for_samples(
     presentation_offset_ms: i64,
     sample_count: u64,
@@ -7743,6 +7970,338 @@ fn v2_presentation_range_duration_ms(range: PresentationRangeMs) -> Result<u64, 
         })
 }
 
+fn v2_resource_checked_sum(parts: &[usize], label: &str) -> Result<usize, String> {
+    parts.iter().try_fold(0_usize, |total, part| {
+        total
+            .checked_add(*part)
+            .ok_or_else(|| format!("blocked:resource-limit：{label}内存上界溢出。"))
+    })
+}
+
+fn v2_resource_checked_product(parts: &[usize], label: &str) -> Result<usize, String> {
+    parts.iter().try_fold(1_usize, |total, part| {
+        total
+            .checked_mul(*part)
+            .ok_or_else(|| format!("blocked:resource-limit：{label}内存上界溢出。"))
+    })
+}
+
+fn v2_short_coarse_frame_count_upper_bound(input: &AlignmentAudioInput) -> Result<usize, String> {
+    let duration_ms = v2_short_pcm_decode_budget(input)?.duration_budget_ms;
+    usize::try_from(
+        (duration_ms as u128)
+            .checked_add(ALIGNMENT_V2_LANDMARK_HOP_MS as u128 - 1)
+            .ok_or_else(|| "blocked:resource-limit：候选帧数溢出。".to_string())?
+            / ALIGNMENT_V2_LANDMARK_HOP_MS as u128,
+    )
+    .map_err(|_| "blocked:resource-limit：候选帧数无法表示。".to_string())
+}
+
+fn v2_unsuppressed_landmark_bytes(frame_count: usize) -> Result<usize, String> {
+    v2_resource_checked_product(
+        &[
+            frame_count,
+            ALIGNMENT_V2_MAX_SPECTRAL_PEAKS_PER_FRAME,
+            ALIGNMENT_V2_LANDMARK_FANOUT,
+            std::mem::size_of::<SpectralLandmark>(),
+        ],
+        "未抑制 landmark",
+    )
+}
+
+fn v2_fine_feature_bytes(frame_count: usize) -> Result<usize, String> {
+    let bytes_per_frame = std::mem::size_of::<FineFeatureFrame>()
+        .checked_add(
+            ALIGNMENT_V2_FINE_FEATURE_VALUE_COUNT
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    "blocked:resource-limit：fine feature value 上界溢出。".to_string()
+                })?,
+        )
+        .ok_or_else(|| "blocked:resource-limit：fine feature frame 上界溢出。".to_string())?;
+    v2_resource_checked_product(&[frame_count, bytes_per_frame], "fine feature")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2CoarseBackendBudgetKind {
+    Cpu,
+    CudaOrHybrid,
+}
+
+fn v2_coarse_backend_budget_kind(
+    planned_backend_id: &str,
+) -> Result<V2CoarseBackendBudgetKind, String> {
+    match planned_backend_id {
+        CPU_SPECTRAL_BACKEND_ID | STREAMING_CPU_SPECTRAL_BACKEND_ID => {
+            Ok(V2CoarseBackendBudgetKind::Cpu)
+        }
+        CUDA_FFT_BACKEND_ID | STREAMING_HYBRID_SPECTRAL_BACKEND_ID => {
+            Ok(V2CoarseBackendBudgetKind::CudaOrHybrid)
+        }
+        backend_id => Err(format!(
+            "blocked:resource-limit：无法为未知 coarse 声谱后端 {backend_id:?} 建立阶段预算。"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct V2CoarseStageBudget {
+    final_artifact_bytes: usize,
+    decode_phase_bytes: usize,
+    analysis_phase_bytes: usize,
+    peak_additional_bytes: usize,
+}
+
+fn v2_cuda_fft_batch_transient_upper_bound_bytes() -> Result<usize, String> {
+    let device =
+        CudaFftMemoryBudget::for_batch(CUDA_FFT_DEFAULT_BATCH_FRAMES).map_err(|error| {
+            format!(
+                "blocked:resource-limit：CUDA FFT 批次显存上界无法建立：{:?}: {}",
+                error.code, error.message
+            )
+        })?;
+    // `transform_batch_inner` first downloads `Vec<cufft_sys::float2>` and then collects a
+    // `Vec<CudaComplex32>`. The allocator may optimize that conversion in place, but admission
+    // cannot depend on an implementation detail, so both pageable host output Vecs are charged.
+    let double_host_output_bytes = device
+        .output_bytes
+        .checked_mul(2)
+        .ok_or_else(|| "blocked:resource-limit：CUDA FFT 双主机输出上界溢出。".to_string())?;
+    let host_batch_bytes = v2_resource_checked_sum(
+        &[
+            device.input_bytes,
+            double_host_output_bytes,
+            v2_resource_checked_product(
+                &[CUDA_FFT_DEFAULT_BATCH_FRAMES, std::mem::size_of::<f64>()],
+                "CUDA FFT RMS",
+            )?,
+        ],
+        "CUDA FFT 主机批次",
+    )?;
+    v2_resource_checked_sum(
+        &[device.worst_case_total_device_bytes, host_batch_bytes],
+        "CUDA FFT 主机与显存合计",
+    )
+}
+
+fn v2_short_coarse_decode_phase_upper_bound(input: &AlignmentAudioInput) -> Result<usize, String> {
+    let decode_budget = v2_short_pcm_decode_budget(input)?;
+    v2_resource_checked_sum(
+        &[
+            supervised_read_bounded_vec_capacity_upper_bound(
+                decode_budget.stdout_hard_limit_bytes,
+            )?,
+            decode_budget.stdout_hard_limit_bytes,
+            supervised_read_bounded_stderr_capacity_upper_bound()?,
+        ],
+        "短媒体 FFmpeg read_bounded stdout 与 parsed PCM 阶段",
+    )
+}
+
+fn v2_short_coarse_analysis_phase_upper_bound(
+    input: &AlignmentAudioInput,
+    backend_kind: V2CoarseBackendBudgetKind,
+) -> Result<usize, String> {
+    let pcm_bytes = v2_short_pcm_decode_budget(input)?.stdout_hard_limit_bytes;
+    let frame_count = v2_short_coarse_frame_count_upper_bound(input)?;
+    let fine_bytes = v2_fine_feature_bytes(frame_count)?;
+    let unsuppressed_landmark_bytes = v2_unsuppressed_landmark_bytes(frame_count)?;
+    let spectra_bytes = v2_resource_checked_product(
+        &[
+            frame_count,
+            std::mem::size_of::<Vec<f64>>()
+                + ALIGNMENT_V2_SPECTRAL_BIN_COUNT * std::mem::size_of::<f64>(),
+        ],
+        "短媒体 duration-sized spectra",
+    )?;
+    let peaks_bytes = v2_resource_checked_product(
+        &[
+            frame_count,
+            std::mem::size_of::<Vec<u8>>()
+                + ALIGNMENT_V2_MAX_SPECTRAL_PEAKS_PER_FRAME
+                    * ALIGNMENT_V2_SPECTRAL_PEAK_UPPER_BYTES,
+        ],
+        "短媒体 peaks-by-frame",
+    )?;
+    let frame_time_bytes = v2_resource_checked_product(
+        &[frame_count, std::mem::size_of::<i64>()],
+        "短媒体 frame time",
+    )?;
+    // During common-family suppression the original unsuppressed Vec allocation can coexist with
+    // all per-family Vec allocations. Each geometrically grown family Vec is bounded below 2x
+    // its live length, so four payload copies cover the input capacity plus family capacities and
+    // the rebuilding output while the spectra/peaks analysis remains borrowed.
+    let landmark_suppression_bytes = unsuppressed_landmark_bytes
+        .checked_mul(4)
+        .ok_or_else(|| "blocked:resource-limit：短媒体 landmark 抑制阶段上界溢出。".to_string())?;
+    let cpu_fft_scratch_bytes = v2_resource_checked_sum(
+        &[
+            v2_resource_checked_product(
+                &[CUDA_FFT_FRAME_LEN, std::mem::size_of::<(f64, f64)>()],
+                "CPU FFT scratch",
+            )?,
+            v2_resource_checked_product(
+                &[
+                    ALIGNMENT_V2_SPECTRAL_BIN_COUNT,
+                    std::mem::size_of::<usize>(),
+                ],
+                "CPU FFT selected bins",
+            )?,
+        ],
+        "CPU FFT scratch",
+    )?;
+    let cuda_batch_bytes = match backend_kind {
+        V2CoarseBackendBudgetKind::Cpu => 0,
+        V2CoarseBackendBudgetKind::CudaOrHybrid => v2_cuda_fft_batch_transient_upper_bound_bytes()?,
+    };
+    v2_resource_checked_sum(
+        &[
+            pcm_bytes,
+            fine_bytes,
+            spectra_bytes,
+            frame_count, // Vec<bool> is bit-packed; one byte per frame is deliberately conservative.
+            peaks_bytes,
+            frame_time_bytes,
+            landmark_suppression_bytes,
+            ALIGNMENT_V2_STREAMING_FAMILY_OVERHEAD_BYTES,
+            cpu_fft_scratch_bytes,
+            cuda_batch_bytes,
+        ],
+        "短媒体 coarse 分析阶段",
+    )
+}
+
+fn v2_streaming_coarse_phase_upper_bound(
+    backend_kind: V2CoarseBackendBudgetKind,
+) -> Result<usize, String> {
+    let final_landmarks = v2_resource_checked_product(
+        &[
+            ALIGNMENT_V2_COARSE_MAX_LANDMARKS,
+            std::mem::size_of::<SpectralLandmark>(),
+        ],
+        "流式最终 landmark",
+    )?;
+    let ranked_index_bytes = v2_resource_checked_product(
+        &[
+            ALIGNMENT_V2_COARSE_MAX_LANDMARKS,
+            ALIGNMENT_V2_STREAMING_RANKED_LANDMARK_UPPER_BYTES,
+        ],
+        "流式 ranked coarse index",
+    )?;
+    let stdout_ring_bytes = v2_resource_checked_product(
+        &[
+            ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES,
+            ALIGNMENT_V2_COARSE_STDOUT_BUFFERED_CHUNKS + 1,
+        ],
+        "流式 stdout ring",
+    )?;
+    let sample_buffer_bytes = ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES
+        .checked_add(std::mem::size_of::<i16>())
+        .ok_or_else(|| "blocked:resource-limit：流式 sample buffer 上界溢出。".to_string())?;
+    let bounded_spectral_state_bytes = v2_resource_checked_sum(
+        &[
+            ALIGNMENT_V2_COARSE_WINDOW_SAMPLES * std::mem::size_of::<i16>(),
+            3 * (std::mem::size_of::<Vec<f64>>()
+                + ALIGNMENT_V2_SPECTRAL_BIN_COUNT * std::mem::size_of::<f64>()),
+            24 * (std::mem::size_of::<Vec<u8>>()
+                + ALIGNMENT_V2_MAX_SPECTRAL_PEAKS_PER_FRAME
+                    * ALIGNMENT_V2_SPECTRAL_PEAK_UPPER_BYTES),
+            CUDA_FFT_FRAME_LEN * std::mem::size_of::<(f64, f64)>(),
+        ],
+        "流式 CPU 声谱状态",
+    )?;
+    let cuda_streaming_bytes = match backend_kind {
+        V2CoarseBackendBudgetKind::Cpu => 0,
+        V2CoarseBackendBudgetKind::CudaOrHybrid => {
+            let source_frames = v2_resource_checked_product(
+                &[
+                    CUDA_FFT_DEFAULT_BATCH_FRAMES,
+                    ALIGNMENT_V2_COARSE_WINDOW_SAMPLES,
+                    std::mem::size_of::<i16>(),
+                ],
+                "流式 CUDA source frames",
+            )?;
+            let frame_indices = v2_resource_checked_product(
+                &[CUDA_FFT_DEFAULT_BATCH_FRAMES, std::mem::size_of::<usize>()],
+                "流式 CUDA frame indices",
+            )?;
+            let reduced_frames = v2_resource_checked_product(
+                &[
+                    CUDA_FFT_DEFAULT_BATCH_FRAMES,
+                    std::mem::size_of::<Vec<f64>>()
+                        + ALIGNMENT_V2_SPECTRAL_BIN_COUNT * std::mem::size_of::<f64>(),
+                ],
+                "流式 CUDA reduced frames",
+            )?;
+            v2_resource_checked_sum(
+                &[
+                    v2_cuda_fft_batch_transient_upper_bound_bytes()?,
+                    source_frames,
+                    frame_indices,
+                    reduced_frames,
+                ],
+                "流式 CUDA 或 hybrid 批次",
+            )?
+        }
+    };
+    v2_resource_checked_sum(
+        &[
+            final_landmarks,
+            ranked_index_bytes,
+            ALIGNMENT_V2_STREAMING_FAMILY_OVERHEAD_BYTES,
+            stdout_ring_bytes,
+            sample_buffer_bytes,
+            supervised_read_bounded_stderr_capacity_upper_bound()?,
+            bounded_spectral_state_bytes,
+            cuda_streaming_bytes,
+        ],
+        "流式 coarse 阶段",
+    )
+}
+
+fn v2_coarse_stage_budget_for_backend_id(
+    input: &AlignmentAudioInput,
+    planned_backend_id: &str,
+) -> Result<V2CoarseStageBudget, String> {
+    let backend_kind = v2_coarse_backend_budget_kind(planned_backend_id)?;
+    let final_artifact_bytes = v2_candidate_artifact_upper_bound(input)?;
+    let (decode_phase_bytes, analysis_phase_bytes) = if should_stream_v2_coarse_only(input) {
+        let streaming_phase = v2_streaming_coarse_phase_upper_bound(backend_kind)?;
+        (streaming_phase, streaming_phase)
+    } else {
+        (
+            v2_short_coarse_decode_phase_upper_bound(input)?,
+            v2_short_coarse_analysis_phase_upper_bound(input, backend_kind)?,
+        )
+    };
+    Ok(V2CoarseStageBudget {
+        final_artifact_bytes,
+        decode_phase_bytes,
+        analysis_phase_bytes,
+        peak_additional_bytes: final_artifact_bytes
+            .max(decode_phase_bytes)
+            .max(analysis_phase_bytes),
+    })
+}
+
+fn execute_after_v2_coarse_stage_admission<T, F>(
+    retained_artifact_bytes: usize,
+    input: &AlignmentAudioInput,
+    planned_backend_id: &str,
+    execute: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    let budget = v2_coarse_stage_budget_for_backend_id(input, planned_backend_id)?;
+    // This is a phase-peak admission, not another retained reservation. Once extraction returns,
+    // the caller settles only `cached_v2_landmark_retained_bytes`; transient bytes never leak into
+    // the next candidate's baseline.
+    ensure_v2_active_artifact_budget(retained_artifact_bytes, budget.peak_additional_bytes)?;
+    execute()
+}
+
 fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usize, String> {
     if should_stream_v2_coarse_only(input) {
         // All long candidates retain only the duration-independent coarse index. After Top-K
@@ -7754,27 +8313,10 @@ fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usiz
                 "blocked:resource-limit：流式粗定位 landmark 驻留上界溢出。".to_string()
             });
     }
-    let duration_ms = input
-        .media_duration_ms
-        .unwrap_or(ALIGNMENT_V2_MAX_DURATION_MS);
-    let pcm_bytes = v2_pcm_bytes_for_duration_ms(duration_ms)
-        .ok_or_else(|| "blocked:resource-limit：候选音轨 PCM 上界无法表示。".to_string())?;
-    let frame_count = usize::try_from(
-        (duration_ms as u128)
-            .checked_add(ALIGNMENT_V2_LANDMARK_HOP_MS as u128 - 1)
-            .ok_or_else(|| "blocked:resource-limit：候选帧数溢出。".to_string())?
-            / ALIGNMENT_V2_LANDMARK_HOP_MS as u128,
-    )
-    .map_err(|_| "blocked:resource-limit：候选帧数无法表示。".to_string())?;
-    let landmark_bytes = frame_count
-        .checked_mul(20)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<SpectralLandmark>()))
-        .ok_or_else(|| "blocked:resource-limit：landmark 驻留上界溢出。".to_string())?;
-    let fine_bytes_per_frame =
-        std::mem::size_of::<FineFeatureFrame>().saturating_add(14 * std::mem::size_of::<f32>());
-    let fine_bytes = frame_count
-        .checked_mul(fine_bytes_per_frame)
-        .ok_or_else(|| "blocked:resource-limit：细特征驻留上界溢出。".to_string())?;
+    let pcm_bytes = v2_short_pcm_decode_budget(input)?.stdout_hard_limit_bytes;
+    let frame_count = v2_short_coarse_frame_count_upper_bound(input)?;
+    let landmark_bytes = v2_unsuppressed_landmark_bytes(frame_count)?;
+    let fine_bytes = v2_fine_feature_bytes(frame_count)?;
     pcm_bytes
         .checked_add(landmark_bytes)
         .and_then(|value| value.checked_add(fine_bytes))
@@ -7783,33 +8325,49 @@ fn v2_candidate_artifact_upper_bound(input: &AlignmentAudioInput) -> Result<usiz
 
 fn v2_fine_window_artifact_upper_bound(range: PresentationRangeMs) -> Result<usize, String> {
     let duration_ms = v2_presentation_range_duration_ms(range)?;
-    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
-        return Err(format!(
-            "blocked:resource-limit：精解码窗口超过 {} 分钟硬上限。",
-            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
-        ));
-    }
-    let pcm_bytes = v2_pcm_bytes_for_duration_ms(duration_ms)
-        .ok_or_else(|| "blocked:resource-limit：精解码窗口 PCM 上界无法表示。".to_string())?;
+    let decode_budget = v2_fine_window_pcm_decode_budget(range)?;
     let frame_count =
         usize::try_from(u128::from(duration_ms).div_ceil(u128::from(ALIGNMENT_V2_FINE_HOP_MS)))
             .map_err(|_| "blocked:resource-limit：精解码窗口细特征帧数无法表示。".to_string())?;
-    let fine_bytes_per_frame =
-        std::mem::size_of::<FineFeatureFrame>().saturating_add(14 * std::mem::size_of::<f32>());
-    // `run_supervised_ffmpeg_output` owns raw stdout while `parse_v2_pcm_output` constructs the
-    // i16 Vec. Both buffers coexist before stdout is dropped, so charging only one PCM copy would
-    // understate a 60-minute window by about 110 MiB. Summing this conservative peak for both
-    // selected axes also covers the retained source artifact while the target window decodes.
-    let peak_pcm_bytes = pcm_bytes
-        .checked_mul(2)
-        .ok_or_else(|| "blocked:resource-limit：精解码窗口双 PCM 驻留上界溢出。".to_string())?;
-    peak_pcm_bytes
-        .checked_add(
-            frame_count
-                .checked_mul(fine_bytes_per_frame)
-                .ok_or_else(|| "blocked:resource-limit：精解码窗口细特征上界溢出。".to_string())?,
-        )
-        .ok_or_else(|| "blocked:resource-limit：精解码窗口活动内存上界溢出。".to_string())
+    let fine_bytes = v2_fine_feature_bytes(frame_count)
+        .map_err(|_| "blocked:resource-limit：精解码窗口细特征上界溢出。".to_string())?;
+    let decode_phase_bytes = v2_resource_checked_sum(
+        &[
+            supervised_read_bounded_vec_capacity_upper_bound(
+                decode_budget.stdout_hard_limit_bytes,
+            )?,
+            decode_budget.stdout_hard_limit_bytes,
+            supervised_read_bounded_stderr_capacity_upper_bound()?,
+        ],
+        "精解码 read_bounded 与 parsed PCM 阶段",
+    )?;
+    let analysis_phase_bytes = v2_resource_checked_sum(
+        &[decode_budget.stdout_hard_limit_bytes, fine_bytes],
+        "精解码 PCM 与 fine feature 阶段",
+    )?;
+    Ok(decode_phase_bytes.max(analysis_phase_bytes))
+}
+
+fn v2_cuda_fine_transient_upper_bound_bytes() -> Result<usize, String> {
+    // Source and target fine extraction are sequential, so one complete CUDA batch is the
+    // whole-run transient peak rather than one batch per axis.
+    v2_cuda_fft_batch_transient_upper_bound_bytes()
+}
+
+fn v2_selected_fine_cuda_transient_upper_bound(
+    source_artifact: &CachedV2Landmarks,
+    target_artifact: &CachedV2Landmarks,
+) -> Result<usize, String> {
+    for artifact in [source_artifact, target_artifact] {
+        if artifact.fine_features.is_some() {
+            continue;
+        }
+        let request = lock_fine_spectral_backend_request(&artifact.spectral_backend)?;
+        if request.planned_backend_id == CUDA_FFT_BACKEND_ID {
+            return v2_cuda_fine_transient_upper_bound_bytes();
+        }
+    }
+    Ok(0)
 }
 
 fn should_stream_v2_coarse_only(input: &AlignmentAudioInput) -> bool {
@@ -7826,6 +8384,127 @@ fn v2_landmark_artifact_kind(input: &AlignmentAudioInput) -> &'static str {
     }
 }
 
+fn v2_planned_coarse_cache_backend_id<'a>(
+    input: &AlignmentAudioInput,
+    planned_backend_id: &'a str,
+) -> &'a str {
+    if should_stream_v2_coarse_only(input) && planned_backend_id != CUDA_FFT_BACKEND_ID {
+        STREAMING_CPU_SPECTRAL_BACKEND_ID
+    } else {
+        planned_backend_id
+    }
+}
+
+fn create_v2_planned_coarse_cache_key(
+    media_path: &str,
+    options: &AudioAlignmentOptions,
+    input: &AlignmentAudioInput,
+    planned_backend_id: &str,
+) -> Result<String, String> {
+    create_v2_audio_cache_key_for_backend(
+        media_path,
+        options,
+        input,
+        v2_landmark_artifact_kind(input),
+        v2_planned_coarse_cache_backend_id(input, planned_backend_id),
+    )
+}
+
+fn cached_v2_landmarks_from_media_artifact(
+    cache_key: String,
+    artifact: V2MediaArtifact,
+) -> CachedV2Landmarks {
+    CachedV2Landmarks {
+        landmarks: artifact.landmarks,
+        pcm: artifact.pcm,
+        fine_features: artifact.fine_features,
+        cache_key,
+        cache_hit: true,
+        spectral_backend: artifact.spectral_backend,
+        presentation_bounds: artifact.presentation_bounds,
+    }
+}
+
+fn plan_v2_candidate_set_cache_aware(
+    media_path: &str,
+    options: &AudioAlignmentOptions,
+    inputs: &[AlignmentAudioInput],
+    planned_backend_id: &str,
+    retained_artifact_bytes: usize,
+) -> Result<V2CandidateSetCachePlan, String> {
+    let cache_keys = inputs
+        .iter()
+        .map(|input| {
+            create_v2_planned_coarse_cache_key(media_path, options, input, planned_backend_id)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Clone every Arc-backed hit while holding one cache lock. Subsequent misses may mutate the
+    // LRU, but execution consumes these snapshots instead of performing a second lookup.
+    let cached_artifacts = {
+        let mut cache = v2_landmark_cache()
+            .lock()
+            .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+        cache_keys
+            .iter()
+            .map(|cache_key| cache.get(cache_key))
+            .collect::<Vec<_>>()
+    };
+
+    let mut prefix_retained = retained_artifact_bytes;
+    let mut plan = Vec::with_capacity(inputs.len());
+    for ((input, cache_key), cached_artifact) in inputs.iter().zip(cache_keys).zip(cached_artifacts)
+    {
+        if let Some(artifact) = cached_artifact {
+            let cached = cached_v2_landmarks_from_media_artifact(cache_key, artifact);
+            prefix_retained = ensure_v2_active_artifact_budget(
+                prefix_retained,
+                cached_v2_landmark_retained_bytes(&cached),
+            )?;
+            plan.push(V2CoarseCandidateCachePlan::Hit(cached));
+        } else {
+            let budget = v2_coarse_stage_budget_for_backend_id(input, planned_backend_id)?;
+            ensure_v2_active_artifact_budget(prefix_retained, budget.peak_additional_bytes)?;
+            prefix_retained =
+                ensure_v2_active_artifact_budget(prefix_retained, budget.final_artifact_bytes)?;
+            plan.push(V2CoarseCandidateCachePlan::Miss {
+                expected_cache_key: cache_key,
+            });
+        }
+    }
+    Ok(V2CandidateSetCachePlan {
+        candidates: plan,
+        planned_baseline_bytes: retained_artifact_bytes,
+        projected_retained_bytes: prefix_retained,
+    })
+}
+
+fn plan_v2_ordinary_candidate_sets_cache_aware(
+    source_media_path: &str,
+    target_media_path: &str,
+    options: &AudioAlignmentOptions,
+    source_inputs: &[AlignmentAudioInput],
+    target_inputs: &[AlignmentAudioInput],
+    planned_backend_id: &str,
+    retained_artifact_bytes: usize,
+) -> Result<V2OrdinaryCandidateCachePlans, String> {
+    let source = plan_v2_candidate_set_cache_aware(
+        source_media_path,
+        options,
+        source_inputs,
+        planned_backend_id,
+        retained_artifact_bytes,
+    )?;
+    let target = plan_v2_candidate_set_cache_aware(
+        target_media_path,
+        options,
+        target_inputs,
+        planned_backend_id,
+        source.projected_retained_bytes,
+    )?;
+    Ok(V2OrdinaryCandidateCachePlans { source, target })
+}
+
+#[cfg(test)]
 fn ensure_v2_candidate_set_active_budget(
     source_inputs: &[AlignmentAudioInput],
     target_inputs: &[AlignmentAudioInput],
@@ -7833,6 +8512,7 @@ fn ensure_v2_candidate_set_active_budget(
     reserve_v2_candidate_set_active_budget(0, source_inputs, target_inputs).map(|_| ())
 }
 
+#[cfg(test)]
 fn reserve_v2_candidate_set_active_budget(
     retained_artifact_bytes: usize,
     source_inputs: &[AlignmentAudioInput],
@@ -7846,6 +8526,7 @@ fn reserve_v2_candidate_set_active_budget(
     Ok(retained)
 }
 
+#[cfg(test)]
 fn execute_after_v2_candidate_reservation<T, F>(
     retained_artifact_bytes: usize,
     source_inputs: &[AlignmentAudioInput],
@@ -7967,130 +8648,149 @@ fn get_v2_landmarks(
     label: &str,
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
-    cancel_flag: Option<&AtomicBool>,
-    shared_backend_request: Option<&SpectralBackendRequest>,
+    context: V2LandmarkExtractionContext<'_>,
 ) -> Result<CachedV2Landmarks, String> {
+    let V2LandmarkExtractionContext {
+        cancel_flag,
+        shared_backend_request,
+        cache_plan,
+        retained_artifact_bytes,
+    } = context;
     check_cancelled(cancel_flag)?;
     let streaming_coarse = should_stream_v2_coarse_only(input);
     let owned_backend_request;
     let backend_request = if let Some(request) = shared_backend_request {
-        Some(request)
+        request
     } else {
         owned_backend_request = resolve_spectral_backend_request()?;
-        Some(&owned_backend_request)
+        &owned_backend_request
     };
-    let planned_backend_id = if streaming_coarse {
-        if backend_request.is_some_and(|request| {
-            request.planned_backend_id == crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
-        }) {
-            crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
-        } else {
-            STREAMING_CPU_SPECTRAL_BACKEND_ID
-        }
-    } else {
-        backend_request
-            .expect("short-media cache lookup must resolve a spectral backend")
-            .planned_backend_id
-            .as_str()
-    };
-    let mut cache_key = create_v2_audio_cache_key_for_backend(
+    let mut cache_key = create_v2_planned_coarse_cache_key(
         media_path,
         options,
         input,
-        v2_landmark_artifact_kind(input),
-        planned_backend_id,
+        &backend_request.planned_backend_id,
     )?;
-    let cached_artifact = {
-        let mut cache = v2_landmark_cache()
-            .lock()
-            .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
-        cache.get(&cache_key)
-    };
-    if let Some(artifact) = cached_artifact {
-        verify_media_content_identity_after_tool_output(
-            media_path,
-            input.content_identity.as_ref(),
-            cancel_flag,
-            "V2 landmark 缓存复用",
-        )?;
-        benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
-        return Ok(CachedV2Landmarks {
-            landmarks: artifact.landmarks,
-            pcm: artifact.pcm,
-            fine_features: artifact.fine_features,
-            cache_key,
-            cache_hit: true,
-            spectral_backend: artifact.spectral_backend,
-            presentation_bounds: artifact.presentation_bounds,
-        });
+    match cache_plan {
+        Some(V2CoarseCandidateCachePlan::Hit(cached)) => {
+            if cached.cache_key != cache_key {
+                return Err(
+                    "blocked:media-identity-changed：V2 coarse 缓存计划与当前媒体身份不一致。"
+                        .to_string(),
+                );
+            }
+            verify_media_content_identity_after_tool_output(
+                media_path,
+                input.content_identity.as_ref(),
+                cancel_flag,
+                "V2 landmark 缓存复用",
+            )?;
+            benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
+            return Ok(cached);
+        }
+        Some(V2CoarseCandidateCachePlan::Miss { expected_cache_key }) => {
+            if expected_cache_key != cache_key {
+                return Err(
+                    "blocked:media-identity-changed：V2 coarse miss 计划与当前媒体身份不一致。"
+                        .to_string(),
+                );
+            }
+            benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
+        }
+        None => {
+            let cached_artifact = {
+                let mut cache = v2_landmark_cache()
+                    .lock()
+                    .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+                cache.get(&cache_key)
+            };
+            if let Some(artifact) = cached_artifact {
+                verify_media_content_identity_after_tool_output(
+                    media_path,
+                    input.content_identity.as_ref(),
+                    cancel_flag,
+                    "V2 landmark 缓存复用",
+                )?;
+                benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
+                return Ok(cached_v2_landmarks_from_media_artifact(cache_key, artifact));
+            }
+            benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
+        }
     }
-    benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
     let presentation_offset_ms = input
         .decode_timeline
         .as_ref()
         .map(|item| item.normalized_pcm_origin_ms)
         .unwrap_or(0);
-    let (pcm, landmarks, fine_features, spectral_backend, presentation_bounds) = if streaming_coarse
-    {
-        let coarse = decode_v2_coarse_landmarks_streaming(
-            media_path,
-            label,
-            options,
+    let (pcm, landmarks, fine_features, spectral_backend, presentation_bounds) =
+        execute_after_v2_coarse_stage_admission(
+            retained_artifact_bytes,
             input,
-            backend_request.expect("streaming extraction must resolve a spectral backend"),
-            cancel_flag,
-        )?;
-        let presentation_bounds = v2_presentation_bounds_for_samples(
-            presentation_offset_ms,
-            coarse.decoded_sample_count,
-        )?;
-        (
-            None,
-            Arc::new(coarse.index.landmarks),
-            None,
-            coarse.spectral_backend,
-            presentation_bounds,
-        )
-    } else {
-        let pcm = Arc::new(decode_v2_pcm(
-            media_path,
-            label,
-            options,
-            input,
-            cancel_flag,
-        )?);
-        let extracted = extract_landmarks_and_fine_features_with_backend_request(
-            &pcm,
-            &LandmarkConfig {
-                sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-                presentation_offset_ms,
-                window_ms: 50,
-                hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
-                max_hash_occurrences: 64,
-                ..LandmarkConfig::default()
+            &backend_request.planned_backend_id,
+            || {
+                if streaming_coarse {
+                    let coarse = decode_v2_coarse_landmarks_streaming(
+                        media_path,
+                        label,
+                        options,
+                        input,
+                        backend_request,
+                        cancel_flag,
+                    )?;
+                    let presentation_bounds = v2_presentation_bounds_for_samples(
+                        presentation_offset_ms,
+                        coarse.decoded_sample_count,
+                    )?;
+                    Ok((
+                        None,
+                        Arc::new(coarse.index.landmarks),
+                        None,
+                        coarse.spectral_backend,
+                        presentation_bounds,
+                    ))
+                } else {
+                    let pcm = Arc::new(decode_v2_pcm(
+                        media_path,
+                        label,
+                        options,
+                        input,
+                        cancel_flag,
+                    )?);
+                    let extracted = extract_landmarks_and_fine_features_with_backend_request(
+                        &pcm,
+                        &LandmarkConfig {
+                            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+                            presentation_offset_ms,
+                            window_ms: 50,
+                            hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
+                            max_hash_occurrences: 64,
+                            ..LandmarkConfig::default()
+                        },
+                        &FineFeatureConfig {
+                            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
+                            presentation_offset_ms,
+                            window_ms: 50,
+                            hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
+                        },
+                        cancel_flag,
+                        backend_request,
+                    )?;
+                    let presentation_bounds = v2_presentation_bounds_for_samples(
+                        presentation_offset_ms,
+                        u64::try_from(pcm.len()).map_err(|_| {
+                            "blocked:resource-limit：短媒体 PCM 样本数无法表示。".to_string()
+                        })?,
+                    )?;
+                    Ok((
+                        Some(pcm),
+                        Arc::new(extracted.bundle.landmarks),
+                        Some(Arc::new(extracted.bundle.fine_features)),
+                        extracted.spectral_backend,
+                        presentation_bounds,
+                    ))
+                }
             },
-            &FineFeatureConfig {
-                sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-                presentation_offset_ms,
-                window_ms: 50,
-                hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
-            },
-            cancel_flag,
-            backend_request.expect("short-media extraction must resolve a spectral backend"),
         )?;
-        let presentation_bounds = v2_presentation_bounds_for_samples(
-            presentation_offset_ms,
-            u64::try_from(pcm.len())
-                .map_err(|_| "blocked:resource-limit：短媒体 PCM 样本数无法表示。".to_string())?,
-        )?;
-        (
-            Some(pcm),
-            Arc::new(extracted.bundle.landmarks),
-            Some(Arc::new(extracted.bundle.fine_features)),
-            extracted.spectral_backend,
-            presentation_bounds,
-        )
-    };
     cache_key = create_v2_audio_cache_key_for_backend(
         media_path,
         options,
@@ -8213,6 +8913,7 @@ fn decode_v2_audio(
         return Ok(DecodedV2Audio {
             pcm,
             fine_features,
+            fine_spectral_backend: landmark_artifact.spectral_backend.clone(),
             presentation_offset_ms: landmark_artifact.presentation_bounds.start_ms,
         });
     }
@@ -8227,7 +8928,9 @@ fn decode_v2_audio(
             cancel_flag,
         )?),
     };
-    let fine_features = Arc::new(extract_fine_features_with_cancel(
+    let fine_backend_request =
+        lock_fine_spectral_backend_request(&landmark_artifact.spectral_backend)?;
+    let fine_extraction = extract_fine_features_with_backend_request(
         &pcm,
         &FineFeatureConfig {
             sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
@@ -8236,7 +8939,13 @@ fn decode_v2_audio(
             hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
         },
         cancel_flag,
-    )?);
+        &fine_backend_request,
+    )?;
+    ensure_v2_fine_spectral_backend_continuity(
+        &landmark_artifact.spectral_backend,
+        &fine_extraction.spectral_backend,
+    )?;
+    let fine_features = Arc::new(fine_extraction.fine_features);
     if fine_features.is_empty() {
         return Err(format!("{label}没有可用的 50 ms 细粒度音频特征。"));
     }
@@ -8246,7 +8955,7 @@ fn decode_v2_audio(
         pcm: Some(pcm.clone()),
         landmarks: landmark_artifact.landmarks.clone(),
         fine_features: Some(fine_features.clone()),
-        spectral_backend: landmark_artifact.spectral_backend.clone(),
+        spectral_backend: fine_extraction.spectral_backend.clone(),
         presentation_bounds: landmark_artifact.presentation_bounds,
     };
     let insertion = v2_landmark_cache()
@@ -8268,8 +8977,23 @@ fn decode_v2_audio(
     Ok(DecodedV2Audio {
         pcm,
         fine_features,
+        fine_spectral_backend: fine_extraction.spectral_backend,
         presentation_offset_ms: landmark_artifact.presentation_bounds.start_ms,
     })
+}
+
+fn ensure_v2_fine_spectral_backend_continuity(
+    coarse_backend: &SpectralBackendExecution,
+    fine_backend: &SpectralBackendExecution,
+) -> Result<(), String> {
+    let locked = lock_fine_spectral_backend_request(coarse_backend)?;
+    if fine_backend.backend_id != locked.planned_backend_id {
+        return Err(format!(
+            "blocked:spectral-backend-continuity：coarse 后端 {} 锁定 fine 后端 {}，实际却由 {} 完成。",
+            coarse_backend.backend_id, locked.planned_backend_id, fine_backend.backend_id
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8456,7 +9180,9 @@ fn decode_v2_audio_for_selected_window(
         window,
         cancel_flag,
     )?);
-    let fine_features = Arc::new(extract_fine_features_with_cancel(
+    let fine_backend_request =
+        lock_fine_spectral_backend_request(&landmark_artifact.spectral_backend)?;
+    let fine_extraction = extract_fine_features_with_backend_request(
         &pcm,
         &FineFeatureConfig {
             sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
@@ -8467,7 +9193,13 @@ fn decode_v2_audio_for_selected_window(
             hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
         },
         cancel_flag,
-    )?);
+        &fine_backend_request,
+    )?;
+    ensure_v2_fine_spectral_backend_continuity(
+        &landmark_artifact.spectral_backend,
+        &fine_extraction.spectral_backend,
+    )?;
+    let fine_features = Arc::new(fine_extraction.fine_features);
     if fine_features.is_empty() {
         return Err(format!(
             "{label}精解码窗口没有可用的 50 ms 细粒度音频特征。"
@@ -8476,6 +9208,7 @@ fn decode_v2_audio_for_selected_window(
     Ok(DecodedV2Audio {
         pcm,
         fine_features,
+        fine_spectral_backend: fine_extraction.spectral_backend,
         presentation_offset_ms: window.start_ms,
     })
 }
@@ -8491,12 +9224,7 @@ fn decode_v2_pcm_window(
 ) -> Result<Vec<i16>, String> {
     check_cancelled(cancel_flag)?;
     let duration_ms = v2_presentation_range_duration_ms(window)?;
-    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
-        return Err(format!(
-            "blocked:resource-limit：{label}精解码窗口为 {duration_ms} ms，超过 {} 分钟硬上限。",
-            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
-        ));
-    }
+    let decode_budget = v2_fine_window_pcm_decode_budget(window)?;
     let seek_ms = window
         .start_ms
         .checked_sub(media_bounds.start_ms)
@@ -8504,11 +9232,6 @@ fn decode_v2_pcm_window(
         .ok_or_else(|| {
             format!("blocked:window-evidence-insufficient：{label}精解码 seek 早于媒体 PCM 起点。")
         })?;
-    let output_budget_ms = duration_ms
-        .checked_add(ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS)
-        .ok_or_else(|| "blocked:resource-limit：精解码 stdout 时长预算溢出。".to_string())?;
-    let stdout_hard_limit = v2_pcm_bytes_for_duration_ms(output_budget_ms)
-        .ok_or_else(|| "blocked:resource-limit：精解码 stdout 字节预算无法表示。".to_string())?;
     verify_media_content_identity_before_tool_input(
         media_path,
         input.content_identity.as_ref(),
@@ -8519,7 +9242,7 @@ fn decode_v2_pcm_window(
         &options.ffmpeg_path,
         create_v2_fine_window_audio_decode_args(media_path, input, seek_ms, duration_ms),
         "FFmpeg V2 affine 窗口精解码",
-        stdout_hard_limit,
+        decode_budget.stdout_hard_limit_bytes,
         cancel_flag,
     );
     // As in streaming coarse, identity/cleanup failure invalidates every decoded byte and takes
@@ -8843,13 +9566,14 @@ fn decode_v2_pcm(
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<i16>, String> {
     check_cancelled(cancel_flag)?;
+    let decode_budget = v2_short_pcm_decode_budget(input)?;
     #[cfg(test)]
     TEST_V2_PCM_DECODE_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
     let output = run_supervised_ffmpeg_output(
         &options.ffmpeg_path,
         create_v2_audio_decode_args(media_path, input),
         "FFmpeg V2 音频解码",
-        ALIGNMENT_V2_MAX_PCM_BYTES,
+        decode_budget.stdout_hard_limit_bytes,
         cancel_flag,
     )?;
     if !output.status.success() {
@@ -8888,7 +9612,13 @@ fn parse_v2_pcm_output(
         return Err(format!("{label} V2 PCM 字节数不是 i16 对齐。"));
     }
     let sample_count = stdout.len() / 2;
-    debug_assert!(sample_count <= ALIGNMENT_V2_MAX_PCM_BYTES / 2);
+    debug_assert!(
+        stdout.len()
+            <= v2_pcm_bytes_for_duration_ms(
+                ALIGNMENT_V2_MAX_DURATION_MS + ALIGNMENT_V2_FINE_WINDOW_DECODE_TOLERANCE_MS,
+            )
+            .unwrap_or(usize::MAX)
+    );
     let mut pcm = Vec::with_capacity(sample_count);
     for bytes in stdout.chunks(V2_PCM_PARSE_CANCEL_CHECK_SAMPLES * 2) {
         pcm.extend(
@@ -8921,8 +9651,6 @@ fn create_v2_audio_decode_args(media_path: &str, input: &AlignmentAudioInput) ->
         "1".to_string(),
         "-af".to_string(),
         format!("aresample={ALIGNMENT_V2_SAMPLE_RATE}:async=1:first_pts=0"),
-        "-t".to_string(),
-        format!("{:.3}", ALIGNMENT_V2_MAX_DURATION_MS as f64 / 1_000.0),
         "-f".to_string(),
         "s16le".to_string(),
         "pipe:1".to_string(),
@@ -9230,7 +9958,7 @@ fn align_v2_feature_chunks(
             ));
         }
         let dp_workspace_bytes =
-            v2_dp_workspace_upper_bound(required_cells, source_window.len(), target_chunk.len())?;
+            v2_dp_workspace_upper_bound(required_cells, target_chunk.len(), source_window.len())?;
         ensure_v2_active_artifact_budget(active_artifact_bytes, dp_workspace_bytes).map_err(
             |error| {
                 format!("blocked:resource-limit：V2 分块 DP workspace 未纳入活动内存预算：{error}")
@@ -9376,9 +10104,22 @@ fn v2_dp_workspace_upper_bound(
     source_frame_count: usize,
     target_frame_count: usize,
 ) -> Result<usize, String> {
-    let planes = cell_count
-        .checked_mul(ALIGNMENT_V2_DP_BYTES_PER_CELL)
-        .ok_or_else(|| "blocked:resource-limit：V2 DP plane workspace 上界溢出。".to_string())?;
+    let parents = cell_count
+        .checked_mul(ALIGNMENT_V2_DP_PARENT_BYTES_PER_CELL)
+        .ok_or_else(|| "blocked:resource-limit：V2 DP parent plane 上界溢出。".to_string())?;
+    let rolling_width = target_frame_count
+        .checked_add(1)
+        .ok_or_else(|| "blocked:resource-limit：V2 DP rolling row 宽度溢出。".to_string())?;
+    let rolling_costs = rolling_width
+        .checked_mul(ALIGNMENT_V2_DP_ROLLING_COST_ROW_COUNT)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<i64>()))
+        .ok_or_else(|| "blocked:resource-limit：V2 DP rolling cost rows 上界溢出。".to_string())?;
+    let norm_frame_count = source_frame_count
+        .checked_add(target_frame_count)
+        .ok_or_else(|| "blocked:resource-limit：V2 DP feature norm 帧数溢出。".to_string())?;
+    let norms = norm_frame_count
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| "blocked:resource-limit：V2 DP feature norm 上界溢出。".to_string())?;
     let path_steps = source_frame_count
         .checked_add(target_frame_count)
         .and_then(|value| value.checked_add(2))
@@ -9386,8 +10127,10 @@ fn v2_dp_workspace_upper_bound(
     let path = path_steps
         .checked_mul(ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP)
         .ok_or_else(|| "blocked:resource-limit：V2 DP path workspace 上界溢出。".to_string())?;
-    planes
-        .checked_add(path)
+    parents
+        .checked_add(rolling_costs)
+        .and_then(|value| value.checked_add(norms))
+        .and_then(|value| value.checked_add(path))
         .and_then(|value| value.checked_add(ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES))
         .ok_or_else(|| "blocked:resource-limit：V2 DP 总 workspace 上界溢出。".to_string())
 }
@@ -12147,23 +12890,17 @@ fn prepare_audio_alignment_batch_media(
                 )];
                 let media_retained_baseline = batch_retained_artifact_bytes;
                 let mut combined_retained_artifact_bytes = media_retained_baseline;
-                let landmarks = execute_after_v2_candidate_reservation(
-                    media_retained_baseline,
+                let landmarks = extract_v2_landmark_candidates(
+                    &stable_path,
+                    media.role_label,
+                    options,
                     &inputs,
-                    &[],
-                    || {
-                        extract_v2_landmark_candidates(
-                            &stable_path,
-                            media.role_label,
-                            options,
-                            &inputs,
-                            Some(cancel_flag),
-                            &mut V2CandidateExtractionState {
-                                notes: &mut extraction_notes,
-                                retained_artifact_bytes: &mut combined_retained_artifact_bytes,
-                                spectral_backend_request: &spectral_backend_request,
-                            },
-                        )
+                    Some(cancel_flag),
+                    None,
+                    &mut V2CandidateExtractionState {
+                        notes: &mut extraction_notes,
+                        retained_artifact_bytes: &mut combined_retained_artifact_bytes,
+                        spectral_backend_request: &spectral_backend_request,
                     },
                 )?;
                 if landmarks.is_empty() {
@@ -18585,7 +19322,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_decode_args_use_selected_stream_and_s16le_16k_mono() {
+    fn v2_short_decode_args_run_to_eof_with_selected_s16le_stream() {
         let args = create_v2_audio_decode_args("episode.mkv", &test_audio_input(4, 125));
         let map_position = args.iter().position(|value| value == "-map").unwrap();
         let filter_position = args.iter().position(|value| value == "-af").unwrap();
@@ -18599,7 +19336,7 @@ mod tests {
         assert_eq!(args[channels_position + 1], "1");
         assert!(args.iter().any(|value| value == "-copyts"));
         assert!(args.iter().any(|value| value == "-start_at_zero"));
-        assert!(args.iter().any(|value| value == "-t"));
+        assert!(!args.iter().any(|value| value == "-t"));
         assert!(args.iter().any(|value| value == "s16le"));
     }
 
@@ -19066,6 +19803,43 @@ mod tests {
     }
 
     #[test]
+    fn v2_dp_workspace_charges_rolling_target_rows_norms_and_full_parents() {
+        let source_frames = 900_usize;
+        let target_frames = 3_300_usize;
+        let cell_count = (source_frames + 1) * (target_frames + 1);
+        let expected = cell_count * ALIGNMENT_V2_DP_PARENT_BYTES_PER_CELL
+            + (target_frames + 1)
+                * ALIGNMENT_V2_DP_ROLLING_COST_ROW_COUNT
+                * std::mem::size_of::<i64>()
+            + (source_frames + target_frames) * std::mem::size_of::<f64>()
+            + (source_frames + target_frames + 2) * ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP
+            + ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES;
+
+        assert_eq!(
+            v2_dp_workspace_upper_bound(cell_count, source_frames, target_frames).unwrap(),
+            expected
+        );
+        assert!(
+            v2_dp_workspace_upper_bound(cell_count, source_frames, target_frames).unwrap()
+                > v2_dp_workspace_upper_bound(cell_count, target_frames, source_frames).unwrap(),
+            "rolling rows must be charged from the real target argument rather than a symmetric matrix dimension"
+        );
+
+        let square_cell_count = 4_000_000_usize;
+        let square_frames = 1_999_usize;
+        let rolling =
+            v2_dp_workspace_upper_bound(square_cell_count, square_frames, square_frames).unwrap();
+        let legacy_full_planes = square_cell_count
+            * (3 * std::mem::size_of::<i64>() + 3 * std::mem::size_of::<u8>())
+            + (square_frames * 2 + 2) * ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP
+            + ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES;
+        assert!(rolling < legacy_full_planes / 2);
+
+        assert!(v2_dp_workspace_upper_bound(usize::MAX, 1, 1).is_err());
+        assert!(v2_dp_workspace_upper_bound(1, 1, usize::MAX).is_err());
+    }
+
+    #[test]
     fn selected_long_reference_window_consumes_complete_target_and_source_support() {
         let mut pair = v2_test_pair_candidate();
         pair.source_input.media_duration_ms = Some(2 * 60 * 60 * 1_000);
@@ -19100,18 +19874,161 @@ mod tests {
     }
 
     #[test]
+    fn pcm_decode_budgets_share_probe_slack_and_bounded_reader_capacity_rules() {
+        let mut short = test_audio_input(1, 0);
+        short.media_duration_ms = Some(120_000);
+        short.stream.duration_ms = Some(120_600);
+        let short_budget = v2_short_pcm_decode_budget(&short).unwrap();
+        assert_eq!(short_budget.duration_budget_ms, 121_600);
+        assert_eq!(short_budget.stdout_hard_limit_bytes, 3_891_200);
+
+        short.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS - 500);
+        short.stream.duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS - 300);
+        let capped_budget = v2_short_pcm_decode_budget(&short).unwrap();
+        assert_eq!(
+            capped_budget.duration_budget_ms,
+            ALIGNMENT_V2_MAX_DURATION_MS
+        );
+        assert_eq!(capped_budget.stdout_hard_limit_bytes, 115_200_000);
+
+        assert_eq!(
+            supervised_read_bounded_vec_capacity_upper_bound(1).unwrap(),
+            64 * 1024
+        );
+        assert_eq!(
+            supervised_read_bounded_vec_capacity_upper_bound(100_000).unwrap(),
+            200_000
+        );
+        assert_eq!(
+            supervised_read_bounded_stderr_capacity_upper_bound().unwrap(),
+            2 * 1024 * 1024
+        );
+
+        let fine_budget = v2_fine_window_pcm_decode_budget(PresentationRangeMs {
+            start_ms: 5_000,
+            end_ms: 6_000,
+        })
+        .unwrap();
+        assert_eq!(fine_budget.duration_budget_ms, 1_050);
+        assert_eq!(fine_budget.stdout_hard_limit_bytes, 33_600);
+    }
+
+    #[test]
     fn fine_window_budget_charges_stdout_and_parsed_pcm_at_the_same_time() {
         let range = PresentationRangeMs {
             start_ms: 0,
             end_ms: ALIGNMENT_V2_MAX_DURATION_MS as i64,
         };
+        let decode = v2_fine_window_pcm_decode_budget(range).unwrap();
         let upper_bound = v2_fine_window_artifact_upper_bound(range).unwrap();
 
-        assert!(
-            upper_bound >= ALIGNMENT_V2_MAX_PCM_BYTES * 2,
-            "upper_bound={upper_bound}, pcm={ALIGNMENT_V2_MAX_PCM_BYTES}"
+        assert_eq!(decode.duration_budget_ms, ALIGNMENT_V2_MAX_DURATION_MS + 50);
+        assert_eq!(decode.stdout_hard_limit_bytes, 115_201_600);
+        assert_eq!(
+            upper_bound,
+            supervised_read_bounded_vec_capacity_upper_bound(decode.stdout_hard_limit_bytes)
+                .unwrap()
+                + decode.stdout_hard_limit_bytes
+                + supervised_read_bounded_stderr_capacity_upper_bound().unwrap()
         );
-        assert!(upper_bound > ALIGNMENT_V2_MAX_PCM_BYTES * 2);
+        assert_eq!(upper_bound, 347_701_952);
+    }
+
+    #[test]
+    fn cuda_fine_budget_combines_host_batch_and_worst_case_device_workspace() {
+        let device = CudaFftMemoryBudget::for_batch(CUDA_FFT_DEFAULT_BATCH_FRAMES).unwrap();
+        let expected_host = device.input_bytes
+            + device.output_bytes * 2
+            + CUDA_FFT_DEFAULT_BATCH_FRAMES * std::mem::size_of::<f64>();
+        let combined = v2_cuda_fine_transient_upper_bound_bytes().unwrap();
+
+        assert_eq!(
+            combined,
+            device.worst_case_total_device_bytes + expected_host
+        );
+        assert_eq!(combined, 176_291_840);
+        assert!(combined > device.worst_case_total_device_bytes);
+    }
+
+    #[test]
+    fn coarse_stage_budget_models_short_and_streaming_cpu_cuda_and_hybrid_peaks() {
+        let mut short = test_audio_input(1, 0);
+        short.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+        let short_cpu =
+            v2_coarse_stage_budget_for_backend_id(&short, CPU_SPECTRAL_BACKEND_ID).unwrap();
+        let short_cuda =
+            v2_coarse_stage_budget_for_backend_id(&short, CUDA_FFT_BACKEND_ID).unwrap();
+        assert_eq!(short_cpu.final_artifact_bytes, 156_096_000);
+        assert_eq!(short_cpu.decode_phase_bytes, 347_697_152);
+        assert_eq!(short_cpu.analysis_phase_bytes, 299_497_152);
+        assert_eq!(short_cpu.peak_additional_bytes, 347_697_152);
+        assert_eq!(short_cuda.analysis_phase_bytes, 475_788_992);
+        assert_eq!(short_cuda.peak_additional_bytes, 475_788_992);
+        assert_eq!(
+            short_cuda.analysis_phase_bytes - short_cpu.analysis_phase_bytes,
+            v2_cuda_fft_batch_transient_upper_bound_bytes().unwrap()
+        );
+        assert!(short_cuda.peak_additional_bytes < MAX_V2_ACTIVE_ARTIFACT_BYTES);
+
+        let mut long = test_audio_input(2, 0);
+        long.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS + 1);
+        let long_cpu =
+            v2_coarse_stage_budget_for_backend_id(&long, CPU_SPECTRAL_BACKEND_ID).unwrap();
+        let long_cuda = v2_coarse_stage_budget_for_backend_id(&long, CUDA_FFT_BACKEND_ID).unwrap();
+        let long_hybrid =
+            v2_coarse_stage_budget_for_backend_id(&long, STREAMING_HYBRID_SPECTRAL_BACKEND_ID)
+                .unwrap();
+        assert_eq!(long_cpu.final_artifact_bytes, 3_538_944);
+        assert_eq!(long_cpu.peak_additional_bytes, 16_266_826);
+        assert_eq!(long_cuda.peak_additional_bytes, 200_816_202);
+        assert_eq!(long_hybrid, long_cuda);
+        assert!(long_cuda.peak_additional_bytes < MAX_V2_ACTIVE_ARTIFACT_BYTES);
+    }
+
+    #[test]
+    fn coarse_phase_near_cap_blocks_before_candidate_closure_but_sixty_minutes_fit() {
+        let mut short = test_audio_input(1, 0);
+        short.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+        let mut long = test_audio_input(2, 0);
+        long.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS + 1);
+        let cases = [
+            (&short, CPU_SPECTRAL_BACKEND_ID),
+            (&short, CUDA_FFT_BACKEND_ID),
+            (&long, STREAMING_CPU_SPECTRAL_BACKEND_ID),
+            (&long, CUDA_FFT_BACKEND_ID),
+            (&long, STREAMING_HYBRID_SPECTRAL_BACKEND_ID),
+        ];
+
+        for (input, backend_id) in cases {
+            let budget = v2_coarse_stage_budget_for_backend_id(input, backend_id).unwrap();
+            let mut starts = 0_usize;
+            execute_after_v2_coarse_stage_admission(0, input, backend_id, || {
+                starts += 1;
+                Ok(())
+            })
+            .expect("a single maximum short/long candidate must fit the 1 GiB phase budget");
+            assert_eq!(starts, 1, "backend={backend_id}");
+
+            let near_cap_baseline = MAX_V2_ACTIVE_ARTIFACT_BYTES
+                .checked_sub(budget.peak_additional_bytes)
+                .unwrap()
+                + 1;
+            let error = execute_after_v2_coarse_stage_admission(
+                near_cap_baseline,
+                input,
+                backend_id,
+                || {
+                    starts += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("one byte beyond the phase peak must fail before the closure starts");
+            assert!(error.starts_with("blocked:resource-limit"));
+            assert_eq!(
+                starts, 1,
+                "blocked closure started for backend={backend_id}"
+            );
+        }
     }
 
     #[test]
@@ -19401,8 +20318,12 @@ mod tests {
             "真实 fixture",
             &test_options(),
             &synthetic_long_input,
-            None,
-            None,
+            V2LandmarkExtractionContext {
+                cancel_flag: None,
+                shared_backend_request: None,
+                cache_plan: None,
+                retained_artifact_bytes: 0,
+            },
         )
         .unwrap();
         assert!(coarse_artifact.pcm.is_none());
@@ -19436,6 +20357,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(window_audio.presentation_offset_ms, 2_000);
+        assert_eq!(
+            window_audio.fine_spectral_backend.backend_id,
+            lock_fine_spectral_backend_request(&coarse_artifact.spectral_backend)
+                .unwrap()
+                .planned_backend_id
+        );
         assert_eq!(
             window_audio.fine_features.first().unwrap().time_ms,
             2_025,
@@ -20516,6 +21443,193 @@ mod tests {
                 end_ms: 120_000,
             },
         }
+    }
+
+    #[test]
+    fn ordinary_joint_cache_plan_blocks_target_before_source_decode_closure() {
+        let _fixture_guard = lock_audio_feature_cache_test_fixture();
+        v2_landmark_cache().lock().unwrap().clear();
+        let options = test_options();
+        let source_inputs = (1..=4_u32)
+            .map(|stream_index| {
+                let mut input = test_audio_input(stream_index, 0);
+                input.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+                input.stream.duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+                input
+            })
+            .collect::<Vec<_>>();
+        let mut target_input = test_audio_input(5, 0);
+        target_input.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+        target_input.stream.duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+        target_input.content_identity = Some(test_media_content_identity('b', 2_048, 2));
+        let source_only = plan_v2_candidate_set_cache_aware(
+            "ordinary-source.mkv",
+            &options,
+            &source_inputs,
+            CUDA_FFT_BACKEND_ID,
+            0,
+        )
+        .expect("the source candidate set must fit by itself");
+        assert_eq!(source_only.projected_retained_bytes, 624_384_000);
+
+        let mut source_decode_closure_count = 0_usize;
+        let error = (|| -> Result<(), String> {
+            let _plans = plan_v2_ordinary_candidate_sets_cache_aware(
+                "ordinary-source.mkv",
+                "ordinary-target.mkv",
+                &options,
+                &source_inputs,
+                std::slice::from_ref(&target_input),
+                CUDA_FFT_BACKEND_ID,
+                0,
+            )?;
+            source_decode_closure_count += 1;
+            Ok(())
+        })()
+        .expect_err("the target phase must overflow the combined projected prefix");
+
+        assert!(error.starts_with("blocked:resource-limit"));
+        assert_eq!(source_decode_closure_count, 0);
+    }
+
+    #[test]
+    fn cache_aware_cuda_plan_reuses_five_warm_tracks_after_cache_eviction() {
+        let _fixture_guard = lock_audio_feature_cache_test_fixture();
+        let options = test_options();
+        let media_path = "synthetic-five-track-warm-cache.mkv";
+        let inputs = (1..=5_u32)
+            .map(|stream_index| {
+                let mut input = test_audio_input(stream_index, 0);
+                input.media_duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+                input.stream.duration_ms = Some(ALIGNMENT_V2_MAX_DURATION_MS);
+                input
+            })
+            .collect::<Vec<_>>();
+        v2_landmark_cache().lock().unwrap().clear();
+
+        let cold_error = plan_v2_candidate_set_cache_aware(
+            media_path,
+            &options,
+            &inputs,
+            CUDA_FFT_BACKEND_ID,
+            0,
+        )
+        .expect_err("five cold one-hour CUDA tracks must exceed the prefix phase budget");
+        assert!(cold_error.starts_with("blocked:resource-limit"));
+
+        let mut original_landmark_arcs = Vec::with_capacity(inputs.len());
+        {
+            let mut cache = v2_landmark_cache().lock().unwrap();
+            for (index, input) in inputs.iter().enumerate() {
+                let key = create_v2_planned_coarse_cache_key(
+                    media_path,
+                    &options,
+                    input,
+                    CUDA_FFT_BACKEND_ID,
+                )
+                .unwrap();
+                let mut artifact = test_v2_media_artifact(1, index as u64 + 1);
+                artifact.spectral_backend = SpectralBackendExecution {
+                    backend_id: CUDA_FFT_BACKEND_ID.to_string(),
+                    requested_backend: "cuda".to_string(),
+                    backend_detail: "synthetic warm CUDA artifact".to_string(),
+                    fallback_reason: None,
+                };
+                artifact.presentation_bounds = PresentationRangeMs {
+                    start_ms: 0,
+                    end_ms: ALIGNMENT_V2_MAX_DURATION_MS as i64,
+                };
+                original_landmark_arcs.push(Arc::clone(&artifact.landmarks));
+                assert!(cache.insert(key, artifact, None).unwrap().stored);
+            }
+        }
+
+        let warm_plan = plan_v2_candidate_set_cache_aware(
+            media_path,
+            &options,
+            &inputs,
+            CUDA_FFT_BACKEND_ID,
+            0,
+        )
+        .expect("warm hits must charge only actual retained Arc payloads");
+        assert_eq!(warm_plan.candidates.len(), 5);
+
+        // Simulate LRU eviction after planning. Every Hit owns cloned Arcs and remains consumable
+        // without a second cache lookup, including the fifth track that a cold transient rejects.
+        v2_landmark_cache().lock().unwrap().clear();
+        for (index, candidate) in warm_plan.candidates.into_iter().enumerate() {
+            let V2CoarseCandidateCachePlan::Hit(cached) = candidate else {
+                panic!("candidate {} unexpectedly planned as a miss", index + 1);
+            };
+            assert!(cached.cache_hit);
+            assert!(Arc::ptr_eq(
+                &cached.landmarks,
+                &original_landmark_arcs[index]
+            ));
+            assert_eq!(cached.landmarks[0].hash, index as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn prefetched_cache_hit_executes_after_eviction_without_pcm_decode() {
+        let _fixture_guard = lock_audio_feature_cache_test_fixture();
+        let path = temp_audio_cache_path("v2-prefetched-hit");
+        std::fs::write(&path, b"stable-prefetched-media").unwrap();
+        let media_path = path.to_string_lossy().to_string();
+        let mut input = test_audio_input(1, 0);
+        input.content_identity =
+            Some(probe_media_content_identity_cancellable(&path, None).unwrap());
+        let options = test_options();
+        let backend_request = resolve_spectral_backend_request().unwrap();
+        let cache_key = create_v2_planned_coarse_cache_key(
+            &media_path,
+            &options,
+            &input,
+            &backend_request.planned_backend_id,
+        )
+        .unwrap();
+        let mut artifact = test_v2_media_artifact(1, 42);
+        artifact.spectral_backend = SpectralBackendExecution {
+            backend_id: backend_request.planned_backend_id.clone(),
+            requested_backend: backend_request.requested_backend.clone(),
+            backend_detail: backend_request.backend_detail.clone(),
+            fallback_reason: backend_request.fallback_reason.clone(),
+        };
+        let original_landmarks = Arc::clone(&artifact.landmarks);
+        {
+            let mut cache = v2_landmark_cache().lock().unwrap();
+            cache.clear();
+            assert!(cache.insert(cache_key, artifact, None).unwrap().stored);
+        }
+        let mut plan = plan_v2_candidate_set_cache_aware(
+            &media_path,
+            &options,
+            std::slice::from_ref(&input),
+            &backend_request.planned_backend_id,
+            0,
+        )
+        .unwrap();
+        v2_landmark_cache().lock().unwrap().clear();
+        reset_test_v2_pcm_decode_invocations();
+
+        let cached = get_v2_landmarks(
+            &media_path,
+            "预取命中",
+            &options,
+            &input,
+            V2LandmarkExtractionContext {
+                cancel_flag: None,
+                shared_backend_request: Some(&backend_request),
+                cache_plan: plan.candidates.pop(),
+                retained_artifact_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(cached.cache_hit);
+        assert!(Arc::ptr_eq(&cached.landmarks, &original_landmarks));
+        assert_eq!(test_v2_pcm_decode_invocations(), 0);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
