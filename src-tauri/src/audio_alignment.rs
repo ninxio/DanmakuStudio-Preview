@@ -645,6 +645,8 @@ const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_PAIRS: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_ID_BYTES: usize = 512;
 const MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS: usize = 16;
+const AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS: f64 = 0.02;
+const AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS: f64 = 0.20;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -14928,6 +14930,7 @@ fn prepare_audio_alignment_batch_media(
     plan: &PlannedAudioAlignmentBatch,
     options: &AudioAlignmentOptions,
     cancel_flag: &AtomicBool,
+    progress_job_id: Option<&str>,
 ) -> Result<Vec<PreparedAudioAlignmentBatchMediaState>, String> {
     let toolchain_cache_identity = audio_alignment_toolchain_cache_identity(options)?.to_string();
     let spectral_backend_request = &options.spectral_backend_request;
@@ -14939,10 +14942,28 @@ fn prepare_audio_alignment_batch_media(
         (PhysicalFileObjectKey, Option<u32>),
         Result<Arc<PreparedAudioAlignmentBatchMedia>, String>,
     >::new();
+    let total_media_count = plan.media.len().max(1);
+    let mut prepared_media_count = 0_usize;
     let prepared = prepare_distinct_audio_alignment_batch_media_with(
         &plan.media,
         cancel_flag,
         |media| {
+            let media_ordinal = prepared_media_count + 1;
+            if let Some(job_id) = progress_job_id {
+                let progress = AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS
+                    + (AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS
+                        - AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS)
+                        * prepared_media_count as f64
+                        / total_media_count as f64;
+                update_audio_alignment_batch_phase(
+                    job_id,
+                    progress,
+                    &format!(
+                        "正在预处理第 {media_ordinal}/{total_media_count} 个素材（{}）：读取 PTS、音轨并生成共享声谱特征。",
+                        media.role_label
+                    ),
+                )?;
+            }
             validate_media_input(&media.path, media.role_label)?;
             let candidate_pin = PinnedPhysicalFile::open(Path::new(&media.path))?;
             candidate_pin.verify_handle_and_path()?;
@@ -14961,6 +14982,21 @@ fn prepare_audio_alignment_batch_media(
             physical_group_by_media_id.insert(media.media_id.clone(), physical_group_index);
             let view_key = (physical_object_key, media.requested_audio_stream_index);
             if let Some(cached) = prepared_views.get(&view_key) {
+                prepared_media_count = media_ordinal;
+                if let Some(job_id) = progress_job_id {
+                    let progress = AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS
+                        + (AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS
+                            - AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS)
+                            * prepared_media_count as f64
+                            / total_media_count as f64;
+                    update_audio_alignment_batch_phase(
+                        job_id,
+                        progress,
+                        &format!(
+                            "已预处理 {prepared_media_count}/{total_media_count} 个素材；当前素材复用同一物理媒体与音轨制品。"
+                        ),
+                    )?;
+                }
                 return cached.clone();
             }
 
@@ -15045,6 +15081,21 @@ fn prepare_audio_alignment_batch_media(
                     },
                 }))
             })();
+            prepared_media_count = media_ordinal;
+            if let Some(job_id) = progress_job_id {
+                let progress = AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS
+                    + (AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS
+                        - AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS)
+                        * prepared_media_count as f64
+                        / total_media_count as f64;
+                update_audio_alignment_batch_phase(
+                    job_id,
+                    progress,
+                    &format!(
+                        "已预处理 {prepared_media_count}/{total_media_count} 个素材；正在准备下一项。"
+                    ),
+                )?;
+            }
             prepared_views.insert(view_key, result.clone());
             result
         },
@@ -16373,6 +16424,14 @@ fn run_audio_alignment_batch_job(
         let _ = fail_audio_alignment_batch_worker(&job_id, 0);
         return;
     }
+    if let Err(error) = update_audio_alignment_batch_phase(
+        &job_id,
+        0.01,
+        "正在检查 FFmpeg、CUDA 计算策略与批次资源。",
+    ) {
+        let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
+        return;
+    }
     let pinned = match plan
         .pairs
         .first()
@@ -16397,8 +16456,12 @@ fn run_audio_alignment_batch_job(
             return;
         }
     };
-    let prepared = match prepare_audio_alignment_batch_media(&plan, &options, cancel_flag.as_ref())
-    {
+    let prepared = match prepare_audio_alignment_batch_media(
+        &plan,
+        &options,
+        cancel_flag.as_ref(),
+        Some(&job_id),
+    ) {
         Ok(prepared) => prepared,
         Err(error) if error == AUDIO_ALIGNMENT_CANCELLED => {
             let _ = cancel_audio_alignment_batch_worker(&job_id);
@@ -16416,6 +16479,18 @@ fn run_audio_alignment_batch_job(
             return;
         }
     };
+    if let Err(error) = update_audio_alignment_batch_phase(
+        &job_id,
+        AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS,
+        &format!(
+            "{} 个素材预处理完成，正在比较 {} 组对应关系。",
+            plan.media.len(),
+            plan.pairs.len()
+        ),
+    ) {
+        let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
+        return;
+    }
     if let Err(error) = bind_audio_alignment_batch_physical_groups(&mut plan, &prepared) {
         let _ = fail_audio_alignment_batch_worker_with_error(&job_id, 0, &error);
         return;
@@ -17734,12 +17809,45 @@ fn update_audio_alignment_batch_pair_progress(
     };
     entry.snapshot.status = AudioAlignmentJobStatus::Running;
     entry.snapshot.current_pair_ordinal = Some(pair_ordinal);
-    entry.snapshot.progress =
+    let execution_progress =
         (pair_index as f64 + clamped) / entry.snapshot.total_pair_count.max(1) as f64;
+    let weighted_progress = AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS
+        + (1.0 - AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS) * execution_progress;
+    entry.snapshot.progress = entry.snapshot.progress.max(weighted_progress);
     entry.snapshot.message = format!(
         "正在执行第 {pair_ordinal}/{} 个 pair：{message}",
         entry.snapshot.total_pair_count
     );
+    entry.snapshot.updated_at_ms = current_time_ms();
+    Ok(())
+}
+
+fn update_audio_alignment_batch_phase(
+    job_id: &str,
+    progress: f64,
+    message: &str,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    if !matches!(
+        entry.snapshot.status,
+        AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running
+    ) {
+        return Ok(());
+    }
+    entry.snapshot.status = AudioAlignmentJobStatus::Running;
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.progress = entry.snapshot.progress.max(progress.clamp(0.0, 1.0));
+    entry.snapshot.message = message.to_string();
+    for pair in &mut entry.snapshot.pairs {
+        if pair.status == AudioAlignmentJobStatus::Queued {
+            pair.message = message.to_string();
+        }
+    }
     entry.snapshot.updated_at_ms = current_time_ms();
     Ok(())
 }
@@ -25922,9 +26030,13 @@ mod tests {
         let mut alias_plan = plan_audio_alignment_batch(request.clone()).unwrap();
         let (options, toolchain) =
             create_pinned_audio_alignment_options(&alias_plan.pairs[0].request).unwrap();
-        let prepared =
-            prepare_audio_alignment_batch_media(&alias_plan, &options, &AtomicBool::new(false))
-                .unwrap();
+        let prepared = prepare_audio_alignment_batch_media(
+            &alias_plan,
+            &options,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
         let PreparedAudioAlignmentBatchMediaState::Ready(first_source) = &prepared[0] else {
             panic!("primary source preparation failed");
         };
@@ -27533,6 +27645,49 @@ mod tests {
             .pairs
             .iter()
             .all(|pair| { pair.request.spectral_backend == Some(SpectralBackendPreference::Cpu) }));
+    }
+
+    #[test]
+    fn batch_shared_preparation_is_observable_before_any_pair_starts() {
+        let job_id = "test-batch-shared-preparation".to_string();
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(None)).unwrap();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag).unwrap();
+
+        update_audio_alignment_batch_phase(
+            &job_id,
+            0.08,
+            "正在预处理第 1/4 个素材：读取 PTS、音轨并生成共享声谱特征。",
+        )
+        .unwrap();
+
+        let preparing = get_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(preparing.status, AudioAlignmentJobStatus::Running);
+        assert_eq!(preparing.current_pair_ordinal, None);
+        assert_eq!(preparing.progress, 0.08);
+        assert!(preparing.message.contains("正在预处理第 1/4 个素材"));
+        assert!(preparing
+            .pairs
+            .iter()
+            .all(|pair| pair.status == AudioAlignmentJobStatus::Queued));
+        assert!(preparing
+            .pairs
+            .iter()
+            .all(|pair| pair.message.contains("正在预处理第 1/4 个素材")));
+
+        update_audio_alignment_batch_pair_progress(
+            &job_id,
+            0,
+            0.08,
+            "正在完成全批项目级 Top-K coarse scoring；尚未执行 fine。",
+        )
+        .unwrap();
+        let scoring = get_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert!(scoring.progress >= AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS);
+        assert_eq!(scoring.current_pair_ordinal, Some(1));
+        assert_eq!(scoring.pairs[0].status, AudioAlignmentJobStatus::Running);
+
+        cancel_audio_alignment_batch_worker(&job_id).unwrap();
     }
 
     #[test]

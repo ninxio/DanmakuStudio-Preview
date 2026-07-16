@@ -1,3 +1,13 @@
+- 2026-07-17：C137 完成第六阶段第十八个切片“批次共享预处理真实进度与排队误导修复”，完整验证并重新打包；Goal 继续进行。
+  - 根因确认：原生 N×M 批次会先对 distinct physical media 统一执行工具链检查、全文件身份校验、PTS/音轨读取和共享声谱特征生成，但旧实现直到进入第一个 pair 比较才把 batch 从 queued 改为 running；前端又把所有 queued pair 固定翻译为“等待前面的组合完成”，因此 1 个长参考 × 5 个原片会在实际繁忙时全部显示等待 0%。
+  - 原生批次现在从工具链检查开始即发布 running：1% 显示 FFmpeg/CUDA 与批次资源检查，2%–20% 按 distinct media 显示“正在预处理第 N/M 个素材（角色）”，并明确区分完成与 physical-media 复用；预处理完成后再进入逐 pair 比较。batch progress 全程单调，后续 pair 进度映射到 20%–100%，不会在阶段切换时倒退。
+  - 匹配页现在以 batch snapshot 为共享阶段权威：共享预处理时所有所选组合显示“分析中”和同一真实阶段/进度，不再伪装成逐组排队；进入 pair 比较后仍保留每组自己的状态与原生日志。取消、项目切换、迟到结果隔离、Evidence v3 和候选发布门禁保持不变。
+  - 当前 CPU/GPU 边界没有伪装：强制 GPU 仍只加速 coarse/fine 声谱 FFT；FFprobe、FFmpeg 解码、全文件 SHA-256、landmark pairing、edit-aware DP、边界精修与 exact assignment 仍会使用 CPU/磁盘。单个长素材内部目前只能报告“第 N/M 个素材”阶段，FFmpeg/哈希尚无稳定的逐字节百分比，因此进度可能在同一素材上停留一段时间，但不再错误显示排队。
+  - 自动验收：新增原生“首个 pair 开始前共享预处理可观察且进度不倒退”回归；Rust 串行全量 **396 passed / 18 ignored / 0 failed**，强制 RTX 4090 / CUDA/cuFFT **26/26**，Rustfmt 通过。`corepack pnpm verify:release` 完整通过源码审计、ESLint、Vitest **88 files / 900 tests**、TypeScript/Vite production build、Chromium 四页北极星 **6/6** 和 Tauri NSIS release。
+  - 本阶段安装器：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `4168096` 字节，时间 `2026-07-17 07:49:13 +08:00`，SHA-256 `12CCAE217CD13ED91502FFD4568026E16D061C48C8CF895B19412D911C9BD1D7`。
+  - 本阶段便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `16280576` 字节，时间 `2026-07-17 07:49:13 +08:00`，SHA-256 `114F5CBB69CADCBBDBC5141ADE1E810DA5F7964B897BD0B7761C15F1CDB6CB5F`。
+  - 诚实限制：本切片修复的是任务可观察性与进度语义，不等于真实影片准确率已经达标；获授权真实冻结 Gold 仍为 0，用户影片上的整体错位、删减双边界 P95、概率校准和 20 套真实长合集仍未闭环。因此 C137 保持 active，不能宣称 Goal 已完成。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-batch-preparation-progress-v1-20260717`。
 - 2026-07-14：C137 完成第六阶段第十七个切片“局部留出漂移门禁、development Gold 治理候选与 formal frozen 失败关闭”，完整验证并重新打包；Goal 继续进行。
   - 最终 TimeMap 新增真实局部漂移闸门：按每个 matched span 独立计算 30 秒滑动窗口 held-out P95，超过 200 ms 即 blocked；sourceOnly、targetOnly 与 ambiguous 编辑段不参与漂移窗口，最大无验证间隙也按 matched span 约束，不再由全片平均值掩盖局部错位。
   - 长片稀疏证据不再按原始 anchor 数误判：验证容量统一使用 1 秒离散 held-out 时间块，90 分钟、32 个均匀时间块且每块多 anchor 可进入 review；同样容量若中央出现未验证大洞仍 blocked。1 小时 32 点、局部 300 ms 漂移会阻断，180 ms 保持 review；30 秒 source-only 不制造假阻断。

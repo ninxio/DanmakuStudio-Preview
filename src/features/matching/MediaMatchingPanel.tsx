@@ -668,7 +668,7 @@ export function MediaMatchingPanel({
           createMediaPairKey(task.sourceMediaId, task.targetMediaId)
         );
         return pairSnapshot
-          ? { ...task, ...batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot.jobId) }
+          ? { ...task, ...batchTaskPatchFromPairSnapshot(pairSnapshot, snapshot) }
           : task;
       })
     );
@@ -798,15 +798,36 @@ function describeSpectralBackendPolicy(value: SpectralBackendPreference): string
 
 function batchTaskPatchFromPairSnapshot(
   snapshot: AudioAlignmentBatchPairSnapshot,
-  jobId: string | null
+  batchSnapshot: AudioAlignmentBatchJobSnapshot
 ): Partial<BatchTask> {
+  const batchMessage = batchSnapshot.message.trim();
+  const pairMessage = snapshot.message.trim();
   const base = {
-    jobId,
-    progress: snapshot.progress,
-    logs: snapshot.message ? [snapshot.message] : []
+    jobId: batchSnapshot.jobId,
+    progress: Math.max(snapshot.progress, batchSnapshot.progress),
+    logs: pairMessage ? [pairMessage] : []
   };
   if (snapshot.status === "queued") {
-    return { ...base, state: "waiting", message: "等待前面的组合完成" };
+    if (batchSnapshot.status === "running" && batchSnapshot.currentPairOrdinal === null) {
+      return {
+        ...base,
+        state: "running",
+        logs: [...new Set([batchMessage, pairMessage].filter((message) => message.length > 0))],
+        message: batchMessage || pairMessage || "正在进行整批共享预处理"
+      };
+    }
+    if (batchSnapshot.status === "running" && batchSnapshot.currentPairOrdinal !== null) {
+      return {
+        ...base,
+        state: "waiting",
+        message: `等待当前第 ${batchSnapshot.currentPairOrdinal}/${batchSnapshot.totalPairCount} 组分析完成`
+      };
+    }
+    return {
+      ...base,
+      state: "waiting",
+      message: pairMessage || "批次已提交，等待原生工作线程启动"
+    };
   }
   if (snapshot.status === "running") {
     return { ...base, state: "running", message: "正在寻找可能对应的片段" };
@@ -1069,6 +1090,7 @@ function BatchTaskList({ tasks, project }: { tasks: BatchTask[]; project: Editor
                 {target?.name ?? task.targetMediaId} ← {source?.name ?? task.sourceMediaId}
               </div>
               <div
+                data-testid="batch-task-message"
                 className={
                   task.state === "failed" ? "text-accent-red" : "text-[11px] text-slate-500"
                 }

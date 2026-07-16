@@ -801,6 +801,43 @@ describe("多媒体自动匹配工作台", () => {
     );
   });
 
+  it("共享媒体预处理期间显示真实批次阶段，不把所有组合误报为逐组排队", async () => {
+    const preparingSnapshot = {
+      ...createLegacyBatchSnapshot("batch-preparing", [
+        createTestBatchPair("source-long", "target-ep1", "queued", null, "等待执行"),
+        createTestBatchPair("source-long", "target-ep2", "queued", null, "等待执行")
+      ]),
+      status: "running" as const,
+      progress: 0.08,
+      message: "正在预处理第 1/3 个素材（B 站参考）：读取 PTS、音轨并生成共享声谱特征。",
+      currentPairOrdinal: null
+    } satisfies AudioAlignmentBatchJobSnapshot;
+    const cancelledSnapshot = createLegacyBatchSnapshot("batch-preparing", [
+      createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已停止"),
+      createTestBatchPair("source-long", "target-ep2", "cancelled", null, "已停止")
+    ]);
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(preparingSnapshot);
+    vi.mocked(cancelTauriAudioAlignmentBatchJob).mockResolvedValueOnce(cancelledSnapshot);
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+
+    const taskList = await screen.findByLabelText("批量匹配任务");
+    const taskMessages = within(taskList).getAllByTestId("batch-task-message");
+    expect(taskMessages).toHaveLength(2);
+    for (const taskMessage of taskMessages) {
+      expect(taskMessage).toHaveTextContent(/正在预处理第 1\/3 个素材/);
+    }
+    expect(within(taskList).getAllByText("分析中")).toHaveLength(2);
+    expect(within(taskList).getAllByText("8%")).toHaveLength(2);
+    expect(screen.queryByText("等待前面的组合完成")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "取消剩余任务" }));
+    await waitFor(() =>
+      expect(cancelTauriAudioAlignmentBatchJob).toHaveBeenCalledWith("batch-preparing")
+    );
+  });
+
   it("只启动一个原生批次并用同一 jobId 轮询一对多结果", async () => {
     vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce(
       createLegacyBatchSnapshot("batch-poll-once", [
