@@ -819,6 +819,11 @@ function createSuccessfulInvoker(
         sessionId,
         status: "released" as const,
         cacheGeneration: generation,
+        jobMemoryReceipt: createJobMemoryReceipt(
+          session.environment.workloadStorage,
+          sessionId,
+          [...terminalJobs.values()]
+        ),
         terminalCleanupReceipt: createTerminalCleanupReceipt(
           session.environment.workloadStorage,
           sessionId,
@@ -864,6 +869,7 @@ function createSession(
     },
     activeJobId: null,
     cleanupIssue: null,
+    jobMemoryReceipt: null,
     terminalCleanupReceipt: null
   };
 }
@@ -965,6 +971,77 @@ function createTerminalCleanupReceipt(
   };
 }
 
+function createJobMemoryReceipt(
+  storage: AlignmentBenchmarkWorkloadStorageReceipt,
+  sessionId: string,
+  snapshots: AlignmentBenchmarkJobSnapshot[]
+): NonNullable<AlignmentBenchmarkSessionSnapshot["jobMemoryReceipt"]> {
+  const jobs = snapshots
+    .map((snapshot) => {
+      const memory = snapshot.telemetry.memory;
+      if (
+        memory.sampler !== "windows-job-object-working-set-v1" ||
+        memory.sampleCount <= 0 ||
+        memory.failedSampleCount !== 0 ||
+        memory.peakProcessTreeRssBytes === null ||
+        !memory.coverageComplete ||
+        !memory.processTreeEmptyAtTerminal ||
+        memory.residualProcessCount !== 0
+      ) {
+        throw new Error("Job memory receipt 测试夹具含不完整 telemetry");
+      }
+      return {
+        jobId: snapshot.jobId,
+        sampleIntervalMs: memory.sampleIntervalMs,
+        sampleCount: memory.sampleCount,
+        failedSampleCount: 0 as const,
+        maximumSampleGapMicros: String(Math.round(memory.maximumSampleGapMs * 1_000)),
+        peakJobHierarchyRssBytes: memory.peakProcessTreeRssBytes,
+        coverageComplete: true as const,
+        processTreeEmptyAtTerminal: true as const,
+        residualProcessCount: 0 as const
+      };
+    })
+    .sort((left, right) => (left.jobId < right.jobId ? -1 : left.jobId > right.jobId ? 1 : 0));
+  const withoutReceiptDigest = {
+    schemaVersion: 1 as const,
+    sessionId,
+    runManifestDigest: storage.runManifestDigest,
+    workloadDigest: storage.workloadDigest,
+    workloadStorageReceiptDigest: storage.receiptDigest,
+    sampler: "windows-job-object-working-set-v1" as const,
+    memoryScope: "application-process-tree" as const,
+    jobCount: jobs.length,
+    totalSampleCount: jobs.reduce((total, job) => total + job.sampleCount, 0),
+    totalFailedSampleCount: 0 as const,
+    maximumSampleGapMicros: jobs.reduce(
+      (maximum, job) =>
+        BigInt(job.maximumSampleGapMicros) > BigInt(maximum)
+          ? job.maximumSampleGapMicros
+          : maximum,
+      "0"
+    ),
+    peakJobHierarchyRssBytes: jobs.reduce(
+      (maximum, job) => Math.max(maximum, job.peakJobHierarchyRssBytes),
+      0
+    ),
+    jobMemoryInventoryDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-job-memory-inventory-v1",
+      jobs
+    }),
+    allJobsCoverageComplete: true as const,
+    allSamplesJobBound: true as const,
+    allTerminalProcessTreesEmpty: true as const
+  };
+  return {
+    ...withoutReceiptDigest,
+    receiptDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-job-memory-receipt-v1",
+      receipt: withoutReceiptDigest
+    })
+  };
+}
+
 function createJobSnapshot(
   sessionId: string,
   sequence: number,
@@ -1003,7 +1080,7 @@ function createJobSnapshot(
       },
       memory: {
         scope: "application-process-tree",
-        sampler: "windows-toolhelp-working-set-v1",
+        sampler: "windows-job-object-working-set-v1",
         sampleIntervalMs: 20,
         sampleCount: terminal ? 25 : 1,
         failedSampleCount: 0,

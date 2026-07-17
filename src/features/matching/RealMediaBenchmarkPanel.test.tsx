@@ -31,8 +31,12 @@ import {
 import {
   computeC137PerformanceEvidenceDigestV2,
   computeC137PerformanceEnvironmentDigestV2,
+  computeC137PerformanceJobMemoryInventoryDigest,
+  computeC137PerformanceJobMemoryReceiptDigest,
   computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformancePlanDigest,
+  projectC137PerformanceJobMemoryInventory,
+  type C137PerformanceJobMemoryReceiptV1,
   type C137PerformanceRawEvidenceV1,
   type C137PerformanceRawEvidenceV2
 } from "../../domain/alignment/c137PerformanceEvidence";
@@ -555,6 +559,7 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(summary).toHaveTextContent("正式性能验收仍要求 Job Object");
     expect(summary).toHaveTextContent("1.00 GiB");
     expect(summary).toHaveTextContent("1 次 · 最大 100ms");
+    expect(summary).toHaveTextContent("内存凭证：缺少 Job Object 内存凭证");
     expect(summary).toHaveTextContent("任务收尾：缺少终态清理凭证");
     expect(screen.getByText(/releaseEligible=false/)).toBeInTheDocument();
 
@@ -571,6 +576,30 @@ describe("C137 真实媒体 benchmark 面板", () => {
       expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
     }
     expect(screen.getByRole("status")).toHaveTextContent("已下载未审批 raw evidence");
+  });
+
+  it("展示严格绑定的 Job Object 内存凭证，但仍不冒充正式验收", async () => {
+    const user = userEvent.setup();
+    const manifest = createRealManifest(1);
+    const evidence = bindPerformanceEvidenceToManifest(manifest);
+    attachJobMemoryReceipt(evidence);
+    const performanceRunner = vi.fn<RealMediaPerformancePanelRunner>(() =>
+      Promise.resolve(evidence)
+    );
+    render(<RealMediaBenchmarkPanel desktopAvailable performanceRunner={performanceRunner} />);
+    await openPanel(user);
+    await uploadManifest(user, manifest);
+
+    await user.click(await screen.findByRole("button", { name: "采集工程性能原始证据" }));
+
+    const summary = await screen.findByLabelText("性能 raw evidence 摘要");
+    expect(summary).toHaveTextContent("进程归属：Job Object");
+    expect(summary).toHaveTextContent("内存凭证：已闭合 · 4 个原生作业");
+    expect(summary).toHaveTextContent("任务收尾：缺少终态清理凭证");
+    expect(summary).toHaveTextContent(
+      "工程采集记录结构完整；正式证据链仍未完成，不能进入正式验收"
+    );
+    expect(summary).not.toHaveTextContent("进程归属仍是 ToolHelp");
   });
 
   it("拒绝工作负载摘要不属于当前 manifest 的有效 raw evidence", async () => {
@@ -938,6 +967,52 @@ function bindPerformanceEvidenceToManifest(
   evidence.planDigest = createC137PerformancePlanDigest(evidence.plan);
   evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
   return evidence;
+}
+
+function attachJobMemoryReceipt(evidence: C137PerformanceRawEvidenceV2): void {
+  evidence.collector.sampler = "windows-job-object-working-set-v1";
+  for (const trial of evidence.trials) {
+    if (trial.trialType === "run") {
+      for (const benchmarkCase of trial.cases) {
+        benchmarkCase.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+      }
+    } else {
+      trial.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+    }
+  }
+  const jobs = projectC137PerformanceJobMemoryInventory(evidence.trials);
+  const unsigned: Omit<C137PerformanceJobMemoryReceiptV1, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: evidence.collector.sessionId,
+    runManifestDigest: evidence.runManifestDigest,
+    workloadDigest: evidence.plan.workloadDigest,
+    workloadStorageReceiptDigest: evidence.environment.workloadStorage.receiptDigest,
+    sampler: "windows-job-object-working-set-v1",
+    memoryScope: "application-process-tree",
+    jobCount: jobs.length,
+    totalSampleCount: jobs.reduce((total, job) => total + job.sampleCount, 0),
+    totalFailedSampleCount: 0,
+    maximumSampleGapMicros: jobs.reduce(
+      (maximum, job) =>
+        BigInt(job.maximumSampleGapMicros) > BigInt(maximum)
+          ? job.maximumSampleGapMicros
+          : maximum,
+      "0"
+    ),
+    peakJobHierarchyRssBytes: jobs.reduce(
+      (maximum, job) => Math.max(maximum, job.peakJobHierarchyRssBytes),
+      0
+    ),
+    jobMemoryInventoryDigest: computeC137PerformanceJobMemoryInventoryDigest(jobs),
+    allJobsCoverageComplete: true,
+    allSamplesJobBound: true,
+    allTerminalProcessTreesEmpty: true
+  };
+  evidence.assurance.jobMemoryReceipt = {
+    ...unsigned,
+    receiptDigest: computeC137PerformanceJobMemoryReceiptDigest(unsigned)
+  };
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
 }
 
 function createCompletedReport(

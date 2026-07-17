@@ -12,12 +12,16 @@ import {
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceEvidenceDigest,
   computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceJobMemoryInventoryDigest,
+  computeC137PerformanceJobMemoryReceiptDigest,
   computeC137PerformanceTerminalCleanupJobInventoryDigest,
   computeC137PerformanceTerminalCleanupReceiptDigest,
   computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformancePlanDigest,
+  projectC137PerformanceJobMemoryInventory,
   projectC137PerformanceTerminalCleanupJobInventory,
   type C137PerformanceRawEvidenceV2,
+  type C137PerformanceJobMemoryReceiptV1,
   type C137PerformanceTerminalCleanupReceiptV1
 } from "./c137PerformanceEvidence";
 import {
@@ -421,12 +425,14 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(storageCheck?.requirement).toContain("结构完整");
     expect(storageCheck?.requirement).toContain("native attestation");
     expect(storageCheck?.requirement).not.toContain("原生 v2 生成");
-    for (const id of ["job-memory-receipt", "native-attestation"]) {
-      expect(gate.checks.find((check) => check.id === id)).toMatchObject({
-        status: "incomplete",
-        actual: "not-verifiable-in-schema-v2"
-      });
-    }
+    expect(gate.checks.find((check) => check.id === "job-memory-receipt")).toMatchObject({
+      status: "incomplete",
+      actual: "missing-or-invalid"
+    });
+    expect(gate.checks.find((check) => check.id === "native-attestation")).toMatchObject({
+      status: "incomplete",
+      actual: "not-verifiable-in-schema-v2"
+    });
     expect(gate.checks.find((check) => check.id === "terminal-cleanup-receipt")).toMatchObject({
       status: "incomplete",
       actual: "missing-or-invalid"
@@ -448,6 +454,29 @@ describe("C137 fail-closed acceptance gate", () => {
       actual: raw.assurance.terminalCleanupReceipt?.receiptDigest
     });
     expect(gate.checks.find((check) => check.id === "job-memory-receipt")?.status).toBe(
+      "incomplete"
+    );
+    expect(gate.checks.find((check) => check.id === "native-attestation")?.status).toBe(
+      "incomplete"
+    );
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
+  it("严格绑定的 Job memory receipt 单项通过，但不能替代 cleanup 与 native attestation", () => {
+    const bundle = createCompleteV2Bundle();
+    const raw = bundle.reports.performance!.rawEvidence;
+    if (raw.schemaVersion !== 2) throw new Error("expected raw evidence v2");
+    attachJobMemoryReceipt(raw);
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(gate.checks.find((check) => check.id === "job-memory-receipt")).toMatchObject({
+      status: "pass",
+      actual: raw.assurance.jobMemoryReceipt?.receiptDigest
+    });
+    expect(gate.checks.find((check) => check.id === "terminal-cleanup-receipt")?.status).toBe(
       "incomplete"
     );
     expect(gate.checks.find((check) => check.id === "native-attestation")?.status).toBe(
@@ -1406,6 +1435,52 @@ function relationshipDecision(
       : [distractors[0], goldCandidateId, ...distractors.slice(1)],
     verifiedCandidateId: null
   };
+}
+
+function attachJobMemoryReceipt(evidence: C137PerformanceRawEvidenceV2): void {
+  evidence.collector.sampler = "windows-job-object-working-set-v1";
+  for (const trial of evidence.trials) {
+    if (trial.trialType === "run") {
+      for (const benchmarkCase of trial.cases) {
+        benchmarkCase.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+      }
+    } else {
+      trial.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+    }
+  }
+  const jobs = projectC137PerformanceJobMemoryInventory(evidence.trials);
+  const unsigned: Omit<C137PerformanceJobMemoryReceiptV1, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: evidence.collector.sessionId,
+    runManifestDigest: evidence.runManifestDigest,
+    workloadDigest: evidence.plan.workloadDigest,
+    workloadStorageReceiptDigest: evidence.environment.workloadStorage.receiptDigest,
+    sampler: "windows-job-object-working-set-v1",
+    memoryScope: "application-process-tree",
+    jobCount: jobs.length,
+    totalSampleCount: jobs.reduce((total, job) => total + job.sampleCount, 0),
+    totalFailedSampleCount: 0,
+    maximumSampleGapMicros: jobs.reduce(
+      (maximum, job) =>
+        BigInt(job.maximumSampleGapMicros) > BigInt(maximum)
+          ? job.maximumSampleGapMicros
+          : maximum,
+      "0"
+    ),
+    peakJobHierarchyRssBytes: jobs.reduce(
+      (maximum, job) => Math.max(maximum, job.peakJobHierarchyRssBytes),
+      0
+    ),
+    jobMemoryInventoryDigest: computeC137PerformanceJobMemoryInventoryDigest(jobs),
+    allJobsCoverageComplete: true,
+    allSamplesJobBound: true,
+    allTerminalProcessTreesEmpty: true
+  };
+  evidence.assurance.jobMemoryReceipt = {
+    ...unsigned,
+    receiptDigest: computeC137PerformanceJobMemoryReceiptDigest(unsigned)
+  };
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
 }
 
 function attachTerminalCleanupReceipt(evidence: C137PerformanceRawEvidenceV2): void {

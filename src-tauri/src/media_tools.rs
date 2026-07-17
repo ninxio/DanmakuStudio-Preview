@@ -266,6 +266,7 @@ fn run_media_tool_version_command(
         .map_err(|error| match error.kind() {
             SupervisedProcessErrorKind::Spawn => MediaToolDetectionFailure::Spawn,
             SupervisedProcessErrorKind::Timeout => MediaToolDetectionFailure::Timeout,
+            SupervisedProcessErrorKind::NoProgress => MediaToolDetectionFailure::Timeout,
             SupervisedProcessErrorKind::Cancelled => MediaToolDetectionFailure::Wait,
             SupervisedProcessErrorKind::StdoutOverflow => MediaToolDetectionFailure::StdoutOverflow,
             SupervisedProcessErrorKind::StderrOverflow => MediaToolDetectionFailure::StderrOverflow,

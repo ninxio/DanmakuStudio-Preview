@@ -537,6 +537,7 @@ fn audio_timeline_probe_streaming_limits() -> SupervisedStreamingLimits {
         },
         stdout_chunk_size: AUDIO_TIMELINE_PROBE_STDOUT_CHUNK_BYTES,
         stdout_buffered_chunks: AUDIO_TIMELINE_PROBE_STDOUT_BUFFERED_CHUNKS,
+        stdout_inactivity_timeout: None,
     }
 }
 
@@ -598,6 +599,9 @@ fn format_supervised_ffprobe_error(
         SupervisedProcessErrorKind::Spawn => format!("{context}无法在受监督进程中启动。"),
         SupervisedProcessErrorKind::Timeout => {
             format!("blocked:process-timeout：{context}超过最长执行或有界收尾时间。")
+        }
+        SupervisedProcessErrorKind::NoProgress => {
+            format!("blocked:process-stalled：{context}持续没有产生新数据，已终止进程。")
         }
         SupervisedProcessErrorKind::Cancelled => format!("cancelled：{context}已取消。"),
         SupervisedProcessErrorKind::StdoutOverflow => format!(

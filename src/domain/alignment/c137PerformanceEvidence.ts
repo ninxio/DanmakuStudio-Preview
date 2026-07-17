@@ -380,6 +380,38 @@ export interface C137PerformanceTerminalCleanupJobInventoryEntryV1 {
   residualProcessCount: 0;
 }
 
+export interface C137PerformanceJobMemoryInventoryEntryV1 {
+  jobId: string;
+  sampleIntervalMs: number;
+  sampleCount: number;
+  failedSampleCount: 0;
+  maximumSampleGapMicros: string;
+  peakJobHierarchyRssBytes: number;
+  coverageComplete: true;
+  processTreeEmptyAtTerminal: true;
+  residualProcessCount: 0;
+}
+
+export interface C137PerformanceJobMemoryReceiptV1 {
+  schemaVersion: 1;
+  sessionId: string;
+  runManifestDigest: C137PerformanceDigest;
+  workloadDigest: C137PerformanceDigest;
+  workloadStorageReceiptDigest: C137PerformanceDigest;
+  sampler: "windows-job-object-working-set-v1";
+  memoryScope: "application-process-tree";
+  jobCount: number;
+  totalSampleCount: number;
+  totalFailedSampleCount: 0;
+  maximumSampleGapMicros: string;
+  peakJobHierarchyRssBytes: number;
+  jobMemoryInventoryDigest: C137PerformanceDigest;
+  allJobsCoverageComplete: true;
+  allSamplesJobBound: true;
+  allTerminalProcessTreesEmpty: true;
+  receiptDigest: C137PerformanceDigest;
+}
+
 export interface C137PerformanceTerminalCleanupReceiptV1 {
   schemaVersion: 1;
   sessionId: string;
@@ -406,7 +438,7 @@ export interface C137PerformanceTerminalCleanupReceiptV1 {
 export interface C137PerformanceAssuranceV2 {
   schemaVersion: 1;
   workloadStorageReceiptDigest: C137PerformanceDigest;
-  jobMemoryReceipt: null;
+  jobMemoryReceipt: C137PerformanceJobMemoryReceiptV1 | null;
   terminalCleanupReceipt: C137PerformanceTerminalCleanupReceiptV1 | null;
   attestation: null;
 }
@@ -518,6 +550,76 @@ export function computeC137PerformanceWorkloadStorageReceiptDigest(
     ? omitWorkloadStorageReceiptDigest(receipt)
     : receipt;
   return computeC137PerformanceCanonicalDigest(payload);
+}
+
+export function projectC137PerformanceJobMemoryInventory(
+  trials: readonly C137PerformanceTrialV2[]
+): C137PerformanceJobMemoryInventoryEntryV1[] {
+  const jobs = trials.flatMap((trial) => {
+    const project = (
+      jobId: string,
+      memory: C137PerformanceMemoryTelemetryV2
+    ): C137PerformanceJobMemoryInventoryEntryV1 => {
+      if (
+        memory.sampler !== "windows-job-object-working-set-v1" ||
+        memory.sampleCount <= 0 ||
+        memory.failedSampleCount !== 0 ||
+        memory.peakProcessTreeRssBytes === null ||
+        memory.peakProcessTreeRssBytes <= 0 ||
+        !memory.coverageComplete ||
+        !memory.processTreeEmptyAtTerminal ||
+        memory.residualProcessCount !== 0
+      ) {
+        throw new Error(`Job memory inventory 遇到覆盖不完整的 job：${jobId}。`);
+      }
+      const maximumSampleGapMicros = Math.round(memory.maximumSampleGapMs * 1_000);
+      if (!Number.isSafeInteger(maximumSampleGapMicros) || maximumSampleGapMicros < 0) {
+        throw new Error(`Job memory inventory 的最大采样间隔越界：${jobId}。`);
+      }
+      return {
+        jobId,
+        sampleIntervalMs: memory.sampleIntervalMs,
+        sampleCount: memory.sampleCount,
+        failedSampleCount: 0,
+        maximumSampleGapMicros: String(maximumSampleGapMicros),
+        peakJobHierarchyRssBytes: memory.peakProcessTreeRssBytes,
+        coverageComplete: true,
+        processTreeEmptyAtTerminal: true,
+        residualProcessCount: 0
+      };
+    };
+    if (trial.trialType === "run") {
+      return trial.cases.map((benchmarkCase) =>
+        project(benchmarkCase.jobId, benchmarkCase.telemetry.memory)
+      );
+    }
+    return [project(trial.jobId, trial.telemetry.memory)];
+  });
+  jobs.sort((left, right) => compareAscii(left.jobId, right.jobId));
+  return jobs;
+}
+
+export function computeC137PerformanceJobMemoryInventoryDigest(
+  jobs: readonly C137PerformanceJobMemoryInventoryEntryV1[]
+): C137PerformanceDigest {
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-job-memory-inventory-v1",
+    jobs
+  });
+}
+
+export function computeC137PerformanceJobMemoryReceiptDigest(
+  receipt:
+    | Omit<C137PerformanceJobMemoryReceiptV1, "receiptDigest">
+    | C137PerformanceJobMemoryReceiptV1
+): C137PerformanceDigest {
+  const payload = "receiptDigest" in receipt
+    ? omitJobMemoryReceiptDigest(receipt)
+    : receipt;
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-job-memory-receipt-v1",
+    receipt: payload
+  });
 }
 
 export function projectC137PerformanceTerminalCleanupJobInventory(
@@ -684,6 +786,7 @@ export function createC137PerformanceEvidenceDraftV2(input: {
   environment: C137PerformanceEnvironmentV2;
   collector: C137PerformanceCollectorV2;
   preflight: C137PerformancePreflightV1;
+  jobMemoryReceipt?: C137PerformanceJobMemoryReceiptV1 | null;
   terminalCleanupReceipt?: C137PerformanceTerminalCleanupReceiptV1 | null;
   status?: C137PerformanceEvidenceStatus;
   issueCodes?: string[];
@@ -701,7 +804,9 @@ export function createC137PerformanceEvidenceDraftV2(input: {
     assurance: {
       schemaVersion: 1,
       workloadStorageReceiptDigest: input.environment.workloadStorage.receiptDigest,
-      jobMemoryReceipt: null,
+      jobMemoryReceipt: input.jobMemoryReceipt
+        ? structuredClone(input.jobMemoryReceipt)
+        : null,
       terminalCleanupReceipt: input.terminalCleanupReceipt
         ? structuredClone(input.terminalCleanupReceipt)
         : null,
@@ -949,6 +1054,67 @@ function validateC137PerformanceEvidenceV2(
   }
   if (evidence.assurance.workloadStorageReceiptDigest !== storage.receiptDigest) {
     issues.push("assurance 未绑定 workload storage receipt。");
+  }
+  const jobMemoryReceipt = evidence.assurance.jobMemoryReceipt;
+  if (jobMemoryReceipt !== null) {
+    try {
+      const inventory = projectC137PerformanceJobMemoryInventory(evidence.trials);
+      const inventoryIds = new Set(inventory.map((job) => job.jobId));
+      const totalSampleCount = inventory.reduce((total, job) => total + job.sampleCount, 0);
+      const maximumSampleGapMicros = inventory.reduce(
+        (maximum, job) =>
+          compareDecimalTicks(job.maximumSampleGapMicros, maximum) > 0
+            ? job.maximumSampleGapMicros
+            : maximum,
+        "0"
+      );
+      const peakJobHierarchyRssBytes = inventory.reduce(
+        (maximum, job) => Math.max(maximum, job.peakJobHierarchyRssBytes),
+        0
+      );
+      if (
+        jobMemoryReceipt.sessionId !== evidence.collector.sessionId ||
+        jobMemoryReceipt.runManifestDigest !== evidence.runManifestDigest ||
+        jobMemoryReceipt.workloadDigest !== evidence.plan.workloadDigest ||
+        jobMemoryReceipt.workloadStorageReceiptDigest !== storage.receiptDigest
+      ) {
+        issues.push("Job memory receipt 未绑定同一 session/run/workload/storage receipt。");
+      }
+      if (
+        evidence.collector.sampler !== "windows-job-object-working-set-v1" ||
+        jobMemoryReceipt.sampler !== evidence.collector.sampler ||
+        jobMemoryReceipt.memoryScope !== evidence.collector.memoryScope
+      ) {
+        issues.push("Job memory receipt 未绑定 collector 的 Job Object 采样契约。");
+      }
+      if (
+        inventoryIds.size !== inventory.length ||
+        jobMemoryReceipt.jobCount !== inventory.length ||
+        jobMemoryReceipt.totalSampleCount !== totalSampleCount ||
+        jobMemoryReceipt.totalFailedSampleCount !== 0 ||
+        jobMemoryReceipt.maximumSampleGapMicros !== maximumSampleGapMicros ||
+        jobMemoryReceipt.peakJobHierarchyRssBytes !== peakJobHierarchyRssBytes
+      ) {
+        issues.push("Job memory receipt 的聚合值与 raw trial inventory 不一致。");
+      }
+      if (
+        jobMemoryReceipt.jobMemoryInventoryDigest !==
+        computeC137PerformanceJobMemoryInventoryDigest(inventory)
+      ) {
+        issues.push("Job memory receipt 的 inventory digest 不一致。");
+      }
+      if (evidence.collector.terminalSessionStatus !== "released") {
+        issues.push("Job memory receipt 只能绑定 released session。");
+      }
+      if (
+        jobMemoryReceipt.receiptDigest !==
+        computeC137PerformanceJobMemoryReceiptDigest(jobMemoryReceipt)
+      ) {
+        issues.push("Job memory receiptDigest 与规范化内容不一致。");
+      }
+    } catch (error: unknown) {
+      issues.push(`Job memory receipt 无法重算：${formatError(error)}`);
+    }
   }
   const terminalCleanupReceipt = evidence.assurance.terminalCleanupReceipt;
   if (terminalCleanupReceipt !== null) {
@@ -1796,7 +1962,9 @@ function validateAssuranceV2(value: unknown, issues: string[]): void {
   if (!record) return;
   requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
   requireDigest(record.workloadStorageReceiptDigest, `${path}.workloadStorageReceiptDigest`, issues);
-  requireLiteral(record.jobMemoryReceipt, null, `${path}.jobMemoryReceipt`, issues);
+  if (record.jobMemoryReceipt !== null) {
+    validateJobMemoryReceiptV1(record.jobMemoryReceipt, `${path}.jobMemoryReceipt`, issues);
+  }
   if (record.terminalCleanupReceipt !== null) {
     validateTerminalCleanupReceiptV1(
       record.terminalCleanupReceipt,
@@ -1805,6 +1973,91 @@ function validateAssuranceV2(value: unknown, issues: string[]): void {
     );
   }
   requireLiteral(record.attestation, null, `${path}.attestation`, issues);
+}
+
+function validateJobMemoryReceiptV1(
+  value: unknown,
+  path: string,
+  issues: string[]
+): void {
+  const record = strictRecord(
+    value,
+    path,
+    [
+      "schemaVersion",
+      "sessionId",
+      "runManifestDigest",
+      "workloadDigest",
+      "workloadStorageReceiptDigest",
+      "sampler",
+      "memoryScope",
+      "jobCount",
+      "totalSampleCount",
+      "totalFailedSampleCount",
+      "maximumSampleGapMicros",
+      "peakJobHierarchyRssBytes",
+      "jobMemoryInventoryDigest",
+      "allJobsCoverageComplete",
+      "allSamplesJobBound",
+      "allTerminalProcessTreesEmpty",
+      "receiptDigest"
+    ],
+    issues
+  );
+  if (!record) return;
+  requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
+  requireOpaqueId(record.sessionId, `${path}.sessionId`, issues);
+  requireDigest(record.runManifestDigest, `${path}.runManifestDigest`, issues);
+  requireDigest(record.workloadDigest, `${path}.workloadDigest`, issues);
+  requireDigest(
+    record.workloadStorageReceiptDigest,
+    `${path}.workloadStorageReceiptDigest`,
+    issues
+  );
+  requireLiteral(
+    record.sampler,
+    "windows-job-object-working-set-v1",
+    `${path}.sampler`,
+    issues
+  );
+  requireLiteral(
+    record.memoryScope,
+    "application-process-tree",
+    `${path}.memoryScope`,
+    issues
+  );
+  requireNonNegativeSafeInteger(record.jobCount, `${path}.jobCount`, issues);
+  requireNonNegativeSafeInteger(record.totalSampleCount, `${path}.totalSampleCount`, issues);
+  requireLiteral(record.totalFailedSampleCount, 0, `${path}.totalFailedSampleCount`, issues);
+  requireDecimalTick(
+    record.maximumSampleGapMicros,
+    `${path}.maximumSampleGapMicros`,
+    issues
+  );
+  requireNonNegativeSafeInteger(
+    record.peakJobHierarchyRssBytes,
+    `${path}.peakJobHierarchyRssBytes`,
+    issues
+  );
+  requireDigest(
+    record.jobMemoryInventoryDigest,
+    `${path}.jobMemoryInventoryDigest`,
+    issues
+  );
+  requireLiteral(
+    record.allJobsCoverageComplete,
+    true,
+    `${path}.allJobsCoverageComplete`,
+    issues
+  );
+  requireLiteral(record.allSamplesJobBound, true, `${path}.allSamplesJobBound`, issues);
+  requireLiteral(
+    record.allTerminalProcessTreesEmpty,
+    true,
+    `${path}.allTerminalProcessTreesEmpty`,
+    issues
+  );
+  requireDigest(record.receiptDigest, `${path}.receiptDigest`, issues);
 }
 
 function validateTerminalCleanupReceiptV1(
@@ -2135,6 +2388,14 @@ function omitReceiptDigestV2(
 function omitWorkloadStorageReceiptDigest(
   receipt: C137PerformanceWorkloadStorageReceiptV2
 ): Omit<C137PerformanceWorkloadStorageReceiptV2, "receiptDigest"> {
+  const { receiptDigest, ...value } = receipt;
+  void receiptDigest;
+  return value;
+}
+
+function omitJobMemoryReceiptDigest(
+  receipt: C137PerformanceJobMemoryReceiptV1
+): Omit<C137PerformanceJobMemoryReceiptV1, "receiptDigest"> {
   const { receiptDigest, ...value } = receipt;
   void receiptDigest;
   return value;

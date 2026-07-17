@@ -607,6 +607,22 @@ describe("C137 原生性能采集 bridge", () => {
   });
 
   it.each([
+    ["missing Job memory receipt", (released: AlignmentBenchmarkSessionSnapshot) => ({
+      ...released,
+      jobMemoryReceipt: null
+    })],
+    ["stale Job memory digest", (released: AlignmentBenchmarkSessionSnapshot) => ({
+      ...released,
+      jobMemoryReceipt: released.jobMemoryReceipt === null
+        ? null
+        : { ...released.jobMemoryReceipt, receiptDigest: `sha256:${"8".repeat(64)}` }
+    })],
+    ["wrong Job memory session binding", (released: AlignmentBenchmarkSessionSnapshot) => ({
+      ...released,
+      jobMemoryReceipt: released.jobMemoryReceipt === null
+        ? null
+        : { ...released.jobMemoryReceipt, sessionId: "benchmark-session-forged" }
+    })],
     ["missing receipt", (released: AlignmentBenchmarkSessionSnapshot) => ({
       ...released,
       terminalCleanupReceipt: null
@@ -1087,6 +1103,7 @@ function createSession(
     },
     activeJobId: null,
     cleanupIssue: null,
+    jobMemoryReceipt: null,
     terminalCleanupReceipt: null
   };
 }
@@ -1123,6 +1140,7 @@ function createReleasedSession(
   return {
     ...session,
     status: "released",
+    jobMemoryReceipt: createEmptyJobMemoryReceipt(session),
     terminalCleanupReceipt: {
       ...withoutReceiptDigest,
       receiptDigest: computeC137CanonicalDigest({
@@ -1130,6 +1148,41 @@ function createReleasedSession(
         receipt: withoutReceiptDigest
       })
     }
+  };
+}
+
+function createEmptyJobMemoryReceipt(
+  session: AlignmentBenchmarkSessionSnapshot
+): NonNullable<AlignmentBenchmarkSessionSnapshot["jobMemoryReceipt"]> {
+  const storage = session.environment.workloadStorage;
+  const jobs: never[] = [];
+  const withoutReceiptDigest = {
+    schemaVersion: 1 as const,
+    sessionId: session.sessionId,
+    runManifestDigest: storage.runManifestDigest,
+    workloadDigest: storage.workloadDigest,
+    workloadStorageReceiptDigest: storage.receiptDigest,
+    sampler: "windows-job-object-working-set-v1" as const,
+    memoryScope: "application-process-tree" as const,
+    jobCount: 0,
+    totalSampleCount: 0,
+    totalFailedSampleCount: 0 as const,
+    maximumSampleGapMicros: "0",
+    peakJobHierarchyRssBytes: 0,
+    jobMemoryInventoryDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-job-memory-inventory-v1",
+      jobs
+    }),
+    allJobsCoverageComplete: true as const,
+    allSamplesJobBound: true as const,
+    allTerminalProcessTreesEmpty: true as const
+  };
+  return {
+    ...withoutReceiptDigest,
+    receiptDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-job-memory-receipt-v1",
+      receipt: withoutReceiptDigest
+    })
   };
 }
 

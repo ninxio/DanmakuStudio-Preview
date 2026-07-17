@@ -1689,6 +1689,13 @@ function evaluatePerformanceThresholds(
     assurance !== null &&
     assurance.workloadStorageReceiptDigest ===
       v2Evidence.environment.workloadStorage.receiptDigest;
+  const jobMemoryReceiptComplete =
+    formalRawSchemaMatches &&
+    validation.valid &&
+    v2Evidence !== null &&
+    v2Evidence.collector.terminalSessionStatus === "released" &&
+    v2Evidence.collector.sampler === "windows-job-object-working-set-v1" &&
+    v2Evidence.assurance.jobMemoryReceipt !== null;
   const terminalCleanupReceiptComplete =
     formalRawSchemaMatches &&
     validation.valid &&
@@ -1712,9 +1719,11 @@ function evaluatePerformanceThresholds(
     ),
     createCheck(
       "job-memory-receipt",
-      "incomplete",
-      "not-verifiable-in-schema-v2",
-      "raw v2 仅预留空字段，尚无 Job Object 进程成员、采样覆盖与峰值内存 receipt 的严格 schema、原生签发与 authority 验证；任意对象不得通过"
+      jobMemoryReceiptComplete ? "pass" : "incomplete",
+      jobMemoryReceiptComplete
+        ? (v2Evidence?.assurance.jobMemoryReceipt?.receiptDigest ?? "missing")
+        : "missing-or-invalid",
+      "正式性能验收必须有严格重算并绑定全部 native job 的 Job Object 成员采样、覆盖、峰值内存和终态进程树归零的 path-free receipt；其原生来源真实性仍由独立 attestation 与 authority 验证"
     ),
     createCheck(
       "terminal-cleanup-receipt",

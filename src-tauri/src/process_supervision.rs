@@ -151,16 +151,24 @@ pub(crate) struct SupervisedStreamingLimits {
     pub process: SupervisedOutputLimits,
     pub stdout_chunk_size: usize,
     pub stdout_buffered_chunks: usize,
+    /// Maximum time without a newly consumed stdout byte or a clean stdout completion signal.
+    /// `None` keeps only the process-wide execution deadline.
+    pub stdout_inactivity_timeout: Option<Duration>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl SupervisedStreamingLimits {
     fn validate(self) -> Result<(), SupervisedProcessError> {
         self.process.validate()?;
-        if self.stdout_chunk_size == 0 || self.stdout_buffered_chunks == 0 {
+        if self.stdout_chunk_size == 0
+            || self.stdout_buffered_chunks == 0
+            || self
+                .stdout_inactivity_timeout
+                .is_some_and(|timeout| timeout.is_zero())
+        {
             return Err(SupervisedProcessError::new(
                 SupervisedProcessErrorKind::Spawn,
-                "streaming stdout chunk size and buffered chunk count must be non-zero",
+                "streaming stdout chunk size, buffered chunk count and optional inactivity timeout must be non-zero",
             ));
         }
         let retained_chunks = self.stdout_buffered_chunks.checked_add(1).ok_or_else(|| {
@@ -200,6 +208,7 @@ pub(crate) struct SupervisedStreamingOutput {
 pub(crate) enum SupervisedProcessErrorKind {
     Spawn,
     Timeout,
+    NoProgress,
     Cancelled,
     StdoutOverflow,
     StderrOverflow,
@@ -286,17 +295,17 @@ mod platform {
         System::{
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-                JobObjectExtendedLimitInformation, QueryInformationJobObject,
-                SetInformationJobObject, TerminateJobObject,
-                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
             Pipes::CreatePipe,
             Threading::{
                 CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-                InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+                InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
                 UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-                EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
+                EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
             },
             IO::CancelSynchronousIo,
@@ -468,12 +477,63 @@ mod platform {
             Ok(accounting.ActiveProcesses)
         }
 
+        fn open_member_synchronization_handles(&self) -> Result<Vec<OwnedHandle>, String> {
+            const MAX_SUPERVISED_JOB_PROCESSES: usize = 4_096;
+            let buffer_bytes = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+                .checked_add((MAX_SUPERVISED_JOB_PROCESSES - 1) * size_of::<usize>())
+                .ok_or_else(|| "supervised Job member buffer size overflowed".to_string())?;
+            let word_count = buffer_bytes.div_ceil(size_of::<usize>());
+            let mut buffer = vec![0_usize; word_count];
+            // SAFETY: buffer is writable, suitably aligned and sized for the variable PID list.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.job.raw(),
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    buffer_bytes as u32,
+                    null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(
+                    "query supervised Job members failed or exceeded the process bound".into(),
+                );
+            }
+            // SAFETY: the successful query initialized the structure at the buffer start.
+            let list = unsafe { &*(buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()) };
+            let assigned = list.NumberOfAssignedProcesses as usize;
+            let returned = list.NumberOfProcessIdsInList as usize;
+            if assigned != returned || returned > MAX_SUPERVISED_JOB_PROCESSES {
+                return Err("supervised Job member list was incomplete".into());
+            }
+            // SAFETY: returned is bounded by the allocated variable-length PID array.
+            let process_ids =
+                unsafe { std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), returned) };
+            let mut handles = Vec::with_capacity(returned);
+            for raw_pid in process_ids {
+                let pid = u32::try_from(*raw_pid)
+                    .map_err(|_| "supervised Job returned an out-of-range PID".to_string())?;
+                // SAFETY: the PID came from this private Job membership snapshot; the handle is
+                // opened only for bounded synchronization and never used to terminate by PID.
+                let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+                if handle.is_null() {
+                    return Err("open supervised Job member synchronization handle failed".into());
+                }
+                handles.push(OwnedHandle(handle));
+            }
+            Ok(handles)
+        }
+
         fn terminate_tree(&self, timeout: Duration) -> Result<(), String> {
             let started = Instant::now();
+            let (member_handles, mut termination_error) =
+                match self.open_member_synchronization_handles() {
+                    Ok(handles) => (handles, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
             // SAFETY: job is this child's private Job Object and is never shared externally.
             let job_terminated =
                 unsafe { TerminateJobObject(self.job.raw(), TERMINATION_EXIT_CODE) };
-            let mut termination_error = None;
             if job_terminated == 0 {
                 let job_error = unsafe { GetLastError() };
                 // The assignment path guarantees membership, but direct-handle termination is a
@@ -482,14 +542,22 @@ mod platform {
                 let direct_terminated =
                     unsafe { TerminateProcess(self.process.raw(), TERMINATION_EXIT_CODE) };
                 if direct_terminated == 0 {
-                    termination_error = Some(format!(
+                    let error = format!(
                         "TerminateJobObject failed with Windows error {job_error}, and direct-handle termination failed with Windows error {}",
                         unsafe { GetLastError() }
-                    ));
+                    );
+                    termination_error = Some(match termination_error {
+                        Some(previous) => format!("{previous}; {error}"),
+                        None => error,
+                    });
                 } else {
-                    termination_error = Some(format!(
+                    let error = format!(
                         "TerminateJobObject failed with Windows error {job_error}; only the direct-child fail-safe succeeded"
-                    ));
+                    );
+                    termination_error = Some(match termination_error {
+                        Some(previous) => format!("{previous}; {error}"),
+                        None => error,
+                    });
                 }
             }
 
@@ -510,16 +578,42 @@ mod platform {
             // SAFETY: process is a live direct-child handle.
             let wait = unsafe { WaitForSingleObject(self.process.raw(), wait_ms) };
             match wait {
-                WAIT_OBJECT_0 => match termination_error {
-                    Some(error) => Err(error),
-                    None => Ok(()),
-                },
+                WAIT_OBJECT_0 => Ok(()),
                 WAIT_TIMEOUT => Err("direct child did not exit before cleanup deadline".into()),
                 _ => Err(last_error(
                     SupervisedProcessErrorKind::Cleanup,
                     "wait for terminated direct child",
                 )
                 .to_string()),
+            }?;
+
+            for handle in member_handles {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                // SAFETY: each handle is an owned synchronization handle captured from the Job
+                // before termination. Waiting proves every known member reached an OS terminal
+                // state instead of trusting accounting to become zero slightly earlier.
+                match unsafe {
+                    WaitForSingleObject(handle.raw(), duration_to_wait_millis(remaining))
+                } {
+                    WAIT_OBJECT_0 => {}
+                    WAIT_TIMEOUT => {
+                        return Err(
+                            "supervised Job member did not exit before cleanup deadline".into()
+                        );
+                    }
+                    _ => {
+                        return Err(last_error(
+                            SupervisedProcessErrorKind::Cleanup,
+                            "wait for terminated supervised Job member",
+                        )
+                        .to_string());
+                    }
+                }
+            }
+
+            match termination_error {
+                Some(error) => Err(error),
+                None => Ok(()),
             }
         }
     }
@@ -964,8 +1058,11 @@ mod platform {
         let mut output_deadline = None;
         let mut root_exit_code = None;
         let mut output = StreamingOutputState::default();
+        let mut stdout_progress_at = Instant::now();
 
         loop {
+            let stdout_bytes_before = output.stdout_bytes;
+            let stdout_complete_before = output.stdout_complete;
             drain_streaming_reader_messages(
                 &stdout_receiver,
                 &stderr_receiver,
@@ -974,6 +1071,11 @@ mod platform {
                 limits.stdout_buffered_chunks.clamp(1, 64),
                 &mut consume_stdout,
             )?;
+            if output.stdout_bytes != stdout_bytes_before
+                || (!stdout_complete_before && output.stdout_complete)
+            {
+                stdout_progress_at = Instant::now();
+            }
 
             if is_cancelled() {
                 return Err(SupervisedProcessError::new(
@@ -1015,6 +1117,21 @@ mod platform {
                         root_exit_code.is_some(),
                         output.stdout_complete,
                         output.stderr.is_some()
+                    ),
+                ));
+            }
+            if active_processes != 0
+                && limits
+                    .stdout_inactivity_timeout
+                    .is_some_and(|timeout| now.duration_since(stdout_progress_at) >= timeout)
+            {
+                return Err(SupervisedProcessError::new(
+                    SupervisedProcessErrorKind::NoProgress,
+                    format!(
+                        "supervised streaming process produced no stdout progress before its inactivity deadline (rootExited={}, activeProcesses={active_processes}, stdoutBytes={}, stdoutComplete={})",
+                        root_exit_code.is_some(),
+                        output.stdout_bytes,
+                        output.stdout_complete
                     ),
                 ));
             }
@@ -2627,6 +2744,7 @@ mod platform {
                 },
                 stdout_chunk_size: 4 * 1024,
                 stdout_buffered_chunks: 1,
+                stdout_inactivity_timeout: None,
             }
         }
 
@@ -2654,6 +2772,18 @@ mod platform {
             }
             stderr.flush().expect("flush oversized stderr");
             println!("stdout-remains-streamed");
+        }
+
+        #[test]
+        #[ignore = "supervised streaming stdout inactivity helper"]
+        fn streaming_stdout_inactivity_helper() {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            stdout
+                .write_all(b"initial-stream-progress")
+                .expect("write initial streaming progress");
+            stdout.flush().expect("flush initial streaming progress");
+            thread::sleep(Duration::from_secs(5));
         }
 
         #[test]
@@ -2716,6 +2846,21 @@ mod platform {
                 )
                 .expect_err("streaming stderr must remain bounded");
             assert_eq!(error.kind(), SupervisedProcessErrorKind::StderrOverflow);
+        }
+
+        #[test]
+        fn streaming_stdout_inactivity_terminates_the_owned_process() {
+            let command = supervised_streaming_helper_command(
+                "process_supervision::platform::tests::streaming_stdout_inactivity_helper",
+            );
+            let mut limits = supervised_streaming_test_limits(64 * 1024, 64 * 1024);
+            limits.stdout_inactivity_timeout = Some(Duration::from_millis(150));
+            let error = command
+                .stream_stdout(limits, || false, |_| Ok(()))
+                .expect_err("silent streaming process must not occupy the worker indefinitely");
+
+            assert_eq!(error.kind(), SupervisedProcessErrorKind::NoProgress);
+            assert!(!process_supervision_cleanup_faulted());
         }
 
         #[test]

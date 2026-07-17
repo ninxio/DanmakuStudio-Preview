@@ -9,6 +9,8 @@ import {
   computeC137PerformanceEvidenceDigest,
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceJobMemoryInventoryDigest,
+  computeC137PerformanceJobMemoryReceiptDigest,
   computeC137PerformanceTerminalCleanupJobInventoryDigest,
   computeC137PerformanceTerminalCleanupReceiptDigest,
   computeC137PerformanceWorkloadStorageReceiptDigest,
@@ -16,6 +18,7 @@ import {
   createC137PerformancePlanDigest,
   finalizeC137PerformanceEvidence,
   parseC137PerformanceEvidence,
+  projectC137PerformanceJobMemoryInventory,
   projectC137PerformanceTerminalCleanupJobInventory,
   serializeC137PerformanceEvidence,
   validateC137PerformanceEvidence,
@@ -29,6 +32,7 @@ import {
   type C137PerformancePlanV1,
   type C137PerformanceRawEvidenceV1,
   type C137PerformanceRawEvidenceV2,
+  type C137PerformanceJobMemoryReceiptV1,
   type C137PerformanceTerminalCleanupReceiptV1,
   type C137PerformanceRunKindV1,
   type C137PerformanceRunV1,
@@ -485,6 +489,76 @@ describe("C137 raw performance evidence v2", () => {
     expect(validateC137PerformanceEvidence(formalFlag).valid).toBe(false);
   });
 
+  it("accepts a path-free Job Object memory receipt bound to every native job sample", () => {
+    const evidence = cloneV2Evidence();
+    attachJobMemoryReceipt(evidence);
+
+    expect(validateC137PerformanceEvidence(evidence)).toEqual({
+      valid: true,
+      complete: true,
+      issues: [],
+      completenessIssues: []
+    });
+    expect(evidence.assurance.jobMemoryReceipt).toMatchObject({
+      jobCount: 4,
+      totalFailedSampleCount: 0,
+      peakJobHierarchyRssBytes: 1_073_741_824,
+      allJobsCoverageComplete: true,
+      allSamplesJobBound: true,
+      allTerminalProcessTreesEmpty: true
+    });
+  });
+
+  it.each([
+    ["session binding", (receipt: C137PerformanceJobMemoryReceiptV1) => {
+      receipt.sessionId = "session-forged-0002";
+    }],
+    ["job count", (receipt: C137PerformanceJobMemoryReceiptV1) => {
+      receipt.jobCount += 1;
+    }],
+    ["inventory", (receipt: C137PerformanceJobMemoryReceiptV1) => {
+      receipt.jobMemoryInventoryDigest = digest("7");
+    }],
+    ["peak RSS", (receipt: C137PerformanceJobMemoryReceiptV1) => {
+      receipt.peakJobHierarchyRssBytes += 1;
+    }]
+  ] as const)("rejects a re-signed Job memory receipt with tampered %s", (_label, mutate) => {
+    const evidence = cloneV2Evidence();
+    attachJobMemoryReceipt(evidence);
+    const receipt = evidence.assurance.jobMemoryReceipt;
+    if (receipt === null) throw new Error("expected Job memory receipt");
+    mutate(receipt);
+    receipt.receiptDigest = computeC137PerformanceJobMemoryReceiptDigest(receipt);
+    evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
+
+    expect(validateC137PerformanceEvidence(evidence).valid).toBe(false);
+  });
+
+  it("rejects a stale Job memory receipt digest and a ToolHelp sampler impersonation", () => {
+    const stale = cloneV2Evidence();
+    attachJobMemoryReceipt(stale);
+    const staleReceipt = stale.assurance.jobMemoryReceipt;
+    if (staleReceipt === null) throw new Error("expected Job memory receipt");
+    staleReceipt.receiptDigest = digest("6");
+    stale.evidenceDigest = computeC137PerformanceEvidenceDigestV2(stale);
+    expect(validateC137PerformanceEvidence(stale).valid).toBe(false);
+
+    const toolHelp = cloneV2Evidence();
+    attachJobMemoryReceipt(toolHelp);
+    toolHelp.collector.sampler = "windows-toolhelp-working-set-v1";
+    for (const trial of toolHelp.trials) {
+      if (trial.trialType === "run") {
+        for (const benchmarkCase of trial.cases) {
+          benchmarkCase.telemetry.memory.sampler = "windows-toolhelp-working-set-v1";
+        }
+      } else {
+        trial.telemetry.memory.sampler = "windows-toolhelp-working-set-v1";
+      }
+    }
+    toolHelp.evidenceDigest = computeC137PerformanceEvidenceDigestV2(toolHelp);
+    expect(validateC137PerformanceEvidence(toolHelp).valid).toBe(false);
+  });
+
   it("accepts a path-free terminal cleanup receipt that is bound to every terminal native job", () => {
     const evidence = cloneV2Evidence();
     attachTerminalCleanupReceipt(evidence);
@@ -896,6 +970,52 @@ function requireCancellation(
 
 function cloneV2Evidence(): C137PerformanceRawEvidenceV2 {
   return structuredClone(createCompleteC137PerformanceEvidenceV2Fixture());
+}
+
+function attachJobMemoryReceipt(evidence: C137PerformanceRawEvidenceV2): void {
+  evidence.collector.sampler = "windows-job-object-working-set-v1";
+  for (const trial of evidence.trials) {
+    if (trial.trialType === "run") {
+      for (const benchmarkCase of trial.cases) {
+        benchmarkCase.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+      }
+    } else {
+      trial.telemetry.memory.sampler = "windows-job-object-working-set-v1";
+    }
+  }
+  const jobs = projectC137PerformanceJobMemoryInventory(evidence.trials);
+  const unsigned: Omit<C137PerformanceJobMemoryReceiptV1, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: evidence.collector.sessionId,
+    runManifestDigest: evidence.runManifestDigest,
+    workloadDigest: evidence.plan.workloadDigest,
+    workloadStorageReceiptDigest: evidence.environment.workloadStorage.receiptDigest,
+    sampler: "windows-job-object-working-set-v1",
+    memoryScope: "application-process-tree",
+    jobCount: jobs.length,
+    totalSampleCount: jobs.reduce((total, job) => total + job.sampleCount, 0),
+    totalFailedSampleCount: 0,
+    maximumSampleGapMicros: jobs.reduce(
+      (maximum, job) =>
+        BigInt(job.maximumSampleGapMicros) > BigInt(maximum)
+          ? job.maximumSampleGapMicros
+          : maximum,
+      "0"
+    ),
+    peakJobHierarchyRssBytes: jobs.reduce(
+      (maximum, job) => Math.max(maximum, job.peakJobHierarchyRssBytes),
+      0
+    ),
+    jobMemoryInventoryDigest: computeC137PerformanceJobMemoryInventoryDigest(jobs),
+    allJobsCoverageComplete: true,
+    allSamplesJobBound: true,
+    allTerminalProcessTreesEmpty: true
+  };
+  evidence.assurance.jobMemoryReceipt = {
+    ...unsigned,
+    receiptDigest: computeC137PerformanceJobMemoryReceiptDigest(unsigned)
+  };
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
 }
 
 function attachTerminalCleanupReceipt(evidence: C137PerformanceRawEvidenceV2): void {

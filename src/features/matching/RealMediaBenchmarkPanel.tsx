@@ -621,6 +621,8 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
   const hot = measured.filter((run) => run.runKind === "hot");
   const peaks = measured.map(getC137PerformancePeakRss).filter((value) => value !== null);
   const cancellations = evidence.trials.filter((trial) => trial.trialType === "cancellation");
+  const jobMemoryReceipt =
+    evidence.schemaVersion === 2 ? evidence.assurance.jobMemoryReceipt : null;
   const terminalCleanupReceipt =
     evidence.schemaVersion === 2 ? evidence.assurance.terminalCleanupReceipt : null;
   return (
@@ -694,6 +696,14 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
             {cancellations.length > 0
               ? ` · 最大 ${Math.max(...cancellations.map((trial) => trial.latencyMs)).toFixed(0)}ms`
               : ""}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">内存凭证：</dt>
+          <dd className="inline">
+            {jobMemoryReceipt
+              ? `已闭合 · ${jobMemoryReceipt.jobCount} 个原生作业`
+              : "缺少 Job Object 内存凭证"}
           </dd>
         </div>
         <div>

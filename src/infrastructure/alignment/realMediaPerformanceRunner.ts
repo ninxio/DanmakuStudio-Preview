@@ -317,6 +317,11 @@ export function createC137PerformanceRawEvidenceFromJournal(
       workloadStorageReceiptDigest: environment.workloadStorage.receiptDigest
     },
     preflight: structuredClone(journal.preflight),
+    jobMemoryReceipt:
+      journal.terminalSession?.jobMemoryReceipt === null ||
+      journal.terminalSession?.jobMemoryReceipt === undefined
+        ? null
+        : structuredClone(journal.terminalSession.jobMemoryReceipt),
     terminalCleanupReceipt:
       journal.terminalSession?.terminalCleanupReceipt === null ||
       journal.terminalSession?.terminalCleanupReceipt === undefined
@@ -1557,6 +1562,9 @@ function findJournalSampler(
   | "windows-toolhelp-working-set-v1"
   | "windows-job-object-working-set-v1"
   | "unsupported" {
+  if (journal.terminalSession?.jobMemoryReceipt) {
+    return journal.terminalSession.jobMemoryReceipt.sampler;
+  }
   for (const trial of journal.trials) {
     if (trial.kind === "run") {
       const sampler = trial.run.cases[0]?.telemetry.memory.sampler;
@@ -1566,7 +1574,7 @@ function findJournalSampler(
     }
   }
   return journal.environment?.operatingSystem.toLowerCase().includes("windows")
-    ? "windows-toolhelp-working-set-v1"
+    ? "windows-job-object-working-set-v1"
     : "unsupported";
 }
 

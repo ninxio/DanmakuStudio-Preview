@@ -244,6 +244,7 @@ const BENCHMARK_TOOL_VERSION_MAX_BYTES: usize = 64 * 1024;
 const CHILD_OUTPUT_DRAIN_TIMEOUT_MS: u64 = 2_000;
 const CHILD_PROCESS_TREE_TERMINATION_TIMEOUT_MS: u64 = 2_000;
 const MEDIA_TOOL_EXECUTION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+const MEDIA_TOOL_STDOUT_INACTIVITY_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
 const LEGACY_MAX_PCM_BYTES: usize =
     DEFAULT_SAMPLE_RATE as usize * (ALIGNMENT_V2_MAX_DURATION_MS as usize / 1_000) * 4;
 const V2_PCM_PARSE_CANCEL_CHECK_SAMPLES: usize = 64 * 1024;
@@ -1205,6 +1206,42 @@ pub struct AlignmentBenchmarkTerminalCleanupReceipt {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkJobMemoryReceipt {
+    schema_version: u8,
+    session_id: String,
+    run_manifest_digest: String,
+    workload_digest: String,
+    workload_storage_receipt_digest: String,
+    sampler: &'static str,
+    memory_scope: &'static str,
+    job_count: usize,
+    total_sample_count: u64,
+    total_failed_sample_count: u64,
+    maximum_sample_gap_micros: String,
+    peak_job_hierarchy_rss_bytes: u64,
+    job_memory_inventory_digest: String,
+    all_jobs_coverage_complete: bool,
+    all_samples_job_bound: bool,
+    all_terminal_process_trees_empty: bool,
+    receipt_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlignmentBenchmarkJobMemoryInventoryEntry {
+    job_id: String,
+    sample_interval_ms: u64,
+    sample_count: u64,
+    failed_sample_count: u64,
+    maximum_sample_gap_micros: String,
+    peak_job_hierarchy_rss_bytes: u64,
+    coverage_complete: bool,
+    process_tree_empty_at_terminal: bool,
+    residual_process_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AlignmentBenchmarkTerminalJobInventoryEntry {
     job_id: String,
     status: AudioAlignmentJobStatus,
@@ -1255,6 +1292,7 @@ pub struct AlignmentBenchmarkSessionSnapshot {
     environment: AlignmentBenchmarkEnvironmentReceipt,
     active_job_id: Option<String>,
     cleanup_issue: Option<String>,
+    job_memory_receipt: Option<AlignmentBenchmarkJobMemoryReceipt>,
     terminal_cleanup_receipt: Option<AlignmentBenchmarkTerminalCleanupReceipt>,
 }
 
@@ -1317,7 +1355,7 @@ impl AlignmentBenchmarkMemoryTelemetry {
         Self {
             scope: "application-process-tree",
             sampler: if cfg!(windows) {
-                "windows-toolhelp-working-set-v1"
+                "windows-job-object-working-set-v1"
             } else {
                 "unsupported"
             },
@@ -2146,6 +2184,7 @@ struct AlignmentBenchmarkSessionEntry {
     baseline_descendants: HashSet<u32>,
     active_job_id: Option<String>,
     cleanup_reason: Option<String>,
+    job_memory_receipt: Option<AlignmentBenchmarkJobMemoryReceipt>,
     terminal_cleanup_receipt: Option<AlignmentBenchmarkTerminalCleanupReceipt>,
     outstanding_receipt: Option<AlignmentBenchmarkOutstandingReceipt>,
     jobs: HashMap<String, AlignmentBenchmarkJobEntry>,
@@ -2193,6 +2232,18 @@ struct ProcessTreeMemorySample {
     descendants: HashSet<u32>,
 }
 
+#[cfg(windows)]
+struct AlignmentBenchmarkAccountingJob {
+    handle: usize,
+}
+
+#[cfg(windows)]
+impl AlignmentBenchmarkAccountingJob {
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
 thread_local! {
     static ACTIVE_ALIGNMENT_BENCHMARK_TELEMETRY: RefCell<Option<Arc<AlignmentBenchmarkRunTelemetry>>> = const { RefCell::new(None) };
     #[cfg(test)]
@@ -2216,6 +2267,10 @@ static VISUAL_FEATURE_CACHE: OnceLock<Mutex<HashMap<String, Vec<VisualFeatureFra
     OnceLock::new();
 static ALIGNMENT_BENCHMARK_COORDINATOR: OnceLock<Mutex<AlignmentBenchmarkCoordinator>> =
     OnceLock::new();
+#[cfg(windows)]
+static ALIGNMENT_BENCHMARK_ACCOUNTING_JOB: OnceLock<
+    Result<AlignmentBenchmarkAccountingJob, String>,
+> = OnceLock::new();
 
 #[tauri::command]
 pub async fn align_audio_files(
@@ -2767,7 +2822,7 @@ fn begin_alignment_benchmark_session_inner(
         .map(PathBuf::from)
         .unwrap_or_else(|| resolve_ffprobe_path(ffmpeg_request));
     let mut initialization_lease = acquire_alignment_benchmark_initialization_lease()?;
-    // Pin and hash every workload file before ToolHelp, tool-version, power, registry or storage
+    // Pin and hash every workload file before Job membership, tool-version, power, registry or storage
     // environment probes run. A failed initialization drops all local pins before the exclusive
     // initialization lease is released and never publishes a partial session.
     let workload = prepare_alignment_benchmark_workload(
@@ -2778,7 +2833,7 @@ fn begin_alignment_benchmark_session_inner(
     let workload_receipt = workload.receipt.clone();
     let (baseline_descendants, (environment, ffmpeg_tool, ffprobe_tool)) =
         collect_alignment_benchmark_baseline_before_probe(
-            || sample_process_tree_memory(std::process::id()).map(|sample| sample.descendants),
+            || sample_alignment_benchmark_job_memory().map(|sample| sample.descendants),
             || {
                 collect_alignment_benchmark_environment(
                     ffmpeg_request,
@@ -2814,6 +2869,7 @@ fn begin_alignment_benchmark_session_inner(
         baseline_descendants,
         active_job_id: None,
         cleanup_reason,
+        job_memory_receipt: None,
         terminal_cleanup_receipt: None,
         outstanding_receipt: None,
         jobs: HashMap::new(),
@@ -2833,6 +2889,12 @@ fn collect_alignment_benchmark_baseline_before_probe<T>(
     // persistent helper during `-version` and have that helper incorrectly grandfathered into the
     // session baseline, bypassing residual-process cleanup for the rest of the lease.
     let baseline = capture_baseline()?;
+    if !baseline.is_empty() {
+        return Err(format!(
+            "原生性能 Job Object 在会话开始前仍有 {} 个后代进程；拒绝把既有进程豁免为基线，请先结束普通匹配或重启应用。",
+            baseline.len()
+        ));
+    }
     let environment = probe_environment()?;
     Ok((baseline, environment))
 }
@@ -2878,6 +2940,7 @@ fn create_alignment_benchmark_session_snapshot(
         environment: session.environment.clone(),
         active_job_id: session.active_job_id.clone(),
         cleanup_issue: session.cleanup_reason.clone(),
+        job_memory_receipt: session.job_memory_receipt.clone(),
         terminal_cleanup_receipt: session.terminal_cleanup_receipt.clone(),
     }
 }
@@ -3587,7 +3650,7 @@ fn run_alignment_benchmark_job(prepared: PreparedAlignmentBenchmarkJob) {
     let sampler_stop = Arc::new(AtomicBool::new(false));
     prepared.telemetry.record_memory_sample(
         Instant::now(),
-        sample_process_tree_memory(std::process::id()),
+        sample_alignment_benchmark_job_memory(),
         &prepared.baseline_descendants,
     );
     let sampler = match spawn_alignment_benchmark_memory_sampler(
@@ -3640,7 +3703,7 @@ fn run_alignment_benchmark_job(prepared: PreparedAlignmentBenchmarkJob) {
     }
     prepared.telemetry.record_memory_sample(
         Instant::now(),
-        sample_process_tree_memory(std::process::id()),
+        sample_alignment_benchmark_job_memory(),
         &prepared.baseline_descendants,
     );
     let cache_telemetry_complete = read_alignment_benchmark_cache_counts()
@@ -3725,7 +3788,7 @@ fn spawn_alignment_benchmark_memory_sampler(
             let sampled_at = Instant::now();
             telemetry.record_memory_sample(
                 sampled_at,
-                sample_process_tree_memory(std::process::id()),
+                sample_alignment_benchmark_job_memory(),
                 &baseline_descendants,
             );
             if stop.load(Ordering::Acquire) {
@@ -3789,7 +3852,7 @@ fn complete_or_block_alignment_benchmark_job(
 ) {
     let deadline = Instant::now() + Duration::from_millis(BENCHMARK_RESIDUAL_GRACE_MS);
     loop {
-        match sample_process_tree_memory(std::process::id()) {
+        match sample_alignment_benchmark_job_memory() {
             Ok(sample) => {
                 let residual = sample.descendants.difference(baseline_descendants).count();
                 if let Ok(mut coordinator) = alignment_benchmark_coordinator().lock() {
@@ -3913,7 +3976,7 @@ fn refresh_alignment_benchmark_cleanup(session_id: &str, job_id: &str) -> Result
     if !has_pending {
         return Ok(());
     }
-    let sample = match sample_process_tree_memory(std::process::id()) {
+    let sample = match sample_alignment_benchmark_job_memory() {
         Ok(sample) => sample,
         Err(error) => {
             let mut coordinator = alignment_benchmark_coordinator()
@@ -4006,7 +4069,7 @@ fn finish_alignment_benchmark_session_inner(
         block_alignment_benchmark_session_for_workload(session);
         return Ok(create_alignment_benchmark_session_snapshot(session));
     }
-    let sample = match sample_process_tree_memory(std::process::id()) {
+    let sample = match sample_alignment_benchmark_job_memory() {
         Ok(sample) => sample,
         Err(_) => {
             session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
@@ -4054,6 +4117,17 @@ fn finish_alignment_benchmark_session_inner(
     let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
     session.cache_generation = released_generation;
     let terminal_tick_ns = session.origin.elapsed().as_nanos();
+    let job_memory_receipt = match create_alignment_benchmark_job_memory_receipt(session) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+            session.cleanup_reason = Some(
+                "Job Object 内存采样无法形成严格、路径无关的原生回执；lease 按 fail-closed 保持占用。"
+                    .to_string(),
+            );
+            return Ok(create_alignment_benchmark_session_snapshot(session));
+        }
+    };
     let terminal_cleanup_receipt = match create_alignment_benchmark_terminal_cleanup_receipt(
         session,
         terminal_tick_ns,
@@ -4074,6 +4148,7 @@ fn finish_alignment_benchmark_session_inner(
     session.active_job_id = None;
     session.status = AlignmentBenchmarkSessionStatus::Released;
     session.cleanup_reason = None;
+    session.job_memory_receipt = Some(job_memory_receipt);
     session.terminal_cleanup_receipt = Some(terminal_cleanup_receipt);
     let snapshot = create_alignment_benchmark_session_snapshot(session);
     coordinator.session = None;
@@ -4854,6 +4929,140 @@ fn create_alignment_benchmark_workload_receipt_digest(
     ))
 }
 
+fn create_alignment_benchmark_job_memory_receipt(
+    session: &AlignmentBenchmarkSessionEntry,
+) -> Result<AlignmentBenchmarkJobMemoryReceipt, String> {
+    let mut jobs = session
+        .jobs
+        .iter()
+        .map(|(job_id, entry)| {
+            if !matches!(
+                entry.snapshot.status,
+                AudioAlignmentJobStatus::Completed
+                    | AudioAlignmentJobStatus::Failed
+                    | AudioAlignmentJobStatus::Cancelled
+            ) {
+                return Err("Job memory receipt 遇到非终态 job。".to_string());
+            }
+            let telemetry = entry.telemetry.snapshot()?;
+            let memory = telemetry.memory;
+            if memory.sampler != "windows-job-object-working-set-v1"
+                || memory.sample_interval_ms != session.sample_interval_ms
+                || memory.sample_count == 0
+                || memory.failed_sample_count != 0
+                || !memory.coverage_complete
+                || !memory.process_tree_empty_at_terminal
+                || memory.residual_process_count != 0
+            {
+                return Err("Job memory receipt 遇到覆盖不完整的内存 telemetry。".to_string());
+            }
+            let peak_job_hierarchy_rss_bytes = memory
+                .peak_process_tree_rss_bytes
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "Job memory receipt 遇到缺失的 working-set 峰值。".to_string())?;
+            let maximum_sample_gap_micros =
+                alignment_benchmark_gap_micros(memory.maximum_sample_gap_ms)?;
+            Ok(AlignmentBenchmarkJobMemoryInventoryEntry {
+                job_id: job_id.clone(),
+                sample_interval_ms: memory.sample_interval_ms,
+                sample_count: memory.sample_count,
+                failed_sample_count: memory.failed_sample_count,
+                maximum_sample_gap_micros: maximum_sample_gap_micros.to_string(),
+                peak_job_hierarchy_rss_bytes,
+                coverage_complete: true,
+                process_tree_empty_at_terminal: true,
+                residual_process_count: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    let total_sample_count = jobs.iter().try_fold(0_u64, |total, job| {
+        total
+            .checked_add(job.sample_count)
+            .ok_or_else(|| "Job memory receipt sample count 求和溢出。".to_string())
+    })?;
+    let total_failed_sample_count = jobs.iter().try_fold(0_u64, |total, job| {
+        total
+            .checked_add(job.failed_sample_count)
+            .ok_or_else(|| "Job memory receipt failed sample count 求和溢出。".to_string())
+    })?;
+    let maximum_sample_gap_micros = jobs
+        .iter()
+        .map(|job| job.maximum_sample_gap_micros.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Job memory receipt 最大采样间隔无法解析。".to_string())?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let peak_job_hierarchy_rss_bytes = jobs
+        .iter()
+        .map(|job| job.peak_job_hierarchy_rss_bytes)
+        .max()
+        .unwrap_or(0);
+    let inventory_value = serde_json::json!({
+        "domain": "c137-performance-job-memory-inventory-v1",
+        "jobs": &jobs,
+    });
+    let inventory_canonical = canonicalize_alignment_benchmark_json(&inventory_value)?;
+    let job_memory_inventory_digest = format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(inventory_canonical.as_bytes())
+    );
+    let workload_storage = &session.environment.workload_storage;
+    let mut receipt = AlignmentBenchmarkJobMemoryReceipt {
+        schema_version: 1,
+        session_id: session.session_id.clone(),
+        run_manifest_digest: workload_storage.run_manifest_digest.clone(),
+        workload_digest: workload_storage.workload_digest.clone(),
+        workload_storage_receipt_digest: workload_storage.receipt_digest.clone(),
+        sampler: "windows-job-object-working-set-v1",
+        memory_scope: "application-process-tree",
+        job_count: jobs.len(),
+        total_sample_count,
+        total_failed_sample_count,
+        maximum_sample_gap_micros: maximum_sample_gap_micros.to_string(),
+        peak_job_hierarchy_rss_bytes,
+        job_memory_inventory_digest,
+        all_jobs_coverage_complete: true,
+        all_samples_job_bound: true,
+        all_terminal_process_trees_empty: true,
+        receipt_digest: String::new(),
+    };
+    receipt.receipt_digest = create_alignment_benchmark_job_memory_receipt_digest(&receipt)?;
+    Ok(receipt)
+}
+
+fn alignment_benchmark_gap_micros(maximum_sample_gap_ms: f64) -> Result<u64, String> {
+    if !maximum_sample_gap_ms.is_finite() || maximum_sample_gap_ms < 0.0 {
+        return Err("Job memory receipt 最大采样间隔不是有限非负数。".to_string());
+    }
+    let micros = (maximum_sample_gap_ms * 1_000.0).round();
+    if micros > u64::MAX as f64 {
+        return Err("Job memory receipt 最大采样间隔越界。".to_string());
+    }
+    Ok(micros as u64)
+}
+
+fn create_alignment_benchmark_job_memory_receipt_digest(
+    receipt: &AlignmentBenchmarkJobMemoryReceipt,
+) -> Result<String, String> {
+    let mut receipt_value =
+        serde_json::to_value(receipt).map_err(|_| "Job memory receipt 无法序列化。".to_string())?;
+    let object = receipt_value
+        .as_object_mut()
+        .ok_or_else(|| "Job memory receipt 不是对象。".to_string())?;
+    object.remove("receiptDigest");
+    let value = serde_json::json!({
+        "domain": "c137-performance-job-memory-receipt-v1",
+        "receipt": receipt_value,
+    });
+    let canonical = canonicalize_alignment_benchmark_json(&value)?;
+    Ok(format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(canonical.as_bytes())
+    ))
+}
+
 fn create_alignment_benchmark_terminal_cleanup_receipt(
     session: &AlignmentBenchmarkSessionEntry,
     terminal_tick_ns: u128,
@@ -5542,12 +5751,137 @@ fn windows_active_power_profile() -> Result<String, String> {
 }
 
 #[cfg(not(windows))]
-fn sample_process_tree_memory(_root_pid: u32) -> Result<ProcessTreeMemorySample, String> {
-    Err("unsupported：进程树 working-set 采样当前只支持 Windows。".to_string())
+fn sample_alignment_benchmark_job_memory() -> Result<ProcessTreeMemorySample, String> {
+    Err("unsupported：Job Object working-set 采样当前只支持 Windows。".to_string())
 }
 
 #[cfg(windows)]
-fn sample_process_tree_memory(root_pid: u32) -> Result<ProcessTreeMemorySample, String> {
+fn sample_alignment_benchmark_job_memory() -> Result<ProcessTreeMemorySample, String> {
+    let job = alignment_benchmark_accounting_job()?;
+    sample_windows_job_hierarchy_memory(job)
+}
+
+#[cfg(windows)]
+fn alignment_benchmark_accounting_job() -> Result<&'static AlignmentBenchmarkAccountingJob, String>
+{
+    let result =
+        ALIGNMENT_BENCHMARK_ACCOUNTING_JOB.get_or_init(create_alignment_benchmark_accounting_job);
+    result.as_ref().map_err(|error| error.clone())
+}
+
+#[cfg(windows)]
+fn create_alignment_benchmark_accounting_job() -> Result<AlignmentBenchmarkAccountingJob, String> {
+    use std::ptr::null;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            JobObjects::{AssignProcessToJobObject, CreateJobObjectW},
+            Threading::GetCurrentProcess,
+        },
+    };
+
+    // SAFETY: null security attributes and name create a private, unnamed Job Object.
+    let handle = unsafe { CreateJobObjectW(null(), null()) };
+    if handle.is_null() {
+        return Err("Windows benchmark accounting Job Object 创建失败。".to_string());
+    }
+    // The current process becomes the root member once for the application lifetime. Every
+    // subsequently spawned media process inherits this job; process_supervision then assigns the
+    // suspended child to its private kill-on-close job, forming a nested child job on Windows 8+.
+    // SAFETY: handle is an owned job handle and GetCurrentProcess returns the current pseudo handle.
+    if unsafe { AssignProcessToJobObject(handle, GetCurrentProcess()) } == 0 {
+        // SAFETY: assignment failed, so closing the otherwise-unpublished owned handle is safe.
+        unsafe { CloseHandle(handle) };
+        return Err(
+            "当前进程无法加入 Windows benchmark accounting Job Object；不能生成正式内存证据。"
+                .to_string(),
+        );
+    }
+    Ok(AlignmentBenchmarkAccountingJob {
+        handle: handle as usize,
+    })
+}
+
+#[cfg(windows)]
+fn sample_windows_job_hierarchy_memory(
+    job: &AlignmentBenchmarkAccountingJob,
+) -> Result<ProcessTreeMemorySample, String> {
+    const MAX_STABLE_MEMBERSHIP_ATTEMPTS: usize = 8;
+    for _ in 0..MAX_STABLE_MEMBERSHIP_ATTEMPTS {
+        let before = query_windows_job_process_ids(job)?;
+        let Ok(working_set_bytes) = read_windows_process_working_sets(&before) else {
+            continue;
+        };
+        let after = query_windows_job_process_ids(job)?;
+        if before != after {
+            continue;
+        }
+        let root_pid = std::process::id();
+        if before.binary_search(&root_pid).is_err() {
+            return Err("Windows benchmark Job Object 成员列表缺少应用根进程。".to_string());
+        }
+        return Ok(ProcessTreeMemorySample {
+            working_set_bytes,
+            descendants: before.into_iter().filter(|pid| *pid != root_pid).collect(),
+        });
+    }
+    Err("Windows benchmark Job Object 成员在采样期间持续变化，覆盖不完整。".to_string())
+}
+
+#[cfg(windows)]
+fn query_windows_job_process_ids(
+    job: &AlignmentBenchmarkAccountingJob,
+) -> Result<Vec<u32>, String> {
+    use std::{mem::size_of, ptr::null_mut};
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectBasicProcessIdList, QueryInformationJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    };
+
+    const MAX_ACCOUNTING_JOB_PROCESSES: usize = 4_096;
+    let buffer_bytes = size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+        .checked_add((MAX_ACCOUNTING_JOB_PROCESSES - 1) * size_of::<usize>())
+        .ok_or_else(|| "Windows Job Object PID 缓冲区大小溢出。".to_string())?;
+    let word_count = buffer_bytes.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0_usize; word_count];
+    // SAFETY: buffer is writable, suitably aligned for the documented structure and bounded to u32.
+    let queried = unsafe {
+        QueryInformationJobObject(
+            job.raw(),
+            JobObjectBasicProcessIdList,
+            buffer.as_mut_ptr().cast(),
+            buffer_bytes as u32,
+            null_mut(),
+        )
+    };
+    if queried == 0 {
+        return Err("Windows benchmark Job Object 成员查询失败或超过 4096 个进程。".to_string());
+    }
+    // SAFETY: QueryInformationJobObject initialized the structure at the start of buffer.
+    let list = unsafe { &*(buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()) };
+    let assigned = list.NumberOfAssignedProcesses as usize;
+    let returned = list.NumberOfProcessIdsInList as usize;
+    if assigned == 0 || assigned != returned || returned > MAX_ACCOUNTING_JOB_PROCESSES {
+        return Err("Windows benchmark Job Object 成员列表不完整。".to_string());
+    }
+    // SAFETY: returned was validated against the allocated variable-length PID array.
+    let process_ids = unsafe { std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), returned) };
+    let mut pids = process_ids
+        .iter()
+        .map(|raw_pid| {
+            u32::try_from(*raw_pid)
+                .map_err(|_| "Windows benchmark Job Object 返回了越界 PID。".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    pids.sort_unstable();
+    if pids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("Windows benchmark Job Object 返回了重复 PID。".to_string());
+    }
+    Ok(pids)
+}
+
+#[cfg(windows)]
+fn read_windows_process_working_sets(process_ids: &[u32]) -> Result<u64, String> {
+    use std::mem::size_of;
     use windows_sys::Win32::{
         Foundation::CloseHandle,
         System::{
@@ -5556,114 +5890,35 @@ fn sample_process_tree_memory(root_pid: u32) -> Result<ProcessTreeMemorySample, 
         },
     };
 
-    // ToolHelp is intentionally used for the first native implementation because it does not
-    // require replacing every std::process::Command call. It cannot provide race-free spawn
-    // attribution like a Job Object, so *any* snapshot/open/read failure marks coverage
-    // incomplete and no RSS value is emitted for that pass. The session keeps a baseline PID set
-    // for persistent WebView children; ToolHelp cannot rule out PID reuse against that baseline,
-    // which is why the sampler/method identity remains explicit for a later Job Object upgrade.
-    let pairs = windows_process_parent_pairs()?;
-    let descendants = collect_process_descendants(root_pid, &pairs);
-    let mut pids = Vec::with_capacity(descendants.len().saturating_add(1));
-    pids.push(root_pid);
-    pids.extend(descendants.iter().copied());
     let mut working_set_bytes = 0_u64;
-    for pid in pids {
-        // SAFETY: pid comes from the current ToolHelp snapshot; no handle is inherited.
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    for pid in process_ids {
+        // SAFETY: pid comes from the owned Job Object membership list; no handle is inherited.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, *pid) };
         if process.is_null() {
-            return Err("Windows 进程树中至少一个进程无法打开，覆盖不完整。".to_string());
+            return Err("Windows benchmark Job Object 中至少一个成员无法打开。".to_string());
         }
         let mut counters = PROCESS_MEMORY_COUNTERS {
-            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
             ..PROCESS_MEMORY_COUNTERS::default()
         };
         // SAFETY: process is open and counters points to a writable structure of the given size.
-        let ok = unsafe {
+        let read = unsafe {
             GetProcessMemoryInfo(
                 process,
                 &mut counters,
-                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
             )
         };
         // SAFETY: process is an owned handle returned by OpenProcess.
         unsafe { CloseHandle(process) };
-        if ok == 0 {
-            return Err("Windows 进程树 working set 读取失败，覆盖不完整。".to_string());
+        if read == 0 {
+            return Err("Windows benchmark Job Object 成员 working set 读取失败。".to_string());
         }
         working_set_bytes = working_set_bytes
             .checked_add(counters.WorkingSetSize as u64)
-            .ok_or_else(|| "进程树 working set 求和溢出。".to_string())?;
+            .ok_or_else(|| "Windows benchmark Job Object working set 求和溢出。".to_string())?;
     }
-    Ok(ProcessTreeMemorySample {
-        working_set_bytes,
-        descendants,
-    })
-}
-
-#[cfg(windows)]
-fn windows_process_parent_pairs() -> Result<Vec<(u32, u32)>, String> {
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
-        System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-            TH32CS_SNAPPROCESS,
-        },
-    };
-
-    // SAFETY: CreateToolhelp32Snapshot has no borrowed pointer arguments.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err("Windows ToolHelp 进程快照创建失败。".to_string());
-    }
-    let mut pairs = Vec::new();
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..PROCESSENTRY32W::default()
-    };
-    // SAFETY: snapshot is valid and entry has the documented size.
-    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-        // SAFETY: snapshot is a valid owned handle.
-        unsafe { CloseHandle(snapshot) };
-        return Err("Windows ToolHelp 进程快照为空或不可读。".to_string());
-    }
-    loop {
-        pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
-        // SAFETY: snapshot and entry remain valid for enumeration.
-        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-            // SAFETY: GetLastError is read immediately after Process32NextW failed.
-            let error = unsafe { GetLastError() };
-            if error != ERROR_NO_MORE_FILES {
-                // SAFETY: snapshot is a valid owned handle.
-                unsafe { CloseHandle(snapshot) };
-                return Err("Windows ToolHelp 进程枚举中途失败，覆盖不完整。".to_string());
-            }
-            break;
-        }
-    }
-    // SAFETY: snapshot is a valid owned handle and is closed exactly once.
-    unsafe { CloseHandle(snapshot) };
-    Ok(pairs)
-}
-
-fn collect_process_descendants(root_pid: u32, pairs: &[(u32, u32)]) -> HashSet<u32> {
-    let mut descendants = HashSet::new();
-    loop {
-        let mut changed = false;
-        for (pid, parent_pid) in pairs {
-            if *pid == root_pid || descendants.contains(pid) {
-                continue;
-            }
-            if *parent_pid == root_pid || descendants.contains(parent_pid) {
-                descendants.insert(*pid);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    descendants
+    Ok(working_set_bytes)
 }
 
 #[cfg(test)]
@@ -18335,6 +18590,10 @@ fn fail_audio_alignment_batch_worker_with_error(
         "CUDA/cuFFT 后端不可用或配置无效；请检查 NVIDIA 驱动与 CUDA 环境。"
     } else if error.starts_with("blocked:resource-limit") {
         "批量匹配超过当前内存或计算资源上限；请缩小批次后重试。"
+    } else if error.starts_with("blocked:tool-stalled") {
+        "媒体解码持续 2 分钟没有产生新音频数据，已自动终止；请检查对应文件和音轨后重试。"
+    } else if error.starts_with("blocked:tool-timeout") {
+        "媒体工具超过最长执行时限，已自动终止；请检查对应文件和媒体工具后重试。"
     } else if error.starts_with("blocked:physical-file")
         || error.starts_with("unsupported:physical-file")
     {
@@ -19788,6 +20047,9 @@ where
             SupervisedProcessErrorKind::Timeout => {
                 format!("blocked:tool-timeout：{context} 超过执行时限。")
             }
+            SupervisedProcessErrorKind::NoProgress => {
+                format!("blocked:tool-stalled：{context} 持续没有输出进展。")
+            }
             SupervisedProcessErrorKind::Cleanup => error.to_string(),
             _ => format!("{context} 失败：{error}"),
         })
@@ -19826,6 +20088,9 @@ where
                 },
                 stdout_chunk_size: ALIGNMENT_V2_COARSE_STDOUT_CHUNK_BYTES,
                 stdout_buffered_chunks: ALIGNMENT_V2_COARSE_STDOUT_BUFFERED_CHUNKS,
+                stdout_inactivity_timeout: Some(Duration::from_millis(
+                    MEDIA_TOOL_STDOUT_INACTIVITY_TIMEOUT_MS,
+                )),
             },
             || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)),
             consume_stdout,
@@ -19842,6 +20107,10 @@ where
             SupervisedProcessErrorKind::Timeout => {
                 format!("blocked:tool-timeout：{context} 超过执行时限。")
             }
+            SupervisedProcessErrorKind::NoProgress => format!(
+                "blocked:tool-stalled：{context} 持续 {} 秒没有产生新音频数据。",
+                MEDIA_TOOL_STDOUT_INACTIVITY_TIMEOUT_MS / 1_000
+            ),
             SupervisedProcessErrorKind::Cleanup => error.to_string(),
             _ => format!("{context} 失败；本地路径与工具输出已隐藏。"),
         })
@@ -21979,6 +22248,49 @@ mod tests {
         assert_ne!(
             create_alignment_benchmark_terminal_cleanup_receipt_digest(&receipt)
                 .expect("tampered terminal cleanup receipt digest"),
+            digest
+        );
+    }
+
+    #[test]
+    fn job_memory_receipt_digest_is_path_free_and_tamper_evident() {
+        let mut receipt = AlignmentBenchmarkJobMemoryReceipt {
+            schema_version: 1,
+            session_id: "benchmark-session-test".to_string(),
+            run_manifest_digest: format!("sha256:{}", "1".repeat(64)),
+            workload_digest: format!("sha256:{}", "1".repeat(64)),
+            workload_storage_receipt_digest: format!("sha256:{}", "2".repeat(64)),
+            sampler: "windows-job-object-working-set-v1",
+            memory_scope: "application-process-tree",
+            job_count: 2,
+            total_sample_count: 40,
+            total_failed_sample_count: 0,
+            maximum_sample_gap_micros: "20000".to_string(),
+            peak_job_hierarchy_rss_bytes: 512 * 1_048_576,
+            job_memory_inventory_digest: format!("sha256:{}", "3".repeat(64)),
+            all_jobs_coverage_complete: true,
+            all_samples_job_bound: true,
+            all_terminal_process_trees_empty: true,
+            receipt_digest: String::new(),
+        };
+        let digest = create_alignment_benchmark_job_memory_receipt_digest(&receipt)
+            .expect("Job memory receipt digest");
+        receipt.receipt_digest = digest.clone();
+
+        assert_eq!(
+            create_alignment_benchmark_job_memory_receipt_digest(&receipt)
+                .expect("receiptDigest excluded from canonical payload"),
+            digest
+        );
+        let serialized = serde_json::to_string(&receipt).expect("serialize Job memory receipt");
+        assert!(!serialized.contains("C:\\"));
+        assert!(!serialized.contains("D:\\"));
+        assert_eq!(alignment_benchmark_gap_micros(20.0004).unwrap(), 20_000);
+
+        receipt.peak_job_hierarchy_rss_bytes += 1;
+        assert_ne!(
+            create_alignment_benchmark_job_memory_receipt_digest(&receipt)
+                .expect("tampered Job memory receipt digest"),
             digest
         );
     }
@@ -29893,6 +30205,34 @@ mod tests {
     }
 
     #[test]
+    fn audio_alignment_batch_reports_stalled_media_decode_without_exposing_paths() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-2", "target-2"),
+        ])))
+        .unwrap();
+        let job_id = format!("test-audio-batch-stalled-decode-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&job_id, &plan, Arc::new(AtomicBool::new(false))).unwrap();
+
+        fail_audio_alignment_batch_worker_with_error(
+            &job_id,
+            0,
+            r"blocked:tool-stalled：参考素材 C:\Users\alice\private\episode.mkv 持续没有输出进展。",
+        )
+        .unwrap();
+
+        let terminal = get_audio_alignment_batch_job(job_id).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Failed);
+        assert_eq!(terminal.pairs[0].status, AudioAlignmentJobStatus::Failed);
+        assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Cancelled);
+        assert!(terminal.message.contains("持续 2 分钟没有产生新音频数据"));
+        assert!(terminal.message.contains("已自动终止"));
+        assert!(!terminal.message.contains("alice"));
+        assert!(!terminal.message.contains("private"));
+        assert!(!terminal.message.contains("episode.mkv"));
+    }
+
+    #[test]
     fn audio_alignment_batch_terminal_retention_is_bounded_without_evicting_active_jobs() {
         let mut jobs = HashMap::new();
         for index in 0..(MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS + 3) {
@@ -30593,7 +30933,7 @@ mod tests {
         let (baseline, value) = collect_alignment_benchmark_baseline_before_probe(
             || {
                 order.borrow_mut().push("baseline");
-                Ok(HashSet::from([17_u32]))
+                Ok(HashSet::new())
             },
             || {
                 assert_eq!(order.borrow().as_slice(), &["baseline"]);
@@ -30603,9 +30943,25 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(baseline, HashSet::from([17_u32]));
+        assert!(baseline.is_empty());
         assert_eq!(value, 23);
         assert_eq!(order.into_inner(), vec!["baseline", "probe"]);
+    }
+
+    #[test]
+    fn benchmark_rejects_non_empty_job_baseline_before_probing_tools() {
+        let probe_called = std::cell::Cell::new(false);
+        let error = collect_alignment_benchmark_baseline_before_probe(
+            || Ok(HashSet::from([17_u32])),
+            || {
+                probe_called.set(true);
+                Ok(23_u32)
+            },
+        )
+        .expect_err("existing Job members must never be grandfathered into a formal session");
+
+        assert!(error.contains("会话开始前仍有 1 个后代进程"));
+        assert!(!probe_called.get());
     }
 
     #[test]
@@ -30770,35 +31126,38 @@ configuration: --extra-cflags=C:\Users\alice\sdk"#;
         assert!(memory.maximum_sample_gap_ms >= 100.0);
     }
 
-    #[test]
-    fn process_descendant_collection_is_transitive_and_excludes_unrelated_processes() {
-        let pairs = vec![(10, 1), (11, 10), (12, 11), (20, 1), (21, 20)];
-        let descendants = collect_process_descendants(10, &pairs);
-        assert_eq!(descendants, HashSet::from([11, 12]));
-    }
-
     #[cfg(windows)]
     #[test]
-    fn windows_benchmark_topology_and_working_set_primitives_are_available() {
+    fn windows_benchmark_job_hierarchy_sampler_and_nested_supervision_are_available() {
         let physical = windows_physical_core_count().unwrap();
         let logical = windows_logical_core_count().unwrap();
         assert!(physical > 0);
         assert!(logical >= physical);
         assert!(windows_total_memory_bytes().unwrap() > 0);
 
-        // Parallel integration tests intentionally create and reap many short-lived FFmpeg
-        // processes. ToolHelp sampling is fail-closed for each pass, so retry until one complete
-        // snapshot proves the primitive works instead of weakening production coverage rules.
-        let sample = (0..50)
-            .find_map(|_| {
-                let sample = sample_process_tree_memory(std::process::id()).ok();
-                if sample.is_none() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                sample
-            })
-            .expect("working-set primitive never produced a complete snapshot");
+        let sample = sample_alignment_benchmark_job_memory()
+            .expect("Job hierarchy working-set primitive must be available");
         assert!(sample.working_set_bytes > 0);
+
+        let mut command = SupervisedCommand::new(std::env::current_exe().unwrap());
+        command.arg("--help");
+        let output = command
+            .output(
+                SupervisedOutputLimits {
+                    execution_timeout: Duration::from_secs(10),
+                    output_drain_timeout: Duration::from_secs(2),
+                    termination_timeout: Duration::from_secs(2),
+                    poll_interval: Duration::from_millis(10),
+                    stdout_hard_limit: 128 * 1_024,
+                    stderr_hard_limit: 128 * 1_024,
+                },
+                || false,
+            )
+            .expect("private supervised Job must nest below benchmark accounting Job");
+        assert!(output.status.success());
+        let settled = sample_alignment_benchmark_job_memory()
+            .expect("Job hierarchy must remain queryable after nested child exits");
+        assert!(settled.working_set_bytes > 0);
     }
 
     #[cfg(windows)]

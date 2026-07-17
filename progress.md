@@ -1,3 +1,13 @@
+- 2026-07-17：C137 完成第六阶段第二十一个切片“Job Object 内存凭证、解码停滞看门狗与确定性进程树收尾”，完整验证并在独立目录重新打包；Goal 继续进行。
+  - 原生性能 session 的 Windows 内存采样从进程快照归因升级为私有 Job Object working-set receipt：基线在任何工具/环境探测前获取且必须为空；每个 native job 的 membership、峰值 working set、采样序列与终态统一进入 path-free schema v1 回执。非空基线、缺失成员、摘要漂移、session/run/workload/storage 绑定错误或额外字段全部失败关闭。
+  - Tauri bridge、性能 runner、raw evidence 与 acceptance 逐层严格解析并交叉重算 Job inventory；匹配页高级性能摘要将“内存凭证”与“任务收尾”分开显示。Job memory receipt 现在可以单项闭合，但它不替代独立 native attestation，也不把本机自洽证据冒充外部可信证明。
+  - 针对真实界面“5 项一直等待 0%”补上 FFmpeg 音频流停滞看门狗：连续 120 秒没有任何新 PCM stdout 即判定 `NoProgress`，终止该任务私有 Job 树并返回固定、无路径中文错误；其余组合同步取消，不再无限占用 CPU/GPU。共享预处理阶段继续显示真实批次进度，不把首项误报为“等待前面的组合完成”。
+  - Windows 进程清理进一步收紧：终止前查询私有 Job 的精确成员并持有同步句柄，终止 Job 后同时等待 active count 归零、直接子进程结束和每个已捕获成员进入 OS 终态；任何查询、打开或等待失败都会形成 sticky cleanup failure，不能靠账面归零伪装清理完成。
+  - 自动验收：Rust 串行全量 **400 passed / 19 ignored / 0 failed**，Rustfmt、strict Clippy `-D warnings` 与 `git diff --check` 通过；`corepack pnpm verify` 与 `corepack pnpm test:e2e` 通过源码审计、ESLint、Vitest **89 files / 926 tests**、TypeScript/Vite production build和 Chromium 四页北极星 **6/6**。普通沙箱首次因 esbuild `spawn EPERM` 未启动，允许构建子进程后相同完整命令全绿，不是代码失败。
+  - 本阶段安装器：`src-tauri/target-c137-job-memory/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `4193933` 字节，时间 `2026-07-17 09:35:17 +08:00`，SHA-256 `7791842D2341E44D18D5990E42075A8882ED7DD980E8CDCCC00ABDF1D97EC18E`。
+  - 本阶段便携版：`src-tauri/target-c137-job-memory/release/danmaku_timeline_studio.exe`，大小 `16340992` 字节，时间 `2026-07-17 09:35:17 +08:00`，SHA-256 `A9ED9C34B4F54CC856728BE1E8A4A033D0897BE6AE5E59EA8E395C60BC60EF2C`。因旧版程序仍在运行且可能有未保存项目，本轮使用独立目标目录打包，没有强行关闭用户进程。
+  - 诚实限制：本切片解决的是 Job 归因内存证据与无输出卡死，不证明用户真实影片上的映射准确率。独立 native attestation、外部 authority/challenge/replay、规定 4 核目标机正式重复测量、pair-local 多窗口/编辑/双边界 frozen evidence 和 20 套真实长合集仍未完成；获授权冻结真实 Gold 仍为 0，因此 C137 保持 active。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-job-memory-stall-watchdog-v1-20260717`。
 - 2026-07-17：C137 完成第六阶段第二十个切片“原生终态清理凭证与验收重算闭环”，完整验证并重新打包；Goal 继续进行。
   - 原生 benchmark session 不再在确认清理后直接丢弃全部状态：释放前生成 schema v1、path-free 的 terminal cleanup receipt，绑定同一 session/run/workload/storage receipt、最终 cache generation、全部 native job 的终态库存与结束 tick，以及进程树归零、监督器清理、工具链/媒体复核和 feature cache 清空声明；任一步不能形成严格回执时 session 保持 `cleanup-blocked` 并占用 lease。
   - Tauri bridge 对 released session 强制要求该回执，逐字段严格解析、重算 canonical SHA-256，并检查 session/workload/storage/cache generation 绑定；缺失、额外字段、旧摘要、错误绑定和虚假完成声明全部失败关闭。性能 journal 保留最终 released snapshot，raw evidence v2 复用已预留的 assurance 字段携带回执，不需要伪造 schema 升级。

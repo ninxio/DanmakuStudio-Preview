@@ -105,6 +105,26 @@ export interface AlignmentBenchmarkTerminalCleanupReceipt {
   receiptDigest: `sha256:${string}`;
 }
 
+export interface AlignmentBenchmarkJobMemoryReceipt {
+  schemaVersion: 1;
+  sessionId: string;
+  runManifestDigest: `sha256:${string}`;
+  workloadDigest: `sha256:${string}`;
+  workloadStorageReceiptDigest: `sha256:${string}`;
+  sampler: "windows-job-object-working-set-v1";
+  memoryScope: "application-process-tree";
+  jobCount: number;
+  totalSampleCount: number;
+  totalFailedSampleCount: 0;
+  maximumSampleGapMicros: string;
+  peakJobHierarchyRssBytes: number;
+  jobMemoryInventoryDigest: `sha256:${string}`;
+  allJobsCoverageComplete: true;
+  allSamplesJobBound: true;
+  allTerminalProcessTreesEmpty: true;
+  receiptDigest: `sha256:${string}`;
+}
+
 export interface AlignmentBenchmarkSessionSnapshot {
   schemaVersion: typeof ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION;
   sessionId: string;
@@ -116,6 +136,7 @@ export interface AlignmentBenchmarkSessionSnapshot {
   environment: AlignmentBenchmarkEnvironmentReceipt;
   activeJobId: string | null;
   cleanupIssue: string | null;
+  jobMemoryReceipt: AlignmentBenchmarkJobMemoryReceipt | null;
   terminalCleanupReceipt: AlignmentBenchmarkTerminalCleanupReceipt | null;
 }
 
@@ -728,6 +749,7 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
       "environment",
       "activeJobId",
       "cleanupIssue",
+      "jobMemoryReceipt",
       "terminalCleanupReceipt"
     ],
     "session snapshot"
@@ -763,6 +785,10 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
           1,
           MAX_TEXT_LENGTH
         );
+  const jobMemoryReceipt =
+    snapshot.jobMemoryReceipt === null
+      ? null
+      : assertJobMemoryReceipt(snapshot.jobMemoryReceipt);
   const terminalCleanupReceipt =
     snapshot.terminalCleanupReceipt === null
       ? null
@@ -781,6 +807,22 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
   }
   if (status !== "released" && terminalCleanupReceipt !== null) {
     throw new Error("invalid non-released session terminal cleanup receipt");
+  }
+  if (status === "released" && jobMemoryReceipt === null) {
+    throw new Error("invalid released session Job memory receipt");
+  }
+  if (status !== "released" && jobMemoryReceipt !== null) {
+    throw new Error("invalid non-released session Job memory receipt");
+  }
+  if (
+    jobMemoryReceipt &&
+    (jobMemoryReceipt.sessionId !== sessionId ||
+      jobMemoryReceipt.runManifestDigest !== environment.workloadStorage.runManifestDigest ||
+      jobMemoryReceipt.workloadDigest !== environment.workloadStorage.workloadDigest ||
+      jobMemoryReceipt.workloadStorageReceiptDigest !==
+        environment.workloadStorage.receiptDigest)
+  ) {
+    throw new Error("Job memory receipt 未绑定当前 session/workload/storage receipt");
   }
   if (
     terminalCleanupReceipt &&
@@ -805,8 +847,113 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
     environment,
     activeJobId,
     cleanupIssue,
+    jobMemoryReceipt,
     terminalCleanupReceipt
   };
+}
+
+function assertJobMemoryReceipt(value: unknown): AlignmentBenchmarkJobMemoryReceipt {
+  const receipt = requireRecord(value, "Job memory receipt");
+  requireExactKeys(
+    receipt,
+    [
+      "schemaVersion",
+      "sessionId",
+      "runManifestDigest",
+      "workloadDigest",
+      "workloadStorageReceiptDigest",
+      "sampler",
+      "memoryScope",
+      "jobCount",
+      "totalSampleCount",
+      "totalFailedSampleCount",
+      "maximumSampleGapMicros",
+      "peakJobHierarchyRssBytes",
+      "jobMemoryInventoryDigest",
+      "allJobsCoverageComplete",
+      "allSamplesJobBound",
+      "allTerminalProcessTreesEmpty",
+      "receiptDigest"
+    ],
+    "Job memory receipt"
+  );
+  if (
+    receipt.schemaVersion !== 1 ||
+    receipt.sampler !== "windows-job-object-working-set-v1" ||
+    receipt.memoryScope !== "application-process-tree" ||
+    receipt.totalFailedSampleCount !== 0 ||
+    receipt.allJobsCoverageComplete !== true ||
+    receipt.allSamplesJobBound !== true ||
+    receipt.allTerminalProcessTreesEmpty !== true
+  ) {
+    throw new Error("invalid Job memory receipt completion claims");
+  }
+  const jobCount = requireBoundedNonNegativeSafeInteger(
+    receipt.jobCount,
+    "Job memory receipt.jobCount",
+    64_000
+  );
+  const totalSampleCount = requireBoundedNonNegativeSafeInteger(
+    receipt.totalSampleCount,
+    "Job memory receipt.totalSampleCount",
+    Number.MAX_SAFE_INTEGER
+  );
+  const peakJobHierarchyRssBytes = requireBoundedNonNegativeSafeInteger(
+    receipt.peakJobHierarchyRssBytes,
+    "Job memory receipt.peakJobHierarchyRssBytes",
+    Number.MAX_SAFE_INTEGER
+  );
+  if (
+    (jobCount === 0 && (totalSampleCount !== 0 || peakJobHierarchyRssBytes !== 0)) ||
+    (jobCount > 0 && (totalSampleCount < jobCount || peakJobHierarchyRssBytes === 0))
+  ) {
+    throw new Error("invalid Job memory receipt aggregate counts");
+  }
+  const withoutReceiptDigest: Omit<AlignmentBenchmarkJobMemoryReceipt, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: requireOpaqueResponseId(receipt.sessionId, "Job memory receipt.sessionId"),
+    runManifestDigest: requireSha256Digest(
+      receipt.runManifestDigest,
+      "Job memory receipt.runManifestDigest"
+    ),
+    workloadDigest: requireSha256Digest(
+      receipt.workloadDigest,
+      "Job memory receipt.workloadDigest"
+    ),
+    workloadStorageReceiptDigest: requireSha256Digest(
+      receipt.workloadStorageReceiptDigest,
+      "Job memory receipt.workloadStorageReceiptDigest"
+    ),
+    sampler: "windows-job-object-working-set-v1",
+    memoryScope: "application-process-tree",
+    jobCount,
+    totalSampleCount,
+    totalFailedSampleCount: 0,
+    maximumSampleGapMicros: requireCanonicalDecimalTick(
+      receipt.maximumSampleGapMicros,
+      "Job memory receipt.maximumSampleGapMicros"
+    ),
+    peakJobHierarchyRssBytes,
+    jobMemoryInventoryDigest: requireSha256Digest(
+      receipt.jobMemoryInventoryDigest,
+      "Job memory receipt.jobMemoryInventoryDigest"
+    ),
+    allJobsCoverageComplete: true,
+    allSamplesJobBound: true,
+    allTerminalProcessTreesEmpty: true
+  };
+  const receiptDigest = requireSha256Digest(
+    receipt.receiptDigest,
+    "Job memory receipt.receiptDigest"
+  );
+  const expectedReceiptDigest = `sha256:${sha256Hex(canonicalJson({
+    domain: "c137-performance-job-memory-receipt-v1",
+    receipt: withoutReceiptDigest
+  }))}`;
+  if (receiptDigest !== expectedReceiptDigest) {
+    throw new Error("invalid Job memory receipt.receiptDigest binding");
+  }
+  return { ...withoutReceiptDigest, receiptDigest };
 }
 
 function assertTerminalCleanupReceipt(
