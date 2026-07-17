@@ -21,6 +21,10 @@ use crate::{
     cuda_fft_backend::{
         CudaFftMemoryBudget, CUDA_FFT_BACKEND_ID, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
     },
+    diagnostic_log::{
+        alignment_diagnostic_log_root, create_alignment_diagnostic_log,
+        AlignmentDiagnosticLogWriter,
+    },
     fine_frontier::{
         analyze_fine_frontier_with_cancel, ExactAssignment, ExactSearchStats, FineCandidate,
         FineCandidateId, FineCandidateInventory, FineEvaluationState, FineFrontierConfig,
@@ -2234,6 +2238,7 @@ struct AudioAlignmentBatchJobEntry {
     terminal_sequence: Option<u64>,
     started_at: Instant,
     next_diagnostic_sequence: u64,
+    persistent_diagnostic_log: Option<AlignmentDiagnosticLogWriter>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2505,13 +2510,19 @@ pub fn cancel_audio_alignment_job(job_id: String) -> Result<AudioAlignmentJobSna
 
 #[tauri::command]
 pub async fn start_audio_alignment_batch_job(
+    app: tauri::AppHandle,
     request: AudioAlignmentBatchRequest,
 ) -> Result<AudioAlignmentBatchJobSnapshot, String> {
     let plan = plan_audio_alignment_batch(request)?;
     let permit = acquire_ordinary_alignment_run()?;
     let job_id = next_audio_alignment_batch_job_id();
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone())?;
+    insert_audio_alignment_batch_job_with_diagnostics(
+        &job_id,
+        &plan,
+        cancel_flag.clone(),
+        Some(alignment_diagnostic_log_root(&app)),
+    )?;
     if let Err(error) = c137_process_attestation::record_blind_batch_started(&job_id) {
         if let Ok(mut jobs) = audio_alignment_batch_jobs().lock() {
             jobs.remove(&job_id);
@@ -16451,13 +16462,27 @@ fn audio_alignment_batch_jobs() -> &'static Mutex<HashMap<String, AudioAlignment
 
 fn next_audio_alignment_batch_job_id() -> String {
     let next = AUDIO_ALIGNMENT_BATCH_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("audio-align-batch-{next}")
+    format!(
+        "audio-align-batch-{}-{}-{next}",
+        current_time_ms(),
+        std::process::id()
+    )
 }
 
+#[cfg(test)]
 fn insert_audio_alignment_batch_job(
     job_id: &str,
     plan: &PlannedAudioAlignmentBatch,
     cancel_flag: Arc<AtomicBool>,
+) -> Result<(), String> {
+    insert_audio_alignment_batch_job_with_diagnostics(job_id, plan, cancel_flag, None)
+}
+
+fn insert_audio_alignment_batch_job_with_diagnostics(
+    job_id: &str,
+    plan: &PlannedAudioAlignmentBatch,
+    cancel_flag: Arc<AtomicBool>,
+    diagnostic_root: Option<Result<PathBuf, String>>,
 ) -> Result<(), String> {
     let started_at = Instant::now();
     let created_at_ms = current_time_ms();
@@ -16481,6 +16506,64 @@ fn insert_audio_alignment_batch_job(
         })
         .collect::<Vec<_>>();
     let total_pair_count = pairs.len();
+    let queued_event = AudioAlignmentBatchDiagnosticEvent {
+        sequence: 1,
+        at_ms: created_at_ms,
+        elapsed_ms: 0,
+        level: AudioAlignmentBatchDiagnosticLevel::Info,
+        stage_key: "batch.queued".to_string(),
+        media_ordinal: None,
+        pair_ordinal: None,
+        message: "批量匹配已进入原生任务队列。".to_string(),
+        duration_ms: None,
+    };
+    let mut diagnostic_events = vec![queued_event.clone()];
+    let mut next_diagnostic_sequence = 2;
+    let mut persistent_diagnostic_log = None;
+    if let Some(root) = diagnostic_root {
+        let writer = root.and_then(|root| {
+            create_alignment_diagnostic_log(&root, job_id, created_at_ms).and_then(|mut writer| {
+                writer.append_event(&queued_event)?;
+                Ok(writer)
+            })
+        });
+        match writer {
+            Ok(mut writer) => {
+                let enabled_event = AudioAlignmentBatchDiagnosticEvent {
+                    sequence: next_diagnostic_sequence,
+                    at_ms: current_time_ms(),
+                    elapsed_ms: 0,
+                    level: AudioAlignmentBatchDiagnosticLevel::Info,
+                    stage_key: "logging.persistence-enabled".to_string(),
+                    media_ordinal: None,
+                    pair_ordinal: None,
+                    message: "脱敏诊断日志已启用；可在批次诊断中查看运行编号并打开日志目录。"
+                        .to_string(),
+                    duration_ms: None,
+                };
+                if writer.append_event(&enabled_event).is_ok() {
+                    diagnostic_events.push(enabled_event);
+                    next_diagnostic_sequence = next_diagnostic_sequence.saturating_add(1);
+                    persistent_diagnostic_log = Some(writer);
+                } else {
+                    diagnostic_events.push(audio_alignment_diagnostic_persistence_warning(
+                        next_diagnostic_sequence,
+                        created_at_ms,
+                        0,
+                    ));
+                    next_diagnostic_sequence = next_diagnostic_sequence.saturating_add(1);
+                }
+            }
+            Err(_) => {
+                diagnostic_events.push(audio_alignment_diagnostic_persistence_warning(
+                    next_diagnostic_sequence,
+                    created_at_ms,
+                    0,
+                ));
+                next_diagnostic_sequence = next_diagnostic_sequence.saturating_add(1);
+            }
+        }
+    }
     let snapshot = AudioAlignmentBatchJobSnapshot {
         schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
         evidence_version: AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION,
@@ -16500,17 +16583,7 @@ fn insert_audio_alignment_batch_job(
         processed_pair_count: 0,
         failed_pair_count: 0,
         current_pair_ordinal: None,
-        diagnostic_events: vec![AudioAlignmentBatchDiagnosticEvent {
-            sequence: 1,
-            at_ms: created_at_ms,
-            elapsed_ms: 0,
-            level: AudioAlignmentBatchDiagnosticLevel::Info,
-            stage_key: "batch.queued".to_string(),
-            media_ordinal: None,
-            pair_ordinal: None,
-            message: "批量匹配已进入原生任务队列。".to_string(),
-            duration_ms: None,
-        }],
+        diagnostic_events,
         pairs,
         error: None,
         updated_at_ms: created_at_ms,
@@ -16528,7 +16601,8 @@ fn insert_audio_alignment_batch_job(
             cancel_flag,
             terminal_sequence: None,
             started_at,
-            next_diagnostic_sequence: 2,
+            next_diagnostic_sequence,
+            persistent_diagnostic_log,
         },
     );
     prune_audio_alignment_batch_terminal_jobs(&mut jobs, None);
@@ -19753,20 +19827,37 @@ fn append_audio_alignment_batch_diagnostic_event_to_entry(
     }
     let sequence = entry.next_diagnostic_sequence;
     entry.next_diagnostic_sequence = entry.next_diagnostic_sequence.saturating_add(1);
-    entry
-        .snapshot
-        .diagnostic_events
-        .push(AudioAlignmentBatchDiagnosticEvent {
-            sequence,
-            at_ms: current_time_ms(),
-            elapsed_ms: u64::try_from(entry.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-            level,
-            stage_key: stage_key.to_string(),
-            media_ordinal,
-            pair_ordinal,
-            message: message.to_string(),
-            duration_ms,
-        });
+    let at_ms = current_time_ms();
+    let elapsed_ms = u64::try_from(entry.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let event = AudioAlignmentBatchDiagnosticEvent {
+        sequence,
+        at_ms,
+        elapsed_ms,
+        level,
+        stage_key: stage_key.to_string(),
+        media_ordinal,
+        pair_ordinal,
+        message: message.to_string(),
+        duration_ms,
+    };
+    let persistence_failed = entry
+        .persistent_diagnostic_log
+        .as_mut()
+        .is_some_and(|log| log.append_event(&event).is_err());
+    entry.snapshot.diagnostic_events.push(event);
+    if persistence_failed {
+        entry.persistent_diagnostic_log = None;
+        let warning_sequence = entry.next_diagnostic_sequence;
+        entry.next_diagnostic_sequence = entry.next_diagnostic_sequence.saturating_add(1);
+        entry
+            .snapshot
+            .diagnostic_events
+            .push(audio_alignment_diagnostic_persistence_warning(
+                warning_sequence,
+                at_ms,
+                elapsed_ms,
+            ));
+    }
     if entry.snapshot.diagnostic_events.len() > MAX_AUDIO_ALIGNMENT_BATCH_DIAGNOSTIC_EVENTS {
         let overflow = entry
             .snapshot
@@ -19774,6 +19865,24 @@ fn append_audio_alignment_batch_diagnostic_event_to_entry(
             .len()
             .saturating_sub(MAX_AUDIO_ALIGNMENT_BATCH_DIAGNOSTIC_EVENTS);
         entry.snapshot.diagnostic_events.drain(0..overflow);
+    }
+}
+
+fn audio_alignment_diagnostic_persistence_warning(
+    sequence: u64,
+    at_ms: u64,
+    elapsed_ms: u64,
+) -> AudioAlignmentBatchDiagnosticEvent {
+    AudioAlignmentBatchDiagnosticEvent {
+        sequence,
+        at_ms,
+        elapsed_ms,
+        level: AudioAlignmentBatchDiagnosticLevel::Warning,
+        stage_key: "logging.persistence-unavailable".to_string(),
+        media_ordinal: None,
+        pair_ordinal: None,
+        message: "磁盘诊断日志不可用；当前运行继续使用内存诊断，不影响匹配计算。".to_string(),
+        duration_ms: None,
     }
 }
 
@@ -32861,7 +32970,91 @@ mod tests {
             terminal_sequence,
             started_at: Instant::now(),
             next_diagnostic_sequence: 1,
+            persistent_diagnostic_log: None,
         }
+    }
+
+    #[test]
+    fn batch_persistent_diagnostics_bind_run_id_and_events_without_media_paths() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+            "source-1", "target-1",
+        )])))
+        .unwrap();
+        let job_id = format!(
+            "test-audio-batch-diagnostic-{}-{}",
+            current_time_ms(),
+            AUDIO_ALIGNMENT_BATCH_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let root = std::env::temp_dir().join(&job_id);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job_with_diagnostics(
+            &job_id,
+            &plan,
+            cancel_flag,
+            Some(Ok(root.clone())),
+        )
+        .unwrap();
+        append_audio_alignment_batch_diagnostic_event(
+            &job_id,
+            AudioAlignmentBatchDiagnosticLevel::Info,
+            "test.stage",
+            Some(1),
+            None,
+            "脱敏阶段完成。",
+            Some(25),
+        )
+        .unwrap();
+
+        let snapshot = get_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(snapshot.diagnostic_events.len(), 3);
+        assert_eq!(
+            snapshot.diagnostic_events[1].stage_key,
+            "logging.persistence-enabled"
+        );
+        let content =
+            fs::read_to_string(root.join(format!("{job_id}.jsonl"))).expect("read diagnostic log");
+        assert!(content.contains(&format!(r#""runId":"{job_id}""#)));
+        assert!(content.contains(r#""stageKey":"test.stage""#));
+        assert!(!content.contains("source.mp4"));
+        assert!(!content.contains("target.mp4"));
+
+        audio_alignment_batch_jobs().lock().unwrap().remove(&job_id);
+        fs::remove_dir_all(root).expect("cleanup diagnostic root");
+    }
+
+    #[test]
+    fn batch_continues_with_memory_diagnostics_when_log_storage_is_unavailable() {
+        let plan = plan_audio_alignment_batch(test_audio_alignment_batch_request(Some(vec![(
+            "source-1", "target-1",
+        )])))
+        .unwrap();
+        let job_id = format!(
+            "test-audio-batch-diagnostic-fallback-{}-{}",
+            current_time_ms(),
+            AUDIO_ALIGNMENT_BATCH_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let root = std::env::temp_dir().join(&job_id);
+        fs::write(&root, b"not a directory").expect("create blocking file");
+        insert_audio_alignment_batch_job_with_diagnostics(
+            &job_id,
+            &plan,
+            Arc::new(AtomicBool::new(false)),
+            Some(Ok(root.clone())),
+        )
+        .unwrap();
+
+        let snapshot = get_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(
+            snapshot.diagnostic_events[1].stage_key,
+            "logging.persistence-unavailable"
+        );
+        assert_eq!(
+            snapshot.diagnostic_events[1].level,
+            AudioAlignmentBatchDiagnosticLevel::Warning
+        );
+
+        audio_alignment_batch_jobs().lock().unwrap().remove(&job_id);
+        fs::remove_file(root).expect("cleanup blocking file");
     }
 
     #[test]

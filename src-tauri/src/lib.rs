@@ -11,6 +11,7 @@ mod app_settings;
 mod audio_alignment;
 mod c137_process_attestation;
 pub mod cuda_fft_backend;
+mod diagnostic_log;
 mod export_files;
 pub mod fine_frontier;
 mod manual_verification;
@@ -42,6 +43,7 @@ pub fn run() {
             audio_alignment::start_audio_alignment_batch_job,
             audio_alignment::get_audio_alignment_batch_job,
             audio_alignment::cancel_audio_alignment_batch_job,
+            diagnostic_log::open_alignment_diagnostic_log_directory,
             audio_alignment::begin_alignment_benchmark_session,
             audio_alignment::get_active_alignment_benchmark_session,
             audio_alignment::reset_alignment_benchmark_caches,

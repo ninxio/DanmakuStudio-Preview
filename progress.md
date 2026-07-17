@@ -1,3 +1,14 @@
+- 2026-07-18：C137 完成第六阶段第三十二个切片“跨重启脱敏 JSONL 诊断日志、唯一运行编号与匹配页追踪入口”，完整验证并在独立目录重新打包；Goal 继续进行。
+  - 持久日志：批量匹配的每条既有结构化诊断事件会逐条立即写入应用本地数据目录的 JSONL 文件；文件包含 schema、运行编号、事件序号、时间、累计/阶段耗时、级别、阶段键与素材/组合序号。每次写入都会 flush，进程异常退出前已经完成的阶段仍可追溯。
+  - 运行追踪：批任务编号由毫秒时间、进程 ID 和进程内序号共同组成，应用重启后不会从 `audio-align-batch-1` 重新开始并覆盖旧证据；日志文件名与界面显示的运行编号完全一致。
+  - 透明入口：匹配页任务区新增渐进披露的“批次诊断与运行编号”，可查看本次编号并直接打开诊断日志目录；每组原有的内存诊断仍保留，用结果语言展示当前阶段和耗时。入口不要求用户重新选择媒体路径。
+  - 隐私与故障边界：磁盘日志固定为 `path-free-content-free-v1`，不写媒体路径、文件名、音视频内容或内容摘要；运行日志单文件上限 2 MiB，总量上限 16 MiB、最多 32 次运行，启动新任务前清理最旧 JSONL，不触碰同目录其他文件。目录不可用、写入中断或达到上限时只追加 `logging.persistence-unavailable` 内存警告并关闭本次磁盘写入，匹配计算继续执行。
+  - 回归覆盖：新增通用 JSONL 写入、目录逃逸拒绝、轮转、批任务真实接线、路径不落盘、存储失败降级、桌面桥调用和匹配页入口测试；strict Clippy `-D warnings` 与 Rustfmt 通过。
+  - 自动验收：Rust 全量 **424 passed / 23 ignored / 0 failed**；完整 `corepack pnpm verify` 通过源码审计、ESLint、Vitest **93 files / 965 tests** 和 TypeScript/Vite production build；Chromium 四页北极星 E2E **6/6**。沙箱内的完整前端验证和首次打包仅因 Windows `spawn EPERM` 无法启动 esbuild，允许同一受限命令启动子进程后全绿。
+  - release 安装包：`src-tauri/target-c137-persistent-diagnostics-v1/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，4,280,498 bytes，SHA-256 `ACCF097BB117EA39447FA3CBC32F64A9CA4A91928C0D88824E224CE3FF5F0BD3`；便携版：`src-tauri/target-c137-persistent-diagnostics-v1/release/danmaku_timeline_studio.exe`，16,729,088 bytes，SHA-256 `203B2E8879A5B9ECCA8FC9D61C2CB00B3F67324FAF0C6A0E96EF047CAB5860A0`。使用独立目标目录，不覆盖可能仍在运行的旧版程序。
+  - 范围说明：本切片覆盖当前最耗时、最需要定位的“匹配”批任务；它不是把原始 FFmpeg stdout/stderr 或全应用行为无筛选落盘。C137 的未映射锚点、长歧义区和最终 TimeMap 门控仍未闭环，因此 Goal 保持 active。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-persistent-diagnostics-v1-20260718`。
+
 - 2026-07-18：C137 完成第六阶段第三十一个切片“真实媒体留出锚点收敛、局部时间独立共识与微编辑抖动归一化”，完整验证并在独立目录重新打包；Goal 继续进行。
   - 精匹配路径：fine 对齐在稳定括号锚点约束下使用 ±2 秒引导格和 120 秒递归恢复；回溯及恢复使用 250ms 上下文平均代价并要求连续 5 秒共同内容。无法可靠判定的区间继续保留为歧义，不会为追求完整 TimeMap 强行填充。
   - 留出证据：留出锚点改为 5 秒局部单元、250ms 有符号偏移桶和双端时间独立共识；同一瞬间的多频率哈希不能伪造多票，候选还必须覆盖至少 3 个独立来源/目标索引与 1 秒时间桶。最终质量门同时约束粗仿射残差、可信锚点数和时间区域数。

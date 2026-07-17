@@ -14,6 +14,7 @@ import {
   getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
   isAudioAlignmentJobFinished,
+  openAudioAlignmentDiagnosticLogDirectory,
   runTauriAudioAlignment,
   startTauriAudioAlignmentBatchJob,
   startTauriAudioAlignmentJob,
@@ -378,6 +379,15 @@ describe("Tauri 音频对齐调用", () => {
     });
     expect(isAudioAlignmentJobFinished("completed")).toBe(true);
     expect(isAudioAlignmentJobFinished("running")).toBe(false);
+  });
+
+  it("通过桌面桥打开脱敏诊断日志目录", async () => {
+    tauriMocks.invoke.mockResolvedValue(undefined);
+
+    await expect(openAudioAlignmentDiagnosticLogDirectory()).resolves.toBeUndefined();
+    expect(tauriMocks.invoke).toHaveBeenCalledWith(
+      "open_alignment_diagnostic_log_directory"
+    );
   });
 
   it("批任务一次发送全部媒体并规范化流索引", async () => {

@@ -1,6 +1,7 @@
 import {
   CircleCheck,
   CircleX,
+  FolderOpen,
   LoaderCircle,
   Play,
   RefreshCw,
@@ -48,6 +49,7 @@ import {
   createAudioAlignmentBatchProposalTimeMapDigest,
   getTauriAudioAlignmentBatchJob,
   isAudioAlignmentJobFinished,
+  openAudioAlignmentDiagnosticLogDirectory,
   startTauriAudioAlignmentBatchJob,
   type AudioAlignmentBatchDiagnosticEvent,
   type AudioAlignmentBatchJobSnapshot,
@@ -255,6 +257,18 @@ export function MediaMatchingPanel({
     (candidate) => candidate.state === "pending" || candidate.state === "blocked"
   );
   const hasCancelledTasks = tasks.some((task) => task.state === "cancelled");
+
+  const openDiagnosticLogDirectory = async () => {
+    try {
+      await openAudioAlignmentDiagnosticLogDirectory();
+      setEditorStatus("已打开脱敏诊断日志目录。日志文件名就是本次运行编号。", "success");
+    } catch (error: unknown) {
+      setEditorStatus(
+        error instanceof Error ? error.message : "打开对齐诊断日志目录失败。",
+        "error"
+      );
+    }
+  };
 
   const runBatch = async () => {
     const unfinishedPriorJob = activeJobRef.current;
@@ -845,7 +859,13 @@ export function MediaMatchingPanel({
         )}
       </div>
 
-      {tasks.length > 0 ? <BatchTaskList tasks={tasks} project={project} /> : null}
+      {tasks.length > 0 ? (
+        <BatchTaskList
+          tasks={tasks}
+          project={project}
+          onOpenDiagnosticLogDirectory={() => void openDiagnosticLogDirectory()}
+        />
+      ) : null}
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <h4 className="text-sm font-medium text-slate-100">候选复核</h4>
@@ -1206,12 +1226,39 @@ function MediaChoiceList({
   );
 }
 
-function BatchTaskList({ tasks, project }: { tasks: BatchTask[]; project: EditorProject }) {
+function BatchTaskList({
+  tasks,
+  project,
+  onOpenDiagnosticLogDirectory
+}: {
+  tasks: BatchTask[];
+  project: EditorProject;
+  onOpenDiagnosticLogDirectory: () => void;
+}) {
+  const jobId = tasks.find((task) => task.jobId !== null)?.jobId ?? null;
   return (
     <div
       className="mt-3 grid gap-1 rounded border border-panel-line bg-black/15 p-2"
       aria-label="批量匹配任务"
     >
+      {jobId ? (
+        <details className="mb-1 rounded border border-panel-line bg-black/15 px-2 py-1.5 text-[11px] text-slate-500">
+          <summary className="cursor-pointer text-slate-400">批次诊断与运行编号</summary>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span>
+              运行编号：<code className="text-slate-300">{jobId}</code>
+            </span>
+            <TextButton className="h-7" onClick={onOpenDiagnosticLogDirectory}>
+              <FolderOpen size={13} />
+              打开诊断日志目录
+            </TextButton>
+          </div>
+          <p className="mt-1 leading-5">
+            磁盘日志采用 JSONL，逐阶段立即写入；不保存媒体路径、文件名、音视频内容或内容摘要。
+            最多保留 32 次运行或 16 MiB，超过后自动清理最旧记录。
+          </p>
+        </details>
+      ) : null}
       {tasks.map((task) => {
         const source = findProjectMedia(project, task.sourceMediaId);
         const target = findProjectMedia(project, task.targetMediaId);

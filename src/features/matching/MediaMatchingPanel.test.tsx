@@ -47,6 +47,7 @@ import {
   createAudioAlignmentBatchProposalTimeMapDigest,
   getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
+  openAudioAlignmentDiagnosticLogDirectory,
   startTauriAudioAlignmentBatchJob,
   startTauriAudioAlignmentJob,
   type AudioAlignmentBatchFineExecutionEvidenceSnapshot,
@@ -76,7 +77,8 @@ vi.mock("../../infrastructure/alignment/tauriAudioAlignment", async () => {
     cancelTauriAudioAlignmentJob: vi.fn(),
     startTauriAudioAlignmentBatchJob: vi.fn(),
     getTauriAudioAlignmentBatchJob: vi.fn(),
-    cancelTauriAudioAlignmentBatchJob: vi.fn()
+    cancelTauriAudioAlignmentBatchJob: vi.fn(),
+    openAudioAlignmentDiagnosticLogDirectory: vi.fn()
   };
 });
 
@@ -729,6 +731,7 @@ describe("多媒体自动匹配工作台", () => {
     );
     vi.mocked(getTauriAudioAlignmentJob).mockReset();
     vi.mocked(cancelTauriAudioAlignmentJob).mockReset();
+    vi.mocked(openAudioAlignmentDiagnosticLogDirectory).mockResolvedValue(undefined);
     legacyBatchJobs.clear();
     installLegacyPairwiseBatchAdapter();
   });
@@ -923,6 +926,13 @@ describe("多媒体自动匹配工作台", () => {
     expect(within(taskList).getAllByLabelText("脱敏运行诊断")[0]).toHaveTextContent(
       "[+0:12.345] [信息] [素材 #1] 媒体身份与容器时间线读取完成。（本阶段耗时 0:10.500）"
     );
+    fireEvent.click(within(taskList).getByText("批次诊断与运行编号"));
+    expect(within(taskList).getByText("batch-preparing")).toBeInTheDocument();
+    fireEvent.click(within(taskList).getByRole("button", { name: "打开诊断日志目录" }));
+    await waitFor(() =>
+      expect(openAudioAlignmentDiagnosticLogDirectory).toHaveBeenCalledTimes(1)
+    );
+    expect(useEditorStore.getState().status.message).toContain("已打开脱敏诊断日志目录");
 
     fireEvent.click(screen.getByRole("button", { name: "取消剩余任务" }));
     await waitFor(() =>

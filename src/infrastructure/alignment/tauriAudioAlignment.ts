@@ -414,6 +414,8 @@ export interface AudioAlignmentBatchJobInvoker {
   cancel: (jobId: string) => Promise<AudioAlignmentBatchJobSnapshot>;
 }
 
+export type AudioAlignmentDiagnosticLogDirectoryInvoker = () => Promise<void>;
+
 export async function runTauriAudioAlignment(
   request: TauriAudioAlignmentRequest,
   invoker: AudioAlignmentInvoker = defaultAudioAlignmentInvoker
@@ -511,6 +513,17 @@ export async function cancelTauriAudioAlignmentBatchJob(
   }
 }
 
+export async function openAudioAlignmentDiagnosticLogDirectory(
+  invoker: AudioAlignmentDiagnosticLogDirectoryInvoker = defaultAudioAlignmentDiagnosticLogDirectoryInvoker
+): Promise<void> {
+  ensureDesktopAudioAlignment(invoker === defaultAudioAlignmentDiagnosticLogDirectoryInvoker);
+  try {
+    await invoker();
+  } catch (error: unknown) {
+    throw new Error(`打开对齐诊断日志目录失败：${formatAudioAlignmentFailure(error)}`);
+  }
+}
+
 function defaultAudioAlignmentInvoker(
   request: NormalizedTauriAudioAlignmentRequest
 ): Promise<AlignmentProposal> {
@@ -532,6 +545,9 @@ const defaultAudioAlignmentBatchJobInvoker: AudioAlignmentBatchJobInvoker = {
   cancel: (jobId) =>
     invoke<AudioAlignmentBatchJobSnapshot>("cancel_audio_alignment_batch_job", { jobId })
 };
+
+const defaultAudioAlignmentDiagnosticLogDirectoryInvoker: AudioAlignmentDiagnosticLogDirectoryInvoker =
+  () => invoke<void>("open_alignment_diagnostic_log_directory");
 
 function ensureDesktopAudioAlignment(usesDefaultInvoker: boolean): void {
   if (usesDefaultInvoker && !isTauri()) {
