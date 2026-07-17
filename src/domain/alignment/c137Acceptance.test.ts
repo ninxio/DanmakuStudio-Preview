@@ -10,6 +10,10 @@ import {
 import { createC137AuthorityProofFixture } from "../../test/c137Authority";
 import { evaluateC137AcceptanceBundleWithAuthority } from "./c137Authority";
 import {
+  deriveC137PairLocalFineEvidence,
+  deriveC137TimeMapCasesFromPairLocalFineEvidence
+} from "./c137PairLocalFineEvidence";
+import {
   computeC137PerformanceEnvironmentDigest,
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceEvidenceDigest,
@@ -162,6 +166,15 @@ describe("C137 fail-closed acceptance gate", () => {
       status: "incomplete",
       actual: "self-consistent-no-native-authority"
     });
+    expect(
+      gate.checks.find((check) => check.id === "native-pair-local-fine-integrity")
+    ).toMatchObject({ status: "pass" });
+    expect(
+      gate.checks.find((check) => check.id === "native-pair-local-time-map-binding")
+    ).toMatchObject({ status: "pass" });
+    expect(
+      gate.checks.find((check) => check.id === "native-pair-local-window-inventory")
+    ).toMatchObject({ status: "incomplete" });
     for (const id of [
       "external-trust-authority",
       "native-blind-plan-authority",
@@ -177,6 +190,27 @@ describe("C137 fail-closed acceptance gate", () => {
       });
     }
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
+  it("调用方修改 TimeMap 误差并重签 report 也不能越过 pair-local frozen Gold 重算", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const bundle = createCompleteBundle();
+    bindFormalBlindProvenanceFixture(bundle, fixture);
+    bundle.reports.timeMap!.cases[0].matchedProjectionErrorsMs[0] = 999;
+    refreshReportEvidenceDigests(bundle);
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(
+      gate.checks.find((check) => check.id === "native-pair-local-fine-integrity")
+    ).toMatchObject({ status: "pass" });
+    expect(
+      gate.checks.find((check) => check.id === "native-pair-local-time-map-binding")
+    ).toMatchObject({
+      status: "incomplete",
+      actual: "report-mismatch-or-incomplete"
+    });
   });
 
   it("真实 authority proof 解除 plan/challenge/replay，但不冒充 native execution attestation", async () => {
@@ -1380,15 +1414,9 @@ function bindFormalBlindProvenanceFixture(
     rankedCandidateIds: [...decision.rankedPairIds],
     verifiedCandidateId: null
   }));
-  timeMapReport.cases = manifest.cases.map((benchmarkCase) => ({
-    caseId: benchmarkCase.id,
-    mediaKind: "real",
-    split: "frozen-test",
-    scenarios: [...benchmarkCase.scenarios],
-    matchedProjectionErrorsMs: [0],
-    endDriftAt45MinutesMs: null,
-    editDecisions: []
-  }));
+  timeMapReport.cases = deriveC137TimeMapCasesFromPairLocalFineEvidence(
+    deriveC137PairLocalFineEvidence(provenance)
+  );
   calibrationReport.samples = decisions.map((decision) => ({
     decisionId: decision.provenanceRef,
     mediaKind: "real",

@@ -26,6 +26,10 @@ import {
   REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION,
   REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION
 } from "./realMediaBlindBatchContract";
+import {
+  c137TimeMapCasesEqualPairLocalEvidence,
+  deriveC137PairLocalFineEvidence
+} from "./c137PairLocalFineEvidence";
 import { sha256Hex } from "../shared/sha256";
 
 export const C137_ACCEPTANCE_SCHEMA_VERSION = 4 as const;
@@ -561,6 +565,7 @@ function evaluateEvidenceCompleteness(
   const checks: C137AcceptanceCheck[] = [
     ...evaluateExternalTrust(bundle, trustContext),
     ...evaluateFormalBlindRankingEvidence(bundle),
+    ...evaluatePairLocalFineEvidence(bundle),
     createCheck(
       "certification-class",
       bundle.certificationClass === "real-frozen" ? "pass" : "incomplete",
@@ -726,6 +731,130 @@ function evaluateEvidenceCompleteness(
 
   checks.push(...evaluateRawEvidenceCompleteness(bundle));
   return checks;
+}
+
+function evaluatePairLocalFineEvidence(bundle: C137AcceptanceBundle): C137AcceptanceCheck[] {
+  const provenance = bundle.formalEvidence.blindRelationship;
+  if (provenance === null) {
+    return [
+      createCheck(
+        "native-pair-local-fine-integrity",
+        "incomplete",
+        "missing-private-provenance",
+        "必须从同一 private formal provenance 的 frozen Gold、fine frontier、实际解码窗口与 proposal TimeMap 唯一推导 pair-local 证据"
+      ),
+      createCheck(
+        "native-pair-local-time-map-binding",
+        "incomplete",
+        "missing-private-provenance",
+        "TimeMap 报告必须逐 case 等于 native proposal 对 frozen Gold 的重算结果，禁止调用方手填误差、删减类别和边界"
+      ),
+      createCheck(
+        "native-pair-local-window-inventory",
+        "incomplete",
+        "missing-private-provenance",
+        "每个 frozen gold pair 必须公开并摘要绑定完整的 pair-local 多窗口候选 ID 清单"
+      ),
+      createCheck(
+        "native-pair-local-bilateral-boundaries",
+        "incomplete",
+        "missing-private-provenance",
+        "编辑事件必须从 frozen Gold 与 proposal TimeMap 推导 source/target 双轴起止边界误差"
+      )
+    ];
+  }
+
+  try {
+    const evidence = deriveC137PairLocalFineEvidence(provenance);
+    const measured = evidence.cases.filter((item) => item.status === "measured");
+    const allMeasured = measured.length === evidence.cases.length && evidence.cases.length > 0;
+    const timeMapReport = bundle.reports.timeMap;
+    const timeMapBound =
+      allMeasured &&
+      timeMapReport !== null &&
+      c137TimeMapCasesEqualPairLocalEvidence(timeMapReport.cases, evidence);
+    const completeInventories =
+      evidence.cases.length > 0 &&
+      evidence.cases.every((item) => item.completePairCandidateInventoryEnumerated);
+    const alternativesObserved = evidence.cases.filter(
+      (item) => item.samePairAlternativeObserved
+    ).length;
+    const manyToManyObserved = evidence.cases.filter(
+      (item) => item.sameSegmentManyToManyObserved
+    ).length;
+    const bilateralDecisionCount = evidence.cases.reduce(
+      (count, item) =>
+        count +
+        (item.timeMap?.editDecisions.filter(
+          (decision) => decision.bilateralBoundaryErrorsMs !== null
+        ).length ?? 0),
+      0
+    );
+    const pairedDecisionCount = evidence.cases.reduce(
+      (count, item) =>
+        count +
+        (item.timeMap?.editDecisions.filter(
+          (decision) => decision.goldKind !== null && decision.predictedKind !== null
+        ).length ?? 0),
+      0
+    );
+    const bilateralComplete =
+      allMeasured && pairedDecisionCount > 0 && bilateralDecisionCount === pairedDecisionCount;
+    const blockedSummary = evidence.cases
+      .filter((item) => item.status === "blocked")
+      .map((item) => `${item.caseId}:${item.issues.join("/")}`)
+      .join("；");
+    return [
+      createCheck(
+        "native-pair-local-fine-integrity",
+        allMeasured ? "pass" : "incomplete",
+        allMeasured ? evidence.evidenceDigest : blockedSummary || "no-measured-case",
+        "每个 frozen case 必须唯一定位 gold native pair，并闭合 resolved fine frontier、selected candidate、实际 decode windows 与 proposal TimeMap digest"
+      ),
+      createCheck(
+        "native-pair-local-time-map-binding",
+        timeMapBound ? "pass" : "incomplete",
+        timeMapBound ? evidence.evidenceDigest : "report-mismatch-or-incomplete",
+        "TimeMap 报告必须逐 case 精确等于同一 native proposal 对同一 frozen Gold 唯一重算的 anchor、45 分钟漂移、编辑分类、边界与时长误差"
+      ),
+      createCheck(
+        "native-pair-local-window-inventory",
+        completeInventories && alternativesObserved === evidence.cases.length
+          ? "pass"
+          : "incomplete",
+        `${alternativesObserved}/${evidence.cases.length} observed; complete=${String(completeInventories)}`,
+        "native receipt 必须枚举并摘要绑定每个 gold pair 的完整多窗口候选 ID 清单，且每个 pair 至少证明两个实际候选；仅有 inventoryCandidateCount 不足以证明"
+      ),
+      createCheck(
+        "native-pair-local-many-to-many",
+        manyToManyObserved > 0 ? "pass" : "incomplete",
+        manyToManyObserved,
+        "冻结证据必须至少覆盖一个 selected temporal group 含多个 coarse member 的同段多版本/多候选场景"
+      ),
+      createCheck(
+        "native-pair-local-bilateral-boundaries",
+        bilateralComplete ? "pass" : "incomplete",
+        `${bilateralDecisionCount}/${pairedDecisionCount}`,
+        "所有配对编辑事件都必须保存由 Gold/TimeMap 重算的 sourceStart/sourceEnd/targetStart/targetEnd 四个绝对误差；无编辑样本不能通过"
+      )
+    ];
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return [
+      createCheck(
+        "native-pair-local-fine-integrity",
+        "incomplete",
+        message,
+        "pair-local fine evidence 必须可从严格有效的 formal provenance 唯一推导"
+      ),
+      createCheck(
+        "native-pair-local-time-map-binding",
+        "incomplete",
+        "derivation-failed",
+        "TimeMap 报告不得绕过 pair-local frozen Gold 重算"
+      )
+    ];
+  }
 }
 
 function evaluateFormalBlindRankingEvidence(
