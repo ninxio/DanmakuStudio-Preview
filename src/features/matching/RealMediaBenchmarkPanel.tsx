@@ -14,6 +14,11 @@ import {
   type RealMediaGoldBenchmarkBundle
 } from "../../domain/alignment/realMediaGoldBenchmarkBundle";
 import {
+  REAL_MEDIA_GOLD_DEVELOPMENT_DATASET_KIND,
+  parseRealMediaGoldDevelopmentDatasetJson,
+  type RealMediaGoldDevelopmentDataset
+} from "../../domain/alignment/realMediaGoldDevelopmentDataset";
+import {
   getC137PerformanceMeasuredRuns,
   getC137PerformancePeakRss,
   serializeC137PerformanceEvidence,
@@ -44,6 +49,7 @@ import {
 } from "../../infrastructure/alignment/sensitiveTextRedaction";
 import { loadAppSettings, type AppSettings } from "../../infrastructure/settings/appSettings";
 import { RealMediaGoldGovernancePanel } from "./RealMediaGoldGovernancePanel";
+import { RealMediaGoldDatasetPanel } from "./RealMediaGoldDatasetPanel";
 
 export type RealMediaBenchmarkPanelRunner = (
   manifest: RealMediaBenchmarkManifest,
@@ -84,6 +90,8 @@ export function RealMediaBenchmarkPanel({
   const [governedBundle, setGovernedBundle] = useState<RealMediaGoldBenchmarkBundle | null>(
     null
   );
+  const [governedDataset, setGovernedDataset] =
+    useState<RealMediaGoldDevelopmentDataset | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [report, setReport] = useState<RealMediaBenchmarkRunReport | null>(null);
   const [runPhase, setRunPhase] = useState<RunPhase>("idle");
@@ -114,6 +122,7 @@ export function RealMediaBenchmarkPanel({
     setManifestFileName(file.name);
     setManifest(null);
     setGovernedBundle(null);
+    setGovernedDataset(null);
     setManifestError(null);
     setReport(null);
     setRunError(null);
@@ -125,9 +134,15 @@ export function RealMediaBenchmarkPanel({
         isRecord(parsedJson) && parsedJson.kind === REAL_MEDIA_GOLD_BENCHMARK_BUNDLE_KIND
           ? parseRealMediaGoldBenchmarkBundleJson(text)
           : null;
-      const parsed = bundle?.manifest ?? parseRealMediaBenchmarkManifestJson(text);
+      const dataset =
+        isRecord(parsedJson) && parsedJson.kind === REAL_MEDIA_GOLD_DEVELOPMENT_DATASET_KIND
+          ? parseRealMediaGoldDevelopmentDatasetJson(text)
+          : null;
+      const parsed =
+        bundle?.manifest ?? dataset?.manifest ?? parseRealMediaBenchmarkManifestJson(text);
       if (operationRef.current !== operation) return;
       setGovernedBundle(bundle);
+      setGovernedDataset(dataset);
       setManifest(parsed);
     } catch (error: unknown) {
       if (operationRef.current !== operation) return;
@@ -197,6 +212,7 @@ export function RealMediaBenchmarkPanel({
     setManifestFileName(null);
     setManifest(null);
     setGovernedBundle(null);
+    setGovernedDataset(null);
     setManifestError(null);
     setReport(null);
     setRunError(null);
@@ -261,6 +277,8 @@ export function RealMediaBenchmarkPanel({
 
           <RealMediaGoldGovernancePanel project={project} desktopAvailable={desktopAvailable} />
 
+          <RealMediaGoldDatasetPanel />
+
           <label className="grid gap-1.5 text-slate-400">
             <span className="font-medium text-slate-300">
               选择治理 bundle JSON（development 可用 raw manifest）
@@ -298,6 +316,7 @@ export function RealMediaBenchmarkPanel({
               manifest={manifest}
               fileName={manifestFileName ?? "manifest.json"}
               governedBundle={governedBundle}
+              governedDataset={governedDataset}
             />
           ) : null}
 
@@ -684,11 +703,13 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
 function ManifestGovernanceSummary({
   manifest,
   fileName,
-  governedBundle
+  governedBundle,
+  governedDataset
 }: {
   manifest: RealMediaBenchmarkManifest;
   fileName: string;
   governedBundle: RealMediaGoldBenchmarkBundle | null;
+  governedDataset: RealMediaGoldDevelopmentDataset | null;
 }) {
   const realCases = manifest.cases.filter(
     (benchmarkCase) => benchmarkCase.mediaKind === "real"
@@ -744,15 +765,23 @@ function ManifestGovernanceSummary({
           <dd className="inline">
             {manifest.isExample
               ? "示例清单"
-              : governedBundle
-                ? "完整治理 bundle（内部自洽，非发布授权）"
-                : "raw development manifest（未验证冻结治理）"}
+              : governedDataset
+                ? "多 case development 治理包（内部自洽，非发布授权）"
+                : governedBundle
+                  ? "完整治理 bundle（内部自洽，非发布授权）"
+                  : "raw development manifest（未验证冻结治理）"}
           </dd>
         </div>
         {governedBundle ? (
           <div className="sm:col-span-2">
             <dt className="inline text-slate-500">bundle 摘要：</dt>
             <dd className="inline break-all">{governedBundle.bundleDigest}</dd>
+          </div>
+        ) : null}
+        {governedDataset ? (
+          <div className="sm:col-span-2">
+            <dt className="inline text-slate-500">dataset 摘要：</dt>
+            <dd className="inline break-all">{governedDataset.datasetDigest}</dd>
           </div>
         ) : null}
       </dl>

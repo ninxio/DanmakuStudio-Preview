@@ -1,3 +1,13 @@
+- 2026-07-17：C137 完成第六阶段第十九个切片“多 case development Gold 治理数据集”，完整验证并重新打包；Goal 继续进行。
+  - 真实 Gold 治理不再只能手工维护一个 case：匹配页高级诊断新增“合并多个已复核 case”入口，可一次多选 2–1000 个现有单 case 治理 bundle，生成确定顺序、可直接载入精度 benchmark 的多 case development 数据集。
+  - 合并器不会只拼 JSON：每个 source bundle 都重新执行严格解析与 digest/receipt/annotation 闭环；重复 case ID、重复 bundle、用不同 ID 包装的同一双端媒体身份/音视频流、manifest 漂移、coverage 漂移、dataset digest 篡改和额外字段全部失败关闭。覆盖摘要从嵌入 bundle 重算 case、source/target binding、reviewer、source-only/target-only/ambiguous 事件与 12 类场景计数。
+  - 信任边界保持不变：数据集只接受 real development case，固定 `releaseEligible=false` 和 `untrusted-self-consistent-gold-governance`；界面明确警告产物含本地绝对路径、完整媒体身份和复核记录，不适合直接分享，也不能计作 frozen-test 或 20 组北极星采集。formal frozen 入口仍失败关闭。
+  - benchmark loader 现在能区分 raw manifest、单 case 治理 bundle 和多 case development 数据集，并展示 dataset digest、关系数和身份完整度；多 case 包验证通过后才可运行，清除/换包会同步清除治理状态和旧报告。
+  - 自动验收：新增领域确定性、重复关系和篡改阻断回归，以及 UI 多选→合并→下载→重新载入闭环。`corepack pnpm verify:release` 完整通过源码审计、ESLint、Vitest **89 files / 905 tests**、TypeScript/Vite production build、Chromium 四页北极星 **6/6** 和 Tauri NSIS release；Rust 串行全量 **396 passed / 18 ignored / 0 failed**，Rustfmt、strict Clippy `-D warnings` 与 `git diff --check` 通过。
+  - 本阶段安装器：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `4170395` 字节，时间 `2026-07-17 08:13:37 +08:00`，SHA-256 `41CDC52FE34825CBF9DFA1AAF67C4A14FEEEE4507BBBDEBB3B2AE0299B427FEA`。
+  - 本阶段便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `16284672` 字节，时间 `2026-07-17 08:13:37 +08:00`，SHA-256 `47745097984DC69EF271C1A812E09B809EC4664335CB40D4961A3EA1B569AA4C`。
+  - 诚实限制：本切片解除的是“只能保存/运行一个已复核 case”的数据工程阻断，不会凭空产生真实 Gold。当前获授权并完成冻结的真实关系仍为 0，外部签名/撤销 authority、challenge/replay、pair-local 编辑/双边界 frozen 证据、正式性能 attestation 和 20 套真实长合集仍未完成。因此 C137 保持 active，不能宣称实际错位与删减精度已经验收通过。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-governed-development-dataset-v1-20260717`。
 - 2026-07-17：C137 完成第六阶段第十八个切片“批次共享预处理真实进度与排队误导修复”，完整验证并重新打包；Goal 继续进行。
   - 根因确认：原生 N×M 批次会先对 distinct physical media 统一执行工具链检查、全文件身份校验、PTS/音轨读取和共享声谱特征生成，但旧实现直到进入第一个 pair 比较才把 batch 从 queued 改为 running；前端又把所有 queued pair 固定翻译为“等待前面的组合完成”，因此 1 个长参考 × 5 个原片会在实际繁忙时全部显示等待 0%。
   - 原生批次现在从工具链检查开始即发布 running：1% 显示 FFmpeg/CUDA 与批次资源检查，2%–20% 按 distinct media 显示“正在预处理第 N/M 个素材（角色）”，并明确区分完成与 physical-media 复用；预处理完成后再进入逐 pair 比较。batch progress 全程单调，后续 pair 进度映射到 20%–100%，不会在阶段切换时倒退。

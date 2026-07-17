@@ -19,6 +19,11 @@ import {
   serializeRealMediaGoldBenchmarkBundle
 } from "../../domain/alignment/realMediaGoldBenchmarkBundle";
 import {
+  createRealMediaGoldDevelopmentDataset,
+  parseRealMediaGoldDevelopmentDatasetJson,
+  serializeRealMediaGoldDevelopmentDataset
+} from "../../domain/alignment/realMediaGoldDevelopmentDataset";
+import {
   createRealMediaGoldAnnotationEnvelope,
   freezeRealMediaGoldCase,
   type RealMediaGoldReviewVerification
@@ -238,6 +243,89 @@ describe("C137 真实媒体 benchmark 面板", () => {
       screen.queryByText(/formal frozen-test 仍缺外部签名与撤销 authority/)
     ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeEnabled();
+  });
+
+  it("可多选单 case bundle，生成确定的 development 数据集并直接载入运行入口", async () => {
+    const user = userEvent.setup();
+    const first = createGovernedBundle("development", 0);
+    const second = createGovernedBundle("development", 1);
+    let downloadedBlob: Blob | null = null;
+    let downloadedName = "";
+    restoreObjectUrls = installObjectUrlMocks((blob) => {
+      downloadedBlob = blob;
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement
+    ) {
+      downloadedName = this.download;
+    });
+    render(<RealMediaBenchmarkPanel desktopAvailable />);
+    await openPanel(user);
+    await user.click(
+      screen.getByRole("button", { name: /合并多个已复核 case（development）/ })
+    );
+
+    const multiInput = screen.getByLabelText("选择多个单 case 治理 bundle");
+    expect(multiInput).toHaveAttribute("multiple");
+    await user.upload(multiInput, [
+      new File([serializeRealMediaGoldBenchmarkBundle(first)], "case-one.json", {
+        type: "application/json"
+      }),
+      new File([serializeRealMediaGoldBenchmarkBundle(second)], "case-two.json", {
+        type: "application/json"
+      })
+    ]);
+
+    const coverage = await screen.findByLabelText("合并覆盖摘要");
+    expect(coverage).toHaveTextContent("可生成：2 个 development case");
+    expect(coverage).toHaveTextContent("源 2 / 目标 2");
+    await user.click(screen.getByRole("button", { name: "下载多 case development 数据集" }));
+    expect(downloadedName).toBe(
+      "c137-local-reviewed-development-development-v1-development-dataset.json"
+    );
+    if (!downloadedBlob) throw new Error("下载测试没有捕获 development dataset Blob");
+    const downloadedText = await readBlobText(downloadedBlob);
+    const dataset = parseRealMediaGoldDevelopmentDatasetJson(downloadedText);
+    expect(dataset.manifest.cases).toHaveLength(2);
+    expect(dataset.releaseEligible).toBe(false);
+
+    await user.upload(
+      screen.getByLabelText("选择 C137 benchmark manifest JSON"),
+      new File([downloadedText], "development-dataset.json", {
+        type: "application/json"
+      })
+    );
+    const summary = await screen.findByLabelText("清单治理摘要");
+    expect(summary).toHaveTextContent("多 case development 治理包（内部自洽，非发布授权）");
+    expect(summary).toHaveTextContent(dataset.datasetDigest);
+    expect(summary).toHaveTextContent("共 2，真实 2");
+    expect(screen.getByRole("button", { name: "运行真实媒体精度基准" })).toBeEnabled();
+  });
+
+  it("可直接载入由领域层创建的多 case development 数据集", async () => {
+    const user = userEvent.setup();
+    const dataset = createRealMediaGoldDevelopmentDataset({
+      metadata: {
+        id: "direct-development",
+        name: "直接载入 development 数据集",
+        datasetVersion: "v1",
+        description: "UI loader 测试。",
+        licenseNotes: ["本机授权。"]
+      },
+      bundles: [createGovernedBundle("development", 0), createGovernedBundle("development", 1)]
+    });
+    render(<RealMediaBenchmarkPanel desktopAvailable />);
+    await openPanel(user);
+    await user.upload(
+      screen.getByLabelText("选择 C137 benchmark manifest JSON"),
+      new File([serializeRealMediaGoldDevelopmentDataset(dataset)], "direct-development.json", {
+        type: "application/json"
+      })
+    );
+
+    const summary = await screen.findByLabelText("清单治理摘要");
+    expect(summary).toHaveTextContent(dataset.datasetDigest);
+    expect(summary).toHaveTextContent("多 case development 治理包");
   });
 
   it("本机自洽 bundle 也不能把 formal frozen-test 提升为可运行", async () => {
@@ -639,8 +727,11 @@ function createRealManifest(count: number): RealMediaBenchmarkManifest {
   };
 }
 
-function createGovernedBundle(split: "development" | "frozen-test" = "development") {
-  const draftCase = createRealCase(0);
+function createGovernedBundle(
+  split: "development" | "frozen-test" = "development",
+  caseIndex = 0
+) {
+  const draftCase = createRealCase(caseIndex);
   draftCase.split = split;
   const sourceIdentity = draftCase.source.contentIdentity;
   const targetIdentity = draftCase.target.contentIdentity;
@@ -698,8 +789,8 @@ function createGovernedBundle(split: "development" | "frozen-test" = "developmen
   });
   const manifest: RealMediaBenchmarkManifest = {
     ...createRealManifest(0),
-    id: `ui-governed-${split}`,
-    datasetVersion: `ui-governed-${split}-v1`,
+    id: `ui-governed-${split}-${caseIndex + 1}`,
+    datasetVersion: `ui-governed-${split}-${caseIndex + 1}-v1`,
     cases: [frozen.manifestCase]
   };
   return createRealMediaGoldBenchmarkBundle({
