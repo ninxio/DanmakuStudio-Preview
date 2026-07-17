@@ -39,6 +39,10 @@ import {
   type AudioAlignmentJobStatus,
   type TauriAudioAlignmentBatchRequest
 } from "./tauriAudioAlignment";
+import {
+  sealC137BlindBatchReceipt,
+  type C137ProcessAttestationInvoker
+} from "./tauriC137ProcessAttestation";
 
 export {
   createRealMediaBlindBatchExecutionDigest,
@@ -84,6 +88,8 @@ export interface RealMediaBlindBatchRunnerOptions {
   cancellationGraceMs?: number;
   signal?: AbortSignal;
   alignmentInvoker?: AudioAlignmentBatchJobInvoker;
+  liveProcessAttestationSessionId?: string;
+  processAttestationInvoker?: C137ProcessAttestationInvoker;
   now?: () => number;
   wait?: (milliseconds: number) => Promise<void>;
 }
@@ -108,6 +114,8 @@ interface ValidatedRunnerOptions {
   cancellationGraceMs: number;
   signal: AbortSignal | undefined;
   alignmentInvoker: AudioAlignmentBatchJobInvoker | undefined;
+  liveProcessAttestationSessionId: string | undefined;
+  processAttestationInvoker: C137ProcessAttestationInvoker | undefined;
   now: () => number;
   wait: (milliseconds: number) => Promise<void>;
 }
@@ -160,7 +168,16 @@ export async function runRealMediaBlindBatchSuite(
       receiptDigest: createRealMediaBlindBatchRunReceiptDigest(withoutDigest)
     };
     assertRealMediaBlindBatchReceiptIsPathFree(receipt, suite);
-    return validateRealMediaBlindBatchRunReceipt(receipt, suite);
+    const validated = validateRealMediaBlindBatchRunReceipt(receipt, suite);
+    if (runnerOptions.liveProcessAttestationSessionId !== undefined) {
+      await sealC137BlindBatchReceipt(
+        runnerOptions.liveProcessAttestationSessionId,
+        validated.nativeJobId,
+        validated.receiptDigest,
+        runnerOptions.processAttestationInvoker
+      );
+    }
+    return validated;
   } catch (error: unknown) {
     if (
       startedSnapshot !== null &&
@@ -519,11 +536,27 @@ function validateRunnerOptions(
     ),
     signal: options.signal,
     alignmentInvoker: options.alignmentInvoker,
+    liveProcessAttestationSessionId:
+      options.liveProcessAttestationSessionId === undefined
+        ? undefined
+        : requireProcessSessionId(options.liveProcessAttestationSessionId),
+    processAttestationInvoker: options.processAttestationInvoker,
     now: options.now ?? Date.now,
     wait:
       options.wait ??
       ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)))
   };
+}
+
+function requireProcessSessionId(value: string): string {
+  if (
+    value.length === 0 ||
+    value.length > 160 ||
+    !/^[A-Za-z0-9_.:-]+$/.test(value)
+  ) {
+    throw new Error("liveProcessAttestationSessionId 不是 canonical 标识。");
+  }
+  return value;
 }
 
 function cloneGlobalSelection(

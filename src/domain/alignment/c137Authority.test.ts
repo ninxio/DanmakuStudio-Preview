@@ -138,6 +138,58 @@ describe("C137 external authority proof", () => {
     expect(result.valid).toBe(false);
     expect(result.issues.join("\n")).toContain("signer 未命中外部固定证书白名单");
   });
+
+  it("旧 authority v2 proof 不能降级混入 live-process v3 语义", async () => {
+    const fixture = await createAuthorityFixture();
+    const legacyProof = structuredClone(fixture.proof) as unknown as {
+      schemaVersion: number;
+    };
+    legacyProof.schemaVersion = 2;
+
+    const result = await verifyC137AuthorityProof(
+      fixture.bundle,
+      legacyProof as unknown as C137AuthorityProofV2,
+      fixture.policy,
+      new Date("2026-07-17T01:15:00.000Z")
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.issues.join("\n")).toContain("schema v3");
+  });
+
+  it("即使重签外层 authority，跨进程改写仍不能伪造进程内 Ed25519 响应", async () => {
+    const fixture = await createAuthorityFixture();
+    const proof = structuredClone(fixture.proof);
+    const attestation = proof.attestation.payload;
+    attestation.liveProcessAttestation.finalization.payload.processId += 1;
+    attestation.binding.liveProcessAttestationDigest = computeC137CanonicalDigest(
+      attestation.liveProcessAttestation
+    );
+    proof.attestation = await signC137AuthorityEnvelope(
+      attestation,
+      fixture.privateKey
+    );
+    const consumed = proof.ledgerCheckpoint.payload.actions[1];
+    if (consumed === undefined) throw new Error("missing consumed action");
+    consumed.attestationDigest = computeC137CanonicalDigest(attestation);
+    proof.ledgerCheckpoint.payload.actionsDigest = computeC137CanonicalDigest(
+      proof.ledgerCheckpoint.payload.actions
+    );
+    proof.ledgerCheckpoint = await signC137AuthorityEnvelope(
+      proof.ledgerCheckpoint.payload,
+      fixture.privateKey
+    );
+
+    const result = await verifyC137AuthorityProof(
+      fixture.bundle,
+      proof,
+      fixture.policy,
+      new Date("2026-07-17T01:15:00.000Z")
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.issues.join("\n")).toMatch(/进程身份|Ed25519/);
+  });
 });
 
 async function createAuthorityFixture(): Promise<{
@@ -171,6 +223,8 @@ function createMinimalBundle(): C137AcceptanceBundle {
         batches: [
           {
             nativeReceipt: {
+              nativeJobId: "audio-align-batch-minimal",
+              receiptDigest: digest("9"),
               pairOutcomes: [
                 {
                   relationRanking: {
@@ -184,7 +238,12 @@ function createMinimalBundle(): C137AcceptanceBundle {
       }
     },
     reports: {
-      performance: { rawEvidence: { evidenceDigest: digest("8") } }
+      performance: {
+        rawEvidence: {
+          evidenceDigest: digest("8"),
+          collector: { sessionId: "alignment-benchmark-session-minimal" }
+        }
+      }
     }
   } as unknown as C137AcceptanceBundle;
 }

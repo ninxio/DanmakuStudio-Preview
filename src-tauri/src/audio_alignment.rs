@@ -17,6 +17,7 @@ use crate::{
         StreamingLandmarkExtractor, AFFINE_HOLDOUT_TIME_BLOCK_MS, CPU_SPECTRAL_BACKEND_ID,
         STREAMING_CPU_SPECTRAL_BACKEND_ID, STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
     },
+    c137_process_attestation::{self, C137ProcessEvidenceBinding, SealC137ProcessEvidenceRequest},
     cuda_fft_backend::{
         CudaFftMemoryBudget, CUDA_FFT_BACKEND_ID, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
     },
@@ -2355,6 +2356,12 @@ pub async fn start_audio_alignment_batch_job(
     let job_id = next_audio_alignment_batch_job_id();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone())?;
+    if let Err(error) = c137_process_attestation::record_blind_batch_started(&job_id) {
+        if let Ok(mut jobs) = audio_alignment_batch_jobs().lock() {
+            jobs.remove(&job_id);
+        }
+        return Err(error);
+    }
     let worker_job_id = job_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
@@ -2370,9 +2377,19 @@ pub fn get_audio_alignment_batch_job(
     let jobs = audio_alignment_batch_jobs()
         .lock()
         .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
-    jobs.get(&job_id)
+    let snapshot = jobs
+        .get(&job_id)
         .map(|entry| entry.snapshot.clone())
-        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    if matches!(
+        snapshot.status,
+        AudioAlignmentJobStatus::Completed
+            | AudioAlignmentJobStatus::Failed
+            | AudioAlignmentJobStatus::Cancelled
+    ) {
+        c137_process_attestation::record_blind_batch_terminal(&job_id)?;
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -2496,7 +2513,34 @@ pub fn cancel_alignment_benchmark_job(
 pub fn finish_alignment_benchmark_session(
     session_id: String,
 ) -> Result<AlignmentBenchmarkSessionSnapshot, String> {
-    finish_alignment_benchmark_session_inner(&session_id)
+    let snapshot = finish_alignment_benchmark_session_inner(&session_id)?;
+    if matches!(snapshot.status, AlignmentBenchmarkSessionStatus::Released) {
+        c137_process_attestation::record_performance_session_terminal(&session_id)?;
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn seal_c137_blind_batch_receipt(
+    request: SealC137ProcessEvidenceRequest,
+) -> Result<C137ProcessEvidenceBinding, String> {
+    let snapshot = get_audio_alignment_batch_job(request.native_run_id.clone())?;
+    if !matches!(
+        snapshot.status,
+        AudioAlignmentJobStatus::Completed
+            | AudioAlignmentJobStatus::Failed
+            | AudioAlignmentJobStatus::Cancelled
+    ) {
+        return Err("只能封存已经进入可信终态的原生 blind batch receipt。".to_string());
+    }
+    c137_process_attestation::seal_blind_batch_receipt(request)
+}
+
+#[tauri::command]
+pub fn seal_c137_performance_raw_evidence(
+    request: SealC137ProcessEvidenceRequest,
+) -> Result<C137ProcessEvidenceBinding, String> {
+    c137_process_attestation::seal_performance_raw_evidence(request)
 }
 
 struct OrdinaryAlignmentRunPermit;
@@ -2858,6 +2902,7 @@ fn begin_alignment_benchmark_session_inner(
     coordinator.sequence = coordinator.sequence.saturating_add(1);
     let session_id =
         create_alignment_benchmark_id("alignment-benchmark-session", coordinator.sequence)?;
+    c137_process_attestation::record_performance_session_started(&session_id)?;
     let (status, cleanup_reason) =
         alignment_benchmark_initial_lifecycle_state(process_supervision_cleanup_faulted());
     let session = AlignmentBenchmarkSessionEntry {

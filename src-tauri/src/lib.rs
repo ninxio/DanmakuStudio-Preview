@@ -9,6 +9,7 @@ use std::time::Duration;
 mod alignment_v2;
 mod app_settings;
 mod audio_alignment;
+mod c137_process_attestation;
 pub mod cuda_fft_backend;
 mod export_files;
 pub mod fine_frontier;
@@ -48,6 +49,10 @@ pub fn run() {
             audio_alignment::get_alignment_benchmark_job,
             audio_alignment::cancel_alignment_benchmark_job,
             audio_alignment::finish_alignment_benchmark_session,
+            audio_alignment::seal_c137_blind_batch_receipt,
+            audio_alignment::seal_c137_performance_raw_evidence,
+            c137_process_attestation::begin_c137_process_attestation,
+            c137_process_attestation::finalize_c137_process_attestation,
             cuda_fft_backend::probe_cuda_fft_capability,
             media_probe::probe_media_timeline,
             media_probe::probe_media_identity,

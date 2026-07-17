@@ -14,10 +14,12 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SIGNATURE_ALGORITHM = "ecdsa-p256-sha256-ieee-p1363";
-const AUTHORITY_SCHEMA_VERSION = 2;
+const AUTHORITY_SCHEMA_VERSION = 3;
 const NATIVE_ARTIFACT_SCHEMA_VERSION = 1;
+const NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION = 1;
 const NATIVE_ARTIFACT_VERIFICATION_PROVIDER =
   "windows-powershell-get-authenticode-signature-v1";
+const NATIVE_PROCESS_VERIFICATION_PROVIDER = "windows-powershell-get-process-v1";
 const MAX_LEDGER_ACTIONS = 100_000;
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -41,7 +43,7 @@ async function main() {
     return;
   }
   throw new Error(
-    "用法：node scripts/c137-authority.mjs <init|issue|attest|verify> --参数 值；init 需要 --native-signer-cert-sha256，attest/verify 需要 --native-executable"
+    "用法：node scripts/c137-authority.mjs <init|issue|attest|verify> --参数 值；init 需要 --native-signer-cert-sha256，attest 还需要 --live-process-attestation，attest/verify 需要 --native-executable"
   );
 }
 
@@ -176,6 +178,7 @@ async function attestBundle(options) {
   const challengePath = requirePath(options, "challenge");
   const bundlePath = requirePath(options, "bundle");
   const nativeExecutablePath = requirePath(options, "native-executable");
+  const liveProcessAttestationPath = requirePath(options, "live-process-attestation");
   const outputPath = requirePath(options, "out");
   const validityDays = requireInteger(options, "valid-days", 1, 365);
   await assertAbsent(outputPath);
@@ -183,6 +186,7 @@ async function attestBundle(options) {
   const ledger = await readJson(ledgerPath);
   const challenge = await readJson(challengePath);
   const bundle = await readJson(bundlePath);
+  const liveProcessAttestation = await readJson(liveProcessAttestationPath);
   validateAuthorityFiles(policy, ledger);
   const nativeArtifactAttestation = await inspectNativeArtifact(nativeExecutablePath);
   validateNativeArtifactAgainstPolicy(nativeArtifactAttestation, policy.nativeArtifactPolicy);
@@ -192,13 +196,31 @@ async function attestBundle(options) {
   if (canonical(challenge.payload.binding) !== canonical(createPreRunBinding(bundle))) {
     throw new Error("challenge 预运行 binding 与完整 bundle 不一致。");
   }
-  const now = new Date();
+  const verificationNow = new Date();
   if (
-    now.getTime() < Date.parse(challenge.payload.issuedAt) ||
-    now.getTime() > Date.parse(challenge.payload.expiresAt)
+    verificationNow.getTime() < Date.parse(challenge.payload.issuedAt) ||
+    verificationNow.getTime() > Date.parse(challenge.payload.expiresAt)
   ) {
     throw new Error("challenge 尚未生效或已经过期。");
   }
+  const dynamicEvidenceBinding = createDynamicEvidenceBinding(
+    bundle,
+    nativeArtifactAttestation
+  );
+  validateLiveProcessAttestation(liveProcessAttestation, {
+    challengeDigest: digest(challenge.payload),
+    authorityNonce: challenge.payload.nonce,
+    challengeIssuedAt: challenge.payload.issuedAt,
+    challengeExpiresAt: challenge.payload.expiresAt,
+    nativeExecutableDigest: nativeArtifactAttestation.nativeExecutableDigest,
+    dynamicEvidenceBindingDigest: digest(dynamicEvidenceBinding),
+    sealedEvidence: createExpectedProcessEvidenceBindings(bundle)
+  });
+  const nativeProcessObservation = await inspectLiveProcess(
+    liveProcessAttestation,
+    nativeExecutablePath
+  );
+  const now = new Date();
   const matchingActions = ledger.actions.filter(
     (action) => action.challengeId === challenge.payload.challengeId
   );
@@ -212,7 +234,12 @@ async function attestBundle(options) {
   const privateKey = await readPrivateKey(privateKeyPath, policy);
   const sequence = ledger.actions.length + 1;
   if (sequence > MAX_LEDGER_ACTIONS) throw new Error("authority ledger 已达到动作上限。");
-  const postRunBinding = createPostRunBinding(bundle, nativeArtifactAttestation);
+  const postRunBinding = createPostRunBinding(
+    bundle,
+    nativeArtifactAttestation,
+    nativeProcessObservation,
+    liveProcessAttestation
+  );
   const attestationPayload = {
     schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-attestation",
@@ -225,6 +252,8 @@ async function attestBundle(options) {
     validUntil: new Date(now.getTime() + validityDays * 86_400_000).toISOString(),
     consumedLedgerSequence: sequence,
     nativeArtifactAttestation,
+    nativeProcessObservation,
+    liveProcessAttestation,
     binding: postRunBinding
   };
   const attestation = signEnvelope(attestationPayload, privateKey);
@@ -320,9 +349,34 @@ function verifyProof(bundle, proof, policy, inspectedNativeArtifact) {
       issues.push("pre-run binding 漂移");
     if (
       canonical(attestation.binding) !==
-      canonical(createPostRunBinding(bundle, attestation.nativeArtifactAttestation))
+      canonical(
+        createPostRunBinding(
+          bundle,
+          attestation.nativeArtifactAttestation,
+          attestation.nativeProcessObservation,
+          attestation.liveProcessAttestation
+        )
+      )
     )
       issues.push("post-run binding 漂移");
+    validateNativeProcessObservation(
+      attestation.nativeProcessObservation,
+      attestation.liveProcessAttestation,
+      attestation.nativeArtifactAttestation
+    );
+    const dynamicEvidenceBinding = createDynamicEvidenceBinding(
+      bundle,
+      attestation.nativeArtifactAttestation
+    );
+    validateLiveProcessAttestation(attestation.liveProcessAttestation, {
+      challengeDigest: digest(challenge),
+      authorityNonce: challenge.nonce,
+      challengeIssuedAt: challenge.issuedAt,
+      challengeExpiresAt: challenge.expiresAt,
+      nativeExecutableDigest: attestation.nativeArtifactAttestation.nativeExecutableDigest,
+      dynamicEvidenceBindingDigest: digest(dynamicEvidenceBinding),
+      sealedEvidence: createExpectedProcessEvidenceBindings(bundle)
+    });
     if (
       canonical(stableNativeArtifactIdentity(attestation.nativeArtifactAttestation)) !==
       canonical(stableNativeArtifactIdentity(inspectedNativeArtifact))
@@ -330,6 +384,11 @@ function verifyProof(bundle, proof, policy, inspectedNativeArtifact) {
       issues.push("proof 中的 native artifact attestation 与当前 EXE 独立复核不一致");
     if (Date.parse(attestation.issuedAt) > Date.parse(challenge.expiresAt))
       issues.push("challenge 过期后签发");
+    if (
+      Date.parse(attestation.nativeProcessObservation.inspectedAt) >
+      Date.parse(attestation.issuedAt)
+    )
+      issues.push("进程观察晚于 authority attestation 签发");
     if (Date.now() > Date.parse(attestation.validUntil)) issues.push("attestation 已过期");
     if (
       checkpoint.sequence !== checkpoint.actions.length ||
@@ -388,7 +447,7 @@ function createPreRunBinding(bundle) {
   };
 }
 
-function createPostRunBinding(bundle, nativeArtifactAttestation) {
+function createDynamicEvidenceBinding(bundle, nativeArtifactAttestation) {
   const provenance = bundle.formalEvidence?.blindRelationship;
   const performance = bundle.reports?.performance;
   if (!provenance || !performance)
@@ -414,8 +473,54 @@ function createPostRunBinding(bundle, nativeArtifactAttestation) {
       "performance evidenceDigest"
     ),
     nativeExecutableDigest,
-    nativeArtifactAttestationDigest: digest(nativeArtifactAttestation)
+    nativeArtifactIdentityDigest: digest(stableNativeArtifactIdentity(nativeArtifactAttestation))
   };
+}
+
+function createPostRunBinding(
+  bundle,
+  nativeArtifactAttestation,
+  nativeProcessObservation,
+  liveProcessAttestation
+) {
+  const dynamicBinding = createDynamicEvidenceBinding(bundle, nativeArtifactAttestation);
+  return {
+    ...dynamicBinding,
+    nativeArtifactAttestationDigest: digest(nativeArtifactAttestation),
+    nativeProcessObservationDigest: digest(nativeProcessObservation),
+    dynamicEvidenceBindingDigest: digest(dynamicBinding),
+    liveProcessAttestationDigest: digest(liveProcessAttestation)
+  };
+}
+
+function createExpectedProcessEvidenceBindings(bundle) {
+  const provenance = bundle.formalEvidence?.blindRelationship;
+  const performance = bundle.reports?.performance?.rawEvidence;
+  if (!provenance || !performance)
+    throw new Error("bundle 缺少 live-process 所需 formal/performance evidence。");
+  const bindings = (provenance.batches ?? []).map((batch) => ({
+    evidenceKind: "blind-batch-receipt",
+    nativeRunId: requireStringValue(
+      batch.nativeReceipt?.nativeJobId,
+      "formal nativeJobId"
+    ),
+    evidenceDigest: requireDigestValue(
+      batch.nativeReceipt?.receiptDigest,
+      "formal native receiptDigest"
+    )
+  }));
+  bindings.push({
+    evidenceKind: "performance-raw-evidence",
+    nativeRunId: requireStringValue(
+      performance.collector?.sessionId,
+      "performance collector.sessionId"
+    ),
+    evidenceDigest: requireDigestValue(
+      performance.evidenceDigest,
+      "performance evidenceDigest"
+    )
+  });
+  return bindings.sort(compareEvidenceBindings);
 }
 
 function signEnvelope(payload, privateKey) {
@@ -550,6 +655,229 @@ function stableNativeArtifactIdentity(attestation) {
     signatureStatus: attestation.signatureStatus,
     signerCertificateDigest: attestation.signerCertificateDigest,
     timestampCertificateDigest: attestation.timestampCertificateDigest
+  };
+}
+
+function validateLiveProcessAttestation(receipt, expected) {
+  if (
+    !receipt ||
+    receipt.schemaVersion !== 1 ||
+    receipt.kind !== "c137-live-process-attestation"
+  ) {
+    throw new Error("live process attestation schema/kind 无效。");
+  }
+  const openingEnvelope = receipt.opening;
+  const finalEnvelope = receipt.finalization;
+  const opening = openingEnvelope?.payload;
+  const finalization = finalEnvelope?.payload;
+  if (
+    openingEnvelope?.signatureAlgorithm !== "Ed25519" ||
+    finalEnvelope?.signatureAlgorithm !== "Ed25519" ||
+    opening?.schemaVersion !== 1 ||
+    opening?.kind !== "c137-live-process-opening" ||
+    finalization?.schemaVersion !== 1 ||
+    finalization?.kind !== "c137-live-process-finalization"
+  ) {
+    throw new Error("live process challenge-response envelope 无效。");
+  }
+  if (
+    opening.challengeDigest !== expected.challengeDigest ||
+    opening.authorityNonce !== expected.authorityNonce
+  ) {
+    throw new Error("live process opening 未绑定当前 authority challenge/nonce。");
+  }
+  requireDigestValue(opening.nativeExecutableDigest, "live process executable digest");
+  if (opening.nativeExecutableDigest !== expected.nativeExecutableDigest) {
+    throw new Error("live process opening 未绑定当前 native executable。");
+  }
+  if (
+    !Number.isSafeInteger(opening.processId) ||
+    opening.processId <= 0 ||
+    typeof opening.processStartFileTimeUtc !== "string" ||
+    !/^[1-9][0-9]{0,19}$/.test(opening.processStartFileTimeUtc) ||
+    !Number.isSafeInteger(opening.openedAtMs) ||
+    opening.openedAtMs < 0
+  ) {
+    throw new Error("live process opening 的 PID/启动时间/时钟无效。");
+  }
+  const publicKeyBytes = Buffer.from(opening.ephemeralPublicKey ?? "", "base64url");
+  if (
+    publicKeyBytes.length !== 32 ||
+    digest({
+      domain: "c137-live-process-ephemeral-key-v1",
+      publicKey: opening.ephemeralPublicKey
+    }) !== opening.ephemeralKeyId
+  ) {
+    throw new Error("live process ephemeral public key/keyId 无效。");
+  }
+  if (
+    finalization.sessionId !== opening.sessionId ||
+    finalization.challengeDigest !== opening.challengeDigest ||
+    finalization.openingDigest !== digest(opening) ||
+    finalization.processId !== opening.processId ||
+    finalization.processStartFileTimeUtc !== opening.processStartFileTimeUtc ||
+    finalization.nativeExecutableDigest !== opening.nativeExecutableDigest ||
+    finalization.dynamicEvidenceBindingDigest !==
+      expected.dynamicEvidenceBindingDigest ||
+    !Number.isSafeInteger(finalization.finalizedAtMs) ||
+    finalization.finalizedAtMs < opening.openedAtMs
+  ) {
+    throw new Error("live process finalization 的进程/挑战/动态证据绑定无效。");
+  }
+  if (
+    opening.openedAtMs < Date.parse(expected.challengeIssuedAt) ||
+    finalization.finalizedAtMs > Date.parse(expected.challengeExpiresAt)
+  ) {
+    throw new Error("live process opening/finalization 不在 challenge 有效期内。");
+  }
+  if (
+    !Array.isArray(finalization.sealedEvidence) ||
+    canonical(finalization.sealedEvidence) !== canonical([...finalization.sealedEvidence].sort(compareEvidenceBindings)) ||
+    digest(finalization.sealedEvidence) !== finalization.sealedEvidenceDigest ||
+    canonical(finalization.sealedEvidence) !== canonical(expected.sealedEvidence)
+  ) {
+    throw new Error("live process sealed evidence 库存与 formal/performance 不一致。");
+  }
+  const uniqueRuns = new Set(
+    finalization.sealedEvidence.map(
+      (binding) => `${binding.evidenceKind}:${binding.nativeRunId}`
+    )
+  );
+  if (uniqueRuns.size !== finalization.sealedEvidence.length) {
+    throw new Error("live process sealed evidence 含重复原生运行。");
+  }
+  for (const binding of finalization.sealedEvidence) {
+    if (
+      (binding.evidenceKind !== "blind-batch-receipt" &&
+        binding.evidenceKind !== "performance-raw-evidence") ||
+      typeof binding.nativeRunId !== "string" ||
+      binding.nativeRunId.length === 0
+    ) {
+      throw new Error("live process evidence binding 标识无效。");
+    }
+    requireDigestValue(binding.evidenceDigest, "live process evidence digest");
+  }
+  const spki = Buffer.concat([
+    Buffer.from("302a300506032b6570032100", "hex"),
+    publicKeyBytes
+  ]);
+  const publicKey = createPublicKey({ key: spki, format: "der", type: "spki" });
+  for (const envelope of [openingEnvelope, finalEnvelope]) {
+    const signature = Buffer.from(envelope.signature ?? "", "base64url");
+    if (
+      signature.length !== 64 ||
+      !verify(null, Buffer.from(digest(envelope.payload)), publicKey, signature)
+    ) {
+      throw new Error("live process Ed25519 challenge-response 签名无效。");
+    }
+  }
+}
+
+function compareEvidenceBindings(left, right) {
+  return left.evidenceKind === right.evidenceKind
+    ? String(left.nativeRunId).localeCompare(String(right.nativeRunId))
+    : String(left.evidenceKind).localeCompare(String(right.evidenceKind));
+}
+
+function validateNativeProcessObservation(observation, receipt, artifact) {
+  const opening = receipt?.opening?.payload;
+  if (
+    !observation ||
+    observation.schemaVersion !== NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION ||
+    observation.kind !== "c137-native-process-observation" ||
+    observation.platform !== "windows" ||
+    observation.verificationProvider !== NATIVE_PROCESS_VERIFICATION_PROVIDER ||
+    observation.processId !== opening?.processId ||
+    observation.processStartFileTimeUtc !== opening?.processStartFileTimeUtc ||
+    observation.nativeExecutableDigest !== opening?.nativeExecutableDigest ||
+    observation.nativeExecutableDigest !== artifact.nativeExecutableDigest ||
+    typeof observation.inspectedAt !== "string" ||
+    new Date(observation.inspectedAt).toISOString() !== observation.inspectedAt
+  ) {
+    throw new Error("native Windows process observation 与 live opening/artifact 不一致。");
+  }
+  if (
+    Date.parse(observation.inspectedAt) <
+    receipt.finalization.payload.finalizedAtMs
+  ) {
+    throw new Error("native Windows process observation 早于进程 finalization。");
+  }
+}
+
+async function inspectLiveProcess(receipt, nativeExecutablePath) {
+  if (process.platform !== "win32") {
+    throw new Error("C137 live process observation 当前只支持 Windows。");
+  }
+  const opening = receipt.opening.payload;
+  const windowsPowerShellPath = resolve(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe"
+  );
+  const powershell = await findPowerShellExecutable(windowsPowerShellPath);
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$pidValue=[int]$env:C137_NATIVE_PROCESS_ID",
+    "$process=Get-Process -Id $pidValue -ErrorAction Stop",
+    "[ordered]@{processId=$process.Id;processStartFileTimeUtc=$process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();path=$process.Path} | ConvertTo-Json -Compress"
+  ].join(";");
+  const result = spawnSync(
+    powershell.path,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script
+    ],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+      env: {
+        ...process.env,
+        C137_NATIVE_PROCESS_ID: String(opening.processId)
+      }
+    }
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `Windows live process 检查失败：${
+        result.error?.code ?? safeProcessError(result.stderr)
+      }`
+    );
+  }
+  let observed;
+  try {
+    observed = JSON.parse(result.stdout.trim());
+  } catch {
+    throw new Error("Windows live process 检查未返回有效 JSON。");
+  }
+  if (
+    observed.processId !== opening.processId ||
+    observed.processStartFileTimeUtc !== opening.processStartFileTimeUtc ||
+    typeof observed.path !== "string" ||
+    resolve(observed.path).toLowerCase() !== resolve(nativeExecutablePath).toLowerCase()
+  ) {
+    throw new Error("Windows live process PID/启动时间/映像路径与 opening 不一致。");
+  }
+  const processImageDigest = await hashFileSha256(observed.path);
+  if (processImageDigest !== opening.nativeExecutableDigest) {
+    throw new Error("Windows live process 映像摘要与 opening 不一致。");
+  }
+  return {
+    schemaVersion: NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION,
+    kind: "c137-native-process-observation",
+    platform: "windows",
+    verificationProvider: NATIVE_PROCESS_VERIFICATION_PROVIDER,
+    processId: observed.processId,
+    processStartFileTimeUtc: observed.processStartFileTimeUtc,
+    nativeExecutableDigest: processImageDigest,
+    inspectedAt: new Date().toISOString()
   };
 }
 

@@ -15,6 +15,7 @@ import {
   collectRealMediaPerformanceEvidence,
   createC137PerformanceRawEvidenceFromJournal,
   createEngineeringRealMediaPerformancePlan,
+  sealC137PerformanceEvidenceForProcess,
   type RealMediaPerformanceExecutionPlan,
   type RealMediaPerformanceRunnerOptions
 } from "./realMediaPerformanceRunner";
@@ -28,6 +29,10 @@ import type {
   AlignmentBenchmarkWorkloadStorageReceipt
 } from "./tauriAlignmentBenchmark";
 import type { NormalizedTauriAudioAlignmentRequest } from "./tauriAudioAlignment";
+import type {
+  C137ProcessAttestationInvoker,
+  C137ProcessEvidenceBindingV1
+} from "./tauriC137ProcessAttestation";
 
 describe("C137 原生性能 evidence 调度器", () => {
   it("严格执行 reset → cold → warmup → hot → reset → cancellation 并只保留去敏证据", async () => {
@@ -93,6 +98,34 @@ describe("C137 原生性能 evidence 调度器", () => {
       issues: [],
       completenessIssues: []
     });
+    const sealPerformance = vi.fn(
+      (
+        _sessionId: string,
+        nativeRunId: string,
+        evidenceDigest: `sha256:${string}`
+      ): Promise<C137ProcessEvidenceBindingV1> =>
+        Promise.resolve({
+          evidenceKind: "performance-raw-evidence",
+          nativeRunId,
+          evidenceDigest
+        })
+    );
+    const processInvoker: C137ProcessAttestationInvoker = {
+      begin: () => Promise.reject(new Error("unused")),
+      sealBlindBatch: () => Promise.reject(new Error("unused")),
+      sealPerformance,
+      finalize: () => Promise.reject(new Error("unused"))
+    };
+    await sealC137PerformanceEvidenceForProcess(
+      rawEvidence,
+      "live-process-performance-test",
+      processInvoker
+    );
+    expect(sealPerformance).toHaveBeenCalledWith(
+      "live-process-performance-test",
+      rawEvidence.collector.sessionId,
+      rawEvidence.evidenceDigest
+    );
     const serialized = serializeC137PerformanceEvidence(rawEvidence);
     expect(serialized).not.toContain(manifest.cases[0].source.path);
     expect(serialized).not.toContain(manifest.cases[0].target.path);

@@ -18,6 +18,7 @@ import {
   createC137PerformancePlanDigest,
   finalizeC137PerformanceEvidenceV2,
   C137_PERFORMANCE_MAX_CASES_PER_RUN,
+  validateC137PerformanceEvidence,
   type C137PerformanceCacheResetReceiptV2,
   type C137PerformanceEnvironmentV2,
   type C137PerformanceEvidenceDraftV2,
@@ -64,6 +65,11 @@ import {
   type AlignmentBenchmarkSessionSnapshot,
   type AlignmentBenchmarkStageTiming
 } from "./tauriAlignmentBenchmark";
+import {
+  sealC137PerformanceRawEvidence,
+  type C137ProcessAttestationInvoker,
+  type C137ProcessEvidenceBindingV1
+} from "./tauriC137ProcessAttestation";
 
 export const REAL_MEDIA_PERFORMANCE_COLLECTOR_VERSION =
   "c137-native-performance-collector-v2" as const;
@@ -341,6 +347,27 @@ export function createC137PerformanceRawEvidenceFromJournal(
     draft,
     toRawEvidenceStatus(journal.status),
     journal.issueCodes
+  );
+}
+
+export async function sealC137PerformanceEvidenceForProcess(
+  evidence: C137PerformanceRawEvidenceV2,
+  liveProcessAttestationSessionId: string,
+  invoker?: C137ProcessAttestationInvoker
+): Promise<C137ProcessEvidenceBindingV1> {
+  const validation = validateC137PerformanceEvidence(evidence);
+  if (!validation.valid) {
+    throw new Error(
+      `性能 raw evidence 未通过严格校验，拒绝交给原生进程封存：${validation.issues.join(
+        "；"
+      )}`
+    );
+  }
+  return sealC137PerformanceRawEvidence(
+    liveProcessAttestationSessionId,
+    evidence.collector.sessionId,
+    evidence.evidenceDigest,
+    invoker
   );
 }
 

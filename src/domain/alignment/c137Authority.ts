@@ -8,12 +8,21 @@ import {
   type C137AcceptanceTrustContext,
   type C137Digest
 } from "./c137Acceptance";
+import {
+  parseC137ProcessAttestationReceipt,
+  verifyC137ProcessAttestationReceipt,
+  type C137ProcessAttestationReceiptV1,
+  type C137ProcessEvidenceBindingV1
+} from "../../infrastructure/alignment/tauriC137ProcessAttestation";
 
-export const C137_AUTHORITY_SCHEMA_VERSION = 2 as const;
+export const C137_AUTHORITY_SCHEMA_VERSION = 3 as const;
 export const C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION = 1 as const;
+export const C137_NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION = 1 as const;
 export const C137_AUTHORITY_SIGNATURE_ALGORITHM = "ecdsa-p256-sha256-ieee-p1363" as const;
 export const C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER =
   "windows-powershell-get-authenticode-signature-v1" as const;
+export const C137_NATIVE_PROCESS_VERIFICATION_PROVIDER =
+  "windows-powershell-get-process-v1" as const;
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -46,6 +55,17 @@ export interface C137NativeArtifactAttestationV1 {
   signatureStatus: "valid";
   signerCertificateDigest: C137Digest;
   timestampCertificateDigest: C137Digest | null;
+  inspectedAt: string;
+}
+
+export interface C137NativeProcessObservationV1 {
+  schemaVersion: typeof C137_NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION;
+  kind: "c137-native-process-observation";
+  platform: "windows";
+  verificationProvider: typeof C137_NATIVE_PROCESS_VERIFICATION_PROVIDER;
+  processId: number;
+  processStartFileTimeUtc: string;
+  nativeExecutableDigest: C137Digest;
   inspectedAt: string;
 }
 
@@ -87,12 +107,21 @@ export interface C137AuthorityChallengePayloadV2 {
   binding: C137AuthorityPreRunBindingV1;
 }
 
-export interface C137AuthorityPostRunBindingV2 extends C137AuthorityPreRunBindingV1 {
+export interface C137AuthorityDynamicEvidenceBindingV1
+  extends C137AuthorityPreRunBindingV1 {
   bundleDigest: C137Digest;
   blindProvenanceDigest: C137Digest;
   performanceEvidenceDigest: C137Digest;
   nativeExecutableDigest: C137Digest;
+  nativeArtifactIdentityDigest: C137Digest;
+}
+
+export interface C137AuthorityPostRunBindingV2
+  extends C137AuthorityDynamicEvidenceBindingV1 {
   nativeArtifactAttestationDigest: C137Digest;
+  nativeProcessObservationDigest: C137Digest;
+  dynamicEvidenceBindingDigest: C137Digest;
+  liveProcessAttestationDigest: C137Digest;
 }
 
 export interface C137AuthorityAttestationPayloadV2 {
@@ -107,6 +136,8 @@ export interface C137AuthorityAttestationPayloadV2 {
   validUntil: string;
   consumedLedgerSequence: number;
   nativeArtifactAttestation: C137NativeArtifactAttestationV1;
+  nativeProcessObservation: C137NativeProcessObservationV1;
+  liveProcessAttestation: C137ProcessAttestationReceiptV1;
   binding: C137AuthorityPostRunBindingV2;
 }
 
@@ -201,10 +232,10 @@ export function createC137AuthorityPreRunBinding(
   };
 }
 
-export function createC137AuthorityPostRunBinding(
+export function createC137AuthorityDynamicEvidenceBinding(
   bundle: C137AcceptanceBundle,
   nativeArtifactAttestation: C137NativeArtifactAttestationV1
-): C137AuthorityPostRunBindingV2 {
+): C137AuthorityDynamicEvidenceBindingV1 {
   const provenance = bundle.formalEvidence.blindRelationship;
   const performance = bundle.reports.performance;
   if (provenance === null || performance === null) {
@@ -224,8 +255,56 @@ export function createC137AuthorityPostRunBinding(
     blindProvenanceDigest: provenance.provenanceDigest,
     performanceEvidenceDigest: performance.rawEvidence.evidenceDigest,
     nativeExecutableDigest,
-    nativeArtifactAttestationDigest: computeC137CanonicalDigest(nativeArtifactAttestation)
+    nativeArtifactIdentityDigest: computeC137CanonicalDigest(
+      stableNativeArtifactIdentity(nativeArtifactAttestation)
+    )
   };
+}
+
+export function createC137AuthorityPostRunBinding(
+  bundle: C137AcceptanceBundle,
+  nativeArtifactAttestation: C137NativeArtifactAttestationV1,
+  nativeProcessObservation: C137NativeProcessObservationV1,
+  liveProcessAttestation: C137ProcessAttestationReceiptV1
+): C137AuthorityPostRunBindingV2 {
+  const dynamicBinding = createC137AuthorityDynamicEvidenceBinding(
+    bundle,
+    nativeArtifactAttestation
+  );
+  return {
+    ...dynamicBinding,
+    nativeArtifactAttestationDigest: computeC137CanonicalDigest(
+      nativeArtifactAttestation
+    ),
+    nativeProcessObservationDigest: computeC137CanonicalDigest(nativeProcessObservation),
+    dynamicEvidenceBindingDigest: computeC137CanonicalDigest(dynamicBinding),
+    liveProcessAttestationDigest: computeC137CanonicalDigest(liveProcessAttestation)
+  };
+}
+
+export function createC137ExpectedProcessEvidenceBindings(
+  bundle: C137AcceptanceBundle
+): C137ProcessEvidenceBindingV1[] {
+  const provenance = bundle.formalEvidence.blindRelationship;
+  const performance = bundle.reports.performance?.rawEvidence;
+  if (provenance === null || performance === null || performance === undefined) {
+    throw new Error("live process attestation 需要 formal blind 与 performance raw evidence。");
+  }
+  const bindings: C137ProcessEvidenceBindingV1[] = provenance.batches.map((batch) => ({
+    evidenceKind: "blind-batch-receipt",
+    nativeRunId: batch.nativeReceipt.nativeJobId,
+    evidenceDigest: batch.nativeReceipt.receiptDigest
+  }));
+  bindings.push({
+    evidenceKind: "performance-raw-evidence",
+    nativeRunId: performance.collector.sessionId,
+    evidenceDigest: performance.evidenceDigest
+  });
+  return bindings.sort((left, right) =>
+    left.evidenceKind === right.evidenceKind
+      ? left.nativeRunId.localeCompare(right.nativeRunId)
+      : left.evidenceKind.localeCompare(right.evidenceKind)
+  );
 }
 
 export function createC137AuthorityTrustContext(
@@ -327,7 +406,12 @@ export async function verifyC137AuthorityProof(
     if (
       !equalJson(
         attestation.binding,
-        createC137AuthorityPostRunBinding(bundle, attestation.nativeArtifactAttestation)
+        createC137AuthorityPostRunBinding(
+          bundle,
+          attestation.nativeArtifactAttestation,
+          attestation.nativeProcessObservation,
+          attestation.liveProcessAttestation
+        )
       )
     ) {
       issues.push("authority attestation 的运行后 binding 与当前 bundle 不一致。");
@@ -343,6 +427,30 @@ export async function verifyC137AuthorityProof(
     parsedPolicy.nativeArtifactPolicy,
     issues
   );
+  validateNativeProcessObservation(
+    attestation.nativeProcessObservation,
+    attestation.liveProcessAttestation,
+    attestation.nativeArtifactAttestation,
+    attestation.binding,
+    issues
+  );
+  const dynamicBinding = createC137AuthorityDynamicEvidenceBinding(
+    bundle,
+    attestation.nativeArtifactAttestation
+  );
+  const processVerification = await verifyC137ProcessAttestationReceipt(
+    attestation.liveProcessAttestation,
+    {
+      challengeDigest,
+      authorityNonce: challenge.nonce,
+      nativeExecutableDigest: attestation.binding.nativeExecutableDigest,
+      dynamicEvidenceBindingDigest: computeC137CanonicalDigest(dynamicBinding),
+      sealedEvidence: createC137ExpectedProcessEvidenceBindings(bundle)
+    }
+  );
+  if (!processVerification.valid) {
+    issues.push(...processVerification.issues);
+  }
 
   const challengeIssuedAt = parseCanonicalDate(
     challenge.issuedAt,
@@ -396,6 +504,29 @@ export async function verifyC137AuthorityProof(
   ) {
     issues.push("native artifact 检查必须发生在 challenge 有效期内且不晚于 authority attestation。");
   }
+  const processInspectedAt = parseCanonicalDate(
+    attestation.nativeProcessObservation.inspectedAt,
+    "attestation.nativeProcessObservation.inspectedAt",
+    issues
+  );
+  const processOpenedAtMs = attestation.liveProcessAttestation.opening.payload.openedAtMs;
+  const processFinalizedAtMs =
+    attestation.liveProcessAttestation.finalization.payload.finalizedAtMs;
+  if (
+    challengeIssuedAt !== null &&
+    challengeExpiresAt !== null &&
+    attestationIssuedAt !== null &&
+    processInspectedAt !== null &&
+    (processOpenedAtMs < challengeIssuedAt.getTime() ||
+      processFinalizedAtMs < processOpenedAtMs ||
+      processFinalizedAtMs > challengeExpiresAt.getTime() ||
+      processInspectedAt.getTime() < processFinalizedAtMs ||
+      processInspectedAt.getTime() > attestationIssuedAt.getTime())
+  ) {
+    issues.push(
+      "live process opening/finalization/外部进程观察必须按序发生在 challenge 有效期内。"
+    );
+  }
   if (
     attestationIssuedAt !== null &&
     attestationValidUntil !== null &&
@@ -442,12 +573,65 @@ function validateNativeArtifactAttestationPolicy(
     issues.push("post-run binding 未绑定完整 native artifact attestation。");
   }
   if (
+    computeC137CanonicalDigest(stableNativeArtifactIdentity(attestation)) !==
+    binding.nativeArtifactIdentityDigest
+  ) {
+    issues.push("dynamic evidence binding 未绑定稳定 native artifact identity。");
+  }
+  if (
     !policy.acceptedSignerCertificateDigests.includes(attestation.signerCertificateDigest)
   ) {
     issues.push("native executable 的 Authenticode signer 未命中外部固定证书白名单。");
   }
   if (policy.requireTimestampCertificate && attestation.timestampCertificateDigest === null) {
     issues.push("native executable 缺少 policy 要求的 Authenticode 时间戳证书。");
+  }
+}
+
+function stableNativeArtifactIdentity(
+  attestation: C137NativeArtifactAttestationV1
+): Omit<C137NativeArtifactAttestationV1, "inspectedAt"> {
+  const { inspectedAt: _inspectedAt, ...identity } = attestation;
+  void _inspectedAt;
+  return identity;
+}
+
+function validateNativeProcessObservation(
+  observation: C137NativeProcessObservationV1,
+  receipt: C137ProcessAttestationReceiptV1,
+  artifact: C137NativeArtifactAttestationV1,
+  binding: C137AuthorityPostRunBindingV2,
+  issues: string[]
+): void {
+  const opening = receipt.opening.payload;
+  const finalization = receipt.finalization.payload;
+  if (
+    observation.processId !== opening.processId ||
+    observation.processStartFileTimeUtc !== opening.processStartFileTimeUtc
+  ) {
+    issues.push("外部 Windows 进程观察未绑定 live-process opening 的 PID/启动时间。");
+  }
+  if (
+    observation.nativeExecutableDigest !== opening.nativeExecutableDigest ||
+    observation.nativeExecutableDigest !== finalization.nativeExecutableDigest ||
+    observation.nativeExecutableDigest !== artifact.nativeExecutableDigest
+  ) {
+    issues.push("外部 Windows 进程观察、动态响应与 Authenticode EXE 摘要不一致。");
+  }
+  if (
+    computeC137CanonicalDigest(observation) !== binding.nativeProcessObservationDigest
+  ) {
+    issues.push("post-run binding 未绑定完整 native process observation。");
+  }
+  if (
+    computeC137CanonicalDigest(receipt) !== binding.liveProcessAttestationDigest
+  ) {
+    issues.push("post-run binding 未绑定完整 live process attestation。");
+  }
+  if (
+    finalization.dynamicEvidenceBindingDigest !== binding.dynamicEvidenceBindingDigest
+  ) {
+    issues.push("live process finalization 与 authority dynamic evidence binding 不一致。");
   }
 }
 
@@ -464,9 +648,11 @@ function applyC137AuthorityVerificationToGate(
     "external-trust-context",
     "native-blind-plan-authority",
     "native-blind-authenticode-artifact",
+    "native-blind-native-attestation",
     "native-blind-challenge-freshness",
     "native-blind-replay-ledger",
-    "authenticode-artifact-attestation"
+    "authenticode-artifact-attestation",
+    "native-attestation"
   ]);
   const checks = gate.checks.map((check) =>
     passIds.has(check.id)
@@ -860,6 +1046,74 @@ function parseNativeArtifactAttestation(
   };
 }
 
+function parseNativeProcessObservation(
+  value: unknown,
+  path: string,
+  issues: string[]
+): C137NativeProcessObservationV1 | null {
+  const record = strictRecord(
+    value,
+    path,
+    [
+      "schemaVersion",
+      "kind",
+      "platform",
+      "verificationProvider",
+      "processId",
+      "processStartFileTimeUtc",
+      "nativeExecutableDigest",
+      "inspectedAt"
+    ],
+    issues
+  );
+  if (record === null) return null;
+  const processId = requireSafeInteger(
+    record.processId,
+    `${path}.processId`,
+    1,
+    0xffff_ffff,
+    issues
+  );
+  const processStartFileTimeUtc =
+    typeof record.processStartFileTimeUtc === "string" &&
+    /^[1-9][0-9]{0,19}$/.test(record.processStartFileTimeUtc)
+      ? record.processStartFileTimeUtc
+      : null;
+  if (processStartFileTimeUtc === null) {
+    issues.push(`${path}.processStartFileTimeUtc 必须是正十进制 FILETIME。`);
+  }
+  const nativeExecutableDigest = requireDigest(
+    record.nativeExecutableDigest,
+    `${path}.nativeExecutableDigest`,
+    issues
+  );
+  const inspectedAt = requireString(record.inspectedAt, `${path}.inspectedAt`, issues);
+  if (
+    record.schemaVersion !== C137_NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION ||
+    record.kind !== "c137-native-process-observation" ||
+    record.platform !== "windows" ||
+    record.verificationProvider !== C137_NATIVE_PROCESS_VERIFICATION_PROVIDER ||
+    processId === null ||
+    processStartFileTimeUtc === null ||
+    nativeExecutableDigest === null ||
+    inspectedAt === null
+  ) {
+    issues.push(`${path} 不是有效的 Windows live process observation。`);
+    return null;
+  }
+  parseCanonicalDate(inspectedAt, `${path}.inspectedAt`, issues);
+  return {
+    schemaVersion: C137_NATIVE_PROCESS_OBSERVATION_SCHEMA_VERSION,
+    kind: "c137-native-process-observation",
+    platform: "windows",
+    verificationProvider: C137_NATIVE_PROCESS_VERIFICATION_PROVIDER,
+    processId,
+    processStartFileTimeUtc,
+    nativeExecutableDigest,
+    inspectedAt
+  };
+}
+
 function parseProof(value: unknown, issues: string[]): C137AuthorityProofV2 | null {
   const record = strictRecord(
     value,
@@ -1015,6 +1269,8 @@ function parseAttestation(
       "validUntil",
       "consumedLedgerSequence",
       "nativeArtifactAttestation",
+      "nativeProcessObservation",
+      "liveProcessAttestation",
       "binding"
     ],
     issues
@@ -1042,6 +1298,23 @@ function parseAttestation(
     `${path}.nativeArtifactAttestation`,
     issues
   );
+  const nativeProcessObservation = parseNativeProcessObservation(
+    record.nativeProcessObservation,
+    `${path}.nativeProcessObservation`,
+    issues
+  );
+  let liveProcessAttestation: C137ProcessAttestationReceiptV1 | null = null;
+  try {
+    liveProcessAttestation = parseC137ProcessAttestationReceipt(
+      record.liveProcessAttestation
+    );
+  } catch (error) {
+    issues.push(
+      `${path}.liveProcessAttestation 无效：${
+        error instanceof Error ? error.message : "unknown"
+      }`
+    );
+  }
   if (
     record.schemaVersion !== C137_AUTHORITY_SCHEMA_VERSION ||
     record.kind !== "c137-authority-attestation" ||
@@ -1052,6 +1325,8 @@ function parseAttestation(
     validUntil === null ||
     consumedLedgerSequence === null ||
     nativeArtifactAttestation === null ||
+    nativeProcessObservation === null ||
+    liveProcessAttestation === null ||
     binding === null
   )
     return null;
@@ -1065,6 +1340,8 @@ function parseAttestation(
     validUntil,
     consumedLedgerSequence,
     nativeArtifactAttestation,
+    nativeProcessObservation,
+    liveProcessAttestation,
     binding
   };
 }
@@ -1312,7 +1589,11 @@ function parsePostRunBinding(
       "blindProvenanceDigest",
       "performanceEvidenceDigest",
       "nativeExecutableDigest",
-      "nativeArtifactAttestationDigest"
+      "nativeArtifactIdentityDigest",
+      "nativeArtifactAttestationDigest",
+      "nativeProcessObservationDigest",
+      "dynamicEvidenceBindingDigest",
+      "liveProcessAttestationDigest"
     ],
     issues
   );
@@ -1326,7 +1607,11 @@ function parsePostRunBinding(
             "blindProvenanceDigest",
             "performanceEvidenceDigest",
             "nativeExecutableDigest",
-            "nativeArtifactAttestationDigest"
+            "nativeArtifactIdentityDigest",
+            "nativeArtifactAttestationDigest",
+            "nativeProcessObservationDigest",
+            "dynamicEvidenceBindingDigest",
+            "liveProcessAttestationDigest"
           ].includes(key)
       )
     ),
@@ -1354,13 +1639,37 @@ function parsePostRunBinding(
     `${path}.nativeArtifactAttestationDigest`,
     issues
   );
+  const nativeArtifactIdentityDigest = requireDigest(
+    record.nativeArtifactIdentityDigest,
+    `${path}.nativeArtifactIdentityDigest`,
+    issues
+  );
+  const nativeProcessObservationDigest = requireDigest(
+    record.nativeProcessObservationDigest,
+    `${path}.nativeProcessObservationDigest`,
+    issues
+  );
+  const dynamicEvidenceBindingDigest = requireDigest(
+    record.dynamicEvidenceBindingDigest,
+    `${path}.dynamicEvidenceBindingDigest`,
+    issues
+  );
+  const liveProcessAttestationDigest = requireDigest(
+    record.liveProcessAttestationDigest,
+    `${path}.liveProcessAttestationDigest`,
+    issues
+  );
   if (
     pre === null ||
     bundleDigest === null ||
     blindProvenanceDigest === null ||
     performanceEvidenceDigest === null ||
     nativeExecutableDigest === null ||
-    nativeArtifactAttestationDigest === null
+    nativeArtifactIdentityDigest === null ||
+    nativeArtifactAttestationDigest === null ||
+    nativeProcessObservationDigest === null ||
+    dynamicEvidenceBindingDigest === null ||
+    liveProcessAttestationDigest === null
   )
     return null;
   return {
@@ -1369,7 +1678,11 @@ function parsePostRunBinding(
     blindProvenanceDigest,
     performanceEvidenceDigest,
     nativeExecutableDigest,
-    nativeArtifactAttestationDigest
+    nativeArtifactIdentityDigest,
+    nativeArtifactAttestationDigest,
+    nativeProcessObservationDigest,
+    dynamicEvidenceBindingDigest,
+    liveProcessAttestationDigest
   };
 }
 

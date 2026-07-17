@@ -2046,14 +2046,14 @@ function evaluatePerformanceThresholds(
     createCheck(
       "authenticode-artifact-attestation",
       "incomplete",
-      "awaiting-external-authenticode-authority-v2",
-      "外部 authority v2 必须对同一 bundle 独立复核 native EXE 全文件摘要、Windows Authenticode 信任、固定 signer 证书和时间戳证书"
+      "awaiting-external-authenticode-authority-v3",
+      "外部 authority v3 必须对同一 bundle 独立复核 native EXE 全文件摘要、Windows Authenticode 信任、固定 signer 证书和时间戳证书"
     ),
     createCheck(
       "native-attestation",
       "incomplete",
-      "authenticode-artifact-bound-no-live-process-proof",
-      "raw v2 内部字段继续保持 null；即使外部 authority v2 已验证签名 EXE，也仍需同一运行进程对 challenge 和动态证据作可验证响应，或提供 TPM/AIK 证明，调用方自建 trustContext 或任意对象不能替代"
+      "awaiting-authority-v3-live-process-challenge",
+      "raw v2 内部字段继续保持 null；正式放行还必须由 authority v3 验证进程内临时 Ed25519 challenge-response、Windows PID/启动时间/映像复核，以及全部 formal/performance 原生运行摘要库存"
     ),
     thresholdCheck(
       "performance-raw-evidence",

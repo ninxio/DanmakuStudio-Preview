@@ -23,6 +23,10 @@ import type {
   NormalizedTauriAudioAlignmentBatchRequest
 } from "./tauriAudioAlignment";
 import { AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION } from "./tauriAudioAlignment";
+import type {
+  C137ProcessAttestationInvoker,
+  C137ProcessEvidenceBindingV1
+} from "./tauriC137ProcessAttestation";
 import {
   createRealMediaBlindBatchExecutionDigest,
   createRealMediaBlindBatchRunReceiptDigest,
@@ -228,6 +232,41 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(() =>
       validateRealMediaBlindBatchRunReceipt(rehashReceipt(selectedWithoutTimeMap), suite)
     ).toThrow("最终 candidate 与 fine execution 不一致");
+  });
+
+  it("启用 live-process 会话时只封存严格验证后的 native receipt digest", async () => {
+    const suite = createSuite();
+    const snapshot = createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]);
+    const sealBlindBatch = vi.fn(
+      (
+        _sessionId: string,
+        nativeRunId: string,
+        evidenceDigest: `sha256:${string}`
+      ): Promise<C137ProcessEvidenceBindingV1> =>
+        Promise.resolve({
+          evidenceKind: "blind-batch-receipt",
+          nativeRunId,
+          evidenceDigest
+        })
+    );
+    const processInvoker: C137ProcessAttestationInvoker = {
+      begin: () => Promise.reject(new Error("unused")),
+      sealBlindBatch,
+      sealPerformance: () => Promise.reject(new Error("unused")),
+      finalize: () => Promise.reject(new Error("unused"))
+    };
+
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: createInvoker({ start: snapshot, get: [] }),
+      liveProcessAttestationSessionId: "live-process-runner-test",
+      processAttestationInvoker: processInvoker
+    });
+
+    expect(sealBlindBatch).toHaveBeenCalledWith(
+      "live-process-runner-test",
+      receipt.nativeJobId,
+      receipt.receiptDigest
+    );
   });
 
   it.each(["unresolved", "noEligibleCandidate"] as const)(
