@@ -9,8 +9,11 @@ import {
   type C137Digest
 } from "./c137Acceptance";
 
-export const C137_AUTHORITY_SCHEMA_VERSION = 1 as const;
+export const C137_AUTHORITY_SCHEMA_VERSION = 2 as const;
+export const C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION = 1 as const;
 export const C137_AUTHORITY_SIGNATURE_ALGORITHM = "ecdsa-p256-sha256-ieee-p1363" as const;
+export const C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER =
+  "windows-powershell-get-authenticode-signature-v1" as const;
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -24,7 +27,29 @@ export interface C137AuthorityPublicJwk {
   y: string;
 }
 
-export interface C137AuthorityTrustPolicyV1 {
+export interface C137NativeArtifactTrustPolicyV1 {
+  schemaVersion: typeof C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION;
+  kind: "c137-native-artifact-trust-policy";
+  platform: "windows";
+  verificationProvider: typeof C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER;
+  acceptedSignerCertificateDigests: C137Digest[];
+  requireTimestampCertificate: boolean;
+}
+
+export interface C137NativeArtifactAttestationV1 {
+  schemaVersion: typeof C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION;
+  kind: "c137-native-artifact-attestation";
+  platform: "windows";
+  verificationProvider: typeof C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER;
+  nativeExecutableDigest: C137Digest;
+  nativeExecutableSizeBytes: number;
+  signatureStatus: "valid";
+  signerCertificateDigest: C137Digest;
+  timestampCertificateDigest: C137Digest | null;
+  inspectedAt: string;
+}
+
+export interface C137AuthorityTrustPolicyV2 {
   schemaVersion: typeof C137_AUTHORITY_SCHEMA_VERSION;
   kind: "c137-authority-trust-policy";
   authorityId: string;
@@ -33,6 +58,7 @@ export interface C137AuthorityTrustPolicyV1 {
   publicKey: C137AuthorityPublicJwk;
   minimumLedgerSequence: number;
   requiredCheckpointDigest: C137Digest | null;
+  nativeArtifactPolicy: C137NativeArtifactTrustPolicyV1;
 }
 
 export interface C137AuthorityPreRunBindingV1 {
@@ -47,7 +73,7 @@ export interface C137AuthorityPreRunBindingV1 {
   runnerParametersDigest: C137Digest;
 }
 
-export interface C137AuthorityChallengePayloadV1 {
+export interface C137AuthorityChallengePayloadV2 {
   schemaVersion: typeof C137_AUTHORITY_SCHEMA_VERSION;
   kind: "c137-authority-challenge";
   authorityId: string;
@@ -61,14 +87,15 @@ export interface C137AuthorityChallengePayloadV1 {
   binding: C137AuthorityPreRunBindingV1;
 }
 
-export interface C137AuthorityPostRunBindingV1 extends C137AuthorityPreRunBindingV1 {
+export interface C137AuthorityPostRunBindingV2 extends C137AuthorityPreRunBindingV1 {
   bundleDigest: C137Digest;
   blindProvenanceDigest: C137Digest;
   performanceEvidenceDigest: C137Digest;
   nativeExecutableDigest: C137Digest;
+  nativeArtifactAttestationDigest: C137Digest;
 }
 
-export interface C137AuthorityAttestationPayloadV1 {
+export interface C137AuthorityAttestationPayloadV2 {
   schemaVersion: typeof C137_AUTHORITY_SCHEMA_VERSION;
   kind: "c137-authority-attestation";
   authorityId: string;
@@ -79,7 +106,8 @@ export interface C137AuthorityAttestationPayloadV1 {
   issuedAt: string;
   validUntil: string;
   consumedLedgerSequence: number;
-  binding: C137AuthorityPostRunBindingV1;
+  nativeArtifactAttestation: C137NativeArtifactAttestationV1;
+  binding: C137AuthorityPostRunBindingV2;
 }
 
 export interface C137AuthorityLedgerActionV1 {
@@ -92,7 +120,7 @@ export interface C137AuthorityLedgerActionV1 {
   recordedAt: string;
 }
 
-export interface C137AuthorityLedgerCheckpointPayloadV1 {
+export interface C137AuthorityLedgerCheckpointPayloadV2 {
   schemaVersion: typeof C137_AUTHORITY_SCHEMA_VERSION;
   kind: "c137-authority-ledger-checkpoint";
   authorityId: string;
@@ -111,12 +139,12 @@ export interface C137AuthoritySignedEnvelopeV1<T> {
   signature: string;
 }
 
-export interface C137AuthorityProofV1 {
+export interface C137AuthorityProofV2 {
   schemaVersion: typeof C137_AUTHORITY_SCHEMA_VERSION;
   kind: "c137-authority-proof";
-  challenge: C137AuthoritySignedEnvelopeV1<C137AuthorityChallengePayloadV1>;
-  attestation: C137AuthoritySignedEnvelopeV1<C137AuthorityAttestationPayloadV1>;
-  ledgerCheckpoint: C137AuthoritySignedEnvelopeV1<C137AuthorityLedgerCheckpointPayloadV1>;
+  challenge: C137AuthoritySignedEnvelopeV1<C137AuthorityChallengePayloadV2>;
+  attestation: C137AuthoritySignedEnvelopeV1<C137AuthorityAttestationPayloadV2>;
+  ledgerCheckpoint: C137AuthoritySignedEnvelopeV1<C137AuthorityLedgerCheckpointPayloadV2>;
 }
 
 export interface C137AuthorityProofVerification {
@@ -174,8 +202,9 @@ export function createC137AuthorityPreRunBinding(
 }
 
 export function createC137AuthorityPostRunBinding(
-  bundle: C137AcceptanceBundle
-): C137AuthorityPostRunBindingV1 {
+  bundle: C137AcceptanceBundle,
+  nativeArtifactAttestation: C137NativeArtifactAttestationV1
+): C137AuthorityPostRunBindingV2 {
   const provenance = bundle.formalEvidence.blindRelationship;
   const performance = bundle.reports.performance;
   if (provenance === null || performance === null) {
@@ -183,12 +212,19 @@ export function createC137AuthorityPostRunBinding(
       "authority attestation 只接受同时包含 formal blind 与 performance evidence 的 bundle。"
     );
   }
+  const nativeExecutableDigest = extractSingleNativeExecutableDigest(provenance);
+  if (nativeArtifactAttestation.nativeExecutableDigest !== nativeExecutableDigest) {
+    throw new Error(
+      "native artifact attestation 的 executable digest 与 formal blind provenance 不一致。"
+    );
+  }
   return {
     ...createC137AuthorityPreRunBinding(bundle),
     bundleDigest: computeC137CanonicalDigest(bundle),
     blindProvenanceDigest: provenance.provenanceDigest,
     performanceEvidenceDigest: performance.rawEvidence.evidenceDigest,
-    nativeExecutableDigest: extractSingleNativeExecutableDigest(provenance)
+    nativeExecutableDigest,
+    nativeArtifactAttestationDigest: computeC137CanonicalDigest(nativeArtifactAttestation)
   };
 }
 
@@ -288,7 +324,12 @@ export async function verifyC137AuthorityProof(
     issues.push("authority challenge 的预运行 binding 与当前 bundle 不一致。");
   }
   try {
-    if (!equalJson(attestation.binding, createC137AuthorityPostRunBinding(bundle))) {
+    if (
+      !equalJson(
+        attestation.binding,
+        createC137AuthorityPostRunBinding(bundle, attestation.nativeArtifactAttestation)
+      )
+    ) {
       issues.push("authority attestation 的运行后 binding 与当前 bundle 不一致。");
     }
   } catch (error) {
@@ -296,6 +337,12 @@ export async function verifyC137AuthorityProof(
       error instanceof Error ? error.message : "无法重建 authority post-run binding。"
     );
   }
+  validateNativeArtifactAttestationPolicy(
+    attestation.nativeArtifactAttestation,
+    attestation.binding,
+    parsedPolicy.nativeArtifactPolicy,
+    issues
+  );
 
   const challengeIssuedAt = parseCanonicalDate(
     challenge.issuedAt,
@@ -333,6 +380,22 @@ export async function verifyC137AuthorityProof(
   ) {
     issues.push("authority attestation 必须在一次性 challenge 有效期内签发。");
   }
+  const artifactInspectedAt = parseCanonicalDate(
+    attestation.nativeArtifactAttestation.inspectedAt,
+    "attestation.nativeArtifactAttestation.inspectedAt",
+    issues
+  );
+  if (
+    challengeIssuedAt !== null &&
+    challengeExpiresAt !== null &&
+    attestationIssuedAt !== null &&
+    artifactInspectedAt !== null &&
+    (artifactInspectedAt.getTime() < challengeIssuedAt.getTime() ||
+      artifactInspectedAt.getTime() > challengeExpiresAt.getTime() ||
+      artifactInspectedAt.getTime() > attestationIssuedAt.getTime())
+  ) {
+    issues.push("native artifact 检查必须发生在 challenge 有效期内且不晚于 authority attestation。");
+  }
   if (
     attestationIssuedAt !== null &&
     attestationValidUntil !== null &&
@@ -364,6 +427,30 @@ export async function verifyC137AuthorityProof(
   };
 }
 
+function validateNativeArtifactAttestationPolicy(
+  attestation: C137NativeArtifactAttestationV1,
+  binding: C137AuthorityPostRunBindingV2,
+  policy: C137NativeArtifactTrustPolicyV1,
+  issues: string[]
+): void {
+  if (attestation.nativeExecutableDigest !== binding.nativeExecutableDigest) {
+    issues.push("native artifact attestation 未绑定 post-run native executable digest。");
+  }
+  if (
+    computeC137CanonicalDigest(attestation) !== binding.nativeArtifactAttestationDigest
+  ) {
+    issues.push("post-run binding 未绑定完整 native artifact attestation。");
+  }
+  if (
+    !policy.acceptedSignerCertificateDigests.includes(attestation.signerCertificateDigest)
+  ) {
+    issues.push("native executable 的 Authenticode signer 未命中外部固定证书白名单。");
+  }
+  if (policy.requireTimestampCertificate && attestation.timestampCertificateDigest === null) {
+    issues.push("native executable 缺少 policy 要求的 Authenticode 时间戳证书。");
+  }
+}
+
 function applyC137AuthorityVerificationToGate(
   gate: C137AcceptanceGate,
   verification: C137AuthorityProofVerification
@@ -376,8 +463,10 @@ function applyC137AuthorityVerificationToGate(
     "external-trust-authority",
     "external-trust-context",
     "native-blind-plan-authority",
+    "native-blind-authenticode-artifact",
     "native-blind-challenge-freshness",
-    "native-blind-replay-ledger"
+    "native-blind-replay-ledger",
+    "authenticode-artifact-attestation"
   ]);
   const checks = gate.checks.map((check) =>
     passIds.has(check.id)
@@ -422,8 +511,8 @@ function extractSingleNativeExecutableDigest(
 }
 
 async function verifyAllSignatures(
-  proof: C137AuthorityProofV1,
-  policy: C137AuthorityTrustPolicyV1,
+  proof: C137AuthorityProofV2,
+  policy: C137AuthorityTrustPolicyV2,
   issues: string[]
 ): Promise<boolean> {
   try {
@@ -459,11 +548,11 @@ async function verifyAllSignatures(
 }
 
 function validateLedger(
-  checkpoint: C137AuthorityLedgerCheckpointPayloadV1,
-  policy: C137AuthorityTrustPolicyV1,
-  challenge: C137AuthorityChallengePayloadV1,
+  checkpoint: C137AuthorityLedgerCheckpointPayloadV2,
+  policy: C137AuthorityTrustPolicyV2,
+  challenge: C137AuthorityChallengePayloadV2,
   challengeDigest: C137Digest,
-  attestation: C137AuthorityAttestationPayloadV1,
+  attestation: C137AuthorityAttestationPayloadV2,
   attestationDigest: C137Digest,
   checkpointDigest: C137Digest,
   issues: string[]
@@ -538,7 +627,7 @@ function validateLedger(
   }
 }
 
-function parsePolicy(value: unknown, issues: string[]): C137AuthorityTrustPolicyV1 | null {
+function parsePolicy(value: unknown, issues: string[]): C137AuthorityTrustPolicyV2 | null {
   const record = strictRecord(
     value,
     "authorityPolicy",
@@ -550,7 +639,8 @@ function parsePolicy(value: unknown, issues: string[]): C137AuthorityTrustPolicy
       "authorityKeyId",
       "publicKey",
       "minimumLedgerSequence",
-      "requiredCheckpointDigest"
+      "requiredCheckpointDigest",
+      "nativeArtifactPolicy"
     ],
     issues
   );
@@ -600,8 +690,13 @@ function parsePolicy(value: unknown, issues: string[]): C137AuthorityTrustPolicy
           "authorityPolicy.requiredCheckpointDigest",
           issues
         );
+  const nativeArtifactPolicy = parseNativeArtifactPolicy(
+    record.nativeArtifactPolicy,
+    "authorityPolicy.nativeArtifactPolicy",
+    issues
+  );
   if (
-    record.schemaVersion !== 1 ||
+    record.schemaVersion !== C137_AUTHORITY_SCHEMA_VERSION ||
     record.kind !== "c137-authority-trust-policy" ||
     key.kty !== "EC" ||
     key.crv !== "P-256" ||
@@ -611,24 +706,161 @@ function parsePolicy(value: unknown, issues: string[]): C137AuthorityTrustPolicy
     x === null ||
     y === null ||
     minimumLedgerSequence === null ||
-    (record.requiredCheckpointDigest !== null && requiredCheckpointDigest === null)
+    (record.requiredCheckpointDigest !== null && requiredCheckpointDigest === null) ||
+    nativeArtifactPolicy === null
   ) {
-    issues.push("authority trust policy 字段值不符合 schema v1。");
+    issues.push(`authority trust policy 字段值不符合 schema v${C137_AUTHORITY_SCHEMA_VERSION}。`);
     return null;
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: C137_AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-trust-policy",
     authorityId,
     ledgerId,
     authorityKeyId,
     publicKey: { kty: "EC", crv: "P-256", x, y },
     minimumLedgerSequence,
-    requiredCheckpointDigest
+    requiredCheckpointDigest,
+    nativeArtifactPolicy
   };
 }
 
-function parseProof(value: unknown, issues: string[]): C137AuthorityProofV1 | null {
+function parseNativeArtifactPolicy(
+  value: unknown,
+  path: string,
+  issues: string[]
+): C137NativeArtifactTrustPolicyV1 | null {
+  const record = strictRecord(
+    value,
+    path,
+    [
+      "schemaVersion",
+      "kind",
+      "platform",
+      "verificationProvider",
+      "acceptedSignerCertificateDigests",
+      "requireTimestampCertificate"
+    ],
+    issues
+  );
+  if (record === null) return null;
+  const rawDigests = record.acceptedSignerCertificateDigests;
+  const digests: C137Digest[] = [];
+  if (!Array.isArray(rawDigests) || rawDigests.length === 0 || rawDigests.length > 32) {
+    issues.push(`${path}.acceptedSignerCertificateDigests 必须包含 1..32 个固定证书摘要。`);
+  } else {
+    rawDigests.forEach((value, index) => {
+      const digest = requireDigest(
+        value,
+        `${path}.acceptedSignerCertificateDigests[${index}]`,
+        issues
+      );
+      if (digest !== null) digests.push(digest);
+    });
+  }
+  const canonicalDigests = [...new Set(digests)].sort();
+  if (
+    record.schemaVersion !== C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION ||
+    record.kind !== "c137-native-artifact-trust-policy" ||
+    record.platform !== "windows" ||
+    record.verificationProvider !== C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER ||
+    record.requireTimestampCertificate !== true ||
+    canonicalDigests.length !== digests.length ||
+    !equalOrderedStrings(canonicalDigests, digests)
+  ) {
+    issues.push(`${path} 不是 canonical Authenticode artifact trust policy。`);
+    return null;
+  }
+  return {
+    schemaVersion: C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION,
+    kind: "c137-native-artifact-trust-policy",
+    platform: "windows",
+    verificationProvider: C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER,
+    acceptedSignerCertificateDigests: canonicalDigests,
+    requireTimestampCertificate: true
+  };
+}
+
+function parseNativeArtifactAttestation(
+  value: unknown,
+  path: string,
+  issues: string[]
+): C137NativeArtifactAttestationV1 | null {
+  const record = strictRecord(
+    value,
+    path,
+    [
+      "schemaVersion",
+      "kind",
+      "platform",
+      "verificationProvider",
+      "nativeExecutableDigest",
+      "nativeExecutableSizeBytes",
+      "signatureStatus",
+      "signerCertificateDigest",
+      "timestampCertificateDigest",
+      "inspectedAt"
+    ],
+    issues
+  );
+  if (record === null) return null;
+  const nativeExecutableDigest = requireDigest(
+    record.nativeExecutableDigest,
+    `${path}.nativeExecutableDigest`,
+    issues
+  );
+  const nativeExecutableSizeBytes = requireSafeInteger(
+    record.nativeExecutableSizeBytes,
+    `${path}.nativeExecutableSizeBytes`,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    issues
+  );
+  const signerCertificateDigest = requireDigest(
+    record.signerCertificateDigest,
+    `${path}.signerCertificateDigest`,
+    issues
+  );
+  const timestampCertificateDigest =
+    record.timestampCertificateDigest === null
+      ? null
+      : requireDigest(
+          record.timestampCertificateDigest,
+          `${path}.timestampCertificateDigest`,
+          issues
+        );
+  const inspectedAt = requireString(record.inspectedAt, `${path}.inspectedAt`, issues);
+  if (
+    record.schemaVersion !== C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION ||
+    record.kind !== "c137-native-artifact-attestation" ||
+    record.platform !== "windows" ||
+    record.verificationProvider !== C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER ||
+    record.signatureStatus !== "valid" ||
+    nativeExecutableDigest === null ||
+    nativeExecutableSizeBytes === null ||
+    signerCertificateDigest === null ||
+    timestampCertificateDigest === null ||
+    inspectedAt === null
+  ) {
+    issues.push(`${path} 不是有效的 Authenticode artifact attestation。`);
+    return null;
+  }
+  parseCanonicalDate(inspectedAt, `${path}.inspectedAt`, issues);
+  return {
+    schemaVersion: C137_NATIVE_ARTIFACT_ATTESTATION_SCHEMA_VERSION,
+    kind: "c137-native-artifact-attestation",
+    platform: "windows",
+    verificationProvider: C137_NATIVE_ARTIFACT_VERIFICATION_PROVIDER,
+    nativeExecutableDigest,
+    nativeExecutableSizeBytes,
+    signatureStatus: "valid",
+    signerCertificateDigest,
+    timestampCertificateDigest,
+    inspectedAt
+  };
+}
+
+function parseProof(value: unknown, issues: string[]): C137AuthorityProofV2 | null {
   const record = strictRecord(
     value,
     "authorityProof",
@@ -655,17 +887,17 @@ function parseProof(value: unknown, issues: string[]): C137AuthorityProofV1 | nu
     issues
   );
   if (
-    record.schemaVersion !== 1 ||
+    record.schemaVersion !== C137_AUTHORITY_SCHEMA_VERSION ||
     record.kind !== "c137-authority-proof" ||
     challenge === null ||
     attestation === null ||
     ledgerCheckpoint === null
   ) {
-    issues.push("authority proof 字段值不符合 schema v1。");
+    issues.push(`authority proof 字段值不符合 schema v${C137_AUTHORITY_SCHEMA_VERSION}。`);
     return null;
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: C137_AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-proof",
     challenge,
     attestation,
@@ -704,7 +936,7 @@ function parseChallenge(
   value: unknown,
   path: string,
   issues: string[]
-): C137AuthorityChallengePayloadV1 | null {
+): C137AuthorityChallengePayloadV2 | null {
   const record = strictRecord(
     value,
     path,
@@ -738,7 +970,7 @@ function parseChallenge(
   );
   const binding = parsePreRunBinding(record.binding, `${path}.binding`, issues);
   if (
-    record.schemaVersion !== 1 ||
+    record.schemaVersion !== C137_AUTHORITY_SCHEMA_VERSION ||
     record.kind !== "c137-authority-challenge" ||
     common === null ||
     challengeId === null ||
@@ -751,7 +983,7 @@ function parseChallenge(
   )
     return null;
   return {
-    schemaVersion: 1,
+    schemaVersion: C137_AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-challenge",
     ...common,
     challengeId,
@@ -767,7 +999,7 @@ function parseAttestation(
   value: unknown,
   path: string,
   issues: string[]
-): C137AuthorityAttestationPayloadV1 | null {
+): C137AuthorityAttestationPayloadV2 | null {
   const record = strictRecord(
     value,
     path,
@@ -782,6 +1014,7 @@ function parseAttestation(
       "issuedAt",
       "validUntil",
       "consumedLedgerSequence",
+      "nativeArtifactAttestation",
       "binding"
     ],
     issues
@@ -804,8 +1037,13 @@ function parseAttestation(
     issues
   );
   const binding = parsePostRunBinding(record.binding, `${path}.binding`, issues);
+  const nativeArtifactAttestation = parseNativeArtifactAttestation(
+    record.nativeArtifactAttestation,
+    `${path}.nativeArtifactAttestation`,
+    issues
+  );
   if (
-    record.schemaVersion !== 1 ||
+    record.schemaVersion !== C137_AUTHORITY_SCHEMA_VERSION ||
     record.kind !== "c137-authority-attestation" ||
     common === null ||
     challengeId === null ||
@@ -813,11 +1051,12 @@ function parseAttestation(
     issuedAt === null ||
     validUntil === null ||
     consumedLedgerSequence === null ||
+    nativeArtifactAttestation === null ||
     binding === null
   )
     return null;
   return {
-    schemaVersion: 1,
+    schemaVersion: C137_AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-attestation",
     ...common,
     challengeId,
@@ -825,6 +1064,7 @@ function parseAttestation(
     issuedAt,
     validUntil,
     consumedLedgerSequence,
+    nativeArtifactAttestation,
     binding
   };
 }
@@ -833,7 +1073,7 @@ function parseCheckpoint(
   value: unknown,
   path: string,
   issues: string[]
-): C137AuthorityLedgerCheckpointPayloadV1 | null {
+): C137AuthorityLedgerCheckpointPayloadV2 | null {
   const record = strictRecord(
     value,
     path,
@@ -872,7 +1112,7 @@ function parseCheckpoint(
   const actionsDigest = requireDigest(record.actionsDigest, `${path}.actionsDigest`, issues);
   const actions = parseLedgerActions(record.actions, `${path}.actions`, issues);
   if (
-    record.schemaVersion !== 1 ||
+    record.schemaVersion !== C137_AUTHORITY_SCHEMA_VERSION ||
     record.kind !== "c137-authority-ledger-checkpoint" ||
     common === null ||
     sequence === null ||
@@ -884,7 +1124,7 @@ function parseCheckpoint(
     return null;
   if (issuedAt !== null) parseCanonicalDate(issuedAt, `${path}.issuedAt`, issues);
   return {
-    schemaVersion: 1,
+    schemaVersion: C137_AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-ledger-checkpoint",
     ...common,
     sequence,
@@ -1054,7 +1294,7 @@ function parsePostRunBinding(
   value: unknown,
   path: string,
   issues: string[]
-): C137AuthorityPostRunBindingV1 | null {
+): C137AuthorityPostRunBindingV2 | null {
   const record = strictRecord(
     value,
     path,
@@ -1071,7 +1311,8 @@ function parsePostRunBinding(
       "bundleDigest",
       "blindProvenanceDigest",
       "performanceEvidenceDigest",
-      "nativeExecutableDigest"
+      "nativeExecutableDigest",
+      "nativeArtifactAttestationDigest"
     ],
     issues
   );
@@ -1084,7 +1325,8 @@ function parsePostRunBinding(
             "bundleDigest",
             "blindProvenanceDigest",
             "performanceEvidenceDigest",
-            "nativeExecutableDigest"
+            "nativeExecutableDigest",
+            "nativeArtifactAttestationDigest"
           ].includes(key)
       )
     ),
@@ -1107,12 +1349,18 @@ function parsePostRunBinding(
     `${path}.nativeExecutableDigest`,
     issues
   );
+  const nativeArtifactAttestationDigest = requireDigest(
+    record.nativeArtifactAttestationDigest,
+    `${path}.nativeArtifactAttestationDigest`,
+    issues
+  );
   if (
     pre === null ||
     bundleDigest === null ||
     blindProvenanceDigest === null ||
     performanceEvidenceDigest === null ||
-    nativeExecutableDigest === null
+    nativeExecutableDigest === null ||
+    nativeArtifactAttestationDigest === null
   )
     return null;
   return {
@@ -1120,7 +1368,8 @@ function parsePostRunBinding(
     bundleDigest,
     blindProvenanceDigest,
     performanceEvidenceDigest,
-    nativeExecutableDigest
+    nativeExecutableDigest,
+    nativeArtifactAttestationDigest
   };
 }
 
@@ -1234,6 +1483,10 @@ function toBufferSource(value: Uint8Array): Uint8Array<ArrayBuffer> {
 
 function equalJson(left: unknown, right: unknown): boolean {
   return computeC137CanonicalDigest(left) === computeC137CanonicalDigest(right);
+}
+
+function equalOrderedStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function emptyVerification(issues: string[]): C137AuthorityProofVerification {

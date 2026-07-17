@@ -7,12 +7,17 @@ import {
   sign,
   verify
 } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { constants as fsConstants, createReadStream } from "node:fs";
+import { access, chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SIGNATURE_ALGORITHM = "ecdsa-p256-sha256-ieee-p1363";
+const AUTHORITY_SCHEMA_VERSION = 2;
+const NATIVE_ARTIFACT_SCHEMA_VERSION = 1;
+const NATIVE_ARTIFACT_VERIFICATION_PROVIDER =
+  "windows-powershell-get-authenticode-signature-v1";
 const MAX_LEDGER_ACTIONS = 100_000;
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -30,7 +35,14 @@ async function main() {
   if (command === "issue") return issueChallenge(options);
   if (command === "attest") return attestBundle(options);
   if (command === "verify") return verifyProofCommand(options);
-  throw new Error("用法：node scripts/c137-authority.mjs <init|issue|attest|verify> --参数 值");
+  if (command === "inspect-native") {
+    const attestation = await inspectNativeArtifact(requirePath(options, "native-executable"));
+    process.stdout.write(`${JSON.stringify(attestation)}\n`);
+    return;
+  }
+  throw new Error(
+    "用法：node scripts/c137-authority.mjs <init|issue|attest|verify> --参数 值；init 需要 --native-signer-cert-sha256，attest/verify 需要 --native-executable"
+  );
 }
 
 async function initAuthority(options) {
@@ -40,6 +52,10 @@ async function initAuthority(options) {
   const ledgerPath = requirePath(options, "ledger");
   const authorityId = requireIdentifier(options, "authority-id");
   const ledgerId = requireIdentifier(options, "ledger-id");
+  const acceptedSignerCertificateDigests = requireDigestList(
+    options,
+    "native-signer-cert-sha256"
+  );
   await assertAbsent(privateKeyPath);
   await assertAbsent(policyPath);
   await assertAbsent(ledgerPath);
@@ -68,17 +84,25 @@ async function initAuthority(options) {
     key: publicKeyValue
   });
   const policy = {
-    schemaVersion: 1,
+    schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-trust-policy",
     authorityId,
     ledgerId,
     authorityKeyId,
     publicKey: publicKeyValue,
     minimumLedgerSequence: 0,
-    requiredCheckpointDigest: null
+    requiredCheckpointDigest: null,
+    nativeArtifactPolicy: {
+      schemaVersion: NATIVE_ARTIFACT_SCHEMA_VERSION,
+      kind: "c137-native-artifact-trust-policy",
+      platform: "windows",
+      verificationProvider: NATIVE_ARTIFACT_VERIFICATION_PROVIDER,
+      acceptedSignerCertificateDigests,
+      requireTimestampCertificate: true
+    }
   };
   const ledger = {
-    schemaVersion: 1,
+    schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-ledger",
     authorityId,
     ledgerId,
@@ -114,7 +138,7 @@ async function issueChallenge(options) {
   const sequence = ledger.actions.length + 1;
   if (sequence > MAX_LEDGER_ACTIONS) throw new Error("authority ledger 已达到动作上限。");
   const challengePayload = {
-    schemaVersion: 1,
+    schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-challenge",
     authorityId: policy.authorityId,
     ledgerId: policy.ledgerId,
@@ -151,6 +175,7 @@ async function attestBundle(options) {
   const ledgerPath = requirePath(options, "ledger");
   const challengePath = requirePath(options, "challenge");
   const bundlePath = requirePath(options, "bundle");
+  const nativeExecutablePath = requirePath(options, "native-executable");
   const outputPath = requirePath(options, "out");
   const validityDays = requireInteger(options, "valid-days", 1, 365);
   await assertAbsent(outputPath);
@@ -159,6 +184,8 @@ async function attestBundle(options) {
   const challenge = await readJson(challengePath);
   const bundle = await readJson(bundlePath);
   validateAuthorityFiles(policy, ledger);
+  const nativeArtifactAttestation = await inspectNativeArtifact(nativeExecutablePath);
+  validateNativeArtifactAgainstPolicy(nativeArtifactAttestation, policy.nativeArtifactPolicy);
   validateEnvelope(challenge, "c137-authority-challenge", policy);
   const publicKey = createPublicKey({ key: { ...policy.publicKey }, format: "jwk" });
   if (!verifyEnvelope(challenge, publicKey)) throw new Error("challenge authority 签名无效。");
@@ -185,8 +212,9 @@ async function attestBundle(options) {
   const privateKey = await readPrivateKey(privateKeyPath, policy);
   const sequence = ledger.actions.length + 1;
   if (sequence > MAX_LEDGER_ACTIONS) throw new Error("authority ledger 已达到动作上限。");
+  const postRunBinding = createPostRunBinding(bundle, nativeArtifactAttestation);
   const attestationPayload = {
-    schemaVersion: 1,
+    schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-attestation",
     authorityId: policy.authorityId,
     ledgerId: policy.ledgerId,
@@ -196,7 +224,8 @@ async function attestBundle(options) {
     issuedAt: now.toISOString(),
     validUntil: new Date(now.getTime() + validityDays * 86_400_000).toISOString(),
     consumedLedgerSequence: sequence,
-    binding: createPostRunBinding(bundle)
+    nativeArtifactAttestation,
+    binding: postRunBinding
   };
   const attestation = signEnvelope(attestationPayload, privateKey);
   ledger.actions.push({
@@ -209,7 +238,7 @@ async function attestBundle(options) {
     recordedAt: attestationPayload.issuedAt
   });
   const checkpointPayload = {
-    schemaVersion: 1,
+    schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-ledger-checkpoint",
     authorityId: policy.authorityId,
     ledgerId: policy.ledgerId,
@@ -222,7 +251,7 @@ async function attestBundle(options) {
   };
   const ledgerCheckpoint = signEnvelope(checkpointPayload, privateKey);
   const proof = {
-    schemaVersion: 1,
+    schemaVersion: AUTHORITY_SCHEMA_VERSION,
     kind: "c137-authority-proof",
     challenge,
     attestation,
@@ -246,24 +275,34 @@ async function verifyProofCommand(options) {
   const policy = await readJson(requirePath(options, "policy"));
   const proof = await readJson(requirePath(options, "proof"));
   const bundle = await readJson(requirePath(options, "bundle"));
+  const nativeExecutablePath = requirePath(options, "native-executable");
+  const nativeArtifactAttestation = await inspectNativeArtifact(nativeExecutablePath);
   const minimumSequence =
     options.get("minimum-sequence") === undefined
       ? policy.minimumLedgerSequence
       : requireInteger(options, "minimum-sequence", 0, MAX_LEDGER_ACTIONS);
-  const issues = verifyProof(bundle, proof, {
+  const verificationPolicy = {
     ...policy,
     minimumLedgerSequence: minimumSequence
-  });
+  };
+  validateNativeArtifactAgainstPolicy(
+    nativeArtifactAttestation,
+    verificationPolicy.nativeArtifactPolicy
+  );
+  const issues = verifyProof(bundle, proof, verificationPolicy, nativeArtifactAttestation);
   if (issues.length > 0) throw new Error(`authority proof 验证失败：${issues.join("；")}`);
   process.stdout.write(
     `${JSON.stringify({ status: "verified", authorityKeyId: policy.authorityKeyId, checkpointDigest: digest(proof.ledgerCheckpoint.payload) })}\n`
   );
 }
 
-function verifyProof(bundle, proof, policy) {
+function verifyProof(bundle, proof, policy, inspectedNativeArtifact) {
   const issues = [];
   try {
-    if (proof.schemaVersion !== 1 || proof.kind !== "c137-authority-proof") {
+    if (
+      proof.schemaVersion !== AUTHORITY_SCHEMA_VERSION ||
+      proof.kind !== "c137-authority-proof"
+    ) {
       issues.push("proof schema/kind 无效");
       return issues;
     }
@@ -279,8 +318,16 @@ function verifyProof(bundle, proof, policy) {
     if (attestation.challengeDigest !== digest(challenge)) issues.push("challenge digest 漂移");
     if (canonical(challenge.binding) !== canonical(createPreRunBinding(bundle)))
       issues.push("pre-run binding 漂移");
-    if (canonical(attestation.binding) !== canonical(createPostRunBinding(bundle)))
+    if (
+      canonical(attestation.binding) !==
+      canonical(createPostRunBinding(bundle, attestation.nativeArtifactAttestation))
+    )
       issues.push("post-run binding 漂移");
+    if (
+      canonical(stableNativeArtifactIdentity(attestation.nativeArtifactAttestation)) !==
+      canonical(stableNativeArtifactIdentity(inspectedNativeArtifact))
+    )
+      issues.push("proof 中的 native artifact attestation 与当前 EXE 独立复核不一致");
     if (Date.parse(attestation.issuedAt) > Date.parse(challenge.expiresAt))
       issues.push("challenge 过期后签发");
     if (Date.now() > Date.parse(attestation.validUntil)) issues.push("attestation 已过期");
@@ -341,7 +388,7 @@ function createPreRunBinding(bundle) {
   };
 }
 
-function createPostRunBinding(bundle) {
+function createPostRunBinding(bundle, nativeArtifactAttestation) {
   const provenance = bundle.formalEvidence?.blindRelationship;
   const performance = bundle.reports?.performance;
   if (!provenance || !performance)
@@ -355,6 +402,9 @@ function createPostRunBinding(bundle) {
   }
   if (nativeDigests.size !== 1)
     throw new Error("bundle 必须只有一个 native executable digest。");
+  const nativeExecutableDigest = [...nativeDigests][0];
+  if (nativeArtifactAttestation.nativeExecutableDigest !== nativeExecutableDigest)
+    throw new Error("native EXE 全文件摘要与 formal blind execution identity 不一致。");
   return {
     ...createPreRunBinding(bundle),
     bundleDigest: digest(bundle),
@@ -363,7 +413,8 @@ function createPostRunBinding(bundle) {
       performance.rawEvidence?.evidenceDigest,
       "performance evidenceDigest"
     ),
-    nativeExecutableDigest: [...nativeDigests][0]
+    nativeExecutableDigest,
+    nativeArtifactAttestationDigest: digest(nativeArtifactAttestation)
   };
 }
 
@@ -392,7 +443,8 @@ function validateEnvelope(envelope, kind, policy) {
     !envelope ||
     envelope.signatureAlgorithm !== SIGNATURE_ALGORITHM ||
     typeof envelope.signature !== "string" ||
-    envelope.payload?.kind !== kind
+    envelope.payload?.kind !== kind ||
+    envelope.payload?.schemaVersion !== AUTHORITY_SCHEMA_VERSION
   )
     throw new Error(`${kind} envelope 无效。`);
   if (
@@ -404,10 +456,14 @@ function validateEnvelope(envelope, kind, policy) {
 }
 
 function validateAuthorityFiles(policy, ledger) {
-  if (policy.schemaVersion !== 1 || policy.kind !== "c137-authority-trust-policy")
-    throw new Error("authority policy 无效。");
   if (
-    ledger.schemaVersion !== 1 ||
+    policy.schemaVersion !== AUTHORITY_SCHEMA_VERSION ||
+    policy.kind !== "c137-authority-trust-policy"
+  )
+    throw new Error("authority policy 无效。");
+  validateNativeArtifactPolicy(policy.nativeArtifactPolicy);
+  if (
+    ledger.schemaVersion !== AUTHORITY_SCHEMA_VERSION ||
     ledger.kind !== "c137-authority-ledger" ||
     ledger.authorityId !== policy.authorityId ||
     ledger.ledgerId !== policy.ledgerId ||
@@ -416,6 +472,218 @@ function validateAuthorityFiles(policy, ledger) {
     ledger.actions.length > MAX_LEDGER_ACTIONS
   )
     throw new Error("authority ledger 与 policy 不一致。");
+}
+
+function validateNativeArtifactPolicy(policy) {
+  if (
+    !policy ||
+    policy.schemaVersion !== NATIVE_ARTIFACT_SCHEMA_VERSION ||
+    policy.kind !== "c137-native-artifact-trust-policy" ||
+    policy.platform !== "windows" ||
+    policy.verificationProvider !== NATIVE_ARTIFACT_VERIFICATION_PROVIDER ||
+    policy.requireTimestampCertificate !== true ||
+    !Array.isArray(policy.acceptedSignerCertificateDigests) ||
+    policy.acceptedSignerCertificateDigests.length === 0 ||
+    policy.acceptedSignerCertificateDigests.length > 32
+  ) {
+    throw new Error("native Authenticode trust policy 无效。");
+  }
+  const canonicalDigests = [
+    ...new Set(
+      policy.acceptedSignerCertificateDigests.map((value, index) =>
+        requireDigestValue(value, `native signer digest[${index}]`)
+      )
+    )
+  ].sort();
+  if (canonical(canonicalDigests) !== canonical(policy.acceptedSignerCertificateDigests)) {
+    throw new Error("native signer 证书白名单必须去重并按摘要排序。");
+  }
+}
+
+function validateNativeArtifactAgainstPolicy(attestation, policy) {
+  validateNativeArtifactPolicy(policy);
+  if (
+    !attestation ||
+    attestation.schemaVersion !== NATIVE_ARTIFACT_SCHEMA_VERSION ||
+    attestation.kind !== "c137-native-artifact-attestation" ||
+    attestation.platform !== "windows" ||
+    attestation.verificationProvider !== NATIVE_ARTIFACT_VERIFICATION_PROVIDER ||
+    attestation.signatureStatus !== "valid" ||
+    !Number.isSafeInteger(attestation.nativeExecutableSizeBytes) ||
+    attestation.nativeExecutableSizeBytes <= 0
+  ) {
+    throw new Error("native artifact attestation 结构无效。");
+  }
+  requireDigestValue(attestation.nativeExecutableDigest, "native executable digest");
+  requireDigestValue(attestation.signerCertificateDigest, "native signer certificate digest");
+  if (
+    !policy.acceptedSignerCertificateDigests.includes(attestation.signerCertificateDigest)
+  ) {
+    throw new Error("native executable signer 未命中 authority policy 固定证书白名单。");
+  }
+  if (
+    policy.requireTimestampCertificate &&
+    (attestation.timestampCertificateDigest === null ||
+      requireDigestValue(
+        attestation.timestampCertificateDigest,
+        "native timestamp certificate digest"
+      ) === null)
+  ) {
+    throw new Error("native executable 缺少 authority policy 要求的 Authenticode 时间戳。");
+  }
+  if (
+    typeof attestation.inspectedAt !== "string" ||
+    new Date(attestation.inspectedAt).toISOString() !== attestation.inspectedAt
+  ) {
+    throw new Error("native artifact inspectedAt 不是 canonical UTC 时间。");
+  }
+}
+
+function stableNativeArtifactIdentity(attestation) {
+  return {
+    schemaVersion: attestation.schemaVersion,
+    kind: attestation.kind,
+    platform: attestation.platform,
+    verificationProvider: attestation.verificationProvider,
+    nativeExecutableDigest: attestation.nativeExecutableDigest,
+    nativeExecutableSizeBytes: attestation.nativeExecutableSizeBytes,
+    signatureStatus: attestation.signatureStatus,
+    signerCertificateDigest: attestation.signerCertificateDigest,
+    timestampCertificateDigest: attestation.timestampCertificateDigest
+  };
+}
+
+async function inspectNativeArtifact(path) {
+  if (process.platform !== "win32") {
+    throw new Error("C137 Authenticode artifact attestation 当前只支持 Windows。");
+  }
+  const metadata = await stat(path);
+  if (!metadata.isFile() || metadata.size <= 0 || !Number.isSafeInteger(metadata.size)) {
+    throw new Error("native executable 必须是非空普通文件。");
+  }
+  const initialFileDigest = await hashFileSha256(path);
+  const windowsPowerShellPath = resolve(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe"
+  );
+  const windowsPowerShellModulePath = resolve(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "Modules"
+  );
+  const powershell = await findPowerShellExecutable(windowsPowerShellPath);
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    ...(powershell.isWindowsPowerShell
+      ? ["Import-Module Microsoft.PowerShell.Security"]
+      : []),
+    "$path=$env:C137_NATIVE_EXECUTABLE",
+    "$signature=Get-AuthenticodeSignature -LiteralPath $path",
+    "$signer=$signature.SignerCertificate",
+    "$timestamp=$signature.TimeStamperCertificate",
+    "[ordered]@{status=$signature.Status.ToString();signerCertificate=if($signer){[Convert]::ToBase64String($signer.RawData)}else{$null};timestampCertificate=if($timestamp){[Convert]::ToBase64String($timestamp.RawData)}else{$null}} | ConvertTo-Json -Compress"
+  ].join(";");
+  const result = spawnSync(
+    powershell.path,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+      env: {
+        ...process.env,
+        ...(powershell.isWindowsPowerShell
+          ? { PSModulePath: windowsPowerShellModulePath }
+          : {}),
+        C137_NATIVE_EXECUTABLE: path
+      }
+    }
+  );
+  if (result.error) {
+    throw new Error(`Windows Authenticode 检查进程启动失败：${result.error.code ?? "unknown"}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`Windows Authenticode 检查失败：${safeProcessError(result.stderr)}`);
+  }
+  let signature;
+  try {
+    signature = JSON.parse(result.stdout.trim());
+  } catch {
+    throw new Error("Windows Authenticode 检查未返回有效 JSON。");
+  }
+  if (signature.status !== "Valid" || typeof signature.signerCertificate !== "string") {
+    throw new Error(`native executable Authenticode 状态不是 Valid：${signature.status ?? "unknown"}`);
+  }
+  const signerCertificateDigest = digestCertificate(
+    signature.signerCertificate,
+    "signer certificate"
+  );
+  const timestampCertificateDigest =
+    typeof signature.timestampCertificate === "string"
+      ? digestCertificate(signature.timestampCertificate, "timestamp certificate")
+      : null;
+  const finalMetadata = await stat(path);
+  const finalFileDigest = await hashFileSha256(path);
+  if (
+    !finalMetadata.isFile() ||
+    finalMetadata.size !== metadata.size ||
+    finalFileDigest !== initialFileDigest
+  ) {
+    throw new Error("native executable 在摘要与 Authenticode 检查期间发生变化。");
+  }
+  return {
+    schemaVersion: NATIVE_ARTIFACT_SCHEMA_VERSION,
+    kind: "c137-native-artifact-attestation",
+    platform: "windows",
+    verificationProvider: NATIVE_ARTIFACT_VERIFICATION_PROVIDER,
+    nativeExecutableDigest: initialFileDigest,
+    nativeExecutableSizeBytes: metadata.size,
+    signatureStatus: "valid",
+    signerCertificateDigest,
+    timestampCertificateDigest,
+    inspectedAt: new Date().toISOString()
+  };
+}
+
+async function hashFileSha256(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return `sha256:${hash.digest("hex")}`;
+}
+
+async function findPowerShellExecutable(windowsPowerShellPath) {
+  const pathEntries = (process.env.Path ?? process.env.PATH ?? "")
+    .split(";")
+    .filter((entry) => entry.length > 0);
+  const pwshCandidates = pathEntries.map((entry) => resolve(entry, "pwsh.exe"));
+  for (const candidate of pwshCandidates) {
+    try {
+      await access(candidate, fsConstants.F_OK);
+      return { path: candidate, isWindowsPowerShell: false };
+    } catch {
+      // Continue to the next PATH entry.
+    }
+  }
+  await access(windowsPowerShellPath, fsConstants.F_OK);
+  return { path: windowsPowerShellPath, isWindowsPowerShell: true };
+}
+
+function digestCertificate(base64, label) {
+  const bytes = Buffer.from(base64, "base64");
+  if (bytes.length === 0 || bytes.toString("base64") !== base64) {
+    throw new Error(`Windows Authenticode ${label} DER 无效。`);
+  }
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function safeProcessError(value) {
+  const text = typeof value === "string" ? value.trim().replace(/\s+/gu, " ") : "";
+  return text.slice(0, 512) || "unknown";
 }
 
 async function readPrivateKey(path, policy) {
@@ -488,6 +756,16 @@ function requireInteger(options, name, minimum, maximum) {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum)
     throw new Error(`--${name} 必须是 ${minimum}..${maximum} 的整数。`);
   return value;
+}
+
+function requireDigestList(options, name) {
+  const value = options.get(name);
+  if (!value) throw new Error(`缺少 --${name}。`);
+  const digests = [...new Set(value.split(",").map((item) => requireDigestValue(item, name)))].sort();
+  if (digests.length === 0 || digests.length > 32) {
+    throw new Error(`--${name} 必须包含 1..32 个逗号分隔的 SHA-256。`);
+  }
+  return digests;
 }
 
 function requireDigestValue(value, label) {

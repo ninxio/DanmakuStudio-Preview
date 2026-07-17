@@ -1099,10 +1099,16 @@ function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[
       "blind plan 必须在运行前由 bundle 外部信任根签发，禁止看完结果后挑选 batch"
     ),
     createCheck(
+      "native-blind-authenticode-artifact",
+      "incomplete",
+      actual,
+      "外部 authority 必须独立复核 formal execution identity 指向的 EXE 全文件摘要、Windows Authenticode 信任、固定 signer 证书与时间戳证书"
+    ),
+    createCheck(
       "native-blind-native-attestation",
       "incomplete",
       actual,
-      "native attestation 必须覆盖 challenge、plan/projection/execution/receipt/provenance、runner build 和参数"
+      "native execution attestation 必须进一步证明 challenge 与动态 plan/projection/execution/receipt/provenance 确由同一个受信运行进程产生；仅验证磁盘上的 Authenticode 文件不等于进程证明"
     ),
     createCheck(
       "native-blind-challenge-freshness",
@@ -1863,10 +1869,16 @@ function evaluatePerformanceThresholds(
       "正式性能验收必须有严格重算并绑定全部 native job 终态、后代进程归零、监督器清理、工具/媒体复核、缓存清空和 released session 的 path-free terminal cleanup receipt；其原生来源真实性仍由独立 attestation 与 authority 验证"
     ),
     createCheck(
+      "authenticode-artifact-attestation",
+      "incomplete",
+      "awaiting-external-authenticode-authority-v2",
+      "外部 authority v2 必须对同一 bundle 独立复核 native EXE 全文件摘要、Windows Authenticode 信任、固定 signer 证书和时间戳证书"
+    ),
+    createCheck(
       "native-attestation",
       "incomplete",
-      "not-verifiable-in-schema-v2",
-      "raw v2 仅预留空字段，尚无独立信任根可核验的原生采集器 attestation schema 和验证器；调用方自建 trustContext 或任意对象不能替代"
+      "authenticode-artifact-bound-no-live-process-proof",
+      "raw v2 内部字段继续保持 null；即使外部 authority v2 已验证签名 EXE，也仍需同一运行进程对 challenge 和动态证据作可验证响应，或提供 TPM/AIK 证明，调用方自建 trustContext 或任意对象不能替代"
     ),
     thresholdCheck(
       "performance-raw-evidence",

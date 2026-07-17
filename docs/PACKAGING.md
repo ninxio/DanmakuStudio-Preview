@@ -78,6 +78,8 @@ corepack pnpm build
 - Tauri 配置中的构建命令使用 `corepack pnpm ...`，避免调用全局 pnpm 导致 Node 版本不兼容。
 - `src-tauri/icons/` 中的图标由 `src-tauri/app-icon.svg` 生成，若更新图标源，可运行 `corepack pnpm tauri icon src-tauri/app-icon.svg` 后重新打包。
 - 当前 Windows 安装包未签名，首次运行或安装时可能出现 Windows SmartScreen 提示。
+- 签名后的候选 EXE 可先运行 `corepack pnpm c137:authority -- inspect-native --native-executable <signed.exe>` 取得 signer 证书摘要；初始化仓库外 authority v2 时必须用 `--native-signer-cert-sha256 sha256:<64-hex>` 固定允许的叶证书。`attest` 与 `verify` 都必须再次传入 `--native-executable <signed.exe>`，并重新检查全文件摘要、Windows Authenticode、signer 与时间戳；当前未签名产物会失败关闭。
+- Authenticode artifact proof 不等于 live-process/TPM attestation：它不能单独解除 C137 的动态 native execution 门禁，也不能把当前工程预览晋级为正式性能或准确率证据。
 - 桌面端 Emby 元数据请求通过 Tauri `emby_http_request` 后端代理，并限制协议、方法和可转发请求头；Web 构建仍可能受浏览器 CORS 限制。
 - C137 的正式分集导出只在桌面端可用：写盘命令会再次计算所有依赖媒体的全文件 SHA-256，并拒绝浏览器下载降级。未经真实校准的 `review/blocked/legacy-unverified` 时间图不会进入该写盘路径。
 - Web 构建没有安装级 secret、签发命令或权威撤销注册表，因此只能展示/编辑复核状态，不能签发、恢复或撤销人工 `verified`。

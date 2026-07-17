@@ -213,7 +213,7 @@ describe("C137 fail-closed acceptance gate", () => {
     });
   });
 
-  it("真实 authority proof 解除 plan/challenge/replay，但不冒充 native execution attestation", async () => {
+  it("authority v2 闭合固定签名 EXE 的 artifact attestation，但不冒充动态进程证明", async () => {
     const provenanceFixture = createC137FormalBlindProvenanceFixture();
     const bundle = createCompleteBundle();
     bindFormalBlindProvenanceFixture(bundle, provenanceFixture);
@@ -230,15 +230,21 @@ describe("C137 fail-closed acceptance gate", () => {
     for (const id of [
       "external-trust-authority",
       "native-blind-plan-authority",
+      "native-blind-authenticode-artifact",
       "native-blind-challenge-freshness",
-      "native-blind-replay-ledger"
+      "native-blind-replay-ledger",
+      "authenticode-artifact-attestation"
     ]) {
       expect(
         gate.checks.find((check) => check.id === id),
         id
       ).toMatchObject({ status: "pass" });
     }
-    for (const id of ["native-blind-native-attestation", "native-attestation"]) {
+    for (const id of [
+      "native-blind-ranking-provenance",
+      "native-blind-native-attestation",
+      "native-attestation"
+    ]) {
       expect(
         gate.checks.find((check) => check.id === id),
         id
@@ -502,7 +508,7 @@ describe("C137 fail-closed acceptance gate", () => {
     });
     expect(gate.checks.find((check) => check.id === "native-attestation")).toMatchObject({
       status: "incomplete",
-      actual: "not-verifiable-in-schema-v2"
+      actual: "authenticode-artifact-bound-no-live-process-proof"
     });
     expect(gate.checks.find((check) => check.id === "terminal-cleanup-receipt")).toMatchObject({
       status: "incomplete",

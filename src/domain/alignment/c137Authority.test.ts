@@ -1,7 +1,7 @@
 import {
   verifyC137AuthorityProof,
-  type C137AuthorityProofV1,
-  type C137AuthorityTrustPolicyV1
+  type C137AuthorityProofV2,
+  type C137AuthorityTrustPolicyV2
 } from "./c137Authority";
 import {
   computeC137CanonicalDigest,
@@ -100,7 +100,7 @@ describe("C137 external authority proof", () => {
 
   it("拒绝回滚到低于外部最低序列或未命中固定 checkpoint 的旧账本", async () => {
     const fixture = await createAuthorityFixture();
-    const strictPolicy: C137AuthorityTrustPolicyV1 = {
+    const strictPolicy: C137AuthorityTrustPolicyV2 = {
       ...fixture.policy,
       minimumLedgerSequence: 3,
       requiredCheckpointDigest: digest("f")
@@ -117,12 +117,33 @@ describe("C137 external authority proof", () => {
     expect(result.issues.join("\n")).toContain("最低序列");
     expect(result.issues.join("\n")).toContain("外部固定摘要");
   });
+
+  it("即使 authority 签名有效，native signer 未命中外部证书白名单也拒绝", async () => {
+    const fixture = await createAuthorityFixture();
+    const wrongSignerPolicy: C137AuthorityTrustPolicyV2 = {
+      ...fixture.policy,
+      nativeArtifactPolicy: {
+        ...fixture.policy.nativeArtifactPolicy,
+        acceptedSignerCertificateDigests: [digest("e")]
+      }
+    };
+
+    const result = await verifyC137AuthorityProof(
+      fixture.bundle,
+      fixture.proof,
+      wrongSignerPolicy,
+      new Date("2026-07-17T01:15:00.000Z")
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.issues.join("\n")).toContain("signer 未命中外部固定证书白名单");
+  });
 });
 
 async function createAuthorityFixture(): Promise<{
   bundle: C137AcceptanceBundle;
-  proof: C137AuthorityProofV1;
-  policy: C137AuthorityTrustPolicyV1;
+  proof: C137AuthorityProofV2;
+  policy: C137AuthorityTrustPolicyV2;
   privateKey: CryptoKey;
 }> {
   const bundle = createMinimalBundle();

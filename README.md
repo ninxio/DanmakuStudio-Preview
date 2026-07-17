@@ -123,6 +123,7 @@ corepack prepare pnpm@9.15.4 --activate
 
 - 开发者构建桌面安装包依赖本机 Rust/Tauri 构建环境；最终用户运行安装包不需要这些开发工具。
 - 当前 Windows 安装包未签名，首次安装或运行时可能出现 SmartScreen 提示。
+- C137 authority v2 已能独立复核指定 EXE 的全文件 SHA-256、Windows Authenticode `Valid` 状态、固定 signer 叶证书和时间戳证书，并把该 artifact attestation 与 formal/performance bundle 一起签名；但当前未签名安装包会按设计拒绝该流程。即使未来签名产物通过，这也只闭合磁盘 artifact identity，尚未证明动态结果由同一个 live process 产生；`native execution attestation` 继续等待同进程 challenge-response/OS 映像复核或 TPM/AIK。
 - mpv 后端当前以桌面 sidecar 方式运行，不把 mpv 画面嵌入 React 预览区；未配置 mpv 或没有真实本地路径时，界面不会假装支持 MKV。HTML Video 播放失败时会明确提示改用 MP4/WebM 或启用 mpv 播放器。
 - V2 媒体分析依赖用户主动导入且合法拥有/授权读取的本地媒体，以及本机 FFmpeg/FFprobe。网页模式不伪装为可执行高精度媒体分析或写盘前身份核验。
 - 当前 V2 已有 PTS、多音轨、声谱 landmark、速度漂移、双向编辑、局部边界和独立视觉回退的工程实现，但真实冻结集样本数仍为 **0**，benchmark manifest v2 示例只有 placeholder。尚未完成统计概率校准、规定硬件性能报告或 20 套北极星长合集 5/5 验收。自动结果最高为 `review`；正式按原片分集导出只接受带可信验证来源的 `verified` 时间图。因此本阶段 release 是安全预览，不代表准确率或性能验收完成。

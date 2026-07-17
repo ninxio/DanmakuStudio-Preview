@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import type { C137AcceptanceBundle, C137Digest } from "./c137Acceptance";
 
@@ -37,9 +38,21 @@ describe("C137 authority external CLI", () => {
         proof: join(root, "proof.json"),
         replayProof: join(root, "replay-proof.json")
       };
+      const nodeExecutableDigest: C137Digest = `sha256:${createHash("sha256")
+        .update(await readFile(process.execPath))
+        .digest("hex")}`;
+      const inspected = runCli([
+        "inspect-native",
+        "--native-executable",
+        process.execPath
+      ]);
+      if (inspected.status !== 0) throw new Error(inspected.stderr);
+      const signerCertificateDigest = (
+        JSON.parse(inspected.stdout) as { signerCertificateDigest: C137Digest }
+      ).signerCertificateDigest;
       await writeFile(
         paths.bundle,
-        `${JSON.stringify(createMinimalBundle(), null, 2)}\n`,
+        `${JSON.stringify(createMinimalBundle(nodeExecutableDigest), null, 2)}\n`,
         "utf8"
       );
 
@@ -55,7 +68,9 @@ describe("C137 authority external CLI", () => {
           "--authority-id",
           "c137-test-authority",
           "--ledger-id",
-          "c137-test-ledger"
+          "c137-test-ledger",
+          "--native-signer-cert-sha256",
+          signerCertificateDigest
         ]).status
       ).toBe(0);
       expect(
@@ -88,6 +103,8 @@ describe("C137 authority external CLI", () => {
           paths.challenge,
           "--bundle",
           paths.bundle,
+          "--native-executable",
+          process.execPath,
           "--out",
           paths.proof,
           "--valid-days",
@@ -102,6 +119,8 @@ describe("C137 authority external CLI", () => {
         paths.proof,
         "--bundle",
         paths.bundle,
+        "--native-executable",
+        process.execPath,
         "--minimum-sequence",
         "2"
       ]);
@@ -125,6 +144,8 @@ describe("C137 authority external CLI", () => {
         paths.challenge,
         "--bundle",
         paths.bundle,
+        "--native-executable",
+        process.execPath,
         "--out",
         paths.replayProof,
         "--valid-days",
@@ -136,6 +157,25 @@ describe("C137 authority external CLI", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("未签名或签名损坏的 EXE 不能生成 native artifact attestation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "c137-unsigned-native-"));
+    try {
+      const unsignedPath = join(root, "unsigned.exe");
+      await writeFile(unsignedPath, "not-an-authenticode-executable", "utf8");
+
+      const result = runCli([
+        "inspect-native",
+        "--native-executable",
+        unsignedPath
+      ]);
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("Authenticode 状态不是 Valid");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function runCli(args: string[]): { status: number | null; stdout: string; stderr: string } {
@@ -147,7 +187,7 @@ function runCli(args: string[]): { status: number | null; stdout: string; stderr
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
-function createMinimalBundle(): C137AcceptanceBundle {
+function createMinimalBundle(nativeExecutableDigest: C137Digest): C137AcceptanceBundle {
   return {
     schemaVersion: 4,
     kind: "c137-acceptance-bundle",
@@ -170,7 +210,7 @@ function createMinimalBundle(): C137AcceptanceBundle {
               pairOutcomes: [
                 {
                   relationRanking: {
-                    executionIdentity: { nativeExecutableDigest: digest("a") }
+                    executionIdentity: { nativeExecutableDigest }
                   }
                 }
               ]
