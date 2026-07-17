@@ -14,6 +14,10 @@ import {
   deriveC137TimeMapCasesFromPairLocalFineEvidence
 } from "./c137PairLocalFineEvidence";
 import {
+  C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT,
+  C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT
+} from "./c137FormalBlindProvenance";
+import {
   computeC137PerformanceEnvironmentDigest,
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceEvidenceDigest,
@@ -32,11 +36,13 @@ import {
 } from "./c137PerformanceEvidence";
 import {
   C137_BLIND_GLOBAL_AGGREGATION_CONTRACT,
+  applyC137CalibrationModel,
   C137_RELATIONSHIP_RANKING_SCOPE,
   computeC137CanonicalDigest,
   computeC137EnvironmentDigest,
   computeC137ReportEvidenceDigest,
   evaluateC137AcceptanceBundle,
+  sealC137CalibrationModel,
   validateC137AcceptanceBundle,
   type C137AcceptanceBundle,
   type C137AcceptanceReports,
@@ -50,13 +56,18 @@ import {
 } from "./c137Acceptance";
 
 describe("C137 fail-closed acceptance gate", () => {
-  it("空 evidence 与未批准 ECE/Brier/取消阈值只能 incomplete", () => {
+  it("空 evidence 与未批准 ECE/Brier、校准模型和取消阈值只能 incomplete", () => {
     const bundle = createCompleteBundle();
     bundle.protocol.calibrationThresholds = {
       status: "pending",
       approvalId: null,
       maximumEce: null,
       maximumBrierScore: null
+    };
+    bundle.protocol.calibrationModel = {
+      status: "pending",
+      approvalId: null,
+      model: null
     };
     bundle.protocol.cancellationThreshold = {
       status: "pending",
@@ -151,7 +162,8 @@ describe("C137 fail-closed acceptance gate", () => {
       "native-blind-media-binding",
       "native-blind-provenance-root-binding",
       "native-blind-parameters-binding",
-      "native-blind-ranking-binding"
+      "native-blind-ranking-binding",
+      "native-blind-calibration-provenance"
     ]) {
       expect(
         gate.checks.find((check) => check.id === id),
@@ -211,6 +223,97 @@ describe("C137 fail-closed acceptance gate", () => {
       status: "incomplete",
       actual: "report-mismatch-or-native-modality-blocked"
     });
+  });
+
+  it.each([
+    [
+      "Top-1 score",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].top1Score -= 0.01;
+      }
+    ],
+    [
+      "Top-2 score",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].top2Score -= 0.01;
+      }
+    ],
+    [
+      "规范化 margin",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].scoreMargin = 0.1;
+      }
+    ],
+    [
+      "模型插值 probability",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.samples[0].probability = 0.99;
+      }
+    ],
+    [
+      "模型摘要",
+      (bundle: C137AcceptanceBundle) => {
+        bundle.reports.calibration!.modelDigest = digest("e");
+      }
+    ]
+  ] as const)(
+    "调用方修改 %s 并重签 calibration report 仍不能越过原生分数与模型绑定",
+    (_label, mutate) => {
+      const fixture = createC137FormalBlindProvenanceFixture();
+      const bundle = createCompleteBundle();
+      bindFormalBlindProvenanceFixture(bundle, fixture);
+      mutate(bundle);
+      refreshReportEvidenceDigests(bundle);
+
+      expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+      const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+      expect(
+        gate.checks.find((check) => check.id === "native-blind-calibration-provenance")
+      ).toMatchObject({ status: "incomplete" });
+    }
+  );
+
+  it("校准模型必须覆盖 0..1、score margin 严格递增且 probability 单调不减", () => {
+    expect(() =>
+      sealC137CalibrationModel({
+        schemaVersion: 1,
+        kind: "c137-native-score-calibration-model",
+        modelId: "invalid-non-monotonic",
+        featureContract: C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT,
+        sourceScoreContract: C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+        calibrationSplit: "calibration",
+        calibrationDatasetVersion: "calibration-1",
+        calibrationDatasetDigest: digest("f"),
+        points: [
+          { scoreMargin: 0, probability: 0.6 },
+          { scoreMargin: 0.5, probability: 0.5 },
+          { scoreMargin: 1, probability: 0.9 }
+        ]
+      })
+    ).toThrow("probability 必须单调不减");
+  });
+
+  it("校准模型在相邻控制点之间执行唯一的分段线性插值", () => {
+    const model = sealC137CalibrationModel({
+      schemaVersion: 1,
+      kind: "c137-native-score-calibration-model",
+      modelId: "piecewise-linear-test",
+      featureContract: C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT,
+      sourceScoreContract: C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+      calibrationSplit: "calibration",
+      calibrationDatasetVersion: "calibration-1",
+      calibrationDatasetDigest: digest("a"),
+      points: [
+        { scoreMargin: 0, probability: 0.1 },
+        { scoreMargin: 0.5, probability: 0.6 },
+        { scoreMargin: 1, probability: 0.9 }
+      ]
+    });
+
+    expect(applyC137CalibrationModel(model, 0)).toBe(0.1);
+    expect(applyC137CalibrationModel(model, 0.25)).toBe(0.35);
+    expect(applyC137CalibrationModel(model, 1)).toBe(0.9);
   });
 
   it("调用方修改 TimeMap 误差并重签 report 也不能越过 pair-local frozen Gold 重算", () => {
@@ -297,7 +400,7 @@ describe("C137 fail-closed acceptance gate", () => {
     ).toMatchObject({ status: "incomplete", actual: "private-provenance-not-closed" });
   });
 
-  it("relationship report v3 的 globalTopK 必须与 protocol5 精确一致", () => {
+  it("relationship report v3 的 globalTopK 必须与 protocol8 精确一致", () => {
     const bundle = createCompleteBundle();
     bundle.reports.relationshipRanking!.globalTopK = bundle.protocol.topK - 1;
 
@@ -331,7 +434,7 @@ describe("C137 fail-closed acceptance gate", () => {
     ["requiredBlindScoreContract", "alignment-v2-pair-local-order-v0"],
     ["requiredBlindMatrixCoverage", "partial"],
     ["requiredBlindAggregation", "merge-local-top-k-v0"]
-  ] as const)("protocol5 字段 %s 被降级或篡改时严格拒绝", (field, value) => {
+  ] as const)("protocol8 字段 %s 被降级或篡改时严格拒绝", (field, value) => {
     const legacy = structuredClone(createCompleteBundle()) as unknown as {
       protocol: Record<string, unknown>;
     };
@@ -416,13 +519,53 @@ describe("C137 fail-closed acceptance gate", () => {
     const validation = validateC137AcceptanceBundle(legacy);
 
     expect(validation.valid).toBe(false);
-    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 7");
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 8");
     expect(validation.issues.join("\n")).toContain(
       "bundle.protocol.requiredFormalBlindProvenanceSchemaVersion 缺失"
     );
   });
 
-  it("旧 bundle v2/protocol4/ranking2/formal1 不能混入 v4/v6/ranking3/formal3 语义", () => {
+  it("protocol v7 缺少批准校准模型时不能混入 protocol v8", () => {
+    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+      protocol: Record<string, unknown>;
+    };
+    legacy.protocol.schemaVersion = 7;
+    legacy.protocol.version = "7";
+    delete legacy.protocol.calibrationModel;
+
+    const validation = validateC137AcceptanceBundle(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 8");
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.calibrationModel 缺失");
+  });
+
+  it("calibration report v1 缺少模型摘要和原生 score feature 时严格拒绝", () => {
+    const legacy = structuredClone(createCompleteBundle()) as unknown as {
+      reports: {
+        calibration: Record<string, unknown> & { samples: Record<string, unknown>[] };
+      };
+    };
+    legacy.reports.calibration.schemaVersion = 1;
+    delete legacy.reports.calibration.modelDigest;
+    for (const sample of legacy.reports.calibration.samples) {
+      delete sample.top1Score;
+      delete sample.top2Score;
+      delete sample.scoreMargin;
+    }
+
+    const validation = validateC137AcceptanceBundle(legacy);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.join("\n")).toContain(
+      "bundle.reports.calibration.schemaVersion 必须为 2"
+    );
+    expect(validation.issues.join("\n")).toContain(
+      "bundle.reports.calibration.modelDigest 缺失"
+    );
+  });
+
+  it("旧 bundle v2/protocol4/ranking2/formal1 不能混入 v6/v8/ranking3/formal3 语义", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
     const current = createCompleteBundle();
     bindFormalBlindProvenanceFixture(current, fixture);
@@ -471,8 +614,8 @@ describe("C137 fail-closed acceptance gate", () => {
     const issues = validation.issues.join("\n");
 
     expect(validation.valid).toBe(false);
-    expect(issues).toContain("bundle.schemaVersion 必须为 5");
-    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 7");
+    expect(issues).toContain("bundle.schemaVersion 必须为 6");
+    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 8");
     expect(issues).toContain("bundle.protocol.requiredBlindAggregation 缺失");
     expect(issues).toContain("bundle.reports.relationshipRanking.schemaVersion 必须为 3");
     expect(issues).toContain("bundle.reports.relationshipRanking.rankingScope 缺失");
@@ -875,6 +1018,9 @@ describe("C137 fail-closed acceptance gate", () => {
         decisionId: item.decisionId,
         mediaKind: "real" as const,
         split: "frozen-test" as const,
+        top1Score: 0.95,
+        top2Score: 0.25,
+        scoreMargin: (0.95 - 0.25) / 0.95,
         probability: item.rankedCandidateIds[0] === item.goldCandidateId ? 1 : 0,
         correct: item.rankedCandidateIds[0] === item.goldCandidateId
       }));
@@ -1029,6 +1175,24 @@ function createCompleteBundle(): C137AcceptanceBundle {
   const predictionsDigest = digest("3");
   const buildDigest = digest("5");
   const parametersDigest = digest("6");
+  const calibrationModel = sealC137CalibrationModel({
+    schemaVersion: 1,
+    kind: "c137-native-score-calibration-model",
+    modelId: "native-margin-isotonic-1",
+    featureContract: C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT,
+    sourceScoreContract: C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+    calibrationSplit: "calibration",
+    calibrationDatasetVersion: "real-calibration-1",
+    calibrationDatasetDigest: digest("d"),
+    points: [
+      { scoreMargin: 0, probability: 0.5 },
+      { scoreMargin: 0.5, probability: 1 },
+      { scoreMargin: 1, probability: 1 }
+    ]
+  });
+  const defaultTop1Score = 0.95;
+  const defaultTop2Score = 0.25;
+  const defaultScoreMargin = (defaultTop1Score - defaultTop2Score) / Math.abs(defaultTop1Score);
   const performanceEvidence = createCompleteC137PerformanceEvidenceFixture();
   performanceEvidence.collector.sampler = "windows-job-object-working-set-v1";
   performanceEvidence.environment.storageScope = "workload-media-volumes";
@@ -1073,7 +1237,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
     goldDigest,
     datasetVersion: "real-frozen-1",
     predictionsDigest,
-    protocolId: "c137-acceptance@5",
+    protocolId: "c137-acceptance@8",
     environmentDigest,
     buildDigest,
     engineVersion: "alignment-v2",
@@ -1117,15 +1281,15 @@ function createCompleteBundle(): C137AcceptanceBundle {
   }));
 
   const bundle: C137AcceptanceBundle = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     kind: "c137-acceptance-bundle",
     manifestDigest,
     datasetVersion: "real-frozen-1",
     certificationClass: "real-frozen",
     protocol: {
-      schemaVersion: 7,
+      schemaVersion: 8,
       id: "c137-acceptance",
-      version: "7",
+      version: "8",
       topK: 5,
       calibrationBinCount: 10,
       requiredColdRuns: 1,
@@ -1157,6 +1321,11 @@ function createCompleteBundle(): C137AcceptanceBundle {
         approvalId: "calibration-threshold-review-1",
         maximumEce: 0.05,
         maximumBrierScore: 0.05
+      },
+      calibrationModel: {
+        status: "approved",
+        approvalId: "calibration-model-review-1",
+        model: calibrationModel
       },
       cancellationThreshold: {
         status: "approved",
@@ -1208,7 +1377,7 @@ function createCompleteBundle(): C137AcceptanceBundle {
         manifestDigest,
         datasetVersion: "real-frozen-1",
         predictionsDigest,
-        protocolId: "c137-acceptance@5",
+        protocolId: "c137-acceptance@8",
         environmentDigest,
         buildDigest,
         engineVersion: "alignment-v2",
@@ -1232,13 +1401,17 @@ function createCompleteBundle(): C137AcceptanceBundle {
       },
       timeMap: { schemaVersion: 1, binding: { ...binding }, cases: timeMapCases },
       calibration: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         binding: { ...binding },
+        modelDigest: calibrationModel.modelDigest,
         samples: decisions.map((item) => ({
           decisionId: item.decisionId,
           mediaKind: "real" as const,
           split: "frozen-test" as const,
-          probability: 1,
+          top1Score: defaultTop1Score,
+          top2Score: defaultTop2Score,
+          scoreMargin: defaultScoreMargin,
+          probability: applyC137CalibrationModel(calibrationModel, defaultScoreMargin),
           correct: true
         }))
       },
@@ -1444,11 +1617,19 @@ function bindFormalBlindProvenanceFixture(
   timeMapReport.cases = deriveC137TimeMapCasesFromPairLocalFineEvidence(
     deriveC137PairLocalFineEvidence(provenance)
   );
+  const calibrationModel = bundle.protocol.calibrationModel.model;
+  if (calibrationModel === null) {
+    throw new Error("formal acceptance fixture requires an approved calibration model");
+  }
+  calibrationReport.modelDigest = calibrationModel.modelDigest;
   calibrationReport.samples = decisions.map((decision) => ({
     decisionId: decision.provenanceRef,
     mediaKind: "real",
     split: "frozen-test",
-    probability: 1,
+    top1Score: decision.top1Score,
+    top2Score: decision.top2Score,
+    scoreMargin: decision.scoreMargin,
+    probability: applyC137CalibrationModel(calibrationModel, decision.scoreMargin),
     correct: decision.rankedPairIds[0] === decision.goldPairId
   }));
   visualReport.cases = [];

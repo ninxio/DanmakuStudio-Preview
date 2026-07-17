@@ -10,6 +10,7 @@ import {
   type C137PerformanceRawEvidenceV2
 } from "./c137PerformanceEvidence";
 import {
+  C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT,
   C137_FORMAL_BLIND_MATRIX_COVERAGE,
   C137_FORMAL_BLIND_MATRIX_PLAN_SCHEMA_VERSION,
   C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
@@ -20,6 +21,7 @@ import {
   computeC137FormalBlindParametersDigest,
   evaluateC137FormalBlindProvenance,
   validateC137FormalBlindProvenance,
+  type C137FormalBlindDerivedRelationshipDecisionV3,
   type C137FormalBlindProvenanceV3
 } from "./c137FormalBlindProvenance";
 import {
@@ -33,16 +35,19 @@ import {
 } from "./c137PairLocalFineEvidence";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_ACCEPTANCE_SCHEMA_VERSION = 5 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 7 as const;
+export const C137_ACCEPTANCE_SCHEMA_VERSION = 6 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 8 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
+export const C137_CALIBRATION_MODEL_SCHEMA_VERSION = 1 as const;
+export const C137_CALIBRATION_REPORT_SCHEMA_VERSION = 2 as const;
 export const C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION = 3 as const;
 export const C137_PERFORMANCE_ACCEPTANCE_REPORT_SCHEMA_VERSION = 3 as const;
 export const C137_FORMAL_PERFORMANCE_RAW_SCHEMA_VERSION = 2 as const;
 export const C137_BLIND_GLOBAL_AGGREGATION_CONTRACT =
   "global-recompute-from-all-matrix-cells-v1" as const;
 export const C137_RELATIONSHIP_RANKING_SCOPE = "global-exhaustive-matrix" as const;
+const C137_CALIBRATION_MODEL_DIGEST_DOMAIN = "c137-native-score-calibration-model-v1";
 
 export const C137_FIXED_ACCEPTANCE_THRESHOLDS = {
   targetPhysicalCoreCount: 4,
@@ -85,6 +90,30 @@ export interface C137CalibrationThresholdApproval {
   maximumBrierScore: number | null;
 }
 
+export interface C137CalibrationCurvePoint {
+  scoreMargin: number;
+  probability: number;
+}
+
+export interface C137CalibrationModelV1 {
+  schemaVersion: typeof C137_CALIBRATION_MODEL_SCHEMA_VERSION;
+  kind: "c137-native-score-calibration-model";
+  modelId: string;
+  featureContract: typeof C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT;
+  sourceScoreContract: typeof C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT;
+  calibrationSplit: "calibration";
+  calibrationDatasetVersion: string;
+  calibrationDatasetDigest: C137Digest;
+  points: C137CalibrationCurvePoint[];
+  modelDigest: C137Digest;
+}
+
+export interface C137CalibrationModelApproval {
+  status: "pending" | "approved";
+  approvalId: string | null;
+  model: C137CalibrationModelV1 | null;
+}
+
 export interface C137CancellationThresholdApproval {
   status: "pending" | "approved";
   approvalId: string | null;
@@ -94,7 +123,7 @@ export interface C137CancellationThresholdApproval {
 export interface C137AcceptanceProtocol {
   schemaVersion: typeof C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION;
   id: string;
-  version: "7";
+  version: "8";
   topK: number;
   calibrationBinCount: number;
   requiredColdRuns: number;
@@ -122,6 +151,7 @@ export interface C137AcceptanceProtocol {
   hotCacheDefinition: "same-process-after-complete-warmup";
   targetEnvironmentDigest: C137Digest;
   calibrationThresholds: C137CalibrationThresholdApproval;
+  calibrationModel: C137CalibrationModelApproval;
   cancellationThreshold: C137CancellationThresholdApproval;
 }
 
@@ -275,13 +305,17 @@ export interface C137CalibrationSample {
   decisionId: string;
   mediaKind: RealMediaBenchmarkMediaKind;
   split: C137DatasetSplit;
+  top1Score: number;
+  top2Score: number;
+  scoreMargin: number;
   probability: number;
   correct: boolean;
 }
 
 export interface C137CalibrationReport {
-  schemaVersion: typeof C137_ACCEPTANCE_REPORT_SCHEMA_VERSION;
+  schemaVersion: typeof C137_CALIBRATION_REPORT_SCHEMA_VERSION;
   binding: C137EvidenceBinding;
+  modelDigest: C137Digest;
   samples: C137CalibrationSample[];
 }
 
@@ -467,6 +501,68 @@ export function computeC137CanonicalDigest(value: unknown): C137Digest {
   return `sha256:${sha256Hex(canonicalJson(value))}`;
 }
 
+export function computeC137CalibrationModelDigest(
+  model: Omit<C137CalibrationModelV1, "modelDigest"> | C137CalibrationModelV1
+): C137Digest {
+  const { modelDigest: ignoredModelDigest, ...payload } = model as C137CalibrationModelV1;
+  void ignoredModelDigest;
+  return computeC137CanonicalDigest({
+    domain: C137_CALIBRATION_MODEL_DIGEST_DOMAIN,
+    model: payload
+  });
+}
+
+export function sealC137CalibrationModel(
+  draft: Omit<C137CalibrationModelV1, "modelDigest">
+): C137CalibrationModelV1 {
+  const model: C137CalibrationModelV1 = {
+    ...draft,
+    points: draft.points.map((point) => ({ ...point })),
+    modelDigest: computeC137CalibrationModelDigest(draft)
+  };
+  const issues: string[] = [];
+  validateC137CalibrationModelValue(model, "calibrationModel", issues);
+  if (issues.length > 0) {
+    throw new Error(issues.join("；"));
+  }
+  return model;
+}
+
+export function applyC137CalibrationModel(
+  model: C137CalibrationModelV1,
+  scoreMargin: number
+): number {
+  const issues: string[] = [];
+  validateC137CalibrationModelValue(model, "calibrationModel", issues);
+  if (issues.length > 0) {
+    throw new Error(issues.join("；"));
+  }
+  if (!isUnitNumber(scoreMargin)) {
+    throw new Error("calibration scoreMargin 必须是 0–1 的有限数字。");
+  }
+  return interpolateC137CalibrationModel(model, scoreMargin);
+}
+
+function interpolateC137CalibrationModel(
+  model: C137CalibrationModelV1,
+  scoreMargin: number
+): number {
+  const exact = model.points.find((point) => point.scoreMargin === scoreMargin);
+  if (exact !== undefined) {
+    return exact.probability;
+  }
+  for (let index = 1; index < model.points.length; index += 1) {
+    const right = model.points[index];
+    const left = model.points[index - 1];
+    if (left === undefined || right === undefined || scoreMargin > right.scoreMargin) {
+      continue;
+    }
+    const weight = (scoreMargin - left.scoreMargin) / (right.scoreMargin - left.scoreMargin);
+    return left.probability + weight * (right.probability - left.probability);
+  }
+  throw new Error("calibration model 未覆盖 scoreMargin。");
+}
+
 /**
  * Environment identity is derived from every allowlisted hardware and toolchain field. Keeping
  * the claimed digest out of the payload prevents a caller from editing CPU/tool data while
@@ -596,6 +692,12 @@ function evaluateEvidenceCompleteness(
         : "incomplete",
       bundle.protocol.calibrationThresholds.status,
       "ECE/Brier 数值门槛必须先经版本化协议批准，禁止临时猜测"
+    ),
+    createCheck(
+      "calibration-model-approved",
+      isApprovedCalibrationModel(bundle.protocol.calibrationModel) ? "pass" : "incomplete",
+      bundle.protocol.calibrationModel.status,
+      "校准模型必须由协议冻结 calibration split、原生 score contract、单调曲线与模型摘要，禁止使用 frozen-test 拟合或临时填写概率"
     ),
     createCheck(
       "cancellation-threshold-approved",
@@ -902,7 +1004,7 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-protocol-structure",
         "incomplete",
         "missing",
-        "protocol v7 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v4、完整 fine inventory、shard-invariant score、exhaustive coverage 与全矩阵重算"
+        "protocol v8 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v4、完整 fine inventory、shard-invariant score、exhaustive coverage、原生 score margin 与批准校准模型"
       ),
       createCheck(
         "native-blind-decision-coverage",
@@ -920,7 +1022,13 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-ranking-provenance",
         "incomplete",
         "missing-private-provenance",
-        "acceptance v5 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
+        "acceptance v6 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
+      ),
+      createCheck(
+        "native-blind-calibration-provenance",
+        "incomplete",
+        "missing-private-provenance",
+        "calibration probability 必须由 formal exhaustive-matrix 的原生 Top-1/Top-2 score margin 和协议批准模型唯一重算"
       ),
       ...createPendingBlindAuthorityChecks("missing-private-provenance")
     ];
@@ -989,6 +1097,7 @@ function evaluateFormalBlindRankingEvidence(
       bundle.reports.relationshipRanking,
       bundle.protocol.topK
     );
+  const calibrationBinding = evaluateNativeCalibrationBinding(bundle, evaluation.decisions);
 
   const structuralClosure =
     integrityValid &&
@@ -1012,7 +1121,7 @@ function evaluateFormalBlindRankingEvidence(
       "native-blind-protocol-structure",
       protocolStructureBound ? "pass" : "incomplete",
       protocolStructureBound,
-      "protocol v7 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v4、完整 fine inventory、固定 shard-invariant scoreContract、exhaustive coverage 与全矩阵重算"
+      "protocol v8 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v4、完整 fine inventory、固定 shard-invariant scoreContract、exhaustive coverage、原生 score margin 与批准校准模型"
     ),
     createCheck(
       "native-blind-plan-binding",
@@ -1022,7 +1131,7 @@ function evaluateFormalBlindRankingEvidence(
         ? "pass"
         : "incomplete",
       provenance.plan.planDigest,
-      "预运行 matrix plan 摘要必须由 protocol v7 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
+      "预运行 matrix plan 摘要必须由 protocol v8 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
     ),
     createCheck(
       "native-blind-decision-coverage",
@@ -1065,6 +1174,12 @@ function evaluateFormalBlindRankingEvidence(
       rankingBound ? "pass" : "incomplete",
       rankingBound,
       "relationship report v3 的 scope/score/globalTopK 及每条 decisionId/provenanceRef/case/gold/有序全局 Top-K/verified policy 必须逐项等于 formal 全矩阵重算"
+    ),
+    createCheck(
+      "native-blind-calibration-provenance",
+      calibrationBinding.bound ? "pass" : "incomplete",
+      calibrationBinding.actual,
+      "calibration report v2 必须逐 decision 精确绑定原生 Top-1/Top-2 score、规范化 margin、协议批准模型摘要及唯一插值概率"
     ),
     createCheck(
       "native-blind-ranking-provenance",
@@ -1119,6 +1234,45 @@ function formalDecisionsMatchRelationshipReport(
   });
 }
 
+function evaluateNativeCalibrationBinding(
+  bundle: C137AcceptanceBundle,
+  decisions: readonly C137FormalBlindDerivedRelationshipDecisionV3[]
+): { bound: boolean; actual: string } {
+  const report = bundle.reports.calibration;
+  const approval = bundle.protocol.calibrationModel;
+  if (report === null) {
+    return { bound: false, actual: "missing-calibration-report" };
+  }
+  if (!isApprovedCalibrationModel(approval)) {
+    return { bound: false, actual: "calibration-model-not-approved" };
+  }
+  const model = approval.model;
+  if (report.modelDigest !== model.modelDigest || report.samples.length !== decisions.length) {
+    return { bound: false, actual: "model-digest-or-sample-count-mismatch" };
+  }
+  const bound = report.samples.every((sample, index) => {
+    const decision = decisions[index];
+    if (decision === undefined) {
+      return false;
+    }
+    const probability = interpolateC137CalibrationModel(model, decision.scoreMargin);
+    return (
+      sample.decisionId === decision.provenanceRef &&
+      sample.mediaKind === "real" &&
+      sample.split === "frozen-test" &&
+      sample.top1Score === decision.top1Score &&
+      sample.top2Score === decision.top2Score &&
+      sample.scoreMargin === decision.scoreMargin &&
+      sample.probability === probability &&
+      sample.correct === (decision.rankedPairIds[0] === decision.goldPairId)
+    );
+  });
+  return {
+    bound,
+    actual: bound ? model.modelDigest : "native-score-or-model-probability-mismatch"
+  };
+}
+
 function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[] {
   return [
     createCheck(
@@ -1150,12 +1304,6 @@ function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[
       "incomplete",
       actual,
       "必须由有状态 authority ledger 原子登记 challenge、native job、receipt 与 provenance root，拒绝跨 bundle 重放"
-    ),
-    createCheck(
-      "native-blind-calibration-provenance",
-      "incomplete",
-      "probability-not-native-bound",
-      "calibration probability 仍未绑定 native score 与冻结校准协议，不能仅凭调用方 correct/probability 放行"
     )
   ];
 }
@@ -1339,6 +1487,9 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
     reports.calibration.samples.map((item) => [item.decisionId, item])
   );
   const frozenCalibrationSamples = reports.calibration.samples.filter(isFrozenRealEvidence);
+  const calibrationModelBound =
+    isApprovedCalibrationModel(bundle.protocol.calibrationModel) &&
+    reports.calibration.modelDigest === bundle.protocol.calibrationModel.model.modelDigest;
   const everyCalibrationSampleBound = reports.calibration.samples.every((sample) => {
     const decision = rankingByDecisionId.get(sample.decisionId);
     return (
@@ -1351,6 +1502,7 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
   const calibrationComplete =
     frozenRankingDecisions.length > 0 &&
     frozenCalibrationSamples.length === frozenRankingDecisions.length &&
+    calibrationModelBound &&
     everyCalibrationSampleBound &&
     frozenRankingDecisions.every((decision) => {
       const sample = calibrationByDecisionId.get(decision.decisionId);
@@ -1440,7 +1592,7 @@ function evaluateRawEvidenceCompleteness(bundle: C137AcceptanceBundle): C137Acce
       "calibration-samples",
       calibrationComplete ? "pass" : "incomplete",
       calibrationComplete,
-      "校准样本必须与全部冻结 ranking decision 一对一，mediaKind/split 一致，且 correct 必须由 Top-1 是否命中 gold 重算"
+      "校准报告必须绑定协议批准模型；样本与全部冻结 ranking decision 一对一、mediaKind/split 一致，且 correct 必须由 Top-1 是否命中 gold 重算"
     ),
     createCheck(
       "visual-fallback-samples",
@@ -2084,6 +2236,20 @@ function isApprovedCalibrationThreshold(value: C137CalibrationThresholdApproval)
   );
 }
 
+function isApprovedCalibrationModel(
+  value: C137CalibrationModelApproval
+): value is C137CalibrationModelApproval & {
+  status: "approved";
+  model: C137CalibrationModelV1;
+} {
+  return (
+    value.status === "approved" &&
+    value.approvalId !== null &&
+    value.model !== null &&
+    value.model.modelDigest === computeC137CalibrationModelDigest(value.model)
+  );
+}
+
 function isApprovedCancellationThreshold(value: C137CancellationThresholdApproval): boolean {
   return (
     value.status === "approved" && value.approvalId !== null && value.maximumP95Ms !== null
@@ -2383,6 +2549,7 @@ function validateProtocol(value: unknown, issues: string[]): void {
       "hotCacheDefinition",
       "targetEnvironmentDigest",
       "calibrationThresholds",
+      "calibrationModel",
       "cancellationThreshold"
     ],
     issues
@@ -2397,7 +2564,7 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   requireString(record.id, "bundle.protocol.id", issues);
-  requireLiteral(record.version, "7", "bundle.protocol.version", issues);
+  requireLiteral(record.version, "8", "bundle.protocol.version", issues);
   requirePositiveInteger(record.topK, "bundle.protocol.topK", issues);
   if (
     Number.isSafeInteger(record.topK) &&
@@ -2536,6 +2703,7 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   validateCalibrationThresholdApproval(record.calibrationThresholds, issues);
+  validateCalibrationModelApproval(record.calibrationModel, issues);
   validateCancellationThresholdApproval(record.cancellationThreshold, issues);
 }
 
@@ -2568,6 +2736,126 @@ function validateCalibrationThresholdApproval(value: unknown, issues: string[]):
     !isUnitNumber(record.maximumBrierScore)
   ) {
     issues.push(`${path} approved 状态必须包含 approvalId、maximumEce 和 maximumBrierScore。`);
+  }
+}
+
+function validateCalibrationModelApproval(value: unknown, issues: string[]): void {
+  const path = "bundle.protocol.calibrationModel";
+  const record = strictRecord(value, path, ["status", "approvalId", "model"], issues);
+  if (record === null) {
+    return;
+  }
+  requireOneOf(record.status, ["pending", "approved"], `${path}.status`, issues);
+  requireNullableString(record.approvalId, `${path}.approvalId`, issues);
+  if (record.status === "pending") {
+    if (record.approvalId !== null || record.model !== null) {
+      issues.push(`${path} pending 状态不得携带 approvalId 或模型。`);
+    }
+    return;
+  }
+  if (!isNonEmptyString(record.approvalId) || record.model === null) {
+    issues.push(`${path} approved 状态必须包含 approvalId 与模型。`);
+    return;
+  }
+  validateC137CalibrationModelValue(record.model, `${path}.model`, issues);
+}
+
+function validateC137CalibrationModelValue(
+  value: unknown,
+  path: string,
+  issues: string[]
+): void {
+  const record = strictRecord(
+    value,
+    path,
+    [
+      "schemaVersion",
+      "kind",
+      "modelId",
+      "featureContract",
+      "sourceScoreContract",
+      "calibrationSplit",
+      "calibrationDatasetVersion",
+      "calibrationDatasetDigest",
+      "points",
+      "modelDigest"
+    ],
+    issues
+  );
+  if (record === null) {
+    return;
+  }
+  requireLiteral(
+    record.schemaVersion,
+    C137_CALIBRATION_MODEL_SCHEMA_VERSION,
+    `${path}.schemaVersion`,
+    issues
+  );
+  requireLiteral(record.kind, "c137-native-score-calibration-model", `${path}.kind`, issues);
+  requireString(record.modelId, `${path}.modelId`, issues);
+  requireLiteral(
+    record.featureContract,
+    C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT,
+    `${path}.featureContract`,
+    issues
+  );
+  requireLiteral(
+    record.sourceScoreContract,
+    C137_FORMAL_BLIND_MATRIX_SCORE_CONTRACT,
+    `${path}.sourceScoreContract`,
+    issues
+  );
+  requireLiteral(record.calibrationSplit, "calibration", `${path}.calibrationSplit`, issues);
+  requireString(record.calibrationDatasetVersion, `${path}.calibrationDatasetVersion`, issues);
+  requireDigest(record.calibrationDatasetDigest, `${path}.calibrationDatasetDigest`, issues);
+  requireDigest(record.modelDigest, `${path}.modelDigest`, issues);
+  validateArray(record.points, `${path}.points`, issues, (point, pointPath) => {
+    const pointRecord = strictRecord(point, pointPath, ["scoreMargin", "probability"], issues);
+    if (pointRecord === null) {
+      return;
+    }
+    requireUnitNumber(pointRecord.scoreMargin, `${pointPath}.scoreMargin`, issues);
+    requireUnitNumber(pointRecord.probability, `${pointPath}.probability`, issues);
+  });
+  if (Array.isArray(record.points)) {
+    if (record.points.length < 2 || record.points.length > 64) {
+      issues.push(`${path}.points 必须包含 2..64 个控制点。`);
+    }
+    const points = record.points.filter(
+      (point): point is C137CalibrationCurvePoint =>
+        isRecord(point) && isUnitNumber(point.scoreMargin) && isUnitNumber(point.probability)
+    );
+    if (points.length === record.points.length && points.length >= 2) {
+      if (points[0]?.scoreMargin !== 0 || points[points.length - 1]?.scoreMargin !== 1) {
+        issues.push(`${path}.points 必须从 scoreMargin=0 覆盖到 1。`);
+      }
+      for (let index = 1; index < points.length; index += 1) {
+        const previous = points[index - 1];
+        const current = points[index];
+        if (previous === undefined || current === undefined) {
+          continue;
+        }
+        if (current.scoreMargin <= previous.scoreMargin) {
+          issues.push(`${path}.points scoreMargin 必须严格递增。`);
+          break;
+        }
+        if (current.probability < previous.probability) {
+          issues.push(`${path}.points probability 必须单调不减。`);
+          break;
+        }
+      }
+    }
+  }
+  try {
+    if (
+      typeof record.modelDigest === "string" &&
+      record.modelDigest !==
+        computeC137CalibrationModelDigest(record as unknown as C137CalibrationModelV1)
+    ) {
+      issues.push(`${path}.modelDigest 与模型内容不一致。`);
+    }
+  } catch {
+    issues.push(`${path}.modelDigest 无法从模型内容唯一重算。`);
   }
 }
 
@@ -3081,19 +3369,47 @@ function validateTimeMapReport(value: unknown, issues: string[]): void {
 
 function validateCalibrationReport(value: unknown, issues: string[]): void {
   const path = "bundle.reports.calibration";
-  const record = validateReportHeader(value, path, ["samples"], issues);
+  const record = validateReportHeader(
+    value,
+    path,
+    ["modelDigest", "samples"],
+    issues,
+    C137_CALIBRATION_REPORT_SCHEMA_VERSION
+  );
   if (record === null) return;
+  requireDigest(record.modelDigest, `${path}.modelDigest`, issues);
   validateArray(record.samples, `${path}.samples`, issues, (item, itemPath) => {
     const entry = strictRecord(
       item,
       itemPath,
-      ["decisionId", "mediaKind", "split", "probability", "correct"],
+      [
+        "decisionId",
+        "mediaKind",
+        "split",
+        "top1Score",
+        "top2Score",
+        "scoreMargin",
+        "probability",
+        "correct"
+      ],
       issues
     );
     if (entry === null) return;
     requireString(entry.decisionId, `${itemPath}.decisionId`, issues);
     validateMediaKind(entry.mediaKind, `${itemPath}.mediaKind`, issues);
     validateSplit(entry.split, `${itemPath}.split`, issues);
+    requireFiniteNumber(entry.top1Score, `${itemPath}.top1Score`, issues);
+    requireFiniteNumber(entry.top2Score, `${itemPath}.top2Score`, issues);
+    if (
+      typeof entry.top1Score === "number" &&
+      Number.isFinite(entry.top1Score) &&
+      typeof entry.top2Score === "number" &&
+      Number.isFinite(entry.top2Score) &&
+      entry.top2Score > entry.top1Score
+    ) {
+      issues.push(`${itemPath}.top2Score 不得高于 top1Score。`);
+    }
+    requireUnitNumber(entry.scoreMargin, `${itemPath}.scoreMargin`, issues);
     requireUnitNumber(entry.probability, `${itemPath}.probability`, issues);
     requireBoolean(entry.correct, `${itemPath}.correct`, issues);
   });
@@ -3567,6 +3883,12 @@ function requireNullableNonNegativeInteger(
 ): void {
   if (value !== null && !isNonNegativeInteger(value)) {
     issues.push(`${path} 必须是 null 或非负整数。`);
+  }
+}
+
+function requireFiniteNumber(value: unknown, path: string, issues: string[]): void {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    issues.push(`${path} 必须是有限数字。`);
   }
 }
 

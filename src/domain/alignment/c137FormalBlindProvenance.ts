@@ -37,6 +37,8 @@ import {
 import { sha256Hex } from "../shared/sha256";
 
 export const C137_FORMAL_BLIND_PROVENANCE_SCHEMA_VERSION = 3 as const;
+export const C137_FORMAL_BLIND_CALIBRATION_FEATURE_CONTRACT =
+  "normalized-top1-relation-score-margin-v1" as const;
 
 const MANIFEST_DIGEST_DOMAIN = "c137-formal-blind-full-manifest-v3";
 const GOLD_DIGEST_DOMAIN = "c137-formal-blind-gold-v3";
@@ -87,6 +89,9 @@ export interface C137FormalBlindDerivedRelationshipDecisionV3 {
   provenanceRef: C137Digest;
   goldPairId: C137Digest;
   rankedPairIds: C137Digest[];
+  top1Score: number;
+  top2Score: number;
+  scoreMargin: number;
 }
 
 export interface C137FormalBlindGlobalScoreObservation {
@@ -600,7 +605,7 @@ function deriveGlobalDecisions(
     ) {
       throw new Error(`formal blind query ${benchmarkCase.id} candidate ordinal 缺失或重复。`);
     }
-    const rankedPairIds = rankC137FormalBlindGlobalScores(
+    const rankedObservations = rankC137FormalBlindGlobalScoreObservations(
       orderedByCandidate.map((observation) => ({
         candidateOrdinal: observation.candidateOrdinal,
         pairId: observation.pairId,
@@ -609,6 +614,10 @@ function deriveGlobalDecisions(
       plan.globalTopK,
       benchmarkCase.id
     );
+    const rankedPairIds = rankedObservations.map((observation) => observation.pairId);
+    const top1Score = requireRankedScore(rankedObservations[0], benchmarkCase.id, 1);
+    const top2Score = requireRankedScore(rankedObservations[1], benchmarkCase.id, 2);
+    const scoreMargin = deriveC137FormalBlindCalibrationScoreMargin(top1Score, top2Score);
     const goldPhysicalKey = fullFileIdentityKey(
       benchmarkCase[candidateSide],
       `${benchmarkCase.id}.${candidateSide}`
@@ -647,7 +656,10 @@ function deriveGlobalDecisions(
       caseId: benchmarkCase.id,
       provenanceRef,
       goldPairId: createGlobalPairId(plan, benchmarkCase.id, goldCandidate),
-      rankedPairIds
+      rankedPairIds,
+      top1Score,
+      top2Score,
+      scoreMargin
     };
   });
 }
@@ -657,6 +669,30 @@ export function rankC137FormalBlindGlobalScores(
   globalTopK: number,
   queryLabel: string = "unknown"
 ): C137Digest[] {
+  return rankC137FormalBlindGlobalScoreObservations(observations, globalTopK, queryLabel).map(
+    (observation) => observation.pairId
+  );
+}
+
+export function deriveC137FormalBlindCalibrationScoreMargin(
+  top1Score: number,
+  top2Score: number
+): number {
+  if (!Number.isFinite(top1Score) || !Number.isFinite(top2Score)) {
+    throw new Error("formal blind calibration Top-1/Top-2 score 必须是有限数字。");
+  }
+  if (top2Score > top1Score) {
+    throw new Error("formal blind calibration Top-2 score 不得高于 Top-1。");
+  }
+  const denominator = Math.max(Math.abs(top1Score), 0.001);
+  return Math.min(1, Math.max(0, (top1Score - top2Score) / denominator));
+}
+
+function rankC137FormalBlindGlobalScoreObservations(
+  observations: readonly C137FormalBlindGlobalScoreObservation[],
+  globalTopK: number,
+  queryLabel: string
+): C137FormalBlindGlobalScoreObservation[] {
   assertGlobalTopK(globalTopK);
   const ordinals = new Set<number>();
   const pairIds = new Set<C137Digest>();
@@ -683,10 +719,18 @@ export function rankC137FormalBlindGlobalScores(
       `formal blind query ${queryLabel} 只有 ${eligible.length} 个 intrinsic eligible candidate，少于 globalTopK=${globalTopK}。`
     );
   }
-  return [...eligible]
-    .sort(compareGlobalScoreObservations)
-    .slice(0, globalTopK)
-    .map((observation) => observation.pairId);
+  return [...eligible].sort(compareGlobalScoreObservations).slice(0, globalTopK);
+}
+
+function requireRankedScore(
+  observation: C137FormalBlindGlobalScoreObservation | undefined,
+  queryLabel: string,
+  rank: number
+): number {
+  if (observation?.score === null || observation?.score === undefined) {
+    throw new Error(`formal blind query ${queryLabel} 缺少 Top-${rank} calibration score。`);
+  }
+  return observation.score;
 }
 
 function compareGlobalScoreObservations(

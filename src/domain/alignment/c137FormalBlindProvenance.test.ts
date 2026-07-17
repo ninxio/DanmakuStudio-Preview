@@ -38,6 +38,16 @@ describe("C137 formal blind exhaustive matrix provenance v3", () => {
     expect(new Set(evaluation.decisions.map((decision) => decision.provenanceRef)).size).toBe(
       fixture.manifest.cases.length
     );
+    expect(
+      evaluation.decisions.every(
+        (decision) =>
+          Number.isFinite(decision.top1Score) &&
+          Number.isFinite(decision.top2Score) &&
+          decision.top1Score >= decision.top2Score &&
+          decision.scoreMargin >= 0 &&
+          decision.scoreMargin <= 1
+      )
+    ).toBe(true);
     expect(fixture.provenance.releaseEligible).toBe(false);
   });
 
