@@ -384,6 +384,8 @@ test.beforeEach(async ({ page }) => {
         const inventoryCandidates = allCandidateIds.map((id, index) => ({
           id,
           coarseUpperBoundMicros: 900_000,
+          sourceAxisReuseGroupOrdinal: null,
+          targetAxisReuseGroupOrdinal: null,
           members: [
             {
               rank: 1,
@@ -413,10 +415,10 @@ test.beforeEach(async ({ page }) => {
         const blockedCount = mode === "resourceBlocked" ? pairCount : 0;
         const unresolvedCount = mode === "unresolved" ? pairCount : 0;
         const receipt = {
-          contractVersion: "alignment-v2-adaptive-fine-frontier-v2",
+          contractVersion: "alignment-v2-adaptive-fine-frontier-v3",
           scoreVersion: "alignment-v2-coarse-upper-times-confidence-v1",
           inventoryDigest: await createRuntimeDigest(
-            "audio-alignment-v4/fine-frontier-inventory/v2",
+            "audio-alignment-v5/fine-frontier-inventory/v3",
             inventoryCandidates
           ),
           inventoryCandidates,
@@ -477,7 +479,7 @@ test.beforeEach(async ({ page }) => {
           }
         };
         receipt.receiptDigest = await createRuntimeDigest(
-          "audio-alignment-v4/fine-frontier-receipt/v2",
+          "audio-alignment-v5/fine-frontier-receipt/v3",
           receipt
         );
         return receipt;
@@ -521,7 +523,7 @@ test.beforeEach(async ({ page }) => {
           sourceEffectiveWindow: createWindow(timeMap.sourceStartMs, timeMap.sourceEndMs, true),
           targetEffectiveWindow: createWindow(timeMap.targetStartMs, timeMap.targetEndMs, true),
           parametersHash: await createRuntimeDigest(
-            "audio-alignment-v4/fine-parameters/v1",
+            "audio-alignment-v5/fine-parameters/v1",
             {
               engineVersion: "alignment-v2.4",
               featureVersion: "chroma-v2",
@@ -531,14 +533,14 @@ test.beforeEach(async ({ page }) => {
           ),
           occupancyDigest: `sha256:${"7".repeat(64)}`,
           proposalTimeMapDigest: await createRuntimeDigest(
-            "audio-alignment-v4/proposal-time-map/v1",
+            "audio-alignment-v5/proposal-time-map/v1",
             timeMap
           ),
           scoreMicros: 900_000,
           evidenceDigest: ""
         };
         evidence.evidenceDigest = await createRuntimeDigest(
-          "audio-alignment-v4/fine-execution-evidence/v1",
+          "audio-alignment-v5/fine-execution-evidence/v2",
           evidence
         );
         return evidence;
@@ -695,6 +697,11 @@ test.beforeEach(async ({ page }) => {
               sources?: Array<{ mediaId: string }>;
               targets?: Array<{ mediaId: string }>;
               pairs?: Array<{ sourceMediaId: string; targetMediaId: string }>;
+              versionReuseGroups?: Array<{
+                groupId: string;
+                side: "source" | "target";
+                mediaIds: string[];
+              }>;
             };
             const sources = request.sources ?? [];
             const targets = request.targets ?? [];
@@ -767,12 +774,16 @@ test.beforeEach(async ({ page }) => {
               })
             );
             const snapshot = {
-              schemaVersion: 1,
-              evidenceVersion: 4,
+              schemaVersion: 2,
+              evidenceVersion: 5,
               jobId,
               pairingMode,
               sourceMediaIds: sources.map((media) => media.mediaId),
               targetMediaIds: targets.map((media) => media.mediaId),
+              versionReuseGroups: (request.versionReuseGroups ?? []).map((group, index) => ({
+                groupOrdinal: index + 1,
+                ...group
+              })),
               status: "completed",
               progress: 1,
               message: "批量分析完成",
@@ -1016,7 +1027,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   });
 });
 
-test("Evidence v4 未决、资源阻断与后端第二选择均失败关闭", async ({ page }) => {
+test("Evidence v5 未决、资源阻断与后端第二选择均失败关闭", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "批量导入原片素材" }).click();
   await page.getByRole("button", { name: "批量导入 B 站参考素材" }).click();

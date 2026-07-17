@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// One full normalized score in fixed-point micros.
-pub const FINE_FRONTIER_CONTRACT_VERSION: &str = "alignment-v2-adaptive-fine-frontier-v2";
+pub const FINE_FRONTIER_CONTRACT_VERSION: &str = "alignment-v2-adaptive-fine-frontier-v3";
 pub const SCORE_MICROS_ONE: u32 = 1_000_000;
 const CANCEL_CHECK_STRIDE: usize = 256;
 
@@ -80,6 +80,11 @@ pub struct PhysicalInterval {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalAxisOccupancy {
     pub space_ordinal: u32,
+    /// Explicit opposite-side version cohort that is allowed to reuse this
+    /// physical interval. `None` preserves exclusive occupancy. A non-zero
+    /// ordinal is meaningful only when both candidates carry the same value;
+    /// callers must prove that cohort members are distinct physical media.
+    pub reuse_group_ordinal: Option<u32>,
     pub intervals: Vec<PhysicalInterval>,
 }
 
@@ -326,6 +331,10 @@ pub enum FineFrontierError {
         axis: PhysicalAxisKind,
         space_ordinal: u32,
     },
+    InvalidReuseGroupOrdinal {
+        id: FineCandidateId,
+        axis: PhysicalAxisKind,
+    },
     NonCanonicalPhysicalIntervals {
         id: FineCandidateId,
         axis: PhysicalAxisKind,
@@ -558,6 +567,9 @@ fn validate_axis_occupancy(
     total_intervals: &mut usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), FineFrontierError> {
+    if occupancy.reuse_group_ordinal == Some(0) {
+        return Err(FineFrontierError::InvalidReuseGroupOrdinal { id, axis });
+    }
     if occupancy.intervals.is_empty() {
         return Err(FineFrontierError::EmptyPhysicalAxisOccupancy {
             id,
@@ -983,6 +995,7 @@ fn physical_occupancy_conflicts(
         (&left_occupancy.target, &right_occupancy.target),
     ] {
         if left_axis.space_ordinal == right_axis.space_ordinal
+            && !axis_reuse_is_explicitly_shared(left_axis, right_axis)
             && canonical_intervals_conflict(
                 &left_axis.intervals,
                 &right_axis.intervals,
@@ -994,6 +1007,14 @@ fn physical_occupancy_conflicts(
         }
     }
     Ok(false)
+}
+
+fn axis_reuse_is_explicitly_shared(
+    left: &PhysicalAxisOccupancy,
+    right: &PhysicalAxisOccupancy,
+) -> bool {
+    left.reuse_group_ordinal
+        .is_some_and(|group| right.reuse_group_ordinal == Some(group))
 }
 
 fn canonical_intervals_conflict(
@@ -1433,10 +1454,12 @@ mod tests {
         candidate.physical_occupancy = Some(PairPhysicalOccupancy {
             source: PhysicalAxisOccupancy {
                 space_ordinal: source_space_ordinal,
+                reuse_group_ordinal: None,
                 intervals: source_intervals,
             },
             target: PhysicalAxisOccupancy {
                 space_ordinal: target_space_ordinal,
+                reuse_group_ordinal: None,
                 intervals: target_intervals,
             },
         });
@@ -1459,10 +1482,12 @@ mod tests {
             .get_or_insert_with(|| PairPhysicalOccupancy {
                 source: PhysicalAxisOccupancy {
                     space_ordinal,
+                    reuse_group_ordinal: None,
                     intervals: vec![PhysicalInterval { start_ms, end_ms }],
                 },
                 target: PhysicalAxisOccupancy {
                     space_ordinal: fallback_target_space,
+                    reuse_group_ordinal: None,
                     intervals: vec![PhysicalInterval {
                         start_ms: 0,
                         end_ms: 1,
@@ -1471,8 +1496,19 @@ mod tests {
             });
         occupancy.source = PhysicalAxisOccupancy {
             space_ordinal,
+            reuse_group_ordinal: None,
             intervals: vec![PhysicalInterval { start_ms, end_ms }],
         };
+        candidate
+    }
+
+    fn with_source_reuse_group(mut candidate: FineCandidate, group_ordinal: u32) -> FineCandidate {
+        candidate
+            .physical_occupancy
+            .as_mut()
+            .expect("test candidate must have occupancy")
+            .source
+            .reuse_group_ordinal = Some(group_ordinal);
         candidate
     }
 
@@ -1497,6 +1533,7 @@ mod tests {
         .iter()
         .any(|(left_axis, right_axis)| {
             left_axis.space_ordinal == right_axis.space_ordinal
+                && !axis_reuse_is_explicitly_shared(left_axis, right_axis)
                 && left_axis.intervals.iter().any(|left_interval| {
                     right_axis.intervals.iter().any(|right_interval| {
                         let overlap_start = left_interval.start_ms.max(right_interval.start_ms);
@@ -2029,6 +2066,60 @@ mod tests {
             analyze_fine_frontier(&over_tolerance, FineFrontierConfig::default()).unwrap();
         assert_eq!(blocked.best_completed.candidate_ids, vec![id(0, 0)]);
         assert_eq!(blocked.best_completed.total_score_micros, 600_000);
+    }
+
+    #[test]
+    fn explicit_same_version_group_allows_shared_physical_interval() {
+        let shared = FineCandidateInventory {
+            candidates: vec![
+                with_source_reuse_group(
+                    with_source_interval(scored(0, 0, 600_000, 600_000), 42, 0, 1_000),
+                    7,
+                ),
+                with_source_reuse_group(
+                    with_source_interval(scored(1, 0, 500_000, 500_000), 42, 100, 1_100),
+                    7,
+                ),
+            ],
+        };
+        let outcome = analyze_fine_frontier(&shared, FineFrontierConfig::default()).unwrap();
+        assert_eq!(
+            outcome.best_completed.candidate_ids,
+            vec![id(0, 0), id(1, 0)]
+        );
+        assert_eq!(outcome.best_completed.total_score_micros, 1_100_000);
+
+        let mismatched = FineCandidateInventory {
+            candidates: vec![
+                with_source_reuse_group(
+                    with_source_interval(scored(0, 0, 600_000, 600_000), 42, 0, 1_000),
+                    7,
+                ),
+                with_source_reuse_group(
+                    with_source_interval(scored(1, 0, 500_000, 500_000), 42, 100, 1_100),
+                    8,
+                ),
+            ],
+        };
+        let outcome = analyze_fine_frontier(&mismatched, FineFrontierConfig::default()).unwrap();
+        assert_eq!(outcome.best_completed.candidate_ids, vec![id(0, 0)]);
+    }
+
+    #[test]
+    fn zero_reuse_group_is_rejected() {
+        let inventory = FineCandidateInventory {
+            candidates: vec![with_source_reuse_group(
+                with_source_interval(scored(0, 0, 600_000, 600_000), 42, 0, 1_000),
+                0,
+            )],
+        };
+        assert!(matches!(
+            analyze_fine_frontier(&inventory, FineFrontierConfig::default()),
+            Err(FineFrontierError::InvalidReuseGroupOrdinal {
+                axis: PhysicalAxisKind::Source,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -100,10 +100,23 @@ export interface TauriAudioAlignmentBatchPair {
   targetMediaId: string;
 }
 
+export type AudioAlignmentBatchVersionGroupSide = "source" | "target";
+
+export interface AudioAlignmentBatchVersionReuseGroup {
+  groupId: string;
+  side: AudioAlignmentBatchVersionGroupSide;
+  mediaIds: string[];
+}
+
+export interface AudioAlignmentBatchVersionReuseGroupSnapshot extends AudioAlignmentBatchVersionReuseGroup {
+  groupOrdinal: number;
+}
+
 export interface TauriAudioAlignmentBatchRequest {
   sources: TauriAudioAlignmentBatchMedia[];
   targets: TauriAudioAlignmentBatchMedia[];
   pairs?: TauriAudioAlignmentBatchPair[];
+  versionReuseGroups?: AudioAlignmentBatchVersionReuseGroup[];
   ffmpegPath: string | null;
   ffprobePath?: string | null;
   spectralBackend?: SpectralBackendPreference;
@@ -119,11 +132,12 @@ export interface TauriAudioAlignmentBatchRequest {
 
 export interface NormalizedTauriAudioAlignmentBatchRequest extends Omit<
   TauriAudioAlignmentBatchRequest,
-  "sources" | "targets" | "ffprobePath" | "spectralBackend"
+  "sources" | "targets" | "ffprobePath" | "spectralBackend" | "versionReuseGroups"
 > {
-  schemaVersion: 1;
+  schemaVersion: 2;
   sources: Required<TauriAudioAlignmentBatchMedia>[];
   targets: Required<TauriAudioAlignmentBatchMedia>[];
+  versionReuseGroups: AudioAlignmentBatchVersionReuseGroup[];
   ffprobePath: string | null;
   spectralBackend: SpectralBackendPreference;
 }
@@ -212,7 +226,7 @@ export interface AudioAlignmentBatchSpectralBackendIdentitySnapshot {
 }
 
 export const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION =
-  "alignment-v2-adaptive-fine-frontier-v2" as const;
+  "alignment-v2-adaptive-fine-frontier-v3" as const;
 export const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION =
   "alignment-v2-coarse-upper-times-confidence-v1" as const;
 
@@ -224,6 +238,8 @@ export interface AudioAlignmentBatchFineCandidateIdSnapshot {
 export interface AudioAlignmentBatchFineInventoryCandidateSnapshot {
   id: AudioAlignmentBatchFineCandidateIdSnapshot;
   coarseUpperBoundMicros: number;
+  sourceAxisReuseGroupOrdinal: number | null;
+  targetAxisReuseGroupOrdinal: number | null;
   members: AudioAlignmentBatchRelationCandidateSnapshot[];
 }
 
@@ -272,10 +288,7 @@ export interface AudioAlignmentBatchFineLimitsSnapshot {
 }
 
 export type AudioAlignmentBatchFineFrontierState =
-  | "resolved"
-  | "noEligibleCandidate"
-  | "unresolved"
-  | "failed";
+  "resolved" | "noEligibleCandidate" | "unresolved" | "failed";
 
 export interface AudioAlignmentBatchFineFrontierReceiptSnapshot {
   contractVersion: typeof AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION;
@@ -359,12 +372,13 @@ export interface AudioAlignmentBatchRelationRankingSnapshot {
 }
 
 export interface AudioAlignmentBatchJobSnapshot {
-  schemaVersion: 1;
-  evidenceVersion: 4;
+  schemaVersion: 2;
+  evidenceVersion: 5;
   jobId: string;
   pairingMode: AudioAlignmentBatchPairingMode;
   sourceMediaIds: string[];
   targetMediaIds: string[];
+  versionReuseGroups: AudioAlignmentBatchVersionReuseGroupSnapshot[];
   status: AudioAlignmentJobStatus;
   progress: number;
   message: string;
@@ -553,19 +567,79 @@ function normalizeAudioAlignmentBatchRequest(
         new Set(targets.map((item) => item.mediaId))
       )
     : undefined;
+  const versionReuseGroups = normalizeVersionReuseGroups(
+    request.versionReuseGroups ?? [],
+    sources.map((item) => item.mediaId),
+    targets.map((item) => item.mediaId)
+  );
   if ((pairs?.length ?? sources.length * targets.length) > 256) {
     throw new Error("批量音频对齐一次最多分析 256 个素材组合。");
   }
   return {
     ...request,
-    schemaVersion: 1,
+    schemaVersion: 2,
     sources,
     targets,
     ...(pairs ? { pairs } : {}),
+    versionReuseGroups,
     ffprobePath: request.ffprobePath ?? null,
     spectralBackend: normalizeTauriSpectralBackendPreference(request.spectralBackend),
     localizationMode: true
   };
+}
+
+function normalizeVersionReuseGroups(
+  groups: readonly AudioAlignmentBatchVersionReuseGroup[],
+  sourceMediaIds: readonly string[],
+  targetMediaIds: readonly string[]
+): AudioAlignmentBatchVersionReuseGroup[] {
+  const sourceOrder = new Map(sourceMediaIds.map((mediaId, index) => [mediaId, index]));
+  const targetOrder = new Map(targetMediaIds.map((mediaId, index) => [mediaId, index]));
+  const seenGroupIds = new Set<string>();
+  const groupedMedia = new Set<string>();
+  const normalized = groups.map((group) => {
+    const groupId = group.groupId.trim();
+    if (
+      !/^[A-Za-z0-9._:-]+$/.test(groupId) ||
+      new TextEncoder().encode(groupId).byteLength > 160
+    ) {
+      throw new Error("多版本组标识必须是最多 160 bytes 的字母数字/._:-。");
+    }
+    if (seenGroupIds.has(groupId)) {
+      throw new Error(`多版本组标识不能重复：${groupId}`);
+    }
+    seenGroupIds.add(groupId);
+    if (group.side !== "source" && group.side !== "target") {
+      throw new Error(`多版本组 ${groupId} 的 side 无效。`);
+    }
+    if (!Array.isArray(group.mediaIds) || group.mediaIds.length < 2) {
+      throw new Error(`多版本组 ${groupId} 至少需要两个不同媒体。`);
+    }
+    const order = group.side === "source" ? sourceOrder : targetOrder;
+    const seenMembers = new Set<string>();
+    const mediaIds = group.mediaIds.map((value) => value.trim());
+    for (const mediaId of mediaIds) {
+      if (!order.has(mediaId)) {
+        throw new Error(`多版本组 ${groupId} 引用了错误侧或不存在的媒体：${mediaId}`);
+      }
+      if (seenMembers.has(mediaId)) {
+        throw new Error(`多版本组 ${groupId} 包含重复媒体：${mediaId}`);
+      }
+      seenMembers.add(mediaId);
+      const membershipKey = `${group.side}\u0000${mediaId}`;
+      if (groupedMedia.has(membershipKey)) {
+        throw new Error(`媒体 ${mediaId} 不能同时属于同一侧的多个多版本组。`);
+      }
+      groupedMedia.add(membershipKey);
+    }
+    mediaIds.sort((left, right) => (order.get(left) ?? 0) - (order.get(right) ?? 0));
+    return { groupId, side: group.side, mediaIds };
+  });
+  return normalized.sort(
+    (left, right) =>
+      (left.side === "source" ? 0 : 1) - (right.side === "source" ? 0 : 1) ||
+      left.groupId.localeCompare(right.groupId)
+  );
 }
 
 export function normalizeTauriSpectralBackendPreference(
@@ -654,7 +728,14 @@ function validateStartedAudioAlignmentBatchSnapshot(
   if (
     snapshot.pairingMode !== expectedPairingMode ||
     !sameOrderedStrings(snapshot.sourceMediaIds, expectedSourceIds) ||
-    !sameOrderedStrings(snapshot.targetMediaIds, expectedTargetIds)
+    !sameOrderedStrings(snapshot.targetMediaIds, expectedTargetIds) ||
+    !sameVersionReuseGroups(
+      snapshot.versionReuseGroups,
+      request.versionReuseGroups.map((group, index) => ({
+        ...group,
+        groupOrdinal: index + 1
+      }))
+    )
   ) {
     throw new Error(
       "原生批任务启动响应未绑定本次请求的 fullCartesian pairingMode 或媒体 inventory。"
@@ -680,6 +761,22 @@ function validateStartedAudioAlignmentBatchSnapshot(
   }
 }
 
+function sameVersionReuseGroups(
+  left: readonly AudioAlignmentBatchVersionReuseGroupSnapshot[],
+  right: readonly AudioAlignmentBatchVersionReuseGroupSnapshot[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (group, index) =>
+        group.groupOrdinal === right[index]?.groupOrdinal &&
+        group.groupId === right[index]?.groupId &&
+        group.side === right[index]?.side &&
+        sameOrderedStrings(group.mediaIds, right[index]?.mediaIds ?? [])
+    )
+  );
+}
+
 function sameOrderedStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -698,12 +795,15 @@ export function createAudioAlignmentBatchFineParametersHash(
   featureVersion: string,
   legacyParametersHash: string
 ): `sha256:${string}` {
-  return createAudioAlignmentBatchV3Digest(AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN, {
-    engineVersion,
-    featureVersion,
-    fineScoreVersion: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
-    legacyParametersHash
-  });
+  return createAudioAlignmentBatchV3Digest(
+    AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN,
+    {
+      engineVersion,
+      featureVersion,
+      fineScoreVersion: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+      legacyParametersHash
+    }
+  );
 }
 
 export function createAudioAlignmentBatchFineExecutionEvidenceDigest(
@@ -733,10 +833,7 @@ export function createAudioAlignmentBatchFineInventoryDigest(
   );
 }
 
-function createAudioAlignmentBatchV3Digest(
-  domain: string,
-  value: unknown
-): `sha256:${string}` {
+function createAudioAlignmentBatchV3Digest(domain: string, value: unknown): `sha256:${string}` {
   return `sha256:${sha256Hex(`${domain}\n${canonicalRuntimeJson(value)}`)}`;
 }
 
@@ -752,7 +849,7 @@ function validateAudioAlignmentBatchJobSnapshot(
   value: unknown,
   expectedJobId?: string
 ): AudioAlignmentBatchJobSnapshot {
-  if (!isRecord(value) || value.schemaVersion !== 1) {
+  if (!isRecord(value) || value.schemaVersion !== 2) {
     throw new Error("原生批任务返回了不支持的响应结构或 schemaVersion。");
   }
   requireRuntimeExactKeys(
@@ -764,6 +861,7 @@ function validateAudioAlignmentBatchJobSnapshot(
       "pairingMode",
       "sourceMediaIds",
       "targetMediaIds",
+      "versionReuseGroups",
       "status",
       "progress",
       "message",
@@ -777,7 +875,7 @@ function validateAudioAlignmentBatchJobSnapshot(
     ],
     "原生批任务响应"
   );
-  if (value.evidenceVersion !== 4) {
+  if (value.evidenceVersion !== 5) {
     throw new Error("原生批任务返回了不支持的 evidenceVersion。");
   }
   const jobId = requireRuntimeText(value.jobId, "批任务 jobId");
@@ -800,6 +898,12 @@ function validateAudioAlignmentBatchJobSnapshot(
   if (sourceMediaIds.some((mediaId) => targetMediaIds.includes(mediaId))) {
     throw new Error("原生批任务响应的两侧媒体 inventory 必须全局唯一。");
   }
+  const versionReuseGroups = validateVersionReuseGroupSnapshots(
+    value.versionReuseGroups,
+    sourceMediaIds,
+    targetMediaIds,
+    "批任务多版本复用组"
+  );
   const status = requireRuntimeJobStatus(value.status, "批任务状态");
   requireRuntimeProgress(value.progress, "批任务进度");
   requireRuntimeText(value.message, "批任务消息");
@@ -844,6 +948,7 @@ function validateAudioAlignmentBatchJobSnapshot(
       new Set(targetMediaIds)
     )
   );
+  validatePairVersionReuseOrdinals(pairs, versionReuseGroups);
   validateAudioAlignmentBatchFineComponentCoherence(pairs);
   if (pairingMode === "fullCartesian") {
     pairs.forEach((pair, index) => {
@@ -896,6 +1001,33 @@ function validateAudioAlignmentBatchJobSnapshot(
   }
   requireRuntimeInteger(value.updatedAtMs, "批任务更新时间", 0, Number.MAX_SAFE_INTEGER);
   return value as unknown as AudioAlignmentBatchJobSnapshot;
+}
+
+function validatePairVersionReuseOrdinals(
+  pairs: readonly AudioAlignmentBatchPairSnapshot[],
+  groups: readonly AudioAlignmentBatchVersionReuseGroupSnapshot[]
+): void {
+  for (const pair of pairs) {
+    const sourceAxisReuseGroupOrdinal =
+      groups.find(
+        (group) => group.side === "target" && group.mediaIds.includes(pair.targetMediaId)
+      )?.groupOrdinal ?? null;
+    const targetAxisReuseGroupOrdinal =
+      groups.find(
+        (group) => group.side === "source" && group.mediaIds.includes(pair.sourceMediaId)
+      )?.groupOrdinal ?? null;
+    for (const candidate of pair.fineFrontier?.inventoryCandidates ?? []) {
+      if (candidate.id.pairOrdinal !== pair.pairOrdinal) continue;
+      if (
+        candidate.sourceAxisReuseGroupOrdinal !== sourceAxisReuseGroupOrdinal ||
+        candidate.targetAxisReuseGroupOrdinal !== targetAxisReuseGroupOrdinal
+      ) {
+        throw new Error(
+          `第 ${pair.pairOrdinal} 个 pair 的 fine inventory 多版本复用组 ordinal 未绑定批次策略。`
+        );
+      }
+    }
+  }
 }
 
 function validateAudioAlignmentBatchPairSnapshot(
@@ -1051,15 +1183,15 @@ const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_STATES = [
 ] as const;
 
 const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-frontier-receipt/v2";
+  "audio-alignment-v5/fine-frontier-receipt/v3";
 const AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-frontier-inventory/v2";
+  "audio-alignment-v5/fine-frontier-inventory/v3";
 const AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-execution-evidence/v1";
+  "audio-alignment-v5/fine-execution-evidence/v2";
 const AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN =
-  "audio-alignment-v4/proposal-time-map/v1";
+  "audio-alignment-v5/proposal-time-map/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-parameters/v1";
+  "audio-alignment-v5/fine-parameters/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_SAMPLE_RATE = 16_000;
 const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_MICROS_ONE = 1_000_000;
 const AUDIO_ALIGNMENT_BATCH_FINE_WINDOW_DECODE_TOLERANCE_MS = 50;
@@ -1415,7 +1547,10 @@ function validateAudioAlignmentBatchFineExecutionEvidence(
   ) {
     throw new Error(`${label}.evidenceDigest 与 canonical evidence 不一致。`);
   }
-  return { ...(value as unknown as AudioAlignmentBatchFineExecutionEvidenceSnapshot), candidateId };
+  return {
+    ...(value as unknown as AudioAlignmentBatchFineExecutionEvidenceSnapshot),
+    candidateId
+  };
 }
 
 function validateAudioAlignmentBatchFinePairBinding(
@@ -1451,7 +1586,11 @@ function validateAudioAlignmentBatchFinePairBinding(
     }
     return;
   }
-  if (status !== "completed" || execution === null || !sameFineCandidateId(selectedForPair[0], execution.candidateId)) {
+  if (
+    status !== "completed" ||
+    execution === null ||
+    !sameFineCandidateId(selectedForPair[0], execution.candidateId)
+  ) {
     throw new Error(`${label} 第二次 assignment 与 fineExecutionEvidence 不一致。`);
   }
   const identity = relationRanking.executionIdentity;
@@ -1663,7 +1802,12 @@ function validateAudioAlignmentBatchFineSearch(
     ["statesVisited", "expansionsConsidered", "intervalComparisons"],
     label
   );
-  requireRuntimeInteger(value.statesVisited, `${label}.statesVisited`, 0, limits.maxSearchStates);
+  requireRuntimeInteger(
+    value.statesVisited,
+    `${label}.statesVisited`,
+    0,
+    limits.maxSearchStates
+  );
   requireRuntimeInteger(
     value.expansionsConsidered,
     `${label}.expansionsConsidered`,
@@ -1803,7 +1947,17 @@ function validateAudioAlignmentBatchFineInventoryCandidates(
   const candidates = value.map((item, index) => {
     const candidateLabel = `${label}[${index}]`;
     if (!isRecord(item)) throw new Error(`${candidateLabel} 不是对象。`);
-    requireRuntimeExactKeys(item, ["id", "coarseUpperBoundMicros", "members"], candidateLabel);
+    requireRuntimeExactKeys(
+      item,
+      [
+        "id",
+        "coarseUpperBoundMicros",
+        "sourceAxisReuseGroupOrdinal",
+        "targetAxisReuseGroupOrdinal",
+        "members"
+      ],
+      candidateLabel
+    );
     const id = validateAudioAlignmentBatchFineCandidateId(
       item.id,
       `${candidateLabel}.id`,
@@ -1815,6 +1969,18 @@ function validateAudioAlignmentBatchFineInventoryCandidates(
       0,
       AUDIO_ALIGNMENT_BATCH_FINE_SCORE_MICROS_ONE
     );
+    const sourceAxisReuseGroupOrdinal = requireRuntimeNullableInteger(
+      item.sourceAxisReuseGroupOrdinal,
+      `${candidateLabel}.sourceAxisReuseGroupOrdinal`,
+      1,
+      Number.MAX_SAFE_INTEGER
+    );
+    const targetAxisReuseGroupOrdinal = requireRuntimeNullableInteger(
+      item.targetAxisReuseGroupOrdinal,
+      `${candidateLabel}.targetAxisReuseGroupOrdinal`,
+      1,
+      Number.MAX_SAFE_INTEGER
+    );
     if (!Array.isArray(item.members) || item.members.length === 0) {
       throw new Error(`${candidateLabel}.members 必须是非空数组。`);
     }
@@ -1825,10 +1991,20 @@ function validateAudioAlignmentBatchFineInventoryCandidates(
         Number.MAX_SAFE_INTEGER
       )
     );
-    if (members.some((member, memberIndex) => memberIndex > 0 && member.rank <= members[memberIndex - 1].rank)) {
+    if (
+      members.some(
+        (member, memberIndex) => memberIndex > 0 && member.rank <= members[memberIndex - 1].rank
+      )
+    ) {
       throw new Error(`${candidateLabel}.members 必须按 rank 严格递增。`);
     }
-    return { id, coarseUpperBoundMicros, members };
+    return {
+      id,
+      coarseUpperBoundMicros,
+      sourceAxisReuseGroupOrdinal,
+      targetAxisReuseGroupOrdinal,
+      members
+    };
   });
   const ids = candidates.map((candidate) => candidate.id);
   const canonical = [...ids].sort(compareFineCandidateId);
@@ -1842,12 +2018,16 @@ function validateAudioAlignmentBatchFineInventoryCandidates(
     const pairCandidates = candidates.filter(
       (candidate) => candidate.id.pairOrdinal === pairOrdinal
     );
+    const first = pairCandidates[0];
     if (
       pairCandidates.some(
-        (candidate, index) => candidate.id.candidateOrdinal !== index + 1
+        (candidate, index) =>
+          candidate.id.candidateOrdinal !== index + 1 ||
+          candidate.sourceAxisReuseGroupOrdinal !== first?.sourceAxisReuseGroupOrdinal ||
+          candidate.targetAxisReuseGroupOrdinal !== first?.targetAxisReuseGroupOrdinal
       )
     ) {
-      throw new Error(`${label} 的每个 pair 必须从 candidateOrdinal=1 连续完整枚举。`);
+      throw new Error(`${label} 的每个 pair 必须连续完整枚举且版本复用组保持一致。`);
     }
   }
   return candidates;
@@ -1927,7 +2107,10 @@ function sameFineCandidateIds(
   left: readonly AudioAlignmentBatchFineCandidateIdSnapshot[],
   right: readonly AudioAlignmentBatchFineCandidateIdSnapshot[]
 ): boolean {
-  return left.length === right.length && left.every((item, index) => sameFineCandidateId(item, right[index]));
+  return (
+    left.length === right.length &&
+    left.every((item, index) => sameFineCandidateId(item, right[index]))
+  );
 }
 
 function validateAudioAlignmentBatchFineComponentCoherence(
@@ -1961,8 +2144,9 @@ function validateAudioAlignmentBatchFineComponentCoherence(
     });
     const executions = componentPairs
       .map((pair) => pair.fineExecutionEvidence)
-      .filter((evidence): evidence is AudioAlignmentBatchFineExecutionEvidenceSnapshot =>
-        evidence !== null
+      .filter(
+        (evidence): evidence is AudioAlignmentBatchFineExecutionEvidenceSnapshot =>
+          evidence !== null
       );
     if (
       frontier.resolved &&
@@ -2642,6 +2826,78 @@ function requireRuntimeIdArray(value: unknown, label: string): string[] {
     throw new Error(`${label} 包含重复媒体 ID。`);
   }
   return ids;
+}
+
+function validateVersionReuseGroupSnapshots(
+  value: unknown,
+  sourceMediaIds: readonly string[],
+  targetMediaIds: readonly string[],
+  label: string
+): AudioAlignmentBatchVersionReuseGroupSnapshot[] {
+  if (!Array.isArray(value)) throw new Error(`${label} 必须是数组。`);
+  const sourceOrder = new Map(sourceMediaIds.map((mediaId, index) => [mediaId, index]));
+  const targetOrder = new Map(targetMediaIds.map((mediaId, index) => [mediaId, index]));
+  const seenGroupIds = new Set<string>();
+  const groupedMedia = new Set<string>();
+  const groups = value.map((item, index) => {
+    const groupLabel = `${label}[${index}]`;
+    if (!isRecord(item)) throw new Error(`${groupLabel} 不是对象。`);
+    requireRuntimeExactKeys(item, ["groupOrdinal", "groupId", "side", "mediaIds"], groupLabel);
+    const groupOrdinal = requireRuntimeInteger(
+      item.groupOrdinal,
+      `${groupLabel}.groupOrdinal`,
+      1,
+      value.length
+    );
+    if (groupOrdinal !== index + 1) {
+      throw new Error(`${label} 必须按连续 groupOrdinal canonical 排序。`);
+    }
+    const groupId = requireRuntimeText(item.groupId, `${groupLabel}.groupId`);
+    if (
+      !/^[A-Za-z0-9._:-]+$/.test(groupId) ||
+      new TextEncoder().encode(groupId).byteLength > 160 ||
+      seenGroupIds.has(groupId)
+    ) {
+      throw new Error(`${groupLabel}.groupId 无效或重复。`);
+    }
+    seenGroupIds.add(groupId);
+    const side = requireRuntimeEnum(
+      item.side,
+      ["source", "target"] as const,
+      `${groupLabel}.side`
+    );
+    const order = side === "source" ? sourceOrder : targetOrder;
+    const mediaIds = requireRuntimeIdArray(item.mediaIds, `${groupLabel}.mediaIds`);
+    if (mediaIds.length < 2) {
+      throw new Error(`${groupLabel}.mediaIds 至少需要两个成员。`);
+    }
+    mediaIds.forEach((mediaId, memberIndex) => {
+      if (!order.has(mediaId)) {
+        throw new Error(`${groupLabel} 引用了错误侧或不存在的媒体。`);
+      }
+      if (
+        memberIndex > 0 &&
+        (order.get(mediaIds[memberIndex - 1] ?? "") ?? -1) >= (order.get(mediaId) ?? -1)
+      ) {
+        throw new Error(`${groupLabel}.mediaIds 未按媒体 inventory canonical 排序。`);
+      }
+      const membershipKey = `${side}\u0000${mediaId}`;
+      if (groupedMedia.has(membershipKey)) {
+        throw new Error(`${groupLabel} 的媒体重复出现在多个同侧版本组。`);
+      }
+      groupedMedia.add(membershipKey);
+    });
+    return { groupOrdinal, groupId, side, mediaIds };
+  });
+  const canonical = [...groups].sort(
+    (left, right) =>
+      (left.side === "source" ? 0 : 1) - (right.side === "source" ? 0 : 1) ||
+      left.groupId.localeCompare(right.groupId)
+  );
+  if (!sameVersionReuseGroups(groups, canonical)) {
+    throw new Error(`${label} 未按 side/groupId canonical 排序。`);
+  }
+  return groups;
 }
 
 function containsInvalidMediaIdCharacter(value: string): boolean {

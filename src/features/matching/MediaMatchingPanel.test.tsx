@@ -226,12 +226,13 @@ function createLegacyBatchSnapshot(
   ).length;
   const fineFrontier = createTestFineFrontier(pairs, status, fineOptions ?? {});
   return {
-    schemaVersion: 1,
-    evidenceVersion: 4,
+    schemaVersion: 2,
+    evidenceVersion: 5,
     jobId,
     pairingMode: "explicit",
     sourceMediaIds,
     targetMediaIds,
+    versionReuseGroups: [],
     status,
     progress:
       status === "running"
@@ -266,8 +267,10 @@ function createLegacyBatchSnapshot(
         fineFrontier:
           pair.snapshot.status === "completed" && status !== "running" ? fineFrontier : null,
         fineExecutionEvidence:
-          pair.snapshot.status === "completed" && status !== "running" && proposal?.timeMap
-          && fineFrontier.selectedCandidateIds.some(
+          pair.snapshot.status === "completed" &&
+          status !== "running" &&
+          proposal?.timeMap &&
+          fineFrontier.selectedCandidateIds.some(
             (candidateId) => candidateId.pairOrdinal === index + 1
           )
             ? createTestFineExecutionEvidence(index + 1, proposal)
@@ -353,8 +356,7 @@ function createTestFineFrontier(
   }, 0);
   const inventoryCandidateCount =
     options.inventoryCandidateCount ?? Math.max(candidatePairOrdinals.length, 1);
-  const inventoryPairOrdinals =
-    candidatePairOrdinals.length > 0 ? candidatePairOrdinals : [1];
+  const inventoryPairOrdinals = candidatePairOrdinals.length > 0 ? candidatePairOrdinals : [1];
   const inventoryCounts = new Map(inventoryPairOrdinals.map((pairOrdinal) => [pairOrdinal, 0]));
   for (let index = 0; index < inventoryCandidateCount; index += 1) {
     const pairOrdinal = inventoryPairOrdinals[index % inventoryPairOrdinals.length];
@@ -364,6 +366,8 @@ function createTestFineFrontier(
     Array.from({ length: inventoryCounts.get(pairOrdinal) ?? 0 }, (_, index) => ({
       id: { pairOrdinal, candidateOrdinal: index + 1 },
       coarseUpperBoundMicros: 900_000 - index,
+      sourceAxisReuseGroupOrdinal: null,
+      targetAxisReuseGroupOrdinal: null,
       members: [
         {
           rank: index + 1,
@@ -760,15 +764,14 @@ describe("多媒体自动匹配工作台", () => {
           { sourceMediaId: "source-long", targetMediaId: "target-ep1" },
           { sourceMediaId: "source-long", targetMediaId: "target-ep2" }
         ],
+        versionReuseGroups: [],
         spectralBackend: "auto",
         localizationMode: true
       })
     );
     expect(screen.getAllByTestId("media-match-candidate")).toHaveLength(2);
     expect(screen.getAllByText(/target-ep1 ← source-long/).length).toBeGreaterThan(0);
-    expect(useEditorStore.getState().status.message).toBe(
-      "批量匹配完成：2 组可逐项确认。"
-    );
+    expect(useEditorStore.getState().status.message).toBe("批量匹配完成：2 组可逐项确认。");
     expect(
       useEditorStore
         .getState()
@@ -830,6 +833,45 @@ describe("多媒体自动匹配工作台", () => {
     await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
       expect.objectContaining({ spectralBackend: "cuda" })
+    );
+  });
+
+  it("允许在匹配页为本次批次直接切换 CPU，不依赖重新打开设置", async () => {
+    render(<MatchingHarness />);
+
+    fireEvent.change(await screen.findByLabelText("本次匹配计算设备"), {
+      target: { value: "cpu" }
+    });
+    expect(screen.getByTestId("spectral-backend-policy")).toHaveTextContent(
+      "本次匹配完全禁用 CUDA"
+    );
+    fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+      expect.objectContaining({ spectralBackend: "cpu" })
+    );
+  });
+
+  it("多版本复用默认关闭，只有显式勾选后才把所选原片绑定为版本组", async () => {
+    render(<MatchingHarness />);
+
+    expect(screen.getByLabelText(/所选 B 站参考素材是同一内容的不同版本/)).toBeDisabled();
+    fireEvent.click(screen.getByText("高级：同一内容的多个版本"));
+    fireEvent.click(screen.getByLabelText(/所选原片素材是同一内容的不同版本/));
+    fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        versionReuseGroups: [
+          {
+            groupId: "selected-target-versions",
+            side: "target",
+            mediaIds: ["target-ep1", "target-ep2"]
+          }
+        ]
+      })
     );
   });
 
@@ -1007,7 +1049,9 @@ describe("多媒体自动匹配工作台", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
 
     await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("未完成分析"));
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("未完成分析")
+    );
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
       expect.objectContaining({
         pairs: [
@@ -1061,7 +1105,9 @@ describe("多媒体自动匹配工作台", () => {
       state: "pending",
       proposal: { timeMap: { quality: { level: "review", probability: 0.62 } } }
     });
-    expect(candidates.some((candidate) => candidate.sourceMediaId === "source-long")).toBe(false);
+    expect(candidates.some((candidate) => candidate.sourceMediaId === "source-long")).toBe(
+      false
+    );
     expect(useEditorStore.getState().status.message).toBe(
       "批量匹配完成：1 组可逐项确认，1 组暂不可确认。"
     );
@@ -1069,7 +1115,9 @@ describe("多媒体自动匹配工作台", () => {
     expect(
       within(taskList).getByText(/target-ep1 ← source-long-b .*已唯一确定/)
     ).toBeInTheDocument();
-    expect(within(taskList).getByText(/最终分配采用了同一组件中的另一组关系/)).toBeInTheDocument();
+    expect(
+      within(taskList).getByText(/最终分配采用了同一组件中的另一组关系/)
+    ).toBeInTheDocument();
     expect(screen.getByTestId("media-match-candidate")).toHaveTextContent(
       "target-ep1 ← source-long-b"
     );
@@ -1147,7 +1195,9 @@ describe("多媒体自动匹配工作台", () => {
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("暂不可确认"));
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("暂不可确认")
+    );
 
     expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
     expect(useEditorStore.getState().status.message).toBe(
@@ -1171,7 +1221,9 @@ describe("多媒体自动匹配工作台", () => {
     render(<MatchingHarness />);
 
     fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
-    await waitFor(() => expect(useEditorStore.getState().status.message).toContain("未完成分析"));
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("未完成分析")
+    );
 
     expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
     const taskList = screen.getByLabelText("批量匹配任务");
@@ -1326,14 +1378,15 @@ describe("多媒体自动匹配工作台", () => {
     ).toBeInTheDocument();
   });
 
-  it("明确说明 Evidence v3 发布边界，并且不提供批量确认", async () => {
+  it("明确说明 Evidence v5 发布边界，并且不提供批量确认", async () => {
     render(<MatchingHarness />);
 
     const warning = screen.getByTestId("legacy-alignment-warning");
     expect(warning).toHaveTextContent("未决结果不会进入候选");
     expect(warning).toHaveTextContent("可用资源不足");
     expect(warning).toHaveTextContent("仍需逐项试听或预览复核");
-    expect(warning).toHaveTextContent("Evidence v3");
+    expect(warning).toHaveTextContent("Evidence v5");
+    expect(warning).toHaveTextContent("显式多版本复用策略");
     expect(warning).toHaveTextContent("前端不会再次求解");
     expect(screen.queryByText(/高可信候选/)).not.toBeInTheDocument();
 

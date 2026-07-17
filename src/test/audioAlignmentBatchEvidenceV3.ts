@@ -42,6 +42,8 @@ export function createTestFineExecutionEvidence(
     targetCoarseBackend?: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
     sourceFineBackend?: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
     targetFineBackend?: AudioAlignmentBatchSpectralBackendIdentitySnapshot;
+    selectedMemberRank?: number;
+    groupMemberRanks?: number[];
   } = {}
 ): AudioAlignmentBatchFineExecutionEvidenceSnapshot {
   const pairOrdinal = options.pairOrdinal ?? 1;
@@ -64,8 +66,8 @@ export function createTestFineExecutionEvidence(
   const targetRequestedWindow = createWindow(timeMap.targetStartMs, timeMap.targetEndMs, false);
   const draft: AudioAlignmentBatchFineExecutionEvidenceSnapshot = {
     candidateId: { pairOrdinal, candidateOrdinal },
-    selectedMemberRank: 1,
-    groupMemberRanks: [1],
+    selectedMemberRank: options.selectedMemberRank ?? 1,
+    groupMemberRanks: [...(options.groupMemberRanks ?? [1])],
     sourceStreamIndex,
     targetStreamIndex,
     sourceCoarseBackend: { ...sourceCoarseBackend },
@@ -96,7 +98,8 @@ function requireTestLockedFineBackend(
   coarse: AudioAlignmentBatchSpectralBackendIdentitySnapshot
 ): AudioAlignmentBatchSpectralBackendIdentitySnapshot {
   const locked = deriveLockedFineSpectralBackendIdentity(coarse);
-  if (locked === null) throw new Error(`测试 coarse backend 无法锁定 fine：${coarse.backendId}`);
+  if (locked === null)
+    throw new Error(`测试 coarse backend 无法锁定 fine：${coarse.backendId}`);
   return locked;
 }
 
@@ -113,8 +116,9 @@ export function createTestFineFrontierReceipt(
   const selectedTotalScoreMicros = selectedCandidateIds.reduce(
     (sum, candidate) =>
       sum +
-      (options.scoreByCandidate?.get(`${candidate.pairOrdinal}:${candidate.candidateOrdinal}`) ??
-        900_000),
+      (options.scoreByCandidate?.get(
+        `${candidate.pairOrdinal}:${candidate.candidateOrdinal}`
+      ) ?? 900_000),
     0
   );
   const minimumInventoryCount = componentPairOrdinals.reduce(
@@ -137,10 +141,11 @@ export function createTestFineFrontierReceipt(
     inventoryCandidateCount,
     selectedCandidateIds
   );
-  const finalState = options.finalState ??
+  const finalState =
+    options.finalState ??
     (selectedCandidateIds.length > 0 ? "resolved" : "noEligibleCandidate");
   const resolved = finalState === "resolved";
-  if (resolved !== (selectedCandidateIds.length > 0)) {
+  if (resolved !== selectedCandidateIds.length > 0) {
     throw new Error("测试 fine frontier 的 resolved 状态与选择集合不一致。");
   }
   const draft: AudioAlignmentBatchFineFrontierReceiptSnapshot = {
@@ -234,6 +239,8 @@ function createTestFineInventoryCandidates(
     Array.from({ length: counts.get(pairOrdinal) ?? 0 }, (_, candidateIndex) => ({
       id: { pairOrdinal, candidateOrdinal: candidateIndex + 1 },
       coarseUpperBoundMicros: 900_000 - candidateIndex,
+      sourceAxisReuseGroupOrdinal: null,
+      targetAxisReuseGroupOrdinal: null,
       members: [
         {
           rank: candidateIndex + 1,

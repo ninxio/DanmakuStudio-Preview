@@ -948,7 +948,7 @@ function evaluatePairLocalFineEvidence(bundle: C137AcceptanceBundle): C137Accept
         "native-pair-local-many-to-many",
         manyToManyObserved > 0 ? "pass" : "incomplete",
         manyToManyObserved,
-        "冻结证据必须至少覆盖一个 selected temporal group 含多个 coarse member 的同段多版本/多候选场景"
+        "冻结证据必须至少覆盖一个显式多版本组：两个不同 pair 在同一 fine component 中同时入选，并在获准复用的物理轴上实际重叠超过容差；单 pair 多轨道成员不能冒充多对多"
       ),
       createCheck(
         "native-pair-local-bilateral-boundaries",

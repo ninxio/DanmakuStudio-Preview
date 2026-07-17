@@ -26,7 +26,8 @@ import type {
   RealMediaBlindBatchExecutionSuite,
   RealMediaBlindBatchPairOutcome,
   RealMediaBlindBatchRunReceipt,
-  RealMediaBlindBatchRunStatus
+  RealMediaBlindBatchRunStatus,
+  RealMediaBlindBatchVersionReuseGroupSnapshot
 } from "../../domain/alignment/realMediaBlindBatchContract";
 import {
   cancelTauriAudioAlignmentBatchJob,
@@ -36,6 +37,7 @@ import {
   type AudioAlignmentBatchJobInvoker,
   type AudioAlignmentBatchJobSnapshot,
   type AudioAlignmentBatchPairSnapshot,
+  type AudioAlignmentBatchVersionReuseGroupSnapshot,
   type AudioAlignmentJobStatus,
   type TauriAudioAlignmentBatchRequest
 } from "./tauriAudioAlignment";
@@ -74,7 +76,10 @@ export type {
   RealMediaBlindBatchRunStatus,
   RealMediaBlindBatchSourceRanking,
   RealMediaBlindBatchTargetRankedCandidate,
-  RealMediaBlindBatchTargetRanking
+  RealMediaBlindBatchTargetRanking,
+  RealMediaBlindBatchVersionGroupSide,
+  RealMediaBlindBatchVersionReuseGroup,
+  RealMediaBlindBatchVersionReuseGroupSnapshot
 } from "../../domain/alignment/realMediaBlindBatchContract";
 
 const NATIVE_BATCH_EVIDENCE_VERSION = REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION;
@@ -95,7 +100,7 @@ export interface RealMediaBlindBatchRunnerOptions {
 }
 
 interface NativeBatchEvidenceSnapshot extends AudioAlignmentBatchJobSnapshot {
-  evidenceVersion: 4;
+  evidenceVersion: 5;
   pairingMode: NativeBatchPairingMode;
   sourceMediaIds: string[];
   targetMediaIds: string[];
@@ -271,6 +276,11 @@ function createNativeBatchRequest(
       audioStreamIndex: media.audioStreamIndex,
       videoStreamIndex: media.videoStreamIndex
     })),
+    versionReuseGroups: suite.versionReuseGroups.map((group) => ({
+      groupId: group.groupId,
+      side: group.side,
+      mediaIds: [...group.mediaIds]
+    })),
     // Deliberately omit `pairs`: only the native fullCartesian planner can produce accepted proof.
     ffmpegPath: parameters.ffmpegPath,
     ffprobePath: parameters.ffprobePath,
@@ -317,6 +327,13 @@ function validateNativeBatchEvidenceSnapshot(
     targetMediaIds,
     suite.targets.map((media) => media.mediaId),
     "native targetMediaIds"
+  );
+  assertVersionReuseGroupsEqual(
+    value.versionReuseGroups,
+    suite.versionReuseGroups.map((group, index) => ({
+      ...group,
+      groupOrdinal: index + 1
+    }))
   );
   if (
     value.totalPairCount !== suite.pairs.length ||
@@ -383,7 +400,9 @@ function validateNativePairEvidence(
       (candidate) => candidate.pairOrdinal === expected.pairOrdinal
     );
     if (selectedForPair.length > 1) {
-      throw new Error(`native pair #${expected.pairOrdinal} 的第二次 assignment 对同一 pair 多选。`);
+      throw new Error(
+        `native pair #${expected.pairOrdinal} 的第二次 assignment 对同一 pair 多选。`
+      );
     }
     const proposal = value.proposal;
     if (selectedForPair.length === 0) {
@@ -475,6 +494,12 @@ function createReceiptWithoutDigest(
     targetCount: suite.targets.length,
     pairCount: suite.pairs.length,
     topK: suite.topK,
+    versionReuseGroups: terminal.snapshot.versionReuseGroups.map((group) => ({
+      groupOrdinal: group.groupOrdinal,
+      groupId: group.groupId,
+      side: group.side,
+      mediaIds: [...group.mediaIds]
+    })),
     pairOutcomes,
     sourceRankings,
     targetRankings
@@ -549,11 +574,7 @@ function validateRunnerOptions(
 }
 
 function requireProcessSessionId(value: string): string {
-  if (
-    value.length === 0 ||
-    value.length > 160 ||
-    !/^[A-Za-z0-9_.:-]+$/.test(value)
-  ) {
+  if (value.length === 0 || value.length > 160 || !/^[A-Za-z0-9_.:-]+$/.test(value)) {
     throw new Error("liveProcessAttestationSessionId 不是 canonical 标识。");
   }
   return value;
@@ -624,6 +645,30 @@ function assertStringArraysEqual(actual: string[], expected: string[], label: st
     actual.some((item, index) => item !== expected[index])
   ) {
     throw new Error(`${label} 与 execution suite 顺序/身份不一致。`);
+  }
+}
+
+function assertVersionReuseGroupsEqual(
+  actual: readonly AudioAlignmentBatchVersionReuseGroupSnapshot[],
+  expected: readonly RealMediaBlindBatchVersionReuseGroupSnapshot[]
+): void {
+  if (
+    actual.length !== expected.length ||
+    actual.some((group, index) => {
+      const expectedGroup = expected[index];
+      return (
+        expectedGroup === undefined ||
+        group.groupOrdinal !== expectedGroup.groupOrdinal ||
+        group.groupId !== expectedGroup.groupId ||
+        group.side !== expectedGroup.side ||
+        group.mediaIds.length !== expectedGroup.mediaIds.length ||
+        group.mediaIds.some(
+          (mediaId, memberIndex) => mediaId !== expectedGroup.mediaIds[memberIndex]
+        )
+      );
+    })
+  ) {
+    throw new Error("native versionReuseGroups 与 execution suite 多版本复用策略不一致。");
   }
 }
 

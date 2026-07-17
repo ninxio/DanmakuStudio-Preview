@@ -632,6 +632,7 @@ function createExecutionSuite(
       sourceMediaId: pair.sourceMediaId,
       targetMediaId: pair.targetMediaId
     })),
+    versionReuseGroups: [],
     parameters: structuredClone(parameters)
   };
 }

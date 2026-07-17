@@ -5,6 +5,7 @@ import {
   createNativeBatchExecutionIdentityDigest,
   createNativeBatchFineExecutionEvidenceDigest,
   createNativeBatchFineFrontierReceiptDigest,
+  createNativeBatchFineInventoryDigest,
   REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION,
   type NativeBatchExecutionIdentity
 } from "../../domain/alignment/realMediaBlindBatchContract";
@@ -85,7 +86,7 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(invoker.cancel).not.toHaveBeenCalled();
     const nativeRequest = vi.mocked(invoker.start).mock.calls[0]?.[0];
     expect(nativeRequest).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       sources: suite.sources.map((media) => ({
         mediaId: media.mediaId,
         path: media.path,
@@ -98,24 +99,26 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
         audioStreamIndex: media.audioStreamIndex,
         videoStreamIndex: media.videoStreamIndex
       })),
+      versionReuseGroups: [],
       localizationMode: true
     });
     expect(nativeRequest).not.toHaveProperty("pairs");
 
     expect(receipt).toMatchObject({
-      schemaVersion: 4,
+      schemaVersion: 5,
       receiptKind: "c137-real-media-blind-batch-run",
       suiteId: suite.suiteId,
       datasetVersion: suite.datasetVersion,
       executionDigest: createRealMediaBlindBatchExecutionDigest(suite),
-      nativeEvidenceVersion: 4,
+      nativeEvidenceVersion: 5,
       pairingMode: "fullCartesian",
       status: "completed",
       terminationReason: "native-terminal",
       sourceCount: 2,
       targetCount: 2,
       pairCount: 4,
-      topK: 2
+      topK: 2,
+      versionReuseGroups: []
     });
     expect(receipt.pairOutcomes).toHaveLength(4);
     expect(receipt.pairOutcomes.map((outcome) => outcome.globalSelected)).toEqual([
@@ -193,6 +196,46 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(serialized).not.toContain(suite.parameters.ffmpegPath);
     expect(serialized).not.toContain(suite.parameters.ffprobePath);
     expect(receipt.receiptDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
+  });
+
+  it("把显式多版本复用策略从 execution suite 传到 native 请求并封入 path-free receipt", async () => {
+    const suite = createSuite();
+    suite.versionReuseGroups = [
+      {
+        groupId: "target-versions",
+        side: "target",
+        mediaIds: ["target-1", "target-2"]
+      }
+    ];
+    const completed = bindSnapshotVersionReuseGroups(
+      createCompletedSnapshot(suite, [0.93, 0.71, 0.62, 0.88]),
+      suite
+    );
+    const invoker = createInvoker({ start: completed, get: [] });
+
+    const receipt = await runRealMediaBlindBatchSuite(suite, {
+      alignmentInvoker: invoker
+    });
+
+    expect(vi.mocked(invoker.start).mock.calls[0]?.[0].versionReuseGroups).toEqual(
+      suite.versionReuseGroups
+    );
+    expect(receipt.versionReuseGroups).toEqual([
+      {
+        groupOrdinal: 1,
+        groupId: "target-versions",
+        side: "target",
+        mediaIds: ["target-1", "target-2"]
+      }
+    ]);
+    expect(
+      receipt.pairOutcomes.every((outcome) =>
+        outcome.fineFrontier?.inventoryCandidates
+          .filter((candidate) => candidate.id.pairOrdinal === outcome.pairOrdinal)
+          .every((candidate) => candidate.sourceAxisReuseGroupOrdinal === 1)
+      )
+    ).toBe(true);
     expect(validateRealMediaBlindBatchRunReceipt(receipt, suite)).toEqual(receipt);
   });
 
@@ -453,6 +496,7 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
       pairs: suite.pairs.map((pair) => ({ ...pair })),
       targets: suite.targets.map((media) => ({ ...media })),
       sources: suite.sources.map((media) => ({ ...media })),
+      versionReuseGroups: suite.versionReuseGroups.map((group) => structuredClone(group)),
       topK: suite.topK,
       datasetVersion: suite.datasetVersion,
       suiteId: suite.suiteId,
@@ -919,7 +963,7 @@ function createSuite(sourceCount = 2, targetCount = 2): RealMediaBlindBatchExecu
     createMedia("target", index + 1, sourceCount + index + 1)
   );
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     suiteId: "blind-suite-1",
     datasetVersion: "frozen-v1",
     topK: Math.min(2, targetCount),
@@ -936,6 +980,7 @@ function createSuite(sourceCount = 2, targetCount = 2): RealMediaBlindBatchExecu
         targetMediaId: target.mediaId
       }))
     ),
+    versionReuseGroups: [],
     parameters: {
       ffmpegPath: "C:\\tools\\ffmpeg.exe",
       ffprobePath: "C:\\tools\\ffprobe.exe",
@@ -995,12 +1040,16 @@ function createRunningSnapshot(
     error: null
   }));
   return {
-    schemaVersion: 1,
-    evidenceVersion: 4,
+    schemaVersion: 2,
+    evidenceVersion: 5,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
     targetMediaIds: suite.targets.map((media) => media.mediaId),
+    versionReuseGroups: suite.versionReuseGroups.map((group, index) => ({
+      ...structuredClone(group),
+      groupOrdinal: index + 1
+    })),
     status: "running",
     progress: 0,
     message: "running",
@@ -1060,12 +1109,16 @@ function createCompletedSnapshot(
     };
   });
   return {
-    schemaVersion: 1,
-    evidenceVersion: 4,
+    schemaVersion: 2,
+    evidenceVersion: 5,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
     targetMediaIds: suite.targets.map((media) => media.mediaId),
+    versionReuseGroups: suite.versionReuseGroups.map((group, index) => ({
+      ...structuredClone(group),
+      groupOrdinal: index + 1
+    })),
     status: "completed",
     progress: 1,
     message: "completed",
@@ -1137,6 +1190,41 @@ function refreshPairFineExecution(pair: AudioAlignmentBatchPairSnapshot): void {
   });
 }
 
+function bindSnapshotVersionReuseGroups(
+  snapshot: AudioAlignmentBatchJobSnapshot,
+  suite: RealMediaBlindBatchExecutionSuite
+): AudioAlignmentBatchJobSnapshot {
+  snapshot.versionReuseGroups = suite.versionReuseGroups.map((group, index) => ({
+    ...structuredClone(group),
+    groupOrdinal: index + 1
+  }));
+  for (const pair of snapshot.pairs) {
+    const frontier = pair.fineFrontier;
+    if (frontier === null) continue;
+    for (const candidate of frontier.inventoryCandidates) {
+      const candidatePair = suite.pairs.find(
+        (registration) => registration.pairOrdinal === candidate.id.pairOrdinal
+      );
+      if (candidatePair === undefined) throw new Error("fixture pair registration missing");
+      candidate.sourceAxisReuseGroupOrdinal =
+        snapshot.versionReuseGroups.find(
+          (group) =>
+            group.side === "target" && group.mediaIds.includes(candidatePair.targetMediaId)
+        )?.groupOrdinal ?? null;
+      candidate.targetAxisReuseGroupOrdinal =
+        snapshot.versionReuseGroups.find(
+          (group) =>
+            group.side === "source" && group.mediaIds.includes(candidatePair.sourceMediaId)
+        )?.groupOrdinal ?? null;
+    }
+    frontier.inventoryDigest = createNativeBatchFineInventoryDigest(
+      frontier.inventoryCandidates
+    );
+    frontier.receiptDigest = createNativeBatchFineFrontierReceiptDigest(frontier);
+  }
+  return snapshot;
+}
+
 function createCancelledSnapshot(
   suite: RealMediaBlindBatchExecutionSuite
 ): AudioAlignmentBatchJobSnapshot {
@@ -1156,12 +1244,16 @@ function createCancelledSnapshot(
     error: null
   }));
   return {
-    schemaVersion: 1,
-    evidenceVersion: 4,
+    schemaVersion: 2,
+    evidenceVersion: 5,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
     targetMediaIds: suite.targets.map((media) => media.mediaId),
+    versionReuseGroups: suite.versionReuseGroups.map((group, index) => ({
+      ...structuredClone(group),
+      groupOrdinal: index + 1
+    })),
     status: "cancelled",
     progress: 1,
     message: "cancelled",

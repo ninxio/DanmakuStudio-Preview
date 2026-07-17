@@ -148,7 +148,7 @@ describe("C137 external authority proof", () => {
 
     const result = await verifyC137AuthorityProof(
       fixture.bundle,
-      legacyProof as unknown as C137AuthorityProofV2,
+      legacyProof,
       fixture.policy,
       new Date("2026-07-17T01:15:00.000Z")
     );

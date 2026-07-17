@@ -6,6 +6,7 @@ import {
   computeC137FormalBlindGoldDigest,
   computeC137FormalBlindManifestDigest,
   validateC137FormalBlindProvenance,
+  type C137FormalBlindProvenanceBatchEnvelopeV3,
   type C137FormalBlindProvenanceV3
 } from "./c137FormalBlindProvenance";
 import type {
@@ -16,14 +17,15 @@ import type {
 import type {
   NativeBatchFineCandidateId,
   NativeBatchFineDecodeWindow,
-  RealMediaBlindBatchPairOutcome
+  RealMediaBlindBatchPairOutcome,
+  RealMediaBlindBatchRunReceipt
 } from "./realMediaBlindBatchContract";
 import { mapSourceTime, type TimeMapSpan } from "./timeMap";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_PAIR_LOCAL_FINE_EVIDENCE_SCHEMA_VERSION = 2 as const;
+export const C137_PAIR_LOCAL_FINE_EVIDENCE_SCHEMA_VERSION = 3 as const;
 
-const EVIDENCE_DIGEST_DOMAIN = "c137-pair-local-fine-evidence-v2";
+const EVIDENCE_DIGEST_DOMAIN = "c137-pair-local-fine-evidence-v3";
 
 type C137PairLocalDigest = `sha256:${string}`;
 export type C137PairLocalEditKind = "sourceOnly" | "targetOnly" | "replacement";
@@ -68,6 +70,17 @@ export interface C137PairLocalTimeMapCaseEvidence {
   editDecisions: C137PairLocalEditDecisionEvidence[];
 }
 
+export interface C137PairLocalVersionReuseEvidence {
+  groupOrdinal: number;
+  groupId: string;
+  groupSide: "source" | "target";
+  reusedPhysicalAxis: "source" | "target";
+  sharedMediaId: string;
+  peerPairOrdinals: number[];
+  maximumOverlapMs: number;
+  overlapToleranceMs: number;
+}
+
 export interface C137DerivedTimeMapCaseEvidence {
   caseId: string;
   mediaKind: "real";
@@ -93,6 +106,7 @@ export interface C137PairLocalFineCaseEvidence {
   samePairAlternativeObserved: boolean;
   selectedGroupMemberCount: number;
   sameSegmentManyToManyObserved: boolean;
+  versionReuseEvidence: C137PairLocalVersionReuseEvidence | null;
   frontierResolutionProven: boolean;
   modality: C137PairLocalModalityEvidence | null;
   timeMap: C137PairLocalTimeMapCaseEvidence | null;
@@ -116,6 +130,7 @@ type C137PairLocalFineEvidenceDraft = Omit<C137PairLocalFineEvidence, "evidenceD
 
 interface LocatedPair {
   batchId: string;
+  batch: C137FormalBlindProvenanceBatchEnvelopeV3;
   outcome: RealMediaBlindBatchPairOutcome;
 }
 
@@ -260,6 +275,10 @@ function deriveCaseEvidence(
     issues.push("fine execution candidate 未绑定当前 pairOrdinal。");
   }
   const modality = deriveNativeModality(proposal, execution, issues);
+  const versionReuseEvidence = deriveC137PairLocalVersionReuseEvidence(
+    pair.batch.nativeReceipt,
+    outcome
+  );
 
   const timeMap = deriveTimeMapCase(benchmarkCase, proposal.spans);
   if (timeMap.matchedProjectionErrorsMs.length !== benchmarkCase.gold.matchedAnchors.length) {
@@ -286,7 +305,8 @@ function deriveCaseEvidence(
     completePairCandidateInventoryEnumerated: true,
     samePairAlternativeObserved: pairCandidateCount >= 2,
     selectedGroupMemberCount: execution.groupMemberRanks.length,
-    sameSegmentManyToManyObserved: execution.groupMemberRanks.length >= 2,
+    sameSegmentManyToManyObserved: versionReuseEvidence !== null,
+    versionReuseEvidence,
     frontierResolutionProven,
     modality,
     timeMap,
@@ -310,11 +330,155 @@ function blockedCase(caseId: string, issues: string[]): C137PairLocalFineCaseEvi
     samePairAlternativeObserved: false,
     selectedGroupMemberCount: 0,
     sameSegmentManyToManyObserved: false,
+    versionReuseEvidence: null,
     frontierResolutionProven: false,
     modality: null,
     timeMap: null,
     issues: [...issues]
   };
+}
+
+export function deriveC137PairLocalVersionReuseEvidence(
+  receipt: Pick<RealMediaBlindBatchRunReceipt, "versionReuseGroups" | "pairOutcomes">,
+  current: RealMediaBlindBatchPairOutcome
+): C137PairLocalVersionReuseEvidence | null {
+  const currentFrontier = current.fineFrontier;
+  const currentExecution = current.fineExecutionEvidence;
+  const currentProposal = current.proposalTimeMap;
+  if (currentFrontier === null || currentExecution === null || currentProposal === null) {
+    return null;
+  }
+  const currentInventory = currentFrontier.inventoryCandidates.find((candidate) =>
+    sameCandidate(candidate.id, currentExecution.candidateId)
+  );
+  if (currentInventory === undefined) return null;
+
+  for (const group of receipt.versionReuseGroups) {
+    const currentMediaId =
+      group.side === "target" ? current.targetMediaId : current.sourceMediaId;
+    if (!group.mediaIds.includes(currentMediaId)) continue;
+    const reusedPhysicalAxis = group.side === "target" ? "source" : "target";
+    const currentGroupOrdinal =
+      reusedPhysicalAxis === "source"
+        ? currentInventory.sourceAxisReuseGroupOrdinal
+        : currentInventory.targetAxisReuseGroupOrdinal;
+    if (currentGroupOrdinal !== group.groupOrdinal) continue;
+
+    const sharedMediaId =
+      group.side === "target" ? current.sourceMediaId : current.targetMediaId;
+    const observedPeers: Array<{ pairOrdinal: number; overlapMs: number }> = [];
+    for (const peer of receipt.pairOutcomes) {
+      if (peer.pairOrdinal === current.pairOrdinal || peer.nativeStatus !== "completed")
+        continue;
+      const peerGroupedMediaId =
+        group.side === "target" ? peer.targetMediaId : peer.sourceMediaId;
+      const peerSharedMediaId =
+        group.side === "target" ? peer.sourceMediaId : peer.targetMediaId;
+      if (peerSharedMediaId !== sharedMediaId || !group.mediaIds.includes(peerGroupedMediaId)) {
+        continue;
+      }
+      const peerFrontier = peer.fineFrontier;
+      const peerExecution = peer.fineExecutionEvidence;
+      const peerProposal = peer.proposalTimeMap;
+      if (peerFrontier === null || peerExecution === null || peerProposal === null) continue;
+      if (
+        peerFrontier.componentOrdinal !== currentFrontier.componentOrdinal ||
+        !currentFrontier.componentPairOrdinals.includes(peer.pairOrdinal) ||
+        !peerFrontier.componentPairOrdinals.includes(current.pairOrdinal) ||
+        !currentFrontier.selectedCandidateIds.some((candidate) =>
+          sameCandidate(candidate, currentExecution.candidateId)
+        ) ||
+        !peerFrontier.selectedCandidateIds.some((candidate) =>
+          sameCandidate(candidate, peerExecution.candidateId)
+        )
+      ) {
+        continue;
+      }
+      const peerInventory = peerFrontier.inventoryCandidates.find((candidate) =>
+        sameCandidate(candidate.id, peerExecution.candidateId)
+      );
+      if (peerInventory === undefined) continue;
+      const peerGroupOrdinal =
+        reusedPhysicalAxis === "source"
+          ? peerInventory.sourceAxisReuseGroupOrdinal
+          : peerInventory.targetAxisReuseGroupOrdinal;
+      if (peerGroupOrdinal !== group.groupOrdinal) continue;
+      const overlapMs = maximumProposalAxisOverlapMs(
+        currentProposal.spans,
+        peerProposal.spans,
+        reusedPhysicalAxis
+      );
+      const overlapToleranceMs = Math.max(
+        currentFrontier.overlapToleranceMs,
+        peerFrontier.overlapToleranceMs
+      );
+      if (overlapMs > overlapToleranceMs) {
+        observedPeers.push({ pairOrdinal: peer.pairOrdinal, overlapMs });
+      }
+    }
+    if (observedPeers.length > 0) {
+      observedPeers.sort((left, right) => left.pairOrdinal - right.pairOrdinal);
+      return {
+        groupOrdinal: group.groupOrdinal,
+        groupId: group.groupId,
+        groupSide: group.side,
+        reusedPhysicalAxis,
+        sharedMediaId,
+        peerPairOrdinals: observedPeers.map((peer) => peer.pairOrdinal),
+        maximumOverlapMs: Math.max(...observedPeers.map((peer) => peer.overlapMs)),
+        overlapToleranceMs: currentFrontier.overlapToleranceMs
+      };
+    }
+  }
+  return null;
+}
+
+interface PhysicalInterval {
+  startMs: number;
+  endMs: number;
+}
+
+function maximumProposalAxisOverlapMs(
+  left: readonly TimeMapSpan[],
+  right: readonly TimeMapSpan[],
+  axis: "source" | "target"
+): number {
+  const leftIntervals = canonicalPhysicalIntervals(left, axis);
+  const rightIntervals = canonicalPhysicalIntervals(right, axis);
+  let maximum = 0;
+  for (const leftInterval of leftIntervals) {
+    for (const rightInterval of rightIntervals) {
+      maximum = Math.max(
+        maximum,
+        Math.min(leftInterval.endMs, rightInterval.endMs) -
+          Math.max(leftInterval.startMs, rightInterval.startMs)
+      );
+    }
+  }
+  return Math.max(0, maximum);
+}
+
+function canonicalPhysicalIntervals(
+  spans: readonly TimeMapSpan[],
+  axis: "source" | "target"
+): PhysicalInterval[] {
+  const intervals = spans
+    .map((span) => ({
+      startMs: axis === "source" ? span.sourceStartMs : span.targetStartMs,
+      endMs: axis === "source" ? span.sourceEndMs : span.targetEndMs
+    }))
+    .filter((interval) => interval.endMs > interval.startMs)
+    .sort((left, right) => left.startMs - right.startMs || left.endMs - right.endMs);
+  const canonical: PhysicalInterval[] = [];
+  for (const interval of intervals) {
+    const previous = canonical.at(-1);
+    if (previous !== undefined && interval.startMs <= previous.endMs) {
+      previous.endMs = Math.max(previous.endMs, interval.endMs);
+    } else {
+      canonical.push({ ...interval });
+    }
+  }
+  return canonical;
 }
 
 function deriveNativeModality(
@@ -398,7 +562,7 @@ function locateGoldPair(
     const outcome = batch.nativeReceipt.pairOutcomes.find(
       (item) => item.sourceMediaId === source.mediaId && item.targetMediaId === target.mediaId
     );
-    if (outcome !== undefined) located.push({ batchId: batch.batchId, outcome });
+    if (outcome !== undefined) located.push({ batchId: batch.batchId, batch, outcome });
   }
   return located;
 }

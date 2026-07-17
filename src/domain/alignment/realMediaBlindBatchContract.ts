@@ -9,30 +9,27 @@ import {
 import type { MediaContentIdentity } from "../project/types";
 import { sha256Hex } from "../shared/sha256";
 
-export const REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION = 1 as const;
-export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 4 as const;
+export const REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION = 2 as const;
+export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 5 as const;
 export const REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION =
-  "c137-real-media-blind-full-cartesian-batch-v4" as const;
-export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 4 as const;
+  "c137-real-media-blind-full-cartesian-batch-v5" as const;
+export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 5 as const;
 export const REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION =
   "alignment-v2-pair-intrinsic-global-weight-v1" as const;
 export const REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION = 1 as const;
 export const REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION =
-  "alignment-v2-adaptive-fine-frontier-v2" as const;
+  "alignment-v2-adaptive-fine-frontier-v3" as const;
 export const REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION =
   "alignment-v2-coarse-upper-times-confidence-v1" as const;
 
 const NATIVE_BATCH_TOP_K_LIMIT = 10;
 const RELATION_MIN_TEMPORAL_COVERAGE = 0.2;
 const RELATION_MIN_INLIER_COUNT = 6;
-const FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-frontier-receipt/v2";
-const FINE_FRONTIER_INVENTORY_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-frontier-inventory/v2";
-const FINE_EXECUTION_EVIDENCE_DIGEST_DOMAIN =
-  "audio-alignment-v4/fine-execution-evidence/v1";
-const FINE_PROPOSAL_TIME_MAP_DIGEST_DOMAIN = "audio-alignment-v4/proposal-time-map/v1";
-const FINE_PARAMETERS_DIGEST_DOMAIN = "audio-alignment-v4/fine-parameters/v1";
+const FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN = "audio-alignment-v5/fine-frontier-receipt/v3";
+const FINE_FRONTIER_INVENTORY_DIGEST_DOMAIN = "audio-alignment-v5/fine-frontier-inventory/v3";
+const FINE_EXECUTION_EVIDENCE_DIGEST_DOMAIN = "audio-alignment-v5/fine-execution-evidence/v2";
+const FINE_PROPOSAL_TIME_MAP_DIGEST_DOMAIN = "audio-alignment-v5/proposal-time-map/v1";
+const FINE_PARAMETERS_DIGEST_DOMAIN = "audio-alignment-v5/fine-parameters/v1";
 const FINE_WINDOW_DECODE_TOLERANCE_MS = 50;
 
 export interface RealMediaBlindBatchExecutionMedia {
@@ -47,6 +44,18 @@ export interface RealMediaBlindBatchPairRegistration {
   pairOrdinal: number;
   sourceMediaId: string;
   targetMediaId: string;
+}
+
+export type RealMediaBlindBatchVersionGroupSide = "source" | "target";
+
+export interface RealMediaBlindBatchVersionReuseGroup {
+  groupId: string;
+  side: RealMediaBlindBatchVersionGroupSide;
+  mediaIds: string[];
+}
+
+export interface RealMediaBlindBatchVersionReuseGroupSnapshot extends RealMediaBlindBatchVersionReuseGroup {
+  groupOrdinal: number;
 }
 
 export interface RealMediaBlindBatchAlignmentParameters {
@@ -74,6 +83,7 @@ export interface RealMediaBlindBatchExecutionSuite {
   sources: RealMediaBlindBatchExecutionMedia[];
   targets: RealMediaBlindBatchExecutionMedia[];
   pairs: RealMediaBlindBatchPairRegistration[];
+  versionReuseGroups: RealMediaBlindBatchVersionReuseGroup[];
   parameters: RealMediaBlindBatchAlignmentParameters;
 }
 
@@ -149,6 +159,8 @@ export interface NativeBatchFineCandidateId {
 export interface NativeBatchFineInventoryCandidate {
   id: NativeBatchFineCandidateId;
   coarseUpperBoundMicros: number;
+  sourceAxisReuseGroupOrdinal: number | null;
+  targetAxisReuseGroupOrdinal: number | null;
   members: NativeBatchRelationCandidateEvidence[];
 }
 
@@ -352,6 +364,7 @@ export interface RealMediaBlindBatchRunReceipt {
   targetCount: number;
   pairCount: number;
   topK: number;
+  versionReuseGroups: RealMediaBlindBatchVersionReuseGroupSnapshot[];
   /**
    * Complete source-major partition of the execution space. Every pair retains native selection
    * evidence and its V2 TimeMap, so a later gold-aware domain compiler can reproduce relation
@@ -445,11 +458,7 @@ function canonicalizeFineV3Value(value: unknown): unknown {
     view.setFloat64(0, value, false);
     return `f64:${view.getBigUint64(0, false).toString(16).padStart(16, "0")}`;
   }
-  if (
-    value === null ||
-    typeof value === "boolean" ||
-    typeof value === "string"
-  ) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
     return value;
   }
   throw new Error("fine v3 canonical JSON 不接受 undefined、函数或 symbol。");
@@ -510,6 +519,7 @@ export function validateRealMediaBlindBatchRunReceipt(
       "targetCount",
       "pairCount",
       "topK",
+      "versionReuseGroups",
       "pairOutcomes",
       "sourceRankings",
       "targetRankings",
@@ -556,6 +566,11 @@ export function validateRealMediaBlindBatchRunReceipt(
   ) {
     throw new Error("blind batch run receipt 的 source/target/pair/topK 计数与 suite 不一致。");
   }
+  const versionReuseGroups = validateVersionReuseGroupSnapshots(
+    receipt.versionReuseGroups,
+    suite.versionReuseGroups,
+    "blind batch run receipt.versionReuseGroups"
+  );
   if (
     !Array.isArray(receipt.pairOutcomes) ||
     receipt.pairOutcomes.length !== suite.pairs.length
@@ -616,6 +631,7 @@ export function validateRealMediaBlindBatchRunReceipt(
     targetCount: suite.targets.length,
     pairCount: suite.pairs.length,
     topK: suite.topK,
+    versionReuseGroups,
     pairOutcomes,
     sourceRankings,
     targetRankings
@@ -641,6 +657,7 @@ export function validateRealMediaBlindBatchExecutionSuite(
       "sources",
       "targets",
       "pairs",
+      "versionReuseGroups",
       "parameters"
     ],
     "blind batch execution suite"
@@ -666,6 +683,11 @@ export function validateRealMediaBlindBatchExecutionSuite(
   const parameters = validateAlignmentParameters(suite.parameters);
   ensureDistinctExecutionMedia(sources, targets, parameters.enableVisualEvidence);
   const pairs = validateFullCartesianPairs(suite.pairs, sources, targets);
+  const versionReuseGroups = validateVersionReuseGroups(
+    suite.versionReuseGroups,
+    sources,
+    targets
+  );
   return {
     schemaVersion: REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION,
     suiteId,
@@ -674,6 +696,7 @@ export function validateRealMediaBlindBatchExecutionSuite(
     sources,
     targets,
     pairs,
+    versionReuseGroups,
     parameters
   };
 }
@@ -1467,7 +1490,10 @@ function validateReceiptFineFrontier(
   ) {
     throw new Error(`${label} contractVersion/scoreVersion 无效。`);
   }
-  const inventoryDigest = requireSha256Digest(frontier.inventoryDigest, `${label}.inventoryDigest`);
+  const inventoryDigest = requireSha256Digest(
+    frontier.inventoryDigest,
+    `${label}.inventoryDigest`
+  );
   const receiptDigest = requireSha256Digest(frontier.receiptDigest, `${label}.receiptDigest`);
   const componentOrdinal = requirePositiveSafeInteger(
     frontier.componentOrdinal,
@@ -1540,7 +1566,10 @@ function validateReceiptFineFrontier(
     throw new Error(`${label}.evaluatedCandidateCount 超过库存。`);
   }
   const finalState = requireFineFrontierState(frontier.finalState, `${label}.finalState`);
-  if (typeof frontier.resolved !== "boolean" || frontier.resolved !== (finalState === "resolved")) {
+  if (
+    typeof frontier.resolved !== "boolean" ||
+    frontier.resolved !== (finalState === "resolved")
+  ) {
     throw new Error(`${label}.resolved 与 finalState 不一致。`);
   }
   const selectedCandidateIds = validateFineCandidateIds(
@@ -1567,7 +1596,10 @@ function validateReceiptFineFrontier(
           `${label}.runnerUpCompleted`,
           componentPairOrdinals
         );
-  if (runnerUpCompleted && runnerUpCompleted.totalScoreMicros > bestCompleted.totalScoreMicros) {
+  if (
+    runnerUpCompleted &&
+    runnerUpCompleted.totalScoreMicros > bestCompleted.totalScoreMicros
+  ) {
     throw new Error(`${label}.runnerUpCompleted 分数超过 bestCompleted。`);
   }
   const optimisticOmitted =
@@ -1702,7 +1734,13 @@ function validateReceiptFineInventoryCandidates(
     const candidateLabel = `${label}[${index}]`;
     const record = requireExactRecord(
       item,
-      ["id", "coarseUpperBoundMicros", "members"],
+      [
+        "id",
+        "coarseUpperBoundMicros",
+        "sourceAxisReuseGroupOrdinal",
+        "targetAxisReuseGroupOrdinal",
+        "members"
+      ],
       candidateLabel
     );
     const id = validateFineCandidateId(
@@ -1719,14 +1757,39 @@ function validateReceiptFineInventoryCandidates(
       0,
       1_000_000
     );
+    const sourceAxisReuseGroupOrdinal = requirePositiveSafeIntegerOrNull(
+      record.sourceAxisReuseGroupOrdinal,
+      `${candidateLabel}.sourceAxisReuseGroupOrdinal`
+    );
+    const targetAxisReuseGroupOrdinal = requirePositiveSafeIntegerOrNull(
+      record.targetAxisReuseGroupOrdinal,
+      `${candidateLabel}.targetAxisReuseGroupOrdinal`
+    );
+    const pair = suite.pairs.find((item) => item.pairOrdinal === id.pairOrdinal);
+    if (pair === undefined) {
+      throw new Error(`${candidateLabel}.id 无法绑定 execution suite pair。`);
+    }
+    const expectedSourceReuseOrdinal =
+      suite.versionReuseGroups.findIndex(
+        (group) => group.side === "target" && group.mediaIds.includes(pair.targetMediaId)
+      ) + 1;
+    const expectedTargetReuseOrdinal =
+      suite.versionReuseGroups.findIndex(
+        (group) => group.side === "source" && group.mediaIds.includes(pair.sourceMediaId)
+      ) + 1;
+    if (
+      sourceAxisReuseGroupOrdinal !==
+        (expectedSourceReuseOrdinal === 0 ? null : expectedSourceReuseOrdinal) ||
+      targetAxisReuseGroupOrdinal !==
+        (expectedTargetReuseOrdinal === 0 ? null : expectedTargetReuseOrdinal)
+    ) {
+      throw new Error(`${candidateLabel} 多版本复用组 ordinal 未绑定当前 pair 的 suite 策略。`);
+    }
     if (!Array.isArray(record.members) || record.members.length === 0) {
       throw new Error(`${candidateLabel}.members 必须是非空数组。`);
     }
     const members = record.members.map((member, memberIndex) =>
-      validateFineInventoryMember(
-        member,
-        `${candidateLabel}.members[${memberIndex}]`
-      )
+      validateFineInventoryMember(member, `${candidateLabel}.members[${memberIndex}]`)
     );
     if (
       members.some(
@@ -1735,7 +1798,13 @@ function validateReceiptFineInventoryCandidates(
     ) {
       throw new Error(`${candidateLabel}.members 必须按 rank 严格递增。`);
     }
-    return { id, coarseUpperBoundMicros, members };
+    return {
+      id,
+      coarseUpperBoundMicros,
+      sourceAxisReuseGroupOrdinal,
+      targetAxisReuseGroupOrdinal,
+      members
+    };
   });
   const ids = candidates.map((candidate) => candidate.id);
   if (!sameFineCandidateIdArrays(ids, [...ids].sort(compareFineCandidateId))) {
@@ -1749,11 +1818,18 @@ function validateReceiptFineInventoryCandidates(
       (candidate) => candidate.id.pairOrdinal === pairOrdinal
     );
     if (
-      pairCandidates.some(
-        (candidate, index) => candidate.id.candidateOrdinal !== index + 1
-      )
+      pairCandidates.some((candidate, index) => candidate.id.candidateOrdinal !== index + 1)
     ) {
       throw new Error(`${label} 的每个 pair 必须从 candidateOrdinal=1 连续完整枚举。`);
+    }
+    const sourceReuseOrdinals = new Set(
+      pairCandidates.map((candidate) => candidate.sourceAxisReuseGroupOrdinal)
+    );
+    const targetReuseOrdinals = new Set(
+      pairCandidates.map((candidate) => candidate.targetAxisReuseGroupOrdinal)
+    );
+    if (sourceReuseOrdinals.size > 1 || targetReuseOrdinals.size > 1) {
+      throw new Error(`${label} 的同一 pair 多版本复用组绑定不一致。`);
     }
   }
   return candidates;
@@ -1802,7 +1878,10 @@ function validateReceiptFineLimits(value: unknown, label: string): NativeBatchFi
   };
 }
 
-function validateReceiptFineStateCounts(value: unknown, label: string): NativeBatchFineStateCounts {
+function validateReceiptFineStateCounts(
+  value: unknown,
+  label: string
+): NativeBatchFineStateCounts {
   const record = requireExactRecord(
     value,
     [
@@ -1907,7 +1986,9 @@ function validateReceiptFineOmitted(
     true
   );
   const openKeys = new Set(openCandidateIds.map(fineCandidateKey));
-  const partitionKeys = [...unresolvedCandidateIds, ...blockedCandidateIds].map(fineCandidateKey);
+  const partitionKeys = [...unresolvedCandidateIds, ...blockedCandidateIds].map(
+    fineCandidateKey
+  );
   if (
     candidateIds.length === 0 ||
     openKeys.size === 0 ||
@@ -2003,7 +2084,10 @@ function requireFineIntegerArray(
     requireBoundedFineInteger(item, `${label}[${index}]`, minimum, maximum)
   );
   if (new Set(items).size !== items.length) throw new Error(`${label} 包含重复值。`);
-  if (canonicalOrder && items.some((item, index) => index > 0 && item <= (items[index - 1] ?? item))) {
+  if (
+    canonicalOrder &&
+    items.some((item, index) => index > 0 && item <= (items[index - 1] ?? item))
+  ) {
     throw new Error(`${label} 必须严格递增。`);
   }
   return items;
@@ -2020,7 +2104,10 @@ function requireBoundedFineInteger(
   return integer;
 }
 
-function compareFineCandidateId(left: NativeBatchFineCandidateId, right: NativeBatchFineCandidateId): number {
+function compareFineCandidateId(
+  left: NativeBatchFineCandidateId,
+  right: NativeBatchFineCandidateId
+): number {
   return left.pairOrdinal - right.pairOrdinal || left.candidateOrdinal - right.candidateOrdinal;
 }
 
@@ -2044,7 +2131,10 @@ function sameFineCandidateIdArrays(
   left: readonly NativeBatchFineCandidateId[],
   right: readonly NativeBatchFineCandidateId[]
 ): boolean {
-  return left.length === right.length && left.every((item, index) => sameFineCandidateId(item, right[index]));
+  return (
+    left.length === right.length &&
+    left.every((item, index) => sameFineCandidateId(item, right[index]))
+  );
 }
 
 function validateReceiptFineExecutionEvidence(
@@ -2104,7 +2194,10 @@ function validateReceiptFineExecutionEvidence(
     record.targetStreamIndex,
     `${label}.targetStreamIndex`
   );
-  if (sourceStreamIndex !== source.audioStreamIndex || targetStreamIndex !== target.audioStreamIndex) {
+  if (
+    sourceStreamIndex !== source.audioStreamIndex ||
+    targetStreamIndex !== target.audioStreamIndex
+  ) {
     throw new Error(`${label} 音轨索引与 execution suite 不一致。`);
   }
   const sourceCoarseBackend = validateReceiptFineBackend(
@@ -2123,8 +2216,16 @@ function validateReceiptFineExecutionEvidence(
     record.targetFineBackend,
     `${label}.targetFineBackend`
   );
-  validateReceiptFineBackendContinuity(sourceCoarseBackend, sourceFineBackend, `${label}.source`);
-  validateReceiptFineBackendContinuity(targetCoarseBackend, targetFineBackend, `${label}.target`);
+  validateReceiptFineBackendContinuity(
+    sourceCoarseBackend,
+    sourceFineBackend,
+    `${label}.source`
+  );
+  validateReceiptFineBackendContinuity(
+    targetCoarseBackend,
+    targetFineBackend,
+    `${label}.target`
+  );
   const executionIdentity = relationRanking.executionIdentity;
   if (
     executionIdentity === null ||
@@ -2510,10 +2611,7 @@ function validateReceiptPairOutcome(
     if (fineExecutionEvidence !== null) {
       throw new Error("failed/cancelled receipt pair 不能包含 fineExecutionEvidence。");
     }
-    if (
-      nativeStatus === "cancelled" &&
-      fineFrontier !== null
-    ) {
+    if (nativeStatus === "cancelled" && fineFrontier !== null) {
       throw new Error("cancelled receipt pair 不能包含 fineFrontier。");
     }
   }
@@ -2971,6 +3069,103 @@ function validateExecutionMediaArray(
       videoStreamIndex
     };
   });
+}
+
+function validateVersionReuseGroups(
+  value: unknown,
+  sources: readonly RealMediaBlindBatchExecutionMedia[],
+  targets: readonly RealMediaBlindBatchExecutionMedia[]
+): RealMediaBlindBatchVersionReuseGroup[] {
+  if (!Array.isArray(value)) {
+    throw new Error("blind batch execution suite.versionReuseGroups 必须是数组。");
+  }
+  const sourceOrder = new Map(sources.map((media, index) => [media.mediaId, index]));
+  const targetOrder = new Map(targets.map((media, index) => [media.mediaId, index]));
+  const seenGroupIds = new Set<string>();
+  const groupedMedia = new Set<string>();
+  const groups = value.map((item, index) => {
+    const label = `versionReuseGroups[${index}]`;
+    const group = requireExactRecord(item, ["groupId", "side", "mediaIds"], label);
+    const groupId = requireNonBlankString(group.groupId, `${label}.groupId`).trim();
+    if (
+      !/^[A-Za-z0-9._:-]+$/.test(groupId) ||
+      new TextEncoder().encode(groupId).byteLength > 160 ||
+      seenGroupIds.has(groupId)
+    ) {
+      throw new Error(`${label}.groupId 无效或重复。`);
+    }
+    seenGroupIds.add(groupId);
+    if (group.side !== "source" && group.side !== "target") {
+      throw new Error(`${label}.side 仅支持 source 或 target。`);
+    }
+    const side: RealMediaBlindBatchVersionGroupSide = group.side;
+    if (!Array.isArray(group.mediaIds) || group.mediaIds.length < 2) {
+      throw new Error(`${label}.mediaIds 至少需要两个不同媒体。`);
+    }
+    const order = side === "source" ? sourceOrder : targetOrder;
+    const members = new Set<string>();
+    const mediaIds = group.mediaIds.map((value, memberIndex) => {
+      const mediaId = requireIdentifier(value, `${label}.mediaIds[${memberIndex}]`);
+      if (!order.has(mediaId)) {
+        throw new Error(`${label} 引用了错误侧或不存在的媒体：${mediaId}`);
+      }
+      if (members.has(mediaId)) {
+        throw new Error(`${label} 包含重复媒体：${mediaId}`);
+      }
+      members.add(mediaId);
+      const membershipKey = `${side}\u0000${mediaId}`;
+      if (groupedMedia.has(membershipKey)) {
+        throw new Error(`媒体 ${mediaId} 不能同时属于同一侧的多个多版本组。`);
+      }
+      groupedMedia.add(membershipKey);
+      return mediaId;
+    });
+    mediaIds.sort((left, right) => (order.get(left) ?? 0) - (order.get(right) ?? 0));
+    return { groupId, side, mediaIds };
+  });
+  return groups.sort(
+    (left, right) =>
+      (left.side === "source" ? 0 : 1) - (right.side === "source" ? 0 : 1) ||
+      left.groupId.localeCompare(right.groupId)
+  );
+}
+
+function validateVersionReuseGroupSnapshots(
+  value: unknown,
+  groups: readonly RealMediaBlindBatchVersionReuseGroup[],
+  label: string
+): RealMediaBlindBatchVersionReuseGroupSnapshot[] {
+  if (!Array.isArray(value) || value.length !== groups.length) {
+    throw new Error(`${label} 与 execution suite 的多版本复用策略不一致。`);
+  }
+  const snapshots = value.map((item, index) => {
+    const itemLabel = `${label}[${index}]`;
+    const snapshot = requireExactRecord(
+      item,
+      ["groupOrdinal", "groupId", "side", "mediaIds"],
+      itemLabel
+    );
+    const groupOrdinal = requirePositiveSafeInteger(
+      snapshot.groupOrdinal,
+      `${itemLabel}.groupOrdinal`
+    );
+    const expected = groups[index];
+    if (
+      groupOrdinal !== index + 1 ||
+      snapshot.groupId !== expected?.groupId ||
+      snapshot.side !== expected?.side ||
+      !canonicalEqual(snapshot.mediaIds, expected?.mediaIds)
+    ) {
+      throw new Error(`${itemLabel} 未精确绑定 execution suite 的 canonical 多版本组。`);
+    }
+    return {
+      groupOrdinal,
+      groupId: expected.groupId,
+      side: expected.side,
+      mediaIds: [...expected.mediaIds]
+    };
+  });
+  return snapshots;
 }
 
 function ensureDistinctExecutionMedia(

@@ -207,7 +207,8 @@ describe("Tauri 音频对齐调用", () => {
   });
 
   it("拒绝单次和批量请求中的未知声谱计算策略", async () => {
-    const invalidPreference = "metal" as unknown as TauriAudioAlignmentRequest["spectralBackend"];
+    const invalidPreference =
+      "metal" as unknown as TauriAudioAlignmentRequest["spectralBackend"];
 
     await expect(
       runTauriAudioAlignment({
@@ -381,12 +382,13 @@ describe("Tauri 音频对齐调用", () => {
 
   it("批任务一次发送全部媒体并规范化流索引", async () => {
     tauriMocks.invoke.mockResolvedValue({
-      schemaVersion: 1,
-      evidenceVersion: 4,
+      schemaVersion: 2,
+      evidenceVersion: 5,
       jobId: "batch-1",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
       targetMediaIds: ["target-1", "target-2"],
+      versionReuseGroups: [],
       status: "queued",
       progress: 0,
       message: "已排队",
@@ -415,7 +417,7 @@ describe("Tauri 音频对齐调用", () => {
 
     expect(tauriMocks.invoke).toHaveBeenCalledWith("start_audio_alignment_batch_job", {
       request: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sources: [
           {
             mediaId: "source",
@@ -438,6 +440,7 @@ describe("Tauri 音频对齐调用", () => {
             videoStreamIndex: 4
           }
         ],
+        versionReuseGroups: [],
         ffmpegPath: null,
         ffprobePath: null,
         spectralBackend: "cpu",
@@ -565,12 +568,13 @@ describe("Tauri 音频对齐调用", () => {
 
   it("批任务可显式指定未完成 pair，并拒绝重复或越界引用", async () => {
     const snapshot = {
-      schemaVersion: 1 as const,
-      evidenceVersion: 4 as const,
+      schemaVersion: 2 as const,
+      evidenceVersion: 5 as const,
       jobId: "batch-explicit",
       pairingMode: "explicit" as const,
       sourceMediaIds: ["source"],
       targetMediaIds: ["target"],
+      versionReuseGroups: [],
       status: "queued" as const,
       progress: 0,
       message: "已排队",
@@ -633,14 +637,103 @@ describe("Tauri 音频对齐调用", () => {
     ).rejects.toThrow("包含重复素材组合");
   });
 
+  it("多版本复用组按媒体 inventory 规范化，并要求原生启动回包精确绑定", async () => {
+    const snapshot: AudioAlignmentBatchJobSnapshot = {
+      schemaVersion: 2,
+      evidenceVersion: 5,
+      jobId: "batch-version-reuse",
+      pairingMode: "fullCartesian",
+      sourceMediaIds: ["source"],
+      targetMediaIds: ["target-1", "target-2"],
+      versionReuseGroups: [
+        {
+          groupOrdinal: 1,
+          groupId: "target-versions",
+          side: "target",
+          mediaIds: ["target-1", "target-2"]
+        }
+      ],
+      status: "queued",
+      progress: 0,
+      message: "已排队",
+      totalPairCount: 2,
+      processedPairCount: 0,
+      failedPairCount: 0,
+      currentPairOrdinal: null,
+      pairs: [
+        batchPairSnapshot(1, "source", "target-1", "queued"),
+        batchPairSnapshot(2, "source", "target-2", "queued")
+      ],
+      error: null,
+      updatedAtMs: 1
+    };
+    const start = vi.fn<AudioAlignmentBatchJobInvoker["start"]>().mockResolvedValue(snapshot);
+
+    await startTauriAudioAlignmentBatchJob(
+      {
+        sources: [{ mediaId: "source", path: "source.mkv" }],
+        targets: [
+          { mediaId: "target-1", path: "target-1.mkv" },
+          { mediaId: "target-2", path: "target-2.mkv" }
+        ],
+        versionReuseGroups: [
+          {
+            groupId: "target-versions",
+            side: "target",
+            mediaIds: ["target-2", "target-1"]
+          }
+        ],
+        ffmpegPath: null,
+        localizationMode: true
+      },
+      { start, get: vi.fn(), cancel: vi.fn() }
+    );
+
+    expect(start.mock.calls[0]?.[0].versionReuseGroups).toEqual([
+      {
+        groupId: "target-versions",
+        side: "target",
+        mediaIds: ["target-1", "target-2"]
+      }
+    ]);
+
+    const mismatched = structuredClone(snapshot);
+    mismatched.versionReuseGroups[0].mediaIds.reverse();
+    const mismatchedStart = vi
+      .fn<AudioAlignmentBatchJobInvoker["start"]>()
+      .mockResolvedValue(mismatched);
+    await expect(
+      startTauriAudioAlignmentBatchJob(
+        {
+          sources: [{ mediaId: "source", path: "source.mkv" }],
+          targets: [
+            { mediaId: "target-1", path: "target-1.mkv" },
+            { mediaId: "target-2", path: "target-2.mkv" }
+          ],
+          versionReuseGroups: [
+            {
+              groupId: "target-versions",
+              side: "target",
+              mediaIds: ["target-1", "target-2"]
+            }
+          ],
+          ffmpegPath: null,
+          localizationMode: true
+        },
+        { start: mismatchedStart, get: vi.fn(), cancel: vi.fn() }
+      )
+    ).rejects.toThrow("canonical 排序");
+  });
+
   it("支持读取和取消原生批任务", async () => {
     const snapshot = {
-      schemaVersion: 1 as const,
-      evidenceVersion: 4 as const,
+      schemaVersion: 2 as const,
+      evidenceVersion: 5 as const,
       jobId: "batch-2",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
       targetMediaIds: ["target-1", "target-2"],
+      versionReuseGroups: [],
       status: "cancelled" as const,
       progress: 1,
       message: "已取消",
@@ -667,12 +760,13 @@ describe("Tauri 音频对齐调用", () => {
 
   it("拒绝计数矛盾或 jobId 不匹配的原生批任务响应", async () => {
     const invalidSnapshot = {
-      schemaVersion: 1 as const,
-      evidenceVersion: 4 as const,
+      schemaVersion: 2 as const,
+      evidenceVersion: 5 as const,
       jobId: "wrong-job",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
       targetMediaIds: ["target"],
+      versionReuseGroups: [],
       status: "running" as const,
       progress: 0.5,
       message: "运行中",
@@ -708,12 +802,13 @@ describe("Tauri 音频对齐调用", () => {
 
   it("启动响应必须绑定请求 inventory，completed 终态不得夹带 cancelled pair", async () => {
     const wrongInventory = {
-      schemaVersion: 1 as const,
-      evidenceVersion: 4 as const,
+      schemaVersion: 2 as const,
+      evidenceVersion: 5 as const,
       jobId: "batch-boundary",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["other-source"],
       targetMediaIds: ["target"],
+      versionReuseGroups: [],
       status: "queued" as const,
       progress: 0,
       message: "queued",
@@ -762,12 +857,13 @@ describe("Tauri 音频对齐调用", () => {
 
   it("接受 fine 失败后保留的 coarse 证据，并严格校验失败状态与完整 Top-K", async () => {
     const failedSnapshot: AudioAlignmentBatchJobSnapshot = {
-      schemaVersion: 1,
-      evidenceVersion: 4,
+      schemaVersion: 2,
+      evidenceVersion: 5,
       jobId: "batch-fine-failed",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
       targetMediaIds: ["target"],
+      versionReuseGroups: [],
       status: "failed",
       progress: 1,
       message: "fine failed",
@@ -823,18 +919,18 @@ describe("Tauri 音频对齐调用", () => {
     await expect(read(mismatchedDecision)).rejects.toThrow("与 Top-K 同 rank 候选不一致");
   });
 
-  it("v4 canonical digest 固定向量保持跨语言一致，并拒绝不安全整数", () => {
+  it("v5 canonical digest 固定向量保持跨语言一致，并拒绝不安全整数", () => {
     expect(
       createAudioAlignmentBatchProposalTimeMapDigest({
         values: [1, -0, 1e-6, 1e-7, 23.976, 0.1, Number.MAX_SAFE_INTEGER]
       })
-    ).toBe("sha256:1e8e7b8e1f3fd67427c079f7fa3b68c8dc52a121059b084349c27d972c971f42");
+    ).toBe("sha256:b1bad579a5498e8c09150d4cb41a6b540e18ba2f8783c8b9367dbe35b902de28");
     expect(() => createAudioAlignmentBatchProposalTimeMapDigest({ value: 1e16 })).toThrow(
       "安全范围"
     );
   });
 
-  it("v4 fine inventory 完整枚举并拒绝重签 receipt 后的成员改窗与序号断层", async () => {
+  it("v5 fine inventory 完整枚举并拒绝重签 receipt 后的成员改窗与序号断层", async () => {
     const read = (snapshot: AudioAlignmentBatchJobSnapshot) =>
       getTauriAudioAlignmentBatchJob("batch-v3", {
         start: vi.fn(),
@@ -845,9 +941,8 @@ describe("Tauri 音频对齐调用", () => {
     const windowFrontier = tamperedWindow.pairs[0]?.fineFrontier;
     if (!windowFrontier) throw new Error("fixture fine frontier missing");
     windowFrontier.inventoryCandidates[0].members[0].sourceEndMs += 1;
-    windowFrontier.receiptDigest = createAudioAlignmentBatchFineFrontierReceiptDigest(
-      windowFrontier
-    );
+    windowFrontier.receiptDigest =
+      createAudioAlignmentBatchFineFrontierReceiptDigest(windowFrontier);
     await expect(read(tamperedWindow)).rejects.toThrow("inventoryDigest");
 
     const ordinalGap = completedBatchJobSnapshot();
@@ -858,7 +953,7 @@ describe("Tauri 音频对齐调用", () => {
       gapFrontier.inventoryCandidates
     );
     gapFrontier.receiptDigest = createAudioAlignmentBatchFineFrontierReceiptDigest(gapFrontier);
-    await expect(read(ordinalGap)).rejects.toThrow("candidateOrdinal=1");
+    await expect(read(ordinalGap)).rejects.toThrow("连续完整枚举");
   });
 
   it("严格拒绝 legacy v2 外层和 v3 外层夹带的旧 fine contract", async () => {
@@ -944,12 +1039,13 @@ describe("Tauri 音频对齐调用", () => {
 
 function completedBatchJobSnapshot(): AudioAlignmentBatchJobSnapshot {
   return {
-    schemaVersion: 1,
-    evidenceVersion: 4,
+    schemaVersion: 2,
+    evidenceVersion: 5,
     jobId: "batch-v3",
     pairingMode: "fullCartesian",
     sourceMediaIds: ["source"],
     targetMediaIds: ["target"],
+    versionReuseGroups: [],
     status: "completed",
     progress: 1,
     message: "completed",
@@ -972,11 +1068,9 @@ function batchPairSnapshot(
   const proposal = status === "completed" ? batchProposal() : null;
   const fineFrontier =
     status === "completed"
-      ? createTestFineFrontierReceipt(
-          [pairOrdinal],
-          [{ pairOrdinal, candidateOrdinal: 1 }],
-          { componentOrdinal: pairOrdinal }
-        )
+      ? createTestFineFrontierReceipt([pairOrdinal], [{ pairOrdinal, candidateOrdinal: 1 }], {
+          componentOrdinal: pairOrdinal
+        })
       : status === "failed"
         ? createTestFineFrontierReceipt([pairOrdinal], [], {
             componentOrdinal: pairOrdinal,

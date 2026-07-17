@@ -62,13 +62,7 @@ import {
 } from "./TimeMapPlaybackReview";
 
 type BatchTaskState =
-  | "waiting"
-  | "running"
-  | "found"
-  | "unresolved"
-  | "notFound"
-  | "failed"
-  | "cancelled";
+  "waiting" | "running" | "found" | "unresolved" | "notFound" | "failed" | "cancelled";
 
 interface BatchTask {
   id: string;
@@ -122,6 +116,10 @@ export function MediaMatchingPanel({
   );
   const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
   const [selectedTargetIds, setSelectedTargetIds] = useState<string[]>([]);
+  const [spectralBackendPreference, setSpectralBackendPreference] =
+    useState<SpectralBackendPreference>(() => loadAppSettings().alignment.spectralBackend);
+  const [treatSelectedSourcesAsVersions, setTreatSelectedSourcesAsVersions] = useState(false);
+  const [treatSelectedTargetsAsVersions, setTreatSelectedTargetsAsVersions] = useState(false);
   const [tasks, setTasks] = useState<BatchTask[]>([]);
   const [running, setRunning] = useState(false);
   const [candidateAssetSelections, setCandidateAssetSelections] = useState<
@@ -162,6 +160,8 @@ export function MediaMatchingPanel({
     setActivePlaybackCandidateId(null);
     setSelectedSourceIds(sourceMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setSelectedTargetIds(targetMedia.filter(canAnalyzeMedia).map((media) => media.id));
+    setTreatSelectedSourcesAsVersions(false);
+    setTreatSelectedTargetsAsVersions(false);
     setTasks([]);
   }, [project.id, sourceMedia, targetMedia]);
 
@@ -199,6 +199,14 @@ export function MediaMatchingPanel({
   }, [activePlaybackCandidateId, project.mediaMatchCandidates]);
 
   useEffect(() => {
+    if (selectedSourceIds.length < 2) setTreatSelectedSourcesAsVersions(false);
+  }, [selectedSourceIds.length]);
+
+  useEffect(() => {
+    if (selectedTargetIds.length < 2) setTreatSelectedTargetsAsVersions(false);
+  }, [selectedTargetIds.length]);
+
+  useEffect(() => {
     if (projectEpochRef.current === projectEpoch) {
       return;
     }
@@ -223,6 +231,8 @@ export function MediaMatchingPanel({
     setActivePlaybackCandidateId(null);
     setSelectedSourceIds(sourceMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setSelectedTargetIds(targetMedia.filter(canAnalyzeMedia).map((media) => media.id));
+    setTreatSelectedSourcesAsVersions(false);
+    setTreatSelectedTargetsAsVersions(false);
     setRunning(false);
     setTasks([]);
   }, [projectEpoch, sourceMedia, targetMedia]);
@@ -240,7 +250,6 @@ export function MediaMatchingPanel({
   );
 
   const pairCount = selectedSourceIds.length * selectedTargetIds.length;
-  const spectralBackendPreference = loadAppSettings().alignment.spectralBackend;
   const pendingCandidates = project.mediaMatchCandidates.filter(
     (candidate) => candidate.state === "pending" || candidate.state === "blocked"
   );
@@ -371,8 +380,32 @@ export function MediaMatchingPanel({
           sourceMediaId: pair.source.id,
           targetMediaId: pair.target.id
         })),
+        versionReuseGroups: [
+          ...(treatSelectedSourcesAsVersions && pendingSourceIds.size >= 2
+            ? [
+                {
+                  groupId: "selected-source-versions",
+                  side: "source" as const,
+                  mediaIds: selectedSources
+                    .filter((media) => pendingSourceIds.has(media.id))
+                    .map((media) => media.id)
+                }
+              ]
+            : []),
+          ...(treatSelectedTargetsAsVersions && pendingTargetIds.size >= 2
+            ? [
+                {
+                  groupId: "selected-target-versions",
+                  side: "target" as const,
+                  mediaIds: selectedTargets
+                    .filter((media) => pendingTargetIds.has(media.id))
+                    .map((media) => media.id)
+                }
+              ]
+            : [])
+        ],
         ffmpegPath: settings.ffmpegPath.trim() || null,
-        spectralBackend: settings.spectralBackend,
+        spectralBackend: spectralBackendPreference,
         windowMs: settings.windowMs,
         minGapMs: settings.minGapMs,
         matchThreshold: settings.matchThreshold,
@@ -532,7 +565,9 @@ export function MediaMatchingPanel({
     let failedCount = 0;
     let cancelledCount = 0;
     for (const pair of pendingPairs) {
-      const pairSnapshot = pairSnapshots.get(createMediaPairKey(pair.source.id, pair.target.id));
+      const pairSnapshot = pairSnapshots.get(
+        createMediaPairKey(pair.source.id, pair.target.id)
+      );
       if (!pairSnapshot) {
         if (cancelRequestedRef.current) {
           cancelledCount += 1;
@@ -702,7 +737,9 @@ export function MediaMatchingPanel({
         <details className="mt-2 text-[11px] text-amber-100/80">
           <summary className="cursor-pointer">技术说明</summary>
           <p className="mt-1">
-            候选发布只服从原生 Evidence v3 的组件最终分配与精执行证据绑定；旧的 coarse globalSelection 仅保留为诊断信息，前端不会再次求解。
+            候选发布只服从原生 Evidence v5
+            的组件最终分配、显式多版本复用策略与精执行证据绑定；旧的 coarse globalSelection
+            仅保留为诊断信息，前端不会再次求解。
           </p>
         </details>
       </div>
@@ -728,11 +765,69 @@ export function MediaMatchingPanel({
         />
       </div>
 
+      <div className="mt-3 rounded border border-panel-line bg-black/15 p-2">
+        <label className="flex flex-wrap items-center gap-2 text-slate-300">
+          <span className="font-medium">本次匹配计算</span>
+          <select
+            aria-label="本次匹配计算设备"
+            className="rounded border border-panel-line bg-panel px-2 py-1 text-xs text-slate-100 outline-none focus:border-accent-cyan"
+            value={spectralBackendPreference}
+            disabled={running}
+            onChange={(event) =>
+              setSpectralBackendPreference(event.target.value as SpectralBackendPreference)
+            }
+          >
+            <option value="cuda">GPU（NVIDIA CUDA，失败即停止）</option>
+            <option value="cpu">CPU（禁用 CUDA）</option>
+            <option value="auto">自动（优先 GPU，可回退 CPU）</option>
+          </select>
+        </label>
+        <details className="mt-2 border-t border-panel-line pt-2 text-[11px] text-slate-400">
+          <summary className="cursor-pointer text-slate-300">高级：同一内容的多个版本</summary>
+          <p className="mt-2 leading-5 text-slate-500">
+            默认每段内容只能分配给一个素材。只有确认所选文件是同一内容的不同发行版、画质版或音轨版时，才开启对应选项；系统仍会为每个版本分别生成候选并要求逐项复核。
+          </p>
+          <label className="mt-2 flex items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 accent-cyan-500"
+              checked={treatSelectedSourcesAsVersions}
+              disabled={running || selectedSourceIds.length < 2}
+              onChange={(event) => setTreatSelectedSourcesAsVersions(event.target.checked)}
+            />
+            <span>
+              所选 B 站参考素材是同一内容的不同版本
+              <span className="block text-slate-500">
+                允许同一原片时间段分别匹配这些参考版本。
+              </span>
+            </span>
+          </label>
+          <label className="mt-2 flex items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 accent-cyan-500"
+              checked={treatSelectedTargetsAsVersions}
+              disabled={running || selectedTargetIds.length < 2}
+              onChange={(event) => setTreatSelectedTargetsAsVersions(event.target.checked)}
+            />
+            <span>
+              所选原片素材是同一内容的不同版本
+              <span className="block text-slate-500">
+                允许同一参考时间段分别匹配这些原片版本。
+              </span>
+            </span>
+          </label>
+        </details>
+      </div>
+
       <div className="mt-3 flex flex-wrap items-center gap-2 rounded border border-panel-line bg-black/15 p-2">
         <span className="mr-auto text-slate-400">
           将分析 {selectedSourceIds.length} 个参考 × {selectedTargetIds.length} 个原片，共{" "}
           {pairCount} 组；所选组合会合并为一个批次并按顺序检查，界面不会逐组重复启动任务。
-          <span className="mt-1 block text-[11px] text-slate-500" data-testid="spectral-backend-policy">
+          <span
+            className="mt-1 block text-[11px] text-slate-500"
+            data-testid="spectral-backend-policy"
+          >
             {describeSpectralBackendPolicy(spectralBackendPreference)}
           </span>
         </span>
@@ -906,10 +1001,7 @@ function describeNativeFineDisposition(
     frontier.bestCompleted.candidateIds.some((id) => sameFineCandidateId(id, candidateId));
   const selectionReceiptConsistent =
     frontier.selectedTotalScoreMicros === frontier.bestCompleted.totalScoreMicros &&
-    sameFineCandidateIdSet(
-      frontier.selectedCandidateIds,
-      frontier.bestCompleted.candidateIds
-    );
+    sameFineCandidateIdSet(frontier.selectedCandidateIds, frontier.bestCompleted.candidateIds);
   const componentBindsPair = frontier.componentPairOrdinals.includes(snapshot.pairOrdinal);
   const executionBindsPair = candidateId?.pairOrdinal === snapshot.pairOrdinal;
   const proposalTimeMap = snapshot.proposal?.timeMap ?? null;
@@ -943,8 +1035,7 @@ function describeNativeFineDisposition(
         "原生精匹配结果的候选、组件裁决或 TimeMap 绑定校验未通过；为避免错配，本组不能确认。";
       return { kind: "evidenceBlocked", taskState: "unresolved", message: reason, reason };
     }
-    const reason =
-      "原生最终分配采用了同一组件中的另一组关系；当前结果只作为不可确认备选。";
+    const reason = "原生最终分配采用了同一组件中的另一组关系；当前结果只作为不可确认备选。";
     return { kind: "alternative", taskState: "unresolved", message: reason, reason };
   }
 
@@ -977,8 +1068,7 @@ function sameFineCandidateId(
   right: AudioAlignmentBatchFineCandidateIdSnapshot
 ): boolean {
   return (
-    left.pairOrdinal === right.pairOrdinal &&
-    left.candidateOrdinal === right.candidateOrdinal
+    left.pairOrdinal === right.pairOrdinal && left.candidateOrdinal === right.candidateOrdinal
   );
 }
 
@@ -1252,8 +1342,8 @@ function MediaMatchCandidateCard({
         <div className="min-w-0 flex-1">
           <div className="font-medium text-slate-100">
             {target?.name ?? candidate.targetMediaId} ←{" "}
-            {source?.name ?? candidate.sourceMediaId}{" "}
-            {formatTimecode(candidate.sourceStartMs)}–{formatTimecode(candidate.sourceEndMs)}
+            {source?.name ?? candidate.sourceMediaId} {formatTimecode(candidate.sourceStartMs)}–
+            {formatTimecode(candidate.sourceEndMs)}
           </div>
           <div className="mt-1 text-[11px] text-slate-500">
             原片对应范围 {formatTimecode(candidate.targetStartMs)}–
@@ -1588,7 +1678,8 @@ function TimeMapQualitySummary({
               差距：{formatQualityRatio(timeMap.quality.alternativeMargin)}
             </div>
             <div>
-              独特内容覆盖：{formatQualityRatio(timeMap.quality.uniqueContentCoverage ?? null)} · 锚点：
+              独特内容覆盖：{formatQualityRatio(timeMap.quality.uniqueContentCoverage ?? null)}{" "}
+              · 锚点：
               {timeMap.quality.anchorCount}（真实留出 {timeMap.quality.heldOutAnchorCount}） ·
               全片支持区域：{timeMap.quality.anchorRegionCount ?? 0}/3
             </div>
@@ -1890,12 +1981,15 @@ function TimeMapSpanEvidenceSummary({ span }: { span: TimeMapSpan }) {
   const startBoundary = span.boundaries.start;
   const endBoundary = span.boundaries.end;
   return (
-    <span className="grid gap-0.5 text-slate-500" data-testid={`time-map-span-evidence-${span.id}`}>
+    <span
+      className="grid gap-0.5 text-slate-500"
+      data-testid={`time-map-span-evidence-${span.id}`}
+    >
       <span>
         逐段 P95 / P99 / 最大残差：{formatQualityMilliseconds(quality.p95ResidualMs)} /{" "}
         {formatQualityMilliseconds(quality.p99ResidualMs)} /{" "}
-        {formatQualityMilliseconds(quality.maxResidualMs)} · 锚点 {quality.anchorCount}（真实留出{" "}
-        {quality.heldOutAnchorCount}）
+        {formatQualityMilliseconds(quality.maxResidualMs)} · 锚点 {quality.anchorCount}
+        （真实留出 {quality.heldOutAnchorCount}）
       </span>
       <span>
         边界不确定度：{formatQualityMilliseconds(quality.boundaryUncertaintyMs)} · 左右支持：
@@ -1915,7 +2009,9 @@ function TimeMapSpanEvidenceSummary({ span }: { span: TimeMapSpan }) {
   );
 }
 
-function formatTimeMapSupportStatus(status: NonNullable<TimeMapSpan["quality"]>["leftSupport"]): string {
+function formatTimeMapSupportStatus(
+  status: NonNullable<TimeMapSpan["quality"]>["leftSupport"]
+): string {
   if (status === "supported") return "已支持";
   if (status === "unsupported") return "缺少支持";
   if (status === "legacyUnverified") return "旧项目未记录";

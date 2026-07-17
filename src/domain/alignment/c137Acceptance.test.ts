@@ -366,9 +366,7 @@ describe("C137 fail-closed acceptance gate", () => {
         id
       ).toMatchObject({ status: "pass" });
     }
-    for (const id of [
-      "native-blind-ranking-provenance"
-    ]) {
+    for (const id of ["native-blind-ranking-provenance"]) {
       expect(
         gate.checks.find((check) => check.id === id),
         id
@@ -1300,8 +1298,8 @@ function createCompleteBundle(): C137AcceptanceBundle {
       requiredFormalBlindProvenanceSchemaVersion: 3,
       requiredBlindMatrixPlanSchemaVersion: 2,
       requiredBlindProjectionSchemaVersion: 1,
-      requiredNativeEvidenceVersion: 4,
-      requiredNativeReceiptSchemaVersion: 4,
+      requiredNativeEvidenceVersion: 5,
+      requiredNativeReceiptSchemaVersion: 5,
       requiredBlindPairingMode: "fullCartesian",
       requiredBlindScoreContract: "alignment-v2-pair-intrinsic-global-weight-v1",
       requiredBlindMatrixCoverage: "exhaustive",

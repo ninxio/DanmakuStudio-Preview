@@ -116,7 +116,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.3-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-fine-frontier-second-assignment-v15";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v16";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -612,25 +612,25 @@ pub struct AudioAlignmentJobSnapshot {
     updated_at_ms: u64,
 }
 
-const AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION: u8 = 1;
-const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 4;
+const AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION: u8 = 2;
+const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 5;
 const AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K: usize = 10;
 const AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION: &str =
     "alignment-v2-pair-intrinsic-global-weight-v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION: &str =
     "alignment-v2-coarse-upper-times-confidence-v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN: &str =
-    "audio-alignment-v4/fine-frontier-inventory/v2";
+    "audio-alignment-v5/fine-frontier-inventory/v3";
 const AUDIO_ALIGNMENT_BATCH_FINE_OCCUPANCY_DIGEST_DOMAIN: &str =
-    "audio-alignment-v4/fine-occupancy/v1";
+    "audio-alignment-v5/fine-occupancy/v2";
 const AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN: &str =
-    "audio-alignment-v4/proposal-time-map/v1";
+    "audio-alignment-v5/proposal-time-map/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN: &str =
-    "audio-alignment-v4/fine-parameters/v1";
+    "audio-alignment-v5/fine-parameters/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN: &str =
-    "audio-alignment-v4/fine-execution-evidence/v1";
+    "audio-alignment-v5/fine-execution-evidence/v2";
 const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN: &str =
-    "audio-alignment-v4/fine-frontier-receipt/v2";
+    "audio-alignment-v5/fine-frontier-receipt/v3";
 const AUDIO_ALIGNMENT_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION: u8 = 1;
 const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS: u64 = 1;
 // Conservative component cap; the resolver also clamps this to the mutable inventory size.
@@ -646,6 +646,7 @@ const AUDIO_ALIGNMENT_BATCH_V3_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_PER_SIDE: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_PAIRS: usize = 256;
 const MAX_AUDIO_ALIGNMENT_BATCH_MEDIA_ID_BYTES: usize = 512;
+const MAX_AUDIO_ALIGNMENT_BATCH_VERSION_GROUP_ID_BYTES: usize = 160;
 const MAX_AUDIO_ALIGNMENT_BATCH_TERMINAL_JOBS: usize = 16;
 const AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS: f64 = 0.02;
 const AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS: f64 = 0.20;
@@ -666,6 +667,30 @@ struct AudioAlignmentBatchPairRequest {
     target_media_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioAlignmentBatchVersionGroupSide {
+    Source,
+    Target,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AudioAlignmentBatchVersionReuseGroupRequest {
+    group_id: String,
+    side: AudioAlignmentBatchVersionGroupSide,
+    media_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchVersionReuseGroupSnapshot {
+    group_ordinal: u32,
+    group_id: String,
+    side: AudioAlignmentBatchVersionGroupSide,
+    media_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioAlignmentBatchRequest {
@@ -673,6 +698,7 @@ pub struct AudioAlignmentBatchRequest {
     sources: Vec<AudioAlignmentBatchMediaRequest>,
     targets: Vec<AudioAlignmentBatchMediaRequest>,
     pairs: Option<Vec<AudioAlignmentBatchPairRequest>>,
+    version_reuse_groups: Vec<AudioAlignmentBatchVersionReuseGroupRequest>,
     ffmpeg_path: Option<String>,
     ffprobe_path: Option<String>,
     spectral_backend: Option<SpectralBackendPreference>,
@@ -856,6 +882,8 @@ pub struct AudioAlignmentBatchFineFrontierReceiptSnapshot {
 pub struct AudioAlignmentBatchFineInventoryCandidateSnapshot {
     id: AudioAlignmentBatchFineCandidateIdSnapshot,
     coarse_upper_bound_micros: u32,
+    source_axis_reuse_group_ordinal: Option<u32>,
+    target_axis_reuse_group_ordinal: Option<u32>,
     members: Vec<AudioAlignmentBatchRelationCandidateSnapshot>,
 }
 
@@ -1077,6 +1105,7 @@ pub struct AudioAlignmentBatchJobSnapshot {
     pairing_mode: AudioAlignmentBatchPairingMode,
     source_media_ids: Vec<String>,
     target_media_ids: Vec<String>,
+    version_reuse_groups: Vec<AudioAlignmentBatchVersionReuseGroupSnapshot>,
     status: AudioAlignmentJobStatus,
     progress: f64,
     message: String,
@@ -1885,6 +1914,8 @@ struct PlannedAudioAlignmentBatchPair {
     target_media_index: usize,
     source_physical_media_index: usize,
     target_physical_media_index: usize,
+    source_axis_reuse_group_ordinal: Option<u32>,
+    target_axis_reuse_group_ordinal: Option<u32>,
     relation_ranking: AudioAlignmentBatchRelationRankingSnapshot,
     global_selection: AudioAlignmentBatchGlobalSelectionSnapshot,
     request: AudioAlignmentRequest,
@@ -1898,11 +1929,18 @@ struct PlannedAudioAlignmentBatchMedia {
     role_label: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct PlannedAudioAlignmentBatchVersionReuseGroup {
+    snapshot: AudioAlignmentBatchVersionReuseGroupSnapshot,
+    media_indices: Vec<usize>,
+}
+
 #[derive(Clone)]
 struct PlannedAudioAlignmentBatch {
     pairing_mode: AudioAlignmentBatchPairingMode,
     source_media_ids: Vec<String>,
     target_media_ids: Vec<String>,
+    version_reuse_groups: Vec<PlannedAudioAlignmentBatchVersionReuseGroup>,
     media: Vec<PlannedAudioAlignmentBatchMedia>,
     pairs: Vec<PlannedAudioAlignmentBatchPair>,
     spectral_backend_request: SpectralBackendRequest,
@@ -7656,6 +7694,7 @@ fn select_v2_global_shortlist_with_limits(
                 pairing_mode: plan.pairing_mode.clone(),
                 source_media_ids: plan.source_media_ids.clone(),
                 target_media_ids: plan.target_media_ids.clone(),
+                version_reuse_groups: plan.version_reuse_groups.clone(),
                 media: plan.media.clone(),
                 pairs: unaffected_indices
                     .iter()
@@ -8466,11 +8505,13 @@ fn v2_fine_physical_occupancy_from_proposal(
         source: PhysicalAxisOccupancy {
             space_ordinal: u32::try_from(pair.source_physical_media_index)
                 .map_err(|_| "source physical group ordinal 无法表示为 u32。".to_string())?,
+            reuse_group_ordinal: pair.source_axis_reuse_group_ordinal,
             intervals: source,
         },
         target: PhysicalAxisOccupancy {
             space_ordinal: u32::try_from(pair.target_physical_media_index)
                 .map_err(|_| "target physical group ordinal 无法表示为 u32。".to_string())?,
+            reuse_group_ordinal: pair.target_axis_reuse_group_ordinal,
             intervals: target,
         },
     })
@@ -8588,6 +8629,8 @@ fn create_v2_fine_frontier_inventory(
             inventory_candidates.push(AudioAlignmentBatchFineInventoryCandidateSnapshot {
                 id: id.into(),
                 coarse_upper_bound_micros: upper.get(),
+                source_axis_reuse_group_ordinal: pair.source_axis_reuse_group_ordinal,
+                target_axis_reuse_group_ordinal: pair.target_axis_reuse_group_ordinal,
                 members,
             });
         }
@@ -9016,12 +9059,14 @@ fn v2_fine_occupancy_digest(occupancy: &PairPhysicalOccupancy) -> Result<String,
     let value = serde_json::json!({
         "source": {
             "spaceOrdinal": occupancy.source.space_ordinal,
+            "reuseGroupOrdinal": occupancy.source.reuse_group_ordinal,
             "intervals": occupancy.source.intervals.iter().map(|interval| {
                 serde_json::json!({"startMs": interval.start_ms, "endMs": interval.end_ms})
             }).collect::<Vec<_>>()
         },
         "target": {
             "spaceOrdinal": occupancy.target.space_ordinal,
+            "reuseGroupOrdinal": occupancy.target.reuse_group_ordinal,
             "intervals": occupancy.target.intervals.iter().map(|interval| {
                 serde_json::json!({"startMs": interval.start_ms, "endMs": interval.end_ms})
             }).collect::<Vec<_>>()
@@ -9184,6 +9229,12 @@ fn v2_global_candidates_conflict(
     right: &V2TrackPairCandidate,
 ) -> bool {
     (left_pair.source_physical_media_index == right_pair.source_physical_media_index
+        && !v2_version_reuse_allows_shared_axis(
+            left_pair.source_axis_reuse_group_ordinal,
+            right_pair.source_axis_reuse_group_ordinal,
+            left_pair.target_physical_media_index,
+            right_pair.target_physical_media_index,
+        )
         && v2_interval_overlap_ms(
             (
                 left.global_source_interval.start_ms,
@@ -9195,6 +9246,12 @@ fn v2_global_candidates_conflict(
             ),
         ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
         || (left_pair.target_physical_media_index == right_pair.target_physical_media_index
+            && !v2_version_reuse_allows_shared_axis(
+                left_pair.target_axis_reuse_group_ordinal,
+                right_pair.target_axis_reuse_group_ordinal,
+                left_pair.source_physical_media_index,
+                right_pair.source_physical_media_index,
+            )
             && v2_interval_overlap_ms(
                 (
                     left.global_target_interval.start_ms,
@@ -9205,6 +9262,18 @@ fn v2_global_candidates_conflict(
                     right.global_target_interval.end_ms,
                 ),
             ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+}
+
+fn v2_version_reuse_allows_shared_axis(
+    left_group: Option<u32>,
+    right_group: Option<u32>,
+    left_opposite_physical_media_index: usize,
+    right_opposite_physical_media_index: usize,
+) -> bool {
+    left_group.is_some_and(|group| {
+        right_group == Some(group)
+            && left_opposite_physical_media_index != right_opposite_physical_media_index
+    })
 }
 
 fn probe_alignment_audio_candidates(
@@ -15135,6 +15204,12 @@ fn plan_audio_alignment_batch(
         requested_audio_stream_index: item.audio_stream_index,
         role_label: "目标原片",
     }));
+    let mut version_reuse_groups = normalize_audio_alignment_batch_version_reuse_groups(
+        &request.version_reuse_groups,
+        &sources,
+        &targets,
+        target_media_offset,
+    )?;
 
     let mut pairs = Vec::with_capacity(pair_count);
     if let Some(pair_selection) = &request.pairs {
@@ -15214,6 +15289,35 @@ fn plan_audio_alignment_batch(
         debug_assert_ne!(pair.source_media_index, usize::MAX);
         debug_assert_ne!(pair.target_media_index, usize::MAX);
     }
+    for group in &mut version_reuse_groups {
+        for media_index in &mut group.media_indices {
+            let remapped = media_index_remap[*media_index];
+            if remapped == usize::MAX {
+                return Err(format!(
+                    "版本复用组 {} 包含未被显式 pair 使用的媒体；请只为本批次实际分析的素材分组。",
+                    group.snapshot.group_id
+                ));
+            }
+            *media_index = remapped;
+        }
+    }
+    let mut source_group_by_media = HashMap::<usize, u32>::new();
+    let mut target_group_by_media = HashMap::<usize, u32>::new();
+    for group in &version_reuse_groups {
+        let target = match group.snapshot.side {
+            AudioAlignmentBatchVersionGroupSide::Source => &mut source_group_by_media,
+            AudioAlignmentBatchVersionGroupSide::Target => &mut target_group_by_media,
+        };
+        for media_index in &group.media_indices {
+            target.insert(*media_index, group.snapshot.group_ordinal);
+        }
+    }
+    for pair in &mut pairs {
+        pair.source_axis_reuse_group_ordinal =
+            target_group_by_media.get(&pair.target_media_index).copied();
+        pair.target_axis_reuse_group_ordinal =
+            source_group_by_media.get(&pair.source_media_index).copied();
+    }
     let media = compact_media;
     let first = pairs
         .first()
@@ -15226,6 +15330,7 @@ fn plan_audio_alignment_batch(
         pairing_mode,
         source_media_ids,
         target_media_ids,
+        version_reuse_groups,
         media,
         pairs,
         spectral_backend_request,
@@ -15250,6 +15355,8 @@ fn create_planned_audio_alignment_batch_pair(
         target_media_index,
         source_physical_media_index: source_media_index,
         target_physical_media_index: target_media_index,
+        source_axis_reuse_group_ordinal: None,
+        target_axis_reuse_group_ordinal: None,
         relation_ranking: AudioAlignmentBatchRelationRankingSnapshot::pending(),
         global_selection: AudioAlignmentBatchGlobalSelectionSnapshot::pending(),
         request: AudioAlignmentRequest {
@@ -15272,6 +15379,115 @@ fn create_planned_audio_alignment_batch_pair(
             localization_mode: batch.localization_mode,
         },
     }
+}
+
+fn normalize_audio_alignment_batch_version_reuse_groups(
+    groups: &[AudioAlignmentBatchVersionReuseGroupRequest],
+    sources: &[AudioAlignmentBatchMediaRequest],
+    targets: &[AudioAlignmentBatchMediaRequest],
+    target_media_offset: usize,
+) -> Result<Vec<PlannedAudioAlignmentBatchVersionReuseGroup>, String> {
+    let source_indices = sources
+        .iter()
+        .enumerate()
+        .map(|(index, media)| (media.media_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let target_indices = targets
+        .iter()
+        .enumerate()
+        .map(|(index, media)| {
+            (
+                media.media_id.as_str(),
+                target_media_offset.saturating_add(index),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen_group_ids = HashSet::<String>::new();
+    let mut grouped_media = HashSet::<(u8, String)>::new();
+    let mut normalized = Vec::<(
+        AudioAlignmentBatchVersionGroupSide,
+        String,
+        Vec<String>,
+        Vec<usize>,
+    )>::new();
+    for group in groups {
+        let group_id = group.group_id.trim();
+        if group_id.is_empty()
+            || group_id.len() > MAX_AUDIO_ALIGNMENT_BATCH_VERSION_GROUP_ID_BYTES
+            || group_id.chars().any(char::is_control)
+            || !group_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
+        {
+            return Err(
+                "版本复用 groupId 必须是最多 160 bytes 的 ASCII 字母数字/._:- 标识。".to_string(),
+            );
+        }
+        if !seen_group_ids.insert(group_id.to_string()) {
+            return Err("版本复用 groupId 必须全局唯一。".to_string());
+        }
+        if group.media_ids.len() < 2 {
+            return Err("版本复用组至少需要两个不同媒体。".to_string());
+        }
+        let (side_order, indices) = match group.side {
+            AudioAlignmentBatchVersionGroupSide::Source => (0_u8, &source_indices),
+            AudioAlignmentBatchVersionGroupSide::Target => (1_u8, &target_indices),
+        };
+        let mut members = Vec::<(usize, String)>::with_capacity(group.media_ids.len());
+        let mut seen_members = HashSet::<String>::new();
+        for media_id in &group.media_ids {
+            let media_id = media_id.trim();
+            let Some(media_index) = indices.get(media_id).copied() else {
+                return Err(format!(
+                    "版本复用组 {group_id} 引用了错误侧或不存在的 mediaId。"
+                ));
+            };
+            if !seen_members.insert(media_id.to_string()) {
+                return Err(format!("版本复用组 {group_id} 包含重复 mediaId。"));
+            }
+            if !grouped_media.insert((side_order, media_id.to_string())) {
+                return Err(format!(
+                    "媒体 {media_id} 不能同时属于同一侧的多个版本复用组。"
+                ));
+            }
+            members.push((media_index, media_id.to_string()));
+        }
+        members.sort_by_key(|(index, _)| *index);
+        normalized.push((
+            group.side,
+            group_id.to_string(),
+            members
+                .iter()
+                .map(|(_, media_id)| media_id.clone())
+                .collect(),
+            members.into_iter().map(|(index, _)| index).collect(),
+        ));
+    }
+    normalized.sort_by(|left, right| {
+        let side_order = |side: AudioAlignmentBatchVersionGroupSide| match side {
+            AudioAlignmentBatchVersionGroupSide::Source => 0_u8,
+            AudioAlignmentBatchVersionGroupSide::Target => 1_u8,
+        };
+        side_order(left.0)
+            .cmp(&side_order(right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    normalized
+        .into_iter()
+        .enumerate()
+        .map(|(index, (side, group_id, media_ids, media_indices))| {
+            Ok(PlannedAudioAlignmentBatchVersionReuseGroup {
+                snapshot: AudioAlignmentBatchVersionReuseGroupSnapshot {
+                    group_ordinal: u32::try_from(index + 1)
+                        .map_err(|_| "版本复用组序号无法表示为 u32。".to_string())?,
+                    group_id,
+                    side,
+                    media_ids,
+                },
+                media_indices,
+            })
+        })
+        .collect()
 }
 
 fn validate_audio_alignment_batch_side_count(label: &str, count: usize) -> Result<(), String> {
@@ -15351,6 +15567,11 @@ fn insert_audio_alignment_batch_job(
         pairing_mode: plan.pairing_mode.clone(),
         source_media_ids: plan.source_media_ids.clone(),
         target_media_ids: plan.target_media_ids.clone(),
+        version_reuse_groups: plan
+            .version_reuse_groups
+            .iter()
+            .map(|group| group.snapshot.clone())
+            .collect(),
         status: AudioAlignmentJobStatus::Queued,
         progress: 0.0,
         message: "批量音频对齐任务已加入队列。".to_string(),
@@ -15627,6 +15848,29 @@ fn bind_audio_alignment_batch_physical_groups(
                 prepared.len().saturating_add(pair.target_media_index)
             }
         };
+    }
+    for group in &plan.version_reuse_groups {
+        let mut physical_groups = HashSet::<usize>::new();
+        for media_index in &group.media_indices {
+            let physical_group = match prepared.get(*media_index) {
+                Some(PreparedAudioAlignmentBatchMediaState::Ready(media)) => {
+                    media.physical_group_index
+                }
+                Some(PreparedAudioAlignmentBatchMediaState::Failed { .. }) => {
+                    return Err(format!(
+                        "blocked:version-reuse-preflight：版本复用组 {} 的全部成员都必须完成物理媒体预检。",
+                        group.snapshot.group_id
+                    ));
+                }
+                None => return Err("版本复用组媒体索引越界。".to_string()),
+            };
+            if !physical_groups.insert(physical_group) {
+                return Err(format!(
+                    "blocked:version-reuse-alias：版本复用组 {} 包含指向同一物理文件的别名；同片段复用只允许不同物理版本。",
+                    group.snapshot.group_id
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -17724,9 +17968,24 @@ fn validate_audio_alignment_batch_fine_inventory_candidates(
         .map(|candidate| candidate.id)
         .collect::<Vec<_>>();
     validate_audio_alignment_batch_fine_candidate_ids(&ids, component_pair_ordinals)?;
+    let mut reuse_groups_by_pair = HashMap::<u32, (Option<u32>, Option<u32>)>::new();
     for candidate in candidates {
-        if candidate.coarse_upper_bound_micros > SCORE_MICROS_ONE || candidate.members.is_empty() {
+        if candidate.coarse_upper_bound_micros > SCORE_MICROS_ONE
+            || candidate.members.is_empty()
+            || candidate.source_axis_reuse_group_ordinal == Some(0)
+            || candidate.target_axis_reuse_group_ordinal == Some(0)
+        {
             return Err("fine frontier inventory candidate 的上界或成员无效。".to_string());
+        }
+        let reuse_groups = (
+            candidate.source_axis_reuse_group_ordinal,
+            candidate.target_axis_reuse_group_ordinal,
+        );
+        if reuse_groups_by_pair
+            .insert(candidate.id.pair_ordinal, reuse_groups)
+            .is_some_and(|previous| previous != reuse_groups)
+        {
+            return Err("fine frontier 同一 pair 的版本复用组发生漂移。".to_string());
         }
         let mut previous_rank = 0_usize;
         for member in &candidate.members {
@@ -22736,6 +22995,7 @@ mod tests {
         PairPhysicalOccupancy {
             source: PhysicalAxisOccupancy {
                 space_ordinal: source_space,
+                reuse_group_ordinal: None,
                 intervals: vec![PhysicalInterval {
                     start_ms: source_start_ms,
                     end_ms: source_end_ms,
@@ -22743,6 +23003,7 @@ mod tests {
             },
             target: PhysicalAxisOccupancy {
                 space_ordinal: target_space,
+                reuse_group_ordinal: None,
                 intervals: vec![PhysicalInterval {
                     start_ms: target_start_ms,
                     end_ms: target_end_ms,
@@ -23423,6 +23684,8 @@ mod tests {
                 candidate_ordinal: 1,
             },
             coarse_upper_bound_micros: 900_000,
+            source_axis_reuse_group_ordinal: None,
+            target_axis_reuse_group_ordinal: None,
             members: vec![AudioAlignmentBatchRelationCandidateSnapshot {
                 rank: 1,
                 source_stream_index: 0,
@@ -26663,6 +26926,7 @@ mod tests {
                     video_stream_index: None,
                 },
             ],
+            version_reuse_groups: Vec::new(),
             targets: vec![AudioAlignmentBatchMediaRequest {
                 media_id: "target".to_string(),
                 path: target_path.to_string_lossy().into_owned(),
@@ -26736,6 +27000,19 @@ mod tests {
             alias_plan.pairs[0].source_physical_media_index,
             alias_plan.pairs[2].source_physical_media_index
         );
+        let mut invalid_version_group_request = request.clone();
+        invalid_version_group_request.version_reuse_groups =
+            vec![AudioAlignmentBatchVersionReuseGroupRequest {
+                group_id: "aliased-source-versions".to_string(),
+                side: AudioAlignmentBatchVersionGroupSide::Source,
+                media_ids: vec!["source-primary".to_string(), "source-alias".to_string()],
+            }];
+        let mut invalid_version_group_plan =
+            plan_audio_alignment_batch(invalid_version_group_request).unwrap();
+        let alias_error =
+            bind_audio_alignment_batch_physical_groups(&mut invalid_version_group_plan, &prepared)
+                .expect_err("hard-link aliases cannot masquerade as distinct versions");
+        assert!(alias_error.starts_with("blocked:version-reuse-alias"));
         drop(prepared);
         toolchain.verify_at_finalization().unwrap();
         drop(toolchain);
@@ -28227,6 +28504,7 @@ mod tests {
             "schemaVersion": AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
             "sources": [{"mediaId": "source", "path": "source.mkv"}],
             "targets": [{"mediaId": "target", "path": "target.mkv"}],
+            "versionReuseGroups": [],
             "spectralBackend": "cpu",
             "localizationMode": true,
         });
@@ -28874,6 +29152,7 @@ mod tests {
                 })
                 .collect(),
             pairs: None,
+            version_reuse_groups: Vec::new(),
             ffmpeg_path: None,
             ffprobe_path: None,
             spectral_backend: Some(SpectralBackendPreference::Cpu),
@@ -29009,6 +29288,7 @@ mod tests {
                     })
                     .collect(),
             ),
+            version_reuse_groups: Vec::new(),
             ffmpeg_path: None,
             ffprobe_path: None,
             spectral_backend: Some(SpectralBackendPreference::Cpu),
@@ -29413,6 +29693,75 @@ mod tests {
                 .count()
                 < 2,
             "same complete episode must never select both local supports"
+        );
+    }
+
+    #[test]
+    fn explicit_target_version_group_allows_one_source_segment_to_match_multiple_versions() {
+        let mut request = test_audio_alignment_batch_request(Some(vec![
+            ("source-1", "target-1"),
+            ("source-1", "target-2"),
+        ]));
+        request.sources.truncate(1);
+        request.version_reuse_groups = vec![AudioAlignmentBatchVersionReuseGroupRequest {
+            group_id: "dark-s01e01-versions".to_string(),
+            side: AudioAlignmentBatchVersionGroupSide::Target,
+            media_ids: vec!["target-2".to_string(), "target-1".to_string()],
+        }];
+        let plan = plan_audio_alignment_batch(request).unwrap();
+        assert_eq!(plan.version_reuse_groups.len(), 1);
+        assert_eq!(
+            plan.version_reuse_groups[0].snapshot.media_ids,
+            ["target-1", "target-2"]
+        );
+        assert_eq!(plan.pairs[0].source_axis_reuse_group_ordinal, Some(1));
+        assert_eq!(plan.pairs[1].source_axis_reuse_group_ordinal, Some(1));
+
+        let first = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 120_000,
+            },
+            0.90,
+            false,
+        );
+        let second = first.clone();
+        assert!(!v2_global_candidates_conflict(
+            &plan.pairs[0],
+            &first,
+            &plan.pairs[1],
+            &second,
+        ));
+        let decisions = select_v2_global_shortlist(
+            &plan,
+            &[
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![first],
+                    temporal_window_groups: Vec::new(),
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![second],
+                    temporal_window_groups: Vec::new(),
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+            ],
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|decision| matches!(decision, V2GlobalShortlistDecision::Selected(_)))
+                .count(),
+            2
         );
     }
 
@@ -29985,7 +30334,7 @@ mod tests {
     #[test]
     fn audio_alignment_batch_planner_rejects_invalid_schema_references_and_duplicates() {
         let mut wrong_schema = test_audio_alignment_batch_request(None);
-        wrong_schema.schema_version = 2;
+        wrong_schema.schema_version = 1;
         assert!(plan_audio_alignment_batch(wrong_schema)
             .err()
             .expect("错误 schema 必须失败")
@@ -30477,6 +30826,7 @@ mod tests {
                     video_stream_index: Some(14),
                 },
             ],
+            version_reuse_groups: Vec::new(),
             pairs: pairs.map(|pairs| {
                 pairs
                     .into_iter()
@@ -30636,6 +30986,7 @@ mod tests {
                 pairing_mode: AudioAlignmentBatchPairingMode::FullCartesian,
                 source_media_ids: Vec::new(),
                 target_media_ids: Vec::new(),
+                version_reuse_groups: Vec::new(),
                 status,
                 progress: 0.0,
                 message: String::new(),

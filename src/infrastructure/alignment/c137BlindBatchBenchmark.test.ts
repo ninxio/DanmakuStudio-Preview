@@ -1065,12 +1065,16 @@ function createTerminalSnapshot(
   failedPairCount: number
 ): AudioAlignmentBatchJobSnapshot {
   return {
-    schemaVersion: 1,
-    evidenceVersion: 4,
+    schemaVersion: 2,
+    evidenceVersion: 5,
     jobId: "coordinator-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
     targetMediaIds: suite.targets.map((media) => media.mediaId),
+    versionReuseGroups: suite.versionReuseGroups.map((group, index) => ({
+      ...structuredClone(group),
+      groupOrdinal: index + 1
+    })),
     status: "completed",
     progress: 1,
     message: "completed",

@@ -230,6 +230,7 @@ function createExecutionSuite(
       sourceMediaId: pair.sourceMediaId,
       targetMediaId: pair.targetMediaId
     })),
+    versionReuseGroups: [],
     parameters: {
       ffmpegPath: "C:\\tools\\ffmpeg.exe",
       ffprobePath: "C:\\tools\\ffprobe.exe",
@@ -362,17 +363,18 @@ function createNativeReceipt(
     ({ selected, ...outcome }) => ({
       ...outcome,
       fineFrontier: structuredClone(fineFrontier),
-      fineExecutionEvidence: selected && outcome.proposalTimeMap !== null
-        ? createTestFineExecutionEvidence(outcome.proposalTimeMap, {
-            pairOrdinal: outcome.pairOrdinal,
-            sourceStreamIndex: outcome.proposalTimeMap.sourceStream?.index ?? 0,
-            targetStreamIndex: outcome.proposalTimeMap.targetStream?.index ?? 0,
-            engineVersion: TEST_NATIVE_EXECUTION_IDENTITY.engineVersion,
-            featureVersion: TEST_NATIVE_EXECUTION_IDENTITY.featureVersion,
-            coarseBackend,
-            fineBackend: coarseBackend
-          })
-        : null
+      fineExecutionEvidence:
+        selected && outcome.proposalTimeMap !== null
+          ? createTestFineExecutionEvidence(outcome.proposalTimeMap, {
+              pairOrdinal: outcome.pairOrdinal,
+              sourceStreamIndex: outcome.proposalTimeMap.sourceStream?.index ?? 0,
+              targetStreamIndex: outcome.proposalTimeMap.targetStream?.index ?? 0,
+              engineVersion: TEST_NATIVE_EXECUTION_IDENTITY.engineVersion,
+              featureVersion: TEST_NATIVE_EXECUTION_IDENTITY.featureVersion,
+              coarseBackend,
+              fineBackend: coarseBackend
+            })
+          : null
     })
   );
   const withoutDigest: Omit<RealMediaBlindBatchRunReceipt, "receiptDigest"> = {
@@ -393,6 +395,10 @@ function createNativeReceipt(
     targetCount: suite.targets.length,
     pairCount: suite.pairs.length,
     topK: suite.topK,
+    versionReuseGroups: suite.versionReuseGroups.map((group, index) => ({
+      ...structuredClone(group),
+      groupOrdinal: index + 1
+    })),
     pairOutcomes,
     sourceRankings: suite.sources.map((source) =>
       createRealMediaBlindBatchSourceRanking(source.mediaId, pairOutcomes, suite.topK)
@@ -729,7 +735,9 @@ export function resealC137FormalBlindNativeReceiptFixture(
       sourceCoarseBackend,
       targetCoarseBackend,
       sourceFineBackend: createFixtureFineBackend(sourceCoarseBackend),
-      targetFineBackend: createFixtureFineBackend(targetCoarseBackend)
+      targetFineBackend: createFixtureFineBackend(targetCoarseBackend),
+      selectedMemberRank: current.selectedMemberRank,
+      groupMemberRanks: [...current.groupMemberRanks]
     });
   }
   receipt.sourceRankings = envelope.executionSuite.sources.map((source) =>
@@ -760,7 +768,8 @@ function createFixtureFineBackend(
   coarse: NativeBatchExecutionIdentity["sourceSpectralBackends"][number]
 ): NativeBatchExecutionIdentity["sourceSpectralBackends"][number] {
   const locked = deriveLockedFineSpectralBackendIdentity(coarse);
-  if (locked === null) throw new Error(`fixture coarse backend 无法锁定 fine：${coarse.backendId}`);
+  if (locked === null)
+    throw new Error(`fixture coarse backend 无法锁定 fine：${coarse.backendId}`);
   return locked;
 }
 
