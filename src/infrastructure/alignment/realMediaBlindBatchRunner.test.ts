@@ -99,12 +99,12 @@ describe("C137 real-media blind full-Cartesian batch runner", () => {
     expect(nativeRequest).not.toHaveProperty("pairs");
 
     expect(receipt).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       receiptKind: "c137-real-media-blind-batch-run",
       suiteId: suite.suiteId,
       datasetVersion: suite.datasetVersion,
       executionDigest: createRealMediaBlindBatchExecutionDigest(suite),
-      nativeEvidenceVersion: 3,
+      nativeEvidenceVersion: 4,
       pairingMode: "fullCartesian",
       status: "completed",
       terminationReason: "native-terminal",
@@ -957,7 +957,7 @@ function createRunningSnapshot(
   }));
   return {
     schemaVersion: 1,
-    evidenceVersion: 3,
+    evidenceVersion: 4,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -1022,7 +1022,7 @@ function createCompletedSnapshot(
   });
   return {
     schemaVersion: 1,
-    evidenceVersion: 3,
+    evidenceVersion: 4,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),
@@ -1118,7 +1118,7 @@ function createCancelledSnapshot(
   }));
   return {
     schemaVersion: 1,
-    evidenceVersion: 3,
+    evidenceVersion: 4,
     jobId: "blind-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),

@@ -612,24 +612,24 @@ pub struct AudioAlignmentJobSnapshot {
 }
 
 const AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION: u8 = 1;
-const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 3;
+const AUDIO_ALIGNMENT_BATCH_EVIDENCE_VERSION: u8 = 4;
 const AUDIO_ALIGNMENT_BATCH_EVIDENCE_TOP_K: usize = 10;
 const AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION: &str =
     "alignment-v2-pair-intrinsic-global-weight-v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION: &str =
     "alignment-v2-coarse-upper-times-confidence-v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN: &str =
-    "audio-alignment-v3/fine-frontier-inventory/v1";
+    "audio-alignment-v4/fine-frontier-inventory/v2";
 const AUDIO_ALIGNMENT_BATCH_FINE_OCCUPANCY_DIGEST_DOMAIN: &str =
-    "audio-alignment-v3/fine-occupancy/v1";
+    "audio-alignment-v4/fine-occupancy/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_TIME_MAP_DIGEST_DOMAIN: &str =
-    "audio-alignment-v3/proposal-time-map/v1";
+    "audio-alignment-v4/proposal-time-map/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_PARAMETERS_DIGEST_DOMAIN: &str =
-    "audio-alignment-v3/fine-parameters/v1";
+    "audio-alignment-v4/fine-parameters/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_EXECUTION_DIGEST_DOMAIN: &str =
-    "audio-alignment-v3/fine-execution-evidence/v1";
+    "audio-alignment-v4/fine-execution-evidence/v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN: &str =
-    "audio-alignment-v3/fine-frontier-receipt/v1";
+    "audio-alignment-v4/fine-frontier-receipt/v2";
 const AUDIO_ALIGNMENT_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION: u8 = 1;
 const AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS: u64 = 1;
 // Conservative component cap; the resolver also clamps this to the mutable inventory size.
@@ -820,12 +820,13 @@ pub enum AudioAlignmentBatchFineFrontierStateSnapshot {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioAlignmentBatchFineFrontierReceiptSnapshot {
     contract_version: &'static str,
     score_version: &'static str,
     inventory_digest: String,
+    inventory_candidates: Vec<AudioAlignmentBatchFineInventoryCandidateSnapshot>,
     receipt_digest: String,
     component_ordinal: usize,
     component_pair_ordinals: Vec<usize>,
@@ -847,6 +848,14 @@ pub struct AudioAlignmentBatchFineFrontierReceiptSnapshot {
     deferred_candidate_count: usize,
     proof: AudioAlignmentBatchFineResolutionProofSnapshot,
     search: AudioAlignmentBatchFineSearchSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AudioAlignmentBatchFineInventoryCandidateSnapshot {
+    id: AudioAlignmentBatchFineCandidateIdSnapshot,
+    coarse_upper_bound_micros: u32,
+    members: Vec<AudioAlignmentBatchRelationCandidateSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2045,12 +2054,9 @@ struct V2FineComponentFailure {
     progress: V2FineFrontierFailureProgress,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct V2FineInventoryDigestEntry {
-    id: AudioAlignmentBatchFineCandidateIdSnapshot,
-    coarse_upper_bound_micros: u32,
-    members: Vec<AudioAlignmentBatchRelationCandidateSnapshot>,
+struct V2FineInventoryEvidence {
+    candidates: Vec<AudioAlignmentBatchFineInventoryCandidateSnapshot>,
+    digest: String,
 }
 
 enum StagedAudioAlignmentBatchPairOutcome {
@@ -8465,14 +8471,14 @@ fn create_v2_fine_frontier_inventory(
     (
         FineCandidateInventory,
         Vec<V2FineFrontierGroupBinding>,
-        String,
+        V2FineInventoryEvidence,
         FineFrontierConfig,
     ),
     String,
 > {
     let mut candidates = Vec::<FineCandidate>::new();
     let mut bindings = Vec::<V2FineFrontierGroupBinding>::new();
-    let mut digest_entries = Vec::<V2FineInventoryDigestEntry>::new();
+    let mut inventory_candidates = Vec::<AudioAlignmentBatchFineInventoryCandidateSnapshot>::new();
     for pair_index in pair_indices {
         let pair = plan
             .pairs
@@ -8534,7 +8540,7 @@ fn create_v2_fine_frontier_inventory(
                 pair_index: *pair_index,
                 member_indices: group.member_indices.clone(),
             });
-            digest_entries.push(V2FineInventoryDigestEntry {
+            inventory_candidates.push(AudioAlignmentBatchFineInventoryCandidateSnapshot {
                 id: id.into(),
                 coarse_upper_bound_micros: upper.get(),
                 members,
@@ -8547,14 +8553,7 @@ fn create_v2_fine_frontier_inventory(
             );
         }
     }
-    let canonical = canonicalize_v2_cross_language_json(
-        &serde_json::to_value(&digest_entries)
-            .map_err(|_| "fine frontier inventory 无法序列化。".to_string())?,
-    )?;
-    let inventory_digest = v2_domain_separated_canonical_digest(
-        AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
-        &canonical,
-    );
+    let inventory_digest = create_v2_fine_inventory_digest(&inventory_candidates)?;
     let inventory = FineCandidateInventory { candidates };
     let mut max_upper_by_pair = HashMap::<u32, u32>::new();
     for candidate in &inventory.candidates {
@@ -8579,7 +8578,28 @@ fn create_v2_fine_frontier_inventory(
         overlap_tolerance_ms,
         ..FineFrontierConfig::default()
     };
-    Ok((inventory, bindings, inventory_digest, config))
+    Ok((
+        inventory,
+        bindings,
+        V2FineInventoryEvidence {
+            candidates: inventory_candidates,
+            digest: inventory_digest,
+        },
+        config,
+    ))
+}
+
+fn create_v2_fine_inventory_digest(
+    inventory_candidates: &[AudioAlignmentBatchFineInventoryCandidateSnapshot],
+) -> Result<String, String> {
+    let canonical = canonicalize_v2_cross_language_json(
+        &serde_json::to_value(inventory_candidates)
+            .map_err(|_| "fine frontier inventory 无法序列化。".to_string())?,
+    )?;
+    Ok(v2_domain_separated_canonical_digest(
+        AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
+        &canonical,
+    ))
 }
 
 fn audio_alignment_batch_fine_assignment_snapshot(
@@ -8739,6 +8759,7 @@ fn seal_audio_alignment_batch_fine_frontier_receipt(
 fn create_audio_alignment_batch_fine_frontier_receipt(
     component_ordinal: usize,
     plan: &PlannedAudioAlignmentBatch,
+    inventory_candidates: &[AudioAlignmentBatchFineInventoryCandidateSnapshot],
     resolution: &V2FineComponentResolution,
 ) -> Result<AudioAlignmentBatchFineFrontierReceiptSnapshot, String> {
     let final_state = match resolution.outcome.state {
@@ -8778,6 +8799,7 @@ fn create_audio_alignment_batch_fine_frontier_receipt(
             contract_version: FINE_FRONTIER_CONTRACT_VERSION,
             score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
             inventory_digest: resolution.inventory_digest.clone(),
+            inventory_candidates: inventory_candidates.to_vec(),
             receipt_digest: String::new(),
             component_ordinal,
             component_pair_ordinals,
@@ -8832,7 +8854,7 @@ fn create_failed_audio_alignment_batch_fine_frontier_receipt(
     plan: &PlannedAudioAlignmentBatch,
     pair_indices: &[usize],
     inventory: &FineCandidateInventory,
-    inventory_digest: String,
+    inventory_evidence: &V2FineInventoryEvidence,
     config: FineFrontierConfig,
     progress: V2FineFrontierFailureProgress,
 ) -> Result<AudioAlignmentBatchFineFrontierReceiptSnapshot, String> {
@@ -8849,7 +8871,8 @@ fn create_failed_audio_alignment_batch_fine_frontier_receipt(
         AudioAlignmentBatchFineFrontierReceiptSnapshot {
             contract_version: FINE_FRONTIER_CONTRACT_VERSION,
             score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
-            inventory_digest,
+            inventory_digest: inventory_evidence.digest.clone(),
+            inventory_candidates: inventory_evidence.candidates.clone(),
             receipt_digest: String::new(),
             component_ordinal,
             component_pair_ordinals,
@@ -8883,35 +8906,6 @@ fn create_failed_audio_alignment_batch_fine_frontier_receipt(
             },
         },
     )
-}
-
-fn create_v2_failed_component_inventory_digest(
-    plan: &PlannedAudioAlignmentBatch,
-    coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
-    pair_indices: &[usize],
-) -> Result<String, String> {
-    let entries = pair_indices
-        .iter()
-        .map(|pair_index| {
-            let pair = plan
-                .pairs
-                .get(*pair_index)
-                .ok_or_else(|| "failed component digest pair 索引越界。".to_string())?;
-            let coarse_complete = coarse_by_pair
-                .get(*pair_index)
-                .ok_or_else(|| "failed component digest coarse 索引越界。".to_string())?
-                .is_ok();
-            Ok(serde_json::json!({
-                "pairOrdinal": pair.pair_ordinal,
-                "coarseComplete": coarse_complete,
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let canonical = canonicalize_v2_cross_language_json(&serde_json::Value::Array(entries))?;
-    Ok(v2_domain_separated_canonical_digest(
-        AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
-        &canonical,
-    ))
 }
 
 fn audio_alignment_batch_spectral_backend_identity(
@@ -16650,12 +16644,16 @@ fn execute_v2_fine_frontier_batch(
                     .map_err(|_| "fine frontier overlap tolerance 不能为负数。".to_string())?,
                 ..FineFrontierConfig::default()
             };
+            let inventory_evidence = V2FineInventoryEvidence {
+                candidates: Vec::new(),
+                digest: create_v2_fine_inventory_digest(&[])?,
+            };
             let receipt = create_failed_audio_alignment_batch_fine_frontier_receipt(
                 component_ordinal,
                 plan,
                 &pair_indices,
                 &inventory,
-                create_v2_failed_component_inventory_digest(plan, coarse_by_pair, &pair_indices)?,
+                &inventory_evidence,
                 config,
                 V2FineFrontierFailureProgress {
                     refinement_round_count: 0,
@@ -16687,13 +16685,12 @@ fn execute_v2_fine_frontier_batch(
             continue;
         }
 
-        let (inventory, bindings, inventory_digest, config) =
+        let (inventory, bindings, inventory_evidence, config) =
             create_v2_fine_frontier_inventory(plan, coarse_by_pair, &pair_indices)?;
-        let failure_inventory_digest = inventory_digest.clone();
         let resolution = resolve_v2_fine_frontier_component_with(
             pair_indices.clone(),
             inventory,
-            inventory_digest,
+            inventory_evidence.digest.clone(),
             V2FineComponentExecutionLimits {
                 frontier: config,
                 component: V2FineComponentBudget::default(),
@@ -16737,7 +16734,7 @@ fn execute_v2_fine_frontier_batch(
                     plan,
                     &pair_indices,
                     &failure.inventory,
-                    failure_inventory_digest,
+                    &inventory_evidence,
                     config,
                     failure.progress,
                 )?;
@@ -16760,6 +16757,7 @@ fn execute_v2_fine_frontier_batch(
         let receipt = create_audio_alignment_batch_fine_frontier_receipt(
             component_ordinal,
             plan,
+            &inventory_evidence.candidates,
             &resolution,
         )?;
         let resolved = resolution.outcome.state == CoreFineFrontierState::Resolved;
@@ -17200,6 +17198,7 @@ fn create_test_audio_alignment_batch_fine_frontier_receipt(
                 AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
                 &inventory_json,
             ),
+            inventory_candidates: Vec::new(),
             receipt_digest: String::new(),
             component_ordinal: pair.pair_index + 1,
             component_pair_ordinals: vec![pair.pair_ordinal],
@@ -17671,6 +17670,55 @@ fn validate_audio_alignment_batch_fine_candidate_ids(
     Ok(())
 }
 
+fn validate_audio_alignment_batch_fine_inventory_candidates(
+    candidates: &[AudioAlignmentBatchFineInventoryCandidateSnapshot],
+    component_pair_ordinals: &[usize],
+) -> Result<(), String> {
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+    validate_audio_alignment_batch_fine_candidate_ids(&ids, component_pair_ordinals)?;
+    for candidate in candidates {
+        if candidate.coarse_upper_bound_micros > SCORE_MICROS_ONE || candidate.members.is_empty() {
+            return Err("fine frontier inventory candidate 的上界或成员无效。".to_string());
+        }
+        let mut previous_rank = 0_usize;
+        for member in &candidate.members {
+            if member.rank <= previous_rank
+                || !member.score.is_finite()
+                || !member.global_score.is_finite()
+                || !member.scale.is_finite()
+                || member.scale <= 0.0
+                || member.source_end_ms <= member.source_start_ms
+                || member.target_end_ms <= member.target_start_ms
+                || !member.temporal_coverage.is_finite()
+                || !(0.0..=1.0).contains(&member.temporal_coverage)
+                || !member.unique_source_coverage.is_finite()
+                || !(0.0..=1.0).contains(&member.unique_source_coverage)
+            {
+                return Err("fine frontier inventory member 结构无效或未按 rank 递增。".to_string());
+            }
+            previous_rank = member.rank;
+        }
+    }
+    for pair_ordinal in component_pair_ordinals {
+        let pair_ordinal = u32::try_from(*pair_ordinal)
+            .map_err(|_| "fine frontier component pair ordinal 无法表示。".to_string())?;
+        let pair_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.id.pair_ordinal == pair_ordinal);
+        for (index, candidate) in pair_candidates.enumerate() {
+            if candidate.id.candidate_ordinal != u32::try_from(index + 1).unwrap_or(u32::MAX) {
+                return Err(
+                    "fine frontier 每个 pair 的 candidateOrdinal 必须从 1 连续枚举。".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_audio_alignment_batch_fine_frontier_receipt(
     receipt: &AudioAlignmentBatchFineFrontierReceiptSnapshot,
 ) -> Result<(), String> {
@@ -17679,6 +17727,7 @@ fn validate_audio_alignment_batch_fine_frontier_receipt(
         || !is_canonical_alignment_benchmark_sha256(&receipt.inventory_digest)
         || !is_canonical_alignment_benchmark_sha256(&receipt.receipt_digest)
         || receipt.component_ordinal == 0
+        || receipt.inventory_candidates.len() != receipt.inventory_candidate_count
         || receipt.component_pair_ordinals.is_empty()
         || receipt.component_pair_ordinals.contains(&0)
         || receipt
@@ -17698,6 +17747,13 @@ fn validate_audio_alignment_batch_fine_frontier_receipt(
         || receipt.search.interval_comparisons > receipt.limits.max_interval_comparisons
     {
         return Err("fine frontier receipt 基础字段无效。".to_string());
+    }
+    validate_audio_alignment_batch_fine_inventory_candidates(
+        &receipt.inventory_candidates,
+        &receipt.component_pair_ordinals,
+    )?;
+    if create_v2_fine_inventory_digest(&receipt.inventory_candidates)? != receipt.inventory_digest {
+        return Err("fine frontier inventoryDigest 与完整候选清单不一致。".to_string());
     }
     let state_total = receipt
         .inventory_state_counts
@@ -23307,6 +23363,57 @@ mod tests {
 
         receipt.inventory_digest = format!("sha256:{}", "f".repeat(64));
         assert!(validate_audio_alignment_batch_fine_frontier_receipt(&receipt).is_err());
+    }
+
+    #[test]
+    fn v2_fine_frontier_inventory_digest_binds_members_and_contiguous_ids() {
+        let plan = test_one_source_three_target_batch_plan();
+        let mut receipt = create_test_audio_alignment_batch_fine_frontier_receipt(
+            &plan.pairs[0],
+            AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate,
+        );
+        receipt.inventory_candidates = vec![AudioAlignmentBatchFineInventoryCandidateSnapshot {
+            id: AudioAlignmentBatchFineCandidateIdSnapshot {
+                pair_ordinal: 1,
+                candidate_ordinal: 1,
+            },
+            coarse_upper_bound_micros: 900_000,
+            members: vec![AudioAlignmentBatchRelationCandidateSnapshot {
+                rank: 1,
+                source_stream_index: 0,
+                target_stream_index: 0,
+                score: 0.9,
+                global_score: 0.9,
+                scale: 1.0,
+                offset_ms: 0,
+                source_start_ms: 0,
+                source_end_ms: 9_000,
+                target_start_ms: 0,
+                target_end_ms: 9_000,
+                inlier_count: 12,
+                temporal_coverage: 0.9,
+                unique_source_coverage: 0.9,
+            }],
+        }];
+        receipt.inventory_candidate_count = 1;
+        receipt.inventory_state_counts.evaluated_ineligible = 1;
+        receipt.evaluated_candidate_count = 1;
+        receipt.inventory_digest =
+            create_v2_fine_inventory_digest(&receipt.inventory_candidates).unwrap();
+        receipt = seal_audio_alignment_batch_fine_frontier_receipt(receipt).unwrap();
+        validate_audio_alignment_batch_fine_frontier_receipt(&receipt).unwrap();
+
+        let mut changed_window = receipt.clone();
+        changed_window.inventory_candidates[0].members[0].source_end_ms += 1;
+        changed_window = seal_audio_alignment_batch_fine_frontier_receipt(changed_window).unwrap();
+        assert!(validate_audio_alignment_batch_fine_frontier_receipt(&changed_window).is_err());
+
+        let mut ordinal_gap = receipt;
+        ordinal_gap.inventory_candidates[0].id.candidate_ordinal = 2;
+        ordinal_gap.inventory_digest =
+            create_v2_fine_inventory_digest(&ordinal_gap.inventory_candidates).unwrap();
+        ordinal_gap = seal_audio_alignment_batch_fine_frontier_receipt(ordinal_gap).unwrap();
+        assert!(validate_audio_alignment_batch_fine_frontier_receipt(&ordinal_gap).is_err());
     }
 
     fn ffmpeg_test_tools_available() -> bool {

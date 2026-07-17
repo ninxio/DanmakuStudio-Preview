@@ -1066,7 +1066,7 @@ function createTerminalSnapshot(
 ): AudioAlignmentBatchJobSnapshot {
   return {
     schemaVersion: 1,
-    evidenceVersion: 3,
+    evidenceVersion: 4,
     jobId: "coordinator-batch-job",
     pairingMode: "fullCartesian",
     sourceMediaIds: suite.sources.map((media) => media.mediaId),

@@ -32,8 +32,8 @@ import {
 } from "./c137PairLocalFineEvidence";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_ACCEPTANCE_SCHEMA_VERSION = 4 as const;
-export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 6 as const;
+export const C137_ACCEPTANCE_SCHEMA_VERSION = 5 as const;
+export const C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION = 7 as const;
 export const C137_ACCEPTANCE_RECEIPT_SCHEMA_VERSION = 1 as const;
 export const C137_ACCEPTANCE_REPORT_SCHEMA_VERSION = 1 as const;
 export const C137_RELATIONSHIP_RANKING_REPORT_SCHEMA_VERSION = 3 as const;
@@ -93,7 +93,7 @@ export interface C137CancellationThresholdApproval {
 export interface C137AcceptanceProtocol {
   schemaVersion: typeof C137_ACCEPTANCE_PROTOCOL_SCHEMA_VERSION;
   id: string;
-  version: "6";
+  version: "7";
   topK: number;
   calibrationBinCount: number;
   requiredColdRuns: number;
@@ -867,13 +867,13 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-envelope-integrity",
         "incomplete",
         "missing",
-        "必须提交私有 formal v3 blind envelope，包含预注册 exhaustive matrix 计划、每个 tile 的 execution suite、native receipt v3 与确定性 raw prediction"
+        "必须提交私有 formal v3 blind envelope，包含预注册 exhaustive matrix 计划、每个 tile 的 execution suite、native receipt v4 与确定性 raw prediction"
       ),
       createCheck(
         "native-blind-protocol-structure",
         "incomplete",
         "missing",
-        "protocol v6 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v3、shard-invariant score、exhaustive coverage 与全矩阵重算"
+        "protocol v7 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v4、完整 fine inventory、shard-invariant score、exhaustive coverage 与全矩阵重算"
       ),
       createCheck(
         "native-blind-decision-coverage",
@@ -891,7 +891,7 @@ function evaluateFormalBlindRankingEvidence(
         "native-blind-ranking-provenance",
         "incomplete",
         "missing-private-provenance",
-        "acceptance v4 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
+        "acceptance v5 不信任调用方或单个 candidate shard 自报 Top-K；缺少 private exhaustive-matrix provenance 时不得放行"
       ),
       ...createPendingBlindAuthorityChecks("missing-private-provenance")
     ];
@@ -977,13 +977,13 @@ function evaluateFormalBlindRankingEvidence(
       "native-blind-envelope-integrity",
       integrityValid ? "pass" : "incomplete",
       integrityValid ? provenance.provenanceDigest : issueSummary,
-      "每个 formal v3 matrix tile 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt v3 与 raw prediction"
+      "每个 formal v3 matrix tile 必须由冻结 manifest 唯一重建 projection，并严格闭合 execution、completed native receipt v4 与 raw prediction"
     ),
     createCheck(
       "native-blind-protocol-structure",
       protocolStructureBound ? "pass" : "incomplete",
       protocolStructureBound,
-      "protocol v6 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v3、固定 shard-invariant scoreContract、exhaustive coverage 与全矩阵重算"
+      "protocol v7 必须精确绑定 formal schema3、matrix plan schema2、native evidence/receipt v4、完整 fine inventory、固定 shard-invariant scoreContract、exhaustive coverage 与全矩阵重算"
     ),
     createCheck(
       "native-blind-plan-binding",
@@ -993,7 +993,7 @@ function evaluateFormalBlindRankingEvidence(
         ? "pass"
         : "incomplete",
       provenance.plan.planDigest,
-      "预运行 matrix plan 摘要必须由 protocol v6 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
+      "预运行 matrix plan 摘要必须由 protocol v7 锁定 axis、visual、global K、query/candidate tiles、candidate universe、score contract 与 exhaustive coverage"
     ),
     createCheck(
       "native-blind-decision-coverage",
@@ -2362,7 +2362,7 @@ function validateProtocol(value: unknown, issues: string[]): void {
     issues
   );
   requireString(record.id, "bundle.protocol.id", issues);
-  requireLiteral(record.version, "6", "bundle.protocol.version", issues);
+  requireLiteral(record.version, "7", "bundle.protocol.version", issues);
   requirePositiveInteger(record.topK, "bundle.protocol.topK", issues);
   if (
     Number.isSafeInteger(record.topK) &&

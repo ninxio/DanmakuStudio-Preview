@@ -381,6 +381,28 @@ test.beforeEach(async ({ page }) => {
           pairOrdinal: index + 1,
           candidateOrdinal: 1
         }));
+        const inventoryCandidates = allCandidateIds.map((id, index) => ({
+          id,
+          coarseUpperBoundMicros: 900_000,
+          members: [
+            {
+              rank: 1,
+              sourceStreamIndex: 1,
+              targetStreamIndex: 2,
+              score: 0.94,
+              globalScore: 0.9,
+              scale: 1,
+              offsetMs: -index * 60_000,
+              sourceStartMs: index * 60_000,
+              sourceEndMs: (index + 1) * 60_000,
+              targetStartMs: 0,
+              targetEndMs: index === 0 ? 61_000 : 60_000,
+              inlierCount: 36,
+              temporalCoverage: index === 0 ? 0.72 : 0.96,
+              uniqueSourceCoverage: 0.94
+            }
+          ]
+        }));
         const selectedCandidateIds =
           mode === "resolved"
             ? allCandidateIds
@@ -391,9 +413,13 @@ test.beforeEach(async ({ page }) => {
         const blockedCount = mode === "resourceBlocked" ? pairCount : 0;
         const unresolvedCount = mode === "unresolved" ? pairCount : 0;
         const receipt = {
-          contractVersion: "alignment-v2-adaptive-fine-frontier-v1",
+          contractVersion: "alignment-v2-adaptive-fine-frontier-v2",
           scoreVersion: "alignment-v2-coarse-upper-times-confidence-v1",
-          inventoryDigest: `sha256:${"d".repeat(64)}`,
+          inventoryDigest: await createRuntimeDigest(
+            "audio-alignment-v4/fine-frontier-inventory/v2",
+            inventoryCandidates
+          ),
+          inventoryCandidates,
           receiptDigest: "",
           componentOrdinal: 1,
           componentPairOrdinals: Array.from({ length: pairCount }, (_value, index) => index + 1),
@@ -451,7 +477,7 @@ test.beforeEach(async ({ page }) => {
           }
         };
         receipt.receiptDigest = await createRuntimeDigest(
-          "audio-alignment-v3/fine-frontier-receipt/v1",
+          "audio-alignment-v4/fine-frontier-receipt/v2",
           receipt
         );
         return receipt;
@@ -495,7 +521,7 @@ test.beforeEach(async ({ page }) => {
           sourceEffectiveWindow: createWindow(timeMap.sourceStartMs, timeMap.sourceEndMs, true),
           targetEffectiveWindow: createWindow(timeMap.targetStartMs, timeMap.targetEndMs, true),
           parametersHash: await createRuntimeDigest(
-            "audio-alignment-v3/fine-parameters/v1",
+            "audio-alignment-v4/fine-parameters/v1",
             {
               engineVersion: "alignment-v2.4",
               featureVersion: "chroma-v2",
@@ -505,14 +531,14 @@ test.beforeEach(async ({ page }) => {
           ),
           occupancyDigest: `sha256:${"7".repeat(64)}`,
           proposalTimeMapDigest: await createRuntimeDigest(
-            "audio-alignment-v3/proposal-time-map/v1",
+            "audio-alignment-v4/proposal-time-map/v1",
             timeMap
           ),
           scoreMicros: 900_000,
           evidenceDigest: ""
         };
         evidence.evidenceDigest = await createRuntimeDigest(
-          "audio-alignment-v3/fine-execution-evidence/v1",
+          "audio-alignment-v4/fine-execution-evidence/v1",
           evidence
         );
         return evidence;
@@ -742,7 +768,7 @@ test.beforeEach(async ({ page }) => {
             );
             const snapshot = {
               schemaVersion: 1,
-              evidenceVersion: 3,
+              evidenceVersion: 4,
               jobId,
               pairingMode,
               sourceMediaIds: sources.map((media) => media.mediaId),
@@ -990,7 +1016,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   });
 });
 
-test("Evidence v3 未决、资源阻断与后端第二选择均失败关闭", async ({ page }) => {
+test("Evidence v4 未决、资源阻断与后端第二选择均失败关闭", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "批量导入原片素材" }).click();
   await page.getByRole("button", { name: "批量导入 B 站参考素材" }).click();

@@ -389,7 +389,7 @@ describe("C137 fail-closed acceptance gate", () => {
     const validation = validateC137AcceptanceBundle(legacy);
 
     expect(validation.valid).toBe(false);
-    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 6");
+    expect(validation.issues.join("\n")).toContain("bundle.protocol.schemaVersion 必须为 7");
     expect(validation.issues.join("\n")).toContain(
       "bundle.protocol.requiredFormalBlindProvenanceSchemaVersion 缺失"
     );
@@ -444,8 +444,8 @@ describe("C137 fail-closed acceptance gate", () => {
     const issues = validation.issues.join("\n");
 
     expect(validation.valid).toBe(false);
-    expect(issues).toContain("bundle.schemaVersion 必须为 4");
-    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 6");
+    expect(issues).toContain("bundle.schemaVersion 必须为 5");
+    expect(issues).toContain("bundle.protocol.schemaVersion 必须为 7");
     expect(issues).toContain("bundle.protocol.requiredBlindAggregation 缺失");
     expect(issues).toContain("bundle.reports.relationshipRanking.schemaVersion 必须为 3");
     expect(issues).toContain("bundle.reports.relationshipRanking.rankingScope 缺失");
@@ -1090,15 +1090,15 @@ function createCompleteBundle(): C137AcceptanceBundle {
   }));
 
   const bundle: C137AcceptanceBundle = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     kind: "c137-acceptance-bundle",
     manifestDigest,
     datasetVersion: "real-frozen-1",
     certificationClass: "real-frozen",
     protocol: {
-      schemaVersion: 6,
+      schemaVersion: 7,
       id: "c137-acceptance",
-      version: "6",
+      version: "7",
       topK: 5,
       calibrationBinCount: 10,
       requiredColdRuns: 1,
@@ -1109,8 +1109,8 @@ function createCompleteBundle(): C137AcceptanceBundle {
       requiredFormalBlindProvenanceSchemaVersion: 3,
       requiredBlindMatrixPlanSchemaVersion: 2,
       requiredBlindProjectionSchemaVersion: 1,
-      requiredNativeEvidenceVersion: 3,
-      requiredNativeReceiptSchemaVersion: 3,
+      requiredNativeEvidenceVersion: 4,
+      requiredNativeReceiptSchemaVersion: 4,
       requiredBlindPairingMode: "fullCartesian",
       requiredBlindScoreContract: "alignment-v2-pair-intrinsic-global-weight-v1",
       requiredBlindMatrixCoverage: "exhaustive",

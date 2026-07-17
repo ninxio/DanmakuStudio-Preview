@@ -10,15 +10,15 @@ import type { MediaContentIdentity } from "../project/types";
 import { sha256Hex } from "../shared/sha256";
 
 export const REAL_MEDIA_BLIND_BATCH_EXECUTION_SCHEMA_VERSION = 1 as const;
-export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 3 as const;
+export const REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION = 4 as const;
 export const REAL_MEDIA_BLIND_BATCH_RUNNER_VERSION =
-  "c137-real-media-blind-full-cartesian-batch-v3" as const;
-export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 3 as const;
+  "c137-real-media-blind-full-cartesian-batch-v4" as const;
+export const REAL_MEDIA_BLIND_BATCH_NATIVE_EVIDENCE_VERSION = 4 as const;
 export const REAL_MEDIA_BLIND_BATCH_RELATION_SCORE_VERSION =
   "alignment-v2-pair-intrinsic-global-weight-v1" as const;
 export const REAL_MEDIA_BLIND_BATCH_EXECUTION_IDENTITY_SCHEMA_VERSION = 1 as const;
 export const REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION =
-  "alignment-v2-adaptive-fine-frontier-v1" as const;
+  "alignment-v2-adaptive-fine-frontier-v2" as const;
 export const REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION =
   "alignment-v2-coarse-upper-times-confidence-v1" as const;
 
@@ -26,11 +26,13 @@ const NATIVE_BATCH_TOP_K_LIMIT = 10;
 const RELATION_MIN_TEMPORAL_COVERAGE = 0.2;
 const RELATION_MIN_INLIER_COUNT = 6;
 const FINE_FRONTIER_RECEIPT_DIGEST_DOMAIN =
-  "audio-alignment-v3/fine-frontier-receipt/v1";
+  "audio-alignment-v4/fine-frontier-receipt/v2";
+const FINE_FRONTIER_INVENTORY_DIGEST_DOMAIN =
+  "audio-alignment-v4/fine-frontier-inventory/v2";
 const FINE_EXECUTION_EVIDENCE_DIGEST_DOMAIN =
-  "audio-alignment-v3/fine-execution-evidence/v1";
-const FINE_PROPOSAL_TIME_MAP_DIGEST_DOMAIN = "audio-alignment-v3/proposal-time-map/v1";
-const FINE_PARAMETERS_DIGEST_DOMAIN = "audio-alignment-v3/fine-parameters/v1";
+  "audio-alignment-v4/fine-execution-evidence/v1";
+const FINE_PROPOSAL_TIME_MAP_DIGEST_DOMAIN = "audio-alignment-v4/proposal-time-map/v1";
+const FINE_PARAMETERS_DIGEST_DOMAIN = "audio-alignment-v4/fine-parameters/v1";
 const FINE_WINDOW_DECODE_TOLERANCE_MS = 50;
 
 export interface RealMediaBlindBatchExecutionMedia {
@@ -144,6 +146,12 @@ export interface NativeBatchFineCandidateId {
   candidateOrdinal: number;
 }
 
+export interface NativeBatchFineInventoryCandidate {
+  id: NativeBatchFineCandidateId;
+  coarseUpperBoundMicros: number;
+  members: NativeBatchRelationCandidateEvidence[];
+}
+
 export interface NativeBatchFineStateCounts {
   unresolved: number;
   scored: number;
@@ -181,6 +189,7 @@ export interface NativeBatchFineFrontierReceipt {
   contractVersion: typeof REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION;
   scoreVersion: typeof REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION;
   inventoryDigest: `sha256:${string}`;
+  inventoryCandidates: NativeBatchFineInventoryCandidate[];
   receiptDigest: `sha256:${string}`;
   componentOrdinal: number;
   componentPairOrdinals: number[];
@@ -373,6 +382,12 @@ export function createNativeBatchFineFrontierReceiptDigest(
     ...receipt,
     receiptDigest: ""
   });
+}
+
+export function createNativeBatchFineInventoryDigest(
+  candidates: readonly NativeBatchFineInventoryCandidate[]
+): `sha256:${string}` {
+  return createNativeBatchFineV3Digest(FINE_FRONTIER_INVENTORY_DIGEST_DOMAIN, candidates);
 }
 
 export function createNativeBatchFineExecutionEvidenceDigest(
@@ -1181,6 +1196,78 @@ function validateRelationCandidateEvidence(
   };
 }
 
+function validateFineInventoryMember(
+  value: unknown,
+  label: string
+): NativeBatchRelationCandidateEvidence {
+  const candidate = requireExactRecord(
+    value,
+    [
+      "rank",
+      "sourceStreamIndex",
+      "targetStreamIndex",
+      "score",
+      "globalScore",
+      "scale",
+      "offsetMs",
+      "sourceStartMs",
+      "sourceEndMs",
+      "targetStartMs",
+      "targetEndMs",
+      "inlierCount",
+      "temporalCoverage",
+      "uniqueSourceCoverage"
+    ],
+    label
+  );
+  const sourceStartMs = requireSafeInteger(candidate.sourceStartMs, `${label}.sourceStartMs`);
+  const sourceEndMs = requireSafeInteger(candidate.sourceEndMs, `${label}.sourceEndMs`);
+  const targetStartMs = requireSafeInteger(candidate.targetStartMs, `${label}.targetStartMs`);
+  const targetEndMs = requireSafeInteger(candidate.targetEndMs, `${label}.targetEndMs`);
+  if (sourceEndMs <= sourceStartMs || targetEndMs <= targetStartMs) {
+    throw new Error(`${label} 的内容区间无效。`);
+  }
+  const inlierCount = requireNonNegativeSafeInteger(
+    candidate.inlierCount,
+    `${label}.inlierCount`
+  );
+  if (inlierCount < RELATION_MIN_INLIER_COUNT) {
+    throw new Error(`${label}.inlierCount 未达到 intrinsic eligibility。`);
+  }
+  const temporalCoverage = requireUnitNumber(
+    candidate.temporalCoverage,
+    `${label}.temporalCoverage`
+  );
+  if (temporalCoverage < RELATION_MIN_TEMPORAL_COVERAGE) {
+    throw new Error(`${label}.temporalCoverage 未达到 intrinsic eligibility。`);
+  }
+  return {
+    rank: requirePositiveSafeInteger(candidate.rank, `${label}.rank`),
+    sourceStreamIndex: requireNonNegativeSafeInteger(
+      candidate.sourceStreamIndex,
+      `${label}.sourceStreamIndex`
+    ),
+    targetStreamIndex: requireNonNegativeSafeInteger(
+      candidate.targetStreamIndex,
+      `${label}.targetStreamIndex`
+    ),
+    score: requireFiniteNumber(candidate.score, `${label}.score`),
+    globalScore: requirePositiveFiniteNumber(candidate.globalScore, `${label}.globalScore`),
+    scale: requirePositiveFiniteNumber(candidate.scale, `${label}.scale`),
+    offsetMs: requireSafeInteger(candidate.offsetMs, `${label}.offsetMs`),
+    sourceStartMs,
+    sourceEndMs,
+    targetStartMs,
+    targetEndMs,
+    inlierCount,
+    temporalCoverage,
+    uniqueSourceCoverage: requireUnitNumber(
+      candidate.uniqueSourceCoverage,
+      `${label}.uniqueSourceCoverage`
+    )
+  };
+}
+
 export function validateRealMediaBlindBatchProposalBinding(
   timeMap: AlignmentTimeMapProposal,
   source: RealMediaBlindBatchExecutionMedia,
@@ -1340,14 +1427,16 @@ function validateGlobalCandidateEvidence(
 function validateReceiptFineFrontier(
   value: unknown,
   label: string,
-  pairCount: number
+  suite: RealMediaBlindBatchExecutionSuite
 ): NativeBatchFineFrontierReceipt {
+  const pairCount = suite.pairs.length;
   const frontier = requireExactRecord(
     value,
     [
       "contractVersion",
       "scoreVersion",
       "inventoryDigest",
+      "inventoryCandidates",
       "receiptDigest",
       "componentOrdinal",
       "componentPairOrdinals",
@@ -1399,6 +1488,18 @@ function validateReceiptFineFrontier(
     frontier.inventoryCandidateCount,
     `${label}.inventoryCandidateCount`
   );
+  const inventoryCandidates = validateReceiptFineInventoryCandidates(
+    frontier.inventoryCandidates,
+    `${label}.inventoryCandidates`,
+    componentPairOrdinals,
+    suite
+  );
+  if (inventoryCandidates.length !== inventoryCandidateCount) {
+    throw new Error(`${label}.inventoryCandidates 未完整枚举 inventoryCandidateCount。`);
+  }
+  if (createNativeBatchFineInventoryDigest(inventoryCandidates) !== inventoryDigest) {
+    throw new Error(`${label}.inventoryDigest 与完整候选清单不一致。`);
+  }
   const resolutionMarginMicros = requirePositiveSafeInteger(
     frontier.resolutionMarginMicros,
     `${label}.resolutionMarginMicros`
@@ -1561,6 +1662,7 @@ function validateReceiptFineFrontier(
     contractVersion: REAL_MEDIA_BLIND_BATCH_FINE_FRONTIER_CONTRACT_VERSION,
     scoreVersion: REAL_MEDIA_BLIND_BATCH_FINE_SCORE_VERSION,
     inventoryDigest,
+    inventoryCandidates,
     receiptDigest,
     componentOrdinal,
     componentPairOrdinals,
@@ -1587,6 +1689,74 @@ function validateReceiptFineFrontier(
     throw new Error(`${label}.receiptDigest 与 canonical receipt 不一致。`);
   }
   return validated;
+}
+
+function validateReceiptFineInventoryCandidates(
+  value: unknown,
+  label: string,
+  componentPairOrdinals: readonly number[],
+  suite: RealMediaBlindBatchExecutionSuite
+): NativeBatchFineInventoryCandidate[] {
+  if (!Array.isArray(value)) throw new Error(`${label} 必须是数组。`);
+  const candidates = value.map((item, index) => {
+    const candidateLabel = `${label}[${index}]`;
+    const record = requireExactRecord(
+      item,
+      ["id", "coarseUpperBoundMicros", "members"],
+      candidateLabel
+    );
+    const id = validateFineCandidateId(
+      record.id,
+      `${candidateLabel}.id`,
+      componentPairOrdinals
+    );
+    if (!suite.pairs.some((item) => item.pairOrdinal === id.pairOrdinal)) {
+      throw new Error(`${candidateLabel}.id 无法绑定 execution suite 媒体。`);
+    }
+    const coarseUpperBoundMicros = requireBoundedFineInteger(
+      record.coarseUpperBoundMicros,
+      `${candidateLabel}.coarseUpperBoundMicros`,
+      0,
+      1_000_000
+    );
+    if (!Array.isArray(record.members) || record.members.length === 0) {
+      throw new Error(`${candidateLabel}.members 必须是非空数组。`);
+    }
+    const members = record.members.map((member, memberIndex) =>
+      validateFineInventoryMember(
+        member,
+        `${candidateLabel}.members[${memberIndex}]`
+      )
+    );
+    if (
+      members.some(
+        (member, memberIndex) => memberIndex > 0 && member.rank <= members[memberIndex - 1].rank
+      )
+    ) {
+      throw new Error(`${candidateLabel}.members 必须按 rank 严格递增。`);
+    }
+    return { id, coarseUpperBoundMicros, members };
+  });
+  const ids = candidates.map((candidate) => candidate.id);
+  if (!sameFineCandidateIdArrays(ids, [...ids].sort(compareFineCandidateId))) {
+    throw new Error(`${label} 未按 candidateId canonical 排序。`);
+  }
+  if (new Set(ids.map(fineCandidateKey)).size !== ids.length) {
+    throw new Error(`${label} 包含重复 candidateId。`);
+  }
+  for (const pairOrdinal of componentPairOrdinals) {
+    const pairCandidates = candidates.filter(
+      (candidate) => candidate.id.pairOrdinal === pairOrdinal
+    );
+    if (
+      pairCandidates.some(
+        (candidate, index) => candidate.id.candidateOrdinal !== index + 1
+      )
+    ) {
+      throw new Error(`${label} 的每个 pair 必须从 candidateOrdinal=1 连续完整枚举。`);
+    }
+  }
+  return candidates;
 }
 
 function validateReceiptFineLimits(value: unknown, label: string): NativeBatchFineLimits {
@@ -2282,7 +2452,7 @@ function validateReceiptPairOutcome(
       : validateReceiptFineFrontier(
           outcome.fineFrontier,
           `receipt pair #${expected.pairOrdinal}.fineFrontier`,
-          suite.pairs.length
+          suite
         );
   const fineExecutionEvidence =
     outcome.fineExecutionEvidence === null

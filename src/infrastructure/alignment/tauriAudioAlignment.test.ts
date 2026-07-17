@@ -8,6 +8,8 @@ import {
   cancelTauriAudioAlignmentBatchJob,
   cancelTauriAudioAlignmentJob,
   createAudioAlignmentBatchFineExecutionEvidenceDigest,
+  createAudioAlignmentBatchFineFrontierReceiptDigest,
+  createAudioAlignmentBatchFineInventoryDigest,
   createAudioAlignmentBatchProposalTimeMapDigest,
   getTauriAudioAlignmentBatchJob,
   getTauriAudioAlignmentJob,
@@ -380,7 +382,7 @@ describe("Tauri 音频对齐调用", () => {
   it("批任务一次发送全部媒体并规范化流索引", async () => {
     tauriMocks.invoke.mockResolvedValue({
       schemaVersion: 1,
-      evidenceVersion: 3,
+      evidenceVersion: 4,
       jobId: "batch-1",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
@@ -564,7 +566,7 @@ describe("Tauri 音频对齐调用", () => {
   it("批任务可显式指定未完成 pair，并拒绝重复或越界引用", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 3 as const,
+      evidenceVersion: 4 as const,
       jobId: "batch-explicit",
       pairingMode: "explicit" as const,
       sourceMediaIds: ["source"],
@@ -634,7 +636,7 @@ describe("Tauri 音频对齐调用", () => {
   it("支持读取和取消原生批任务", async () => {
     const snapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 3 as const,
+      evidenceVersion: 4 as const,
       jobId: "batch-2",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
@@ -666,7 +668,7 @@ describe("Tauri 音频对齐调用", () => {
   it("拒绝计数矛盾或 jobId 不匹配的原生批任务响应", async () => {
     const invalidSnapshot = {
       schemaVersion: 1 as const,
-      evidenceVersion: 3 as const,
+      evidenceVersion: 4 as const,
       jobId: "wrong-job",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["source"],
@@ -707,7 +709,7 @@ describe("Tauri 音频对齐调用", () => {
   it("启动响应必须绑定请求 inventory，completed 终态不得夹带 cancelled pair", async () => {
     const wrongInventory = {
       schemaVersion: 1 as const,
-      evidenceVersion: 3 as const,
+      evidenceVersion: 4 as const,
       jobId: "batch-boundary",
       pairingMode: "fullCartesian" as const,
       sourceMediaIds: ["other-source"],
@@ -761,7 +763,7 @@ describe("Tauri 音频对齐调用", () => {
   it("接受 fine 失败后保留的 coarse 证据，并严格校验失败状态与完整 Top-K", async () => {
     const failedSnapshot: AudioAlignmentBatchJobSnapshot = {
       schemaVersion: 1,
-      evidenceVersion: 3,
+      evidenceVersion: 4,
       jobId: "batch-fine-failed",
       pairingMode: "fullCartesian",
       sourceMediaIds: ["source"],
@@ -821,15 +823,42 @@ describe("Tauri 音频对齐调用", () => {
     await expect(read(mismatchedDecision)).rejects.toThrow("与 Top-K 同 rank 候选不一致");
   });
 
-  it("v3 canonical digest 固定向量保持跨语言一致，并拒绝不安全整数", () => {
+  it("v4 canonical digest 固定向量保持跨语言一致，并拒绝不安全整数", () => {
     expect(
       createAudioAlignmentBatchProposalTimeMapDigest({
         values: [1, -0, 1e-6, 1e-7, 23.976, 0.1, Number.MAX_SAFE_INTEGER]
       })
-    ).toBe("sha256:717365859677112aa36704edc6f5ea20b52ef7ed1f5b26a76a3aaf07085a730a");
+    ).toBe("sha256:1e8e7b8e1f3fd67427c079f7fa3b68c8dc52a121059b084349c27d972c971f42");
     expect(() => createAudioAlignmentBatchProposalTimeMapDigest({ value: 1e16 })).toThrow(
       "安全范围"
     );
+  });
+
+  it("v4 fine inventory 完整枚举并拒绝重签 receipt 后的成员改窗与序号断层", async () => {
+    const read = (snapshot: AudioAlignmentBatchJobSnapshot) =>
+      getTauriAudioAlignmentBatchJob("batch-v3", {
+        start: vi.fn(),
+        get: () => Promise.resolve(snapshot),
+        cancel: vi.fn()
+      });
+    const tamperedWindow = completedBatchJobSnapshot();
+    const windowFrontier = tamperedWindow.pairs[0]?.fineFrontier;
+    if (!windowFrontier) throw new Error("fixture fine frontier missing");
+    windowFrontier.inventoryCandidates[0].members[0].sourceEndMs += 1;
+    windowFrontier.receiptDigest = createAudioAlignmentBatchFineFrontierReceiptDigest(
+      windowFrontier
+    );
+    await expect(read(tamperedWindow)).rejects.toThrow("inventoryDigest");
+
+    const ordinalGap = completedBatchJobSnapshot();
+    const gapFrontier = ordinalGap.pairs[0]?.fineFrontier;
+    if (!gapFrontier) throw new Error("fixture fine frontier missing");
+    gapFrontier.inventoryCandidates[0].id.candidateOrdinal = 2;
+    gapFrontier.inventoryDigest = createAudioAlignmentBatchFineInventoryDigest(
+      gapFrontier.inventoryCandidates
+    );
+    gapFrontier.receiptDigest = createAudioAlignmentBatchFineFrontierReceiptDigest(gapFrontier);
+    await expect(read(ordinalGap)).rejects.toThrow("candidateOrdinal=1");
   });
 
   it("严格拒绝 legacy v2 外层和 v3 外层夹带的旧 fine contract", async () => {
@@ -916,7 +945,7 @@ describe("Tauri 音频对齐调用", () => {
 function completedBatchJobSnapshot(): AudioAlignmentBatchJobSnapshot {
   return {
     schemaVersion: 1,
-    evidenceVersion: 3,
+    evidenceVersion: 4,
     jobId: "batch-v3",
     pairingMode: "fullCartesian",
     sourceMediaIds: ["source"],

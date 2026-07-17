@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// One full normalized score in fixed-point micros.
-pub const FINE_FRONTIER_CONTRACT_VERSION: &str = "alignment-v2-adaptive-fine-frontier-v1";
+pub const FINE_FRONTIER_CONTRACT_VERSION: &str = "alignment-v2-adaptive-fine-frontier-v2";
 pub const SCORE_MICROS_ONE: u32 = 1_000_000;
 const CANCEL_CHECK_STRIDE: usize = 256;
 

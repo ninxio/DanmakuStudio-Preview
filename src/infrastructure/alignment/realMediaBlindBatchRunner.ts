@@ -89,7 +89,7 @@ export interface RealMediaBlindBatchRunnerOptions {
 }
 
 interface NativeBatchEvidenceSnapshot extends AudioAlignmentBatchJobSnapshot {
-  evidenceVersion: 3;
+  evidenceVersion: 4;
   pairingMode: NativeBatchPairingMode;
   sourceMediaIds: string[];
   targetMediaIds: string[];

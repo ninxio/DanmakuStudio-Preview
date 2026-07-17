@@ -5,12 +5,14 @@ import {
   AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
   createAudioAlignmentBatchFineExecutionEvidenceDigest,
   createAudioAlignmentBatchFineFrontierReceiptDigest,
+  createAudioAlignmentBatchFineInventoryDigest,
   createAudioAlignmentBatchFineParametersHash,
   createAudioAlignmentBatchProposalTimeMapDigest,
   type AudioAlignmentBatchExecutionIdentitySnapshot,
   type AudioAlignmentBatchFineCandidateIdSnapshot,
   type AudioAlignmentBatchFineExecutionEvidenceSnapshot,
   type AudioAlignmentBatchFineFrontierReceiptSnapshot,
+  type AudioAlignmentBatchFineInventoryCandidateSnapshot,
   type AudioAlignmentBatchSpectralBackendIdentitySnapshot
 } from "../infrastructure/alignment/tauriAudioAlignment";
 
@@ -115,9 +117,25 @@ export function createTestFineFrontierReceipt(
         900_000),
     0
   );
+  const minimumInventoryCount = componentPairOrdinals.reduce(
+    (sum, pairOrdinal) =>
+      sum +
+      Math.max(
+        1,
+        ...selectedCandidateIds
+          .filter((candidate) => candidate.pairOrdinal === pairOrdinal)
+          .map((candidate) => candidate.candidateOrdinal)
+      ),
+    0
+  );
   const inventoryCandidateCount = Math.max(
-    options.inventoryCandidateCount ?? componentPairOrdinals.length,
-    selectedCandidateIds.length
+    options.inventoryCandidateCount ?? minimumInventoryCount,
+    minimumInventoryCount
+  );
+  const inventoryCandidates = createTestFineInventoryCandidates(
+    componentPairOrdinals,
+    inventoryCandidateCount,
+    selectedCandidateIds
   );
   const finalState = options.finalState ??
     (selectedCandidateIds.length > 0 ? "resolved" : "noEligibleCandidate");
@@ -128,7 +146,8 @@ export function createTestFineFrontierReceipt(
   const draft: AudioAlignmentBatchFineFrontierReceiptSnapshot = {
     contractVersion: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION,
     scoreVersion: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
-    inventoryDigest: DIGEST_A,
+    inventoryDigest: createAudioAlignmentBatchFineInventoryDigest(inventoryCandidates),
+    inventoryCandidates,
     receiptDigest: DIGEST_B,
     componentOrdinal: options.componentOrdinal ?? 1,
     componentPairOrdinals: [...componentPairOrdinals],
@@ -184,6 +203,57 @@ export function createTestFineFrontierReceipt(
     ...draft,
     receiptDigest: createAudioAlignmentBatchFineFrontierReceiptDigest(draft)
   };
+}
+
+function createTestFineInventoryCandidates(
+  componentPairOrdinals: readonly number[],
+  inventoryCandidateCount: number,
+  selectedCandidateIds: readonly AudioAlignmentBatchFineCandidateIdSnapshot[]
+): AudioAlignmentBatchFineInventoryCandidateSnapshot[] {
+  if (componentPairOrdinals.length === 0 && inventoryCandidateCount > 0) {
+    throw new Error("测试 fine frontier 不能为无 pair component 创建候选。");
+  }
+  const counts = new Map(
+    componentPairOrdinals.map((pairOrdinal) => [
+      pairOrdinal,
+      Math.max(
+        1,
+        ...selectedCandidateIds
+          .filter((candidate) => candidate.pairOrdinal === pairOrdinal)
+          .map((candidate) => candidate.candidateOrdinal)
+      )
+    ])
+  );
+  let allocated = [...counts.values()].reduce((sum, count) => sum + count, 0);
+  while (allocated < inventoryCandidateCount) {
+    const pairOrdinal = componentPairOrdinals[allocated % componentPairOrdinals.length];
+    counts.set(pairOrdinal, (counts.get(pairOrdinal) ?? 0) + 1);
+    allocated += 1;
+  }
+  return componentPairOrdinals.flatMap((pairOrdinal) =>
+    Array.from({ length: counts.get(pairOrdinal) ?? 0 }, (_, candidateIndex) => ({
+      id: { pairOrdinal, candidateOrdinal: candidateIndex + 1 },
+      coarseUpperBoundMicros: 900_000 - candidateIndex,
+      members: [
+        {
+          rank: candidateIndex + 1,
+          sourceStreamIndex: 0,
+          targetStreamIndex: 0,
+          score: 0.9,
+          globalScore: 0.9,
+          scale: 1,
+          offsetMs: candidateIndex * 1_000,
+          sourceStartMs: candidateIndex * 10_000,
+          sourceEndMs: candidateIndex * 10_000 + 9_000,
+          targetStartMs: candidateIndex * 10_000,
+          targetEndMs: candidateIndex * 10_000 + 9_000,
+          inlierCount: 12,
+          temporalCoverage: 0.9,
+          uniqueSourceCoverage: 0.9
+        }
+      ]
+    }))
+  );
 }
 
 export function createTestExecutionIdentity(

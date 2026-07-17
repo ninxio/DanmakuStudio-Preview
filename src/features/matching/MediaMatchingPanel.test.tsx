@@ -227,7 +227,7 @@ function createLegacyBatchSnapshot(
   const fineFrontier = createTestFineFrontier(pairs, status, fineOptions ?? {});
   return {
     schemaVersion: 1,
-    evidenceVersion: 3,
+    evidenceVersion: 4,
     jobId,
     pairingMode: "explicit",
     sourceMediaIds,
@@ -353,6 +353,37 @@ function createTestFineFrontier(
   }, 0);
   const inventoryCandidateCount =
     options.inventoryCandidateCount ?? Math.max(candidatePairOrdinals.length, 1);
+  const inventoryPairOrdinals =
+    candidatePairOrdinals.length > 0 ? candidatePairOrdinals : [1];
+  const inventoryCounts = new Map(inventoryPairOrdinals.map((pairOrdinal) => [pairOrdinal, 0]));
+  for (let index = 0; index < inventoryCandidateCount; index += 1) {
+    const pairOrdinal = inventoryPairOrdinals[index % inventoryPairOrdinals.length];
+    inventoryCounts.set(pairOrdinal, (inventoryCounts.get(pairOrdinal) ?? 0) + 1);
+  }
+  const inventoryCandidates = inventoryPairOrdinals.flatMap((pairOrdinal) =>
+    Array.from({ length: inventoryCounts.get(pairOrdinal) ?? 0 }, (_, index) => ({
+      id: { pairOrdinal, candidateOrdinal: index + 1 },
+      coarseUpperBoundMicros: 900_000 - index,
+      members: [
+        {
+          rank: index + 1,
+          sourceStreamIndex: 0,
+          targetStreamIndex: 0,
+          score: 0.9,
+          globalScore: 0.9,
+          scale: 1,
+          offsetMs: index * 1_000,
+          sourceStartMs: index * 10_000,
+          sourceEndMs: index * 10_000 + 9_000,
+          targetStartMs: index * 10_000,
+          targetEndMs: index * 10_000 + 9_000,
+          inlierCount: 12,
+          temporalCoverage: 0.9,
+          uniqueSourceCoverage: 0.9
+        }
+      ]
+    }))
+  );
   const defaultStateCounts: AudioAlignmentBatchFineStateCountsSnapshot = {
     unresolved: finalState === "unresolved" ? inventoryCandidateCount : 0,
     scored: resolved ? candidatePairOrdinals.length : 0,
@@ -371,6 +402,7 @@ function createTestFineFrontier(
     contractVersion: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_CONTRACT_VERSION,
     scoreVersion: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
     inventoryDigest: `sha256:${"1".repeat(64)}`,
+    inventoryCandidates,
     receiptDigest: `sha256:${"2".repeat(64)}`,
     componentOrdinal: 1,
     componentPairOrdinals: pairs.map((_pair, index) => index + 1),

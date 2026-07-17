@@ -24,15 +24,15 @@ describe("C137 pair-local fine evidence", () => {
     ).toBe(true);
   });
 
-  it("不会把 component 总候选数冒充为某个 pair 的完整多窗口清单", () => {
+  it("从 receipt 的完整候选清单逐 pair 精确统计，不再以 component 总数推测", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
 
     const evidence = deriveC137PairLocalFineEvidence(fixture.provenance);
 
     expect(
-      evidence.cases.every((item) => item.completePairCandidateInventoryEnumerated === false)
+      evidence.cases.every((item) => item.completePairCandidateInventoryEnumerated)
     ).toBe(true);
-    expect(evidence.cases.every((item) => item.pairCandidateCountLowerBound === 1)).toBe(true);
+    expect(evidence.cases.every((item) => item.pairCandidateCount === 1)).toBe(true);
     expect(evidence.cases.every((item) => !item.samePairAlternativeObserved)).toBe(true);
   });
 

@@ -75,8 +75,8 @@ export interface C137PairLocalFineCaseEvidence {
   selectedCandidateId: NativeBatchFineCandidateId | null;
   selectedSourceWindow: NativeBatchFineDecodeWindow | null;
   selectedTargetWindow: NativeBatchFineDecodeWindow | null;
-  pairCandidateCountLowerBound: number;
-  completePairCandidateInventoryEnumerated: false;
+  pairCandidateCount: number;
+  completePairCandidateInventoryEnumerated: boolean;
   samePairAlternativeObserved: boolean;
   selectedGroupMemberCount: number;
   sameSegmentManyToManyObserved: boolean;
@@ -205,10 +205,7 @@ function deriveCaseEvidence(
   }
 
   const candidateIds = observedPairCandidateIds(frontier, outcome.pairOrdinal);
-  const pairCandidateCountLowerBound = candidateIds.reduce(
-    (maximum, candidate) => Math.max(maximum, candidate.candidateOrdinal),
-    execution.candidateId.candidateOrdinal
-  );
+  const pairCandidateCount = candidateIds.length;
   const selectedByFrontier = frontier.selectedCandidateIds.some((candidate) =>
     sameCandidate(candidate, execution.candidateId)
   );
@@ -246,9 +243,9 @@ function deriveCaseEvidence(
     selectedCandidateId: structuredClone(execution.candidateId),
     selectedSourceWindow: structuredClone(execution.sourceEffectiveWindow),
     selectedTargetWindow: structuredClone(execution.targetEffectiveWindow),
-    pairCandidateCountLowerBound,
-    completePairCandidateInventoryEnumerated: false,
-    samePairAlternativeObserved: pairCandidateCountLowerBound >= 2,
+    pairCandidateCount,
+    completePairCandidateInventoryEnumerated: true,
+    samePairAlternativeObserved: pairCandidateCount >= 2,
     selectedGroupMemberCount: execution.groupMemberRanks.length,
     sameSegmentManyToManyObserved: execution.groupMemberRanks.length >= 2,
     frontierResolutionProven,
@@ -268,7 +265,7 @@ function blockedCase(caseId: string, issues: string[]): C137PairLocalFineCaseEvi
     selectedCandidateId: null,
     selectedSourceWindow: null,
     selectedTargetWindow: null,
-    pairCandidateCountLowerBound: 0,
+    pairCandidateCount: 0,
     completePairCandidateInventoryEnumerated: false,
     samePairAlternativeObserved: false,
     selectedGroupMemberCount: 0,
@@ -321,22 +318,9 @@ function observedPairCandidateIds(
   frontier: NonNullable<RealMediaBlindBatchPairOutcome["fineFrontier"]>,
   pairOrdinal: number
 ): NativeBatchFineCandidateId[] {
-  const candidates = [
-    ...frontier.selectedCandidateIds,
-    ...frontier.bestCompleted.candidateIds,
-    ...(frontier.runnerUpCompleted?.candidateIds ?? []),
-    ...(frontier.optimisticOmitted?.candidateIds ?? []),
-    ...(frontier.optimisticOmitted?.openCandidateIds ?? []),
-    ...(frontier.optimisticOmitted?.unresolvedCandidateIds ?? []),
-    ...(frontier.optimisticOmitted?.blockedCandidateIds ?? []),
-    ...frontier.nextRefinementCandidateIds
-  ].filter((candidate) => candidate.pairOrdinal === pairOrdinal);
-  const unique = new Map(
-    candidates.map((candidate) => [candidate.candidateOrdinal, structuredClone(candidate)])
-  );
-  return [...unique.values()].sort(
-    (left, right) => left.candidateOrdinal - right.candidateOrdinal
-  );
+  return frontier.inventoryCandidates
+    .filter((candidate) => candidate.id.pairOrdinal === pairOrdinal)
+    .map((candidate) => structuredClone(candidate.id));
 }
 
 function deriveTimeMapCase(
