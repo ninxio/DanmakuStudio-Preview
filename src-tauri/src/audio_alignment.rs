@@ -178,6 +178,21 @@ const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_SINGLE_MS: u64 = 750;
 const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_ISLAND_MS: u64 = 10_000;
 const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_NET_RESIDUAL_MS: f64 = 100.0;
 const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MIN_COUNT: usize = 4;
+// A chunk can lack five continuous seconds of low-cost DP recovery even though several
+// independently timed coarse-training anchors prove a short common-content island inside the
+// unresolved interval. Only training anchors may shape the map; held-out anchors remain strictly
+// validation-only. Three distinct 1 s buckets over at least 5 s prevent same-frame spectral votes
+// or a single transient from turning an ambiguous interval into matched content. Two buckets may
+// also establish a rescue when they are at least 30 s apart; this is materially stronger temporal
+// evidence than three nearby collision votes. A short bridge from an already matched left boundary
+// may be recovered when its endpoint drift stays bounded, but no held-out anchor is consulted.
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_MIN_ANCHORS: usize = 3;
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_MIN_SPAN_MS: u64 = 5_000;
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_LONG_MIN_ANCHORS: usize = 2;
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_LONG_MIN_SPAN_MS: u64 = 30_000;
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_MAX_LEFT_BRIDGE_MS: u64 = 10_000;
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_TIME_BUCKET_MS: u64 = 1_000;
+const ALIGNMENT_V2_AMBIGUOUS_RESCUE_MAX_ENDPOINT_DRIFT_MS: u64 = 250;
 // Global residual percentiles can hide a short nonlinear excursion. Re-evaluate every distinct
 // 30 s source-time window, falling back to the nearest same-span anchor when a window is sparse.
 const ALIGNMENT_V2_LOCAL_HELD_OUT_WINDOW_MS: u64 = 30_000;
@@ -12445,6 +12460,7 @@ fn align_v2_feature_chunks(
             "fine path normalization：已合并 {balanced_micro_edit_island_count} 个方向交替、首尾净时长守恒的微编辑抖动岛；单次或不平衡真实编辑保持不变。"
         ));
     }
+    path_checkpoints.extend(recover_v2_training_anchor_islands(&mut spans, coarse));
     for span in &mut spans {
         span.boundaries = create_initial_v2_span_boundaries(
             span.kind,
@@ -12844,6 +12860,257 @@ fn v2_balanced_micro_edit_island_fits(island: &[AudioTimeMapSpanDto], expected_s
             <= ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_ISLAND_MS
         && (target_duration_ms as f64 - expected_scale * source_duration_ms as f64).abs()
             <= ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_NET_RESIDUAL_MS
+}
+
+fn recover_v2_training_anchor_islands(
+    spans: &mut Vec<AudioTimeMapSpanDto>,
+    hypothesis: &AffineHypothesis,
+) -> Vec<String> {
+    if !hypothesis.scale.is_finite() || hypothesis.scale <= 0.0 {
+        return Vec::new();
+    }
+    let residual_tolerance_ms = v2_affine_match_config()
+        .residual_tolerance_ms
+        .unsigned_abs();
+    let mut diagnostics = Vec::new();
+    let mut span_index = 0_usize;
+    while span_index < spans.len() {
+        if spans[span_index].kind != AudioTimeMapSpanKind::Ambiguous {
+            span_index += 1;
+            continue;
+        }
+        let ambiguous = spans[span_index].clone();
+        let mut anchors = hypothesis
+            .training_anchors
+            .iter()
+            .filter(|anchor| {
+                anchor.residual_ms.unsigned_abs() <= residual_tolerance_ms
+                    && u64::try_from(anchor.source_time_ms).is_ok_and(|source_time_ms| {
+                        source_time_ms >= ambiguous.source_start_ms
+                            && source_time_ms < ambiguous.source_end_ms
+                    })
+                    && u64::try_from(anchor.target_time_ms).is_ok_and(|target_time_ms| {
+                        target_time_ms >= ambiguous.target_start_ms
+                            && target_time_ms < ambiguous.target_end_ms
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        anchors.sort_unstable_by_key(|anchor| (anchor.source_time_ms, anchor.target_time_ms));
+        anchors.dedup_by_key(|anchor| (anchor.source_time_ms, anchor.target_time_ms));
+        let Some((first, last, support_count)) =
+            widest_v2_training_anchor_rescue_chain(&anchors, hypothesis.scale)
+        else {
+            span_index += 1;
+            continue;
+        };
+        let Ok(source_start_ms) = u64::try_from(first.source_time_ms) else {
+            span_index += 1;
+            continue;
+        };
+        let Ok(target_start_ms) = u64::try_from(first.target_time_ms) else {
+            span_index += 1;
+            continue;
+        };
+        let source_end_ms = u64::try_from(last.source_time_ms)
+            .unwrap_or(ambiguous.source_end_ms)
+            .saturating_add(ALIGNMENT_V2_FINE_HOP_MS as u64)
+            .min(ambiguous.source_end_ms);
+        let target_padding_ms = (hypothesis.scale * ALIGNMENT_V2_FINE_HOP_MS as f64)
+            .round()
+            .max(1.0) as u64;
+        let target_end_ms = u64::try_from(last.target_time_ms)
+            .unwrap_or(ambiguous.target_end_ms)
+            .saturating_add(target_padding_ms)
+            .min(ambiguous.target_end_ms);
+        if source_end_ms <= source_start_ms
+            || target_end_ms <= target_start_ms
+            || !v2_anchor_chain_fits_segment(
+                &anchors,
+                source_start_ms,
+                source_end_ms,
+                target_start_ms,
+                target_end_ms,
+                residual_tolerance_ms,
+            )
+        {
+            span_index += 1;
+            continue;
+        }
+        let bridge_from_left = v2_training_anchor_rescue_can_bridge_from_left(
+            spans,
+            span_index,
+            &ambiguous,
+            source_start_ms,
+            target_start_ms,
+            hypothesis.scale,
+        );
+        let mut replacement = Vec::with_capacity(3);
+        if source_start_ms > ambiguous.source_start_ms
+            || target_start_ms > ambiguous.target_start_ms
+        {
+            replacement.push(create_v2_span(
+                if bridge_from_left {
+                    AudioTimeMapSpanKind::Matched
+                } else {
+                    AudioTimeMapSpanKind::Ambiguous
+                },
+                ambiguous.source_start_ms,
+                source_start_ms,
+                ambiguous.target_start_ms,
+                target_start_ms,
+            ));
+        }
+        replacement.push(create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            source_start_ms,
+            source_end_ms,
+            target_start_ms,
+            target_end_ms,
+        ));
+        if source_end_ms < ambiguous.source_end_ms || target_end_ms < ambiguous.target_end_ms {
+            replacement.push(create_v2_span(
+                AudioTimeMapSpanKind::Ambiguous,
+                source_end_ms,
+                ambiguous.source_end_ms,
+                target_end_ms,
+                ambiguous.target_end_ms,
+            ));
+        }
+        let bridge_note = if bridge_from_left {
+            "；并以已匹配左边界和首个训练锚点恢复短桥"
+        } else {
+            ""
+        };
+        diagnostics.push(format!(
+            "fine path anchor rescue：仅用 {support_count} 个训练锚点在原 ambiguous 内恢复 matched 岛 source=[{source_start_ms},{source_end_ms}) ms、target=[{target_start_ms},{target_end_ms}) ms{bridge_note}；留出锚点未参与地图生成。"
+        ));
+        let replacement_len = replacement.len();
+        spans.splice(span_index..=span_index, replacement);
+        span_index = span_index.saturating_add(replacement_len);
+    }
+    diagnostics
+}
+
+fn widest_v2_training_anchor_rescue_chain(
+    anchors: &[AffineAnchorEvidence],
+    expected_scale: f64,
+) -> Option<(&AffineAnchorEvidence, &AffineAnchorEvidence, usize)> {
+    let mut best = None::<(usize, usize, usize, u64)>;
+    for start in 0..anchors.len() {
+        let mut source_buckets = HashSet::<u64>::new();
+        let mut target_buckets = HashSet::<u64>::new();
+        for end in start..anchors.len() {
+            let source_time_ms = u64::try_from(anchors[end].source_time_ms).ok()?;
+            let target_time_ms = u64::try_from(anchors[end].target_time_ms).ok()?;
+            if end > start
+                && (anchors[end].source_time_ms <= anchors[end - 1].source_time_ms
+                    || anchors[end].target_time_ms <= anchors[end - 1].target_time_ms)
+            {
+                break;
+            }
+            source_buckets.insert(source_time_ms / ALIGNMENT_V2_AMBIGUOUS_RESCUE_TIME_BUCKET_MS);
+            target_buckets.insert(target_time_ms / ALIGNMENT_V2_AMBIGUOUS_RESCUE_TIME_BUCKET_MS);
+            let source_span_ms =
+                source_time_ms.abs_diff(u64::try_from(anchors[start].source_time_ms).ok()?);
+            let support_count = source_buckets.len().min(target_buckets.len());
+            let short_chain_supported = support_count >= ALIGNMENT_V2_AMBIGUOUS_RESCUE_MIN_ANCHORS
+                && source_span_ms >= ALIGNMENT_V2_AMBIGUOUS_RESCUE_MIN_SPAN_MS;
+            let long_chain_supported = support_count
+                >= ALIGNMENT_V2_AMBIGUOUS_RESCUE_LONG_MIN_ANCHORS
+                && source_span_ms >= ALIGNMENT_V2_AMBIGUOUS_RESCUE_LONG_MIN_SPAN_MS;
+            if !short_chain_supported && !long_chain_supported {
+                continue;
+            }
+            let target_span_ms =
+                target_time_ms.abs_diff(u64::try_from(anchors[start].target_time_ms).ok()?);
+            let expected_target_span_ms = expected_scale * source_span_ms as f64;
+            if (target_span_ms as f64 - expected_target_span_ms).abs()
+                > ALIGNMENT_V2_AMBIGUOUS_RESCUE_MAX_ENDPOINT_DRIFT_MS as f64
+            {
+                continue;
+            }
+            let candidate = (start, end, support_count, source_span_ms);
+            if best.is_none_or(|current| {
+                candidate.3 > current.3
+                    || (candidate.3 == current.3 && candidate.2 > current.2)
+                    || (candidate.3 == current.3
+                        && candidate.2 == current.2
+                        && candidate.0 < current.0)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    let (start, end, support_count, _) = best?;
+    Some((&anchors[start], &anchors[end], support_count))
+}
+
+fn v2_training_anchor_rescue_can_bridge_from_left(
+    spans: &[AudioTimeMapSpanDto],
+    span_index: usize,
+    ambiguous: &AudioTimeMapSpanDto,
+    source_anchor_ms: u64,
+    target_anchor_ms: u64,
+    expected_scale: f64,
+) -> bool {
+    let Some(previous) = span_index.checked_sub(1).and_then(|index| spans.get(index)) else {
+        return false;
+    };
+    if previous.kind != AudioTimeMapSpanKind::Matched
+        || previous.source_end_ms != ambiguous.source_start_ms
+        || previous.target_end_ms != ambiguous.target_start_ms
+        || source_anchor_ms <= ambiguous.source_start_ms
+        || target_anchor_ms <= ambiguous.target_start_ms
+    {
+        return false;
+    }
+    let source_gap_ms = source_anchor_ms.saturating_sub(ambiguous.source_start_ms);
+    let target_gap_ms = target_anchor_ms.saturating_sub(ambiguous.target_start_ms);
+    source_gap_ms <= ALIGNMENT_V2_AMBIGUOUS_RESCUE_MAX_LEFT_BRIDGE_MS
+        && target_gap_ms <= ALIGNMENT_V2_AMBIGUOUS_RESCUE_MAX_LEFT_BRIDGE_MS
+        && (target_gap_ms as f64 - expected_scale * source_gap_ms as f64).abs()
+            <= ALIGNMENT_V2_AMBIGUOUS_RESCUE_MAX_ENDPOINT_DRIFT_MS as f64
+}
+
+fn v2_anchor_chain_fits_segment(
+    anchors: &[AffineAnchorEvidence],
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+    residual_tolerance_ms: u64,
+) -> bool {
+    let source_duration_ms = source_end_ms.saturating_sub(source_start_ms);
+    let target_duration_ms = target_end_ms.saturating_sub(target_start_ms);
+    if source_duration_ms == 0 || target_duration_ms == 0 {
+        return false;
+    }
+    anchors.iter().all(|anchor| {
+        let (Ok(source_time_ms), Ok(target_time_ms)) = (
+            u64::try_from(anchor.source_time_ms),
+            u64::try_from(anchor.target_time_ms),
+        ) else {
+            return false;
+        };
+        if source_time_ms < source_start_ms
+            || source_time_ms >= source_end_ms
+            || target_time_ms < target_start_ms
+            || target_time_ms >= target_end_ms
+        {
+            return true;
+        }
+        let source_delta_ms = source_time_ms.saturating_sub(source_start_ms);
+        let mapped_target_ms = u128::from(target_start_ms).saturating_add(
+            u128::from(source_delta_ms)
+                .saturating_mul(u128::from(target_duration_ms))
+                .saturating_add(u128::from(source_duration_ms / 2))
+                / u128::from(source_duration_ms),
+        );
+        u64::try_from(mapped_target_ms).is_ok_and(|mapped_target_ms| {
+            mapped_target_ms.abs_diff(target_time_ms) <= residual_tolerance_ms
+        })
+    })
 }
 
 fn absorb_v2_short_tempo_skips(spans: &mut Vec<AudioTimeMapSpanDto>, expected_scale: f64) {
@@ -14219,6 +14486,123 @@ fn v2_final_map_held_out_anchor_diagnostics(
     diagnostics
 }
 
+fn v2_final_map_problem_training_anchor_diagnostics(
+    spans: &[AudioTimeMapSpanDto],
+    hypothesis: &AffineHypothesis,
+) -> Vec<String> {
+    let residual_tolerance_ms = v2_affine_match_config()
+        .residual_tolerance_ms
+        .unsigned_abs();
+    let mut anchors = hypothesis
+        .training_anchors
+        .iter()
+        .filter_map(|anchor| {
+            let final_residual_ms = v2_final_map_anchor_residual(spans, anchor);
+            if final_residual_ms.is_some_and(|residual_ms| residual_ms <= residual_tolerance_ms) {
+                None
+            } else {
+                Some((anchor, final_residual_ms))
+            }
+        })
+        .collect::<Vec<_>>();
+    anchors.sort_by(|(left, _), (right, _)| {
+        left.source_time_ms
+            .cmp(&right.source_time_ms)
+            .then_with(|| left.target_time_ms.cmp(&right.target_time_ms))
+    });
+    let omitted_count = anchors
+        .len()
+        .saturating_sub(ALIGNMENT_V2_MAX_HELD_OUT_TRACE_ITEMS);
+    let mut diagnostics = anchors
+        .into_iter()
+        .take(ALIGNMENT_V2_MAX_HELD_OUT_TRACE_ITEMS)
+        .enumerate()
+        .map(|(index, (anchor, final_residual_ms))| {
+            let predicted_target_ms =
+                hypothesis.scale * anchor.source_time_ms as f64 + hypothesis.offset_ms as f64;
+            let coarse_signed_residual_ms =
+                (anchor.target_time_ms as f64 - predicted_target_ms).round() as i64;
+            let final_result = final_residual_ms.map_or_else(
+                || "未映射（阻断）".to_string(),
+                |residual_ms| format!("{residual_ms} ms（超阈值）"),
+            );
+            format!(
+                "Final TimeMap 问题训练 anchor #{}：source={} ms，target={} ms，coarseSignedResidual={:+} ms，finalResidual={}。",
+                index + 1,
+                anchor.source_time_ms,
+                anchor.target_time_ms,
+                coarse_signed_residual_ms,
+                final_result
+            )
+        })
+        .collect::<Vec<_>>();
+    if omitted_count > 0 {
+        diagnostics.push(format!(
+            "Final TimeMap 问题训练 anchor 追踪已限长；另有 {omitted_count} 个问题 anchor 未逐条展开。"
+        ));
+    }
+    diagnostics
+}
+
+fn v2_final_map_ambiguous_span_diagnostics(
+    spans: &[AudioTimeMapSpanDto],
+    hypothesis: &AffineHypothesis,
+) -> Vec<String> {
+    let credible_held_out_anchors = v2_credible_held_out_anchors(hypothesis);
+    let ambiguous_spans = spans
+        .iter()
+        .filter(|span| span.kind == AudioTimeMapSpanKind::Ambiguous)
+        .collect::<Vec<_>>();
+    let omitted_count = ambiguous_spans
+        .len()
+        .saturating_sub(ALIGNMENT_V2_MAX_HELD_OUT_TRACE_ITEMS);
+    let mut diagnostics = ambiguous_spans
+        .into_iter()
+        .take(ALIGNMENT_V2_MAX_HELD_OUT_TRACE_ITEMS)
+        .enumerate()
+        .map(|(index, span)| {
+            let training_count = hypothesis
+                .training_anchors
+                .iter()
+                .filter(|anchor| v2_anchor_inside_span(anchor, span))
+                .count();
+            let held_out_count = credible_held_out_anchors
+                .iter()
+                .filter(|anchor| v2_anchor_inside_span(anchor, span))
+                .count();
+            format!(
+                "Final TimeMap ambiguous span #{}：source=[{}, {}) ms，target=[{}, {}) ms，内部训练 anchor={}，内部可信留出 anchor={}。",
+                index + 1,
+                span.source_start_ms,
+                span.source_end_ms,
+                span.target_start_ms,
+                span.target_end_ms,
+                training_count,
+                held_out_count
+            )
+        })
+        .collect::<Vec<_>>();
+    if omitted_count > 0 {
+        diagnostics.push(format!(
+            "Final TimeMap ambiguous span 追踪已限长；另有 {omitted_count} 个区间未逐条展开。"
+        ));
+    }
+    diagnostics
+}
+
+fn v2_anchor_inside_span(anchor: &AffineAnchorEvidence, span: &AudioTimeMapSpanDto) -> bool {
+    let (Ok(source_ms), Ok(target_ms)) = (
+        u64::try_from(anchor.source_time_ms),
+        u64::try_from(anchor.target_time_ms),
+    ) else {
+        return false;
+    };
+    source_ms >= span.source_start_ms
+        && source_ms < span.source_end_ms
+        && target_ms >= span.target_start_ms
+        && target_ms < span.target_end_ms
+}
+
 fn v2_anchors_in_source_span<'a>(
     anchors: &'a [AffineAnchorEvidence],
     span: &AudioTimeMapSpanDto,
@@ -14597,7 +14981,15 @@ fn create_v2_alignment_proposal(
         graph_p99_residual_ms,
         graph_max_residual_ms
     ));
+    diagnostics.extend(v2_final_map_problem_training_anchor_diagnostics(
+        &alignment.spans,
+        &pair.hypothesis,
+    ));
     diagnostics.extend(v2_final_map_held_out_anchor_diagnostics(
+        &alignment.spans,
+        &pair.hypothesis,
+    ));
+    diagnostics.extend(v2_final_map_ambiguous_span_diagnostics(
         &alignment.spans,
         &pair.hypothesis,
     ));
@@ -26579,6 +26971,229 @@ mod tests {
     }
 
     #[test]
+    fn v2_ambiguous_rescue_uses_distributed_training_anchors_without_consuming_holdout() {
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, 20_000);
+        hypothesis.offset_ms = 100;
+        hypothesis.training_anchors = [5_000, 10_000, 15_000]
+            .into_iter()
+            .map(|source_time_ms| AffineAnchorEvidence {
+                source_time_ms,
+                target_time_ms: source_time_ms + 100,
+                residual_ms: 0,
+            })
+            .collect();
+        hypothesis.held_out_anchors = vec![AffineAnchorEvidence {
+            source_time_ms: 12_500,
+            target_time_ms: 12_600,
+            residual_ms: 0,
+        }];
+        let original_holdout = hypothesis.held_out_anchors.clone();
+        let mut spans = vec![create_v2_span(
+            AudioTimeMapSpanKind::Ambiguous,
+            0,
+            20_000,
+            0,
+            20_200,
+        )];
+
+        let diagnostics = recover_v2_training_anchor_islands(&mut spans, &hypothesis);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("仅用 3 个训练锚点"));
+        assert!(diagnostics[0].contains("留出锚点未参与"));
+        assert_eq!(hypothesis.held_out_anchors, original_holdout);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].kind, AudioTimeMapSpanKind::Ambiguous);
+        assert_eq!(spans[1].kind, AudioTimeMapSpanKind::Matched);
+        assert_eq!(
+            (
+                spans[1].source_start_ms,
+                spans[1].source_end_ms,
+                spans[1].target_start_ms,
+                spans[1].target_end_ms,
+            ),
+            (5_000, 15_050, 5_100, 15_150)
+        );
+        assert_eq!(
+            v2_final_map_anchor_residual(&spans, &hypothesis.held_out_anchors[0]),
+            Some(0)
+        );
+        validate_v2_time_map_spans(&spans).unwrap();
+    }
+
+    #[test]
+    fn v2_ambiguous_rescue_accepts_two_distant_anchors_and_a_bounded_left_bridge() {
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 900, 61_000);
+        hypothesis.training_anchors = vec![
+            AffineAnchorEvidence {
+                source_time_ms: 15_000,
+                target_time_ms: 15_800,
+                residual_ms: -100,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 50_000,
+                target_time_ms: 50_900,
+                residual_ms: 0,
+            },
+        ];
+        hypothesis.held_out_anchors = vec![AffineAnchorEvidence {
+            source_time_ms: 12_500,
+            target_time_ms: 13_400,
+            residual_ms: 0,
+        }];
+        let original_holdout = hypothesis.held_out_anchors.clone();
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 1_000, 11_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::Ambiguous,
+                10_000,
+                60_000,
+                11_000,
+                61_000,
+            ),
+        ];
+
+        let diagnostics = recover_v2_training_anchor_islands(&mut spans, &hypothesis);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("仅用 2 个训练锚点"));
+        assert!(diagnostics[0].contains("恢复短桥"));
+        assert!(diagnostics[0].contains("留出锚点未参与"));
+        assert_eq!(hypothesis.held_out_anchors, original_holdout);
+        assert_eq!(spans.len(), 4);
+        assert_eq!(spans[1].kind, AudioTimeMapSpanKind::Matched);
+        assert_eq!(
+            (
+                spans[1].source_start_ms,
+                spans[1].source_end_ms,
+                spans[1].target_start_ms,
+                spans[1].target_end_ms,
+            ),
+            (10_000, 15_000, 11_000, 15_800)
+        );
+        assert_eq!(spans[2].kind, AudioTimeMapSpanKind::Matched);
+        assert_eq!(
+            (
+                spans[2].source_start_ms,
+                spans[2].source_end_ms,
+                spans[2].target_start_ms,
+                spans[2].target_end_ms,
+            ),
+            (15_000, 50_050, 15_800, 50_950)
+        );
+        assert_eq!(
+            v2_final_map_anchor_residual(&spans, &hypothesis.held_out_anchors[0]),
+            Some(0)
+        );
+        validate_v2_time_map_spans(&spans).unwrap();
+    }
+
+    #[test]
+    fn v2_ambiguous_rescue_covers_real_e01_unmapped_holdout_without_using_it() {
+        let mut hypothesis =
+            v2_test_final_map_hypothesis_for_duration(0.999_966_303_466_477_4, 22_689, 3_090_504);
+        hypothesis.training_anchors = vec![
+            AffineAnchorEvidence {
+                source_time_ms: 1_783_025,
+                target_time_ms: 1_805_575,
+                residual_ms: -79,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 1_889_525,
+                target_time_ms: 1_912_225,
+                residual_ms: 75,
+            },
+        ];
+        hypothesis.held_out_anchors = vec![AffineAnchorEvidence {
+            source_time_ms: 1_781_375,
+            target_time_ms: 1_804_075,
+            residual_ms: 71,
+        }];
+        let original_holdout = hypothesis.held_out_anchors.clone();
+        let mut spans = vec![
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                1_697_625,
+                1_777_275,
+                1_720_375,
+                1_800_025,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Ambiguous,
+                1_777_275,
+                1_912_275,
+                1_800_025,
+                1_935_025,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                1_912_275,
+                2_884_444,
+                1_935_025,
+                2_907_175,
+            ),
+        ];
+
+        let diagnostics = recover_v2_training_anchor_islands(&mut spans, &hypothesis);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("仅用 2 个训练锚点"));
+        assert!(diagnostics[0].contains("恢复短桥"));
+        assert_eq!(hypothesis.held_out_anchors, original_holdout);
+        assert_eq!(
+            v2_final_map_anchor_residual(&spans, &hypothesis.held_out_anchors[0]),
+            Some(93)
+        );
+        assert_eq!(spans[1].kind, AudioTimeMapSpanKind::Matched);
+        assert_eq!(spans[2].kind, AudioTimeMapSpanKind::Matched);
+        assert_eq!(spans[3].kind, AudioTimeMapSpanKind::Ambiguous);
+        validate_v2_time_map_spans(&spans).unwrap();
+    }
+
+    #[test]
+    fn v2_ambiguous_rescue_rejects_holdout_only_or_same_time_vote_stuffing() {
+        let mut hypothesis = v2_test_final_map_hypothesis_for_duration(1.0, 0, 20_000);
+        hypothesis.training_anchors = vec![
+            AffineAnchorEvidence {
+                source_time_ms: 5_000,
+                target_time_ms: 5_000,
+                residual_ms: 0,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 5_000,
+                target_time_ms: 5_001,
+                residual_ms: 1,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 5_000,
+                target_time_ms: 5_002,
+                residual_ms: 2,
+            },
+        ];
+        hypothesis.held_out_anchors = [5_000, 10_000, 15_000]
+            .into_iter()
+            .map(|source_time_ms| AffineAnchorEvidence {
+                source_time_ms,
+                target_time_ms: source_time_ms,
+                residual_ms: 0,
+            })
+            .collect();
+        let mut spans = vec![create_v2_span(
+            AudioTimeMapSpanKind::Ambiguous,
+            0,
+            20_000,
+            0,
+            20_000,
+        )];
+
+        let diagnostics = recover_v2_training_anchor_islands(&mut spans, &hypothesis);
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].kind, AudioTimeMapSpanKind::Ambiguous);
+    }
+
+    #[test]
     fn v2_short_real_edits_survive_thresholds_even_when_coarse_tempo_is_biased() {
         for duration_ms in [50, 100, 101] {
             let mut target_only = vec![
@@ -28077,6 +28692,56 @@ mod tests {
         assert!(diagnostics[0].contains(&spans[0].id));
         assert!(diagnostics[1].contains("source=8000 ms"));
         assert!(diagnostics[1].contains("finalResidual=500 ms（超阈值）"));
+    }
+
+    #[test]
+    fn v2_final_map_problem_diagnostics_expose_training_and_ambiguous_evidence() {
+        let spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 10_000, 1_000, 11_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::Ambiguous,
+                10_000,
+                20_000,
+                11_000,
+                21_000,
+            ),
+        ];
+        let mut hypothesis = v2_test_hypothesis(1.0, 1_000);
+        hypothesis.training_anchors = vec![
+            AffineAnchorEvidence {
+                source_time_ms: 2_000,
+                target_time_ms: 3_000,
+                residual_ms: 0,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 8_000,
+                target_time_ms: 9_500,
+                residual_ms: 500,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 12_000,
+                target_time_ms: 13_000,
+                residual_ms: 0,
+            },
+        ];
+        hypothesis.held_out_anchors = vec![AffineAnchorEvidence {
+            source_time_ms: 15_000,
+            target_time_ms: 16_000,
+            residual_ms: 0,
+        }];
+
+        let training = v2_final_map_problem_training_anchor_diagnostics(&spans, &hypothesis);
+        let ambiguous = v2_final_map_ambiguous_span_diagnostics(&spans, &hypothesis);
+
+        assert_eq!(training.len(), 2);
+        assert!(training[0].contains("source=8000 ms"));
+        assert!(training[0].contains("finalResidual=500 ms（超阈值）"));
+        assert!(training[1].contains("source=12000 ms"));
+        assert!(training[1].contains("finalResidual=未映射（阻断）"));
+        assert_eq!(ambiguous.len(), 1);
+        assert!(ambiguous[0].contains("source=[10000, 20000) ms"));
+        assert!(ambiguous[0].contains("内部训练 anchor=1"));
+        assert!(ambiguous[0].contains("内部可信留出 anchor=1"));
     }
 
     #[test]

@@ -1,3 +1,14 @@
+- 2026-07-18：C137 完成第六阶段第三十三个切片“训练锚点歧义岛恢复、真实 E01 未映射留出闭环与问题区间诊断”，完整验证并在独立目录重新打包；Goal 继续进行。
+  - 安全恢复规则：只有建图用 training anchors 可以改变 TimeMap，held-out anchors 继续严格只做验收。普通短岛要求至少 3 个独立 1 秒时间桶并覆盖至少 5 秒；两个锚点只有相距至少 30 秒时才可构成长距离证据。若首个锚点距已匹配左边界不超过 10 秒且双轴端点漂移不超过 250ms，可把这段短桥恢复为独立 matched span；不会把不同局部斜率强行合并为一条直线。
+  - 防伪与回归：新增同瞬间投票填充、仅留出锚点、三点短岛、两点长岛、左侧短桥和 Dark E01 实际失败参数回归；真实 E01 回归固定使用原歧义段、两枚相距 106.5 秒的训练锚点与原未映射留出点，证明留出点不参与建图仍可得到 93ms 重投影残差。
+  - 透明诊断：Final TimeMap 现在逐条输出所有未映射或超阈值的训练 anchor，并逐个列出 ambiguous span 的双轴区间、内部训练 anchor 数和内部可信留出 anchor 数；与上一切片的跨重启 JSONL 运行编号组合后，可以从“哪个阶段耗时”继续定位到“哪个证据和区间阻断发布”。
+  - 真实 RTX 4090 E01：强制 CUDA/cuFFT 的完整生产链确实触发 `2 training anchors + matched left boundary` 恢复；原先未映射的 held-out anchor `source=1,781,375ms / target=1,804,075ms` 现在以 **37ms** 通过。可信留出通过率由 **6/11 提升为 7/11**，未映射留出由 **1 降为 0**，未映射训练 anchor 由 **3 降为 1**，final-map source coverage 由 **86.0% 提升为 89.7%**；P50/P95/P99/max 保持 **50/200/200/200ms**。脱敏回执为 `artifacts/c137-real-media-smoke-e01-gpu-training-anchor-rescue-v2.json`，SHA-256 `35AB12ED28891F66A7B94DB6DB8BA8AF0301FABE983BD766DD4455A7295C17AD`。
+  - 仍然失败关闭：最大无验证锚跨度仍为 496,350ms，高于 486,085ms 限制；还有 1 个训练 anchor 未映射、7 个 ambiguous spans、72 个未通过逐段门控的 spans 和 54 个不稳定局部边界。因此当前仍不发布 TimeMap，不能用于宣称弹幕或删减边界已经准确。
+  - 性能诚实边界：本次开发测试进程的完整冷运行耗时 **1,040,546ms（约 17.3 分钟）**，两个素材的粗制品均为 0 次缓存命中；没有达到单集 5–10 分钟。当前跨进程持久粗索引只覆盖超过 60 分钟的 streaming-coarse 媒体，而本组约 50 分钟素材仍使用进程内缓存；媒体身份/容器时间线、完整 PTS 扫描、细特征和最终身份复核仍占主要时长。后续必须把受内容身份约束的探测/粗证据复用扩展到此类单集素材，不能把 4090 FFT 利用率等同于全链性能。
+  - 自动验收：Rust 全量 **429 passed / 23 ignored / 0 failed**，Rustfmt 与 strict Clippy `-D warnings` 通过；完整 `corepack pnpm verify` 通过源码审计、ESLint、Vitest **93 files / 965 tests** 和 TypeScript/Vite production build。Chromium 北极星 E2E 首轮在 60 秒边界超时，单项复跑遇到既有截图文件瞬时打开失败，随后完整 **6/6** 通过；本切片没有改动前端或截图基线。
+  - release 安装包：`src-tauri/target-c137-training-anchor-rescue-v1/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，4,294,687 bytes，SHA-256 `307818D8667245E6B12694433E47E771F844D6AE6C168FBD792313BA604DF601`；便携版：`src-tauri/target-c137-training-anchor-rescue-v1/release/danmaku_timeline_studio.exe`，16,764,928 bytes，SHA-256 `298C12C9A4AF5E8CA4626113121003442F73D6A143BAD7A4C6B366309E986F26`。使用独立目标目录，不覆盖可能仍在运行的旧版程序。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-training-anchor-rescue-v1-20260718`。
+
 - 2026-07-18：C137 完成第六阶段第三十二个切片“跨重启脱敏 JSONL 诊断日志、唯一运行编号与匹配页追踪入口”，完整验证并在独立目录重新打包；Goal 继续进行。
   - 持久日志：批量匹配的每条既有结构化诊断事件会逐条立即写入应用本地数据目录的 JSONL 文件；文件包含 schema、运行编号、事件序号、时间、累计/阶段耗时、级别、阶段键与素材/组合序号。每次写入都会 flush，进程异常退出前已经完成的阶段仍可追溯。
   - 运行追踪：批任务编号由毫秒时间、进程 ID 和进程内序号共同组成，应用重启后不会从 `audio-align-batch-1` 重新开始并覆盖旧证据；日志文件名与界面显示的运行编号完全一致。
