@@ -9,11 +9,14 @@ import {
   computeC137PerformanceEvidenceDigest,
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceTerminalCleanupJobInventoryDigest,
+  computeC137PerformanceTerminalCleanupReceiptDigest,
   computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformanceEvidenceDraft,
   createC137PerformancePlanDigest,
   finalizeC137PerformanceEvidence,
   parseC137PerformanceEvidence,
+  projectC137PerformanceTerminalCleanupJobInventory,
   serializeC137PerformanceEvidence,
   validateC137PerformanceEvidence,
   type C137PerformanceCacheCountsV1,
@@ -26,6 +29,7 @@ import {
   type C137PerformancePlanV1,
   type C137PerformanceRawEvidenceV1,
   type C137PerformanceRawEvidenceV2,
+  type C137PerformanceTerminalCleanupReceiptV1,
   type C137PerformanceRunKindV1,
   type C137PerformanceRunV1,
   type C137PerformanceStageTimingV1,
@@ -480,6 +484,62 @@ describe("C137 raw performance evidence v2", () => {
     formalFlag.evidenceDigest = computeC137PerformanceEvidenceDigestV2(formalFlag);
     expect(validateC137PerformanceEvidence(formalFlag).valid).toBe(false);
   });
+
+  it("accepts a path-free terminal cleanup receipt that is bound to every terminal native job", () => {
+    const evidence = cloneV2Evidence();
+    attachTerminalCleanupReceipt(evidence);
+
+    expect(validateC137PerformanceEvidence(evidence)).toEqual({
+      valid: true,
+      complete: true,
+      issues: [],
+      completenessIssues: []
+    });
+    expect(evidence.assurance.terminalCleanupReceipt).toMatchObject({
+      jobCount: 4,
+      completedJobCount: 3,
+      cancelledJobCount: 1,
+      processTreeEmpty: true,
+      supervisionCleanupStatus: "clean",
+      featureCachesEmpty: true
+    });
+  });
+
+  it.each([
+    ["session binding", (receipt: C137PerformanceTerminalCleanupReceiptV1) => {
+      receipt.sessionId = "session-forged-0001";
+    }],
+    ["job count", (receipt: C137PerformanceTerminalCleanupReceiptV1) => {
+      receipt.jobCount += 1;
+    }],
+    ["job inventory", (receipt: C137PerformanceTerminalCleanupReceiptV1) => {
+      receipt.jobInventoryDigest = digest("9");
+    }],
+    ["terminal tick", (receipt: C137PerformanceTerminalCleanupReceiptV1) => {
+      receipt.terminalTickNs = "0";
+    }]
+  ] as const)("rejects a re-signed terminal cleanup receipt with tampered %s", (_label, mutate) => {
+    const evidence = cloneV2Evidence();
+    attachTerminalCleanupReceipt(evidence);
+    const receipt = evidence.assurance.terminalCleanupReceipt;
+    if (receipt === null) throw new Error("expected terminal cleanup receipt");
+    mutate(receipt);
+    receipt.receiptDigest = computeC137PerformanceTerminalCleanupReceiptDigest(receipt);
+    evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
+
+    expect(validateC137PerformanceEvidence(evidence).valid).toBe(false);
+  });
+
+  it("rejects a stale terminal cleanup receipt digest after the outer envelope is re-signed", () => {
+    const evidence = cloneV2Evidence();
+    attachTerminalCleanupReceipt(evidence);
+    const receipt = evidence.assurance.terminalCleanupReceipt;
+    if (receipt === null) throw new Error("expected terminal cleanup receipt");
+    receipt.receiptDigest = digest("8");
+    evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
+
+    expect(validateC137PerformanceEvidence(evidence).valid).toBe(false);
+  });
 });
 
 function createCompleteEvidence(): C137PerformanceRawEvidenceV1 {
@@ -836,6 +896,40 @@ function requireCancellation(
 
 function cloneV2Evidence(): C137PerformanceRawEvidenceV2 {
   return structuredClone(createCompleteC137PerformanceEvidenceV2Fixture());
+}
+
+function attachTerminalCleanupReceipt(evidence: C137PerformanceRawEvidenceV2): void {
+  const jobs = projectC137PerformanceTerminalCleanupJobInventory(evidence.trials);
+  const latestTick = jobs.reduce(
+    (maximum, job) => (BigInt(job.endTickNs) > maximum ? BigInt(job.endTickNs) : maximum),
+    0n
+  );
+  const unsigned: Omit<C137PerformanceTerminalCleanupReceiptV1, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: evidence.collector.sessionId,
+    runManifestDigest: evidence.runManifestDigest,
+    workloadDigest: evidence.plan.workloadDigest,
+    workloadStorageReceiptDigest: evidence.environment.workloadStorage.receiptDigest,
+    terminalTickNs: String(latestTick + 1n),
+    finalCacheGeneration: 3,
+    jobCount: jobs.length,
+    completedJobCount: jobs.filter((job) => job.status === "completed").length,
+    failedJobCount: jobs.filter((job) => job.status === "failed").length,
+    cancelledJobCount: jobs.filter((job) => job.status === "cancelled").length,
+    jobInventoryDigest: computeC137PerformanceTerminalCleanupJobInventoryDigest(jobs),
+    allJobsTerminal: true,
+    processTreeEmpty: true,
+    residualProcessCount: 0,
+    supervisionCleanupStatus: "clean",
+    toolchainReverified: true,
+    workloadReverified: true,
+    featureCachesEmpty: true
+  };
+  evidence.assurance.terminalCleanupReceipt = {
+    ...unsigned,
+    receiptDigest: computeC137PerformanceTerminalCleanupReceiptDigest(unsigned)
+  };
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
 }
 
 function resignV2Evidence(evidence: C137PerformanceRawEvidenceV2): void {

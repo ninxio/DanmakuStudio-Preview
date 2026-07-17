@@ -1,3 +1,13 @@
+- 2026-07-17：C137 完成第六阶段第二十个切片“原生终态清理凭证与验收重算闭环”，完整验证并重新打包；Goal 继续进行。
+  - 原生 benchmark session 不再在确认清理后直接丢弃全部状态：释放前生成 schema v1、path-free 的 terminal cleanup receipt，绑定同一 session/run/workload/storage receipt、最终 cache generation、全部 native job 的终态库存与结束 tick，以及进程树归零、监督器清理、工具链/媒体复核和 feature cache 清空声明；任一步不能形成严格回执时 session 保持 `cleanup-blocked` 并占用 lease。
+  - Tauri bridge 对 released session 强制要求该回执，逐字段严格解析、重算 canonical SHA-256，并检查 session/workload/storage/cache generation 绑定；缺失、额外字段、旧摘要、错误绑定和虚假完成声明全部失败关闭。性能 journal 保留最终 released snapshot，raw evidence v2 复用已预留的 assurance 字段携带回执，不需要伪造 schema 升级。
+  - raw evidence 验证器从全部 run case 与 cancellation trial 重新投影、排序并摘要 job inventory，复核状态计数、唯一 job ID、最大终态 tick、released session 与 receipt digest；acceptance 的 terminal-cleanup-receipt 可据此单项通过，但 Job memory receipt 与独立 native attestation 继续 incomplete，不能被同一采集器的自洽回执替代。
+  - 匹配页高级性能摘要新增“任务收尾：已闭合/缺少终态清理凭证”，使用结果语言展示，不把内部 digest 推到主界面。Goal 文档同步拆开 terminal cleanup、Job working-set 与 attestation 的真实完成边界。
+  - 自动验收：新增 Rust path-free/tamper-evident 摘要回归，TypeScript bridge、runner、raw evidence、acceptance 与 UI 的缺失/篡改/正向闭环回归。Rust 串行全量 **397 passed / 18 ignored / 0 failed**，Rustfmt、strict Clippy `-D warnings` 与 `git diff --check` 通过；`corepack pnpm verify:release` 完整通过源码审计、ESLint、Vitest **89 files / 915 tests**、TypeScript/Vite production build、Chromium 四页北极星 **6/6** 和 Tauri NSIS release。
+  - 本阶段安装器：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，大小 `4180720` 字节，时间 `2026-07-17 08:43:22 +08:00`，SHA-256 `329FFAD563E5776C0DDC51EA6A55E59D7F5E7A0FD205BEAED91C2FA2DF931CEC`。
+  - 本阶段便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，大小 `16300544` 字节，时间 `2026-07-17 08:43:22 +08:00`，SHA-256 `2BAC2F317491AC22894E9A97687CBD80F5066B459FD5BD989EB28D549CE21E34`。
+  - 诚实限制：该回执证明同一次 native session 的任务与资源清理状态闭合，但没有独立信任根，不能证明采集器本身未被替换；Job Object membership working-set receipt、native attestation、外部 authority/challenge/replay、规定 4 核目标机重复测量仍未完成。获授权冻结真实 Gold 仍为 0，实际影片错位与删减双边界准确率也尚未验收，因此 C137 保持 active。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-terminal-cleanup-receipt-v1-20260717`。
 - 2026-07-17：C137 完成第六阶段第十九个切片“多 case development Gold 治理数据集”，完整验证并重新打包；Goal 继续进行。
   - 真实 Gold 治理不再只能手工维护一个 case：匹配页高级诊断新增“合并多个已复核 case”入口，可一次多选 2–1000 个现有单 case 治理 bundle，生成确定顺序、可直接载入精度 benchmark 的多 case development 数据集。
   - 合并器不会只拼 JSON：每个 source bundle 都重新执行严格解析与 digest/receipt/annotation 闭环；重复 case ID、重复 bundle、用不同 ID 包装的同一双端媒体身份/音视频流、manifest 漂移、coverage 漂移、dataset digest 篡改和额外字段全部失败关闭。覆盖摘要从嵌入 bundle 重算 case、source/target binding、reviewer、source-only/target-only/ambiguous 事件与 12 类场景计数。

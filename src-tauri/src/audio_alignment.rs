@@ -1180,6 +1180,41 @@ pub struct AlignmentBenchmarkWorkloadStorageReceipt {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AlignmentBenchmarkTerminalCleanupReceipt {
+    schema_version: u8,
+    session_id: String,
+    run_manifest_digest: String,
+    workload_digest: String,
+    workload_storage_receipt_digest: String,
+    terminal_tick_ns: String,
+    final_cache_generation: u64,
+    job_count: usize,
+    completed_job_count: usize,
+    failed_job_count: usize,
+    cancelled_job_count: usize,
+    job_inventory_digest: String,
+    all_jobs_terminal: bool,
+    process_tree_empty: bool,
+    residual_process_count: usize,
+    supervision_cleanup_status: &'static str,
+    toolchain_reverified: bool,
+    workload_reverified: bool,
+    feature_caches_empty: bool,
+    receipt_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AlignmentBenchmarkTerminalJobInventoryEntry {
+    job_id: String,
+    status: AudioAlignmentJobStatus,
+    end_tick_ns: String,
+    process_tree_empty_at_terminal: bool,
+    residual_process_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AlignmentBenchmarkToolFingerprint {
     version: String,
     binary_digest: String,
@@ -1220,6 +1255,7 @@ pub struct AlignmentBenchmarkSessionSnapshot {
     environment: AlignmentBenchmarkEnvironmentReceipt,
     active_job_id: Option<String>,
     cleanup_issue: Option<String>,
+    terminal_cleanup_receipt: Option<AlignmentBenchmarkTerminalCleanupReceipt>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -2110,6 +2146,7 @@ struct AlignmentBenchmarkSessionEntry {
     baseline_descendants: HashSet<u32>,
     active_job_id: Option<String>,
     cleanup_reason: Option<String>,
+    terminal_cleanup_receipt: Option<AlignmentBenchmarkTerminalCleanupReceipt>,
     outstanding_receipt: Option<AlignmentBenchmarkOutstandingReceipt>,
     jobs: HashMap<String, AlignmentBenchmarkJobEntry>,
 }
@@ -2777,6 +2814,7 @@ fn begin_alignment_benchmark_session_inner(
         baseline_descendants,
         active_job_id: None,
         cleanup_reason,
+        terminal_cleanup_receipt: None,
         outstanding_receipt: None,
         jobs: HashMap::new(),
     };
@@ -2840,6 +2878,7 @@ fn create_alignment_benchmark_session_snapshot(
         environment: session.environment.clone(),
         active_job_id: session.active_job_id.clone(),
         cleanup_issue: session.cleanup_reason.clone(),
+        terminal_cleanup_receipt: session.terminal_cleanup_receipt.clone(),
     }
 }
 
@@ -4014,11 +4053,28 @@ fn finish_alignment_benchmark_session_inner(
     let released_generation = coordinator.cache_generation;
     let session = require_alignment_benchmark_session_mut(&mut coordinator, session_id)?;
     session.cache_generation = released_generation;
+    let terminal_tick_ns = session.origin.elapsed().as_nanos();
+    let terminal_cleanup_receipt = match create_alignment_benchmark_terminal_cleanup_receipt(
+        session,
+        terminal_tick_ns,
+        released_generation,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            session.status = AlignmentBenchmarkSessionStatus::CleanupBlocked;
+            session.cleanup_reason = Some(
+                "终态清理状态无法形成严格、路径无关的原生回执；lease 按 fail-closed 保持占用。"
+                    .to_string(),
+            );
+            return Ok(create_alignment_benchmark_session_snapshot(session));
+        }
+    };
     session.jobs.clear();
     session.outstanding_receipt = None;
     session.active_job_id = None;
     session.status = AlignmentBenchmarkSessionStatus::Released;
     session.cleanup_reason = None;
+    session.terminal_cleanup_receipt = Some(terminal_cleanup_receipt);
     let snapshot = create_alignment_benchmark_session_snapshot(session);
     coordinator.session = None;
     Ok(snapshot)
@@ -4791,6 +4847,110 @@ fn create_alignment_benchmark_workload_receipt_digest(
         .as_object_mut()
         .ok_or_else(|| "workload storage receipt 不是对象。".to_string())?;
     object.remove("receiptDigest");
+    let canonical = canonicalize_alignment_benchmark_json(&value)?;
+    Ok(format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(canonical.as_bytes())
+    ))
+}
+
+fn create_alignment_benchmark_terminal_cleanup_receipt(
+    session: &AlignmentBenchmarkSessionEntry,
+    terminal_tick_ns: u128,
+    final_cache_generation: u64,
+) -> Result<AlignmentBenchmarkTerminalCleanupReceipt, String> {
+    let mut jobs = session
+        .jobs
+        .iter()
+        .map(|(job_id, entry)| {
+            if !matches!(
+                entry.snapshot.status,
+                AudioAlignmentJobStatus::Completed
+                    | AudioAlignmentJobStatus::Failed
+                    | AudioAlignmentJobStatus::Cancelled
+            ) {
+                return Err("terminal cleanup receipt 遇到非终态 job。".to_string());
+            }
+            let telemetry = entry.telemetry.snapshot()?;
+            let end_tick_ns = telemetry
+                .end_tick_ns
+                .ok_or_else(|| "terminal cleanup receipt 遇到缺少 end tick 的 job。".to_string())?;
+            if !telemetry.memory.process_tree_empty_at_terminal
+                || telemetry.memory.residual_process_count != 0
+            {
+                return Err("terminal cleanup receipt 遇到未清空进程树的 job。".to_string());
+            }
+            Ok(AlignmentBenchmarkTerminalJobInventoryEntry {
+                job_id: job_id.clone(),
+                status: entry.snapshot.status,
+                end_tick_ns,
+                process_tree_empty_at_terminal: true,
+                residual_process_count: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    let completed_job_count = jobs
+        .iter()
+        .filter(|job| job.status == AudioAlignmentJobStatus::Completed)
+        .count();
+    let failed_job_count = jobs
+        .iter()
+        .filter(|job| job.status == AudioAlignmentJobStatus::Failed)
+        .count();
+    let cancelled_job_count = jobs
+        .iter()
+        .filter(|job| job.status == AudioAlignmentJobStatus::Cancelled)
+        .count();
+    let inventory_value = serde_json::json!({
+        "domain": "c137-performance-terminal-job-inventory-v1",
+        "jobs": jobs,
+    });
+    let inventory_canonical = canonicalize_alignment_benchmark_json(&inventory_value)?;
+    let job_inventory_digest = format!(
+        "sha256:{}",
+        sha256_alignment_benchmark_bytes(inventory_canonical.as_bytes())
+    );
+    let workload_storage = &session.environment.workload_storage;
+    let mut receipt = AlignmentBenchmarkTerminalCleanupReceipt {
+        schema_version: 1,
+        session_id: session.session_id.clone(),
+        run_manifest_digest: workload_storage.run_manifest_digest.clone(),
+        workload_digest: workload_storage.workload_digest.clone(),
+        workload_storage_receipt_digest: workload_storage.receipt_digest.clone(),
+        terminal_tick_ns: terminal_tick_ns.to_string(),
+        final_cache_generation,
+        job_count: jobs.len(),
+        completed_job_count,
+        failed_job_count,
+        cancelled_job_count,
+        job_inventory_digest,
+        all_jobs_terminal: true,
+        process_tree_empty: true,
+        residual_process_count: 0,
+        supervision_cleanup_status: "clean",
+        toolchain_reverified: true,
+        workload_reverified: true,
+        feature_caches_empty: true,
+        receipt_digest: String::new(),
+    };
+    receipt.receipt_digest = create_alignment_benchmark_terminal_cleanup_receipt_digest(&receipt)?;
+    Ok(receipt)
+}
+
+fn create_alignment_benchmark_terminal_cleanup_receipt_digest(
+    receipt: &AlignmentBenchmarkTerminalCleanupReceipt,
+) -> Result<String, String> {
+    let mut receipt_value = serde_json::to_value(receipt)
+        .map_err(|_| "terminal cleanup receipt 无法序列化。".to_string())?;
+    let object = receipt_value
+        .as_object_mut()
+        .ok_or_else(|| "terminal cleanup receipt 不是对象。".to_string())?;
+    object.remove("receiptDigest");
+    let value = serde_json::json!({
+        "domain": "c137-performance-terminal-cleanup-receipt-v1",
+        "receipt": receipt_value,
+    });
     let canonical = canonicalize_alignment_benchmark_json(&value)?;
     Ok(format!(
         "sha256:{}",
@@ -21776,6 +21936,51 @@ mod tests {
             visual_sample_interval_ms: DEFAULT_VISUAL_SAMPLE_INTERVAL_MS,
             localization_mode: false,
         }
+    }
+
+    #[test]
+    fn terminal_cleanup_receipt_digest_is_path_free_and_tamper_evident() {
+        let mut receipt = AlignmentBenchmarkTerminalCleanupReceipt {
+            schema_version: 1,
+            session_id: "benchmark-session-test".to_string(),
+            run_manifest_digest: format!("sha256:{}", "1".repeat(64)),
+            workload_digest: format!("sha256:{}", "1".repeat(64)),
+            workload_storage_receipt_digest: format!("sha256:{}", "2".repeat(64)),
+            terminal_tick_ns: "100".to_string(),
+            final_cache_generation: 3,
+            job_count: 2,
+            completed_job_count: 1,
+            failed_job_count: 0,
+            cancelled_job_count: 1,
+            job_inventory_digest: format!("sha256:{}", "3".repeat(64)),
+            all_jobs_terminal: true,
+            process_tree_empty: true,
+            residual_process_count: 0,
+            supervision_cleanup_status: "clean",
+            toolchain_reverified: true,
+            workload_reverified: true,
+            feature_caches_empty: true,
+            receipt_digest: String::new(),
+        };
+        let digest = create_alignment_benchmark_terminal_cleanup_receipt_digest(&receipt)
+            .expect("terminal cleanup receipt digest");
+        receipt.receipt_digest = digest.clone();
+
+        assert_eq!(
+            create_alignment_benchmark_terminal_cleanup_receipt_digest(&receipt)
+                .expect("receiptDigest excluded from canonical payload"),
+            digest
+        );
+        let serialized = serde_json::to_string(&receipt).expect("serialize terminal receipt");
+        assert!(!serialized.contains("C:\\"));
+        assert!(!serialized.contains("D:\\"));
+
+        receipt.cancelled_job_count = 0;
+        assert_ne!(
+            create_alignment_benchmark_terminal_cleanup_receipt_digest(&receipt)
+                .expect("tampered terminal cleanup receipt digest"),
+            digest
+        );
     }
 
     fn test_media_content_identity(

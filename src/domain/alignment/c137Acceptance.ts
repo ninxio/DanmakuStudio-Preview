@@ -1689,6 +1689,12 @@ function evaluatePerformanceThresholds(
     assurance !== null &&
     assurance.workloadStorageReceiptDigest ===
       v2Evidence.environment.workloadStorage.receiptDigest;
+  const terminalCleanupReceiptComplete =
+    formalRawSchemaMatches &&
+    validation.valid &&
+    v2Evidence !== null &&
+    v2Evidence.collector.terminalSessionStatus === "released" &&
+    v2Evidence.assurance.terminalCleanupReceipt !== null;
   return [
     createCheck(
       "performance-formal-raw-schema-version",
@@ -1712,9 +1718,11 @@ function evaluatePerformanceThresholds(
     ),
     createCheck(
       "terminal-cleanup-receipt",
-      "incomplete",
-      "not-verifiable-in-schema-v2",
-      "raw v2 仅预留空字段，尚无活动进程归零、输出读取器回收和 session 释放 receipt 的严格 schema、原生签发与 authority 验证；任意对象不得通过"
+      terminalCleanupReceiptComplete ? "pass" : "incomplete",
+      terminalCleanupReceiptComplete
+        ? (v2Evidence?.assurance.terminalCleanupReceipt?.receiptDigest ?? "missing")
+        : "missing-or-invalid",
+      "正式性能验收必须有严格重算并绑定全部 native job 终态、后代进程归零、监督器清理、工具/媒体复核、缓存清空和 released session 的 path-free terminal cleanup receipt；其原生来源真实性仍由独立 attestation 与 authority 验证"
     ),
     createCheck(
       "native-attestation",

@@ -372,11 +372,42 @@ export type C137PerformanceTrialV2 =
   | C137PerformanceRunV2
   | C137PerformanceCancellationTrialV2;
 
+export interface C137PerformanceTerminalCleanupJobInventoryEntryV1 {
+  jobId: string;
+  status: "completed" | "failed" | "cancelled";
+  endTickNs: string;
+  processTreeEmptyAtTerminal: true;
+  residualProcessCount: 0;
+}
+
+export interface C137PerformanceTerminalCleanupReceiptV1 {
+  schemaVersion: 1;
+  sessionId: string;
+  runManifestDigest: C137PerformanceDigest;
+  workloadDigest: C137PerformanceDigest;
+  workloadStorageReceiptDigest: C137PerformanceDigest;
+  terminalTickNs: string;
+  finalCacheGeneration: number;
+  jobCount: number;
+  completedJobCount: number;
+  failedJobCount: number;
+  cancelledJobCount: number;
+  jobInventoryDigest: C137PerformanceDigest;
+  allJobsTerminal: true;
+  processTreeEmpty: true;
+  residualProcessCount: 0;
+  supervisionCleanupStatus: "clean";
+  toolchainReverified: true;
+  workloadReverified: true;
+  featureCachesEmpty: true;
+  receiptDigest: C137PerformanceDigest;
+}
+
 export interface C137PerformanceAssuranceV2 {
   schemaVersion: 1;
   workloadStorageReceiptDigest: C137PerformanceDigest;
   jobMemoryReceipt: null;
-  terminalCleanupReceipt: null;
+  terminalCleanupReceipt: C137PerformanceTerminalCleanupReceiptV1 | null;
   attestation: null;
 }
 
@@ -487,6 +518,59 @@ export function computeC137PerformanceWorkloadStorageReceiptDigest(
     ? omitWorkloadStorageReceiptDigest(receipt)
     : receipt;
   return computeC137PerformanceCanonicalDigest(payload);
+}
+
+export function projectC137PerformanceTerminalCleanupJobInventory(
+  trials: readonly C137PerformanceTrialV2[]
+): C137PerformanceTerminalCleanupJobInventoryEntryV1[] {
+  const jobs = trials.flatMap((trial) => {
+    if (trial.trialType === "run") {
+      return trial.cases.map((benchmarkCase) => ({
+        jobId: benchmarkCase.jobId,
+        status: benchmarkCase.status,
+        endTickNs: requireTerminalTelemetryEndTick(benchmarkCase.telemetry, benchmarkCase.jobId),
+        processTreeEmptyAtTerminal: true as const,
+        residualProcessCount: 0 as const
+      }));
+    }
+    if (trial.terminalStatus === "timeout") {
+      throw new Error(`terminal cleanup inventory 不接受 timeout job：${trial.jobId}。`);
+    }
+    return [
+      {
+        jobId: trial.jobId,
+        status: trial.terminalStatus,
+        endTickNs: requireTerminalTelemetryEndTick(trial.telemetry, trial.jobId),
+        processTreeEmptyAtTerminal: true as const,
+        residualProcessCount: 0 as const
+      }
+    ];
+  });
+  jobs.sort((left, right) => compareAscii(left.jobId, right.jobId));
+  return jobs;
+}
+
+export function computeC137PerformanceTerminalCleanupJobInventoryDigest(
+  jobs: readonly C137PerformanceTerminalCleanupJobInventoryEntryV1[]
+): C137PerformanceDigest {
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-terminal-job-inventory-v1",
+    jobs
+  });
+}
+
+export function computeC137PerformanceTerminalCleanupReceiptDigest(
+  receipt:
+    | Omit<C137PerformanceTerminalCleanupReceiptV1, "receiptDigest">
+    | C137PerformanceTerminalCleanupReceiptV1
+): C137PerformanceDigest {
+  const payload = "receiptDigest" in receipt
+    ? omitTerminalCleanupReceiptDigest(receipt)
+    : receipt;
+  return computeC137PerformanceCanonicalDigest({
+    domain: "c137-performance-terminal-cleanup-receipt-v1",
+    receipt: payload
+  });
 }
 
 export function computeC137PerformanceCaseOutputDigest(input: {
@@ -600,6 +684,7 @@ export function createC137PerformanceEvidenceDraftV2(input: {
   environment: C137PerformanceEnvironmentV2;
   collector: C137PerformanceCollectorV2;
   preflight: C137PerformancePreflightV1;
+  terminalCleanupReceipt?: C137PerformanceTerminalCleanupReceiptV1 | null;
   status?: C137PerformanceEvidenceStatus;
   issueCodes?: string[];
 }): C137PerformanceEvidenceDraftV2 {
@@ -617,7 +702,9 @@ export function createC137PerformanceEvidenceDraftV2(input: {
       schemaVersion: 1,
       workloadStorageReceiptDigest: input.environment.workloadStorage.receiptDigest,
       jobMemoryReceipt: null,
-      terminalCleanupReceipt: null,
+      terminalCleanupReceipt: input.terminalCleanupReceipt
+        ? structuredClone(input.terminalCleanupReceipt)
+        : null,
       attestation: null
     },
     preflight: structuredClone(input.preflight),
@@ -862,6 +949,58 @@ function validateC137PerformanceEvidenceV2(
   }
   if (evidence.assurance.workloadStorageReceiptDigest !== storage.receiptDigest) {
     issues.push("assurance 未绑定 workload storage receipt。");
+  }
+  const terminalCleanupReceipt = evidence.assurance.terminalCleanupReceipt;
+  if (terminalCleanupReceipt !== null) {
+    try {
+      const inventory = projectC137PerformanceTerminalCleanupJobInventory(evidence.trials);
+      const inventoryIds = new Set(inventory.map((job) => job.jobId));
+      const completedJobCount = inventory.filter((job) => job.status === "completed").length;
+      const failedJobCount = inventory.filter((job) => job.status === "failed").length;
+      const cancelledJobCount = inventory.filter((job) => job.status === "cancelled").length;
+      const latestJobTick = inventory.reduce(
+        (latest, job) =>
+          compareDecimalTicks(job.endTickNs, latest) > 0 ? job.endTickNs : latest,
+        "0"
+      );
+      if (
+        terminalCleanupReceipt.sessionId !== evidence.collector.sessionId ||
+        terminalCleanupReceipt.runManifestDigest !== evidence.runManifestDigest ||
+        terminalCleanupReceipt.workloadDigest !== evidence.plan.workloadDigest ||
+        terminalCleanupReceipt.workloadStorageReceiptDigest !== storage.receiptDigest
+      ) {
+        issues.push("terminal cleanup receipt 未绑定同一 session/run/workload/storage receipt。");
+      }
+      if (
+        inventoryIds.size !== inventory.length ||
+        terminalCleanupReceipt.jobCount !== inventory.length ||
+        terminalCleanupReceipt.completedJobCount !== completedJobCount ||
+        terminalCleanupReceipt.failedJobCount !== failedJobCount ||
+        terminalCleanupReceipt.cancelledJobCount !== cancelledJobCount
+      ) {
+        issues.push("terminal cleanup receipt 的 job 计数与 raw trial inventory 不一致。");
+      }
+      if (
+        terminalCleanupReceipt.jobInventoryDigest !==
+        computeC137PerformanceTerminalCleanupJobInventoryDigest(inventory)
+      ) {
+        issues.push("terminal cleanup receipt 的 jobInventoryDigest 不一致。");
+      }
+      if (compareDecimalTicks(terminalCleanupReceipt.terminalTickNs, latestJobTick) < 0) {
+        issues.push("terminal cleanup receipt 的 terminal tick 早于 job 终态。");
+      }
+      if (evidence.collector.terminalSessionStatus !== "released") {
+        issues.push("terminal cleanup receipt 只能绑定 released session。");
+      }
+      if (
+        terminalCleanupReceipt.receiptDigest !==
+        computeC137PerformanceTerminalCleanupReceiptDigest(terminalCleanupReceipt)
+      ) {
+        issues.push("terminal cleanup receiptDigest 与规范化内容不一致。");
+      }
+    } catch (error: unknown) {
+      issues.push(`terminal cleanup receipt 无法重算：${formatError(error)}`);
+    }
   }
   for (const receipt of evidence.cacheResets) {
     if (
@@ -1658,8 +1797,86 @@ function validateAssuranceV2(value: unknown, issues: string[]): void {
   requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
   requireDigest(record.workloadStorageReceiptDigest, `${path}.workloadStorageReceiptDigest`, issues);
   requireLiteral(record.jobMemoryReceipt, null, `${path}.jobMemoryReceipt`, issues);
-  requireLiteral(record.terminalCleanupReceipt, null, `${path}.terminalCleanupReceipt`, issues);
+  if (record.terminalCleanupReceipt !== null) {
+    validateTerminalCleanupReceiptV1(
+      record.terminalCleanupReceipt,
+      `${path}.terminalCleanupReceipt`,
+      issues
+    );
+  }
   requireLiteral(record.attestation, null, `${path}.attestation`, issues);
+}
+
+function validateTerminalCleanupReceiptV1(
+  value: unknown,
+  path: string,
+  issues: string[]
+): void {
+  const record = strictRecord(
+    value,
+    path,
+    [
+      "schemaVersion",
+      "sessionId",
+      "runManifestDigest",
+      "workloadDigest",
+      "workloadStorageReceiptDigest",
+      "terminalTickNs",
+      "finalCacheGeneration",
+      "jobCount",
+      "completedJobCount",
+      "failedJobCount",
+      "cancelledJobCount",
+      "jobInventoryDigest",
+      "allJobsTerminal",
+      "processTreeEmpty",
+      "residualProcessCount",
+      "supervisionCleanupStatus",
+      "toolchainReverified",
+      "workloadReverified",
+      "featureCachesEmpty",
+      "receiptDigest"
+    ],
+    issues
+  );
+  if (!record) return;
+  requireLiteral(record.schemaVersion, 1, `${path}.schemaVersion`, issues);
+  requireOpaqueId(record.sessionId, `${path}.sessionId`, issues);
+  requireDigest(record.runManifestDigest, `${path}.runManifestDigest`, issues);
+  requireDigest(record.workloadDigest, `${path}.workloadDigest`, issues);
+  requireDigest(
+    record.workloadStorageReceiptDigest,
+    `${path}.workloadStorageReceiptDigest`,
+    issues
+  );
+  requireDecimalTick(record.terminalTickNs, `${path}.terminalTickNs`, issues);
+  requireNonNegativeSafeInteger(
+    record.finalCacheGeneration,
+    `${path}.finalCacheGeneration`,
+    issues
+  );
+  for (const key of [
+    "jobCount",
+    "completedJobCount",
+    "failedJobCount",
+    "cancelledJobCount"
+  ]) {
+    requireNonNegativeSafeInteger(record[key], `${path}.${key}`, issues);
+  }
+  requireDigest(record.jobInventoryDigest, `${path}.jobInventoryDigest`, issues);
+  requireLiteral(record.allJobsTerminal, true, `${path}.allJobsTerminal`, issues);
+  requireLiteral(record.processTreeEmpty, true, `${path}.processTreeEmpty`, issues);
+  requireLiteral(record.residualProcessCount, 0, `${path}.residualProcessCount`, issues);
+  requireLiteral(
+    record.supervisionCleanupStatus,
+    "clean",
+    `${path}.supervisionCleanupStatus`,
+    issues
+  );
+  requireLiteral(record.toolchainReverified, true, `${path}.toolchainReverified`, issues);
+  requireLiteral(record.workloadReverified, true, `${path}.workloadReverified`, issues);
+  requireLiteral(record.featureCachesEmpty, true, `${path}.featureCachesEmpty`, issues);
+  requireDigest(record.receiptDigest, `${path}.receiptDigest`, issues);
 }
 
 function validatePreflight(value: unknown, issues: string[]): void {
@@ -1923,6 +2140,28 @@ function omitWorkloadStorageReceiptDigest(
   return value;
 }
 
+function omitTerminalCleanupReceiptDigest(
+  receipt: C137PerformanceTerminalCleanupReceiptV1
+): Omit<C137PerformanceTerminalCleanupReceiptV1, "receiptDigest"> {
+  const { receiptDigest, ...value } = receipt;
+  void receiptDigest;
+  return value;
+}
+
+function requireTerminalTelemetryEndTick(
+  telemetry: C137PerformanceNativeTelemetryV2,
+  jobId: string
+): string {
+  if (
+    telemetry.endTickNs === null ||
+    !telemetry.memory.processTreeEmptyAtTerminal ||
+    telemetry.memory.residualProcessCount !== 0
+  ) {
+    throw new Error(`terminal cleanup inventory 的 job ${jobId} 缺少可信终态。`);
+  }
+  return telemetry.endTickNs;
+}
+
 function cacheMissCounts(cache: C137PerformanceCacheTelemetryV1): number[] {
   return [cache.audioFeatures.misses, cache.landmarks.misses, cache.visualFeatures.misses];
 }
@@ -1955,6 +2194,10 @@ function compareDecimalTicks(left: string, right: string): number {
   const leftTick = BigInt(left);
   const rightTick = BigInt(right);
   return leftTick < rightTick ? -1 : leftTick > rightTick ? 1 : 0;
+}
+
+function compareAscii(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function strictRecord(value: unknown, path: string, keys: readonly string[], issues: string[]): Record<string, unknown> | null {

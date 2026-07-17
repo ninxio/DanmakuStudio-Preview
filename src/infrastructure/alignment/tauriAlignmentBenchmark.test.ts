@@ -62,7 +62,7 @@ describe("C137 原生性能采集 bridge", () => {
         return Promise.resolve(job);
       }
       if (command === "finish_alignment_benchmark_session") {
-        return Promise.resolve({ ...session, status: "released" });
+        return Promise.resolve(createReleasedSession(session));
       }
       throw new Error(`unexpected ${command}`);
     });
@@ -606,6 +606,35 @@ describe("C137 原生性能采集 bridge", () => {
     expect(isAlignmentBenchmarkJobFinished("cancelled")).toBe(true);
   });
 
+  it.each([
+    ["missing receipt", (released: AlignmentBenchmarkSessionSnapshot) => ({
+      ...released,
+      terminalCleanupReceipt: null
+    })],
+    ["stale receipt digest", (released: AlignmentBenchmarkSessionSnapshot) => ({
+      ...released,
+      terminalCleanupReceipt: released.terminalCleanupReceipt === null
+        ? null
+        : { ...released.terminalCleanupReceipt, receiptDigest: `sha256:${"9".repeat(64)}` }
+    })],
+    ["wrong session binding", (released: AlignmentBenchmarkSessionSnapshot) => ({
+      ...released,
+      terminalCleanupReceipt: released.terminalCleanupReceipt === null
+        ? null
+        : { ...released.terminalCleanupReceipt, sessionId: "benchmark-session-forged" }
+    })]
+  ] as const)("released session fail-closed rejects %s", async (_label, mutate) => {
+    const session = createSession();
+    const response = mutate(createReleasedSession(session));
+    const invoker = createInvoker({
+      finish: () => Promise.resolve(unsafeNativeResponse<AlignmentBenchmarkSessionSnapshot>(response))
+    });
+
+    await expect(finishAlignmentBenchmarkSession(session.sessionId, invoker)).rejects.toThrow(
+      "未得到可信终态"
+    );
+  });
+
   it("深层拒绝伪造环境、非规范 ID/tick、越界数组和不可信摘要，且错误保持去敏", async () => {
     const session = createSession();
     const secret = "D:\\private\\secret-ffmpeg.exe";
@@ -957,7 +986,7 @@ function createInvoker(
     startJob: () => Promise.resolve(job),
     getJob: () => Promise.resolve(job),
     cancelJob: () => Promise.resolve(job),
-    finish: () => Promise.resolve({ ...session, status: "released" }),
+    finish: () => Promise.resolve(createReleasedSession(session)),
     ...overrides
   };
 }
@@ -1057,7 +1086,50 @@ function createSession(
       ffprobe: { version: "ffprobe 7", binaryDigest: `sha256:${"b".repeat(64)}` }
     },
     activeJobId: null,
-    cleanupIssue: null
+    cleanupIssue: null,
+    terminalCleanupReceipt: null
+  };
+}
+
+function createReleasedSession(
+  session: AlignmentBenchmarkSessionSnapshot
+): AlignmentBenchmarkSessionSnapshot {
+  const storage = session.environment.workloadStorage;
+  const jobs: never[] = [];
+  const withoutReceiptDigest = {
+    schemaVersion: 1 as const,
+    sessionId: session.sessionId,
+    runManifestDigest: storage.runManifestDigest,
+    workloadDigest: storage.workloadDigest,
+    workloadStorageReceiptDigest: storage.receiptDigest,
+    terminalTickNs: "1",
+    finalCacheGeneration: session.cacheGeneration,
+    jobCount: 0,
+    completedJobCount: 0,
+    failedJobCount: 0,
+    cancelledJobCount: 0,
+    jobInventoryDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-terminal-job-inventory-v1",
+      jobs
+    }),
+    allJobsTerminal: true as const,
+    processTreeEmpty: true as const,
+    residualProcessCount: 0 as const,
+    supervisionCleanupStatus: "clean" as const,
+    toolchainReverified: true as const,
+    workloadReverified: true as const,
+    featureCachesEmpty: true as const
+  };
+  return {
+    ...session,
+    status: "released",
+    terminalCleanupReceipt: {
+      ...withoutReceiptDigest,
+      receiptDigest: computeC137CanonicalDigest({
+        domain: "c137-performance-terminal-cleanup-receipt-v1",
+        receipt: withoutReceiptDigest
+      })
+    }
   };
 }
 

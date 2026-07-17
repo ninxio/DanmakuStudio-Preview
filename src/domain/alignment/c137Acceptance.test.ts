@@ -12,9 +12,13 @@ import {
   computeC137PerformanceEnvironmentDigestV2,
   computeC137PerformanceEvidenceDigest,
   computeC137PerformanceEvidenceDigestV2,
+  computeC137PerformanceTerminalCleanupJobInventoryDigest,
+  computeC137PerformanceTerminalCleanupReceiptDigest,
   computeC137PerformanceWorkloadStorageReceiptDigest,
   createC137PerformancePlanDigest,
-  type C137PerformanceRawEvidenceV2
+  projectC137PerformanceTerminalCleanupJobInventory,
+  type C137PerformanceRawEvidenceV2,
+  type C137PerformanceTerminalCleanupReceiptV1
 } from "./c137PerformanceEvidence";
 import {
   C137_BLIND_GLOBAL_AGGREGATION_CONTRACT,
@@ -397,7 +401,7 @@ describe("C137 fail-closed acceptance gate", () => {
     );
   });
 
-  it("raw v2 即使改写为 Job、完整绑定存储、自摘要和自建信任上下文，仍缺三项原生正式 receipt", () => {
+  it("raw v2 即使改写为 Job、完整绑定存储、自摘要和自建信任上下文，缺少正式 receipt 仍 fail closed", () => {
     const bundle = createCompleteV2Bundle();
     const raw = bundle.reports.performance!.rawEvidence;
     if (raw.schemaVersion !== 2) throw new Error("expected raw evidence v2");
@@ -417,12 +421,39 @@ describe("C137 fail-closed acceptance gate", () => {
     expect(storageCheck?.requirement).toContain("结构完整");
     expect(storageCheck?.requirement).toContain("native attestation");
     expect(storageCheck?.requirement).not.toContain("原生 v2 生成");
-    for (const id of ["job-memory-receipt", "terminal-cleanup-receipt", "native-attestation"]) {
+    for (const id of ["job-memory-receipt", "native-attestation"]) {
       expect(gate.checks.find((check) => check.id === id)).toMatchObject({
         status: "incomplete",
         actual: "not-verifiable-in-schema-v2"
       });
     }
+    expect(gate.checks.find((check) => check.id === "terminal-cleanup-receipt")).toMatchObject({
+      status: "incomplete",
+      actual: "missing-or-invalid"
+    });
+  });
+
+  it("严格绑定的 terminal cleanup receipt 单项通过，但不能替代 Job memory 与 native attestation", () => {
+    const bundle = createCompleteV2Bundle();
+    const raw = bundle.reports.performance!.rawEvidence;
+    if (raw.schemaVersion !== 2) throw new Error("expected raw evidence v2");
+    attachTerminalCleanupReceipt(raw);
+    refreshReportEvidenceDigests(bundle);
+
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    expect(gate.checks.find((check) => check.id === "terminal-cleanup-receipt")).toMatchObject({
+      status: "pass",
+      actual: raw.assurance.terminalCleanupReceipt?.receiptDigest
+    });
+    expect(gate.checks.find((check) => check.id === "job-memory-receipt")?.status).toBe(
+      "incomplete"
+    );
+    expect(gate.checks.find((check) => check.id === "native-attestation")?.status).toBe(
+      "incomplete"
+    );
+    expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
   });
 
   it("另一工作负载的 raw v2 即使完整闭环重签也不能绑定当前冻结集", () => {
@@ -1375,6 +1406,40 @@ function relationshipDecision(
       : [distractors[0], goldCandidateId, ...distractors.slice(1)],
     verifiedCandidateId: null
   };
+}
+
+function attachTerminalCleanupReceipt(evidence: C137PerformanceRawEvidenceV2): void {
+  const jobs = projectC137PerformanceTerminalCleanupJobInventory(evidence.trials);
+  const latestTick = jobs.reduce(
+    (maximum, job) => (BigInt(job.endTickNs) > maximum ? BigInt(job.endTickNs) : maximum),
+    0n
+  );
+  const unsigned: Omit<C137PerformanceTerminalCleanupReceiptV1, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: evidence.collector.sessionId,
+    runManifestDigest: evidence.runManifestDigest,
+    workloadDigest: evidence.plan.workloadDigest,
+    workloadStorageReceiptDigest: evidence.environment.workloadStorage.receiptDigest,
+    terminalTickNs: String(latestTick + 1n),
+    finalCacheGeneration: 3,
+    jobCount: jobs.length,
+    completedJobCount: jobs.filter((job) => job.status === "completed").length,
+    failedJobCount: jobs.filter((job) => job.status === "failed").length,
+    cancelledJobCount: jobs.filter((job) => job.status === "cancelled").length,
+    jobInventoryDigest: computeC137PerformanceTerminalCleanupJobInventoryDigest(jobs),
+    allJobsTerminal: true,
+    processTreeEmpty: true,
+    residualProcessCount: 0,
+    supervisionCleanupStatus: "clean",
+    toolchainReverified: true,
+    workloadReverified: true,
+    featureCachesEmpty: true
+  };
+  evidence.assurance.terminalCleanupReceipt = {
+    ...unsigned,
+    receiptDigest: computeC137PerformanceTerminalCleanupReceiptDigest(unsigned)
+  };
+  evidence.evidenceDigest = computeC137PerformanceEvidenceDigestV2(evidence);
 }
 
 const REPORT_KEYS: readonly (keyof C137AcceptanceReports)[] = [

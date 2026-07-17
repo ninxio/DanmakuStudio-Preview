@@ -555,6 +555,7 @@ describe("C137 真实媒体 benchmark 面板", () => {
     expect(summary).toHaveTextContent("正式性能验收仍要求 Job Object");
     expect(summary).toHaveTextContent("1.00 GiB");
     expect(summary).toHaveTextContent("1 次 · 最大 100ms");
+    expect(summary).toHaveTextContent("任务收尾：缺少终态清理凭证");
     expect(screen.getByText(/releaseEligible=false/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "下载未审批 raw evidence" }));

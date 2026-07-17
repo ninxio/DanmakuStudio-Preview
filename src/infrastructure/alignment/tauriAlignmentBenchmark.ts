@@ -82,6 +82,29 @@ export interface AlignmentBenchmarkEnvironmentReceipt {
 
 export type AlignmentBenchmarkSessionStatus = "active" | "cleanup-blocked" | "released";
 
+export interface AlignmentBenchmarkTerminalCleanupReceipt {
+  schemaVersion: 1;
+  sessionId: string;
+  runManifestDigest: `sha256:${string}`;
+  workloadDigest: `sha256:${string}`;
+  workloadStorageReceiptDigest: `sha256:${string}`;
+  terminalTickNs: string;
+  finalCacheGeneration: number;
+  jobCount: number;
+  completedJobCount: number;
+  failedJobCount: number;
+  cancelledJobCount: number;
+  jobInventoryDigest: `sha256:${string}`;
+  allJobsTerminal: true;
+  processTreeEmpty: true;
+  residualProcessCount: 0;
+  supervisionCleanupStatus: "clean";
+  toolchainReverified: true;
+  workloadReverified: true;
+  featureCachesEmpty: true;
+  receiptDigest: `sha256:${string}`;
+}
+
 export interface AlignmentBenchmarkSessionSnapshot {
   schemaVersion: typeof ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION;
   sessionId: string;
@@ -93,6 +116,7 @@ export interface AlignmentBenchmarkSessionSnapshot {
   environment: AlignmentBenchmarkEnvironmentReceipt;
   activeJobId: string | null;
   cleanupIssue: string | null;
+  terminalCleanupReceipt: AlignmentBenchmarkTerminalCleanupReceipt | null;
 }
 
 export interface AlignmentBenchmarkCacheCounts {
@@ -691,6 +715,23 @@ const MAX_U128 = 340_282_366_920_938_463_463_374_607_431_768_211_455n;
 
 function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapshot {
   const snapshot = requireRecord(value, "session snapshot");
+  requireExactKeys(
+    snapshot,
+    [
+      "schemaVersion",
+      "sessionId",
+      "status",
+      "sessionOriginTickNs",
+      "cacheGeneration",
+      "memoryScope",
+      "memorySampleIntervalMs",
+      "environment",
+      "activeJobId",
+      "cleanupIssue",
+      "terminalCleanupReceipt"
+    ],
+    "session snapshot"
+  );
   requireSchemaVersion(snapshot.schemaVersion, "session snapshot.schemaVersion");
   const sessionId = requireOpaqueResponseId(snapshot.sessionId, "session snapshot.sessionId");
   const status = requireEnum(snapshot.status, SESSION_STATUSES, "session snapshot.status");
@@ -722,6 +763,10 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
           1,
           MAX_TEXT_LENGTH
         );
+  const terminalCleanupReceipt =
+    snapshot.terminalCleanupReceipt === null
+      ? null
+      : assertTerminalCleanupReceipt(snapshot.terminalCleanupReceipt);
   if (status === "released" && activeJobId !== null) {
     throw new Error("invalid released session active job");
   }
@@ -730,6 +775,24 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
   }
   if (status !== "cleanup-blocked" && cleanupIssue !== null) {
     throw new Error("invalid non-blocked session issue");
+  }
+  if (status === "released" && terminalCleanupReceipt === null) {
+    throw new Error("invalid released session terminal cleanup receipt");
+  }
+  if (status !== "released" && terminalCleanupReceipt !== null) {
+    throw new Error("invalid non-released session terminal cleanup receipt");
+  }
+  if (
+    terminalCleanupReceipt &&
+    (terminalCleanupReceipt.sessionId !== sessionId ||
+      terminalCleanupReceipt.runManifestDigest !==
+        environment.workloadStorage.runManifestDigest ||
+      terminalCleanupReceipt.workloadDigest !== environment.workloadStorage.workloadDigest ||
+      terminalCleanupReceipt.workloadStorageReceiptDigest !==
+        environment.workloadStorage.receiptDigest ||
+      terminalCleanupReceipt.finalCacheGeneration !== cacheGeneration)
+  ) {
+    throw new Error("terminal cleanup receipt 未绑定当前 session/workload/cache generation");
   }
   return {
     schemaVersion: ALIGNMENT_BENCHMARK_NATIVE_SCHEMA_VERSION,
@@ -741,8 +804,132 @@ function assertSessionSnapshot(value: unknown): AlignmentBenchmarkSessionSnapsho
     memorySampleIntervalMs,
     environment,
     activeJobId,
-    cleanupIssue
+    cleanupIssue,
+    terminalCleanupReceipt
   };
+}
+
+function assertTerminalCleanupReceipt(
+  value: unknown
+): AlignmentBenchmarkTerminalCleanupReceipt {
+  const receipt = requireRecord(value, "terminal cleanup receipt");
+  requireExactKeys(
+    receipt,
+    [
+      "schemaVersion",
+      "sessionId",
+      "runManifestDigest",
+      "workloadDigest",
+      "workloadStorageReceiptDigest",
+      "terminalTickNs",
+      "finalCacheGeneration",
+      "jobCount",
+      "completedJobCount",
+      "failedJobCount",
+      "cancelledJobCount",
+      "jobInventoryDigest",
+      "allJobsTerminal",
+      "processTreeEmpty",
+      "residualProcessCount",
+      "supervisionCleanupStatus",
+      "toolchainReverified",
+      "workloadReverified",
+      "featureCachesEmpty",
+      "receiptDigest"
+    ],
+    "terminal cleanup receipt"
+  );
+  if (receipt.schemaVersion !== 1) {
+    throw new Error("invalid terminal cleanup receipt.schemaVersion");
+  }
+  const jobCount = requireBoundedNonNegativeSafeInteger(
+    receipt.jobCount,
+    "terminal cleanup receipt.jobCount",
+    64_000
+  );
+  const completedJobCount = requireBoundedNonNegativeSafeInteger(
+    receipt.completedJobCount,
+    "terminal cleanup receipt.completedJobCount",
+    jobCount
+  );
+  const failedJobCount = requireBoundedNonNegativeSafeInteger(
+    receipt.failedJobCount,
+    "terminal cleanup receipt.failedJobCount",
+    jobCount
+  );
+  const cancelledJobCount = requireBoundedNonNegativeSafeInteger(
+    receipt.cancelledJobCount,
+    "terminal cleanup receipt.cancelledJobCount",
+    jobCount
+  );
+  if (completedJobCount + failedJobCount + cancelledJobCount !== jobCount) {
+    throw new Error("invalid terminal cleanup receipt job counts");
+  }
+  if (
+    receipt.allJobsTerminal !== true ||
+    receipt.processTreeEmpty !== true ||
+    receipt.residualProcessCount !== 0 ||
+    receipt.supervisionCleanupStatus !== "clean" ||
+    receipt.toolchainReverified !== true ||
+    receipt.workloadReverified !== true ||
+    receipt.featureCachesEmpty !== true
+  ) {
+    throw new Error("invalid terminal cleanup receipt completion claims");
+  }
+  const withoutReceiptDigest: Omit<AlignmentBenchmarkTerminalCleanupReceipt, "receiptDigest"> = {
+    schemaVersion: 1,
+    sessionId: requireOpaqueResponseId(
+      receipt.sessionId,
+      "terminal cleanup receipt.sessionId"
+    ),
+    runManifestDigest: requireSha256Digest(
+      receipt.runManifestDigest,
+      "terminal cleanup receipt.runManifestDigest"
+    ),
+    workloadDigest: requireSha256Digest(
+      receipt.workloadDigest,
+      "terminal cleanup receipt.workloadDigest"
+    ),
+    workloadStorageReceiptDigest: requireSha256Digest(
+      receipt.workloadStorageReceiptDigest,
+      "terminal cleanup receipt.workloadStorageReceiptDigest"
+    ),
+    terminalTickNs: requireCanonicalDecimalTick(
+      receipt.terminalTickNs,
+      "terminal cleanup receipt.terminalTickNs"
+    ),
+    finalCacheGeneration: requireNonNegativeSafeInteger(
+      receipt.finalCacheGeneration,
+      "terminal cleanup receipt.finalCacheGeneration"
+    ),
+    jobCount,
+    completedJobCount,
+    failedJobCount,
+    cancelledJobCount,
+    jobInventoryDigest: requireSha256Digest(
+      receipt.jobInventoryDigest,
+      "terminal cleanup receipt.jobInventoryDigest"
+    ),
+    allJobsTerminal: true,
+    processTreeEmpty: true,
+    residualProcessCount: 0,
+    supervisionCleanupStatus: "clean",
+    toolchainReverified: true,
+    workloadReverified: true,
+    featureCachesEmpty: true
+  };
+  const receiptDigest = requireSha256Digest(
+    receipt.receiptDigest,
+    "terminal cleanup receipt.receiptDigest"
+  );
+  const expectedReceiptDigest = `sha256:${sha256Hex(canonicalJson({
+    domain: "c137-performance-terminal-cleanup-receipt-v1",
+    receipt: withoutReceiptDigest
+  }))}`;
+  if (receiptDigest !== expectedReceiptDigest) {
+    throw new Error("invalid terminal cleanup receipt.receiptDigest binding");
+  }
+  return { ...withoutReceiptDigest, receiptDigest };
 }
 
 function assertEnvironmentReceipt(value: unknown): AlignmentBenchmarkEnvironmentReceipt {

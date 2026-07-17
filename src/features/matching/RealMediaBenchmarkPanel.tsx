@@ -621,6 +621,8 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
   const hot = measured.filter((run) => run.runKind === "hot");
   const peaks = measured.map(getC137PerformancePeakRss).filter((value) => value !== null);
   const cancellations = evidence.trials.filter((trial) => trial.trialType === "cancellation");
+  const terminalCleanupReceipt =
+    evidence.schemaVersion === 2 ? evidence.assurance.terminalCleanupReceipt : null;
   return (
     <section
       className="grid gap-2 rounded border border-panel-line/70 bg-black/20 p-2"
@@ -692,6 +694,14 @@ function PerformanceEvidenceSummary({ evidence }: { evidence: C137PerformanceRaw
             {cancellations.length > 0
               ? ` · 最大 ${Math.max(...cancellations.map((trial) => trial.latencyMs)).toFixed(0)}ms`
               : ""}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline text-slate-500">任务收尾：</dt>
+          <dd className="inline">
+            {terminalCleanupReceipt
+              ? `已闭合 · ${terminalCleanupReceipt.jobCount} 个原生作业`
+              : "缺少终态清理凭证"}
           </dd>
         </div>
       </dl>

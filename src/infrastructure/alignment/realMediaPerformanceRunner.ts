@@ -207,6 +207,7 @@ export interface RealMediaPerformanceCollectionJournal {
   cacheResets: AlignmentBenchmarkCacheResetReceipt[];
   trials: RealMediaPerformanceTrialEvidence[];
   terminalSessionStatus: AlignmentBenchmarkSessionSnapshot["status"] | null;
+  terminalSession: AlignmentBenchmarkSessionSnapshot | null;
   failure: SafeAlignmentFailureDisclosure | null;
   issueCodes: string[];
 }
@@ -316,6 +317,11 @@ export function createC137PerformanceRawEvidenceFromJournal(
       workloadStorageReceiptDigest: environment.workloadStorage.receiptDigest
     },
     preflight: structuredClone(journal.preflight),
+    terminalCleanupReceipt:
+      journal.terminalSession?.terminalCleanupReceipt === null ||
+      journal.terminalSession?.terminalCleanupReceipt === undefined
+        ? null
+        : structuredClone(journal.terminalSession.terminalCleanupReceipt),
     status: toRawEvidenceStatus(journal.status),
     issueCodes: [...journal.issueCodes]
   });
@@ -419,6 +425,7 @@ export async function collectRealMediaPerformanceEvidence(
     cacheResets: [],
     trials: [],
     terminalSessionStatus: null,
+    terminalSession: null,
     failure: null,
     issueCodes: []
   };
@@ -651,6 +658,7 @@ export async function collectRealMediaPerformanceEvidence(
           executionOptions.benchmarkInvoker
         );
         journal.terminalSessionStatus = terminalSession.status;
+        journal.terminalSession = cloneSessionSnapshot(terminalSession);
         if (terminalSession.status === "cleanup-blocked") {
           journal.status = "cleanup-blocked";
           journal.issueCodes.push("cleanup-blocked");

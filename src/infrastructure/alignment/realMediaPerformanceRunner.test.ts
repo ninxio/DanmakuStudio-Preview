@@ -24,7 +24,8 @@ import type {
   AlignmentBenchmarkInvoker,
   AlignmentBenchmarkJobSnapshot,
   AlignmentBenchmarkSessionRequest,
-  AlignmentBenchmarkSessionSnapshot
+  AlignmentBenchmarkSessionSnapshot,
+  AlignmentBenchmarkWorkloadStorageReceipt
 } from "./tauriAlignmentBenchmark";
 import type { NormalizedTauriAudioAlignmentRequest } from "./tauriAudioAlignment";
 
@@ -724,14 +725,17 @@ function createSuccessfulInvoker(
 ): AlignmentBenchmarkInvoker {
   let generation = 0;
   let jobSequence = 0;
+  let session = createSession();
   const cancelledJobs = new Set<string>();
+  const terminalJobs = new Map<string, AlignmentBenchmarkJobSnapshot>();
   const invoker: AlignmentBenchmarkInvoker = {
     begin: vi.fn((request: AlignmentBenchmarkSessionRequest) => {
       events.push("begin");
       const parsed = JSON.parse(request.runManifestCanonicalJson) as { cases: unknown[] };
-      return Promise.resolve(createSession(request.workloadDigest, parsed.cases.length));
+      session = createSession(request.workloadDigest, parsed.cases.length);
+      return Promise.resolve(session);
     }),
-    getActive: vi.fn(() => Promise.resolve(createSession())),
+    getActive: vi.fn(() => Promise.resolve(session)),
     resetCaches: vi.fn(
       (sessionId: string): Promise<AlignmentBenchmarkCacheResetReceipt> => {
       generation += 1;
@@ -769,8 +773,7 @@ function createSuccessfulInvoker(
       const sequence = Number(jobId.split("-").at(-1));
       events.push(`get:${sequence}`);
       if (cancelledJobs.has(jobId)) {
-        return Promise.resolve(
-          createJobSnapshot(
+        const snapshot = createJobSnapshot(
             sessionId,
             sequence,
             "cancelled",
@@ -778,19 +781,20 @@ function createSuccessfulInvoker(
             generation,
             null,
             true
-          )
-        );
+          );
+        terminalJobs.set(jobId, snapshot);
+        return Promise.resolve(snapshot);
       }
-      return Promise.resolve(
-        createJobSnapshot(
+      const snapshot = createJobSnapshot(
           sessionId,
           sequence,
           "completed",
           "completed",
           generation,
           createProposal(manifest)
-        )
-      );
+        );
+      terminalJobs.set(jobId, snapshot);
+      return Promise.resolve(snapshot);
     }),
     cancelJob: vi.fn((sessionId: string, jobId: string) => {
       const sequence = Number(jobId.split("-").at(-1));
@@ -811,9 +815,16 @@ function createSuccessfulInvoker(
     finish: vi.fn((sessionId: string): Promise<AlignmentBenchmarkSessionSnapshot> => {
       events.push("finish");
       return Promise.resolve({
-        ...createSession(),
+        ...session,
         sessionId,
-        status: "released" as const
+        status: "released" as const,
+        cacheGeneration: generation,
+        terminalCleanupReceipt: createTerminalCleanupReceipt(
+          session.environment.workloadStorage,
+          sessionId,
+          generation,
+          [...terminalJobs.values()]
+        )
       });
     })
   };
@@ -852,7 +863,8 @@ function createSession(
       ffprobe: { version: "ffprobe 7", binaryDigest: `sha256:${"b".repeat(64)}` }
     },
     activeJobId: null,
-    cleanupIssue: null
+    cleanupIssue: null,
+    terminalCleanupReceipt: null
   };
 }
 
@@ -888,6 +900,68 @@ function createWorkloadStorageReceipt(
   return {
     ...withoutReceiptDigest,
     receiptDigest: computeC137CanonicalDigest(withoutReceiptDigest)
+  };
+}
+
+function createTerminalCleanupReceipt(
+  storage: AlignmentBenchmarkWorkloadStorageReceipt,
+  sessionId: string,
+  finalCacheGeneration: number,
+  snapshots: AlignmentBenchmarkJobSnapshot[]
+): NonNullable<AlignmentBenchmarkSessionSnapshot["terminalCleanupReceipt"]> {
+  const jobs = snapshots
+    .map((snapshot) => {
+      if (
+        (snapshot.status !== "completed" &&
+          snapshot.status !== "failed" &&
+          snapshot.status !== "cancelled") ||
+        snapshot.telemetry.endTickNs === null
+      ) {
+        throw new Error("terminal cleanup 测试夹具含非终态 job");
+      }
+      return {
+        jobId: snapshot.jobId,
+        status: snapshot.status,
+        endTickNs: snapshot.telemetry.endTickNs,
+        processTreeEmptyAtTerminal: true as const,
+        residualProcessCount: 0 as const
+      };
+    })
+    .sort((left, right) => left.jobId.localeCompare(right.jobId));
+  const terminalTick = jobs.reduce(
+    (maximum, job) => (BigInt(job.endTickNs) > maximum ? BigInt(job.endTickNs) : maximum),
+    0n
+  );
+  const withoutReceiptDigest = {
+    schemaVersion: 1 as const,
+    sessionId,
+    runManifestDigest: storage.runManifestDigest,
+    workloadDigest: storage.workloadDigest,
+    workloadStorageReceiptDigest: storage.receiptDigest,
+    terminalTickNs: (terminalTick + 1n).toString(),
+    finalCacheGeneration,
+    jobCount: jobs.length,
+    completedJobCount: jobs.filter((job) => job.status === "completed").length,
+    failedJobCount: jobs.filter((job) => job.status === "failed").length,
+    cancelledJobCount: jobs.filter((job) => job.status === "cancelled").length,
+    jobInventoryDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-terminal-job-inventory-v1",
+      jobs
+    }),
+    allJobsTerminal: true as const,
+    processTreeEmpty: true as const,
+    residualProcessCount: 0 as const,
+    supervisionCleanupStatus: "clean" as const,
+    toolchainReverified: true as const,
+    workloadReverified: true as const,
+    featureCachesEmpty: true as const
+  };
+  return {
+    ...withoutReceiptDigest,
+    receiptDigest: computeC137CanonicalDigest({
+      domain: "c137-performance-terminal-cleanup-receipt-v1",
+      receipt: withoutReceiptDigest
+    })
   };
 }
 
