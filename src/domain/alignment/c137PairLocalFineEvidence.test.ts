@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createC137FormalBlindProvenanceFixture } from "../../test/c137FormalBlindProvenance";
 import {
+  c137RelationshipModalitiesEqualPairLocalEvidence,
   c137TimeMapCasesEqualPairLocalEvidence,
   deriveC137PairLocalFineEvidence,
   deriveC137TimeMapCasesFromPairLocalFineEvidence
@@ -17,6 +18,13 @@ describe("C137 pair-local fine evidence", () => {
     expect(evidence.cases.every((item) => item.frontierResolutionProven)).toBe(true);
     expect(evidence.cases.every((item) => item.selectedSourceWindow !== null)).toBe(true);
     expect(evidence.cases.every((item) => item.selectedTargetWindow !== null)).toBe(true);
+    expect(evidence.cases.every((item) => item.modality?.modality === "same-audio")).toBe(true);
+    expect(
+      c137RelationshipModalitiesEqualPairLocalEvidence(
+        evidence.cases.map((item) => ({ caseId: item.caseId, modality: "same-audio" })),
+        evidence
+      )
+    ).toBe(true);
     expect(
       evidence.cases.every((item) =>
         item.timeMap?.matchedProjectionErrorsMs.every((errorMs) => errorMs === 0)
@@ -24,14 +32,33 @@ describe("C137 pair-local fine evidence", () => {
     ).toBe(true);
   });
 
+  it("relationship modality 必须逐 case 等于 native TimeMap 锚点与实际流身份", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const evidence = deriveC137PairLocalFineEvidence(fixture.provenance);
+    const claimed: Array<{
+      caseId: string;
+      modality: "same-audio" | "visual-only" | "mixed" | "no-common-content";
+    }> = evidence.cases.map((item) => ({
+      caseId: item.caseId,
+      modality: "same-audio"
+    }));
+
+    expect(c137RelationshipModalitiesEqualPairLocalEvidence(claimed, evidence)).toBe(true);
+    claimed[0].modality = "visual-only";
+    expect(c137RelationshipModalitiesEqualPairLocalEvidence(claimed, evidence)).toBe(false);
+    claimed[0].modality = "same-audio";
+    claimed[1].caseId = claimed[0].caseId;
+    expect(c137RelationshipModalitiesEqualPairLocalEvidence(claimed, evidence)).toBe(false);
+  });
+
   it("从 receipt 的完整候选清单逐 pair 精确统计，不再以 component 总数推测", () => {
     const fixture = createC137FormalBlindProvenanceFixture();
 
     const evidence = deriveC137PairLocalFineEvidence(fixture.provenance);
 
-    expect(
-      evidence.cases.every((item) => item.completePairCandidateInventoryEnumerated)
-    ).toBe(true);
+    expect(evidence.cases.every((item) => item.completePairCandidateInventoryEnumerated)).toBe(
+      true
+    );
     expect(evidence.cases.every((item) => item.pairCandidateCount === 1)).toBe(true);
     expect(evidence.cases.every((item) => !item.samePairAlternativeObserved)).toBe(true);
   });

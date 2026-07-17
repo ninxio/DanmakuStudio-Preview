@@ -21,12 +21,25 @@ import type {
 import { mapSourceTime, type TimeMapSpan } from "./timeMap";
 import { sha256Hex } from "../shared/sha256";
 
-export const C137_PAIR_LOCAL_FINE_EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const C137_PAIR_LOCAL_FINE_EVIDENCE_SCHEMA_VERSION = 2 as const;
 
-const EVIDENCE_DIGEST_DOMAIN = "c137-pair-local-fine-evidence-v1";
+const EVIDENCE_DIGEST_DOMAIN = "c137-pair-local-fine-evidence-v2";
 
 type C137PairLocalDigest = `sha256:${string}`;
 export type C137PairLocalEditKind = "sourceOnly" | "targetOnly" | "replacement";
+export type C137NativeModality = "same-audio" | "visual-only" | "mixed" | "no-common-content";
+
+export interface C137PairLocalModalityEvidence {
+  modality: C137NativeModality;
+  evidenceTypes: Array<"audio" | "visual">;
+  audioAnchorCount: number;
+  visualAnchorCount: number;
+  sourceAudioStreamIndex: number | null;
+  targetAudioStreamIndex: number | null;
+  sourceVisualStreamIndex: number | null;
+  targetVisualStreamIndex: number | null;
+  fineScoreMicros: number;
+}
 
 export interface C137PairLocalBoundaryErrors {
   sourceStartMs: number;
@@ -81,6 +94,7 @@ export interface C137PairLocalFineCaseEvidence {
   selectedGroupMemberCount: number;
   sameSegmentManyToManyObserved: boolean;
   frontierResolutionProven: boolean;
+  modality: C137PairLocalModalityEvidence | null;
   timeMap: C137PairLocalTimeMapCaseEvidence | null;
   issues: string[];
 }
@@ -177,6 +191,30 @@ export function c137TimeMapCasesEqualPairLocalEvidence(
   );
 }
 
+export function c137RelationshipModalitiesEqualPairLocalEvidence(
+  actual: readonly { caseId: string; modality: C137NativeModality }[],
+  evidence: C137PairLocalFineEvidence
+): boolean {
+  if (
+    actual.length !== evidence.cases.length ||
+    evidence.cases.some((item) => item.status !== "measured" || item.modality === null)
+  ) {
+    return false;
+  }
+  const expectedByCaseId = new Map(
+    evidence.cases.map((item) => [item.caseId, item.modality?.modality] as const)
+  );
+  if (expectedByCaseId.size !== evidence.cases.length) return false;
+  const seen = new Set<string>();
+  for (const item of actual) {
+    if (seen.has(item.caseId) || expectedByCaseId.get(item.caseId) !== item.modality) {
+      return false;
+    }
+    seen.add(item.caseId);
+  }
+  return seen.size === expectedByCaseId.size;
+}
+
 function deriveCaseEvidence(
   provenance: C137FormalBlindProvenanceV3,
   benchmarkCase: RealMediaBenchmarkCase
@@ -221,6 +259,7 @@ function deriveCaseEvidence(
   if (execution.candidateId.pairOrdinal !== outcome.pairOrdinal) {
     issues.push("fine execution candidate 未绑定当前 pairOrdinal。");
   }
+  const modality = deriveNativeModality(proposal, execution, issues);
 
   const timeMap = deriveTimeMapCase(benchmarkCase, proposal.spans);
   if (timeMap.matchedProjectionErrorsMs.length !== benchmarkCase.gold.matchedAnchors.length) {
@@ -249,6 +288,7 @@ function deriveCaseEvidence(
     selectedGroupMemberCount: execution.groupMemberRanks.length,
     sameSegmentManyToManyObserved: execution.groupMemberRanks.length >= 2,
     frontierResolutionProven,
+    modality,
     timeMap,
     issues
   };
@@ -271,8 +311,64 @@ function blockedCase(caseId: string, issues: string[]): C137PairLocalFineCaseEvi
     selectedGroupMemberCount: 0,
     sameSegmentManyToManyObserved: false,
     frontierResolutionProven: false,
+    modality: null,
     timeMap: null,
     issues: [...issues]
+  };
+}
+
+function deriveNativeModality(
+  proposal: NonNullable<RealMediaBlindBatchPairOutcome["proposalTimeMap"]>,
+  execution: NonNullable<RealMediaBlindBatchPairOutcome["fineExecutionEvidence"]>,
+  issues: string[]
+): C137PairLocalModalityEvidence | null {
+  const evidenceTypes = proposal.evidence.types.filter(
+    (type): type is "audio" | "visual" => type === "audio" || type === "visual"
+  );
+  const uniqueTypes = [...new Set(evidenceTypes)];
+  const audioUsed = proposal.evidence.audioAnchorCount > 0;
+  const visualUsed = proposal.evidence.visualAnchorCount > 0;
+  if (audioUsed !== uniqueTypes.includes("audio")) {
+    issues.push("native TimeMap 的 audio evidence type 与 audioAnchorCount 不一致。");
+  }
+  if (visualUsed !== uniqueTypes.includes("visual")) {
+    issues.push("native TimeMap 的 visual evidence type 与 visualAnchorCount 不一致。");
+  }
+  if (
+    audioUsed &&
+    (proposal.sourceStream?.type !== "audio" ||
+      proposal.targetStream?.type !== "audio" ||
+      proposal.sourceStream.index !== execution.sourceStreamIndex ||
+      proposal.targetStream.index !== execution.targetStreamIndex)
+  ) {
+    issues.push("native audio modality 未绑定 fine execution 实际使用的双端音轨。");
+  }
+  if (
+    visualUsed &&
+    (proposal.sourceVisualStream?.type !== "video" ||
+      proposal.targetVisualStream?.type !== "video")
+  ) {
+    issues.push("native visual modality 缺少双端实际视频流身份。");
+  }
+  if (proposal.quality.level === "blocked") {
+    issues.push("native TimeMap 已因证据冲突或不足被 blocked，不能发布 modality。");
+  }
+  if (!audioUsed && !visualUsed) {
+    issues.push(
+      "native TimeMap 没有可用的 audio/visual 锚点；不能把成功候选事后标为 no-common-content。"
+    );
+    return null;
+  }
+  return {
+    modality: audioUsed ? (visualUsed ? "mixed" : "same-audio") : "visual-only",
+    evidenceTypes: uniqueTypes,
+    audioAnchorCount: proposal.evidence.audioAnchorCount,
+    visualAnchorCount: proposal.evidence.visualAnchorCount,
+    sourceAudioStreamIndex: audioUsed ? (proposal.sourceStream?.index ?? null) : null,
+    targetAudioStreamIndex: audioUsed ? (proposal.targetStream?.index ?? null) : null,
+    sourceVisualStreamIndex: visualUsed ? (proposal.sourceVisualStream?.index ?? null) : null,
+    targetVisualStreamIndex: visualUsed ? (proposal.targetVisualStream?.index ?? null) : null,
+    fineScoreMicros: execution.scoreMicros
   };
 }
 

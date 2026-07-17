@@ -173,6 +173,9 @@ describe("C137 fail-closed acceptance gate", () => {
       gate.checks.find((check) => check.id === "native-pair-local-time-map-binding")
     ).toMatchObject({ status: "pass" });
     expect(
+      gate.checks.find((check) => check.id === "native-blind-modality-provenance")
+    ).toMatchObject({ status: "pass" });
+    expect(
       gate.checks.find((check) => check.id === "native-pair-local-window-inventory")
     ).toMatchObject({ status: "incomplete" });
     for (const id of [
@@ -190,6 +193,24 @@ describe("C137 fail-closed acceptance gate", () => {
       });
     }
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
+  it("调用方修改 modality 并重签 report 也不能越过 native pair-local 推导", () => {
+    const fixture = createC137FormalBlindProvenanceFixture();
+    const bundle = createCompleteBundle();
+    bindFormalBlindProvenanceFixture(bundle, fixture);
+    bundle.reports.relationshipRanking!.decisions[0].modality = "visual-only";
+    refreshReportEvidenceDigests(bundle);
+
+    expect(validateC137AcceptanceBundle(bundle)).toEqual({ valid: true, issues: [] });
+    const gate = evaluateC137AcceptanceBundle(bundle, createTrustContext(bundle));
+
+    expect(
+      gate.checks.find((check) => check.id === "native-blind-modality-provenance")
+    ).toMatchObject({
+      status: "incomplete",
+      actual: "report-mismatch-or-native-modality-blocked"
+    });
   });
 
   it("调用方修改 TimeMap 误差并重签 report 也不能越过 pair-local frozen Gold 重算", () => {

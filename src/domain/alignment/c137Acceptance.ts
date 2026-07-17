@@ -27,6 +27,7 @@ import {
   REAL_MEDIA_BLIND_BATCH_RECEIPT_SCHEMA_VERSION
 } from "./realMediaBlindBatchContract";
 import {
+  c137RelationshipModalitiesEqualPairLocalEvidence,
   c137TimeMapCasesEqualPairLocalEvidence,
   deriveC137PairLocalFineEvidence
 } from "./c137PairLocalFineEvidence";
@@ -760,6 +761,12 @@ function evaluatePairLocalFineEvidence(bundle: C137AcceptanceBundle): C137Accept
         "incomplete",
         "missing-private-provenance",
         "编辑事件必须从 frozen Gold 与 proposal TimeMap 推导 source/target 双轴起止边界误差"
+      ),
+      createCheck(
+        "native-blind-modality-provenance",
+        "incomplete",
+        "missing-private-provenance",
+        "relationship modality 必须从同一 native gold pair 的实际音频/视觉锚点与双端流身份唯一推导"
       )
     ];
   }
@@ -800,6 +807,16 @@ function evaluatePairLocalFineEvidence(bundle: C137AcceptanceBundle): C137Accept
     );
     const bilateralComplete =
       allMeasured && pairedDecisionCount > 0 && bilateralDecisionCount === pairedDecisionCount;
+    const modalityBound =
+      allMeasured &&
+      bundle.reports.relationshipRanking !== null &&
+      c137RelationshipModalitiesEqualPairLocalEvidence(
+        bundle.reports.relationshipRanking.decisions.map((decision) => ({
+          caseId: decision.caseId,
+          modality: decision.modality
+        })),
+        evidence
+      );
     const blockedSummary = evidence.cases
       .filter((item) => item.status === "blocked")
       .map((item) => `${item.caseId}:${item.issues.join("/")}`)
@@ -836,6 +853,12 @@ function evaluatePairLocalFineEvidence(bundle: C137AcceptanceBundle): C137Accept
         bilateralComplete ? "pass" : "incomplete",
         `${bilateralDecisionCount}/${pairedDecisionCount}`,
         "所有配对编辑事件都必须保存由 Gold/TimeMap 重算的 sourceStart/sourceEnd/targetStart/targetEnd 四个绝对误差；无编辑样本不能通过"
+      ),
+      createCheck(
+        "native-blind-modality-provenance",
+        modalityBound ? "pass" : "incomplete",
+        modalityBound ? evidence.evidenceDigest : "report-mismatch-or-native-modality-blocked",
+        "same-audio/visual-only/mixed 必须逐 case 等于 native TimeMap 的实际锚点类型、双端流身份与 fine execution；调用方不能事后改写"
       )
     ];
   } catch (error: unknown) {
@@ -852,6 +875,12 @@ function evaluatePairLocalFineEvidence(bundle: C137AcceptanceBundle): C137Accept
         "incomplete",
         "derivation-failed",
         "TimeMap 报告不得绕过 pair-local frozen Gold 重算"
+      ),
+      createCheck(
+        "native-blind-modality-provenance",
+        "incomplete",
+        "derivation-failed",
+        "modality 不得绕过 native pair-local evidence 推导"
       )
     ];
   }
@@ -1121,12 +1150,6 @@ function createPendingBlindAuthorityChecks(actual: string): C137AcceptanceCheck[
       "incomplete",
       actual,
       "必须由有状态 authority ledger 原子登记 challenge、native job、receipt 与 provenance root，拒绝跨 bundle 重放"
-    ),
-    createCheck(
-      "native-blind-modality-provenance",
-      "incomplete",
-      "not-represented-in-frozen-gold-v1",
-      "same-audio/visual/mixed modality 必须进入冻结审批数据后才能作为准确率分母，禁止调用方事后改写"
     ),
     createCheck(
       "native-blind-calibration-provenance",
