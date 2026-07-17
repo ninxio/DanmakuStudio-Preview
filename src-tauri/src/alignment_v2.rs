@@ -22,6 +22,17 @@ pub const AFFINE_COARSE_MAX_MODEL_SEEDS: usize = 768;
 const MAX_MODEL_SEEDS: usize = AFFINE_COARSE_MAX_MODEL_SEEDS;
 const MAX_OBSERVATIONS: usize = 40_000;
 pub(crate) const AFFINE_HOLDOUT_TIME_BLOCK_MS: i64 = 1_000;
+// Long-form media can contain only a few dozen collision-resistant landmark correspondences over
+// thousands of one-second blocks. A 32-block cap frequently sampled no true correspondence at
+// all, then exposed only distant same-hash collisions as "held-out anchors". Keep the pre-fit,
+// deterministic 20% partition but allow enough uniformly distributed blocks to intersect sparse
+// real support on media up to roughly 90 minutes.
+const MAX_AFFINE_HOLDOUT_TIME_BLOCKS: usize = 1_024;
+const AFFINE_HOLDOUT_CONSENSUS_TIME_BUCKET_MS: i64 = 5_000;
+const AFFINE_HOLDOUT_CONSENSUS_TIME_RADIUS_BUCKETS: i64 = 2;
+const AFFINE_HOLDOUT_CONSENSUS_OFFSET_QUANTUM_MS: i64 = 250;
+const AFFINE_HOLDOUT_CONSENSUS_EVIDENCE_TIME_QUANTUM_MS: i64 = 1_000;
+const AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT: usize = 3;
 const MAX_STREAMING_HASH_OCCURRENCES_PER_FAMILY: usize = 16_384;
 const MAX_STREAMING_RETAINED_LANDMARKS: usize = 262_144;
 const MAX_STREAMING_WINDOW_SAMPLES: usize = 65_536;
@@ -33,6 +44,12 @@ const STATE_TARGET_ONLY: u8 = 2;
 const STATE_NONE: u8 = u8::MAX;
 const EDIT_DP_NORM_CANCEL_INTERVAL: usize = 256;
 const EDIT_DP_WIDE_LOOP_CANCEL_INTERVAL: usize = 4_096;
+// A single 50 ms log-spectrum frame is not distinctive enough for television dialogue: unrelated
+// frames can retain a high cosine similarity because every log-energy band is positive. Average
+// the diagonal cost over a 250 ms context (the current frame plus two neighbours on each side).
+// This keeps edit-boundary uncertainty local to 100 ms while preventing an accidental cheap frame
+// from certifying a long false match.
+const EDIT_DP_CONTEXT_RADIUS_FRAMES: usize = 2;
 const ALIGNMENT_V2_CANCELLED: &str = "Alignment V2 算法已取消。";
 pub const CPU_SPECTRAL_BACKEND_ID: &str = "cpu-radix2-f64-r2c-512-v1";
 pub const STREAMING_CPU_SPECTRAL_BACKEND_ID: &str = "cpu-streaming-radix2-f64-r2c-512-v1";
@@ -2591,11 +2608,13 @@ pub fn align_features_edit_aware_with_cancel(
         let index = source_index * width + target_index;
         match state {
             STATE_MATCHED if source_index > 0 && target_index > 0 => {
-                let local_cost = feature_distance_cost_with_norms(
-                    &source[source_index - 1].values,
-                    &target[target_index - 1].values,
-                    source_norms[source_index - 1],
-                    target_norms[target_index - 1],
+                let local_cost = feature_context_distance_cost_with_norms(
+                    source,
+                    target,
+                    source_index - 1,
+                    target_index - 1,
+                    &source_norms,
+                    &target_norms,
                 );
                 let kind = if local_cost >= config.ambiguous_match_cost {
                     EditPathKind::Ambiguous
@@ -2726,6 +2745,9 @@ fn align_features_edit_aware_full_matrix_reference(
         };
     }
 
+    let source_norms = precompute_feature_norms(source, None)?;
+    let target_norms = precompute_feature_norms(target, None)?;
+
     for source_index in 1..=source_len {
         let (target_start, target_end) = target_band_range(
             target,
@@ -2811,9 +2833,13 @@ fn align_features_edit_aware_full_matrix_reference(
         let index = source_index * width + target_index;
         match state {
             STATE_MATCHED if source_index > 0 && target_index > 0 => {
-                let local_cost = feature_distance_cost(
-                    &source[source_index - 1].values,
-                    &target[target_index - 1].values,
+                let local_cost = feature_context_distance_cost_with_norms(
+                    source,
+                    target,
+                    source_index - 1,
+                    target_index - 1,
+                    &source_norms,
+                    &target_norms,
                 );
                 let kind = if local_cost >= config.ambiguous_match_cost {
                     EditPathKind::Ambiguous
@@ -3703,6 +3729,7 @@ fn materialize_affine_hypothesis_from_partition(
         &partition.held_out_time_blocks,
         hypothesis.scale,
         hypothesis.offset_ms as f64,
+        config.residual_tolerance_ms,
     );
     if held_out_anchors.len() > MAX_OBSERVATIONS {
         return Err(format!(
@@ -3782,15 +3809,31 @@ fn select_distributed_holdout_time_blocks(
         return HashSet::new();
     }
 
-    let maximum_holdout_block_count = blocks.len().saturating_sub(1).min(32);
+    let maximum_holdout_block_count = blocks
+        .len()
+        .saturating_sub(1)
+        .min(MAX_AFFINE_HOLDOUT_TIME_BLOCKS);
     let holdout_block_count = blocks
         .len()
         .div_ceil(5)
         .max(2)
         .min(maximum_holdout_block_count);
+    // One deterministic pseudo-random position per equal-width stratum preserves full-axis
+    // coverage without sampling the same modulo-5 phase across the whole media. The former
+    // midpoint sequence aliased with the 50 ms landmark cadence on real E01 and removed nearly
+    // every sparse true correspondence from the fitting partition.
     let mut block_indices = (0..holdout_block_count)
-        .map(|slot| ((2 * slot + 1) * blocks.len()) / (2 * holdout_block_count))
-        .map(|index| index.min(blocks.len().saturating_sub(1)))
+        .map(|slot| {
+            let start = slot * blocks.len() / holdout_block_count;
+            let end = ((slot + 1) * blocks.len() / holdout_block_count).max(start + 1);
+            let width = end.saturating_sub(start);
+            let mut mixed = (slot as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (blocks.len() as u64).rotate_left(17);
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^= mixed >> 31;
+            start + usize::try_from(mixed % width as u64).unwrap_or(0)
+        })
         .collect::<Vec<_>>();
     block_indices.sort_unstable();
     block_indices.dedup();
@@ -3827,30 +3870,125 @@ fn evaluate_affine_holdout(
     held_out_time_blocks: &HashSet<i64>,
     scale: f64,
     offset: f64,
+    residual_tolerance_ms: i64,
 ) -> Vec<AffineAnchorEvidence> {
+    #[derive(Debug)]
+    struct HoldoutCandidate {
+        source_index: usize,
+        target_index: usize,
+        source_time_ms: i64,
+        signed_residual_ms: i64,
+        anchor: AffineAnchorEvidence,
+    }
+
+    let candidates = observations
+        .iter()
+        .filter(|item| {
+            held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
+        })
+        .map(|observation| {
+            let signed_residual_ms = (observation.target_time_ms as f64
+                - (scale * observation.source_time_ms as f64 + offset))
+                .round() as i64;
+            HoldoutCandidate {
+                source_index: observation.source_index,
+                target_index: observation.target_index,
+                source_time_ms: observation.source_time_ms,
+                signed_residual_ms,
+                anchor: AffineAnchorEvidence {
+                    source_time_ms: observation.source_time_ms,
+                    target_time_ms: observation.target_time_ms,
+                    residual_ms: signed_residual_ms.abs(),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut support_cells =
+        HashMap::<(i64, i64), (HashSet<usize>, HashSet<usize>, HashSet<i64>, HashSet<i64>)>::new();
+    for candidate in &candidates {
+        let time_bucket = candidate
+            .source_time_ms
+            .div_euclid(AFFINE_HOLDOUT_CONSENSUS_TIME_BUCKET_MS);
+        let offset_bucket = candidate
+            .signed_residual_ms
+            .div_euclid(AFFINE_HOLDOUT_CONSENSUS_OFFSET_QUANTUM_MS);
+        let cell = support_cells
+            .entry((time_bucket, offset_bucket))
+            .or_default();
+        cell.0.insert(candidate.source_index);
+        cell.1.insert(candidate.target_index);
+        cell.2.insert(
+            candidate
+                .source_time_ms
+                .div_euclid(AFFINE_HOLDOUT_CONSENSUS_EVIDENCE_TIME_QUANTUM_MS),
+        );
+        cell.3.insert(
+            candidate
+                .anchor
+                .target_time_ms
+                .div_euclid(AFFINE_HOLDOUT_CONSENSUS_EVIDENCE_TIME_QUANTUM_MS),
+        );
+    }
+
     let mut best_by_source = HashMap::<usize, AffineAnchorEvidence>::new();
-    for observation in observations.iter().filter(|item| {
-        held_out_time_blocks.contains(&affine_holdout_time_block(item.source_time_ms))
-    }) {
-        let residual_ms = (observation.target_time_ms as f64
-            - (scale * observation.source_time_ms as f64 + offset))
-            .abs()
-            .round() as i64;
-        let candidate = AffineAnchorEvidence {
-            source_time_ms: observation.source_time_ms,
-            target_time_ms: observation.target_time_ms,
-            residual_ms,
+    for candidate in candidates {
+        let globally_consistent =
+            candidate.anchor.residual_ms.unsigned_abs() <= residual_tolerance_ms.unsigned_abs();
+        let locally_supported = if globally_consistent {
+            true
+        } else {
+            let time_bucket = candidate
+                .source_time_ms
+                .div_euclid(AFFINE_HOLDOUT_CONSENSUS_TIME_BUCKET_MS);
+            let offset_bucket = candidate
+                .signed_residual_ms
+                .div_euclid(AFFINE_HOLDOUT_CONSENSUS_OFFSET_QUANTUM_MS);
+            let mut source_support = HashSet::<usize>::new();
+            let mut target_support = HashSet::<usize>::new();
+            let mut source_time_support = HashSet::<i64>::new();
+            let mut target_time_support = HashSet::<i64>::new();
+            'support: for adjacent_time in (time_bucket
+                - AFFINE_HOLDOUT_CONSENSUS_TIME_RADIUS_BUCKETS)
+                ..=(time_bucket + AFFINE_HOLDOUT_CONSENSUS_TIME_RADIUS_BUCKETS)
+            {
+                for adjacent_offset in (offset_bucket - 1)..=(offset_bucket + 1) {
+                    if let Some((sources, targets, source_times, target_times)) =
+                        support_cells.get(&(adjacent_time, adjacent_offset))
+                    {
+                        source_support.extend(sources);
+                        target_support.extend(targets);
+                        source_time_support.extend(source_times);
+                        target_time_support.extend(target_times);
+                        if source_support.len() >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                            && target_support.len() >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                            && source_time_support.len()
+                                >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                            && target_time_support.len()
+                                >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                        {
+                            break 'support;
+                        }
+                    }
+                }
+            }
+            source_support.len() >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                && target_support.len() >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                && source_time_support.len() >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
+                && target_time_support.len() >= AFFINE_HOLDOUT_CONSENSUS_MIN_UNIQUE_SUPPORT
         };
+        if !locally_supported {
+            continue;
+        }
         let replace = best_by_source
-            .get(&observation.source_index)
+            .get(&candidate.source_index)
             .map(|current| {
-                candidate.residual_ms < current.residual_ms
-                    || (candidate.residual_ms == current.residual_ms
-                        && candidate.target_time_ms < current.target_time_ms)
+                candidate.anchor.residual_ms < current.residual_ms
+                    || (candidate.anchor.residual_ms == current.residual_ms
+                        && candidate.anchor.target_time_ms < current.target_time_ms)
             })
             .unwrap_or(true);
         if replace {
-            best_by_source.insert(observation.source_index, candidate);
+            best_by_source.insert(candidate.source_index, candidate.anchor);
         }
     }
     let mut result = best_by_source.into_values().collect::<Vec<_>>();
@@ -4136,13 +4274,38 @@ fn feature_distance_cost_with_norms(
 fn feature_distance_cost(left: &[f32], right: &[f32]) -> i64 {
     // Preserve the original operation order for the full-matrix parity oracle: dot first, then
     // each norm, then the norm product/division/clamp/round sequence.
-    let dot = feature_dot(left, right);
-    let left_norm = feature_norm(left);
-    let right_norm = feature_norm(right);
-    if left_norm <= f64::EPSILON || right_norm <= f64::EPSILON {
-        return 1_000;
+    feature_distance_cost_with_norms(left, right, feature_norm(left), feature_norm(right))
+}
+
+fn feature_context_distance_cost_with_norms(
+    source: &[FineFeatureFrame],
+    target: &[FineFeatureFrame],
+    source_index: usize,
+    target_index: usize,
+    source_norms: &[f64],
+    target_norms: &[f64],
+) -> i64 {
+    let backward = EDIT_DP_CONTEXT_RADIUS_FRAMES.min(source_index.min(target_index));
+    let forward = EDIT_DP_CONTEXT_RADIUS_FRAMES.min(
+        source
+            .len()
+            .saturating_sub(source_index + 1)
+            .min(target.len().saturating_sub(target_index + 1)),
+    );
+    let mut total_cost = 0i64;
+    let mut observation_count = 0i64;
+    for offset in -(backward as isize)..=(forward as isize) {
+        let source_context_index = source_index.wrapping_add_signed(offset);
+        let target_context_index = target_index.wrapping_add_signed(offset);
+        total_cost = total_cost.saturating_add(feature_distance_cost_with_norms(
+            &source[source_context_index].values,
+            &target[target_context_index].values,
+            source_norms[source_context_index],
+            target_norms[target_context_index],
+        ));
+        observation_count += 1;
     }
-    ((1.0 - dot / (left_norm * right_norm)).clamp(0.0, 2.0) * 1_000.0).round() as i64
+    (total_cost + observation_count / 2) / observation_count
 }
 
 fn select_min_state(matched: i64, source_only: i64, target_only: i64) -> (u8, i64) {
@@ -5216,7 +5379,7 @@ mod tests {
                 .unwrap();
         let held_out_time_blocks = select_distributed_holdout_time_blocks(&observations, 4);
 
-        assert_eq!(held_out_time_blocks, HashSet::from([2, 7, 12]));
+        assert_eq!(held_out_time_blocks.len(), 3);
         for time_ordinal in 0..15usize {
             let source_time_ms = time_ordinal as i64 * AFFINE_HOLDOUT_TIME_BLOCK_MS;
             let frame_observations = observations
@@ -5235,7 +5398,38 @@ mod tests {
     }
 
     #[test]
-    fn affine_holdout_is_partitioned_before_seed_and_records_out_of_tolerance_failures() {
+    fn affine_holdout_scales_beyond_thirty_two_blocks_for_sparse_long_media_support() {
+        let observations = (0..5_000usize)
+            .map(|index| LandmarkObservation {
+                source_index: index,
+                target_index: index,
+                source_time_ms: index as i64 * AFFINE_HOLDOUT_TIME_BLOCK_MS,
+                target_time_ms: index as i64 * AFFINE_HOLDOUT_TIME_BLOCK_MS + 5_000,
+            })
+            .collect::<Vec<_>>();
+
+        let held_out_time_blocks = select_distributed_holdout_time_blocks(&observations, 24);
+
+        assert_eq!(held_out_time_blocks.len(), 1_000);
+        assert!(held_out_time_blocks.len() > 32);
+        let sparse_phase_hits = (0..5_000i64)
+            .step_by(50)
+            .map(|block| block + 2)
+            .filter(|block| held_out_time_blocks.contains(block))
+            .count();
+        assert!(
+            (10..=30).contains(&sparse_phase_hits),
+            "stratified deterministic jitter must avoid both fixed-phase capture and starvation: {sparse_phase_hits}"
+        );
+        assert!(held_out_time_blocks.iter().any(|block| *block < 500));
+        assert!(held_out_time_blocks
+            .iter()
+            .any(|block| (2_250..2_750).contains(block)));
+        assert!(held_out_time_blocks.iter().any(|block| *block >= 4_500));
+    }
+
+    #[test]
+    fn affine_holdout_is_partitioned_before_seed_and_keeps_supported_edit_offset() {
         let source = (0..15usize)
             .map(|index| test_landmark((((200 + index) as u64) << 8) | 7, index as i64 * 1_000))
             .collect::<Vec<_>>();
@@ -5243,9 +5437,18 @@ mod tests {
             .iter()
             .map(|item| test_landmark(item.hash, item.time_ms + 5_000))
             .collect::<Vec<_>>();
-        // For 15 one-second source blocks and min_inliers=4 the deterministic region-centred
-        // partition selects source blocks 2, 7 and 12 before any seed is generated.
-        let held_out_ordinals = [2usize, 7, 12];
+        let observations = create_landmark_observations(
+            &source,
+            &baseline_target,
+            &AffineMatchConfig::default(),
+            None,
+        )
+        .unwrap();
+        let held_out_time_blocks = select_distributed_holdout_time_blocks(&observations, 4);
+        let held_out_ordinals = held_out_time_blocks
+            .iter()
+            .filter_map(|block| usize::try_from(*block).ok())
+            .collect::<HashSet<_>>();
         let shifted_target = source
             .iter()
             .enumerate()
@@ -5279,6 +5482,60 @@ mod tests {
             .iter()
             .all(|item| item.residual_ms >= 30_000));
         assert_eq!(shifted.held_out_within_tolerance_count, 0);
+    }
+
+    #[test]
+    fn affine_holdout_rejects_unclustered_large_offset_collisions() {
+        let held_out_time_blocks = HashSet::from([10]);
+        let observations = [30_000i64, 60_000, 90_000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset_ms)| LandmarkObservation {
+                source_index: index,
+                target_index: index,
+                source_time_ms: 10_000 + index as i64 * 250,
+                target_time_ms: 10_000 + index as i64 * 250 + offset_ms,
+            })
+            .collect::<Vec<_>>();
+
+        let anchors = evaluate_affine_holdout(&observations, &held_out_time_blocks, 1.0, 0.0, 100);
+
+        assert!(anchors.is_empty());
+    }
+
+    #[test]
+    fn affine_holdout_keeps_locally_supported_large_edit_offsets() {
+        let held_out_time_blocks = HashSet::from([10, 11, 12, 13, 14, 15]);
+        let observations = (0..6usize)
+            .map(|index| LandmarkObservation {
+                source_index: index,
+                target_index: index,
+                source_time_ms: 10_000 + index as i64 * 1_000,
+                target_time_ms: 40_000 + index as i64 * 1_000,
+            })
+            .collect::<Vec<_>>();
+
+        let anchors = evaluate_affine_holdout(&observations, &held_out_time_blocks, 1.0, 0.0, 100);
+
+        assert_eq!(anchors.len(), observations.len());
+        assert!(anchors.iter().all(|anchor| anchor.residual_ms == 30_000));
+    }
+
+    #[test]
+    fn affine_holdout_does_not_count_same_instant_landmarks_as_independent_consensus() {
+        let held_out_time_blocks = HashSet::from([10]);
+        let observations = (0..6usize)
+            .map(|index| LandmarkObservation {
+                source_index: index,
+                target_index: index,
+                source_time_ms: 10_000,
+                target_time_ms: 16_000,
+            })
+            .collect::<Vec<_>>();
+
+        let anchors = evaluate_affine_holdout(&observations, &held_out_time_blocks, 1.0, 0.0, 100);
+
+        assert!(anchors.is_empty());
     }
 
     #[test]
