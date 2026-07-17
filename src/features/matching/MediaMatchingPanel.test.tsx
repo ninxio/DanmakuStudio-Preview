@@ -252,6 +252,7 @@ function createLegacyBatchSnapshot(
       pairs.findIndex(
         (pair) => pair.snapshot.status === "queued" || pair.snapshot.status === "running"
       ) + 1 || null,
+    diagnosticEvents: [],
     pairs: pairs.map((pair, index) => {
       const proposal = createTestFineCompatibleProposal(pair.snapshot.proposal);
       return {
@@ -884,7 +885,20 @@ describe("多媒体自动匹配工作台", () => {
       status: "running" as const,
       progress: 0.08,
       message: "正在预处理第 1/3 个素材（B 站参考）：读取 PTS、音轨并生成共享声谱特征。",
-      currentPairOrdinal: null
+      currentPairOrdinal: null,
+      diagnosticEvents: [
+        {
+          sequence: 1,
+          atMs: 1_000,
+          elapsedMs: 12_345,
+          level: "info" as const,
+          stageKey: "media.timeline-probe",
+          mediaOrdinal: 1,
+          pairOrdinal: null,
+          message: "媒体身份与容器时间线读取完成。",
+          durationMs: 10_500
+        }
+      ]
     } satisfies AudioAlignmentBatchJobSnapshot;
     const cancelledSnapshot = createLegacyBatchSnapshot("batch-preparing", [
       createTestBatchPair("source-long", "target-ep1", "cancelled", null, "已停止"),
@@ -905,6 +919,10 @@ describe("多媒体自动匹配工作台", () => {
     expect(within(taskList).getAllByText("分析中")).toHaveLength(2);
     expect(within(taskList).getAllByText("8%")).toHaveLength(2);
     expect(screen.queryByText("等待前面的组合完成")).not.toBeInTheDocument();
+    fireEvent.click(within(taskList).getAllByText(/运行诊断（1 条/)[0]);
+    expect(within(taskList).getAllByLabelText("脱敏运行诊断")[0]).toHaveTextContent(
+      "[+0:12.345] [信息] [素材 #1] 媒体身份与容器时间线读取完成。（本阶段耗时 0:10.500）"
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "取消剩余任务" }));
     await waitFor(() =>

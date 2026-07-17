@@ -10,7 +10,7 @@ use crate::cuda_fft_backend::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -321,7 +321,7 @@ pub struct StreamingLandmarkExtraction {
 #[derive(Debug)]
 struct CoarseFamilySample {
     seen: u64,
-    retained: Vec<RankedLandmark>,
+    retained: BinaryHeap<RankedLandmark>,
 }
 
 #[derive(Debug)]
@@ -329,6 +329,26 @@ struct RankedLandmark {
     priority: u64,
     ordinal: u64,
     landmark: SpectralLandmark,
+}
+
+impl PartialEq for RankedLandmark {
+    fn eq(&self, other: &Self) -> bool {
+        (self.priority, self.ordinal) == (other.priority, other.ordinal)
+    }
+}
+
+impl Eq for RankedLandmark {}
+
+impl PartialOrd for RankedLandmark {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedLandmark {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.priority, self.ordinal).cmp(&(other.priority, other.ordinal))
+    }
 }
 
 /// `MediaCoarseIndex` 的确定性、有界 common-family 抑制结果。
@@ -387,7 +407,7 @@ impl MediaCoarseIndex {
                 family,
                 CoarseFamilySample {
                     seen: 0,
-                    retained: Vec::new(),
+                    retained: BinaryHeap::new(),
                 },
             );
         }
@@ -422,16 +442,13 @@ impl MediaCoarseIndex {
                 .ok_or_else(|| "MediaCoarseIndex 驻留 landmark 计数溢出。".to_string())?;
             return Ok(());
         }
-        let replace = sample
+        if sample
             .retained
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, item)| (item.priority, item.ordinal))
-            .and_then(|(index, item)| {
-                ((ranked.priority, ranked.ordinal) < (item.priority, item.ordinal)).then_some(index)
-            });
-        if let Some(index) = replace {
-            sample.retained[index] = ranked;
+            .peek()
+            .is_some_and(|largest| ranked < *largest)
+        {
+            let _ = sample.retained.pop();
+            sample.retained.push(ranked);
         }
         Ok(())
     }
@@ -447,7 +464,13 @@ impl MediaCoarseIndex {
             .try_reserve_exact(self.retained_landmark_count)
             .map_err(|error| format!("MediaCoarseIndex 无法为结果保留内存：{error}"))?;
         for sample in self.families.into_values() {
-            landmarks.extend(sample.retained.into_iter().map(|item| item.landmark));
+            landmarks.extend(
+                sample
+                    .retained
+                    .into_vec()
+                    .into_iter()
+                    .map(|item| item.landmark),
+            );
         }
         sort_landmarks_canonically(&mut landmarks);
         Ok(MediaCoarseIndexResult {

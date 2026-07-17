@@ -1068,7 +1068,8 @@ mod platform {
                 &stderr_receiver,
                 &mut output,
                 limits.process.stdout_hard_limit,
-                limits.stdout_buffered_chunks.clamp(1, 64),
+                64,
+                limits.process.poll_interval.min(Duration::from_millis(20)),
                 &mut consume_stdout,
             )?;
             if output.stdout_bytes != stdout_bytes_before
@@ -1076,6 +1077,8 @@ mod platform {
             {
                 stdout_progress_at = Instant::now();
             }
+            let stdout_made_progress = output.stdout_bytes != stdout_bytes_before
+                || (!stdout_complete_before && output.stdout_complete);
 
             if is_cancelled() {
                 return Err(SupervisedProcessError::new(
@@ -1141,7 +1144,16 @@ mod platform {
                     "supervised streaming readers exceeded their drain deadline",
                 ));
             }
-            thread::sleep(limits.process.poll_interval.min(Duration::from_millis(20)));
+            if stdout_made_progress {
+                // The bounded queue already limits resident output and each pass processes only a
+                // finite message budget. When bytes were available, immediately revisit
+                // cancellation, deadlines and Job state instead of adding one fixed poll delay per
+                // pair of chunks. This keeps the same cooperative checkpoints without throttling a
+                // high-volume FFprobe/FFmpeg stream to the supervisor's idle polling cadence.
+                thread::yield_now();
+            } else {
+                thread::sleep(limits.process.poll_interval.min(Duration::from_millis(20)));
+            }
         }
     }
 
@@ -1218,6 +1230,7 @@ mod platform {
         output: &mut StreamingOutputState,
         stdout_hard_limit: usize,
         message_budget: usize,
+        consume_time_budget: Duration,
         consume_stdout: &mut C,
     ) -> Result<(), SupervisedProcessError>
     where
@@ -1257,7 +1270,8 @@ mod platform {
             }
         }
 
-        for _ in 0..message_budget {
+        let consume_started_at = Instant::now();
+        for message_index in 0..message_budget {
             let message = match stdout_receiver.try_recv() {
                 Ok(message) => message,
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -1324,6 +1338,11 @@ mod platform {
                     ));
                 }
             }
+            if message_index + 1 < message_budget
+                && consume_started_at.elapsed() >= consume_time_budget
+            {
+                return Ok(());
+            }
         }
         // A producer may refill the bounded queue as quickly as it is drained. Yield after a
         // finite batch so sustained output cannot starve cancellation, timeout or Job polling.
@@ -1362,17 +1381,14 @@ mod platform {
     ) {
         let mut total = 0usize;
         let mut buffer = vec![0u8; chunk_size];
+        let mut filled = 0usize;
         loop {
             if stopped.load(Ordering::Acquire) {
                 return;
             }
-            match reader.read(&mut buffer) {
+            match reader.read(&mut buffer[filled..]) {
                 Ok(0) => {
-                    let _ = send_streaming_reader_message(
-                        &sender,
-                        StreamingReaderMessage::Complete,
-                        stopped,
-                    );
+                    let _ = finish_streaming_stdout(&sender, &buffer[..filled], stopped);
                     return;
                 }
                 Ok(read) => {
@@ -1393,21 +1409,21 @@ mod platform {
                         return;
                     }
                     total = next_total;
-                    if !send_streaming_reader_message(
-                        &sender,
-                        StreamingReaderMessage::Chunk(buffer[..read].to_vec()),
-                        stopped,
-                    ) {
-                        return;
+                    filled += read;
+                    if filled == buffer.len() {
+                        if !send_streaming_reader_message(
+                            &sender,
+                            StreamingReaderMessage::Chunk(buffer.clone()),
+                            stopped,
+                        ) {
+                            return;
+                        }
+                        filled = 0;
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                    let _ = send_streaming_reader_message(
-                        &sender,
-                        StreamingReaderMessage::Complete,
-                        stopped,
-                    );
+                    let _ = finish_streaming_stdout(&sender, &buffer[..filled], stopped);
                     return;
                 }
                 Err(error) => {
@@ -1420,6 +1436,23 @@ mod platform {
                 }
             }
         }
+    }
+
+    fn finish_streaming_stdout(
+        sender: &SyncSender<StreamingReaderMessage>,
+        residual: &[u8],
+        stopped: &AtomicBool,
+    ) -> bool {
+        if !residual.is_empty()
+            && !send_streaming_reader_message(
+                sender,
+                StreamingReaderMessage::Chunk(residual.to_vec()),
+                stopped,
+            )
+        {
+            return false;
+        }
+        send_streaming_reader_message(sender, StreamingReaderMessage::Complete, stopped)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

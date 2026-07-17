@@ -396,6 +396,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 0,
       failedPairCount: 0,
       currentPairOrdinal: null,
+      diagnosticEvents: [],
       pairs: [
         batchPairSnapshot(1, "source", "target-1", "queued"),
         batchPairSnapshot(2, "source", "target-2", "queued")
@@ -582,6 +583,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 0,
       failedPairCount: 0,
       currentPairOrdinal: null,
+      diagnosticEvents: [],
       pairs: [batchPairSnapshot(1, "source", "target", "queued")],
       error: null,
       updatedAtMs: 1
@@ -660,6 +662,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 0,
       failedPairCount: 0,
       currentPairOrdinal: null,
+      diagnosticEvents: [],
       pairs: [
         batchPairSnapshot(1, "source", "target-1", "queued"),
         batchPairSnapshot(2, "source", "target-2", "queued")
@@ -741,6 +744,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 1,
       failedPairCount: 0,
       currentPairOrdinal: null,
+      diagnosticEvents: [],
       pairs: [
         batchPairSnapshot(1, "source", "target-1", "completed"),
         batchPairSnapshot(2, "source", "target-2", "cancelled")
@@ -774,6 +778,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 1,
       failedPairCount: 0,
       currentPairOrdinal: 1,
+      diagnosticEvents: [],
       pairs: [batchPairSnapshot(1, "source", "target", "running")],
       error: null,
       updatedAtMs: 3
@@ -816,6 +821,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 0,
       failedPairCount: 0,
       currentPairOrdinal: null,
+      diagnosticEvents: [],
       pairs: [batchPairSnapshot(1, "other-source", "target", "queued")],
       error: null,
       updatedAtMs: 1
@@ -871,6 +877,7 @@ describe("Tauri 音频对齐调用", () => {
       processedPairCount: 1,
       failedPairCount: 1,
       currentPairOrdinal: null,
+      diagnosticEvents: [],
       pairs: [
         {
           ...batchPairSnapshot(1, "source", "target", "failed"),
@@ -1053,6 +1060,7 @@ function completedBatchJobSnapshot(): AudioAlignmentBatchJobSnapshot {
     processedPairCount: 1,
     failedPairCount: 0,
     currentPairOrdinal: null,
+    diagnosticEvents: [],
     pairs: [batchPairSnapshot(1, "source", "target", "completed")],
     error: null,
     updatedAtMs: 1

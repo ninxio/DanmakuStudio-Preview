@@ -1,3 +1,15 @@
+- 2026-07-18：C137 完成第六阶段第三十个切片“结构化脱敏运行诊断、Windows 流监督性能修复与跨进程长参考粗索引”，完整验证并在独立目录重新打包；Goal 继续进行。
+  - 透明日志系统：原生批任务新增有序、限长 512 条的结构化诊断事件，统一携带相对耗时、单阶段耗时、级别、阶段键、素材/组合序号和固定安全文案；覆盖入队、工具链、媒体时间轴、音频 PTS、粗特征、缓存、逐组合进度和终态。匹配页以 `[+时长] [级别] [素材/组合]` 展示可展开的“运行诊断”，明确标注已隐藏媒体路径和内容摘要；前端对缺字段、未知字段、乱序、非法阶段/级别和终态不闭合继续严格失败关闭。
+  - 真实性能根因：50 分钟级耗时的主要瓶颈不是 RTX 4090，也不是 FFT，而是 Windows 管道大量约 1.9 KiB 短读被逐条跨线程投递；164,866,443 字节形成 86,571 条消息，仅传输监督就耗时约 398.1 秒。现在 reader 聚合为约 32 KiB 块，监督器在取得进展后有界连续排空；同一输出降到 5,032 块、传输约 23.966 秒，完整 852,830 帧 PTS 解析约 32.572 秒，字节上限、反压、取消、残留 EOF 与进程树清理语义保持不变。
+  - 计算和解析优化：coarse landmark 的每桶 Top-64 保留由线性扫描改为确定性的有界堆，复杂度从每个 landmark 的 O(64) 降到 O(log 64)；FFprobe compact 解析器复用跨块 carry 并单次扫描字段，避免逐记录 HashMap 和完整行复制。
+  - 持久化长参考索引：新增 path-free、SHA-256 完整性校验的 schema v1 粗特征缓存，仅保存粗 landmarks、后端与展示边界，不保存 PCM、视频或本地路径；键绑定完整媒体身份、工具链、流/PTS、特征参数和实际计算后端。缓存采用原子替换、单文件 64 MiB、总量 512 MiB、最多 128 项和修改时间清理；损坏或篡改条目会拒绝并删除。日志会区分内存命中、磁盘命中和磁盘写入。
+  - 真实 RTX 4090 运行：修复前 E01 全链约 3035.5 秒，其中长参考 PTS 414.1 秒、粗特征 2469.9 秒；修复后冷启动完整生产链约 320–330 秒，已经进入“单集 5–10 分钟”的目标区间；全新进程复用磁盘粗索引后约 140 秒。对应脱敏回执为 `artifacts/c137-real-media-smoke-e01-gpu-heap.json`、`artifacts/c137-real-media-smoke-e01-gpu-stream-v2.json`、`artifacts/c137-real-media-smoke-e01-gpu-persistent-cold.json` 和 `artifacts/c137-real-media-smoke-e01-gpu-persistent-warm.json`，均复核不含本地媒体路径或文件名。
+  - 精度仍然失败关闭：当前 Dark E01 实样粗匹配仍得到约 `+22.704s / scale 0.999981 / coverage 0.8415` 的候选，但 fine 阶段没有形成完整单调双轴路径，映射覆盖为 0%，全部训练/留出锚点无法投影且首个 fine block 缺少连续 5 秒共同内容锚点。因此没有发布 TimeMap；界面现在保留每个候选的绝对 fine 窗口、后端、资源预算和所有质量门控拒绝原因，不再只显示笼统的“未通过质量门控”。
+  - 自动验收：Rust 全量 **408 passed / 23 ignored / 0 failed**，strict Clippy `-D warnings` 通过；完整 `corepack pnpm verify` 通过源码审计、ESLint、Vitest **93 files / 964 tests** 和 TypeScript/Vite production build；Chromium 四页北极星 E2E **6/6**。E2E 首轮准确发现模拟原生响应仍缺新增诊断字段，补齐严格契约后同一完整套件全绿。
+  - release 安装包：`src-tauri/target-c137-transparent-diagnostics-v1/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，4,257,438 bytes，SHA-256 `1280BD91F2524B083180718E5A8FA3D78E5F8F3B60F6BABD376ADD0DB1C7DEFF`；便携版：`src-tauri/target-c137-transparent-diagnostics-v1/release/danmaku_timeline_studio.exe`，16,633,856 bytes，SHA-256 `002E4B51E6D26B541412408051406A36BB68371A0B7E51C82A7C3F017816C054`。使用独立目标目录，不覆盖可能仍在运行的旧版程序。
+  - 诚实限制：本切片已经把真实单集耗时压入目标区间并建立可复核日志链，但当前实样仍未通过 fine 质量门控，不能宣称错位和删减边界准确率已解决。获授权 frozen Gold、真实 calibration split/model、production authority provision、规定 4 核正式测量与 20 套真实北极星长合集仍未闭环，因此 C137 保持 active。
+  - 本阶段 checkpoint 标签：`checkpoint/c137-transparent-diagnostics-v1-20260718`。
+
 - 2026-07-17：C137 完成第六阶段第二十九个切片“显式多版本复用、真实跨 pair many-to-many 证据与单次 CPU/GPU 选择”，完整验证并在独立目录重新打包；Goal 继续进行。
   - 原生多版本合同：批任务升级为 schema v2 / Evidence v5，来源侧和目标侧都可显式声明至少两个不同物理媒体组成的版本复用组；默认仍保持物理时间轴独占，只有同一非空版本组内的候选才能共享相应轴上的内容区间。组 ID、成员侧别、canonical 顺序和连续 ordinal 全链严格校验；同一路径、硬链接或 FileId 别名不能伪装成多个版本，误用时以 `blocked:version-reuse-alias` 失败关闭。
   - fine frontier 与 formal receipt：frontier 升级为 v3，完整候选 inventory 逐项绑定 source/target 复用组 ordinal；Tauri bridge、formal blind execution/receipt、digest domain 与真实 runner 全部升级并相互复核。旧 schema/Evidence、未知字段、跨侧成员、重复成员、组策略漂移和候选 ordinal 冒用均拒绝。

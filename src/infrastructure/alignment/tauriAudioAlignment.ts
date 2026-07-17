@@ -158,6 +158,20 @@ export interface AudioAlignmentBatchPairSnapshot {
   error: string | null;
 }
 
+export type AudioAlignmentBatchDiagnosticLevel = "info" | "warning" | "error";
+
+export interface AudioAlignmentBatchDiagnosticEvent {
+  sequence: number;
+  atMs: number;
+  elapsedMs: number;
+  level: AudioAlignmentBatchDiagnosticLevel;
+  stageKey: string;
+  mediaOrdinal: number | null;
+  pairOrdinal: number | null;
+  message: string;
+  durationMs: number | null;
+}
+
 export type AudioAlignmentBatchPairingMode = "fullCartesian" | "explicit";
 export type AudioAlignmentBatchGlobalSelectionState =
   "pending" | "selected" | "blocked" | "failed" | "cancelled";
@@ -386,6 +400,7 @@ export interface AudioAlignmentBatchJobSnapshot {
   processedPairCount: number;
   failedPairCount: number;
   currentPairOrdinal: number | null;
+  diagnosticEvents: AudioAlignmentBatchDiagnosticEvent[];
   pairs: AudioAlignmentBatchPairSnapshot[];
   error: string | null;
   updatedAtMs: number;
@@ -869,6 +884,7 @@ function validateAudioAlignmentBatchJobSnapshot(
       "processedPairCount",
       "failedPairCount",
       "currentPairOrdinal",
+      "diagnosticEvents",
       "pairs",
       "error",
       "updatedAtMs"
@@ -980,6 +996,17 @@ function validateAudioAlignmentBatchJobSnapshot(
       throw new Error("原生批任务响应的 currentPairOrdinal 无效。");
     }
   }
+  const diagnosticEvents = validateAudioAlignmentBatchDiagnosticEvents(
+    value.diagnosticEvents,
+    totalPairCount
+  );
+  if (
+    diagnosticEvents.some(
+      (event) => event.pairOrdinal !== null && !pairOrdinals.has(event.pairOrdinal)
+    )
+  ) {
+    throw new Error("原生批任务诊断日志引用了不存在的 pair。");
+  }
   if (isAudioAlignmentJobFinished(status)) {
     if (
       currentPairOrdinal !== null ||
@@ -1001,6 +1028,93 @@ function validateAudioAlignmentBatchJobSnapshot(
   }
   requireRuntimeInteger(value.updatedAtMs, "批任务更新时间", 0, Number.MAX_SAFE_INTEGER);
   return value as unknown as AudioAlignmentBatchJobSnapshot;
+}
+
+function validateAudioAlignmentBatchDiagnosticEvents(
+  value: unknown,
+  totalPairCount: number
+): AudioAlignmentBatchDiagnosticEvent[] {
+  if (!Array.isArray(value) || value.length > 512) {
+    throw new Error("原生批任务诊断日志必须是至多 512 条事件的数组。");
+  }
+  let previousSequence = 0;
+  let previousElapsedMs = 0;
+  return value.map((event, index) => {
+    if (!isRecord(event)) {
+      throw new Error(`第 ${index + 1} 条批任务诊断日志不是对象。`);
+    }
+    requireRuntimeExactKeys(
+      event,
+      [
+        "sequence",
+        "atMs",
+        "elapsedMs",
+        "level",
+        "stageKey",
+        "mediaOrdinal",
+        "pairOrdinal",
+        "message",
+        "durationMs"
+      ],
+      `第 ${index + 1} 条批任务诊断日志`
+    );
+    const sequence = requireRuntimeInteger(
+      event.sequence,
+      `第 ${index + 1} 条诊断日志序号`,
+      1,
+      Number.MAX_SAFE_INTEGER
+    );
+    if (sequence <= previousSequence) {
+      throw new Error("原生批任务诊断日志序号必须严格递增。");
+    }
+    previousSequence = sequence;
+    requireRuntimeInteger(
+      event.atMs,
+      `第 ${index + 1} 条诊断日志时间`,
+      0,
+      Number.MAX_SAFE_INTEGER
+    );
+    const elapsedMs = requireRuntimeInteger(
+      event.elapsedMs,
+      `第 ${index + 1} 条诊断日志累计耗时`,
+      0,
+      Number.MAX_SAFE_INTEGER
+    );
+    if (elapsedMs < previousElapsedMs) {
+      throw new Error("原生批任务诊断日志累计耗时不能倒退。");
+    }
+    previousElapsedMs = elapsedMs;
+    requireRuntimeEnum(
+      event.level,
+      ["info", "warning", "error"] as const,
+      `第 ${index + 1} 条诊断日志级别`
+    );
+    requireRuntimeText(event.stageKey, `第 ${index + 1} 条诊断日志阶段`);
+    requireRuntimeText(event.message, `第 ${index + 1} 条诊断日志消息`);
+    for (const [field, maximum] of [
+      ["mediaOrdinal", Number.MAX_SAFE_INTEGER],
+      ["pairOrdinal", totalPairCount]
+    ] as const) {
+      const fieldValue = event[field];
+      if (fieldValue !== null) {
+        requireRuntimeInteger(
+          fieldValue,
+          `第 ${index + 1} 条诊断日志 ${field}`,
+          1,
+          maximum
+        );
+      }
+    }
+    if (event.durationMs !== null) {
+      requireRuntimeInteger(
+        event.durationMs,
+        `第 ${index + 1} 条诊断日志阶段耗时`,
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+    }
+    return event as unknown as AudioAlignmentBatchDiagnosticEvent;
+  });
 }
 
 function validatePairVersionReuseOrdinals(

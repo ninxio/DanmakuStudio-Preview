@@ -1057,6 +1057,7 @@ function createRunningSnapshot(
     processedPairCount: 0,
     failedPairCount: 0,
     currentPairOrdinal: 1,
+    diagnosticEvents: [],
     pairs,
     error: null,
     updatedAtMs: 1
@@ -1126,6 +1127,7 @@ function createCompletedSnapshot(
     processedPairCount: pairs.length,
     failedPairCount: 0,
     currentPairOrdinal: null,
+    diagnosticEvents: [],
     pairs,
     error: null,
     updatedAtMs: 2
@@ -1261,6 +1263,7 @@ function createCancelledSnapshot(
     processedPairCount: 0,
     failedPairCount: 0,
     currentPairOrdinal: null,
+    diagnosticEvents: [],
     pairs,
     error: null,
     updatedAtMs: 3

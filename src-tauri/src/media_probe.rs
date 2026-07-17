@@ -176,8 +176,13 @@ impl AudioTimelineCompactStreamParser {
         ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
         let mut remaining = chunk;
         while let Some(newline_offset) = remaining.iter().position(|byte| *byte == b'\n') {
-            self.extend_carry(&remaining[..newline_offset])?;
-            self.consume_complete_record(cancel_flag)?;
+            let record = &remaining[..newline_offset];
+            if self.carry.is_empty() {
+                self.consume_borrowed_record(record, cancel_flag)?;
+            } else {
+                self.extend_carry(record)?;
+                self.consume_complete_record(cancel_flag)?;
+            }
             remaining = &remaining[newline_offset + 1..];
         }
         self.extend_carry(remaining)
@@ -221,6 +226,20 @@ impl AudioTimelineCompactStreamParser {
         Ok(())
     }
 
+    fn consume_borrowed_record(
+        &mut self,
+        record: &[u8],
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.len() > self.record_hard_limit {
+            return Err(audio_timeline_record_limit_error(self.record_hard_limit));
+        }
+        let record = String::from_utf8_lossy(record);
+        apply_audio_timeline_compact_record(record.trim(), &mut self.accumulators)
+    }
+
     fn consume_complete_record(&mut self, cancel_flag: Option<&AtomicBool>) -> Result<(), String> {
         ensure_alignment_probe_not_cancelled(cancel_flag, "FFprobe 音频逐帧时间戳结果解析")?;
         let mut record = std::mem::take(&mut self.carry);
@@ -230,8 +249,13 @@ impl AudioTimelineCompactStreamParser {
         if record.len() > self.record_hard_limit {
             return Err(audio_timeline_record_limit_error(self.record_hard_limit));
         }
-        let record = String::from_utf8_lossy(&record);
-        apply_audio_timeline_compact_record(record.trim(), &mut self.accumulators)
+        let result = {
+            let record_text = String::from_utf8_lossy(&record);
+            apply_audio_timeline_compact_record(record_text.trim(), &mut self.accumulators)
+        };
+        record.clear();
+        self.carry = record;
+        result
     }
 }
 
@@ -638,13 +662,27 @@ fn apply_audio_timeline_compact_record(
     }
     let mut fields = record.split('|');
     let record_type = fields.next().unwrap_or_default();
-    let values = fields
-        .filter_map(|field| field.split_once('='))
-        .collect::<HashMap<_, _>>();
-    let Some(stream_index) = values
-        .get("stream_index")
-        .and_then(|value| value.parse::<u32>().ok())
-    else {
+    let mut stream_index = None;
+    let mut best_effort_timestamp_time = None;
+    let mut pts_time = None;
+    let mut packet_duration_time = None;
+    let mut skip_samples = None;
+    let mut discard_padding = None;
+    for field in fields {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "stream_index" => stream_index = Some(value),
+            "best_effort_timestamp_time" => best_effort_timestamp_time = Some(value),
+            "pts_time" => pts_time = Some(value),
+            "pkt_duration_time" => packet_duration_time = Some(value),
+            "skip_samples" => skip_samples = Some(value),
+            "discard_padding" => discard_padding = Some(value),
+            _ => {}
+        }
+    }
+    let Some(stream_index) = stream_index.and_then(|value| value.parse::<u32>().ok()) else {
         return Ok(());
     };
     let stream_capacity_reached = accumulators.len() >= AUDIO_TIMELINE_PROBE_MAX_STREAMS;
@@ -661,15 +699,13 @@ fn apply_audio_timeline_compact_record(
     };
     match record_type {
         "frame" => {
-            let pts_ms = values
-                .get("best_effort_timestamp_time")
-                .or_else(|| values.get("pts_time"))
+            let pts_ms = best_effort_timestamp_time
+                .or(pts_time)
                 .and_then(|value| parse_signed_seconds_ms(Some(value)));
             let Some(pts_ms) = pts_ms else {
                 return Ok(());
             };
-            let duration_ms = values
-                .get("pkt_duration_time")
+            let duration_ms = packet_duration_time
                 .and_then(|value| parse_duration_ms(Some(value)))
                 .and_then(|value| i64::try_from(value).ok())
                 .filter(|value| *value > 0);
@@ -701,15 +737,13 @@ fn apply_audio_timeline_compact_record(
         }
         "packet" => {
             accumulator.evidence.skip_samples = accumulator.evidence.skip_samples.saturating_add(
-                values
-                    .get("skip_samples")
+                skip_samples
                     .and_then(|value| value.parse::<u64>().ok())
                     .unwrap_or(0),
             );
             accumulator.evidence.discard_padding =
                 accumulator.evidence.discard_padding.saturating_add(
-                    values
-                        .get("discard_padding")
+                    discard_padding
                         .and_then(|value| value.parse::<u64>().ok())
                         .unwrap_or(0),
                 );
@@ -1616,6 +1650,51 @@ mod tests {
         assert!(evidence.decoded_frame_count > 0);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires user-provided real media and profiles supervised stdout transport"]
+    fn production_real_media_audio_pts_transport_profile_from_environment() {
+        let source_path = std::env::var("C137_REAL_MEDIA_SOURCE")
+            .expect("C137_REAL_MEDIA_SOURCE must point to one reference video");
+        assert!(
+            Path::new(&source_path).is_file(),
+            "C137_REAL_MEDIA_SOURCE is not a file"
+        );
+        let mut command = SupervisedCommand::new("ffprobe");
+        command.args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_frames",
+            "-show_packets",
+            "-show_entries",
+            "frame=stream_index,best_effort_timestamp_time,pts_time,pkt_duration_time,nb_samples:frame_side_data=side_data_type,skip_samples,discard_padding:packet=stream_index,pts_time,duration_time:packet_side_data=side_data_type,skip_samples,discard_padding",
+            "-of",
+            "compact=p=1:nk=0",
+            &source_path,
+        ]);
+        let mut chunk_count = 0_u64;
+        let mut observed_bytes = 0_u64;
+        let started_at = std::time::Instant::now();
+        let output = command
+            .stream_stdout(
+                audio_timeline_probe_streaming_limits(),
+                || false,
+                |chunk| {
+                    chunk_count = chunk_count.saturating_add(1);
+                    observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
+                    Ok(())
+                },
+            )
+            .expect("real-media supervised PTS transport profile must complete");
+        assert!(output.status.success());
+        assert_eq!(output.stdout_bytes as u64, observed_bytes);
+        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        eprintln!(
+            "C137 real-media audio PTS transport profile: elapsedMs={elapsed_ms} chunkCount={chunk_count} stdoutBytes={observed_bytes}"
+        );
     }
 
     #[cfg(windows)]

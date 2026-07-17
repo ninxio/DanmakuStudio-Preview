@@ -792,6 +792,7 @@ test.beforeEach(async ({ page }) => {
               failedPairCount: 0,
               currentPairOrdinal: null,
               pairs: pairSnapshots,
+              diagnosticEvents: [],
               error: null,
               updatedAtMs: Date.now()
             };

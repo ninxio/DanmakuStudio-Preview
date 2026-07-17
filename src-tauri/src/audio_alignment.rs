@@ -47,8 +47,8 @@ use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
-    fs::File,
-    io::Read,
+    fs::{self, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -219,6 +219,11 @@ const ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN: f64 = 0.08;
 // 16 kHz mono i16 PCM is about 110 MiB, while a 20-minute episode is about 37 MiB; larger sets
 // degrade by LRU eviction.
 const MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES: usize = 768 * 1024 * 1024;
+const PERSISTENT_V2_COARSE_CACHE_SCHEMA_VERSION: u8 = 1;
+const PERSISTENT_V2_COARSE_CACHE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const PERSISTENT_V2_COARSE_CACHE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const PERSISTENT_V2_COARSE_CACHE_MAX_ENTRIES: usize = 128;
+const PERSISTENT_V2_COARSE_CACHE_DIRECTORY: &str = "alignment-v2-coarse-cache-v1";
 // Short candidate PCM must remain alive until track-pair selection finishes to preserve the
 // one-decode shared-FFT path. Long candidates contribute only the bounded coarse index here.
 // Fail closed before a pathological multi-track input can make either working set unbounded.
@@ -619,6 +624,7 @@ const AUDIO_ALIGNMENT_BATCH_RELATION_SCORE_VERSION: &str =
     "alignment-v2-pair-intrinsic-global-weight-v1";
 const AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION: &str =
     "alignment-v2-coarse-upper-times-confidence-v1";
+const MAX_AUDIO_ALIGNMENT_BATCH_DIAGNOSTIC_EVENTS: usize = 512;
 const AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN: &str =
     "audio-alignment-v5/fine-frontier-inventory/v3";
 const AUDIO_ALIGNMENT_BATCH_FINE_OCCUPANCY_DIGEST_DOMAIN: &str =
@@ -1096,6 +1102,28 @@ pub struct AudioAlignmentBatchPairSnapshot {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AudioAlignmentBatchDiagnosticLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioAlignmentBatchDiagnosticEvent {
+    sequence: u64,
+    at_ms: u64,
+    elapsed_ms: u64,
+    level: AudioAlignmentBatchDiagnosticLevel,
+    stage_key: String,
+    media_ordinal: Option<usize>,
+    pair_ordinal: Option<usize>,
+    message: String,
+    duration_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioAlignmentBatchJobSnapshot {
@@ -1113,6 +1141,7 @@ pub struct AudioAlignmentBatchJobSnapshot {
     processed_pair_count: usize,
     failed_pair_count: usize,
     current_pair_ordinal: Option<usize>,
+    diagnostic_events: Vec<AudioAlignmentBatchDiagnosticEvent>,
     pairs: Vec<AudioAlignmentBatchPairSnapshot>,
     error: Option<String>,
     updated_at_ms: u64,
@@ -1505,8 +1534,28 @@ struct CachedV2Landmarks {
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
     cache_key: String,
     cache_hit: bool,
+    cache_origin: V2ArtifactCacheOrigin,
     spectral_backend: SpectralBackendExecution,
     presentation_bounds: PresentationRangeMs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2ArtifactCacheOrigin {
+    NewMemoryOnly,
+    NewPersistent,
+    Memory,
+    Persistent,
+}
+
+impl V2ArtifactCacheOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NewMemoryOnly => "新提取（仅内存缓存）",
+            Self::NewPersistent => "新提取并写入磁盘粗索引",
+            Self::Memory => "内存缓存命中",
+            Self::Persistent => "磁盘粗索引命中",
+        }
+    }
 }
 
 struct V2CandidateExtractionState<'a> {
@@ -1556,6 +1605,34 @@ struct V2MediaArtifact {
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
     spectral_backend: SpectralBackendExecution,
     presentation_bounds: PresentationRangeMs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistentV2CoarseBackend {
+    backend_id: String,
+    requested_backend: String,
+    backend_detail: String,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistentV2CoarsePayload {
+    cache_key_digest: String,
+    presentation_start_ms: i64,
+    presentation_end_ms: i64,
+    spectral_backend: PersistentV2CoarseBackend,
+    landmarks: Vec<SpectralLandmark>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistentV2CoarseEnvelope {
+    schema_version: u8,
+    payload_digest: String,
+    last_access_ms: u64,
+    payload: PersistentV2CoarsePayload,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2064,6 +2141,7 @@ struct V2FineGroupEvaluationOutcome {
     state: FineEvaluationState,
     record: Option<V2FineGroupEvaluationRecord>,
     member_execution_count: usize,
+    diagnostics: Vec<String>,
 }
 
 struct V2FineMemberEvaluation {
@@ -2072,6 +2150,7 @@ struct V2FineMemberEvaluation {
     occupancy: Option<PairPhysicalOccupancy>,
     execution_evidence: Option<AudioAlignmentBatchFineExecutionEvidenceSnapshot>,
     proposal: Option<AudioAlignmentProposal>,
+    diagnostics: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -2084,6 +2163,7 @@ struct V2FineComponentResolution {
     refinement_round_count: usize,
     evaluated_candidate_count: usize,
     records: HashMap<FineCandidateId, V2FineGroupEvaluationRecord>,
+    diagnostics_by_pair: HashMap<usize, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -2116,6 +2196,8 @@ struct AudioAlignmentBatchJobEntry {
     snapshot: AudioAlignmentBatchJobSnapshot,
     cancel_flag: Arc<AtomicBool>,
     terminal_sequence: Option<u64>,
+    started_at: Instant,
+    next_diagnostic_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9283,13 +9365,51 @@ fn probe_alignment_audio_candidates(
     options: &AudioAlignmentOptions,
     cancel_flag: Option<&AtomicBool>,
 ) -> Result<Vec<AlignmentAudioInput>, String> {
+    probe_alignment_audio_candidates_with_diagnostics(
+        media_path,
+        label,
+        requested_stream_index,
+        options,
+        cancel_flag,
+        &mut |_stage_key, _duration_ms, _message| Ok(()),
+    )
+}
+
+fn probe_alignment_audio_candidates_with_diagnostics<F>(
+    media_path: &str,
+    label: &str,
+    requested_stream_index: Option<u32>,
+    options: &AudioAlignmentOptions,
+    cancel_flag: Option<&AtomicBool>,
+    diagnostics: &mut F,
+) -> Result<Vec<AlignmentAudioInput>, String>
+where
+    F: FnMut(&str, Option<u64>, &str) -> Result<(), String>,
+{
+    diagnostics(
+        "media.timeline-probe",
+        None,
+        "开始核验媒体身份并读取容器、音轨和展示时间线。",
+    )?;
+    let timeline_started_at = Instant::now();
     let snapshot = probe_media_timeline_with_ffprobe_cancellable(
         media_path,
         &options.ffprobe_path,
         cancel_flag,
     )
     .map_err(|error| format_alignment_probe_error(&format!("{label}媒体时间线探测失败"), error))?;
+    diagnostics(
+        "media.timeline-probe",
+        Some(u64::try_from(timeline_started_at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        "媒体身份与容器时间线读取完成。",
+    )?;
     check_v2_coarse_probe_duration(snapshot.duration_ms, label)?;
+    diagnostics(
+        "media.audio-pts-probe",
+        None,
+        "开始扫描音频 frame/packet PTS 与 skip-sample 证据。",
+    )?;
+    let pts_started_at = Instant::now();
     let decode_timelines = probe_audio_decode_timelines_with_ffprobe_cancellable(
         media_path,
         &options.ffprobe_path,
@@ -9303,6 +9423,11 @@ fn probe_alignment_audio_candidates(
     .map_err(|error| {
         format_alignment_probe_error(&format!("{label}逐帧 PTS/skip-sample 探测失败"), error)
     })?;
+    diagnostics(
+        "media.audio-pts-probe",
+        Some(u64::try_from(pts_started_at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        "音频 PTS 与 skip-sample 扫描完成。",
+    )?;
     if let Some(stream_index) = requested_stream_index {
         let stream = select_audio_stream(&snapshot, Some(stream_index), label)?;
         let decode_timeline = decode_timelines
@@ -9525,11 +9650,7 @@ fn extract_v2_landmark_candidates(
                 state.notes.push(format!(
                     "{label}音轨 #{} landmark {}：{} 个；声谱后端 {}（{}）。",
                     input.stream.stream_index,
-                    if artifact.cache_hit {
-                        "缓存命中"
-                    } else {
-                        "新提取"
-                    },
+                    artifact.cache_origin.label(),
                     artifact.landmarks.len(),
                     artifact.spectral_backend.backend_id,
                     artifact.spectral_backend.backend_detail
@@ -10137,6 +10258,7 @@ fn create_v2_planned_coarse_cache_key(
 fn cached_v2_landmarks_from_media_artifact(
     cache_key: String,
     artifact: V2MediaArtifact,
+    cache_origin: V2ArtifactCacheOrigin,
 ) -> CachedV2Landmarks {
     CachedV2Landmarks {
         landmarks: artifact.landmarks,
@@ -10144,6 +10266,7 @@ fn cached_v2_landmarks_from_media_artifact(
         fine_features: artifact.fine_features,
         cache_key,
         cache_hit: true,
+        cache_origin,
         spectral_backend: artifact.spectral_backend,
         presentation_bounds: artifact.presentation_bounds,
     }
@@ -10179,7 +10302,11 @@ fn plan_v2_candidate_set_cache_aware(
     for ((input, cache_key), cached_artifact) in inputs.iter().zip(cache_keys).zip(cached_artifacts)
     {
         if let Some(artifact) = cached_artifact {
-            let cached = cached_v2_landmarks_from_media_artifact(cache_key, artifact);
+            let cached = cached_v2_landmarks_from_media_artifact(
+                cache_key,
+                artifact,
+                V2ArtifactCacheOrigin::Memory,
+            );
             prefix_retained = ensure_v2_active_artifact_budget(
                 prefix_retained,
                 cached_v2_landmark_retained_bytes(&cached),
@@ -10367,6 +10494,318 @@ fn v2_landmark_cache() -> &'static Mutex<V2MediaArtifactCache> {
         .get_or_init(|| Mutex::new(V2MediaArtifactCache::new(MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES)))
 }
 
+fn persistent_v2_coarse_cache_root() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("C137_V2_COARSE_CACHE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Some(path);
+    }
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("studio.danmaku.timeline")
+            .join(PERSISTENT_V2_COARSE_CACHE_DIRECTORY)
+    })
+}
+
+fn persistent_v2_coarse_cache_key_digest(cache_key: &str) -> String {
+    Sha256::digest(cache_key.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn persistent_v2_coarse_payload_digest(
+    payload: &PersistentV2CoarsePayload,
+) -> Result<String, String> {
+    let bytes =
+        serde_json::to_vec(payload).map_err(|_| "磁盘粗索引 payload 无法序列化。".to_string())?;
+    Ok(format!(
+        "sha256:{}",
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn persistent_v2_coarse_cache_path(root: &Path, cache_key_digest: &str) -> PathBuf {
+    root.join(format!("{cache_key_digest}.json"))
+}
+
+fn persistent_v2_coarse_payload_from_artifact(
+    cache_key: &str,
+    artifact: &V2MediaArtifact,
+) -> PersistentV2CoarsePayload {
+    PersistentV2CoarsePayload {
+        cache_key_digest: persistent_v2_coarse_cache_key_digest(cache_key),
+        presentation_start_ms: artifact.presentation_bounds.start_ms,
+        presentation_end_ms: artifact.presentation_bounds.end_ms,
+        spectral_backend: PersistentV2CoarseBackend {
+            backend_id: artifact.spectral_backend.backend_id.clone(),
+            requested_backend: artifact.spectral_backend.requested_backend.clone(),
+            backend_detail: artifact.spectral_backend.backend_detail.clone(),
+            fallback_reason: artifact.spectral_backend.fallback_reason.clone(),
+        },
+        landmarks: artifact.landmarks.as_ref().clone(),
+    }
+}
+
+fn validate_persistent_v2_coarse_payload(
+    expected_cache_key_digest: &str,
+    payload: &PersistentV2CoarsePayload,
+) -> Result<(), String> {
+    if payload.cache_key_digest != expected_cache_key_digest {
+        return Err("磁盘粗索引 cache key 摘要不匹配。".to_string());
+    }
+    if payload.presentation_end_ms <= payload.presentation_start_ms {
+        return Err("磁盘粗索引展示时间范围无效。".to_string());
+    }
+    if payload.landmarks.is_empty() || payload.landmarks.len() > ALIGNMENT_V2_COARSE_MAX_LANDMARKS {
+        return Err("磁盘粗索引 landmark 数量超出硬边界。".to_string());
+    }
+    for landmark in &payload.landmarks {
+        let anchor_bin = landmark.hash >> 16;
+        let target_bin = (landmark.hash >> 8) & 0xff;
+        if anchor_bin >= ALIGNMENT_V2_SPECTRAL_BIN_COUNT as u64
+            || target_bin >= ALIGNMENT_V2_SPECTRAL_BIN_COUNT as u64
+            || landmark.time_ms < payload.presentation_start_ms
+            || landmark.time_ms > payload.presentation_end_ms
+        {
+            return Err("磁盘粗索引包含越界 landmark。".to_string());
+        }
+    }
+    if payload.landmarks.windows(2).any(|pair| {
+        let left = &pair[0];
+        let right = &pair[1];
+        left.time_ms > right.time_ms
+            || (left.time_ms == right.time_ms && left.hash > right.hash)
+            || (left.time_ms == right.time_ms
+                && left.hash == right.hash
+                && left.strength_milli < right.strength_milli)
+    }) {
+        return Err("磁盘粗索引 landmark 未按规范顺序保存。".to_string());
+    }
+    for value in [
+        payload.spectral_backend.backend_id.as_str(),
+        payload.spectral_backend.requested_backend.as_str(),
+        payload.spectral_backend.backend_detail.as_str(),
+    ] {
+        if value.is_empty() || value.len() > 16 * 1024 {
+            return Err("磁盘粗索引声谱后端字段无效。".to_string());
+        }
+    }
+    if payload
+        .spectral_backend
+        .fallback_reason
+        .as_ref()
+        .is_some_and(|value| value.len() > 16 * 1024)
+    {
+        return Err("磁盘粗索引声谱回退字段过长。".to_string());
+    }
+    Ok(())
+}
+
+fn v2_media_artifact_from_persistent_payload(
+    payload: PersistentV2CoarsePayload,
+) -> V2MediaArtifact {
+    V2MediaArtifact {
+        pcm: None,
+        landmarks: Arc::new(payload.landmarks),
+        fine_features: None,
+        spectral_backend: SpectralBackendExecution {
+            backend_id: payload.spectral_backend.backend_id,
+            requested_backend: payload.spectral_backend.requested_backend,
+            backend_detail: payload.spectral_backend.backend_detail,
+            fallback_reason: payload.spectral_backend.fallback_reason,
+        },
+        presentation_bounds: PresentationRangeMs {
+            start_ms: payload.presentation_start_ms,
+            end_ms: payload.presentation_end_ms,
+        },
+    }
+}
+
+fn replace_persistent_v2_coarse_cache_file(
+    temporary_path: &Path,
+    destination_path: &Path,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let temporary = temporary_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = destination_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the call.
+        let moved = unsafe {
+            MoveFileExW(
+                temporary.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err("磁盘粗索引无法原子替换目标文件。".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary_path, destination_path)
+            .map_err(|_| "磁盘粗索引无法原子替换目标文件。".to_string())
+    }
+}
+
+fn prune_persistent_v2_coarse_cache(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut artifacts = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+            let digest = file_name.strip_suffix(".json")?;
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            Some((path, metadata.len(), modified))
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by_key(|(_, _, modified)| *modified);
+    let mut total_bytes = artifacts
+        .iter()
+        .fold(0_u64, |total, (_, bytes, _)| total.saturating_add(*bytes));
+    let mut remaining_entries = artifacts.len();
+    for (path, bytes, _) in artifacts {
+        if remaining_entries <= PERSISTENT_V2_COARSE_CACHE_MAX_ENTRIES
+            && total_bytes <= PERSISTENT_V2_COARSE_CACHE_MAX_TOTAL_BYTES
+        {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            remaining_entries = remaining_entries.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+fn write_persistent_v2_coarse_artifact(
+    cache_key: &str,
+    artifact: &V2MediaArtifact,
+) -> Result<(), String> {
+    let Some(root) = persistent_v2_coarse_cache_root() else {
+        return Err("当前环境没有可用的本地应用数据目录。".to_string());
+    };
+    write_persistent_v2_coarse_artifact_at(&root, cache_key, artifact)
+}
+
+fn write_persistent_v2_coarse_artifact_at(
+    root: &Path,
+    cache_key: &str,
+    artifact: &V2MediaArtifact,
+) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|_| "无法创建磁盘粗索引目录。".to_string())?;
+    let payload = persistent_v2_coarse_payload_from_artifact(cache_key, artifact);
+    validate_persistent_v2_coarse_payload(&payload.cache_key_digest, &payload)?;
+    let envelope = PersistentV2CoarseEnvelope {
+        schema_version: PERSISTENT_V2_COARSE_CACHE_SCHEMA_VERSION,
+        payload_digest: persistent_v2_coarse_payload_digest(&payload)?,
+        last_access_ms: current_time_ms(),
+        payload,
+    };
+    let bytes = serde_json::to_vec(&envelope)
+        .map_err(|_| "磁盘粗索引 envelope 无法序列化。".to_string())?;
+    if bytes.len() as u64 > PERSISTENT_V2_COARSE_CACHE_MAX_FILE_BYTES {
+        return Err("磁盘粗索引文件超过单文件硬上限。".to_string());
+    }
+    let destination = persistent_v2_coarse_cache_path(root, &envelope.payload.cache_key_digest);
+    let temporary = root.join(format!(
+        ".{}.{}.{}.tmp",
+        envelope.payload.cache_key_digest,
+        std::process::id(),
+        current_time_ms()
+    ));
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| "无法创建磁盘粗索引临时文件。".to_string())?;
+        file.write_all(&bytes)
+            .map_err(|_| "无法完整写入磁盘粗索引临时文件。".to_string())?;
+        file.sync_all()
+            .map_err(|_| "无法同步磁盘粗索引临时文件。".to_string())?;
+        replace_persistent_v2_coarse_cache_file(&temporary, &destination)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
+    prune_persistent_v2_coarse_cache(root);
+    Ok(())
+}
+
+fn load_persistent_v2_coarse_artifact(cache_key: &str) -> Option<V2MediaArtifact> {
+    let root = persistent_v2_coarse_cache_root()?;
+    load_persistent_v2_coarse_artifact_at(&root, cache_key)
+}
+
+fn load_persistent_v2_coarse_artifact_at(root: &Path, cache_key: &str) -> Option<V2MediaArtifact> {
+    let expected_cache_key_digest = persistent_v2_coarse_cache_key_digest(cache_key);
+    let path = persistent_v2_coarse_cache_path(root, &expected_cache_key_digest);
+    let load_result = (|| -> Result<(V2MediaArtifact, PersistentV2CoarseEnvelope), String> {
+        let metadata = fs::metadata(&path).map_err(|_| "磁盘粗索引不存在。".to_string())?;
+        if metadata.len() == 0 || metadata.len() > PERSISTENT_V2_COARSE_CACHE_MAX_FILE_BYTES {
+            return Err("磁盘粗索引文件大小无效。".to_string());
+        }
+        let bytes = fs::read(&path).map_err(|_| "磁盘粗索引无法读取。".to_string())?;
+        let mut envelope = serde_json::from_slice::<PersistentV2CoarseEnvelope>(&bytes)
+            .map_err(|_| "磁盘粗索引 JSON 无效。".to_string())?;
+        if envelope.schema_version != PERSISTENT_V2_COARSE_CACHE_SCHEMA_VERSION {
+            return Err("磁盘粗索引 schema 版本不受支持。".to_string());
+        }
+        validate_persistent_v2_coarse_payload(&expected_cache_key_digest, &envelope.payload)?;
+        let expected_payload_digest = persistent_v2_coarse_payload_digest(&envelope.payload)?;
+        if envelope.payload_digest != expected_payload_digest {
+            return Err("磁盘粗索引 payload 摘要校验失败。".to_string());
+        }
+        envelope.last_access_ms = current_time_ms();
+        let artifact = v2_media_artifact_from_persistent_payload(envelope.payload.clone());
+        Ok((artifact, envelope))
+    })();
+    match load_result {
+        Ok((artifact, envelope)) => {
+            // Refreshing the envelope gives the bounded cleanup pass a real last-access order.
+            let _ = write_persistent_v2_coarse_artifact_at(root, cache_key, &artifact);
+            debug_assert_eq!(envelope.payload.cache_key_digest, expected_cache_key_digest);
+            Some(artifact)
+        }
+        Err(_) => {
+            if path.is_file() {
+                let _ = fs::remove_file(path);
+            }
+            None
+        }
+    }
+}
+
 fn get_v2_landmarks(
     media_path: &str,
     label: &str,
@@ -10438,9 +10877,45 @@ fn get_v2_landmarks(
                     "V2 landmark 缓存复用",
                 )?;
                 benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
-                return Ok(cached_v2_landmarks_from_media_artifact(cache_key, artifact));
+                return Ok(cached_v2_landmarks_from_media_artifact(
+                    cache_key,
+                    artifact,
+                    V2ArtifactCacheOrigin::Memory,
+                ));
             }
             benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
+        }
+    }
+    if streaming_coarse {
+        check_cancelled(cancel_flag)?;
+        if let Some(artifact) = load_persistent_v2_coarse_artifact(&cache_key) {
+            verify_v2_spectral_backend_policy(
+                &artifact.spectral_backend,
+                &options.spectral_backend_request,
+            )?;
+            verify_media_content_identity_after_tool_output(
+                media_path,
+                input.content_identity.as_ref(),
+                cancel_flag,
+                "V2 磁盘粗索引复用",
+            )?;
+            let cached = cached_v2_landmarks_from_media_artifact(
+                cache_key.clone(),
+                artifact.clone(),
+                V2ArtifactCacheOrigin::Persistent,
+            );
+            let mut cache = v2_landmark_cache()
+                .lock()
+                .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+            let insertion = cache.insert(cache_key, artifact, cancel_flag)?;
+            for _ in 0..insertion.eviction_count {
+                benchmark_cache_event(
+                    BenchmarkCacheKind::V2Landmarks,
+                    BenchmarkCacheEvent::Eviction,
+                );
+            }
+            benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
+            return Ok(cached);
         }
     }
     let presentation_offset_ms = input
@@ -10534,6 +11009,8 @@ fn get_v2_landmarks(
         spectral_backend: spectral_backend.clone(),
         presentation_bounds,
     };
+    let persistent_cache_stored =
+        streaming_coarse && write_persistent_v2_coarse_artifact(&cache_key, &artifact).is_ok();
     let mut cache = v2_landmark_cache()
         .lock()
         .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
@@ -10553,6 +11030,11 @@ fn get_v2_landmarks(
         fine_features,
         cache_key,
         cache_hit: false,
+        cache_origin: if persistent_cache_stored {
+            V2ArtifactCacheOrigin::NewPersistent
+        } else {
+            V2ArtifactCacheOrigin::NewMemoryOnly
+        },
         spectral_backend,
         presentation_bounds,
     })
@@ -15540,6 +16022,8 @@ fn insert_audio_alignment_batch_job(
     plan: &PlannedAudioAlignmentBatch,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let started_at = Instant::now();
+    let created_at_ms = current_time_ms();
     let pairs = plan
         .pairs
         .iter()
@@ -15579,9 +16063,20 @@ fn insert_audio_alignment_batch_job(
         processed_pair_count: 0,
         failed_pair_count: 0,
         current_pair_ordinal: None,
+        diagnostic_events: vec![AudioAlignmentBatchDiagnosticEvent {
+            sequence: 1,
+            at_ms: created_at_ms,
+            elapsed_ms: 0,
+            level: AudioAlignmentBatchDiagnosticLevel::Info,
+            stage_key: "batch.queued".to_string(),
+            media_ordinal: None,
+            pair_ordinal: None,
+            message: "批量匹配已进入原生任务队列。".to_string(),
+            duration_ms: None,
+        }],
         pairs,
         error: None,
-        updated_at_ms: current_time_ms(),
+        updated_at_ms: created_at_ms,
     };
     let mut jobs = audio_alignment_batch_jobs()
         .lock()
@@ -15595,6 +16090,8 @@ fn insert_audio_alignment_batch_job(
             snapshot,
             cancel_flag,
             terminal_sequence: None,
+            started_at,
+            next_diagnostic_sequence: 2,
         },
     );
     prune_audio_alignment_batch_terminal_jobs(&mut jobs, None);
@@ -15680,12 +16177,43 @@ fn prepare_audio_alignment_batch_media(
                 .to_string_lossy()
                 .into_owned();
             let result = (|| {
-                let inputs = probe_alignment_audio_candidates(
+                let media_progress = AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS
+                    + (AUDIO_ALIGNMENT_BATCH_PREPARATION_END_PROGRESS
+                        - AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS)
+                        * prepared_media_count as f64
+                        / total_media_count as f64;
+                let mut record_probe_diagnostic =
+                    |stage_key: &str, duration_ms: Option<u64>, message: &str| {
+                        if let Some(job_id) = progress_job_id {
+                            if duration_ms.is_none() {
+                                update_audio_alignment_batch_phase(
+                                    job_id,
+                                    media_progress,
+                                    &format!(
+                                        "正在预处理第 {media_ordinal}/{total_media_count} 个素材（{}）：{message}",
+                                        media.role_label
+                                    ),
+                                )?;
+                            }
+                            append_audio_alignment_batch_diagnostic_event(
+                                job_id,
+                                AudioAlignmentBatchDiagnosticLevel::Info,
+                                stage_key,
+                                Some(media_ordinal),
+                                None,
+                                message,
+                                duration_ms,
+                            )?;
+                        }
+                        Ok(())
+                    };
+                let inputs = probe_alignment_audio_candidates_with_diagnostics(
                     &stable_path,
                     media.role_label,
                     media.requested_audio_stream_index,
                     options,
                     Some(cancel_flag),
+                    &mut record_probe_diagnostic,
                 )?;
                 if inputs.is_empty() {
                     return Err(format!(
@@ -15719,6 +16247,26 @@ fn prepare_audio_alignment_batch_media(
                 )];
                 let media_retained_baseline = batch_retained_artifact_bytes;
                 let mut combined_retained_artifact_bytes = media_retained_baseline;
+                if let Some(job_id) = progress_job_id {
+                    update_audio_alignment_batch_phase(
+                        job_id,
+                        media_progress,
+                        &format!(
+                            "正在预处理第 {media_ordinal}/{total_media_count} 个素材（{}）：正在加载或生成共享声谱地标。",
+                            media.role_label
+                        ),
+                    )?;
+                    append_audio_alignment_batch_diagnostic_event(
+                        job_id,
+                        AudioAlignmentBatchDiagnosticLevel::Info,
+                        "media.coarse-landmarks",
+                        Some(media_ordinal),
+                        None,
+                        "开始加载或生成共享声谱地标。",
+                        None,
+                    )?;
+                }
+                let landmark_started_at = Instant::now();
                 let landmarks = extract_v2_landmark_candidates(
                     &stable_path,
                     media.role_label,
@@ -15734,6 +16282,46 @@ fn prepare_audio_alignment_batch_media(
                 )?;
                 if landmarks.is_empty() {
                     return Err(format!("{}候选音轨未产生可用 landmark。", media.role_label));
+                }
+                if let Some(job_id) = progress_job_id {
+                    let cache_hit_count = landmarks
+                        .values()
+                        .filter(|artifact| artifact.cache_hit)
+                        .count();
+                    let persistent_hit_count = landmarks
+                        .values()
+                        .filter(|artifact| {
+                            artifact.cache_origin == V2ArtifactCacheOrigin::Persistent
+                        })
+                        .count();
+                    let persistent_write_count = landmarks
+                        .values()
+                        .filter(|artifact| {
+                            artifact.cache_origin == V2ArtifactCacheOrigin::NewPersistent
+                        })
+                        .count();
+                    let backend_ids = landmarks
+                        .values()
+                        .map(|artifact| artifact.spectral_backend.backend_id.as_str())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    append_audio_alignment_batch_diagnostic_event(
+                        job_id,
+                        AudioAlignmentBatchDiagnosticLevel::Info,
+                        "media.coarse-landmarks",
+                        Some(media_ordinal),
+                        None,
+                        &format!(
+                            "共享声谱地标准备完成：{} 条音轨制品，缓存命中 {cache_hit_count} 条（磁盘 {persistent_hit_count} 条），新写入磁盘粗索引 {persistent_write_count} 条，计算后端 {backend_ids}。",
+                            landmarks.len()
+                        ),
+                        Some(
+                            u64::try_from(landmark_started_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        ),
+                    )?;
                 }
                 let media_retained_artifact_bytes = combined_retained_artifact_bytes
                     .checked_sub(media_retained_baseline)
@@ -15756,6 +16344,19 @@ fn prepare_audio_alignment_batch_media(
                     },
                 }))
             })();
+            if result.is_err() {
+                if let Some(job_id) = progress_job_id {
+                    append_audio_alignment_batch_diagnostic_event(
+                        job_id,
+                        AudioAlignmentBatchDiagnosticLevel::Error,
+                        "media.preparation-failed",
+                        Some(media_ordinal),
+                        None,
+                        "素材预处理失败；未发布该素材的缓存制品或匹配结论。",
+                        None,
+                    )?;
+                }
+            }
             prepared_media_count = media_ordinal;
             if let Some(job_id) = progress_job_id {
                 let progress = AUDIO_ALIGNMENT_BATCH_PREPARATION_START_PROGRESS
@@ -16012,6 +16613,10 @@ where
             occupancy: None,
             execution_evidence: None,
             proposal: None,
+            diagnostics: vec![
+                "该 raw coarse member 未通过 intrinsic relation eligibility，未启动 fine。"
+                    .to_string(),
+            ],
         });
     }
     let source = prepared_audio_alignment_batch_media(
@@ -16073,6 +16678,7 @@ where
                 occupancy: None,
                 execution_evidence: None,
                 proposal: None,
+                diagnostics: vec!["fine member 因资源上限被阻断，未生成可发布关系。".to_string()],
             })
         }
         Err(_) => {
@@ -16082,9 +16688,11 @@ where
                 occupancy: None,
                 execution_evidence: None,
                 proposal: None,
+                diagnostics: vec!["fine member 的执行基础设施失败，未生成可发布关系。".to_string()],
             })
         }
     };
+    let proposal_diagnostics = proposal.diagnostics.clone();
     if v2_fine_proposal_has_diagnostic_prefix(&proposal, "blocked:resource-limit") {
         return Ok(V2FineMemberEvaluation {
             state: FineEvaluationState::ResourceBlocked,
@@ -16092,6 +16700,7 @@ where
             occupancy: None,
             execution_evidence: None,
             proposal: None,
+            diagnostics: proposal_diagnostics,
         });
     }
     if v2_fine_proposal_has_diagnostic_prefix(&proposal, "blocked:artifact-missing") {
@@ -16101,6 +16710,7 @@ where
             occupancy: None,
             execution_evidence: None,
             proposal: None,
+            diagnostics: proposal_diagnostics,
         });
     }
     let runtime = capture
@@ -16114,6 +16724,7 @@ where
             occupancy: None,
             execution_evidence: None,
             proposal: None,
+            diagnostics: proposal_diagnostics,
         });
     };
     if proposal.time_map.is_none() {
@@ -16123,6 +16734,7 @@ where
             occupancy: None,
             execution_evidence: None,
             proposal: None,
+            diagnostics: proposal_diagnostics,
         });
     }
     if proposal.confidence.is_finite() && proposal.confidence <= 0.0 {
@@ -16131,7 +16743,8 @@ where
             score: None,
             occupancy: None,
             execution_evidence: None,
-            proposal: None,
+            proposal: Some(proposal),
+            diagnostics: proposal_diagnostics,
         });
     }
     let score = match v2_fine_score_from_proposal(coarse_upper_bound, &proposal) {
@@ -16143,6 +16756,7 @@ where
                 occupancy: None,
                 execution_evidence: None,
                 proposal: None,
+                diagnostics: proposal_diagnostics,
             })
         }
     };
@@ -16155,6 +16769,7 @@ where
                 occupancy: None,
                 execution_evidence: None,
                 proposal: None,
+                diagnostics: proposal_diagnostics,
             })
         }
     };
@@ -16177,6 +16792,7 @@ where
         occupancy: Some(occupancy),
         execution_evidence: Some(execution_evidence),
         proposal: Some(proposal),
+        diagnostics: Vec::new(),
     })
 }
 
@@ -16239,6 +16855,9 @@ where
             state: FineEvaluationState::EvaluatedIneligible,
             record: None,
             member_execution_count: 0,
+            diagnostics: vec![
+                "该 temporal group 没有 intrinsically eligible 的 raw member。".to_string(),
+            ],
         });
     }
     let allowed_member_executions = remaining_component_member_executions
@@ -16251,11 +16870,15 @@ where
             state: FineEvaluationState::ResourceBlocked,
             record: None,
             member_execution_count: 0,
+            diagnostics: vec![
+                "该 temporal group 的 raw member 数超过剩余 fine 执行预算。".to_string()
+            ],
         });
     }
     let mut blocked_state = None;
     let mut best = None::<(usize, V2FineMemberEvaluation)>;
     let mut member_execution_count = 0_usize;
+    let mut diagnostics = Vec::<String>::new();
     for member_index in eligible_member_indices {
         check_cancelled(Some(context.cancel_flag))?;
         member_execution_count = member_execution_count
@@ -16275,6 +16898,14 @@ where
             )?,
             update_progress,
         )?;
+        for diagnostic in &evaluated.diagnostics {
+            if diagnostics.len() >= 256 {
+                break;
+            }
+            if !diagnostics.contains(diagnostic) {
+                diagnostics.push(diagnostic.clone());
+            }
+        }
         blocked_state = v2_fine_group_blocked_state(blocked_state, evaluated.state);
         if matches!(evaluated.state, FineEvaluationState::Scored { .. }) {
             let replace = best.as_ref().is_none_or(|(best_index, best)| {
@@ -16291,6 +16922,7 @@ where
             state: blocked_state,
             record: None,
             member_execution_count,
+            diagnostics,
         });
     }
     let Some((_selected_member_index, mut best)) = best else {
@@ -16298,6 +16930,7 @@ where
             state: FineEvaluationState::EvaluatedIneligible,
             record: None,
             member_execution_count,
+            diagnostics,
         });
     };
     let score = best
@@ -16322,6 +16955,7 @@ where
             proposal: Box::new(proposal),
         }),
         member_execution_count,
+        diagnostics: Vec::new(),
     })
 }
 
@@ -16449,6 +17083,7 @@ where
     let mut member_execution_count = 0_usize;
     let mut cumulative_search = zero_v2_fine_search_stats();
     let mut records = HashMap::<FineCandidateId, V2FineGroupEvaluationRecord>::new();
+    let mut diagnostics_by_pair = HashMap::<usize, Vec<String>>::new();
     let mut candidate_index_by_id = HashMap::<FineCandidateId, usize>::new();
     for (index, candidate) in inventory.candidates.iter().enumerate() {
         if candidate_index_by_id.insert(candidate.id, index).is_some() {
@@ -16570,6 +17205,7 @@ where
                 refinement_round_count,
                 evaluated_candidate_count,
                 records,
+                diagnostics_by_pair,
             });
         }
         if outcome.next_refinement.candidate_ids.is_empty() {
@@ -16683,6 +17319,15 @@ where
                 .expect("remaining member execution budget already proved checked addition");
             let state = evaluation.state;
             let record = evaluation.record;
+            let pair_diagnostics = diagnostics_by_pair.entry(binding.pair_index).or_default();
+            for diagnostic in evaluation.diagnostics {
+                if pair_diagnostics.len() >= 256 {
+                    break;
+                }
+                if !pair_diagnostics.contains(&diagnostic) {
+                    pair_diagnostics.push(diagnostic);
+                }
+            }
             if matches!(
                 state,
                 FineEvaluationState::Unresolved | FineEvaluationState::Cancelled
@@ -16771,22 +17416,36 @@ where
 fn create_v2_fine_frontier_blocked_proposal(
     coarse: &Result<V2PairCoarseCandidates, String>,
     reason: &str,
+    fine_diagnostics: Option<&[String]>,
 ) -> AudioAlignmentProposal {
     match coarse {
-        Ok(coarse) => create_blocked_v2_proposal(
-            reason,
-            coarse
-                .candidates
-                .first()
-                .map(|candidate| &candidate.source_input),
-            coarse
-                .candidates
-                .first()
-                .map(|candidate| &candidate.target_input),
-            Some(0.0),
-            coarse.alternatives.clone(),
-            coarse.diagnostics.clone(),
-        ),
+        Ok(coarse) => {
+            let mut diagnostics = coarse.diagnostics.clone();
+            if let Some(fine_diagnostics) = fine_diagnostics {
+                for diagnostic in fine_diagnostics {
+                    if diagnostics.len() >= 256 {
+                        break;
+                    }
+                    if !diagnostics.contains(diagnostic) {
+                        diagnostics.push(format!("fine 质量诊断：{diagnostic}"));
+                    }
+                }
+            }
+            create_blocked_v2_proposal(
+                reason,
+                coarse
+                    .candidates
+                    .first()
+                    .map(|candidate| &candidate.source_input),
+                coarse
+                    .candidates
+                    .first()
+                    .map(|candidate| &candidate.target_input),
+                Some(0.0),
+                coarse.alternatives.clone(),
+                diagnostics,
+            )
+        }
         Err(error) => {
             create_blocked_v2_proposal(reason, None, None, None, Vec::new(), vec![error.clone()])
         }
@@ -17097,6 +17756,10 @@ fn execute_v2_fine_frontier_batch(
                         create_v2_fine_frontier_blocked_proposal(
                             &coarse_by_pair[*pair_index],
                             reason,
+                            resolution
+                                .diagnostics_by_pair
+                                .get(pair_index)
+                                .map(Vec::as_slice),
                         ),
                     )),
                 )
@@ -18571,16 +19234,17 @@ fn update_audio_alignment_batch_pair_progress(
         return Ok(());
     }
     let clamped = pair_progress.clamp(0.0, 1.0);
-    let pair_ordinal = {
+    let (pair_ordinal, message_changed) = {
         let pair = entry
             .snapshot
             .pairs
             .get_mut(pair_index)
             .ok_or_else(|| "批量音频对齐 pair 索引越界。".to_string())?;
+        let message_changed = pair.message != message;
         pair.status = AudioAlignmentJobStatus::Running;
         pair.progress = clamped;
         pair.message = message.to_string();
-        pair.pair_ordinal
+        (pair.pair_ordinal, message_changed)
     };
     entry.snapshot.status = AudioAlignmentJobStatus::Running;
     entry.snapshot.current_pair_ordinal = Some(pair_ordinal);
@@ -18593,8 +19257,87 @@ fn update_audio_alignment_batch_pair_progress(
         "正在执行第 {pair_ordinal}/{} 个 pair：{message}",
         entry.snapshot.total_pair_count
     );
+    if message_changed {
+        append_audio_alignment_batch_diagnostic_event_to_entry(
+            entry,
+            AudioAlignmentBatchDiagnosticLevel::Info,
+            "pair.progress",
+            None,
+            Some(pair_ordinal),
+            message,
+            None,
+        );
+    }
     entry.snapshot.updated_at_ms = current_time_ms();
     Ok(())
+}
+
+fn append_audio_alignment_batch_diagnostic_event(
+    job_id: &str,
+    level: AudioAlignmentBatchDiagnosticLevel,
+    stage_key: &str,
+    media_ordinal: Option<usize>,
+    pair_ordinal: Option<usize>,
+    message: &str,
+    duration_ms: Option<u64>,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    append_audio_alignment_batch_diagnostic_event_to_entry(
+        entry,
+        level,
+        stage_key,
+        media_ordinal,
+        pair_ordinal,
+        message,
+        duration_ms,
+    );
+    entry.snapshot.updated_at_ms = current_time_ms();
+    Ok(())
+}
+
+fn append_audio_alignment_batch_diagnostic_event_to_entry(
+    entry: &mut AudioAlignmentBatchJobEntry,
+    level: AudioAlignmentBatchDiagnosticLevel,
+    stage_key: &str,
+    media_ordinal: Option<usize>,
+    pair_ordinal: Option<usize>,
+    message: &str,
+    duration_ms: Option<u64>,
+) {
+    let stage_key = stage_key.trim();
+    let message = message.trim();
+    if stage_key.is_empty() || message.is_empty() {
+        return;
+    }
+    let sequence = entry.next_diagnostic_sequence;
+    entry.next_diagnostic_sequence = entry.next_diagnostic_sequence.saturating_add(1);
+    entry
+        .snapshot
+        .diagnostic_events
+        .push(AudioAlignmentBatchDiagnosticEvent {
+            sequence,
+            at_ms: current_time_ms(),
+            elapsed_ms: u64::try_from(entry.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            level,
+            stage_key: stage_key.to_string(),
+            media_ordinal,
+            pair_ordinal,
+            message: message.to_string(),
+            duration_ms,
+        });
+    if entry.snapshot.diagnostic_events.len() > MAX_AUDIO_ALIGNMENT_BATCH_DIAGNOSTIC_EVENTS {
+        let overflow = entry
+            .snapshot
+            .diagnostic_events
+            .len()
+            .saturating_sub(MAX_AUDIO_ALIGNMENT_BATCH_DIAGNOSTIC_EVENTS);
+        entry.snapshot.diagnostic_events.drain(0..overflow);
+    }
 }
 
 fn update_audio_alignment_batch_phase(
@@ -18614,6 +19357,7 @@ fn update_audio_alignment_batch_phase(
     ) {
         return Ok(());
     }
+    let message_changed = entry.snapshot.message != message;
     entry.snapshot.status = AudioAlignmentJobStatus::Running;
     entry.snapshot.current_pair_ordinal = None;
     entry.snapshot.progress = entry.snapshot.progress.max(progress.clamp(0.0, 1.0));
@@ -18622,6 +19366,17 @@ fn update_audio_alignment_batch_phase(
         if pair.status == AudioAlignmentJobStatus::Queued {
             pair.message = message.to_string();
         }
+    }
+    if message_changed {
+        append_audio_alignment_batch_diagnostic_event_to_entry(
+            entry,
+            AudioAlignmentBatchDiagnosticLevel::Info,
+            "batch.phase",
+            None,
+            None,
+            message,
+            None,
+        );
     }
     entry.snapshot.updated_at_ms = current_time_ms();
     Ok(())
@@ -18831,6 +19586,33 @@ fn mark_audio_alignment_batch_cancelled(entry: &mut AudioAlignmentBatchJobEntry)
 
 fn mark_audio_alignment_batch_terminal(entry: &mut AudioAlignmentBatchJobEntry) {
     if entry.terminal_sequence.is_none() {
+        let (level, stage_key) = match entry.snapshot.status {
+            AudioAlignmentJobStatus::Completed => {
+                (AudioAlignmentBatchDiagnosticLevel::Info, "batch.completed")
+            }
+            AudioAlignmentJobStatus::Cancelled => (
+                AudioAlignmentBatchDiagnosticLevel::Warning,
+                "batch.cancelled",
+            ),
+            AudioAlignmentJobStatus::Failed => {
+                (AudioAlignmentBatchDiagnosticLevel::Error, "batch.failed")
+            }
+            AudioAlignmentJobStatus::Queued | AudioAlignmentJobStatus::Running => (
+                AudioAlignmentBatchDiagnosticLevel::Warning,
+                "batch.terminal-with-nonterminal-status",
+            ),
+        };
+        let message = entry.snapshot.message.clone();
+        let elapsed_ms = u64::try_from(entry.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        append_audio_alignment_batch_diagnostic_event_to_entry(
+            entry,
+            level,
+            stage_key,
+            None,
+            None,
+            &message,
+            Some(elapsed_ms),
+        );
         entry.terminal_sequence =
             Some(AUDIO_ALIGNMENT_BATCH_TERMINAL_SEQUENCE.fetch_add(1, Ordering::Relaxed));
     }
@@ -22974,6 +23756,7 @@ mod tests {
             fine_features: None,
             cache_key: "test-window-artifact".to_string(),
             cache_hit: false,
+            cache_origin: V2ArtifactCacheOrigin::NewMemoryOnly,
             spectral_backend: SpectralBackendExecution {
                 backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
                 requested_backend: "streaming-cpu".to_string(),
@@ -23151,6 +23934,7 @@ mod tests {
                         v2_test_fine_occupancy(1, 0, 1_000, 2, 0, 1_000),
                     )),
                     member_execution_count: 1,
+                    diagnostics: Vec::new(),
                 })
             },
         )
@@ -23201,6 +23985,7 @@ mod tests {
                     state: FineEvaluationState::ResourceBlocked,
                     record: None,
                     member_execution_count: 0,
+                    diagnostics: Vec::new(),
                 })
             },
         )
@@ -23244,6 +24029,7 @@ mod tests {
                     state: FineEvaluationState::EvidenceBlocked,
                     record: None,
                     member_execution_count: 1,
+                    diagnostics: Vec::new(),
                 })
             },
         )
@@ -23300,6 +24086,7 @@ mod tests {
                     state: FineEvaluationState::EvaluatedIneligible,
                     record: None,
                     member_execution_count: 1,
+                    diagnostics: Vec::new(),
                 })
             },
         )
@@ -23433,6 +24220,50 @@ mod tests {
     }
 
     #[test]
+    fn v2_fine_frontier_preserves_ineligible_quality_diagnostics_by_pair() {
+        let id = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![v2_test_unresolved_fine_candidate(id, 900_000)],
+        };
+        let bindings = vec![v2_test_fine_binding(id)];
+
+        let resolution = resolve_v2_fine_frontier_component_with(
+            vec![0],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            None,
+            |_, _, _| {
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::EvaluatedIneligible,
+                    record: None,
+                    member_execution_count: 1,
+                    diagnostics: vec![
+                        "Final blocked TimeMap：source coverage 12.5%，P95=420 ms。".to_string()
+                    ],
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.outcome.state,
+            CoreFineFrontierState::NoEligibleCandidate
+        );
+        assert_eq!(
+            resolution.diagnostics_by_pair.get(&0).unwrap(),
+            &vec!["Final blocked TimeMap：source coverage 12.5%，P95=420 ms。".to_string()]
+        );
+    }
+
+    #[test]
     fn v2_fine_frontier_second_assignment_uses_fine_physical_occupancy() {
         let first_pair = FineCandidateId {
             pair_ordinal: 1,
@@ -23486,6 +24317,7 @@ mod tests {
                     },
                     record: Some(v2_test_fine_record(binding.id, score, occupancy)),
                     member_execution_count: 1,
+                    diagnostics: Vec::new(),
                 })
             },
         )
@@ -27080,6 +27912,213 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires user-provided real media and can run for several minutes"]
+    fn production_real_media_identity_profile_from_environment() {
+        let source_path = std::env::var("C137_REAL_MEDIA_SOURCE")
+            .expect("C137_REAL_MEDIA_SOURCE must point to one reference video");
+        assert!(
+            Path::new(&source_path).is_file(),
+            "C137_REAL_MEDIA_SOURCE is not a file"
+        );
+
+        let started_at = std::time::Instant::now();
+        let identity = probe_media_content_identity_cancellable(Path::new(&source_path), None)
+            .expect("real-media full-file identity must complete");
+        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        eprintln!(
+            "C137 real-media identity profile: elapsedMs={elapsed_ms} sizeBytes={} algorithm={}",
+            identity.size_bytes, identity.algorithm
+        );
+    }
+
+    #[test]
+    #[ignore = "requires user-provided real media and can run for several minutes"]
+    fn production_real_media_audio_pts_profile_from_environment() {
+        let source_path = std::env::var("C137_REAL_MEDIA_SOURCE")
+            .expect("C137_REAL_MEDIA_SOURCE must point to one reference video");
+        assert!(
+            Path::new(&source_path).is_file(),
+            "C137_REAL_MEDIA_SOURCE is not a file"
+        );
+        let identity = probe_media_content_identity_cancellable(Path::new(&source_path), None)
+            .expect("real-media full-file identity must complete");
+
+        let started_at = std::time::Instant::now();
+        let timelines = probe_audio_decode_timelines_with_ffprobe_cancellable(
+            &source_path,
+            Path::new("ffprobe"),
+            &identity,
+            None,
+        )
+        .expect("real-media audio PTS profile must complete");
+        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let decoded_frame_count = timelines
+            .values()
+            .map(|timeline| timeline.decoded_frame_count)
+            .sum::<u64>();
+        eprintln!(
+            "C137 real-media audio PTS profile: elapsedMs={elapsed_ms} streamCount={} decodedFrameCount={decoded_frame_count}",
+            timelines.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires user-provided real media and can run for several minutes"]
+    fn production_real_media_batch_smoke_from_environment() {
+        let source_path = std::env::var("C137_REAL_MEDIA_SOURCE")
+            .expect("C137_REAL_MEDIA_SOURCE must point to one reference video");
+        let target_paths = std::env::var("C137_REAL_MEDIA_TARGETS")
+            .expect("C137_REAL_MEDIA_TARGETS must contain | separated target video paths")
+            .split('|')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            Path::new(&source_path).is_file(),
+            "C137_REAL_MEDIA_SOURCE is not a file"
+        );
+        assert!(
+            !target_paths.is_empty(),
+            "C137_REAL_MEDIA_TARGETS must contain at least one path"
+        );
+        for target_path in &target_paths {
+            assert!(
+                Path::new(target_path).is_file(),
+                "C137_REAL_MEDIA_TARGETS contains a non-file path"
+            );
+        }
+        let spectral_backend = match std::env::var("C137_REAL_MEDIA_BACKEND")
+            .unwrap_or_else(|_| "cuda".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "auto" => SpectralBackendPreference::Auto,
+            "cpu" => SpectralBackendPreference::Cpu,
+            "cuda" => SpectralBackendPreference::Cuda,
+            value => panic!("C137_REAL_MEDIA_BACKEND must be auto, cpu, or cuda; got {value:?}"),
+        };
+        let requested_backend = match spectral_backend {
+            SpectralBackendPreference::Auto => "auto",
+            SpectralBackendPreference::Cpu => "cpu",
+            SpectralBackendPreference::Cuda => "cuda",
+        };
+        let request = AudioAlignmentBatchRequest {
+            schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
+            sources: vec![AudioAlignmentBatchMediaRequest {
+                media_id: "real-reference-001".to_string(),
+                path: source_path,
+                audio_stream_index: None,
+                video_stream_index: None,
+            }],
+            targets: target_paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| AudioAlignmentBatchMediaRequest {
+                    media_id: format!("real-target-{:03}", index + 1),
+                    path: path.clone(),
+                    audio_stream_index: None,
+                    video_stream_index: None,
+                })
+                .collect(),
+            pairs: None,
+            version_reuse_groups: Vec::new(),
+            ffmpeg_path: Some("ffmpeg".to_string()),
+            ffprobe_path: Some("ffprobe".to_string()),
+            spectral_backend: Some(spectral_backend),
+            sample_rate: None,
+            window_ms: Some(1_000),
+            match_threshold: Some(0.35),
+            min_gap_ms: Some(3_000),
+            max_cells: None,
+            enable_visual_evidence: Some(false),
+            visual_sample_interval_ms: None,
+            localization_mode: Some(true),
+        };
+
+        let plan =
+            plan_audio_alignment_batch(request).expect("real-media batch plan must validate");
+        let job_id = format!("real-media-smoke-{}", current_time_ms());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        insert_audio_alignment_batch_job(&job_id, &plan, cancel_flag.clone())
+            .expect("real-media batch job must enter the native queue");
+        let worker_job_id = job_id.clone();
+        let started_at = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            run_audio_alignment_batch_job(worker_job_id, cancel_flag, plan);
+        });
+        let terminal = loop {
+            let snapshot =
+                get_audio_alignment_batch_job(job_id.clone()).expect("real-media job must exist");
+            eprintln!(
+                "C137 real-media smoke: elapsed={}s status={:?} progress={:.3} processed={}/{} failed={} current={:?} message={}",
+                started_at.elapsed().as_secs(),
+                snapshot.status,
+                snapshot.progress,
+                snapshot.processed_pair_count,
+                snapshot.total_pair_count,
+                snapshot.failed_pair_count,
+                snapshot.current_pair_ordinal,
+                snapshot.message
+            );
+            if matches!(
+                snapshot.status,
+                AudioAlignmentJobStatus::Completed
+                    | AudioAlignmentJobStatus::Failed
+                    | AudioAlignmentJobStatus::Cancelled
+            ) {
+                break snapshot;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        };
+        worker
+            .join()
+            .expect("real-media batch worker must not panic");
+
+        let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let receipt = serde_json::json!({
+            "schemaVersion": 1,
+            "evidenceKind": "c137-development-real-media-smoke",
+            "releaseEligible": false,
+            "requestedBackend": requested_backend,
+            "elapsedMs": elapsed_ms,
+            "snapshot": terminal
+        });
+        if let Ok(output_path) = std::env::var("C137_REAL_MEDIA_OUTPUT") {
+            let output_path = PathBuf::from(output_path);
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .expect("real-media smoke output directory must be writable");
+            }
+            std::fs::write(
+                output_path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&receipt)
+                        .expect("real-media smoke receipt must serialize")
+                ),
+            )
+            .expect("real-media smoke receipt must be writable");
+        }
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&receipt)
+                .expect("real-media smoke receipt must serialize")
+        );
+        assert_eq!(
+            terminal.status,
+            AudioAlignmentJobStatus::Completed,
+            "real-media batch failed: {:?}",
+            terminal.error
+        );
+        assert_eq!(
+            terminal.failed_pair_count, 0,
+            "real-media batch contains failed pairs"
+        );
+    }
+
+    #[test]
     fn ffmpeg_v2_vfr_container_keeps_audio_pts_and_bilateral_edit_boundaries() {
         if !ffmpeg_test_tools_available() {
             eprintln!("跳过 Alignment V2 VFR 金标准：ffmpeg/ffprobe 不可用。");
@@ -28102,6 +29141,72 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.resident_bytes, 0);
         assert_eq!(cache.access_clock, 0);
+    }
+
+    #[test]
+    fn persistent_v2_coarse_cache_round_trips_path_free_and_rejects_tampering() {
+        let root = std::env::temp_dir().join(format!(
+            "c137-persistent-coarse-cache-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        let cache_key =
+            r"engine=v2|content=sha256:secret-content|logicalPath=C:\private\episode.mkv";
+        let artifact = V2MediaArtifact {
+            pcm: None,
+            landmarks: Arc::new(vec![
+                SpectralLandmark {
+                    hash: (1_u64 << 16) | (2_u64 << 8) | 3,
+                    time_ms: 1_000,
+                    strength_milli: 900,
+                },
+                SpectralLandmark {
+                    hash: (2_u64 << 16) | (3_u64 << 8) | 4,
+                    time_ms: 2_000,
+                    strength_milli: 800,
+                },
+            ]),
+            fine_features: None,
+            spectral_backend: SpectralBackendExecution {
+                backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
+                requested_backend: "cpu".to_string(),
+                backend_detail: "test persistent coarse backend".to_string(),
+                fallback_reason: None,
+            },
+            presentation_bounds: PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 10_000,
+            },
+        };
+
+        write_persistent_v2_coarse_artifact_at(&root, cache_key, &artifact).unwrap();
+        let digest = persistent_v2_coarse_cache_key_digest(cache_key);
+        let path = persistent_v2_coarse_cache_path(&root, &digest);
+        let stored_text = fs::read_to_string(&path).unwrap();
+        assert!(!stored_text.contains(r"C:\private"));
+        assert!(!stored_text.contains("secret-content"));
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "atomic write must leave no temporary file"
+        );
+
+        let loaded = load_persistent_v2_coarse_artifact_at(&root, cache_key).unwrap();
+        assert_eq!(loaded.landmarks.as_ref(), artifact.landmarks.as_ref());
+        assert_eq!(loaded.spectral_backend, artifact.spectral_backend);
+        assert_eq!(loaded.presentation_bounds, artifact.presentation_bounds);
+
+        let mut tampered =
+            serde_json::from_str::<PersistentV2CoarseEnvelope>(&fs::read_to_string(&path).unwrap())
+                .unwrap();
+        tampered.payload.landmarks[0].strength_milli += 1;
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(load_persistent_v2_coarse_artifact_at(&root, cache_key).is_none());
+        assert!(
+            !path.exists(),
+            "invalid cache artifact must be quarantined by deletion"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -30994,12 +32099,15 @@ mod tests {
                 processed_pair_count: 0,
                 failed_pair_count: 0,
                 current_pair_ordinal: None,
+                diagnostic_events: Vec::new(),
                 pairs: Vec::new(),
                 error: None,
                 updated_at_ms: 0,
             },
             cancel_flag: Arc::new(AtomicBool::new(false)),
             terminal_sequence,
+            started_at: Instant::now(),
+            next_diagnostic_sequence: 1,
         }
     }
 

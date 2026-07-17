@@ -1082,6 +1082,7 @@ function createTerminalSnapshot(
     processedPairCount: pairs.length,
     failedPairCount,
     currentPairOrdinal: null,
+    diagnosticEvents: [],
     pairs,
     error: null,
     updatedAtMs: 2

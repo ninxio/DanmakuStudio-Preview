@@ -49,6 +49,7 @@ import {
   getTauriAudioAlignmentBatchJob,
   isAudioAlignmentJobFinished,
   startTauriAudioAlignmentBatchJob,
+  type AudioAlignmentBatchDiagnosticEvent,
   type AudioAlignmentBatchJobSnapshot,
   type AudioAlignmentBatchFineCandidateIdSnapshot,
   type AudioAlignmentBatchPairSnapshot
@@ -897,17 +898,24 @@ function batchTaskPatchFromPairSnapshot(
 ): Partial<BatchTask> {
   const batchMessage = batchSnapshot.message.trim();
   const pairMessage = snapshot.message.trim();
+  const diagnosticLogs = formatBatchDiagnosticEvents(
+    batchSnapshot.diagnosticEvents,
+    snapshot.pairOrdinal
+  );
   const base = {
     jobId: batchSnapshot.jobId,
     progress: Math.max(snapshot.progress, batchSnapshot.progress),
-    logs: pairMessage ? [pairMessage] : []
+    logs: diagnosticLogs.length > 0 ? diagnosticLogs : pairMessage ? [pairMessage] : []
   };
   if (snapshot.status === "queued") {
     if (batchSnapshot.status === "running" && batchSnapshot.currentPairOrdinal === null) {
       return {
         ...base,
         state: "running",
-        logs: [...new Set([batchMessage, pairMessage].filter((message) => message.length > 0))],
+        logs:
+          diagnosticLogs.length > 0
+            ? diagnosticLogs
+            : [...new Set([batchMessage, pairMessage].filter((message) => message.length > 0))],
         message: batchMessage || pairMessage || "正在进行整批共享预处理"
       };
     }
@@ -953,6 +961,43 @@ function batchTaskPatchFromPairSnapshot(
     progress: 1,
     message: disposition.message
   };
+}
+
+function formatBatchDiagnosticEvents(
+  events: readonly AudioAlignmentBatchDiagnosticEvent[],
+  pairOrdinal: number
+): string[] {
+  return events
+    .filter((event) => event.pairOrdinal === null || event.pairOrdinal === pairOrdinal)
+    .map((event) => {
+      const scope =
+        event.pairOrdinal !== null
+          ? `组合 #${event.pairOrdinal}`
+          : event.mediaOrdinal !== null
+            ? `素材 #${event.mediaOrdinal}`
+            : "批次";
+      const duration =
+        event.durationMs === null
+          ? ""
+          : `（本阶段耗时 ${formatDiagnosticDuration(event.durationMs)}）`;
+      const level = event.level === "error" ? "错误" : event.level === "warning" ? "注意" : "信息";
+      return `[+${formatDiagnosticDuration(event.elapsedMs)}] [${level}] [${scope}] ${event.message}${duration}`;
+    });
+}
+
+function formatDiagnosticDuration(milliseconds: number): string {
+  const totalSeconds = Math.floor(milliseconds / 1_000);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  const fraction = Math.floor(milliseconds % 1_000)
+    .toString()
+    .padStart(3, "0");
+  return hours > 0
+    ? `${hours}:${minutes.toString().padStart(2, "0")}:${seconds
+        .toString()
+        .padStart(2, "0")}.${fraction}`
+    : `${minutes}:${seconds.toString().padStart(2, "0")}.${fraction}`;
 }
 
 function describeNativeFineDisposition(
@@ -1189,8 +1234,13 @@ function BatchTaskList({ tasks, project }: { tasks: BatchTask[]; project: Editor
               </div>
               {task.logs.length > 0 ? (
                 <details className="mt-1 text-[11px] text-slate-500">
-                  <summary className="cursor-pointer">任务日志</summary>
-                  <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap">
+                  <summary className="cursor-pointer">
+                    运行诊断（{task.logs.length} 条，已隐藏媒体路径和内容摘要）
+                  </summary>
+                  <pre
+                    className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-2 leading-5"
+                    aria-label="脱敏运行诊断"
+                  >
                     {task.logs.join("\n")}
                   </pre>
                 </details>

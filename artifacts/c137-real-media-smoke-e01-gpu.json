@@ -1,0 +1,340 @@
+{
+  "elapsedMs": 4225421,
+  "evidenceKind": "c137-development-real-media-smoke",
+  "releaseEligible": false,
+  "requestedBackend": "cuda",
+  "schemaVersion": 1,
+  "snapshot": {
+    "currentPairOrdinal": null,
+    "error": null,
+    "evidenceVersion": 5,
+    "failedPairCount": 0,
+    "jobId": "real-media-smoke-1784289715678",
+    "message": "批量音频对齐完成：1 个 pair 均已真实执行。",
+    "pairingMode": "fullCartesian",
+    "pairs": [
+      {
+        "error": null,
+        "fineExecutionEvidence": null,
+        "fineFrontier": {
+          "bestCompleted": {
+            "candidateIds": [],
+            "totalScoreMicros": 0
+          },
+          "componentOrdinal": 1,
+          "componentPairOrdinals": [
+            1
+          ],
+          "contractVersion": "alignment-v2-adaptive-fine-frontier-v3",
+          "deferredCandidateCount": 0,
+          "evaluatedCandidateCount": 2,
+          "finalState": "noEligibleCandidate",
+          "inventoryCandidateCount": 2,
+          "inventoryCandidates": [
+            {
+              "coarseUpperBoundMicros": 212238,
+              "id": {
+                "candidateOrdinal": 1,
+                "pairOrdinal": 1
+              },
+              "members": [
+                {
+                  "globalScore": 0.25468531729982596,
+                  "inlierCount": 56,
+                  "offsetMs": 22704,
+                  "rank": 1,
+                  "scale": 0.9999809790971971,
+                  "score": 0.726484558491603,
+                  "sourceEndMs": 3067859,
+                  "sourceStartMs": 0,
+                  "sourceStreamIndex": 1,
+                  "targetEndMs": 3090504,
+                  "targetStartMs": 0,
+                  "targetStreamIndex": 1,
+                  "temporalCoverage": 0.8415220540055106,
+                  "uniqueSourceCoverage": 0.0005264889766370517
+                },
+                {
+                  "globalScore": 0.2514335538372585,
+                  "inlierCount": 56,
+                  "offsetMs": 22748,
+                  "rank": 2,
+                  "scale": 0.9999897008701015,
+                  "score": 0.71720288104301,
+                  "sourceEndMs": 3067788,
+                  "sourceStartMs": 0,
+                  "sourceStreamIndex": 1,
+                  "targetEndMs": 3090504,
+                  "targetStartMs": 0,
+                  "targetStreamIndex": 1,
+                  "temporalCoverage": 0.8415293937093676,
+                  "uniqueSourceCoverage": 0.0005264889766370517
+                }
+              ],
+              "sourceAxisReuseGroupOrdinal": null,
+              "targetAxisReuseGroupOrdinal": null
+            },
+            {
+              "coarseUpperBoundMicros": 165397,
+              "id": {
+                "candidateOrdinal": 2,
+                "pairOrdinal": 1
+              },
+              "members": [
+                {
+                  "globalScore": 0.198475809830015,
+                  "inlierCount": 8,
+                  "offsetMs": 34460,
+                  "rank": 3,
+                  "scale": 0.9950660735445668,
+                  "score": 0.5665171655291462,
+                  "sourceEndMs": 3071198,
+                  "sourceStartMs": 0,
+                  "sourceStreamIndex": 1,
+                  "targetEndMs": 3090504,
+                  "targetStartMs": 0,
+                  "targetStreamIndex": 1,
+                  "temporalCoverage": 0.7966781364035186,
+                  "uniqueSourceCoverage": 0.00007521271094815024
+                }
+              ],
+              "sourceAxisReuseGroupOrdinal": null,
+              "targetAxisReuseGroupOrdinal": null
+            }
+          ],
+          "inventoryDigest": "sha256:ab28b3e909a416301704cfa80590fd702eaa95712fe4b9330736807d5fcfb7b0",
+          "inventoryStateCounts": {
+            "cancelled": 0,
+            "evaluatedIneligible": 2,
+            "evidenceBlocked": 0,
+            "infrastructureFailed": 0,
+            "resourceBlocked": 0,
+            "scored": 0,
+            "unresolved": 0
+          },
+          "limits": {
+            "maxCandidates": 32768,
+            "maxIntervalComparisons": 32000000,
+            "maxIntervalsPerAxis": 4096,
+            "maxSearchExpansions": 8000000,
+            "maxSearchStates": 2000000,
+            "maxTotalIntervals": 262144,
+            "refinementBatchSize": 16
+          },
+          "nextRefinementCandidateIds": [],
+          "optimisticOmitted": null,
+          "overlapToleranceMs": 250,
+          "proof": {
+            "beatsOptimisticOmittedWithMargin": true,
+            "beatsRunnerUpWithMargin": true
+          },
+          "receiptDigest": "sha256:b0620558b09f133d58f42afb7ecc83c24f054ebddf7ad92bab73805232e9193f",
+          "refinementRoundCount": 2,
+          "resolutionMarginMicros": 16980,
+          "resolved": false,
+          "runnerUpCompleted": null,
+          "scoreVersion": "alignment-v2-coarse-upper-times-confidence-v1",
+          "search": {
+            "expansionsConsidered": 0,
+            "intervalComparisons": 0,
+            "statesVisited": 3
+          },
+          "selectedCandidateIds": [],
+          "selectedTotalScoreMicros": null
+        },
+        "globalSelection": {
+          "candidateCount": 3,
+          "decisionCandidate": {
+            "eligible": true,
+            "globalScore": 0.25468531729982596,
+            "globalSelected": false,
+            "inlierCount": 56,
+            "offsetMs": 22704,
+            "rank": 1,
+            "scale": 0.9999809790971971,
+            "score": 0.726484558491603,
+            "sourceEndMs": 3067859,
+            "sourceStartMs": 0,
+            "sourceStreamIndex": 1,
+            "targetEndMs": 3090504,
+            "targetStartMs": 0,
+            "targetStreamIndex": 1,
+            "temporalCoverage": 0.8415220540055106,
+            "uniqueSourceCoverage": 0.0005264889766370517
+          },
+          "decisionRank": 1,
+          "decisionScore": 0.25468531729982596,
+          "eligibleCandidateCount": 3,
+          "margin": 0.012767769642328217,
+          "selected": false,
+          "selectedRank": null,
+          "selectedScore": null,
+          "state": "blocked",
+          "topK": [
+            {
+              "eligible": true,
+              "globalScore": 0.25468531729982596,
+              "globalSelected": false,
+              "inlierCount": 56,
+              "offsetMs": 22704,
+              "rank": 1,
+              "scale": 0.9999809790971971,
+              "score": 0.726484558491603,
+              "sourceEndMs": 3067859,
+              "sourceStartMs": 0,
+              "sourceStreamIndex": 1,
+              "targetEndMs": 3090504,
+              "targetStartMs": 0,
+              "targetStreamIndex": 1,
+              "temporalCoverage": 0.8415220540055106,
+              "uniqueSourceCoverage": 0.0005264889766370517
+            },
+            {
+              "eligible": true,
+              "globalScore": 0.2514335538372585,
+              "globalSelected": false,
+              "inlierCount": 56,
+              "offsetMs": 22748,
+              "rank": 2,
+              "scale": 0.9999897008701015,
+              "score": 0.71720288104301,
+              "sourceEndMs": 3067788,
+              "sourceStartMs": 0,
+              "sourceStreamIndex": 1,
+              "targetEndMs": 3090504,
+              "targetStartMs": 0,
+              "targetStreamIndex": 1,
+              "temporalCoverage": 0.8415293937093676,
+              "uniqueSourceCoverage": 0.0005264889766370517
+            },
+            {
+              "eligible": true,
+              "globalScore": 0.198475809830015,
+              "globalSelected": false,
+              "inlierCount": 8,
+              "offsetMs": 34460,
+              "rank": 3,
+              "scale": 0.9950660735445668,
+              "score": 0.5665171655291462,
+              "sourceEndMs": 3071198,
+              "sourceStartMs": 0,
+              "sourceStreamIndex": 1,
+              "targetEndMs": 3090504,
+              "targetStartMs": 0,
+              "targetStreamIndex": 1,
+              "temporalCoverage": 0.7966781364035186,
+              "uniqueSourceCoverage": 0.00007521271094815024
+            }
+          ]
+        },
+        "message": "当前 pair 已完成并通过批次最终身份复核。",
+        "pairIndex": 0,
+        "pairOrdinal": 1,
+        "progress": 1.0,
+        "proposal": {
+          "anchors": [],
+          "confidence": 0.0,
+          "cutCandidates": [],
+          "diagnostics": [
+            "音轨 #1 → #1 完整 coarse affine universe：98 个 seed、3 个去重 candidate；预览：scale=0.999981,offset=+22704,inliers=56,range=397875-2982575；scale=0.999990,offset=+22748,inliers=56,range=397875-2982575；scale=0.995066,offset=+34460,inliers=8,range=412875-2871925。",
+            "pair coarse temporal-window grouping：完整保留 3 个跨音轨 affine raw candidate，以 bounded intersection-core 归入 2 个稳定时间候选组，共执行 2 次 O(1) group probe；raw candidate 仍逐个计入完整证据集，temporal group 作为 pair-level relation alternative 进入 evidence v3 完整 fine frontier，不是展示用 Top-K。",
+            "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
+            "候选 B 站参考音轨 #1、目标原片音轨 #1 未通过质量门控。",
+            "阻断时 Top1/Top2 margin 为 0.000。",
+            "已保留 3 个候选音轨组合分数；因没有合法定位范围，不生成 timeMap。"
+          ],
+          "evidence": {
+            "algorithm": "alignment-v2-edit-map",
+            "completeFingerprintCount": 0,
+            "confirmedChangeCount": 0,
+            "fingerprintMatchCount": 0,
+            "lowConfidenceRegionCount": 1,
+            "monotonicMatchCount": 0,
+            "offsetClusterCount": 0,
+            "quality": "blocked",
+            "refinedCandidateCount": 0,
+            "signals": [
+              {
+                "kind": "audio",
+                "label": "Alignment V2 landmark + edit-aware DP",
+                "note": "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
+                "observations": 0,
+                "status": "blocked",
+                "weight": 0.0
+              }
+            ],
+            "sourceFingerprintCount": 0,
+            "strongAnchorCount": 0,
+            "timeMappingSegmentCount": 0,
+            "weakAnchorCount": 0
+          }
+        },
+        "relationRanking": {
+          "bestEligibleCandidate": {
+            "globalScore": 0.25468531729982596,
+            "inlierCount": 56,
+            "offsetMs": 22704,
+            "rank": 1,
+            "scale": 0.9999809790971971,
+            "score": 0.726484558491603,
+            "sourceEndMs": 3067859,
+            "sourceStartMs": 0,
+            "sourceStreamIndex": 1,
+            "targetEndMs": 3090504,
+            "targetStartMs": 0,
+            "targetStreamIndex": 1,
+            "temporalCoverage": 0.8415220540055106,
+            "uniqueSourceCoverage": 0.0005264889766370517
+          },
+          "candidateCount": 3,
+          "eligibleCandidateCount": 3,
+          "executionIdentity": {
+            "engineVersion": "alignment-v2.3-rust",
+            "featureVersion": "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v16",
+            "ffmpegBinaryDigest": "sha256:e6d5cad4ab133c37f3db224986992b3fa1235d10c356f94dabb0cdf862013b3e",
+            "ffprobeBinaryDigest": "sha256:9f4452d02b78327492f5e7ada8249adff55b3d6aae21e73d2af2fbda4dabffb9",
+            "nativeExecutableDigest": "sha256:8f6dd83edce16311748d96f55ebc977d57768e8e690665a24281f66e69cec880",
+            "relationScoreVersion": "alignment-v2-pair-intrinsic-global-weight-v1",
+            "schemaVersion": 1,
+            "sourceSpectralBackends": [
+              {
+                "backendDetail": "CUDA/cuFFT device #0 NVIDIA GeForce RTX 4090; bindings=CUDA 13.x ABI via cudarc 0.19.8; driverLibrary=nvcuda.dll; cufftLibrary=cufft64_12.dll; driverRuntime=13030; cufftRuntime=12300（跨 PCM chunk 流式批次）",
+                "backendId": "cuda-cufft-r2c-512-v1",
+                "fallbackReason": null,
+                "requestedBackend": "cuda"
+              }
+            ],
+            "targetSpectralBackends": [
+              {
+                "backendDetail": "CUDA/cuFFT device #0 NVIDIA GeForce RTX 4090; bindings=CUDA 13.x ABI via cudarc 0.19.8; driverLibrary=nvcuda.dll; cufftLibrary=cufft64_12.dll; driverRuntime=13030; cufftRuntime=12300",
+                "backendId": "cuda-cufft-r2c-512-v1",
+                "fallbackReason": null,
+                "requestedBackend": "cuda"
+              }
+            ]
+          },
+          "executionIdentityDigest": "sha256:b03c37401087ac4b8e30d9c6a16814d5e7f1d092b4ed57c7459e9473d29a7177",
+          "score": 0.25468531729982596,
+          "scoreVersion": "alignment-v2-pair-intrinsic-global-weight-v1",
+          "state": "ranked"
+        },
+        "sourceMediaId": "real-reference-001",
+        "status": "completed",
+        "targetMediaId": "real-target-001"
+      }
+    ],
+    "processedPairCount": 1,
+    "progress": 1.0,
+    "schemaVersion": 2,
+    "sourceMediaIds": [
+      "real-reference-001"
+    ],
+    "status": "completed",
+    "targetMediaIds": [
+      "real-target-001"
+    ],
+    "totalPairCount": 1,
+    "updatedAtMs": 1784293937947,
+    "versionReuseGroups": []
+  }
+}
