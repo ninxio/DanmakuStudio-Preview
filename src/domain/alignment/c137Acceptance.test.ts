@@ -7,6 +7,8 @@ import {
   createC137FormalBlindProvenanceFixture,
   type C137FormalBlindProvenanceFixture
 } from "../../test/c137FormalBlindProvenance";
+import { createC137AuthorityProofFixture } from "../../test/c137Authority";
+import { evaluateC137AcceptanceBundleWithAuthority } from "./c137Authority";
 import {
   computeC137PerformanceEnvironmentDigest,
   computeC137PerformanceEnvironmentDigestV2,
@@ -175,6 +177,41 @@ describe("C137 fail-closed acceptance gate", () => {
       });
     }
     expect(gate).toMatchObject({ status: "incomplete-evidence", verifiedEligible: false });
+  });
+
+  it("真实 authority proof 解除 plan/challenge/replay，但不冒充 native execution attestation", async () => {
+    const provenanceFixture = createC137FormalBlindProvenanceFixture();
+    const bundle = createCompleteBundle();
+    bindFormalBlindProvenanceFixture(bundle, provenanceFixture);
+    const authorityFixture = await createC137AuthorityProofFixture(bundle);
+
+    const { gate, verification } = await evaluateC137AcceptanceBundleWithAuthority(
+      bundle,
+      authorityFixture.proof,
+      authorityFixture.policy,
+      new Date("2026-07-17T01:15:00.000Z")
+    );
+
+    expect(verification).toMatchObject({ valid: true, issues: [] });
+    for (const id of [
+      "external-trust-authority",
+      "native-blind-plan-authority",
+      "native-blind-challenge-freshness",
+      "native-blind-replay-ledger"
+    ]) {
+      expect(
+        gate.checks.find((check) => check.id === id),
+        id
+      ).toMatchObject({ status: "pass" });
+    }
+    for (const id of ["native-blind-native-attestation", "native-attestation"]) {
+      expect(
+        gate.checks.find((check) => check.id === id),
+        id
+      ).toMatchObject({ status: "incomplete" });
+    }
+    expect(gate.status).not.toBe("pass");
+    expect(gate.verifiedEligible).toBe(false);
   });
 
   it("调用方重排 global Top-K 并重签全部 report 仍不能越过 formal 全矩阵 exact binding", () => {

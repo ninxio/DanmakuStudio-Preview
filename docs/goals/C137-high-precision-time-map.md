@@ -11,7 +11,7 @@
 1. 在真实媒体冻结测试集达到本目标门槛之前，不得对外宣称自动匹配或删减检测“精度通过”。
 2. 算法的任何结论都先是候选；即使达到高质量门槛，也只能进入可批量人工确认状态，不能静默写入已确认映射。
 
-当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、C137 acceptance bundle v3 / protocol v5 的 fail-closed 聚合器、A/B 播放复核证据 v2，以及 native/raw/acceptance 性能证据链第五阶段。私有 formal blind matrix provenance v2 已把完整 manifest、预注册二维 query×candidate tiles、物理 candidate universe、execution suite、native receipt v2、确定性 raw 与逐 case global ranking 接入 acceptance；每个 pair 的 shard-invariant relation score 在 tile-local assignment/fine 之前冻结，并绑定当前 native executable、固定 FFmpeg/FFprobe 与两端实际 spectral backend/fallback 的 execution identity，只有收齐 actual identity 完全一致的 exhaustive matrix 后才能重算 global Top-K，旧式调用方或局部 shard Top-K 不再能靠重签报告形成内容闭环。该 provenance 仍明确是不受信自洽证据，外部 plan authority、native execution attestation、challenge freshness、有状态防重放账本和 modality/calibration 来源尚未完成。性能链继续使用 performance report v3 / raw schema v2，能从生产调用链记录 session-relative 单调时钟、真实阶段边界、冷/热缓存、取消终态和应用进程树 working set，并在任何工具探测前固定全部 workload media、逐 distinct 文件完整哈希、按实际卷生成 path-free storage receipt；session 释放前还会签发 path-free terminal cleanup receipt，绑定全部 native job 终态、后代进程归零、监督器清理、工具/媒体复核、缓存清空与最终 cache generation。Windows 一次性媒体工具仍由独立 lifecycle Job Object 挂起创建、入 Job 后恢复并有界清理；普通对齐 run 的 source/target media lease、run-start/run-final SHA、TimeMap identity、frame/packet PTS、缓存和音画证据继续绑定同一全文件身份。
+当前已完成 production blind benchmark runner、组件级 TimeMap 评测降权、C137 acceptance bundle 的 fail-closed 聚合器、A/B 播放复核证据、native/raw/acceptance 性能证据链，以及仓库外 P-256 authority challenge/replay 工具链。私有 formal blind matrix provenance 已把完整 manifest、预注册二维 query×candidate tiles、物理 candidate universe、execution suite、native receipt、确定性 raw 与逐 case global ranking 接入 acceptance；每个 pair 的 shard-invariant relation score 在 tile-local assignment/fine 之前冻结，并绑定当前 native executable、固定 FFmpeg/FFprobe 与两端实际 spectral backend/fallback 的 execution identity，只有收齐 actual identity 完全一致的 exhaustive matrix 后才能重算 global Top-K，旧式调用方或局部 shard Top-K 不再能靠重签报告形成内容闭环。外部 authority 现在可在运行前签发 plan challenge，并在运行后以 append-only ledger 原子消费和签名完整 bundle；但 production key/policy 尚未 provision，native execution attestation 和 modality/calibration 来源仍未完成。性能链继续使用 performance report v3 / raw schema v2，能从生产调用链记录 session-relative 单调时钟、真实阶段边界、冷/热缓存、取消终态和应用进程树 working set，并在任何工具探测前固定全部 workload media、逐 distinct 文件完整哈希、按实际卷生成 path-free storage receipt；session 释放前还会签发 path-free terminal cleanup receipt，绑定全部 native job 终态、后代进程归零、监督器清理、工具/媒体复核、缓存清空与最终 cache generation。Windows 一次性媒体工具仍由独立 lifecycle Job Object 挂起创建、入 Job 后恢复并有界清理；普通对齐 run 的 source/target media lease、run-start/run-final SHA、TimeMap identity、frame/packet PTS、缓存和音画证据继续绑定同一全文件身份。
 
 当前生产工程模型已升级为 schema v13 / `media-time-map-core-v2`：每个 span 保存稳定 ID、独立训练/真实留出锚点统计、p50/p95/p99/max 残差、独特内容覆盖、左右支持、结构化边界不确定区间、失败原因和备选路径。留出观测在 seed、拟合、排序和 refit 前分区，逐段证据缺失或 blocked 时投影与 verified export 失败关闭；旧项目只会保守补成 `legacy-unverified`，不会从图级平均值伪造逐段测量。桌面 XML 导入同时由 native 固定并读取精确字节、独立解析、写入内容寻址存储并签发安装级 HMAC 收据；`verified-export-manifest-v3` 会绑定收据、完整投影 derivation、项目投影摘要和输出摘要，native 在写盘前重读 CAS 并重算不可变弹幕库存。普通原生 writer 只接受有界 `.txt` 报告，投影 `.xml/.zip` 只能走 verified writer。
 
@@ -19,7 +19,7 @@
 
 `projectSnapshotDigest` 当前是 native 可重算的 canonical 投影摘要，不是带单调 revision/head 的 native 项目意图签名。它和 XML 收据足以阻止“修改原始弹幕并同步重算输出/manifest”的项目 JSON 伪造，但仍不能把已完全控制 Tauri invoke 的 renderer 所提交的 routes、ignored、disabled 或 adjustment 证明为用户原始意图；该更强边界仍需 native project snapshot authority、单调 head 和明确 user-gesture capability，不能在当前阶段冒充已解决。
 
-这些能力解决的是“怎样盲跑生产算法、怎样安全拥有和清理媒体进程树、怎样把实际媒体卷、Job 成员内存和任务收尾绑定到性能记录、怎样防止改字符串/自摘要/跨 workload 复用冒充完整验收”，不代表真实准确率或正式性能验收已经通过。实际 `workload-media-volumes`、Job memory 与 terminal cleanup 三类 receipt 已完成严格生成和重算；raw v2 如实声明 `windows-job-object-working-set-v1`，但 `assurance.attestation` 仍为空，因此不能证明同一 native 采集器自身未被替换。该产物继续固定为 `releaseEligible=false` 的 engineering raw。当前获授权且完成运行的真实冻结关系数仍为 0；实测校准、批准协议与外部信任根、规定目标机的正式性能测量、20 套北极星长合集和真实媒体回归均未完成。
+这些能力解决的是“怎样盲跑生产算法、怎样安全拥有和清理媒体进程树、怎样把实际媒体卷、Job 成员内存和任务收尾绑定到性能记录、怎样防止改字符串/自摘要/跨 workload 复用冒充完整验收”，不代表真实准确率或正式性能验收已经通过。实际 `workload-media-volumes`、Job memory 与 terminal cleanup 三类 receipt 已完成严格生成和重算；raw v2 如实声明 `windows-job-object-working-set-v1`，但 `assurance.attestation` 仍为空，因此不能证明同一 native 采集器自身未被替换。外部 authority 的代码链已完成但当前没有正式 key/policy 实例，产物继续固定为 `releaseEligible=false` 的 engineering raw。当前获授权且完成运行的真实冻结关系数仍为 0；实测校准、批准协议、native attestation、规定目标机的正式性能测量、20 套北极星长合集和真实媒体回归均未完成。
 
 ## 产品目标
 
@@ -413,9 +413,11 @@ production blind benchmark runner 已能执行以下闭环：
 
 现有 `evaluateRealMediaBenchmark` 只评估“已知正确媒体 pair 的 TimeMap 组件”，其 gate 明确为 `time-map-component`。即使 150 个已知 pair 的组件指标全部通过，`verifiedEligible` 仍恒为 `false`，也不能替代 Top-1/Top-K、全局 N×M 分配、校准、性能、北极星、UI 或 release 验收。
 
-完整 C137 acceptance bundle 已定义 versioned protocol、数据审批/preflight/prediction receipts，以及 dataset、关系排名、TimeMap、校准、视觉回退、安全降级、北极星、性能、UI 和 release 原始报告。bundle v3 / protocol v5 / relationship report v3 另有私有 formal blind matrix provenance v2：plan 在运行前锁定完整物理 candidate universe、二维 query×candidate tiles、axis、visual、global K、score contract 与 exhaustive coverage；acceptance 从完整 manifest 重建每个 projection，严格复核 execution 路径、全文件身份、流、full-Cartesian pairs、completed native receipt v2、raw 与 provenance root，并从全部 matrix cell 重算 global Top-K。每个 frozen query 只能产生一次决策，relationship report 的 scope/score/K 与 `decisionId/provenanceRef/case/gold/Top-K/verified` 必须逐项等于派生结果。performance report v3 继续只接受 raw schema v2，并检查实际媒体卷、Job memory、terminal cleanup 与 native attestation。旧 bundle v2/protocol v4/ranking v2/formal v1/native receipt v1、raw v1 和自建 trustContext 均不能晋级。内容自洽不等于来源权威；缺 plan/native authority、challenge/freshness/replay ledger、modality/calibration provenance 或性能 assurance 时仍只能得到 `incomplete-evidence`。
+完整 C137 acceptance bundle 已定义 versioned protocol、数据审批/preflight/prediction receipts，以及 dataset、关系排名、TimeMap、校准、视觉回退、安全降级、北极星、性能、UI 和 release 原始报告。bundle v3 / protocol v5 / relationship report v3 另有私有 formal blind matrix provenance v2：plan 在运行前锁定完整物理 candidate universe、二维 query×candidate tiles、axis、visual、global K、score contract 与 exhaustive coverage；acceptance 从完整 manifest 重建每个 projection，严格复核 execution 路径、全文件身份、流、full-Cartesian pairs、completed native receipt v2、raw 与 provenance root，并从全部 matrix cell 重算 global Top-K。每个 frozen query 只能产生一次决策，relationship report 的 scope/score/K 与 `decisionId/provenanceRef/case/gold/Top-K/verified` 必须逐项等于派生结果。performance report v3 继续只接受 raw schema v2，并检查实际媒体卷、Job memory、terminal cleanup 与 native attestation。旧 bundle v2/protocol v4/ranking v2/formal v1/native receipt v1、raw v1 和自建 trustContext 均不能晋级。
 
-acceptance 不内置可自行放行的非空白名单。当前 `trustContext` 只保存调用方提供的 protocol、三类 receipt 和每份 raw report 的 canonical SHA-256；报告摘要从原始内容重算并排除自身 `evidenceDigest`，所以它可发现快照后的内容变化，却不能证明摘要由独立信任根签发。门禁因此另设固定未完成的 `external-trust-authority` 检查，只有未来验证独立 authority 的签名或受信封装后才可解除。当前 release 尚无正式批准的协议摘要、数据审批 receipt 或外部信任根，因此不存在可用于真实发布放行的 production authority envelope。
+acceptance 不内置可自行放行的非空白名单。当前 `trustContext` 只保存调用方提供的 protocol、三类 receipt 和每份 raw report 的 canonical SHA-256；报告摘要从原始内容重算并排除自身 `evidenceDigest`，所以它可发现快照后的内容变化，却不能证明摘要由独立信任根签发。现在新增独立 `c137:authority` 工具和 `C137AuthorityProofV1` 验证器：私钥必须由 release 进程在仓库外持有；P-256 公钥以 out-of-band trust policy 固定。authority 在结果产生前签发一次性 256-bit nonce challenge，绑定 protocol、manifest、dataset、blind/performance plan、环境、release build 和参数；运行后签名再绑定完整 acceptance bundle、formal provenance、performance raw 和唯一 native executable digest。append-only ledger 为同一 challenge 依次写入唯一 `issued` / `consumed` 动作并签发 checkpoint，重复消费、跨 bundle 复用、过期、低于外部 minimum sequence 的回滚、未命中固定 checkpoint、伪密钥和任一摘要漂移均被拒绝。
+
+authority proof 只能解除外部 trust、blind plan、challenge freshness 与 replay-ledger 检查；它不会自动解除 `native-blind-native-attestation` 或性能 `native-attestation`。原因是普通 P-256 authority 签名只能证明独立审批者签过这些字节，尚不能证明本次进程由受信 Authenticode 构建执行，也不能证明动态结果由 TPM/AIK 保护的不可迁移密钥签发。当前 release 仍未配置 production authority 私钥、公钥白名单、批准协议或 TPM/代码签名 attestation，所以默认应用继续 `incomplete-evidence`，不存在可自行生成并放行的 production envelope。
 
 第四、第五阶段已完成原生性能**工程**原始测量生成器及工作负载媒体卷绑定：
 
@@ -430,7 +432,7 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 9. frame/packet PTS 探测同时绑定 stream snapshot expected identity、FFprobe 前 identity 与 Job 退出后 identity；音频、landmark、legacy/V2 视觉 cache key 都强制绑定 `sha256-full-file-v2`。FFmpeg 成功后、PCM/视觉帧解析前再次核验；视觉证据必须在 cache/decode 前后均与音频 TimeMap 属于同一双端媒体世代，之后才允许附加 visual stream/evidence。
 10. reader 状态机只在 root exit、Job empty、stdout/stderr 全就绪时消费缓冲，修复先完成流在轮询中被提前丢弃的竞态。取消检查延伸到工具退出后的 JSON deserialize 前后、逐 stream/record 归一化、V2 PCM 分块、legacy PCM/频谱分块和视觉逐帧解析；取消后不返回部分 snapshot、缓存或 proposal。
 
-实际媒体卷、Job 成员内存和终态清理回执已经拆成独立、可重算的检查。应用生命周期内的 benchmark accounting Job 固定当前进程及其后续后代；每个 FFmpeg/FFprobe 同时进入自己的 kill-on-close 子 Job，形成可清理的嵌套成员关系。内存采样器从 accounting Job 的精确成员清单读取 working set，并要求采样前后成员集合一致、全部样本成功、全部 native job 覆盖完整且终态进程树归零；会话开始前若已有 Job 后代则直接拒绝，不允许把它们豁免成 baseline。raw v2 因而声明 `windows-job-object-working-set-v1`，Job memory receipt 可在严格重算后单项通过。但 storage、Job memory 和 terminal cleanup receipt 都仍由同一 native 采集器签发，必须由未来的独立 attestation/authority 证明来源真实性。在独立 attestation、获批协议和规定 4 核目标机重复运行完成前，当前 raw 只能用于工程诊断。blind runner 和组件面板的协调器 wall time 同样不能替代正式性能证据。
+实际媒体卷、Job 成员内存和终态清理回执已经拆成独立、可重算的检查。应用生命周期内的 benchmark accounting Job 固定当前进程及其后续后代；每个 FFmpeg/FFprobe 同时进入自己的 kill-on-close 子 Job，形成可清理的嵌套成员关系。内存采样器从 accounting Job 的精确成员清单读取 working set，并要求采样前后成员集合一致、全部样本成功、全部 native job 覆盖完整且终态进程树归零；会话开始前若已有 Job 后代则直接拒绝，不允许把它们豁免成 baseline。raw v2 因而声明 `windows-job-object-working-set-v1`，Job memory receipt 可在严格重算后单项通过。但 storage、Job memory 和 terminal cleanup receipt 都仍由同一 native 采集器签发；新 authority proof 能把它们所在的完整 bundle 交给仓库外审批者签名，却还不能证明采集器进程本身未被替换。在独立 native attestation、获批协议和规定 4 核目标机重复运行完成前，当前 raw 只能用于工程诊断。blind runner 和组件面板的协调器 wall time同样不能替代正式性能证据。
 
 ### 指标
 
@@ -525,11 +527,12 @@ acceptance 不内置可自行放行的非空白名单。当前 `trustContext` �
 - [x] 匹配页高级诊断可一次多选 2–1000 个单 case 治理 bundle，严格校验并确定性合并为可直接运行的多 case development 数据集；重复 case/关系、manifest/coverage/digest 漂移和额外字段均失败关闭，产物始终 `releaseEligible=false`，不冒充 frozen-test 或北极星采集。
 - [x] 原生 N×M batch evidence v1 固定完整 source-major 笛卡尔积、候选数/Top-10/决策候选和原子终态；blind compiler 用显式关系轴、实际视觉模式、两侧独立 salted commitment、严格 `candidateCount > K` 与 projection digest 阻断 gold 编号泄漏、伪候选和跨 manifest 重放，并让公开报告只保留纯聚合指标。
 - [x] formal acceptance 直接消费并重算私有 exhaustive query×candidate matrix plan/projection/execution/native-receipt-v2/raw provenance，并从全部 cell 重算 global Top-K 后逐条绑定 relationship report；调用方或局部 shard 自报 Top-K 不能形成内容闭环。
-- [ ] 为 formal blind plan 和 native execution 增加独立 authority 签名、一次性 challenge、有效期与防重放账本，并把 modality/calibration 纳入冻结审批；在此之前 `native-blind-ranking-provenance` 仍因 `self-consistent-no-native-authority` incomplete。
+- [x] 为 formal blind plan 增加仓库外 P-256 authority 签名、一次性 challenge、有效期与 append-only 防重放账本；proof 严格绑定当前 bundle、formal provenance、performance raw 和唯一 native executable digest，伪密钥/过期/重复消费/跨 bundle/回滚均失败关闭。
+- [ ] 将 native execution 接入可独立验证的 Authenticode/TPM attestation，并把 modality/calibration 纳入冻结审批；在此之前 `native-blind-native-attestation` 与性能 `native-attestation` 继续 incomplete。
 - [x] 解除每侧 64 distinct candidate 的 formal 容量阻断：native 单 tile 提升为每侧 256/总计 256 pair，formal v2 以预注册二维 exhaustive tiles 收齐全部 shard-invariant relation score 后重算 global Top-K；仍禁止拼接局部 Top-K。
 - [ ] pair-local 多窗口 Top-K、编辑/删减分类 F1、双侧边界误差和同一片段多版本 many-to-many fine alignment 进入同一冻结 gold 证据链；当前跨媒体关系 Top-K 不得冒充这些指标。
 
-当前剩余限制：逐段真实留出证据、双侧边界不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷/Job memory/终态清理回执和 fail-closed acceptance v5 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；概率仍必须保持 null，实测校准、批准的 production protocol / trust root、blind plan/native authority、native attestation 和规定目标机正式运行仍未完成，20 套北极星长合集也未完成。formal 跨 tile 只证明完整候选关系排名，不能把 tile-local global assignment、fine TimeMap 或 same-segment many-to-many 当成一个单体超大 batch 的等价结果，因此不能据此宣称准确率或性能达标。
+当前剩余限制：逐段真实留出证据、双侧边界不确定范围、A/B 人工复核、blind runner、lifecycle Job、工程 raw v2、实际媒体卷/Job memory/终态清理回执和 fail-closed acceptance 虽已落地，但获授权且实际运行的真实冻结关系数仍为 0；概率仍必须保持 null。authority/challenge/replay 契约和独立 CLI 已实现，但 production key/policy/批准协议尚未配置，native attestation、modality/calibration 来源和规定目标机正式运行仍未完成，20 套北极星长合集也未完成。formal 跨 tile 只证明完整候选关系排名，不能把 tile-local global assignment、fine TimeMap 或 same-segment many-to-many 当成一个单体超大 batch 的等价结果，因此不能据此宣称准确率或性能达标。
 
 性能执行已完成新的生产切片：匹配页把 1×N、N×1、N×M 一次提交为原生批任务；worker 按 distinct media 只建立一次媒体 lease、全文件身份、timeline/逐帧 PTS、候选音轨与 coarse landmark，再让全部 pair 完成 coarse scoring。合理音轨组合产生的 affine candidate 会先经过有界 fine-window 与活动内存检查；引擎同时构造完整保留成员的跨音轨 temporal-window group，要求 source/target 两轴都覆盖较长窗口至少 80%，并用 complete-link 防止桥接候选吞并两个真实位置。组内按 global objective 排列代表，但当前 exact assignment 继续消费未截断的 candidate universe，因此不会在 eligibility、内存预算或 track ambiguity 之前丢掉音轨备援。项目级 exact branch-and-bound 仍不使用文件名、数组顺序或剧集号先验；搜索超过确定性硬上限时整批失败关闭，未入选或全批 coarse 不完整的候选不会进入 fine。长媒体以有界 CPU 或 CUDA/cuFFT 流建立 coarse 索引；候选只有在至少一侧能提供完整的分集级查询轴，并且完整候选逆投影、全部 coarse inlier support、edit-aware DP 与边界精修所需 guard 都能同时装入两侧各自不超过 60 分钟的精解码窗口、活动内存预算也允许时，才会按仿射窗口进入 fine。双侧都超过 60 分钟且没有完整短轴只是其中一个明确阻断分支；任何窗口内容、必需 guard 或内存预算不满足的候选也会 fail-closed，不会截断后冒充完整时间图。批次 proposal 在最终媒体身份复核前只存在于 worker 私有 staging，完成或取消都必须复核后才原子发布。
 
@@ -542,7 +545,7 @@ N×M blind 组件证据已进一步接入私有 formal matrix provenance v2。na
 ### 真实准确率与发布
 
 - [ ] 真实媒体基准规模、双人标注和冻结集达到要求。
-- [ ] 正式批准 versioned 验收协议、校准/取消阈值、数据审批 receipts 与独立 production trust root。
+- [ ] 正式批准 versioned 验收协议、校准/取消阈值、数据审批 receipts，并 provision 仓库外 production authority 私钥和 out-of-band 公钥/checkpoint policy；代码链已具备但当前没有正式 trust root 实例。
 - [x] 工程性能 raw v2 可在原生独占 session 中输出硬件/工具链、实际 workload media volumes、阶段耗时、冷/热缓存、Job Object 精确成员峰值内存、取消响应和一致性证据，并保持不可晋级状态。
 - [x] V2.1 中间性能层将 PCM/landmark/fine 合并为 768 MiB 字节 LRU 制品，同一主音轨冷路径只解码一次、landmark/fine 每帧只做一次 FFT；以 1 GiB 单任务预算和 native 并发 1 保持总资源有界，并用 exact/FFmpeg 回归证明语义不变。
 - [x] N×M 产品执行已改为 distinct-media 一次预处理、全 pair coarse-before-fine、精确且资源有界的项目级 Top-K 非冲突选择，并只让入选候选进入 fine；长参考不再要求整段 PCM，但仿射窗口 fine 是条件能力：必须存在完整分集级查询轴，完整逆投影、全部 coarse support、DP/边界 guard 均装入每侧不超过 60 分钟的窗口且活动内存预算通过，否则明确阻断。
@@ -552,7 +555,8 @@ N×M blind 组件证据已进一步接入私有 formal matrix provenance v2。na
 - [ ] 同一 pair 内多窗口 Top-K、编辑事件 F1/边界误差及 same-segment many-to-many 形成真实冻结证据并达到批准门槛。
 - [x] 原生 session 释放前生成严格、path-free 的 terminal cleanup receipt，绑定全部 job 终态、进程树归零、监督器清理、工具/媒体复核、缓存清空与最终 cache generation；raw v2 和 acceptance 对其逐项重算并拒绝篡改。
 - [x] 正式性能采集在现有 lifecycle Job 之上实现诚实限定覆盖范围、绑定全部 native job 的 Job working-set receipt。
-- [ ] 实现可由独立信任根验证的 native attestation，并与 authority/challenge/replay 账本闭环。
+- [x] 独立 authority/challenge/expiry/replay ledger 契约、P-256 签发 CLI 和 acceptance 验证器已闭环；默认无 production key/policy 时仍失败关闭。
+- [ ] 实现可由独立信任根验证的 Authenticode/TPM native execution attestation，并与已完成的 authority proof 闭环。
 - [ ] 在规定 4 核目标机按获批协议重复运行并形成受信原始报告。
 - [ ] 所有上线准确率、校准和性能门槛通过并有可重复报告。
 - [ ] 北极星 20 套长合集 5/5 定位和完整导出通过。

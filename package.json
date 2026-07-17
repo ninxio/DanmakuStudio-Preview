@@ -17,6 +17,7 @@
     "verify:release": "corepack pnpm verify && corepack pnpm test:e2e && corepack pnpm tauri:build",
     "format": "prettier --write .",
     "align:audio": "node scripts/audio-align-prototype.mjs",
+    "c137:authority": "node scripts/c137-authority.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
