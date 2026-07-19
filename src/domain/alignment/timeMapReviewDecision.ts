@@ -30,10 +30,24 @@ export interface RecordedTimeMapSpanReview {
   reviewedAt: string;
 }
 
+export interface ManualTimeMapSpanPatch {
+  kind: TimeMapSpanKind;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  targetStartMs: number;
+  targetEndMs: number;
+}
+
+export interface ManualTimeMapSplitPoint {
+  sourceMs: number;
+  targetMs: number;
+}
+
 const REVIEW_NOTE_PREFIX = "manual-span-review:v1:";
 const PLAYBACK_REVIEW_PREFIX = "manual-playback-review:v2:";
 const LEGACY_PLAYBACK_REVIEW_PREFIX = "manual-playback-review:v1:";
 const MANUAL_TAKEOVER_NOTE_PREFIX = "manual-takeover:v1:";
+const MANUAL_STRUCTURE_EDIT_NOTE_PREFIX = "manual-span-structure-edit:v1:";
 const MANUAL_REVIEW_STATE_REASON_PREFIX = "逐段人工复核状态：";
 
 export class TimeMapSpanReviewError extends Error {
@@ -335,6 +349,177 @@ export function reviewCandidateTimeMapSpan(
   };
 }
 
+/**
+ * 人工同时改写一段的双轴边界和语义。相邻段共享的边界会一起移动，避免留下重叠或空洞。
+ * 结构改变后所有旧的逐段分类、播放证据、接管记录和安装级验证都失效。
+ */
+export function editCandidateTimeMapSpan(
+  project: EditorProject,
+  timeMapId: string,
+  spanIndex: number,
+  patch: ManualTimeMapSpanPatch,
+  editedAt: string
+): EditorProject {
+  const { timeMap, candidate } = requireEditableCandidateTimeMap(project, timeMapId);
+  assertSpanIndex(timeMap, spanIndex, "要调整的时间图片段不存在。");
+  assertIsoTimestamp(editedAt, "人工调整时间必须是有效的 ISO 时间戳。");
+  assertManualSpanPatch(patch);
+
+  const completeSpans = normalizeCandidateSpans(timeMap);
+  const touchedIndexes = new Set<number>([spanIndex]);
+  const spans = completeSpans.map((span) => ({ ...span }));
+  const current = spans[spanIndex];
+  spans[spanIndex] = {
+    ...current,
+    ...patch
+  };
+  if (spanIndex > 0) {
+    touchedIndexes.add(spanIndex - 1);
+    spans[spanIndex - 1] = {
+      ...spans[spanIndex - 1],
+      sourceEndMs: patch.sourceStartMs,
+      targetEndMs: patch.targetStartMs
+    };
+  }
+  if (spanIndex + 1 < spans.length) {
+    touchedIndexes.add(spanIndex + 1);
+    spans[spanIndex + 1] = {
+      ...spans[spanIndex + 1],
+      sourceStartMs: patch.sourceEndMs,
+      targetStartMs: patch.targetEndMs
+    };
+  }
+  const invalidatedSpans = spans.map((span, index) =>
+    touchedIndexes.has(index)
+      ? invalidateTimeMapSpanEvidenceForManualReview(
+          span,
+          false,
+          `第 ${index + 1} 段边界受人工调整影响，原算法证据与旧播放复核已失效。`
+        )
+      : span
+  );
+  assertValidManualStructure(invalidatedSpans, "边界调整");
+  const editedMap = createManuallyStructuredCandidateMap(
+    timeMap,
+    invalidatedSpans,
+    editedAt,
+    `用户调整了第 ${spanIndex + 1} 段的双轴边界与类型。`
+  );
+  return replaceEditableCandidateTimeMap(project, candidate.id, editedMap);
+}
+
+/**
+ * 在用户指定的双轴位置拆分一段。零长度轴必须保留在原边界点；正长度轴必须严格位于
+ * 区间内部。拆分不会自动声称新边界准确，必须重新 A/B 复核或明确接管。
+ */
+export function splitCandidateTimeMapSpan(
+  project: EditorProject,
+  timeMapId: string,
+  spanIndex: number,
+  point: ManualTimeMapSplitPoint,
+  editedAt: string
+): EditorProject {
+  const { timeMap, candidate } = requireEditableCandidateTimeMap(project, timeMapId);
+  assertSpanIndex(timeMap, spanIndex, "要拆分的时间图片段不存在。");
+  assertIsoTimestamp(editedAt, "人工拆分时间必须是有效的 ISO 时间戳。");
+  assertMilliseconds(point.sourceMs, "参考拆分位置");
+  assertMilliseconds(point.targetMs, "原片拆分位置");
+
+  const spans = normalizeCandidateSpans(timeMap);
+  const span = spans[spanIndex];
+  assertSplitCoordinate(
+    point.sourceMs,
+    span.sourceStartMs,
+    span.sourceEndMs,
+    "参考拆分位置"
+  );
+  assertSplitCoordinate(
+    point.targetMs,
+    span.targetStartMs,
+    span.targetEndMs,
+    "原片拆分位置"
+  );
+  const idStem = `${span.id}:manual-split:${timeMap.revision + 1}`;
+  const left = invalidateTimeMapSpanEvidenceForManualReview(
+    {
+      ...span,
+      id: `${idStem}:left`,
+      sourceEndMs: point.sourceMs,
+      targetEndMs: point.targetMs
+    },
+    false,
+    `第 ${spanIndex + 1} 段由用户拆分，新左段需要重新复核。`
+  );
+  const right = invalidateTimeMapSpanEvidenceForManualReview(
+    {
+      ...span,
+      id: `${idStem}:right`,
+      sourceStartMs: point.sourceMs,
+      targetStartMs: point.targetMs
+    },
+    false,
+    `第 ${spanIndex + 1} 段由用户拆分，新右段需要重新复核。`
+  );
+  const nextSpans = [...spans.slice(0, spanIndex), left, right, ...spans.slice(spanIndex + 1)];
+  assertValidManualStructure(nextSpans, "拆分");
+  const editedMap = createManuallyStructuredCandidateMap(
+    timeMap,
+    nextSpans,
+    editedAt,
+    `用户在参考 ${point.sourceMs} ms / 原片 ${point.targetMs} ms 拆分了第 ${spanIndex + 1} 段。`
+  );
+  return replaceEditableCandidateTimeMap(project, candidate.id, editedMap);
+}
+
+/**
+ * 合并当前段与下一段。只有相同类型才允许合并，避免把“共同内容+删减”静默抹平成
+ * 一条仿射线。合并后仍需重新复核。
+ */
+export function mergeCandidateTimeMapSpanWithNext(
+  project: EditorProject,
+  timeMapId: string,
+  spanIndex: number,
+  editedAt: string
+): EditorProject {
+  const { timeMap, candidate } = requireEditableCandidateTimeMap(project, timeMapId);
+  assertSpanIndex(timeMap, spanIndex, "要合并的时间图片段不存在。");
+  assertIsoTimestamp(editedAt, "人工合并时间必须是有效的 ISO 时间戳。");
+  const spans = normalizeCandidateSpans(timeMap);
+  const left = spans[spanIndex];
+  const right = spans[spanIndex + 1];
+  if (!right) {
+    throw new TimeMapSpanReviewError("最后一段后面没有可合并的分段。");
+  }
+  if (left.kind !== right.kind) {
+    throw new TimeMapSpanReviewError(
+      "只有相同类型的相邻段可以直接合并；请先在边界编辑中统一类型。"
+    );
+  }
+  const merged = invalidateTimeMapSpanEvidenceForManualReview(
+    {
+      ...left,
+      id: `${left.id}:manual-merge:${timeMap.revision + 1}`,
+      sourceEndMs: right.sourceEndMs,
+      targetEndMs: right.targetEndMs
+    },
+    false,
+    `第 ${spanIndex + 1}、${spanIndex + 2} 段由用户合并，合并段需要重新复核。`
+  );
+  const nextSpans = [
+    ...spans.slice(0, spanIndex),
+    merged,
+    ...spans.slice(spanIndex + 2)
+  ];
+  assertValidManualStructure(nextSpans, "合并");
+  const editedMap = createManuallyStructuredCandidateMap(
+    timeMap,
+    nextSpans,
+    editedAt,
+    `用户合并了第 ${spanIndex + 1}、${spanIndex + 2} 段。`
+  );
+  return replaceEditableCandidateTimeMap(project, candidate.id, editedMap);
+}
+
 export function readTimeMapSpanReviewDecision(
   timeMap: MediaTimeMap,
   spanIndex: number
@@ -423,6 +608,208 @@ function readReviewDecisionFromNotes(
     }
   }
   return null;
+}
+
+function requireEditableCandidateTimeMap(
+  project: EditorProject,
+  timeMapId: string
+): {
+  timeMap: MediaTimeMap;
+  candidate: EditorProject["mediaMatchCandidates"][number];
+} {
+  const timeMap = project.mediaTimeMaps.find((item) => item.id === timeMapId);
+  if (!timeMap || timeMap.state !== "candidate") {
+    throw new TimeMapSpanReviewError("只能编辑尚未确认的候选时间图。");
+  }
+  const candidate = project.mediaMatchCandidates.find(
+    (item) =>
+      item.timeMapId === timeMapId && (item.state === "pending" || item.state === "blocked")
+  );
+  if (!candidate) {
+    throw new TimeMapSpanReviewError("该时间图不再属于待复核候选，无法编辑结构。");
+  }
+  return { timeMap, candidate };
+}
+
+function replaceEditableCandidateTimeMap(
+  project: EditorProject,
+  candidateId: string,
+  editedMap: MediaTimeMap
+): EditorProject {
+  const candidate = project.mediaMatchCandidates.find((item) => item.id === candidateId);
+  if (!candidate) {
+    throw new TimeMapSpanReviewError("待更新的匹配候选不存在。");
+  }
+  const proposalTimeMap = candidate.proposal.timeMap
+    ? {
+        ...candidate.proposal.timeMap,
+        sourceStartMs: editedMap.sourceStartMs,
+        sourceEndMs: editedMap.sourceEndMs,
+        targetStartMs: editedMap.targetStartMs,
+        targetEndMs: editedMap.targetEndMs,
+        spans: structuredClone(editedMap.spans),
+        quality: structuredClone(editedMap.quality),
+        evidence: {
+          ...candidate.proposal.timeMap.evidence,
+          types: [...editedMap.evidence.types],
+          audioAnchorCount: editedMap.evidence.audioAnchorCount,
+          visualAnchorCount: editedMap.evidence.visualAnchorCount,
+          heldOutAnchorCount: editedMap.evidence.heldOutAnchorCount,
+          notes: [...editedMap.evidence.notes]
+        }
+      }
+    : undefined;
+  const matchRange = candidate.proposal.matchRange
+    ? {
+        ...candidate.proposal.matchRange,
+        sourceStartMs: editedMap.sourceStartMs,
+        sourceEndMs: editedMap.sourceEndMs,
+        targetStartMs: editedMap.targetStartMs,
+        targetEndMs: editedMap.targetEndMs
+      }
+    : undefined;
+  const updatedCandidate = {
+    ...candidate,
+    sourceStartMs: editedMap.sourceStartMs,
+    sourceEndMs: editedMap.sourceEndMs,
+    targetStartMs: editedMap.targetStartMs,
+    targetEndMs: editedMap.targetEndMs,
+    state: "blocked" as const,
+    proposal: {
+      ...candidate.proposal,
+      matchRange,
+      timeMap: proposalTimeMap
+    },
+    updatedAt: editedMap.updatedAt
+  };
+  return {
+    ...project,
+    mediaMatchCandidates: project.mediaMatchCandidates.map((item) =>
+      item.id === candidateId ? updatedCandidate : item
+    ),
+    mediaTimeMaps: project.mediaTimeMaps.map((item) =>
+      item.id === editedMap.id ? editedMap : item
+    )
+  };
+}
+
+function createManuallyStructuredCandidateMap(
+  timeMap: MediaTimeMap,
+  spans: MediaTimeMap["spans"],
+  editedAt: string,
+  reason: string
+): MediaTimeMap {
+  const first = spans[0];
+  const last = spans[spans.length - 1];
+  if (!first || !last) {
+    throw new TimeMapSpanReviewError("时间图至少需要保留一个分段。");
+  }
+  const notes = timeMap.evidence.notes.filter(
+    (note) =>
+      !note.startsWith(REVIEW_NOTE_PREFIX) &&
+      !note.startsWith(PLAYBACK_REVIEW_PREFIX) &&
+      !note.startsWith(LEGACY_PLAYBACK_REVIEW_PREFIX) &&
+      !note.startsWith(MANUAL_TAKEOVER_NOTE_PREFIX)
+  );
+  const nextMap: MediaTimeMap = {
+    ...timeMap,
+    revision: timeMap.revision + 1,
+    sourceStartMs: first.sourceStartMs,
+    sourceEndMs: last.sourceEndMs,
+    targetStartMs: first.targetStartMs,
+    targetEndMs: last.targetEndMs,
+    spans,
+    quality: {
+      ...timeMap.quality,
+      level: "blocked",
+      reasons: uniqueStrings([
+        ...timeMap.quality.reasons.filter(
+          (item) => !item.startsWith(MANUAL_REVIEW_STATE_REASON_PREFIX)
+        ),
+        reason,
+        "人工修改已撤销旧验证和旧播放证据；可继续逐段复核，或明确采用当前最高可能方案后签发。"
+      ])
+    },
+    evidence: {
+      ...timeMap.evidence,
+      types: appendUnique(timeMap.evidence.types, "manual"),
+      notes: [
+        ...notes,
+        `${MANUAL_STRUCTURE_EDIT_NOTE_PREFIX}${editedAt}:${reason}`
+      ]
+    },
+    verification: null,
+    updatedAt: editedAt
+  };
+  return reconcileCandidateTimeMapManualReview(readinessWithoutPlayback(nextMap));
+}
+
+function normalizeCandidateSpans(timeMap: MediaTimeMap) {
+  return timeMap.spans.map((span, spanIndex) =>
+    isCompleteTimeMapSpanEvidence(span)
+      ? { ...span }
+      : normalizeLegacyUnverifiedTimeMapSpanEvidence(span, {
+          id: span.id ?? `${timeMap.id}:span:${String(spanIndex + 1).padStart(4, "0")}`,
+          blocked: true
+        })
+  );
+}
+
+function assertManualSpanPatch(patch: ManualTimeMapSpanPatch): void {
+  assertMilliseconds(patch.sourceStartMs, "参考开始");
+  assertMilliseconds(patch.sourceEndMs, "参考结束");
+  assertMilliseconds(patch.targetStartMs, "原片开始");
+  assertMilliseconds(patch.targetEndMs, "原片结束");
+  if (patch.sourceEndMs < patch.sourceStartMs || patch.targetEndMs < patch.targetStartMs) {
+    throw new TimeMapSpanReviewError("片段结束时间不能早于开始时间。");
+  }
+}
+
+function assertSpanIndex(timeMap: MediaTimeMap, spanIndex: number, message: string): void {
+  if (!Number.isSafeInteger(spanIndex) || spanIndex < 0 || spanIndex >= timeMap.spans.length) {
+    throw new TimeMapSpanReviewError(message);
+  }
+}
+
+function assertMilliseconds(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TimeMapSpanReviewError(`${label}必须是非负整数毫秒。`);
+  }
+}
+
+function assertIsoTimestamp(value: string, message: string): void {
+  if (!isIsoTimestamp(value)) {
+    throw new TimeMapSpanReviewError(message);
+  }
+}
+
+function assertSplitCoordinate(
+  point: number,
+  startMs: number,
+  endMs: number,
+  label: string
+): void {
+  if (startMs === endMs) {
+    if (point !== startMs) {
+      throw new TimeMapSpanReviewError(`${label}所在轴是边界点，必须保持 ${startMs} ms。`);
+    }
+    return;
+  }
+  if (point <= startMs || point >= endMs) {
+    throw new TimeMapSpanReviewError(`${label}必须严格位于当前分段内部。`);
+  }
+}
+
+function assertValidManualStructure(
+  spans: readonly TimeMapSpan[],
+  action: string
+): void {
+  const validation = validateTimeMap(spans);
+  if (!validation.valid) {
+    throw new TimeMapSpanReviewError(
+      `${action}后的时间图结构无效，未写入：${validation.issues[0]?.message ?? "未知结构错误"}`
+    );
+  }
 }
 
 function decisionToSpanKind(decision: TimeMapSpanReviewDecision): TimeMapSpanKind {

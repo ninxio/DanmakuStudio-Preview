@@ -1919,6 +1919,15 @@ function TimeMapReview({
   const reviewCandidateTimeMapSpan = useEditorStore(
     (state) => state.reviewCandidateTimeMapSpan
   );
+  const editCandidateTimeMapSpan = useEditorStore(
+    (state) => state.editCandidateTimeMapSpan
+  );
+  const splitCandidateTimeMapSpan = useEditorStore(
+    (state) => state.splitCandidateTimeMapSpan
+  );
+  const mergeCandidateTimeMapSpanWithNext = useEditorStore(
+    (state) => state.mergeCandidateTimeMapSpanWithNext
+  );
   const [selectedSpanIndex, setSelectedSpanIndex] = useState(0);
   const onPlaybackOpenChangeRef = useRef(onPlaybackOpenChange);
 
@@ -2134,6 +2143,23 @@ function TimeMapReview({
                   }
                 />
               ) : null}
+              {relationState === "candidate" ? (
+                <TimeMapSpanManualEditControls
+                  timeMap={timeMap}
+                  span={span}
+                  nextSpan={timeMap.spans[spanIndex + 1]}
+                  spanIndex={spanIndex}
+                  onSave={(patch) =>
+                    editCandidateTimeMapSpan(timeMap.id, spanIndex, patch)
+                  }
+                  onSplit={(point) =>
+                    splitCandidateTimeMapSpan(timeMap.id, spanIndex, point)
+                  }
+                  onMergeNext={() =>
+                    mergeCandidateTimeMapSpanWithNext(timeMap.id, spanIndex)
+                  }
+                />
+              ) : null}
             </li>
           ))}
         </ol>
@@ -2276,10 +2302,232 @@ function TimeMapSpanReviewControls({
           : "尚未人工分类；当前颜色只是算法候选结果。"}
       </p>
       <p className="mt-1 leading-5 text-slate-500">
-        未显示的分类与当前两侧长度不兼容；如需改成其他类型，请先在编辑页调整该段边界。
+        当前可直接采用的分类按两侧长度显示。若判断不同，可在下方“调整边界与结构”中
+        同时修改双轴边界和类型，不会再被算法给出的形状锁死。
       </p>
     </fieldset>
   );
+}
+
+const MANUAL_TIME_MAP_KIND_OPTIONS: ReadonlyArray<{
+  value: TimeMapSpanKind;
+  label: string;
+}> = [
+  { value: "matched", label: "共同内容" },
+  { value: "sourceOnly", label: "参考多出" },
+  { value: "targetOnly", label: "原片多出" },
+  { value: "ambiguous", label: "版本替换" }
+];
+
+function TimeMapSpanManualEditControls({
+  timeMap,
+  span,
+  nextSpan,
+  spanIndex,
+  onSave,
+  onSplit,
+  onMergeNext
+}: {
+  timeMap: MediaTimeMap;
+  span: TimeMapSpan;
+  nextSpan: TimeMapSpan | undefined;
+  spanIndex: number;
+  onSave: (patch: {
+    kind: TimeMapSpanKind;
+    sourceStartMs: number;
+    sourceEndMs: number;
+    targetStartMs: number;
+    targetEndMs: number;
+  }) => void;
+  onSplit: (point: { sourceMs: number; targetMs: number }) => void;
+  onMergeNext: () => void;
+}) {
+  const [kind, setKind] = useState<TimeMapSpanKind>(span.kind);
+  const [sourceStartText, setSourceStartText] = useState(formatTimecode(span.sourceStartMs));
+  const [sourceEndText, setSourceEndText] = useState(formatTimecode(span.sourceEndMs));
+  const [targetStartText, setTargetStartText] = useState(formatTimecode(span.targetStartMs));
+  const [targetEndText, setTargetEndText] = useState(formatTimecode(span.targetEndMs));
+  const [sourceSplitText, setSourceSplitText] = useState(
+    formatTimecode(createManualSplitPoint(span.sourceStartMs, span.sourceEndMs))
+  );
+  const [targetSplitText, setTargetSplitText] = useState(
+    formatTimecode(createManualSplitPoint(span.targetStartMs, span.targetEndMs))
+  );
+  const [inputError, setInputError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setKind(span.kind);
+    setSourceStartText(formatTimecode(span.sourceStartMs));
+    setSourceEndText(formatTimecode(span.sourceEndMs));
+    setTargetStartText(formatTimecode(span.targetStartMs));
+    setTargetEndText(formatTimecode(span.targetEndMs));
+    setSourceSplitText(
+      formatTimecode(createManualSplitPoint(span.sourceStartMs, span.sourceEndMs))
+    );
+    setTargetSplitText(
+      formatTimecode(createManualSplitPoint(span.targetStartMs, span.targetEndMs))
+    );
+    setInputError(null);
+  }, [
+    timeMap.id,
+    timeMap.revision,
+    span.kind,
+    span.sourceEndMs,
+    span.sourceStartMs,
+    span.targetEndMs,
+    span.targetStartMs,
+    spanIndex
+  ]);
+
+  const save = () => {
+    const sourceStartMs = parseSourceTimecode(sourceStartText);
+    const sourceEndMs = parseSourceTimecode(sourceEndText);
+    const targetStartMs = parseSourceTimecode(targetStartText);
+    const targetEndMs = parseSourceTimecode(targetEndText);
+    if (
+      sourceStartMs === null ||
+      sourceEndMs === null ||
+      targetStartMs === null ||
+      targetEndMs === null
+    ) {
+      setInputError("请输入 HH:MM:SS.mmm 或 MM:SS.mmm 格式的有效时间。");
+      return;
+    }
+    setInputError(null);
+    onSave({
+      kind,
+      sourceStartMs,
+      sourceEndMs,
+      targetStartMs,
+      targetEndMs
+    });
+  };
+
+  const split = () => {
+    const sourceMs = parseSourceTimecode(sourceSplitText);
+    const targetMs = parseSourceTimecode(targetSplitText);
+    if (sourceMs === null || targetMs === null) {
+      setInputError("拆分位置必须是有效时间；边界点轴请保持原值。");
+      return;
+    }
+    setInputError(null);
+    onSplit({ sourceMs, targetMs });
+  };
+
+  return (
+    <details className="mt-1 rounded border border-panel-line/60 bg-black/20 p-2">
+      <summary className="cursor-pointer select-none font-medium text-slate-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan">
+        调整边界与结构
+      </summary>
+      <p className="mt-1.5 leading-5 text-slate-500">
+        用于算法边界或类型判断不对的情况。保存会同步相邻段的共享边界，并撤销旧验证；
+        之后可重新 A/B 复核，也可明确采用当前方案并在本机签发。
+      </p>
+      <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+        <label className="grid gap-1 text-slate-400">
+          <span>片段类型</span>
+          <select
+            className="h-9 rounded border border-panel-line bg-panel px-2 text-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan"
+            value={kind}
+            onChange={(event) => setKind(event.target.value as TimeMapSpanKind)}
+          >
+            {MANUAL_TIME_MAP_KIND_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <ManualTimeInput
+          label="参考开始"
+          value={sourceStartText}
+          onChange={setSourceStartText}
+        />
+        <ManualTimeInput
+          label="参考结束"
+          value={sourceEndText}
+          onChange={setSourceEndText}
+        />
+        <ManualTimeInput
+          label="原片开始"
+          value={targetStartText}
+          onChange={setTargetStartText}
+        />
+        <ManualTimeInput
+          label="原片结束"
+          value={targetEndText}
+          onChange={setTargetEndText}
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap items-end gap-2">
+        <TextButton className="h-8 px-3 text-[11px]" tone="primary" onClick={save}>
+          保存边界和类型
+        </TextButton>
+        <ManualTimeInput
+          compact
+          label="参考拆分点"
+          value={sourceSplitText}
+          onChange={setSourceSplitText}
+        />
+        <ManualTimeInput
+          compact
+          label="原片拆分点"
+          value={targetSplitText}
+          onChange={setTargetSplitText}
+        />
+        <TextButton className="h-8 px-3 text-[11px]" tone="neutral" onClick={split}>
+          按双轴位置拆分
+        </TextButton>
+        {nextSpan?.kind === span.kind ? (
+          <TextButton
+            className="h-8 px-3 text-[11px]"
+            tone="neutral"
+            onClick={onMergeNext}
+          >
+            与下一同类段合并
+          </TextButton>
+        ) : null}
+      </div>
+      {inputError ? (
+        <p className="mt-1.5 text-red-200" role="alert">
+          {inputError}
+        </p>
+      ) : null}
+      <p className="mt-1.5 text-slate-500">
+        “参考多出”要求原片开始=结束；“原片多出”要求参考开始=结束；
+        “共同内容”和“版本替换”要求双方都有长度。所有类型都可选择，结构不合法时会说明具体原因。
+      </p>
+    </details>
+  );
+}
+
+function ManualTimeInput({
+  label,
+  value,
+  onChange,
+  compact = false
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  compact?: boolean;
+}) {
+  return (
+    <label className={`grid gap-1 text-slate-400 ${compact ? "min-w-36" : ""}`}>
+      <span>{label}</span>
+      <input
+        className="h-9 rounded border border-panel-line bg-panel px-2 text-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan"
+        value={value}
+        inputMode="decimal"
+        spellCheck={false}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </label>
+  );
+}
+
+function createManualSplitPoint(startMs: number, endMs: number): number {
+  return startMs === endMs ? startMs : startMs + Math.floor((endMs - startMs) / 2);
 }
 
 function TimeMapTrack({

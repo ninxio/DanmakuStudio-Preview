@@ -1796,7 +1796,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(playback).toHaveTextContent("已达到本段要求的有效试听时长和覆盖范围");
   });
 
-  it("四类人工判定按边界形状 fail-closed，并在项目保存重开后恢复", async () => {
+  it("快捷判定保持边界约束，但结构编辑提供全部类型并在项目保存重开后恢复", async () => {
     const user = userEvent.setup();
     const project = createMatchingProject();
     project.mediaLibrary = project.mediaLibrary.filter((media) => media.id !== "target-ep2");
@@ -1829,7 +1829,10 @@ describe("多媒体自动匹配工作台", () => {
     expect(controls.queryByRole("button", { name: "版本替换" })).not.toBeInTheDocument();
     expect(controls.getByRole("button", { name: "无法判断" })).toBeEnabled();
     expect(sourceOnlyItem).toHaveTextContent("系统建议：参考多出");
-    expect(sourceOnlyItem).toHaveTextContent("未显示的分类与当前两侧长度不兼容");
+    expect(sourceOnlyItem).toHaveTextContent("不会再被算法给出的形状锁死");
+    expect(
+      within(controls.getByRole("combobox", { name: "片段类型" })).getAllByRole("option")
+    ).toHaveLength(4);
 
     await user.click(controls.getByRole("button", { name: "参考多出" }));
     const reviewedMap = useEditorStore.getState().project.mediaTimeMaps[0];

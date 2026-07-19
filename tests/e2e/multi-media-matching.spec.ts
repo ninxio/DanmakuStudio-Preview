@@ -954,7 +954,14 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await expect(sourceOnlyItem.getByRole("button", { name: "版本替换" })).toHaveCount(0);
   await expect(sourceOnlyItem.getByRole("button", { name: "无法判断" })).toBeEnabled();
   await expect(sourceOnlyItem).toContainText("系统建议：参考多出");
-  await expect(sourceOnlyItem).toContainText("未显示的分类与当前两侧长度不兼容");
+  await expect(sourceOnlyItem).toContainText("不会再被算法给出的形状锁死");
+  await sourceOnlyItem.getByText("调整边界与结构", { exact: true }).click();
+  await expect(sourceOnlyItem.getByRole("combobox", { name: "片段类型" })).toHaveValue(
+    "sourceOnly"
+  );
+  await expect(
+    sourceOnlyItem.getByRole("combobox", { name: "片段类型" }).getByRole("option")
+  ).toHaveCount(4);
 
   const targetOnlyButton = firstReview.getByRole("button", { name: /第 3 段 原片独有/ });
   const targetOnlyItem = targetOnlyButton.locator("..");

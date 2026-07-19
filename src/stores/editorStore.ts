@@ -103,7 +103,12 @@ import {
   type MediaMatchRangePatch
 } from "../domain/alignment/mediaMatching";
 import {
+  editCandidateTimeMapSpan as editProjectCandidateTimeMapSpan,
+  mergeCandidateTimeMapSpanWithNext as mergeProjectCandidateTimeMapSpanWithNext,
   reviewCandidateTimeMapSpan as reviewProjectCandidateTimeMapSpan,
+  splitCandidateTimeMapSpan as splitProjectCandidateTimeMapSpan,
+  type ManualTimeMapSpanPatch,
+  type ManualTimeMapSplitPoint,
   type TimeMapSpanReviewDecision
 } from "../domain/alignment/timeMapReviewDecision";
 import {
@@ -193,6 +198,17 @@ interface EditorStore {
     spanIndex: number,
     decision: TimeMapSpanReviewDecision
   ) => void;
+  editCandidateTimeMapSpan: (
+    timeMapId: string,
+    spanIndex: number,
+    patch: ManualTimeMapSpanPatch
+  ) => void;
+  splitCandidateTimeMapSpan: (
+    timeMapId: string,
+    spanIndex: number,
+    point: ManualTimeMapSplitPoint
+  ) => void;
+  mergeCandidateTimeMapSpanWithNext: (timeMapId: string, spanIndex: number) => void;
   recordTimeMapSpanPlaybackReview: (
     timeMapId: string,
     spanIndex: number,
@@ -546,6 +562,71 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       });
     } catch (error) {
       set({ status: createErrorStatus("无法保存这一段的人工分类", error) });
+    }
+  },
+
+  editCandidateTimeMapSpan: (timeMapId, spanIndex, patch) => {
+    try {
+      commitProject(set, get, "调整时间图片段边界", (project) =>
+        editProjectCandidateTimeMapSpan(
+          project,
+          timeMapId,
+          spanIndex,
+          patch,
+          new Date().toISOString()
+        )
+      );
+      set({
+        status: {
+          message: "已更新双轴边界和片段类型；旧验证已撤销，请重新复核或明确接管当前方案。",
+          tone: "warning"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法调整时间图片段", error) });
+    }
+  },
+
+  splitCandidateTimeMapSpan: (timeMapId, spanIndex, point) => {
+    try {
+      commitProject(set, get, "拆分时间图片段", (project) =>
+        splitProjectCandidateTimeMapSpan(
+          project,
+          timeMapId,
+          spanIndex,
+          point,
+          new Date().toISOString()
+        )
+      );
+      set({
+        status: {
+          message: "已按参考/原片双轴位置拆分；两个新分段需要重新复核。",
+          tone: "warning"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法拆分时间图片段", error) });
+    }
+  },
+
+  mergeCandidateTimeMapSpanWithNext: (timeMapId, spanIndex) => {
+    try {
+      commitProject(set, get, "合并时间图片段", (project) =>
+        mergeProjectCandidateTimeMapSpanWithNext(
+          project,
+          timeMapId,
+          spanIndex,
+          new Date().toISOString()
+        )
+      );
+      set({
+        status: {
+          message: "已合并相邻同类分段；合并后的边界需要重新复核。",
+          tone: "warning"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法合并时间图片段", error) });
     }
   },
 

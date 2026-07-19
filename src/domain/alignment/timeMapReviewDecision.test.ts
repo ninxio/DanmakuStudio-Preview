@@ -6,9 +6,12 @@ import {
   applySystemSuggestedTimeMapReviews,
   applyTimeMapSpanReviewDecision,
   describeTimeMapSpanReviewAvailability,
+  editCandidateTimeMapSpan,
+  mergeCandidateTimeMapSpanWithNext,
   readTimeMapManualTakeover,
   readTimeMapSpanReviewDecision,
-  reviewCandidateTimeMapSpan
+  reviewCandidateTimeMapSpan,
+  splitCandidateTimeMapSpan
 } from "./timeMapReviewDecision";
 import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 
@@ -186,6 +189,129 @@ describe("时间图差异人工分类", () => {
     expect(() =>
       reviewCandidateTimeMapSpan(project, map.id, 2, "target-extra", "2026-07-12T10:00:00.000Z")
     ).toThrow("不再属于待复核候选");
+  });
+
+  it("允许一次性改写双轴边界和类型，并同步相邻段、候选范围与失效状态", () => {
+    const project = createEmptyProject("manual-boundary");
+    const map = applyTimeMapSpanReviewDecision(
+      createMap(),
+      3,
+      "replacement",
+      "2026-07-12T09:30:00.000Z"
+    );
+    project.mediaTimeMaps = [map];
+    project.mediaMatchCandidates = [createCandidate(map.id)];
+
+    const edited = editCandidateTimeMapSpan(
+      project,
+      map.id,
+      3,
+      {
+        kind: "sourceOnly",
+        sourceStartMs: 12_000,
+        sourceEndMs: 30_000,
+        targetStartMs: 13_000,
+        targetEndMs: 13_000
+      },
+      "2026-07-12T10:00:00.000Z"
+    );
+    const editedMap = edited.mediaTimeMaps[0];
+
+    expect(editedMap.spans[2]).toMatchObject({
+      targetEndMs: 13_000,
+      reason: "manualReview",
+      quality: { level: "review" }
+    });
+    expect(editedMap.spans[3]).toMatchObject({
+      kind: "sourceOnly",
+      targetStartMs: 13_000,
+      targetEndMs: 13_000,
+      reason: "manualReview"
+    });
+    expect(editedMap.revision).toBe(map.revision + 1);
+    expect(editedMap.targetEndMs).toBe(13_000);
+    expect(editedMap.verification).toBeNull();
+    expect(readTimeMapSpanReviewDecision(editedMap, 3)).toBeNull();
+    expect(editedMap.evidence.notes.join(" ")).toContain("manual-span-structure-edit:v1:");
+    expect(edited.mediaMatchCandidates[0]).toMatchObject({
+      targetEndMs: 13_000,
+      state: "blocked"
+    });
+  });
+
+  it("按双轴锚点拆分并可把相邻同类段合并，异类合并明确拒绝", () => {
+    const project = createEmptyProject("manual-structure");
+    const map = createMap();
+    project.mediaTimeMaps = [map];
+    project.mediaMatchCandidates = [createCandidate(map.id)];
+
+    const split = splitCandidateTimeMapSpan(
+      project,
+      map.id,
+      0,
+      { sourceMs: 5_000, targetMs: 5_000 },
+      "2026-07-12T10:00:00.000Z"
+    );
+    const splitMap = split.mediaTimeMaps[0];
+    expect(splitMap.spans).toHaveLength(5);
+    expect(splitMap.spans[0]).toMatchObject({
+      kind: "matched",
+      sourceEndMs: 5_000,
+      targetEndMs: 5_000
+    });
+    expect(splitMap.spans[1]).toMatchObject({
+      kind: "matched",
+      sourceStartMs: 5_000,
+      targetStartMs: 5_000
+    });
+
+    const merged = mergeCandidateTimeMapSpanWithNext(
+      split,
+      map.id,
+      0,
+      "2026-07-12T10:01:00.000Z"
+    );
+    expect(merged.mediaTimeMaps[0]?.spans).toHaveLength(4);
+    expect(merged.mediaTimeMaps[0]?.spans[0]).toMatchObject({
+      kind: "matched",
+      sourceStartMs: 0,
+      sourceEndMs: 10_000,
+      targetStartMs: 0,
+      targetEndMs: 10_000,
+      reason: "manualReview"
+    });
+    expect(() =>
+      mergeCandidateTimeMapSpanWithNext(
+        project,
+        map.id,
+        0,
+        "2026-07-12T10:02:00.000Z"
+      )
+    ).toThrow("只有相同类型的相邻段可以直接合并");
+  });
+
+  it("结构不合法时拒绝写入，不会为所选分类猜测边界", () => {
+    const project = createEmptyProject("manual-invalid");
+    const map = createMap();
+    project.mediaTimeMaps = [map];
+    project.mediaMatchCandidates = [createCandidate(map.id)];
+
+    expect(() =>
+      editCandidateTimeMapSpan(
+        project,
+        map.id,
+        1,
+        {
+          kind: "targetOnly",
+          sourceStartMs: 10_000,
+          sourceEndMs: 12_000,
+          targetStartMs: 10_000,
+          targetEndMs: 11_000
+        },
+        "2026-07-12T10:00:00.000Z"
+      )
+    ).toThrow("结构无效");
+    expect(project.mediaTimeMaps[0]?.spans[1]?.kind).toBe("sourceOnly");
   });
 });
 
