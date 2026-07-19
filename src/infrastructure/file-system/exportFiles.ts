@@ -43,7 +43,7 @@ export interface VerifiedExportMapProof {
   revision: number;
   state: "confirmed";
   declaredQuality: "verified";
-  spanKinds: Array<"matched" | "sourceOnly" | "targetOnly">;
+  spanKinds: Array<"matched" | "sourceOnly" | "targetOnly" | "ambiguous">;
   coreDigest: string;
   coreCanonicalJson: string;
   sourceMediaId: string;

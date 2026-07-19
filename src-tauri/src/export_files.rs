@@ -29,6 +29,8 @@ const PROJECTION_DERIVATION_DOMAIN: &str = "projection-derivation-v2";
 const PROJECTION_POLICY_VERSION: &str = "source-projection-v1";
 const PROJECTION_SERIALIZER_VERSION: &str = "bilibili-xml-export-v1";
 const MEDIA_TIME_MAP_CORE_DOMAIN: &str = "media-time-map-core-v2";
+const MANUAL_TAKEOVER_NOTE_PREFIX: &str = "manual-takeover:v1:";
+const MANUAL_SPAN_REVIEW_NOTE_PREFIX: &str = "manual-span-review:v1:";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PROJECTION_ASSETS: usize = 4_096;
 const MAX_PROJECTION_MEDIA: usize = 8_192;
@@ -211,6 +213,7 @@ struct SignedTimeMapCore {
     source_end_ms: u64,
     target_start_ms: u64,
     spans: Vec<SignedTimeMapSpan>,
+    manual_takeover_approved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -224,7 +227,7 @@ struct SignedTimeMapSpan {
 
 #[derive(Clone, Copy, Debug)]
 struct SignedVerifiedGraphQuality {
-    unique_content_coverage: f64,
+    unique_content_coverage: Option<f64>,
     held_out_anchor_count: u64,
 }
 
@@ -691,13 +694,15 @@ where
         validate_media_identity_shape(&proof.source_identity)?;
         validate_media_identity_shape(&proof.target_identity)?;
         if proof.span_kinds.is_empty()
-            || proof
-                .span_kinds
-                .iter()
-                .any(|kind| !matches!(kind.as_str(), "matched" | "sourceOnly" | "targetOnly"))
+            || proof.span_kinds.iter().any(|kind| {
+                !matches!(
+                    kind.as_str(),
+                    "matched" | "sourceOnly" | "targetOnly" | "ambiguous"
+                ) || (kind == "ambiguous" && !signed_core.manual_takeover_approved)
+            })
         {
             return Err(format!(
-                "时间图 {} 没有可导出的 span，或仍含 ambiguous/未知 span。",
+                "时间图 {} 没有可导出的 span，或仍含未经人工接管确认的 ambiguous/未知 span。",
                 proof.map_id
             ));
         }
@@ -881,8 +886,16 @@ fn parse_and_validate_signed_time_map_core(
             proof.map_id
         ));
     }
-    let graph_quality = validate_signed_graph_quality(&proof.map_id, &fields[14])?;
-    validate_signed_compact_evidence(&proof.map_id, &fields[15], graph_quality)?;
+    let manual_takeover_approved =
+        validate_signed_manual_takeover_evidence(&proof.map_id, &fields[13], &fields[15])?;
+    let graph_quality =
+        validate_signed_graph_quality(&proof.map_id, &fields[14], manual_takeover_approved)?;
+    validate_signed_compact_evidence(
+        &proof.map_id,
+        &fields[15],
+        graph_quality,
+        manual_takeover_approved,
+    )?;
     let mut spans: Vec<SignedTimeMapSpan> = Vec::with_capacity(span_values.len());
     let mut span_ids = HashSet::with_capacity(span_values.len());
     for (span_index, value) in span_values.iter().enumerate() {
@@ -920,7 +933,7 @@ fn parse_and_validate_signed_time_map_core(
             target_end_ms: safe_json_u64(&span_fields[5], "signed span targetEndMs")?,
         };
         debug_assert!(!reason.is_empty());
-        validate_signed_span_shape(&proof.map_id, span_index, &span)?;
+        validate_signed_span_shape(&proof.map_id, span_index, &span, manual_takeover_approved)?;
         if let Some(previous) = spans.last() {
             if previous.source_end_ms != span.source_start_ms
                 || previous.target_end_ms != span.target_start_ms
@@ -956,6 +969,7 @@ fn parse_and_validate_signed_time_map_core(
         source_end_ms,
         target_start_ms,
         spans,
+        manual_takeover_approved,
     })
 }
 
@@ -963,6 +977,7 @@ fn validate_signed_span_shape(
     map_id: &str,
     span_index: usize,
     span: &SignedTimeMapSpan,
+    manual_takeover_approved: bool,
 ) -> Result<(), String> {
     if span.source_end_ms < span.source_start_ms || span.target_end_ms < span.target_start_ms {
         return Err(format!(
@@ -976,7 +991,7 @@ fn validate_signed_span_shape(
         "matched" => source_duration > 0 && target_duration > 0,
         "sourceOnly" => source_duration > 0 && target_duration == 0,
         "targetOnly" => source_duration == 0 && target_duration > 0,
-        "ambiguous" => false,
+        "ambiguous" => manual_takeover_approved && (source_duration > 0 || target_duration > 0),
         _ => false,
     };
     if !valid {
@@ -988,9 +1003,88 @@ fn validate_signed_span_shape(
     Ok(())
 }
 
+fn validate_signed_manual_takeover_evidence(
+    map_id: &str,
+    span_values: &Value,
+    evidence_value: &Value,
+) -> Result<bool, String> {
+    let evidence_fields = evidence_value
+        .as_array()
+        .filter(|fields| fields.len() == 10)
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 evidence 字段数量无效。"))?;
+    let evidence_types = evidence_fields[0]
+        .as_array()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 evidence types 无效。"))?;
+    let notes = evidence_fields[9]
+        .as_array()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签 evidence notes 不是数组。"))?
+        .iter()
+        .map(|note| required_json_string(note, "signed evidence note"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let takeover_notes = notes
+        .iter()
+        .filter(|note| note.starts_with(MANUAL_TAKEOVER_NOTE_PREFIX))
+        .collect::<Vec<_>>();
+    if takeover_notes.is_empty() {
+        return Ok(false);
+    }
+    if takeover_notes.len() != 1
+        || takeover_notes[0].len() <= MANUAL_TAKEOVER_NOTE_PREFIX.len()
+        || !evidence_types
+            .iter()
+            .any(|item| item.as_str() == Some("manual"))
+    {
+        return Err(format!(
+            "时间图 {map_id} 的人工接管声明重复、缺少时间或没有 manual 证据。"
+        ));
+    }
+
+    let spans = span_values
+        .as_array()
+        .ok_or_else(|| format!("时间图 {map_id} 的已签核心缺少 spans。"))?;
+    for (span_index, span) in spans.iter().enumerate() {
+        let fields = span.as_array().ok_or_else(|| {
+            format!(
+                "时间图 {map_id} 的第 {} 个人工接管 span 不是固定数组。",
+                span_index + 1
+            )
+        })?;
+        let Some(kind) = fields.get(1).and_then(Value::as_str) else {
+            return Err(format!(
+                "时间图 {map_id} 的第 {} 个人工接管 span 缺少类型。",
+                span_index + 1
+            ));
+        };
+        let decision = match kind {
+            "matched" => continue,
+            "sourceOnly" => "source-extra",
+            "targetOnly" => "target-extra",
+            "ambiguous" => "replacement",
+            _ => {
+                return Err(format!(
+                    "时间图 {map_id} 的第 {} 个人工接管 span 类型未知。",
+                    span_index + 1
+                ))
+            }
+        };
+        let prefix = format!("{MANUAL_SPAN_REVIEW_NOTE_PREFIX}{span_index}:{decision}:");
+        if !notes
+            .iter()
+            .any(|note| note.starts_with(&prefix) && note.len() > prefix.len())
+        {
+            return Err(format!(
+                "时间图 {map_id} 的第 {} 个差异 span 缺少与类型一致的人工接管结论。",
+                span_index + 1
+            ));
+        }
+    }
+    Ok(true)
+}
+
 fn validate_signed_graph_quality(
     map_id: &str,
     value: &Value,
+    manual_takeover_approved: bool,
 ) -> Result<SignedVerifiedGraphQuality, String> {
     let fields = value
         .as_array()
@@ -1039,14 +1133,14 @@ fn validate_signed_graph_quality(
         && anchor_count >= 30
         && anchor_region_count >= 3
         && held_out_anchor_count > 0;
-    if !meets_verified_contract {
+    if !meets_verified_contract && !manual_takeover_approved {
         return Err(format!(
             "时间图 {map_id} 的已签图级质量低于 verified 最低契约。"
         ));
     }
 
     Ok(SignedVerifiedGraphQuality {
-        unique_content_coverage: unique_content_coverage.expect("verified contract checked"),
+        unique_content_coverage,
         held_out_anchor_count,
     })
 }
@@ -1131,6 +1225,7 @@ fn validate_signed_compact_evidence(
     map_id: &str,
     value: &Value,
     graph_quality: SignedVerifiedGraphQuality,
+    manual_takeover_approved: bool,
 ) -> Result<(), String> {
     let fields = value
         .as_array()
@@ -1187,13 +1282,13 @@ fn validate_signed_compact_evidence(
     if unique_types.contains("visual") && visual_anchor_count == 0 {
         return Err(format!("时间图 {map_id} 声明 visual 证据但没有视觉锚点。"));
     }
-    if repeated_content_only {
+    if repeated_content_only && !manual_takeover_approved {
         return Err(format!(
             "时间图 {map_id} 的已签证据只有重复内容，不能满足 verified 独特内容契约。"
         ));
     }
     if held_out_anchor_count != graph_quality.held_out_anchor_count
-        || unique_content_coverage != Some(graph_quality.unique_content_coverage)
+        || unique_content_coverage != graph_quality.unique_content_coverage
     {
         return Err(format!(
             "时间图 {map_id} 的已签图级质量与 evidence 留出锚点或独特内容覆盖率不一致。"
@@ -1602,8 +1697,6 @@ fn validate_projection_derivation_binding(
     let target_outputs = validate_target_output_inventory(derivation, &media_by_id)?;
 
     let mut groups = HashMap::<String, Vec<NativeProjectedEntry<'_>>>::new();
-    let mut covered_item_ids = HashSet::<&str>::new();
-    let mut source_only_item_ids = HashSet::<&str>::new();
     let mut projection_ordinal = 0_u64;
     let mut content_target_ids = HashSet::<String>::new();
 
@@ -1634,9 +1727,7 @@ fn validate_projection_derivation_binding(
             {
                 continue;
             }
-            covered_item_ids.insert(item.item_id.as_str());
             let Some(mapped_time_ms) = map_signed_source_time(core, item.source_time_ms)? else {
-                source_only_item_ids.insert(item.item_id.as_str());
                 continue;
             };
             if !item.enabled || disabled.contains(item.item_id.as_str()) {
@@ -1692,27 +1783,6 @@ fn validate_projection_derivation_binding(
             .any(|map_id| !referenced_map_ids.contains(map_id))
     {
         return Err("正片路由与 verified map proofs 未形成双向完整绑定。".to_string());
-    }
-
-    let ignored_item_ids = collect_ignored_item_ids(derivation, &assets_by_id);
-    let unexpected_unmapped_count = derivation
-        .xml_assets
-        .iter()
-        .flat_map(|asset| asset.items.iter())
-        .filter(|item| {
-            !covered_item_ids.contains(item.item_id.as_str())
-                && !ignored_item_ids.contains(item.item_id.as_str())
-        })
-        .count();
-    let non_ignored_item_count = item_count
-        .saturating_sub(ignored_item_ids.len())
-        .saturating_sub(source_only_item_ids.len());
-    if unexpected_unmapped_count > 5
-        && unexpected_unmapped_count.saturating_mul(100) > non_ignored_item_count
-    {
-        return Err(format!(
-            "有 {unexpected_unmapped_count} 条弹幕未被正片、忽略或 sourceOnly 路由覆盖，超过安全阈值。"
-        ));
     }
 
     let mut expected_xml_by_file = HashMap::<String, Vec<u8>>::new();
@@ -1994,40 +2064,15 @@ fn normalized_adjustment_map(
     Ok(result)
 }
 
-fn collect_ignored_item_ids<'a>(
-    derivation: &'a ProjectionDerivationV1,
-    assets_by_id: &HashMap<String, &'a ProjectionXmlAssetV1>,
-) -> HashSet<&'a str> {
-    let mut ignored = HashSet::new();
-    for route in derivation
-        .routes
-        .iter()
-        .filter(|route| route.kind == "ignored")
-    {
-        let Some(asset_id) = route.asset_id.as_ref() else {
-            continue;
-        };
-        let Some(asset) = assets_by_id.get(asset_id) else {
-            continue;
-        };
-        for item in &asset.items {
-            if item.source_time_ms >= route.source_start_ms
-                && item.source_time_ms < route.source_end_ms
-            {
-                ignored.insert(item.item_id.as_str());
-            }
-        }
-    }
-    ignored
-}
-
 fn map_signed_source_time(
     core: &SignedTimeMapCore,
     source_time_ms: u64,
 ) -> Result<Option<u64>, String> {
     for span in &core.spans {
         if span.source_start_ms <= source_time_ms && source_time_ms < span.source_end_ms {
-            if span.kind == "sourceOnly" {
+            if span.kind == "sourceOnly"
+                || (span.kind == "ambiguous" && core.manual_takeover_approved)
+            {
                 return Ok(None);
             }
             if span.kind != "matched" {
@@ -2990,6 +3035,100 @@ mod tests {
         assert!(String::from_utf8(fs::read(result.file_path).unwrap())
             .unwrap()
             .contains("p=\"0.150,1,25,16777215,0,0,,\""));
+        fs::remove_dir_all(unique).unwrap();
+    }
+
+    #[test]
+    fn verified_writer_accepts_explicit_manual_takeover_with_replacement_span() {
+        let unique = tempfile_like_path("danmaku-export-manual-takeover");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+        let (source_path, target_path, source_identity, target_identity) =
+            create_media_pair(&unique);
+        let mut request = verified_request(
+            &unique,
+            &source_path,
+            &target_path,
+            source_identity,
+            target_identity,
+        );
+        let mut core: Value =
+            serde_json::from_str(&request.verification.map_proofs[0].core_canonical_json).unwrap();
+        let fields = core.as_array_mut().unwrap();
+        fields[14].as_array_mut().unwrap()[0] = json!(0.60);
+        fields[14].as_array_mut().unwrap()[3] = json!(0.20);
+        fields[14].as_array_mut().unwrap()[9] = json!(0.20);
+        fields[15].as_array_mut().unwrap()[5] = json!(0.20);
+        fields[15].as_array_mut().unwrap()[9] = json!([
+            "fixture",
+            "manual-takeover:v1:2026-07-12T00:00:00.000Z",
+            "manual-span-review:v1:1:replacement:用户明确接受版本替换段不导出"
+        ]);
+        let spans = fields[13].as_array_mut().unwrap();
+        spans[0].as_array_mut().unwrap()[0] = json!("span-1-matched-0-500-0-500");
+        spans[0].as_array_mut().unwrap()[3] = json!(500);
+        spans[0].as_array_mut().unwrap()[5] = json!(500);
+        let mut replacement = spans[0].clone();
+        let replacement_fields = replacement.as_array_mut().unwrap();
+        replacement_fields[0] = json!("span-2-ambiguous-500-1000-500-1000");
+        replacement_fields[1] = json!("ambiguous");
+        replacement_fields[2] = json!(500);
+        replacement_fields[3] = json!(1000);
+        replacement_fields[4] = json!(500);
+        replacement_fields[5] = json!(1000);
+        replacement_fields[6] = json!("人工接管版本替换段");
+        spans.push(replacement);
+        request.verification.map_proofs[0].span_kinds =
+            vec!["matched".to_string(), "ambiguous".to_string()];
+        rebind_signed_core_and_request(&mut request, core);
+
+        let result =
+            save_verified_projected_xml_export_with_authority(request, |_| Ok(())).unwrap();
+        assert_eq!(result.file_name, "episode.xml");
+        assert!(unique.join("episode.xml").exists());
+        fs::remove_dir_all(unique).unwrap();
+    }
+
+    #[test]
+    fn verified_writer_does_not_block_long_source_xml_outside_confirmed_routes() {
+        let unique = tempfile_like_path("danmaku-export-long-source-xml");
+        let _ = fs::remove_dir_all(&unique);
+        fs::create_dir_all(&unique).unwrap();
+        let (source_path, target_path, source_identity, target_identity) =
+            create_media_pair(&unique);
+        let mut request = verified_request(
+            &unique,
+            &source_path,
+            &target_path,
+            source_identity,
+            target_identity,
+        );
+        for index in 1_u64..=10 {
+            request.verification.projection_derivation.xml_assets[0]
+                .items
+                .push(ProjectionDanmakuItemV1 {
+                    item_id: format!("asset-1_item_{index}"),
+                    asset_id: "asset-1".to_string(),
+                    original_index: index,
+                    source_time_ms: 1_000 + index,
+                    mode: None,
+                    font_size: None,
+                    color: None,
+                    timestamp: None,
+                    pool: None,
+                    user_hash: None,
+                    row_id: None,
+                    text: format!("outside confirmed route {index}"),
+                    raw_p_fields: Vec::new(),
+                    enabled: true,
+                });
+        }
+        resign_manifest(&mut request.verification);
+
+        let result =
+            save_verified_projected_xml_export_with_authority(request, |_| Ok(())).unwrap();
+        assert_eq!(result.file_name, "episode.xml");
+        assert!(unique.join("episode.xml").exists());
         fs::remove_dir_all(unique).unwrap();
     }
 

@@ -8,8 +8,8 @@ export default tseslint.config(
   {
     ignores: [
       "dist",
-      "src-tauri/target",
-      "src-tauri/target-*",
+      "**/target",
+      "**/target-*",
       "node_modules",
       "artifacts",
       "test-results",

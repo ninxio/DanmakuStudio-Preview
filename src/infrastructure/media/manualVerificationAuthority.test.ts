@@ -124,6 +124,48 @@ describe("安装级人工验证 bridge", () => {
       )
     ).rejects.toThrow("Tauri 桌面端");
   });
+
+  it("已明确接管的版本替换段可在导出动作中取得安装级凭据", async () => {
+    const bridge = createBridge();
+    const takeoverMap = createVerificationEligibleMap();
+    takeoverMap.spans = [
+      createTestCompleteTimeMapSpan({
+        kind: "ambiguous",
+        sourceStartMs: 0,
+        sourceEndMs: 60_000,
+        targetStartMs: 0,
+        targetEndMs: 60_000
+      })
+    ];
+    takeoverMap.quality = {
+      ...takeoverMap.quality,
+      probability: 0.6,
+      uniqueContentCoverage: 0.2,
+      alternativeMargin: 0.1
+    };
+    takeoverMap.evidence = {
+      ...takeoverMap.evidence,
+      uniqueContentCoverage: 0.2,
+      notes: [
+        "manual-span-review:v1:0:replacement:2026-07-12T00:00:00.000Z",
+        "manual-takeover:v1:2026-07-12T00:00:00.000Z"
+      ]
+    };
+
+    const issued = await issuePersistedManualMediaTimeMapVerification(
+      takeoverMap,
+      {
+        ...verificationInput(),
+        calibrationArtifactId: "manual-takeover-direct-export"
+      },
+      bridge
+    );
+
+    expect(bridge.issue).toHaveBeenCalledTimes(1);
+    expect(issued.quality.level).toBe("verified");
+    expect(issued.spans[0]?.kind).toBe("ambiguous");
+    expect(assessMediaTimeMapVerification(issued).trusted).toBe(true);
+  });
 });
 
 function createBridge(): ManualVerificationAuthorityBridge {
