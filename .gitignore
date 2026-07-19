@@ -17,6 +17,9 @@ test-results
 # AI assistant local context / planning docs
 AGENTS.md
 agents.md
+progress.md
 docs/player-goal.md
+docs/PLAN.md
+docs/goals/
 .agents/
 .codex/
