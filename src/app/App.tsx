@@ -2,6 +2,7 @@ import { Panel } from "../components/Panel";
 import { TextButton } from "../components/TextButton";
 import { createUsabilityViewModel } from "../domain/project/usabilityViewModel";
 import { AssetPanel } from "../features/assets/AssetPanel";
+import { CalibrationOverview } from "../features/editor/CalibrationOverview";
 import { EditorToolbar } from "../features/editor/EditorToolbar";
 import { KeyboardShortcuts } from "../features/editor/KeyboardShortcuts";
 import { ExportDialog } from "../features/export/ExportDialog";
@@ -307,7 +308,7 @@ export function App() {
             gridTemplateRows: `minmax(260px, 1fr) 6px ${timelineHeight}px`
           }}
         >
-          <Panel title="编辑素材" className="row-span-3">
+          <Panel title="弹幕素材与高级工具" className="row-span-3">
             <AssetPanel section="editing" />
           </Panel>
           <ResizeHandle
@@ -324,8 +325,13 @@ export function App() {
               )
             }
           />
-          <Panel title="预览" className="min-h-0">
-            <PreviewPanel />
+          <Panel title="校准预览" className="min-h-0">
+            <div className="flex h-full min-h-0 flex-col">
+              <CalibrationOverview />
+              <div className="min-h-0 flex-1">
+                <PreviewPanel />
+              </div>
+            </div>
           </Panel>
           <ResizeHandle
             label="调整检查器宽度"
@@ -341,7 +347,7 @@ export function App() {
               )
             }
           />
-          <Panel title="检查器" className="row-span-3">
+          <Panel title="所选对象与高级参数" className="row-span-3">
             <InspectorPanel />
           </Panel>
           <ResizeHandle
@@ -358,7 +364,7 @@ export function App() {
               )
             }
           />
-          <Panel className="min-h-0">
+          <Panel title="时间关系" className="min-h-0">
             <TimelinePanel />
           </Panel>
         </main>

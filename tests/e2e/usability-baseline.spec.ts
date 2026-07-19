@@ -175,6 +175,43 @@ test("易用化阶段 2 可从空项目准备三类素材并进入智能匹配",
   await expect(page.getByText("开发与验收工具", { exact: true })).toBeVisible();
 });
 
+test("易用化阶段 4 在校准工作区完成常用非破坏性修复", async ({
+  page
+}) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/");
+  await page.getByLabel("导入弹幕 XML 文件").setInputFiles({
+    name: "calibration.xml",
+    mimeType: "text/xml",
+    buffer: Buffer.from(
+      '<?xml version="1.0" encoding="UTF-8"?><i><d p="2,1,25,16777215,0,0,u,r">校准</d></i>',
+      "utf8"
+    )
+  });
+  await page.getByTestId("workspace-nav-editing").click();
+
+  const overview = page.getByTestId("calibration-overview");
+  await expect(overview).toBeVisible();
+  await expect(page.getByTestId("preview-panel")).toHaveCount(1);
+  await expect(page.getByTestId("timeline-panel")).toBeVisible();
+
+  await overview.getByRole("button", { name: /自动排列弹幕/ }).click();
+  await expect(overview.getByRole("button", { name: /播放检查/ })).toBeVisible();
+  await overview.locator("summary").filter({ hasText: "常用修复" }).click();
+  await overview.getByRole("button", { name: "整体延后 0.5 秒" }).click();
+  await expect(overview).toContainText("整体偏移 延后 0.5 秒");
+
+  await overview.getByRole("button", { name: /从这里重新同步/ }).click();
+  await overview.getByLabel("对应原片时间").fill("00:00:03.000");
+  await overview.getByRole("button", { name: "保存同步点" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText("已添加同步点");
+
+  await overview.getByRole("button", { name: /这之后有版本差异/ }).click();
+  await overview.getByLabel("版本差异秒数").fill("-1.5");
+  await overview.getByRole("button", { name: "保存版本差异" }).click();
+  await expect(page.getByTestId("status-bar")).toContainText("已标记版本差异");
+});
+
 function roundMilliseconds(value: number): number {
   return Math.round(value * 10) / 10;
 }
