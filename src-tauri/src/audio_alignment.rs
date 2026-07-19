@@ -10,11 +10,11 @@ use crate::{
         resolve_spectral_backend_request, AffineAnchorEvidence, AffineFineDecodeWindows,
         AffineFineWindowRequest, AffineHypothesis, AffineMatchConfig, BoundaryContextSide,
         BoundaryRefinementConfig, CoarseAffineHypothesis, CoarseSpectralFingerprintFrame,
-        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
-        FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs,
-        SpectralBackendExecution, SpectralBackendPreference, SpectralBackendRequest,
-        SpectralLandmark, StreamingLandmarkExtractor, AFFINE_HOLDOUT_TIME_BLOCK_MS,
-        CPU_SPECTRAL_BACKEND_ID, STREAMING_CPU_SPECTRAL_BACKEND_ID,
+        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditPathStep, EditTimeSpan,
+        FineFeatureConfig, FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult,
+        PresentationRangeMs, SpectralBackendExecution, SpectralBackendPreference,
+        SpectralBackendRequest, SpectralLandmark, StreamingLandmarkExtractor,
+        AFFINE_HOLDOUT_TIME_BLOCK_MS, CPU_SPECTRAL_BACKEND_ID, STREAMING_CPU_SPECTRAL_BACKEND_ID,
         STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
     },
     c137_process_attestation::{self, C137ProcessEvidenceBinding, SealC137ProcessEvidenceRequest},
@@ -124,7 +124,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.3-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v18";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v21";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -182,6 +182,17 @@ const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_SINGLE_MS: u64 = 750;
 const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_ISLAND_MS: u64 = 10_000;
 const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MAX_NET_RESIDUAL_MS: f64 = 100.0;
 const ALIGNMENT_V2_BALANCED_MICRO_EDIT_MIN_COUNT: usize = 4;
+// DP lattice noise can extend beyond one short alternating island. Treat low-cost diagonal steps
+// as independent fine anchors, then collapse an edit island only when stable anchors bracket both
+// ends, cover at least 90% of the complete interval, preserve the coarse affine duration within two
+// fine hops and contain no ambiguous content. This is structural evidence, not a duration shortcut:
+// a real one-sided edit changes the net affine residual, while a replacement creates an ambiguous
+// or low-density interval and therefore remains reviewable.
+const ALIGNMENT_V2_PIECEWISE_ANCHOR_MIN_SIDE_SUPPORT_MS: u64 = 5_000;
+const ALIGNMENT_V2_PIECEWISE_ANCHOR_MIN_DENSITY_NUMERATOR: u64 = 9;
+const ALIGNMENT_V2_PIECEWISE_ANCHOR_MIN_DENSITY_DENOMINATOR: u64 = 10;
+const ALIGNMENT_V2_PIECEWISE_ANCHOR_MAX_NET_RESIDUAL_MS: f64 =
+    2.0 * ALIGNMENT_V2_FINE_HOP_MS as f64;
 // A chunk can lack five continuous seconds of low-cost DP recovery even though several
 // independently timed coarse-training anchors prove a short common-content island inside the
 // unresolved interval. Only training anchors may shape the map; held-out anchors remain strictly
@@ -7149,6 +7160,72 @@ fn create_v2_approximate_fingerprint_candidates(
     })
 }
 
+fn append_v2_approximate_fingerprint_candidates(
+    source_input: &AlignmentAudioInput,
+    target_input: &AlignmentAudioInput,
+    approximate_result: V2ApproximateFingerprintCandidates,
+    candidates: &mut Vec<V2TrackPairCandidate>,
+    alternatives: &mut Vec<AudioAlternativeTrackScoreDto>,
+    diagnostics: &mut Vec<String>,
+) -> Result<usize, String> {
+    diagnostics.push(format!(
+        "音轨 #{} → #{}：{}",
+        source_input.stream.stream_index,
+        target_input.stream.stream_index,
+        approximate_result.diagnostic
+    ));
+    let approximate_candidates = approximate_result.candidates;
+    if approximate_candidates.is_empty() {
+        diagnostics.push(format!(
+            "音轨 #{} → #{} 的近似声谱时间指纹没有形成满足分布、唯一性与内点门槛的候选。",
+            source_input.stream.stream_index, target_input.stream.stream_index
+        ));
+        return Ok(0);
+    }
+    let projected_candidate_count = candidates
+        .len()
+        .checked_add(approximate_candidates.len())
+        .ok_or_else(|| {
+            "blocked:resource-limit：完整 coarse supplement candidate 数量溢出。".to_string()
+        })?;
+    if projected_candidate_count > ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES {
+        return Err(format!(
+            "blocked:resource-limit：完整 coarse candidate universe 需要 {} 个 candidate，超过硬上限 {}。",
+            projected_candidate_count, ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES
+        ));
+    }
+    diagnostics.push(format!(
+        "音轨 #{} → #{} 的近似声谱时间指纹补充 {} 个候选：{}。",
+        source_input.stream.stream_index,
+        target_input.stream.stream_index,
+        approximate_candidates.len(),
+        approximate_candidates
+            .iter()
+            .map(|candidate| format!(
+                "offset={:+},anchors={}/{},coverage={:.3},p95={}ms,score={:.3}",
+                candidate.hypothesis.offset_ms,
+                candidate.hypothesis.training_anchors.len(),
+                candidate.hypothesis.held_out_anchors.len(),
+                candidate.temporal_coverage,
+                candidate.hypothesis.p95_residual_ms,
+                candidate.score
+            ))
+            .collect::<Vec<_>>()
+            .join("；")
+    ));
+    alternatives.extend(approximate_candidates.iter().map(|candidate| {
+        v2_alternative_hypothesis_score(
+            &candidate.source_input,
+            &candidate.target_input,
+            &candidate.hypothesis,
+            candidate.score,
+        )
+    }));
+    let appended_count = approximate_candidates.len();
+    candidates.extend(approximate_candidates);
+    Ok(appended_count)
+}
+
 fn v2_affine_hypothesis_from_approximate_fingerprint(
     approximate: &ApproximateCoarseHypothesis,
     affine_config: &AffineMatchConfig,
@@ -7282,61 +7359,14 @@ fn collect_v2_pair_coarse_candidates(
                         continue;
                     }
                 };
-                diagnostics.push(format!(
-                    "音轨 #{} → #{}：{}",
-                    source_input.stream.stream_index,
-                    target_input.stream.stream_index,
-                    approximate_result.diagnostic
-                ));
-                let approximate_candidates = approximate_result.candidates;
-                if approximate_candidates.is_empty() {
-                    diagnostics.push(format!(
-                        "音轨 #{} → #{} 的近似声谱时间指纹也没有形成满足分布、唯一性与内点门槛的候选。",
-                        source_input.stream.stream_index, target_input.stream.stream_index
-                    ));
-                    continue;
-                }
-                let projected_candidate_count = candidates
-                    .len()
-                    .checked_add(approximate_candidates.len())
-                    .ok_or_else(|| {
-                        "blocked:resource-limit：完整 coarse fallback candidate 数量溢出。"
-                            .to_string()
-                    })?;
-                if projected_candidate_count > ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES {
-                    return Err(format!(
-                        "blocked:resource-limit：完整 coarse candidate universe 需要 {} 个 candidate，超过硬上限 {}。",
-                        projected_candidate_count, ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES
-                    ));
-                }
-                diagnostics.push(format!(
-                    "音轨 #{} → #{} 的近似声谱时间指纹生成 {} 个候选：{}。",
-                    source_input.stream.stream_index,
-                    target_input.stream.stream_index,
-                    approximate_candidates.len(),
-                    approximate_candidates
-                        .iter()
-                        .map(|candidate| format!(
-                            "offset={:+},anchors={}/{},coverage={:.3},p95={}ms,score={:.3}",
-                            candidate.hypothesis.offset_ms,
-                            candidate.hypothesis.training_anchors.len(),
-                            candidate.hypothesis.held_out_anchors.len(),
-                            candidate.temporal_coverage,
-                            candidate.hypothesis.p95_residual_ms,
-                            candidate.score
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("；")
-                ));
-                alternatives.extend(approximate_candidates.iter().map(|candidate| {
-                    v2_alternative_hypothesis_score(
-                        &candidate.source_input,
-                        &candidate.target_input,
-                        &candidate.hypothesis,
-                        candidate.score,
-                    )
-                }));
-                candidates.extend(approximate_candidates);
+                append_v2_approximate_fingerprint_candidates(
+                    source_input,
+                    target_input,
+                    approximate_result,
+                    &mut candidates,
+                    &mut alternatives,
+                    &mut diagnostics,
+                )?;
                 continue;
             }
             let projected_candidate_count = candidates
@@ -7443,6 +7473,36 @@ fn collect_v2_pair_coarse_candidates(
                     }
                 };
                 candidates.push(candidate);
+            }
+            match create_v2_approximate_fingerprint_candidates(
+                source_input,
+                target_input,
+                source_artifact,
+                target_artifact,
+                toolchain_cache_identity,
+                &affine_config,
+                cancel_flag,
+            ) {
+                Ok(approximate_result) => {
+                    let appended_count = append_v2_approximate_fingerprint_candidates(
+                        source_input,
+                        target_input,
+                        approximate_result,
+                        &mut candidates,
+                        &mut alternatives,
+                        &mut diagnostics,
+                    )?;
+                    diagnostics.push(format!(
+                        "音轨 #{} → #{} 同时保留 exact-landmark 与 {} 个近似声谱候选进入统一 temporal-window grouping；两种证据不再互斥。",
+                        source_input.stream.stream_index,
+                        target_input.stream.stream_index,
+                        appended_count
+                    ));
+                }
+                Err(error) => diagnostics.push(format!(
+                    "音轨 #{} → #{} 的近似声谱补充无法执行，已保留完整 exact-landmark universe：{error}",
+                    source_input.stream.stream_index, target_input.stream.stream_index
+                )),
             }
         }
     }
@@ -12504,6 +12564,7 @@ fn align_v2_feature_chunks(
     let chunk_frame_count = (ALIGNMENT_V2_DP_CHUNK_MS / target_hop_ms).max(1) as usize;
     let inverse = inverse_affine_hypothesis(coarse)?;
     let mut spans = Vec::<AudioTimeMapSpanDto>::new();
+    let mut piecewise_anchor_runs = Vec::<V2TrustedFineAnchorStep>::new();
     let mut path_checkpoints = Vec::<String>::new();
     let mut matched_step_count = 0usize;
     let mut ambiguous_step_count = 0usize;
@@ -12656,6 +12717,17 @@ fn align_v2_feature_chunks(
             .iter()
             .map(swap_v2_edit_span_axes)
             .collect::<Result<Vec<_>, _>>()?;
+        let chunk_piecewise_anchor_runs = collect_v2_trusted_fine_anchor_steps(&result.path);
+        let piecewise_anchor_noise_island_count =
+            absorb_v2_piecewise_anchor_supported_lattice_noise_with_steps(
+                &mut chunk_spans,
+                &chunk_piecewise_anchor_runs,
+                coarse.scale,
+            );
+        append_v2_trusted_fine_anchor_steps(
+            &mut piecewise_anchor_runs,
+            chunk_piecewise_anchor_runs,
+        );
         absorb_v2_short_tempo_skips(&mut chunk_spans, coarse.scale);
         let target_chunk_duration_ms = u64::try_from(target_end_ms - target_start_ms)
             .map_err(|_| "V2 target chunk 时长无法表示为非负毫秒。".to_string())?;
@@ -12682,6 +12754,11 @@ fn align_v2_feature_chunks(
             "fine path checkpoint #{chunk_ordinal}：corridor={corridor_kind}，target=[{target_start_ms},{target_end_ms}) ms，sourceSearch=[{source_lower_ms},{source_upper_ms}] ms，pathSource={path_source_start_ms:?}..{path_source_end_ms:?} ms，recoverySource={recovery_source_start_ms:?} ms，contextCost P50/P95={context_cost_p50:?}/{context_cost_p95:?}，M/A={}/{}。",
             result.matched_step_count, result.ambiguous_step_count
         ));
+        if piecewise_anchor_noise_island_count > 0 {
+            path_checkpoints.push(format!(
+                "fine piecewise anchor model #{chunk_ordinal}：以两侧稳定低成本锚点、90% 区间证据密度和净仿射守恒合并 {piecewise_anchor_noise_island_count} 个 lattice-noise 岛；单侧编辑、低密度替换与 ambiguous 保持不变。"
+            ));
+        }
         if recovery_source_start_ms.is_none() {
             // A full semi-global DP with no reliable match cannot safely choose its otherwise
             // arbitrary free-prefix endpoint as the next source cursor. Before the first reliable
@@ -12764,6 +12841,17 @@ fn align_v2_feature_chunks(
     }
     if spans.is_empty() {
         return Err("V2 分块 DP 没有输出 span。".to_string());
+    }
+    let global_piecewise_anchor_noise_island_count =
+        absorb_v2_piecewise_anchor_supported_lattice_noise_with_steps(
+            &mut spans,
+            &piecewise_anchor_runs,
+            coarse.scale,
+        );
+    if global_piecewise_anchor_noise_island_count > 0 {
+        path_checkpoints.push(format!(
+            "fine global piecewise anchor model：跨 45 秒 chunk 汇总连续低成本锚点后，合并 {global_piecewise_anchor_noise_island_count} 个净仿射守恒的 lattice-noise 岛；门槛与逐 chunk 模型相同。"
+        ));
     }
     let balanced_micro_edit_island_count =
         absorb_v2_balanced_micro_edit_islands(&mut spans, coarse.scale);
@@ -13071,6 +13159,199 @@ fn append_or_merge_v2_span(output: &mut Vec<AudioTimeMapSpanDto>, span: AudioTim
         }
     }
     output.push(span);
+}
+
+#[cfg(test)]
+fn absorb_v2_piecewise_anchor_supported_lattice_noise(
+    spans: &mut Vec<AudioTimeMapSpanDto>,
+    reverse_axis_path: &[EditPathStep],
+    expected_scale: f64,
+) -> usize {
+    let trusted_steps = collect_v2_trusted_fine_anchor_steps(reverse_axis_path);
+    absorb_v2_piecewise_anchor_supported_lattice_noise_with_steps(
+        spans,
+        &trusted_steps,
+        expected_scale,
+    )
+}
+
+fn absorb_v2_piecewise_anchor_supported_lattice_noise_with_steps(
+    spans: &mut Vec<AudioTimeMapSpanDto>,
+    trusted_steps: &[V2TrustedFineAnchorStep],
+    expected_scale: f64,
+) -> usize {
+    if spans.len() < 3 || !expected_scale.is_finite() || expected_scale <= 0.0 {
+        return 0;
+    }
+    if trusted_steps.is_empty() {
+        return 0;
+    }
+
+    let mut absorbed_count = 0usize;
+    let mut left_index = 0usize;
+    while left_index + 2 < spans.len() {
+        if !v2_span_has_stable_piecewise_anchor_support(&spans[left_index], trusted_steps) {
+            left_index += 1;
+            continue;
+        }
+        let mut right_index = None;
+        for candidate_end in (left_index + 2)..spans.len() {
+            if !v2_span_has_stable_piecewise_anchor_support(&spans[candidate_end], trusted_steps) {
+                continue;
+            }
+            let candidate = &spans[left_index..=candidate_end];
+            if candidate
+                .iter()
+                .any(|span| span.kind == AudioTimeMapSpanKind::Ambiguous)
+            {
+                break;
+            }
+            if candidate.iter().any(|span| is_v2_edit_span(span.kind))
+                && v2_piecewise_anchor_interval_is_dense(candidate, trusted_steps, expected_scale)
+            {
+                right_index = Some(candidate_end);
+                break;
+            }
+        }
+        let Some(right_index) = right_index else {
+            left_index += 1;
+            continue;
+        };
+
+        let merged = create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            spans[left_index].source_start_ms,
+            spans[right_index].source_end_ms,
+            spans[left_index].target_start_ms,
+            spans[right_index].target_end_ms,
+        );
+        spans.splice(left_index..=right_index, [merged]);
+        absorbed_count = absorbed_count.saturating_add(1);
+        left_index = left_index.saturating_sub(1);
+    }
+    absorbed_count
+}
+
+fn collect_v2_trusted_fine_anchor_steps(
+    reverse_axis_path: &[EditPathStep],
+) -> Vec<V2TrustedFineAnchorStep> {
+    let mut trusted_steps = Vec::<V2TrustedFineAnchorStep>::new();
+    for step in reverse_axis_path
+        .iter()
+        .filter_map(v2_trusted_fine_anchor_step)
+    {
+        if let Some(previous) = trusted_steps.last_mut() {
+            if previous.source_end_ms == step.source_start_ms
+                && previous.target_end_ms == step.target_start_ms
+            {
+                previous.source_end_ms = step.source_end_ms;
+                previous.target_end_ms = step.target_end_ms;
+                continue;
+            }
+        }
+        trusted_steps.push(step);
+    }
+    trusted_steps
+}
+
+fn append_v2_trusted_fine_anchor_steps(
+    output: &mut Vec<V2TrustedFineAnchorStep>,
+    steps: Vec<V2TrustedFineAnchorStep>,
+) {
+    for step in steps {
+        if let Some(previous) = output.last_mut() {
+            if previous.source_end_ms == step.source_start_ms
+                && previous.target_end_ms == step.target_start_ms
+            {
+                previous.source_end_ms = step.source_end_ms;
+                previous.target_end_ms = step.target_end_ms;
+                continue;
+            }
+        }
+        output.push(step);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2TrustedFineAnchorStep {
+    source_start_ms: u64,
+    source_end_ms: u64,
+    target_start_ms: u64,
+    target_end_ms: u64,
+}
+
+fn v2_trusted_fine_anchor_step(step: &EditPathStep) -> Option<V2TrustedFineAnchorStep> {
+    if step.kind != EditPathKind::Matched || step.local_cost > ALIGNMENT_V2_RECOVERY_CONTEXT_COST {
+        return None;
+    }
+    // Fine DP is called with the original episode as source and the reference search window as
+    // target. Swap axes back to the public reference -> original TimeMap direction.
+    let anchor = V2TrustedFineAnchorStep {
+        source_start_ms: u64::try_from(step.target_start_ms).ok()?,
+        source_end_ms: u64::try_from(step.target_end_ms).ok()?,
+        target_start_ms: u64::try_from(step.source_start_ms).ok()?,
+        target_end_ms: u64::try_from(step.source_end_ms).ok()?,
+    };
+    (anchor.source_end_ms > anchor.source_start_ms && anchor.target_end_ms > anchor.target_start_ms)
+        .then_some(anchor)
+}
+
+fn v2_span_has_stable_piecewise_anchor_support(
+    span: &AudioTimeMapSpanDto,
+    trusted_steps: &[V2TrustedFineAnchorStep],
+) -> bool {
+    span.kind == AudioTimeMapSpanKind::Matched
+        && v2_piecewise_anchor_support_ms(span, trusted_steps)
+            >= ALIGNMENT_V2_PIECEWISE_ANCHOR_MIN_SIDE_SUPPORT_MS
+}
+
+fn v2_piecewise_anchor_interval_is_dense(
+    spans: &[AudioTimeMapSpanDto],
+    trusted_steps: &[V2TrustedFineAnchorStep],
+    expected_scale: f64,
+) -> bool {
+    let (Some(first), Some(last)) = (spans.first(), spans.last()) else {
+        return false;
+    };
+    let interval = create_v2_span(
+        AudioTimeMapSpanKind::Matched,
+        first.source_start_ms,
+        last.source_end_ms,
+        first.target_start_ms,
+        last.target_end_ms,
+    );
+    let (source_duration_ms, target_duration_ms) = v2_span_axis_durations_ms(&interval);
+    let comparable_duration_ms = source_duration_ms.min(target_duration_ms);
+    if comparable_duration_ms == 0
+        || (target_duration_ms as f64 - expected_scale * source_duration_ms as f64).abs()
+            > ALIGNMENT_V2_PIECEWISE_ANCHOR_MAX_NET_RESIDUAL_MS
+    {
+        return false;
+    }
+    let trusted_support_ms = v2_piecewise_anchor_support_ms(&interval, trusted_steps);
+    trusted_support_ms.saturating_mul(ALIGNMENT_V2_PIECEWISE_ANCHOR_MIN_DENSITY_DENOMINATOR)
+        >= comparable_duration_ms
+            .saturating_mul(ALIGNMENT_V2_PIECEWISE_ANCHOR_MIN_DENSITY_NUMERATOR)
+}
+
+fn v2_piecewise_anchor_support_ms(
+    span: &AudioTimeMapSpanDto,
+    trusted_steps: &[V2TrustedFineAnchorStep],
+) -> u64 {
+    trusted_steps
+        .iter()
+        .filter(|step| {
+            step.source_start_ms >= span.source_start_ms
+                && step.source_end_ms <= span.source_end_ms
+                && step.target_start_ms >= span.target_start_ms
+                && step.target_end_ms <= span.target_end_ms
+        })
+        .map(|step| {
+            step.source_end_ms
+                .saturating_sub(step.source_start_ms)
+                .min(step.target_end_ms.saturating_sub(step.target_start_ms))
+        })
+        .sum()
 }
 
 fn absorb_v2_balanced_micro_edit_islands(
@@ -27707,6 +27988,163 @@ mod tests {
         assert!(kinds.contains(&AudioTimeMapSpanKind::TargetOnly));
         assert!(kinds.contains(&AudioTimeMapSpanKind::Matched));
         validate_v2_time_map_spans(&result.spans).unwrap();
+    }
+
+    fn v2_test_trusted_reverse_path(spans: &[AudioTimeMapSpanDto]) -> Vec<EditPathStep> {
+        let mut path = Vec::new();
+        for span in spans
+            .iter()
+            .filter(|span| span.kind == AudioTimeMapSpanKind::Matched)
+        {
+            let source_duration_ms = span.source_end_ms - span.source_start_ms;
+            let target_duration_ms = span.target_end_ms - span.target_start_ms;
+            assert_eq!(source_duration_ms, target_duration_ms);
+            assert_eq!(source_duration_ms % 100, 0);
+            for offset_ms in (0..source_duration_ms).step_by(100) {
+                let source_start_ms = span.source_start_ms + offset_ms;
+                let target_start_ms = span.target_start_ms + offset_ms;
+                path.push(EditPathStep {
+                    kind: EditPathKind::Matched,
+                    // Production fine DP runs in the reverse direction: original episode first,
+                    // reference search window second.
+                    source_start_ms: i64::try_from(target_start_ms).unwrap(),
+                    source_end_ms: i64::try_from(target_start_ms + 100).unwrap(),
+                    target_start_ms: i64::try_from(source_start_ms).unwrap(),
+                    target_end_ms: i64::try_from(source_start_ms + 100).unwrap(),
+                    local_cost: 50,
+                });
+            }
+        }
+        path
+    }
+
+    fn v2_test_span_shapes(
+        spans: &[AudioTimeMapSpanDto],
+    ) -> Vec<(AudioTimeMapSpanKind, u64, u64, u64, u64)> {
+        spans
+            .iter()
+            .map(|span| {
+                (
+                    span.kind,
+                    span.source_start_ms,
+                    span.source_end_ms,
+                    span.target_start_ms,
+                    span.target_end_ms,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v2_piecewise_anchor_model_collapses_long_dense_zero_shift_lattice_noise() {
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 6_000, 0, 6_000),
+            create_v2_span(AudioTimeMapSpanKind::TargetOnly, 6_000, 6_000, 6_000, 6_200),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 6_000, 12_000, 6_200, 12_200),
+            create_v2_span(
+                AudioTimeMapSpanKind::SourceOnly,
+                12_000,
+                12_200,
+                12_200,
+                12_200,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                12_200,
+                30_000,
+                12_200,
+                30_000,
+            ),
+        ];
+        let path = v2_test_trusted_reverse_path(&spans);
+        let anchor_runs = collect_v2_trusted_fine_anchor_steps(&path);
+        assert_eq!(anchor_runs.len(), 3);
+        assert_eq!(
+            anchor_runs
+                .iter()
+                .map(|run| run.source_end_ms - run.source_start_ms)
+                .sum::<u64>(),
+            29_800
+        );
+
+        let absorbed = absorb_v2_piecewise_anchor_supported_lattice_noise(&mut spans, &path, 1.0);
+
+        assert_eq!(absorbed, 1);
+        assert_eq!(
+            v2_test_span_shapes(&spans),
+            vec![(AudioTimeMapSpanKind::Matched, 0, 30_000, 0, 30_000)]
+        );
+    }
+
+    #[test]
+    fn v2_piecewise_anchor_model_preserves_low_density_balanced_replacement() {
+        let mut spans = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 6_000, 0, 6_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::TargetOnly,
+                6_000,
+                6_000,
+                6_000,
+                11_000,
+            ),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 6_000, 8_000, 11_000, 13_000),
+            create_v2_span(
+                AudioTimeMapSpanKind::SourceOnly,
+                8_000,
+                13_000,
+                13_000,
+                13_000,
+            ),
+            create_v2_span(
+                AudioTimeMapSpanKind::Matched,
+                13_000,
+                20_000,
+                13_000,
+                20_000,
+            ),
+        ];
+        let original = v2_test_span_shapes(&spans);
+        let path = v2_test_trusted_reverse_path(&spans);
+
+        let absorbed = absorb_v2_piecewise_anchor_supported_lattice_noise(&mut spans, &path, 1.0);
+
+        assert_eq!(absorbed, 0);
+        assert_eq!(v2_test_span_shapes(&spans), original);
+    }
+
+    #[test]
+    fn v2_piecewise_anchor_model_preserves_ambiguous_and_net_shift_edits() {
+        let mut ambiguous = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 6_000, 0, 6_000),
+            create_v2_span(AudioTimeMapSpanKind::Ambiguous, 6_000, 6_200, 6_000, 6_200),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 6_200, 20_000, 6_200, 20_000),
+        ];
+        let ambiguous_path = v2_test_trusted_reverse_path(&ambiguous);
+        assert_eq!(
+            absorb_v2_piecewise_anchor_supported_lattice_noise(
+                &mut ambiguous,
+                &ambiguous_path,
+                1.0
+            ),
+            0
+        );
+        assert_eq!(ambiguous[1].kind, AudioTimeMapSpanKind::Ambiguous);
+
+        let mut net_shift = vec![
+            create_v2_span(AudioTimeMapSpanKind::Matched, 0, 6_000, 0, 6_000),
+            create_v2_span(AudioTimeMapSpanKind::SourceOnly, 6_000, 6_500, 6_000, 6_000),
+            create_v2_span(AudioTimeMapSpanKind::Matched, 6_500, 20_000, 6_000, 19_500),
+        ];
+        let net_shift_path = v2_test_trusted_reverse_path(&net_shift);
+        assert_eq!(
+            absorb_v2_piecewise_anchor_supported_lattice_noise(
+                &mut net_shift,
+                &net_shift_path,
+                1.0
+            ),
+            0
+        );
+        assert_eq!(net_shift[1].kind, AudioTimeMapSpanKind::SourceOnly);
     }
 
     #[test]
