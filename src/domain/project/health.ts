@@ -7,6 +7,7 @@ import type {
   SyncAnchor
 } from "../danmaku/types";
 import { reconcileMediaTimeMapQuality } from "../alignment/mediaTimeMap";
+import { readTimeMapSpanReviewDecision } from "../alignment/timeMapReviewDecision";
 import { areMediaContentIdentitiesEqual } from "./mediaIdentity";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { isItemInsideClip, resolveProjectDanmakuEvents } from "../timeline/mapping";
@@ -374,7 +375,13 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
           });
         }
       }
-      if (timeMap.spans.some((span) => span.kind === "ambiguous")) {
+      if (
+        timeMap.spans.some(
+          (span, spanIndex) =>
+            span.kind === "ambiguous" &&
+            readTimeMapSpanReviewDecision(timeMap, spanIndex)?.decision !== "replacement"
+        )
+      ) {
         findings.push({
           id: `source-segment-time-map-ambiguous-${segment.id}`,
           severity: "error",

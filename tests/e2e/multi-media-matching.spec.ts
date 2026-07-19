@@ -2,7 +2,13 @@ import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
-const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
+const screenshotDir = resolve(
+  process.cwd(),
+  "test-results",
+  "acceptance-artifacts",
+  String(process.pid),
+  "screenshots"
+);
 
 interface MockDialogCall {
   title: string;
@@ -831,6 +837,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻断", async ({ page }) => {
+  test.setTimeout(90_000);
   await page.goto("/");
 
   await page.getByRole("button", { name: "批量导入原片素材" }).click();
@@ -968,8 +975,8 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await ambiguousItem.getByRole("button", { name: "版本替换" }).click();
   await expect(ambiguousItem).toContainText("已保存：版本替换");
   await expect(
-    firstCandidate.getByRole("button", { name: "保存关系供试听复核" })
-  ).toBeEnabled();
+    firstCandidate.getByRole("button", { name: "此候选不能确认" })
+  ).toBeDisabled();
 
   await firstReview.getByRole("button", { name: /第 1 段 共同内容/ }).click();
   const playbackReview = firstReview.getByTestId("time-map-playback-review");
@@ -987,14 +994,15 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   });
 
   const candidateCards = page.getByTestId("media-match-candidate");
-  for (let index = 0; index < 5; index += 1) {
+  for (let index = 1; index < 5; index += 1) {
     await candidateCards.nth(index).getByRole("button", { name: "保存关系供试听复核" }).click();
   }
-  await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E01");
-  await expect(page.getByTestId("confirmed-media-relations")).toContainText("C136-E05");
-  await expect(matchingPanel).toContainText("5 / 5 个原片已有保存关系");
+  await expect(matchingPanel).toContainText("4 / 5 个原片已有保存关系");
+  const confirmedRelations = page.getByTestId("confirmed-media-relations");
+  await expect(confirmedRelations).toContainText("C136-E02");
+  await expect(confirmedRelations).toContainText("C136-E05");
 
-  const verification = candidateCards.nth(0).getByTestId("manual-time-map-verification");
+  const verification = candidateCards.nth(1).getByTestId("manual-time-map-verification");
   await expect(verification).toContainText("自动匹配和保存关系都不会触发签发");
   await expect(verification).toContainText("当前不能签发");
   await expect(verification.getByRole("button", { name: "完成复核并签发" })).toBeDisabled();

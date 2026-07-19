@@ -3,21 +3,25 @@ use crate::alignment_v2::match_landmarks_affine_with_cancel;
 use crate::{
     alignment_v2::{
         align_features_edit_aware_with_cancel, derive_affine_fine_decode_windows,
-        extract_fine_features_with_backend_request,
-        extract_landmarks_and_fine_features_with_backend_request,
-        lock_fine_spectral_backend_request, match_landmarks_affine_coarse_universe_with_cancel,
+        extract_fine_features_with_backend_request, lock_fine_spectral_backend_request,
+        match_landmarks_affine_coarse_universe_with_cancel,
         materialize_affine_hypothesis_with_cancel, refine_boundary_by_correlation_with_cancel,
         refine_boundary_by_one_sided_correlation_with_cancel, resolve_spectral_backend_preference,
         resolve_spectral_backend_request, AffineAnchorEvidence, AffineFineDecodeWindows,
         AffineFineWindowRequest, AffineHypothesis, AffineMatchConfig, BoundaryContextSide,
-        BoundaryRefinementConfig, CoarseAffineHypothesis, EditAlignmentConfig, EditAlignmentMode,
-        EditPathKind, EditTimeSpan, FineFeatureConfig, FineFeatureFrame, LandmarkConfig,
-        MediaCoarseIndexResult, PresentationRangeMs, SpectralBackendExecution,
-        SpectralBackendPreference, SpectralBackendRequest, SpectralLandmark,
-        StreamingLandmarkExtractor, AFFINE_HOLDOUT_TIME_BLOCK_MS, CPU_SPECTRAL_BACKEND_ID,
-        STREAMING_CPU_SPECTRAL_BACKEND_ID, STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
+        BoundaryRefinementConfig, CoarseAffineHypothesis, CoarseSpectralFingerprintFrame,
+        EditAlignmentConfig, EditAlignmentMode, EditPathKind, EditTimeSpan, FineFeatureConfig,
+        FineFeatureFrame, LandmarkConfig, MediaCoarseIndexResult, PresentationRangeMs,
+        SpectralBackendExecution, SpectralBackendPreference, SpectralBackendRequest,
+        SpectralLandmark, StreamingLandmarkExtractor, AFFINE_HOLDOUT_TIME_BLOCK_MS,
+        CPU_SPECTRAL_BACKEND_ID, STREAMING_CPU_SPECTRAL_BACKEND_ID,
+        STREAMING_HYBRID_SPECTRAL_BACKEND_ID,
     },
     c137_process_attestation::{self, C137ProcessEvidenceBinding, SealC137ProcessEvidenceRequest},
+    coarse_fingerprint::{
+        match_landmark_timelines_approximately, match_spectral_fingerprints_approximately,
+        ApproximateCoarseHypothesis, ApproximateFingerprintConfig,
+    },
     cuda_fft_backend::{
         CudaFftMemoryBudget, CUDA_FFT_BACKEND_ID, CUDA_FFT_DEFAULT_BATCH_FRAMES, CUDA_FFT_FRAME_LEN,
     },
@@ -120,7 +124,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.3-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v17";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v18";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -273,11 +277,11 @@ const ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN: f64 = 0.08;
 // 16 kHz mono i16 PCM is about 110 MiB, while a 20-minute episode is about 37 MiB; larger sets
 // degrade by LRU eviction.
 const MAX_V2_MEDIA_ARTIFACT_CACHE_BYTES: usize = 768 * 1024 * 1024;
-const PERSISTENT_V2_COARSE_CACHE_SCHEMA_VERSION: u8 = 1;
+const PERSISTENT_V2_COARSE_CACHE_SCHEMA_VERSION: u8 = 2;
 const PERSISTENT_V2_COARSE_CACHE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const PERSISTENT_V2_COARSE_CACHE_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const PERSISTENT_V2_COARSE_CACHE_MAX_ENTRIES: usize = 128;
-const PERSISTENT_V2_COARSE_CACHE_DIRECTORY: &str = "alignment-v2-coarse-cache-v1";
+const PERSISTENT_V2_COARSE_CACHE_DIRECTORY: &str = "alignment-v2-coarse-cache-v2";
 // Short candidate PCM must remain alive until track-pair selection finishes to preserve the
 // one-decode shared-FFT path. Long candidates contribute only the bounded coarse index here.
 // Fail closed before a pathological multi-track input can make either working set unbounded.
@@ -1575,6 +1579,12 @@ struct AlignmentMediaReadLease {
     _target: File,
 }
 
+#[derive(Debug)]
+struct PinnedMediaIdentityGuard {
+    physical_pin: Arc<PinnedPhysicalFile>,
+    expected_identity: MediaContentIdentity,
+}
+
 #[derive(Debug, Clone)]
 struct CachedAudioFeatures {
     frames: Vec<AudioFeatureFrame>,
@@ -1584,13 +1594,16 @@ struct CachedAudioFeatures {
 #[derive(Debug, Clone)]
 struct CachedV2Landmarks {
     landmarks: Arc<Vec<SpectralLandmark>>,
+    coarse_fingerprint: Arc<Vec<CoarseSpectralFingerprintFrame>>,
     pcm: Option<Arc<Vec<i16>>>,
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
     cache_key: String,
     cache_hit: bool,
     cache_origin: V2ArtifactCacheOrigin,
+    cache_persistence_error: Option<String>,
     spectral_backend: SpectralBackendExecution,
     presentation_bounds: PresentationRangeMs,
+    identity_guard: Option<Arc<PinnedMediaIdentityGuard>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1642,6 +1655,7 @@ struct V2LandmarkExtractionContext<'a> {
     shared_backend_request: Option<&'a SpectralBackendRequest>,
     cache_plan: Option<V2CoarseCandidateCachePlan>,
     retained_artifact_bytes: usize,
+    identity_guard: Option<Arc<PinnedMediaIdentityGuard>>,
 }
 
 #[derive(Debug)]
@@ -1656,6 +1670,7 @@ struct DecodedV2Audio {
 struct V2MediaArtifact {
     pcm: Option<Arc<Vec<i16>>>,
     landmarks: Arc<Vec<SpectralLandmark>>,
+    coarse_fingerprint: Arc<Vec<CoarseSpectralFingerprintFrame>>,
     fine_features: Option<Arc<Vec<FineFeatureFrame>>>,
     spectral_backend: SpectralBackendExecution,
     presentation_bounds: PresentationRangeMs,
@@ -1678,6 +1693,7 @@ struct PersistentV2CoarsePayload {
     presentation_end_ms: i64,
     spectral_backend: PersistentV2CoarseBackend,
     landmarks: Vec<SpectralLandmark>,
+    coarse_fingerprint: Vec<CoarseSpectralFingerprintFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1692,6 +1708,7 @@ struct PersistentV2CoarseEnvelope {
 #[derive(Debug, PartialEq, Eq)]
 struct DecodedV2CoarseLandmarks {
     index: MediaCoarseIndexResult,
+    coarse_fingerprint: Vec<CoarseSpectralFingerprintFrame>,
     decoded_sample_count: u64,
     spectral_backend: SpectralBackendExecution,
 }
@@ -2088,7 +2105,7 @@ struct PreparedV2BatchMediaEvidence {
 }
 
 struct PreparedAudioAlignmentBatchMedia {
-    physical_pin: Arc<PinnedPhysicalFile>,
+    identity_guard: Arc<PinnedMediaIdentityGuard>,
     path: String,
     physical_group_index: usize,
     physical_object_key: PhysicalFileObjectKey,
@@ -2195,6 +2212,7 @@ struct V2FineGroupEvaluationRecord {
 struct V2FineGroupEvaluationOutcome {
     state: FineEvaluationState,
     record: Option<V2FineGroupEvaluationRecord>,
+    review_proposal: Option<Box<AudioAlignmentProposal>>,
     member_execution_count: usize,
     diagnostics: Vec<String>,
 }
@@ -2218,6 +2236,7 @@ struct V2FineComponentResolution {
     refinement_round_count: usize,
     evaluated_candidate_count: usize,
     records: HashMap<FineCandidateId, V2FineGroupEvaluationRecord>,
+    review_proposals_by_pair: HashMap<usize, Box<AudioAlignmentProposal>>,
     diagnostics_by_pair: HashMap<usize, Vec<String>>,
 }
 
@@ -6553,6 +6572,7 @@ where
             &source_inputs,
             cancel_flag,
             Some(cache_plan),
+            None,
             &mut V2CandidateExtractionState {
                 notes: &mut extraction_notes,
                 retained_artifact_bytes: &mut retained_artifact_bytes,
@@ -6580,6 +6600,7 @@ where
             &target_inputs,
             cancel_flag,
             Some(cache_plan),
+            None,
             &mut V2CandidateExtractionState {
                 notes: &mut extraction_notes,
                 retained_artifact_bytes: &mut retained_artifact_bytes,
@@ -7009,6 +7030,173 @@ fn v2_prepared_retained_artifact_baseline(prepared: Option<&PreparedV2PairEviden
         .unwrap_or(0)
 }
 
+#[derive(Debug)]
+struct V2ApproximateFingerprintCandidates {
+    candidates: Vec<V2TrackPairCandidate>,
+    diagnostic: String,
+}
+
+fn create_v2_approximate_fingerprint_candidates(
+    source_input: &AlignmentAudioInput,
+    target_input: &AlignmentAudioInput,
+    source_artifact: &CachedV2Landmarks,
+    target_artifact: &CachedV2Landmarks,
+    toolchain_cache_identity: &str,
+    affine_config: &AffineMatchConfig,
+    cancel_flag: Option<&AtomicBool>,
+) -> Result<V2ApproximateFingerprintCandidates, String> {
+    let result = if !source_artifact.coarse_fingerprint.is_empty()
+        && !target_artifact.coarse_fingerprint.is_empty()
+    {
+        match_spectral_fingerprints_approximately(
+            &source_artifact.coarse_fingerprint,
+            &target_artifact.coarse_fingerprint,
+            (
+                target_artifact.presentation_bounds.start_ms,
+                target_artifact.presentation_bounds.end_ms,
+            ),
+            &ApproximateFingerprintConfig::default(),
+            cancel_flag,
+        )
+    } else {
+        // Compatibility guard for in-memory test fixtures. Release v18 persistent artifacts
+        // always contain full coarse spectral frames.
+        match_landmark_timelines_approximately(
+            &source_artifact.landmarks,
+            &target_artifact.landmarks,
+            (
+                source_artifact.presentation_bounds.start_ms,
+                source_artifact.presentation_bounds.end_ms,
+            ),
+            (
+                target_artifact.presentation_bounds.start_ms,
+                target_artifact.presentation_bounds.end_ms,
+            ),
+            &ApproximateFingerprintConfig::default(),
+            cancel_flag,
+        )
+    }
+    .map_err(|error| format!("近似声谱时间指纹失败：{error}"))?;
+    let diagnostic = format!(
+        "近似声谱时间指纹窗口统计：queryBlocks={}、scoreAccepted={}、uniqueTraining={}、best/medianScore={:?}/{:?}、best/medianMargin={:?}/{:?}、trainingOffsetsMs={:?}。",
+        result.query_block_count,
+        result.score_accepted_block_count,
+        result.unique_training_block_count,
+        result.best_block_score,
+        result.median_block_score,
+        result.best_block_margin,
+        result.median_block_margin,
+        result.unique_training_offsets_ms
+    );
+    let hypotheses = result.hypotheses;
+    let alternative_margin = hypotheses
+        .first()
+        .zip(hypotheses.get(1))
+        .map(|(best, second)| ((best.score - second.score) / best.score.max(0.001)).clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    let repeated_content_only =
+        hypotheses
+            .first()
+            .zip(hypotheses.get(1))
+            .is_some_and(|(best, second)| {
+                alternative_margin < ALIGNMENT_V2_MIN_TRACK_MARGIN
+                    && best.offset_ms.abs_diff(second.offset_ms) >= 10_000
+            });
+    let candidates = hypotheses
+        .into_iter()
+        .map(|approximate| {
+            let hypothesis =
+                v2_affine_hypothesis_from_approximate_fingerprint(&approximate, affine_config);
+            let temporal_coverage = approximate.target_coverage;
+            let ordinary_score = score_v2_track_pair(
+                &hypothesis,
+                temporal_coverage,
+                affine_config,
+                source_input,
+                target_input,
+            );
+            let score = (ordinary_score * 0.70 + approximate.score * 0.30).clamp(0.0, 1.0);
+            let candidate = V2TrackPairCandidate {
+                source_input: source_input.clone(),
+                target_input: target_input.clone(),
+                // The approximate fingerprint already owns complete training and held-out
+                // evidence. It must not be rematerialized through exact-hash observations.
+                coarse_hypothesis: None,
+                hypothesis,
+                score,
+                temporal_coverage,
+                intrinsic_margin: alternative_margin,
+                repeated_content_only,
+                observation_count: approximate
+                    .training_anchors
+                    .len()
+                    .saturating_add(approximate.held_out_anchors.len()),
+                source_landmark_count: source_artifact.landmarks.len(),
+                target_landmark_count: target_artifact.landmarks.len(),
+                source_spectral_backend_id: source_artifact.spectral_backend.backend_id.clone(),
+                target_spectral_backend_id: target_artifact.spectral_backend.backend_id.clone(),
+                toolchain_cache_identity: toolchain_cache_identity.to_string(),
+                global_source_interval: source_artifact.presentation_bounds,
+                global_target_interval: target_artifact.presentation_bounds,
+                fine_working_set_bytes: 0,
+            };
+            bind_v2_candidate_global_intervals(candidate, source_artifact, target_artifact)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(V2ApproximateFingerprintCandidates {
+        candidates,
+        diagnostic,
+    })
+}
+
+fn v2_affine_hypothesis_from_approximate_fingerprint(
+    approximate: &ApproximateCoarseHypothesis,
+    affine_config: &AffineMatchConfig,
+) -> AffineHypothesis {
+    let training_anchors = approximate
+        .training_anchors
+        .iter()
+        .map(|anchor| AffineAnchorEvidence {
+            source_time_ms: anchor.source_time_ms,
+            target_time_ms: anchor.target_time_ms,
+            residual_ms: anchor.residual_ms,
+        })
+        .collect::<Vec<_>>();
+    let held_out_anchors = approximate
+        .held_out_anchors
+        .iter()
+        .map(|anchor| AffineAnchorEvidence {
+            source_time_ms: anchor.source_time_ms,
+            target_time_ms: anchor.target_time_ms,
+            residual_ms: anchor.residual_ms,
+        })
+        .collect::<Vec<_>>();
+    let held_out_within_tolerance_count = approximate
+        .held_out_anchors
+        .iter()
+        .filter(|anchor| {
+            anchor.residual_ms.unsigned_abs() <= affine_config.residual_tolerance_ms as u64
+        })
+        .count();
+    AffineHypothesis {
+        scale: approximate.scale,
+        offset_ms: approximate.offset_ms,
+        inlier_count: training_anchors.len(),
+        unique_source_count: training_anchors.len(),
+        unique_source_coverage: approximate.target_coverage,
+        unique_target_count: training_anchors.len(),
+        unique_target_coverage: approximate.target_coverage,
+        source_start_ms: approximate.source_start_ms,
+        source_end_ms: approximate.source_end_ms,
+        p50_residual_ms: approximate.p50_residual_ms,
+        p95_residual_ms: approximate.p95_residual_ms,
+        max_residual_ms: approximate.max_residual_ms,
+        training_anchors,
+        held_out_anchors,
+        held_out_within_tolerance_count,
+    }
+}
+
 fn collect_v2_pair_coarse_candidates(
     source_inputs: &[AlignmentAudioInput],
     target_inputs: &[AlignmentAudioInput],
@@ -7068,9 +7256,87 @@ fn collect_v2_pair_coarse_candidates(
             };
             if result.hypotheses.is_empty() {
                 diagnostics.push(format!(
-                    "音轨 #{} → #{} 没有达到最小内点数的仿射假设。",
-                    source_input.stream.stream_index, target_input.stream.stream_index
+                    "音轨 #{} → #{} 的 exact-landmark 仿射拟合没有候选：sourceLandmarks={}、targetLandmarks={}、exactObservations={}、modelSeeds={}；转入近似声谱时间指纹。",
+                    source_input.stream.stream_index,
+                    target_input.stream.stream_index,
+                    result.source_landmark_count,
+                    result.target_landmark_count,
+                    result.observation_count,
+                    result.seed_count
                 ));
+                let approximate_result = match create_v2_approximate_fingerprint_candidates(
+                    source_input,
+                    target_input,
+                    source_artifact,
+                    target_artifact,
+                    toolchain_cache_identity,
+                    &affine_config,
+                    cancel_flag,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        diagnostics.push(format!(
+                            "音轨 #{} → #{} 的近似声谱时间指纹无法执行：{error}",
+                            source_input.stream.stream_index, target_input.stream.stream_index
+                        ));
+                        continue;
+                    }
+                };
+                diagnostics.push(format!(
+                    "音轨 #{} → #{}：{}",
+                    source_input.stream.stream_index,
+                    target_input.stream.stream_index,
+                    approximate_result.diagnostic
+                ));
+                let approximate_candidates = approximate_result.candidates;
+                if approximate_candidates.is_empty() {
+                    diagnostics.push(format!(
+                        "音轨 #{} → #{} 的近似声谱时间指纹也没有形成满足分布、唯一性与内点门槛的候选。",
+                        source_input.stream.stream_index, target_input.stream.stream_index
+                    ));
+                    continue;
+                }
+                let projected_candidate_count = candidates
+                    .len()
+                    .checked_add(approximate_candidates.len())
+                    .ok_or_else(|| {
+                        "blocked:resource-limit：完整 coarse fallback candidate 数量溢出。"
+                            .to_string()
+                    })?;
+                if projected_candidate_count > ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES {
+                    return Err(format!(
+                        "blocked:resource-limit：完整 coarse candidate universe 需要 {} 个 candidate，超过硬上限 {}。",
+                        projected_candidate_count, ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_CANDIDATES
+                    ));
+                }
+                diagnostics.push(format!(
+                    "音轨 #{} → #{} 的近似声谱时间指纹生成 {} 个候选：{}。",
+                    source_input.stream.stream_index,
+                    target_input.stream.stream_index,
+                    approximate_candidates.len(),
+                    approximate_candidates
+                        .iter()
+                        .map(|candidate| format!(
+                            "offset={:+},anchors={}/{},coverage={:.3},p95={}ms,score={:.3}",
+                            candidate.hypothesis.offset_ms,
+                            candidate.hypothesis.training_anchors.len(),
+                            candidate.hypothesis.held_out_anchors.len(),
+                            candidate.temporal_coverage,
+                            candidate.hypothesis.p95_residual_ms,
+                            candidate.score
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("；")
+                ));
+                alternatives.extend(approximate_candidates.iter().map(|candidate| {
+                    v2_alternative_hypothesis_score(
+                        &candidate.source_input,
+                        &candidate.target_input,
+                        &candidate.hypothesis,
+                        candidate.score,
+                    )
+                }));
+                candidates.extend(approximate_candidates);
                 continue;
             }
             let projected_candidate_count = candidates
@@ -8707,22 +8973,24 @@ fn v2_fine_pair_components(plan: &PlannedAudioAlignmentBatch) -> Vec<Vec<usize>>
     components
 }
 
+type V2FineFrontierInventoryBuild = (
+    FineCandidateInventory,
+    Vec<V2FineFrontierGroupBinding>,
+    Vec<FineCandidateId>,
+    V2FineInventoryEvidence,
+    FineFrontierConfig,
+);
+
 fn create_v2_fine_frontier_inventory(
     plan: &PlannedAudioAlignmentBatch,
     coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
     pair_indices: &[usize],
-) -> Result<
-    (
-        FineCandidateInventory,
-        Vec<V2FineFrontierGroupBinding>,
-        V2FineInventoryEvidence,
-        FineFrontierConfig,
-    ),
-    String,
-> {
+) -> Result<V2FineFrontierInventoryBuild, String> {
     let mut candidates = Vec::<FineCandidate>::new();
     let mut bindings = Vec::<V2FineFrontierGroupBinding>::new();
     let mut inventory_candidates = Vec::<AudioAlignmentBatchFineInventoryCandidateSnapshot>::new();
+    let mut mandatory_seed_by_target =
+        HashMap::<(bool, usize), (ScoreMicros, FineCandidateId)>::new();
     for pair_index in pair_indices {
         let pair = plan
             .pairs
@@ -8779,6 +9047,20 @@ fn create_v2_fine_frontier_inventory(
                     FineEvaluationState::EvaluatedIneligible
                 },
             });
+            if intrinsically_eligible {
+                let target_axis_key = pair
+                    .target_axis_reuse_group_ordinal
+                    .map(|ordinal| (true, ordinal as usize))
+                    .unwrap_or((false, pair.target_physical_media_index));
+                mandatory_seed_by_target
+                    .entry(target_axis_key)
+                    .and_modify(|current| {
+                        if upper > current.0 || (upper == current.0 && id < current.1) {
+                            *current = (upper, id);
+                        }
+                    })
+                    .or_insert((upper, id));
+            }
             bindings.push(V2FineFrontierGroupBinding {
                 id,
                 pair_index: *pair_index,
@@ -8824,9 +9106,15 @@ fn create_v2_fine_frontier_inventory(
         overlap_tolerance_ms,
         ..FineFrontierConfig::default()
     };
+    let mut mandatory_seed_candidate_ids = mandatory_seed_by_target
+        .into_values()
+        .map(|(_, id)| id)
+        .collect::<Vec<_>>();
+    mandatory_seed_candidate_ids.sort_unstable();
     Ok((
         inventory,
         bindings,
+        mandatory_seed_candidate_ids,
         V2FineInventoryEvidence {
             candidates: inventory_candidates,
             digest: inventory_digest,
@@ -9666,6 +9954,9 @@ fn v2_language_pair_prior(source: &AlignmentAudioInput, target: &AlignmentAudioI
     }
 }
 
+// These arguments deliberately keep media identity, cancellation and memory-accounting
+// boundaries visible at the extraction call site.
+#[allow(clippy::too_many_arguments)]
 fn extract_v2_landmark_candidates(
     media_path: &str,
     label: &str,
@@ -9673,6 +9964,7 @@ fn extract_v2_landmark_candidates(
     inputs: &[AlignmentAudioInput],
     cancel_flag: Option<&AtomicBool>,
     prebuilt_cache_plan: Option<V2CandidateSetCachePlan>,
+    identity_guard: Option<&Arc<PinnedMediaIdentityGuard>>,
     state: &mut V2CandidateExtractionState<'_>,
 ) -> Result<HashMap<u32, CachedV2Landmarks>, String> {
     // Snapshot every warm artifact as an Arc-backed plan before extraction. Cache hits are charged
@@ -9714,6 +10006,7 @@ fn extract_v2_landmark_candidates(
                 shared_backend_request: Some(state.spectral_backend_request),
                 cache_plan: Some(candidate_plan),
                 retained_artifact_bytes: *state.retained_artifact_bytes,
+                identity_guard: identity_guard.cloned(),
             },
         ) {
             Ok(artifact) if !artifact.landmarks.is_empty() => {
@@ -9734,6 +10027,12 @@ fn extract_v2_landmark_candidates(
                 if let Some(reason) = &artifact.spectral_backend.fallback_reason {
                     state.notes.push(format!(
                         "{label}音轨 #{} 声谱后端说明：{reason}",
+                        input.stream.stream_index
+                    ));
+                }
+                if let Some(error) = &artifact.cache_persistence_error {
+                    state.notes.push(format!(
+                        "{label}音轨 #{} 的磁盘粗索引未写入：{error}",
                         input.stream.stream_index
                     ));
                 }
@@ -10297,19 +10596,15 @@ fn should_stream_v2_coarse_only(input: &AlignmentAudioInput) -> bool {
         .is_none_or(|duration| duration > ALIGNMENT_V2_MAX_DURATION_MS)
 }
 
-fn v2_landmark_artifact_kind(input: &AlignmentAudioInput) -> &'static str {
-    if should_stream_v2_coarse_only(input) {
-        "landmark-streaming-coarse"
-    } else {
-        "landmark-full"
-    }
+fn v2_landmark_artifact_kind(_input: &AlignmentAudioInput) -> &'static str {
+    "landmark-streaming-coarse"
 }
 
 fn v2_planned_coarse_cache_backend_id<'a>(
-    input: &AlignmentAudioInput,
+    _input: &AlignmentAudioInput,
     planned_backend_id: &'a str,
 ) -> &'a str {
-    if should_stream_v2_coarse_only(input) && planned_backend_id != CUDA_FFT_BACKEND_ID {
+    if planned_backend_id != CUDA_FFT_BACKEND_ID {
         STREAMING_CPU_SPECTRAL_BACKEND_ID
     } else {
         planned_backend_id
@@ -10335,16 +10630,20 @@ fn cached_v2_landmarks_from_media_artifact(
     cache_key: String,
     artifact: V2MediaArtifact,
     cache_origin: V2ArtifactCacheOrigin,
+    identity_guard: Option<Arc<PinnedMediaIdentityGuard>>,
 ) -> CachedV2Landmarks {
     CachedV2Landmarks {
         landmarks: artifact.landmarks,
+        coarse_fingerprint: artifact.coarse_fingerprint,
         pcm: artifact.pcm,
         fine_features: artifact.fine_features,
         cache_key,
         cache_hit: true,
         cache_origin,
+        cache_persistence_error: None,
         spectral_backend: artifact.spectral_backend,
         presentation_bounds: artifact.presentation_bounds,
+        identity_guard,
     }
 }
 
@@ -10382,6 +10681,7 @@ fn plan_v2_candidate_set_cache_aware(
                 cache_key,
                 artifact,
                 V2ArtifactCacheOrigin::Memory,
+                None,
             );
             prefix_retained = ensure_v2_active_artifact_budget(
                 prefix_retained,
@@ -10510,6 +10810,7 @@ fn cached_v2_landmark_retained_bytes(artifact: &CachedV2Landmarks) -> usize {
     v2_media_artifact_payload_bytes(&V2MediaArtifact {
         pcm: artifact.pcm.clone(),
         landmarks: artifact.landmarks.clone(),
+        coarse_fingerprint: artifact.coarse_fingerprint.clone(),
         fine_features: artifact.fine_features.clone(),
         spectral_backend: artifact.spectral_backend.clone(),
         presentation_bounds: artifact.presentation_bounds,
@@ -10526,6 +10827,10 @@ fn v2_media_artifact_payload_bytes(artifact: &V2MediaArtifact) -> usize {
         .landmarks
         .capacity()
         .saturating_mul(std::mem::size_of::<SpectralLandmark>());
+    let coarse_fingerprint_bytes = artifact
+        .coarse_fingerprint
+        .capacity()
+        .saturating_mul(std::mem::size_of::<CoarseSpectralFingerprintFrame>());
     let fine_bytes = artifact
         .fine_features
         .as_ref()
@@ -10545,6 +10850,7 @@ fn v2_media_artifact_payload_bytes(artifact: &V2MediaArtifact) -> usize {
         .unwrap_or(0);
     pcm_bytes
         .saturating_add(landmark_bytes)
+        .saturating_add(coarse_fingerprint_bytes)
         .saturating_add(fine_bytes)
         .saturating_add(artifact.spectral_backend.backend_id.len())
         .saturating_add(artifact.spectral_backend.requested_backend.len())
@@ -10624,6 +10930,7 @@ fn persistent_v2_coarse_payload_from_artifact(
             fallback_reason: artifact.spectral_backend.fallback_reason.clone(),
         },
         landmarks: artifact.landmarks.as_ref().clone(),
+        coarse_fingerprint: artifact.coarse_fingerprint.as_ref().clone(),
     }
 }
 
@@ -10639,6 +10946,21 @@ fn validate_persistent_v2_coarse_payload(
     }
     if payload.landmarks.is_empty() || payload.landmarks.len() > ALIGNMENT_V2_COARSE_MAX_LANDMARKS {
         return Err("磁盘粗索引 landmark 数量超出硬边界。".to_string());
+    }
+    if payload.coarse_fingerprint.is_empty()
+        || payload.coarse_fingerprint.len() > 200_000
+        || payload.coarse_fingerprint.windows(2).any(|pair| {
+            pair[0].time_ms >= pair[1].time_ms
+                || pair[0].active_ratio_milli > 1_000
+                || pair[1].active_ratio_milli > 1_000
+        })
+        || payload.coarse_fingerprint.iter().any(|frame| {
+            frame.time_ms < payload.presentation_start_ms
+                || frame.time_ms > payload.presentation_end_ms
+                || frame.active_ratio_milli > 1_000
+        })
+    {
+        return Err("磁盘粗索引 coarse fingerprint 无效。".to_string());
     }
     for landmark in &payload.landmarks {
         let anchor_bin = landmark.hash >> 16;
@@ -10688,6 +11010,7 @@ fn v2_media_artifact_from_persistent_payload(
     V2MediaArtifact {
         pcm: None,
         landmarks: Arc::new(payload.landmarks),
+        coarse_fingerprint: Arc::new(payload.coarse_fingerprint),
         fine_features: None,
         spectral_backend: SpectralBackendExecution {
             backend_id: payload.spectral_backend.backend_id,
@@ -10894,9 +11217,9 @@ fn get_v2_landmarks(
         shared_backend_request,
         cache_plan,
         retained_artifact_bytes,
+        identity_guard,
     } = context;
     check_cancelled(cancel_flag)?;
-    let streaming_coarse = should_stream_v2_coarse_only(input);
     let backend_request = shared_backend_request.unwrap_or(&options.spectral_backend_request);
     let mut cache_key = create_v2_planned_coarse_cache_key(
         media_path,
@@ -10905,7 +11228,7 @@ fn get_v2_landmarks(
         &backend_request.planned_backend_id,
     )?;
     match cache_plan {
-        Some(V2CoarseCandidateCachePlan::Hit(cached)) => {
+        Some(V2CoarseCandidateCachePlan::Hit(mut cached)) => {
             if cached.cache_key != cache_key {
                 return Err(
                     "blocked:media-identity-changed：V2 coarse 缓存计划与当前媒体身份不一致。"
@@ -10916,13 +11239,15 @@ fn get_v2_landmarks(
                 &cached.spectral_backend,
                 &options.spectral_backend_request,
             )?;
-            verify_media_content_identity_after_tool_output(
+            verify_media_content_identity_after_tool_output_or_pinned(
+                identity_guard.as_deref(),
                 media_path,
                 input.content_identity.as_ref(),
                 cancel_flag,
                 "V2 landmark 缓存复用",
             )?;
             benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
+            cached.identity_guard = identity_guard;
             return Ok(cached);
         }
         Some(V2CoarseCandidateCachePlan::Miss { expected_cache_key }) => {
@@ -10946,7 +11271,8 @@ fn get_v2_landmarks(
                     &artifact.spectral_backend,
                     &options.spectral_backend_request,
                 )?;
-                verify_media_content_identity_after_tool_output(
+                verify_media_content_identity_after_tool_output_or_pinned(
+                    identity_guard.as_deref(),
                     media_path,
                     input.content_identity.as_ref(),
                     cancel_flag,
@@ -10957,115 +11283,74 @@ fn get_v2_landmarks(
                     cache_key,
                     artifact,
                     V2ArtifactCacheOrigin::Memory,
+                    identity_guard,
                 ));
             }
             benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Miss);
         }
     }
-    if streaming_coarse {
-        check_cancelled(cancel_flag)?;
-        if let Some(artifact) = load_persistent_v2_coarse_artifact(&cache_key) {
-            verify_v2_spectral_backend_policy(
-                &artifact.spectral_backend,
-                &options.spectral_backend_request,
-            )?;
-            verify_media_content_identity_after_tool_output(
-                media_path,
-                input.content_identity.as_ref(),
-                cancel_flag,
-                "V2 磁盘粗索引复用",
-            )?;
-            let cached = cached_v2_landmarks_from_media_artifact(
-                cache_key.clone(),
-                artifact.clone(),
-                V2ArtifactCacheOrigin::Persistent,
+    check_cancelled(cancel_flag)?;
+    if let Some(artifact) = load_persistent_v2_coarse_artifact(&cache_key) {
+        verify_v2_spectral_backend_policy(
+            &artifact.spectral_backend,
+            &options.spectral_backend_request,
+        )?;
+        verify_media_content_identity_after_tool_output_or_pinned(
+            identity_guard.as_deref(),
+            media_path,
+            input.content_identity.as_ref(),
+            cancel_flag,
+            "V2 磁盘粗索引复用",
+        )?;
+        let cached = cached_v2_landmarks_from_media_artifact(
+            cache_key.clone(),
+            artifact.clone(),
+            V2ArtifactCacheOrigin::Persistent,
+            identity_guard.clone(),
+        );
+        let mut cache = v2_landmark_cache()
+            .lock()
+            .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
+        let insertion = cache.insert(cache_key, artifact, cancel_flag)?;
+        for _ in 0..insertion.eviction_count {
+            benchmark_cache_event(
+                BenchmarkCacheKind::V2Landmarks,
+                BenchmarkCacheEvent::Eviction,
             );
-            let mut cache = v2_landmark_cache()
-                .lock()
-                .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
-            let insertion = cache.insert(cache_key, artifact, cancel_flag)?;
-            for _ in 0..insertion.eviction_count {
-                benchmark_cache_event(
-                    BenchmarkCacheKind::V2Landmarks,
-                    BenchmarkCacheEvent::Eviction,
-                );
-            }
-            benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
-            return Ok(cached);
         }
+        benchmark_cache_event(BenchmarkCacheKind::V2Landmarks, BenchmarkCacheEvent::Hit);
+        return Ok(cached);
     }
     let presentation_offset_ms = input
         .decode_timeline
         .as_ref()
         .map(|item| item.normalized_pcm_origin_ms)
         .unwrap_or(0);
-    let (pcm, landmarks, fine_features, spectral_backend, presentation_bounds) =
+    let (landmarks, coarse_fingerprint, spectral_backend, presentation_bounds) =
         execute_after_v2_coarse_stage_admission(
             retained_artifact_bytes,
             input,
             &backend_request.planned_backend_id,
             || {
-                if streaming_coarse {
-                    let coarse = decode_v2_coarse_landmarks_streaming(
-                        media_path,
-                        label,
-                        options,
-                        input,
-                        backend_request,
-                        cancel_flag,
-                    )?;
-                    let presentation_bounds = v2_presentation_bounds_for_samples(
-                        presentation_offset_ms,
-                        coarse.decoded_sample_count,
-                    )?;
-                    Ok((
-                        None,
-                        Arc::new(coarse.index.landmarks),
-                        None,
-                        coarse.spectral_backend,
-                        presentation_bounds,
-                    ))
-                } else {
-                    let pcm = Arc::new(decode_v2_pcm(
-                        media_path,
-                        label,
-                        options,
-                        input,
-                        cancel_flag,
-                    )?);
-                    let extracted = extract_landmarks_and_fine_features_with_backend_request(
-                        &pcm,
-                        &LandmarkConfig {
-                            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-                            presentation_offset_ms,
-                            window_ms: 50,
-                            hop_ms: ALIGNMENT_V2_LANDMARK_HOP_MS,
-                            max_hash_occurrences: 64,
-                            ..LandmarkConfig::default()
-                        },
-                        &FineFeatureConfig {
-                            sample_rate: ALIGNMENT_V2_SAMPLE_RATE,
-                            presentation_offset_ms,
-                            window_ms: 50,
-                            hop_ms: ALIGNMENT_V2_FINE_HOP_MS,
-                        },
-                        cancel_flag,
-                        backend_request,
-                    )?;
-                    let presentation_bounds = v2_presentation_bounds_for_samples(
-                        presentation_offset_ms,
-                        u64::try_from(pcm.len()).map_err(|_| {
-                            "blocked:resource-limit：短媒体 PCM 样本数无法表示。".to_string()
-                        })?,
-                    )?;
-                    Ok((
-                        Some(pcm),
-                        Arc::new(extracted.bundle.landmarks),
-                        Some(Arc::new(extracted.bundle.fine_features)),
-                        extracted.spectral_backend,
-                        presentation_bounds,
-                    ))
-                }
+                let coarse = decode_v2_coarse_landmarks_streaming(
+                    media_path,
+                    label,
+                    options,
+                    input,
+                    backend_request,
+                    cancel_flag,
+                    identity_guard.as_deref(),
+                )?;
+                let presentation_bounds = v2_presentation_bounds_for_samples(
+                    presentation_offset_ms,
+                    coarse.decoded_sample_count,
+                )?;
+                Ok((
+                    Arc::new(coarse.index.landmarks),
+                    Arc::new(coarse.coarse_fingerprint),
+                    coarse.spectral_backend,
+                    presentation_bounds,
+                ))
             },
         )?;
     verify_v2_spectral_backend_policy(&spectral_backend, &options.spectral_backend_request)?;
@@ -11079,14 +11364,21 @@ fn get_v2_landmarks(
     // Cancellation after extraction must never publish a partially trusted warm artifact.
     check_cancelled(cancel_flag)?;
     let artifact = V2MediaArtifact {
-        pcm: pcm.clone(),
+        pcm: None,
         landmarks: landmarks.clone(),
-        fine_features: fine_features.clone(),
+        coarse_fingerprint: coarse_fingerprint.clone(),
+        fine_features: None,
         spectral_backend: spectral_backend.clone(),
         presentation_bounds,
     };
-    let persistent_cache_stored =
-        streaming_coarse && write_persistent_v2_coarse_artifact(&cache_key, &artifact).is_ok();
+    // Persist the bounded coarse payload for episode-sized targets too. The disk envelope never
+    // stores PCM or fine features, so warm 1×N runs can reuse target landmarks while selected
+    // candidates still receive fresh bounded fine evidence.
+    let (persistent_cache_stored, cache_persistence_error) =
+        match write_persistent_v2_coarse_artifact(&cache_key, &artifact) {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error)),
+        };
     let mut cache = v2_landmark_cache()
         .lock()
         .map_err(|_| "Alignment V2 landmark 缓存锁已损坏。".to_string())?;
@@ -11102,8 +11394,9 @@ fn get_v2_landmarks(
     }
     Ok(CachedV2Landmarks {
         landmarks,
-        pcm,
-        fine_features,
+        coarse_fingerprint,
+        pcm: None,
+        fine_features: None,
         cache_key,
         cache_hit: false,
         cache_origin: if persistent_cache_stored {
@@ -11111,8 +11404,10 @@ fn get_v2_landmarks(
         } else {
             V2ArtifactCacheOrigin::NewMemoryOnly
         },
+        cache_persistence_error,
         spectral_backend,
         presentation_bounds,
+        identity_guard,
     })
 }
 
@@ -11124,9 +11419,7 @@ fn create_v2_audio_cache_key(
     artifact: &str,
 ) -> Result<String, String> {
     let request = &options.spectral_backend_request;
-    let backend_id = if should_stream_v2_coarse_only(input)
-        && request.planned_backend_id != crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID
-    {
+    let backend_id = if request.planned_backend_id != crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID {
         STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string()
     } else {
         request.planned_backend_id.clone()
@@ -11200,7 +11493,8 @@ fn decode_v2_audio(
     }
     // Cache hits never replace the run-level final identity gate. Recheck before the
     // retained PCM is consumed so stale bytes cannot drive expensive DP work.
-    verify_media_content_identity_after_tool_output(
+    verify_media_content_identity_after_tool_output_or_pinned(
+        landmark_artifact.identity_guard.as_deref(),
         media_path,
         input.content_identity.as_ref(),
         cancel_flag,
@@ -11239,6 +11533,7 @@ fn decode_v2_audio(
             options,
             input,
             cancel_flag,
+            landmark_artifact.identity_guard.as_deref(),
         )?),
     };
     let fine_backend_request =
@@ -11267,8 +11562,12 @@ fn decode_v2_audio(
     let artifact = V2MediaArtifact {
         pcm: Some(pcm.clone()),
         landmarks: landmark_artifact.landmarks.clone(),
+        coarse_fingerprint: landmark_artifact.coarse_fingerprint.clone(),
         fine_features: Some(fine_features.clone()),
-        spectral_backend: fine_extraction.spectral_backend.clone(),
+        // The cache key and persisted coarse artifact are bound to the coarse backend. Fine may
+        // use the locked compatible CPU backend after streaming CPU coarse, so retaining the
+        // fine backend here would make the next coarse lookup self-inconsistent.
+        spectral_backend: landmark_artifact.spectral_backend.clone(),
         presentation_bounds: landmark_artifact.presentation_bounds,
     };
     let insertion = v2_landmark_cache()
@@ -11492,6 +11791,7 @@ fn decode_v2_audio_for_selected_window(
         landmark_artifact.presentation_bounds,
         window,
         cancel_flag,
+        landmark_artifact.identity_guard.as_deref(),
     )?);
     let fine_backend_request =
         lock_fine_spectral_backend_request(&landmark_artifact.spectral_backend)?;
@@ -11526,6 +11826,9 @@ fn decode_v2_audio_for_selected_window(
     })
 }
 
+// A fine-window decode is a trust boundary: media bounds, the selected window and the pinned
+// identity guard must remain explicit instead of being hidden in a loosely reusable context.
+#[allow(clippy::too_many_arguments)]
 fn decode_v2_pcm_window(
     media_path: &str,
     label: &str,
@@ -11534,6 +11837,7 @@ fn decode_v2_pcm_window(
     media_bounds: PresentationRangeMs,
     window: PresentationRangeMs,
     cancel_flag: Option<&AtomicBool>,
+    identity_guard: Option<&PinnedMediaIdentityGuard>,
 ) -> Result<Vec<i16>, String> {
     check_cancelled(cancel_flag)?;
     let duration_ms = v2_presentation_range_duration_ms(window)?;
@@ -11545,7 +11849,8 @@ fn decode_v2_pcm_window(
         .ok_or_else(|| {
             format!("blocked:window-evidence-insufficient：{label}精解码 seek 早于媒体 PCM 起点。")
         })?;
-    verify_media_content_identity_before_tool_input(
+    verify_media_content_identity_before_tool_input_or_pinned(
+        identity_guard,
         media_path,
         input.content_identity.as_ref(),
         cancel_flag,
@@ -11560,7 +11865,8 @@ fn decode_v2_pcm_window(
     );
     // As in streaming coarse, identity/cleanup failure invalidates every decoded byte and takes
     // precedence over an ordinary codec failure.
-    verify_media_content_identity_after_tool_output(
+    verify_media_content_identity_after_tool_output_or_pinned(
+        identity_guard,
         media_path,
         input.content_identity.as_ref(),
         cancel_flag,
@@ -11739,6 +12045,7 @@ impl V2S16LeLandmarkStream {
             .map_err(map_v2_streaming_algorithm_error)?;
         Ok(DecodedV2CoarseLandmarks {
             index: extraction.index,
+            coarse_fingerprint: extraction.coarse_fingerprint,
             decoded_sample_count,
             spectral_backend: extraction.spectral_backend,
         })
@@ -11765,9 +12072,11 @@ fn decode_v2_coarse_landmarks_streaming(
     input: &AlignmentAudioInput,
     backend_request: &SpectralBackendRequest,
     cancel_flag: Option<&AtomicBool>,
+    identity_guard: Option<&PinnedMediaIdentityGuard>,
 ) -> Result<DecodedV2CoarseLandmarks, String> {
     check_cancelled(cancel_flag)?;
-    verify_media_content_identity_before_tool_input(
+    verify_media_content_identity_before_tool_input_or_pinned(
+        identity_guard,
         media_path,
         input.content_identity.as_ref(),
         cancel_flag,
@@ -11809,7 +12118,8 @@ fn decode_v2_coarse_landmarks_streaming(
     );
     // Recheck even when the tool or consumer failed. Identity/cleanup failures invalidate every
     // byte already consumed and take precedence over an ordinary decode error.
-    verify_media_content_identity_after_tool_output(
+    verify_media_content_identity_after_tool_output_or_pinned(
+        identity_guard,
         media_path,
         input.content_identity.as_ref(),
         cancel_flag,
@@ -11877,6 +12187,7 @@ fn decode_v2_pcm(
     options: &AudioAlignmentOptions,
     input: &AlignmentAudioInput,
     cancel_flag: Option<&AtomicBool>,
+    identity_guard: Option<&PinnedMediaIdentityGuard>,
 ) -> Result<Vec<i16>, String> {
     check_cancelled(cancel_flag)?;
     let decode_budget = v2_short_pcm_decode_budget(input)?;
@@ -11896,7 +12207,8 @@ fn decode_v2_pcm(
             &output.stderr,
         ));
     }
-    verify_media_content_identity_after_tool_output(
+    verify_media_content_identity_after_tool_output_or_pinned(
+        identity_guard,
         media_path,
         input.content_identity.as_ref(),
         cancel_flag,
@@ -12596,10 +12908,12 @@ fn v2_bracketing_anchor_inverse_for_target_chunk(
     let residual_tolerance_ms = v2_affine_match_config()
         .residual_tolerance_ms
         .unsigned_abs();
+    // Held-out anchors are validation evidence only. Letting them close either side of this
+    // bracket would leak validation coordinates into the fine DP corridor and make the final
+    // re-projection metrics self-fulfilling.
     let anchors = coarse
         .training_anchors
         .iter()
-        .chain(&coarse.held_out_anchors)
         .filter(|anchor| anchor.residual_ms.unsigned_abs() <= residual_tolerance_ms);
     let before = anchors
         .clone()
@@ -17143,6 +17457,11 @@ fn prepare_audio_alignment_batch_media(
                         media.role_label
                     ));
                 }
+                physical_pin.verify_handle_and_path()?;
+                let identity_guard = Arc::new(PinnedMediaIdentityGuard {
+                    physical_pin: Arc::clone(&physical_pin),
+                    expected_identity: expected_identity.clone(),
+                });
                 let mut extraction_notes = vec![format!(
                     "批次级 physical-media 预处理：素材 {} 绑定物理组 {}；相同文件对象与音轨视图只建立一次 timeline、全量音频 PTS 和 coarse landmark。",
                     media.media_id,
@@ -17177,6 +17496,7 @@ fn prepare_audio_alignment_batch_media(
                     &inputs,
                     Some(cancel_flag),
                     None,
+                    Some(&identity_guard),
                     &mut V2CandidateExtractionState {
                         notes: &mut extraction_notes,
                         retained_artifact_bytes: &mut combined_retained_artifact_bytes,
@@ -17233,7 +17553,7 @@ fn prepare_audio_alignment_batch_media(
                     })?;
                 batch_retained_artifact_bytes = combined_retained_artifact_bytes;
                 Ok(Arc::new(PreparedAudioAlignmentBatchMedia {
-                    physical_pin: Arc::clone(&physical_pin),
+                    identity_guard,
                     path: stable_path,
                     physical_group_index,
                     physical_object_key,
@@ -17464,13 +17784,15 @@ where
     );
     ensure_alignment_process_supervision_clean()?;
     if let Ok(proposal) = &result {
-        verify_media_content_identity_after_tool_output(
+        verify_media_content_identity_after_tool_output_or_pinned(
+            Some(&source.identity_guard),
             &source.path,
             Some(&source.expected_identity),
             Some(context.cancel_flag),
             "批次 pair 结果最终复核",
         )?;
-        verify_media_content_identity_after_tool_output(
+        verify_media_content_identity_after_tool_output_or_pinned(
+            Some(&target.identity_guard),
             &target.path,
             Some(&target.expected_identity),
             Some(context.cancel_flag),
@@ -17718,6 +18040,33 @@ fn v2_fine_group_blocked_state(
     }
 }
 
+fn v2_fine_review_proposal_rank(proposal: &AudioAlignmentProposal) -> (u64, u64, u64, usize) {
+    let Some(time_map) = proposal.time_map.as_ref() else {
+        return (0, 0, 0, 0);
+    };
+    let coverage = time_map
+        .quality
+        .coverage
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let coverage_micros = (coverage * 1_000_000.0).round() as u64;
+    let residual_score =
+        u64::MAX.saturating_sub(time_map.quality.p95_residual_ms.unwrap_or(u64::MAX));
+    let matched_source_ms = time_map
+        .spans
+        .iter()
+        .filter(|span| span.kind == AudioTimeMapSpanKind::Matched)
+        .map(|span| span.source_end_ms.saturating_sub(span.source_start_ms))
+        .sum();
+    (
+        coverage_micros,
+        residual_score,
+        matched_source_ms,
+        time_map.quality.anchor_count,
+    )
+}
+
 fn evaluate_v2_fine_frontier_group<F>(
     context: &V2FineEvaluationContext<'_>,
     binding: &V2FineFrontierGroupBinding,
@@ -17757,6 +18106,7 @@ where
         return Ok(V2FineGroupEvaluationOutcome {
             state: FineEvaluationState::EvaluatedIneligible,
             record: None,
+            review_proposal: None,
             member_execution_count: 0,
             diagnostics: vec![
                 "该 temporal group 没有 intrinsically eligible 的 raw member。".to_string(),
@@ -17772,6 +18122,7 @@ where
         return Ok(V2FineGroupEvaluationOutcome {
             state: FineEvaluationState::ResourceBlocked,
             record: None,
+            review_proposal: None,
             member_execution_count: 0,
             diagnostics: vec![
                 "该 temporal group 的 raw member 数超过剩余 fine 执行预算。".to_string()
@@ -17780,6 +18131,7 @@ where
     }
     let mut blocked_state = None;
     let mut best = None::<(usize, V2FineMemberEvaluation)>;
+    let mut best_review = None::<(usize, Box<AudioAlignmentProposal>)>;
     let mut member_execution_count = 0_usize;
     let mut diagnostics = Vec::<String>::new();
     for member_index in eligible_member_indices {
@@ -17787,7 +18139,7 @@ where
         member_execution_count = member_execution_count
             .checked_add(1)
             .ok_or_else(|| "fine frontier member execution count 溢出。".to_string())?;
-        let evaluated = evaluate_v2_fine_frontier_member(
+        let mut evaluated = evaluate_v2_fine_frontier_member(
             context,
             pair,
             coarse,
@@ -17810,6 +18162,23 @@ where
             }
         }
         blocked_state = v2_fine_group_blocked_state(blocked_state, evaluated.state);
+        if matches!(evaluated.state, FineEvaluationState::EvaluatedIneligible) {
+            if let Some(proposal) = evaluated.proposal.take() {
+                let proposal = Box::new(proposal);
+                let replace = best_review
+                    .as_ref()
+                    .is_none_or(|(best_index, best_proposal)| {
+                        v2_fine_review_proposal_rank(&proposal)
+                            > v2_fine_review_proposal_rank(best_proposal)
+                            || v2_fine_review_proposal_rank(&proposal)
+                                == v2_fine_review_proposal_rank(best_proposal)
+                                && member_index < *best_index
+                    });
+                if replace {
+                    best_review = Some((member_index, proposal));
+                }
+            }
+        }
         if matches!(evaluated.state, FineEvaluationState::Scored { .. }) {
             let replace = best.as_ref().is_none_or(|(best_index, best)| {
                 evaluated.score > best.score
@@ -17824,6 +18193,7 @@ where
         return Ok(V2FineGroupEvaluationOutcome {
             state: blocked_state,
             record: None,
+            review_proposal: None,
             member_execution_count,
             diagnostics,
         });
@@ -17832,6 +18202,7 @@ where
         return Ok(V2FineGroupEvaluationOutcome {
             state: FineEvaluationState::EvaluatedIneligible,
             record: None,
+            review_proposal: best_review.map(|(_, proposal)| proposal),
             member_execution_count,
             diagnostics,
         });
@@ -17857,6 +18228,7 @@ where
             execution_evidence,
             proposal: Box::new(proposal),
         }),
+        review_proposal: None,
         member_execution_count,
         diagnostics: Vec::new(),
     })
@@ -17962,12 +18334,16 @@ fn create_v2_fine_component_failure(
     }
 }
 
+// The generic evaluator is a deterministic test seam. Keeping the frontier inputs explicit makes
+// inventory, mandatory seeds, budgets and cancellation independently auditable.
+#[allow(clippy::too_many_arguments)]
 fn resolve_v2_fine_frontier_component_with<E>(
     pair_indices: Vec<usize>,
     mut inventory: FineCandidateInventory,
     inventory_digest: String,
     limits: V2FineComponentExecutionLimits,
     bindings: &[V2FineFrontierGroupBinding],
+    mandatory_seed_candidate_ids: &[FineCandidateId],
     cancel_flag: Option<&AtomicBool>,
     mut evaluate_group: E,
 ) -> Result<V2FineComponentResolution, V2FineComponentFailure>
@@ -17986,6 +18362,7 @@ where
     let mut member_execution_count = 0_usize;
     let mut cumulative_search = zero_v2_fine_search_stats();
     let mut records = HashMap::<FineCandidateId, V2FineGroupEvaluationRecord>::new();
+    let mut review_proposals_by_pair = HashMap::<usize, Box<AudioAlignmentProposal>>::new();
     let mut diagnostics_by_pair = HashMap::<usize, Vec<String>>::new();
     let mut candidate_index_by_id = HashMap::<FineCandidateId, usize>::new();
     for (index, candidate) in inventory.candidates.iter().enumerate() {
@@ -18024,6 +18401,23 @@ where
             cumulative_search,
         ));
     }
+    let mut pending_mandatory_seed_candidate_ids = mandatory_seed_candidate_ids.to_vec();
+    pending_mandatory_seed_candidate_ids.sort_unstable();
+    pending_mandatory_seed_candidate_ids.dedup();
+    if pending_mandatory_seed_candidate_ids.iter().any(|id| {
+        candidate_index_by_id
+            .get(id)
+            .and_then(|index| inventory.candidates.get(*index))
+            .is_none_or(|candidate| candidate.state != FineEvaluationState::Unresolved)
+    }) {
+        return Err(create_v2_fine_component_failure(
+            "fine frontier mandatory seed 必须来自完整 inventory 的可执行候选。".to_string(),
+            &inventory,
+            refinement_round_count,
+            evaluated_candidate_count,
+            cumulative_search,
+        ));
+    }
     let max_refinement_rounds = budget.max_refinement_rounds.min(inventory.candidates.len());
     let max_member_executions = budget
         .max_member_executions
@@ -18048,78 +18442,86 @@ where
                 cumulative_search,
             ));
         }
-        let round_config = match remaining_v2_fine_search_config(config, cumulative_search) {
-            Ok(config) => config,
-            Err(error) => {
+        let next_refinement_candidate_ids = if pending_mandatory_seed_candidate_ids.is_empty() {
+            let round_config = match remaining_v2_fine_search_config(config, cumulative_search) {
+                Ok(config) => config,
+                Err(error) => {
+                    return Err(create_v2_fine_component_failure(
+                        error,
+                        &inventory,
+                        refinement_round_count,
+                        evaluated_candidate_count,
+                        cumulative_search,
+                    ))
+                }
+            };
+            let mut outcome =
+                match analyze_fine_frontier_with_cancel(&inventory, round_config, cancel_flag) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if let FineFrontierError::SearchLimitExceeded { search, .. } = &error {
+                            if let Err(accumulation_error) = accumulate_v2_fine_search_stats(
+                                &mut cumulative_search,
+                                *search,
+                                config,
+                            ) {
+                                return Err(create_v2_fine_component_failure(
+                                    accumulation_error,
+                                    &inventory,
+                                    refinement_round_count,
+                                    evaluated_candidate_count,
+                                    cumulative_search,
+                                ));
+                            }
+                        }
+                        return Err(create_v2_fine_component_failure(
+                            map_v2_fine_frontier_error(error),
+                            &inventory,
+                            refinement_round_count,
+                            evaluated_candidate_count,
+                            cumulative_search,
+                        ));
+                    }
+                };
+            if let Err(error) =
+                accumulate_v2_fine_search_stats(&mut cumulative_search, outcome.search, config)
+            {
                 return Err(create_v2_fine_component_failure(
                     error,
                     &inventory,
                     refinement_round_count,
                     evaluated_candidate_count,
                     cumulative_search,
-                ))
+                ));
             }
+            outcome.search = cumulative_search;
+            if outcome.state != CoreFineFrontierState::Pending {
+                return Ok(V2FineComponentResolution {
+                    pair_indices,
+                    inventory,
+                    inventory_digest,
+                    config,
+                    outcome,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    records,
+                    review_proposals_by_pair,
+                    diagnostics_by_pair,
+                });
+            }
+            if outcome.next_refinement.candidate_ids.is_empty() {
+                return Err(create_v2_fine_component_failure(
+                    "fine frontier Pending 状态缺少 next refinement。".to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            outcome.next_refinement.candidate_ids
+        } else {
+            std::mem::take(&mut pending_mandatory_seed_candidate_ids)
         };
-        let mut outcome =
-            match analyze_fine_frontier_with_cancel(&inventory, round_config, cancel_flag) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    if let FineFrontierError::SearchLimitExceeded { search, .. } = &error {
-                        if let Err(accumulation_error) =
-                            accumulate_v2_fine_search_stats(&mut cumulative_search, *search, config)
-                        {
-                            return Err(create_v2_fine_component_failure(
-                                accumulation_error,
-                                &inventory,
-                                refinement_round_count,
-                                evaluated_candidate_count,
-                                cumulative_search,
-                            ));
-                        }
-                    }
-                    return Err(create_v2_fine_component_failure(
-                        map_v2_fine_frontier_error(error),
-                        &inventory,
-                        refinement_round_count,
-                        evaluated_candidate_count,
-                        cumulative_search,
-                    ));
-                }
-            };
-        if let Err(error) =
-            accumulate_v2_fine_search_stats(&mut cumulative_search, outcome.search, config)
-        {
-            return Err(create_v2_fine_component_failure(
-                error,
-                &inventory,
-                refinement_round_count,
-                evaluated_candidate_count,
-                cumulative_search,
-            ));
-        }
-        outcome.search = cumulative_search;
-        if outcome.state != CoreFineFrontierState::Pending {
-            return Ok(V2FineComponentResolution {
-                pair_indices,
-                inventory,
-                inventory_digest,
-                config,
-                outcome,
-                refinement_round_count,
-                evaluated_candidate_count,
-                records,
-                diagnostics_by_pair,
-            });
-        }
-        if outcome.next_refinement.candidate_ids.is_empty() {
-            return Err(create_v2_fine_component_failure(
-                "fine frontier Pending 状态缺少 next refinement。".to_string(),
-                &inventory,
-                refinement_round_count,
-                evaluated_candidate_count,
-                cumulative_search,
-            ));
-        }
         if refinement_round_count >= max_refinement_rounds {
             return Err(create_v2_fine_component_failure(
                 "blocked:resource-limit：fine frontier component 已耗尽累计 refinement rounds。"
@@ -18131,7 +18533,7 @@ where
             ));
         }
         refinement_round_count += 1;
-        for id in &outcome.next_refinement.candidate_ids {
+        for id in &next_refinement_candidate_ids {
             if let Err(error) = check_cancelled(cancel_flag) {
                 return Err(create_v2_fine_component_failure(
                     error,
@@ -18222,6 +18624,7 @@ where
                 .expect("remaining member execution budget already proved checked addition");
             let state = evaluation.state;
             let record = evaluation.record;
+            let review_proposal = evaluation.review_proposal;
             let pair_diagnostics = diagnostics_by_pair.entry(binding.pair_index).or_default();
             for diagnostic in evaluation.diagnostics {
                 if pair_diagnostics.len() >= 256 {
@@ -18242,6 +18645,28 @@ where
                     evaluated_candidate_count,
                     cumulative_search,
                 ));
+            }
+            if review_proposal.is_some()
+                && !matches!(state, FineEvaluationState::EvaluatedIneligible)
+            {
+                return Err(create_v2_fine_component_failure(
+                    "只有 EvaluatedIneligible fine group 可以保留人工复核 proposal。".to_string(),
+                    &inventory,
+                    refinement_round_count,
+                    evaluated_candidate_count,
+                    cumulative_search,
+                ));
+            }
+            if let Some(review_proposal) = review_proposal {
+                let replace = review_proposals_by_pair
+                    .get(&binding.pair_index)
+                    .is_none_or(|current| {
+                        v2_fine_review_proposal_rank(&review_proposal)
+                            > v2_fine_review_proposal_rank(current)
+                    });
+                if replace {
+                    review_proposals_by_pair.insert(binding.pair_index, review_proposal);
+                }
             }
             match state {
                 FineEvaluationState::Scored { score } => {
@@ -18450,8 +18875,8 @@ fn verify_prepared_audio_alignment_batch_media(
         if !verified_physical_media.insert(media.physical_object_key) {
             continue;
         }
-        media.physical_pin.verify_handle_and_path()?;
-        verify_media_content_identity_after_tool_output(
+        verify_media_content_identity_after_tool_output_or_pinned(
+            Some(&media.identity_guard),
             &media.path,
             Some(&media.expected_identity),
             cancel_flag,
@@ -18536,7 +18961,7 @@ fn execute_v2_fine_frontier_batch(
             continue;
         }
 
-        let (inventory, bindings, inventory_evidence, config) =
+        let (inventory, bindings, mandatory_seed_candidate_ids, inventory_evidence, config) =
             create_v2_fine_frontier_inventory(plan, coarse_by_pair, &pair_indices)?;
         let resolution = resolve_v2_fine_frontier_component_with(
             pair_indices.clone(),
@@ -18547,6 +18972,7 @@ fn execute_v2_fine_frontier_batch(
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &mandatory_seed_candidate_ids,
             Some(cancel_flag),
             |binding, _coarse_upper_bound, remaining_member_executions| {
                 let mut update = |progress: f64, message: &str| {
@@ -18645,9 +19071,21 @@ fn execute_v2_fine_frontier_batch(
                     StagedAudioAlignmentBatchPairOutcome::Proposal(expected.proposal.clone()),
                 )
             } else {
+                let review_proposal = (resolution.outcome.state
+                    == CoreFineFrontierState::NoEligibleCandidate
+                    && pair.global_selection.state
+                        == AudioAlignmentBatchGlobalSelectionState::Selected
+                    && pair.global_selection.selected)
+                    .then(|| resolution.review_proposals_by_pair.get(pair_index))
+                    .flatten()
+                    .cloned();
                 let reason = match resolution.outcome.state {
                     CoreFineFrontierState::Resolved =>
                         "fine frontier 已完成第二次 exact assignment；当前 pair 因全局物理占用冲突未被选择。",
+                    CoreFineFrontierState::NoEligibleCandidate
+                        if pair.global_selection.state
+                            == AudioAlignmentBatchGlobalSelectionState::Blocked =>
+                        "fine frontier 已完成必要评估，但当前 pair 与批内其他关系存在全局物理占用冲突；不能发布可由单 pair 人工复核绕过的候选图。",
                     CoreFineFrontierState::NoEligibleCandidate =>
                         "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
                     CoreFineFrontierState::Unresolved | CoreFineFrontierState::Pending =>
@@ -18655,15 +19093,17 @@ fn execute_v2_fine_frontier_batch(
                 };
                 (
                     None,
-                    StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(
-                        create_v2_fine_frontier_blocked_proposal(
-                            &coarse_by_pair[*pair_index],
-                            reason,
-                            resolution
-                                .diagnostics_by_pair
-                                .get(pair_index)
-                                .map(Vec::as_slice),
-                        ),
+                    StagedAudioAlignmentBatchPairOutcome::Proposal(review_proposal.unwrap_or_else(
+                        || {
+                            Box::new(create_v2_fine_frontier_blocked_proposal(
+                                &coarse_by_pair[*pair_index],
+                                reason,
+                                resolution
+                                    .diagnostics_by_pair
+                                    .get(pair_index)
+                                    .map(Vec::as_slice),
+                            ))
+                        },
                     )),
                 )
             };
@@ -19005,8 +19445,8 @@ fn run_audio_alignment_batch_job(
         let _ = cancel_audio_alignment_batch_worker(&job_id);
         return;
     }
-    if commit_staged_audio_alignment_batch_results(&job_id, staged, false).is_err() {
-        let _ = invalidate_audio_alignment_batch_after_final_identity_failure(&job_id);
+    if let Err(error) = commit_staged_audio_alignment_batch_results(&job_id, staged, false) {
+        let _ = invalidate_audio_alignment_batch_after_commit_failure(&job_id, &error);
     }
 }
 
@@ -19213,8 +19653,9 @@ fn run_audio_alignment_batch_job_with_pair_executor_and_finalizer<F, G>(
     // Staged outcomes become observable only after the final verifier has succeeded. The commit
     // and terminal decision share one registry lock, so polling cannot observe a proposal in the
     // unverified Running state. A cancellation accepted after the verifier is honored atomically.
-    if commit_staged_audio_alignment_batch_results(&job_id, staged_results, false).is_err() {
-        let _ = invalidate_audio_alignment_batch_after_final_identity_failure(&job_id);
+    if let Err(error) = commit_staged_audio_alignment_batch_results(&job_id, staged_results, false)
+    {
+        let _ = invalidate_audio_alignment_batch_after_commit_failure(&job_id, &error);
     }
 }
 
@@ -19247,8 +19688,10 @@ fn finish_cancelled_audio_alignment_batch_with_staging<G>(
     // fresh identity check only for media referenced by completed staged outcomes.
     match verify_before_finalize(&completed_pair_indices, true) {
         Ok(()) => {
-            if commit_staged_audio_alignment_batch_results(job_id, staged_results, true).is_err() {
-                let _ = invalidate_audio_alignment_batch_after_final_identity_failure(job_id);
+            if let Err(error) =
+                commit_staged_audio_alignment_batch_results(job_id, staged_results, true)
+            {
+                let _ = invalidate_audio_alignment_batch_after_commit_failure(job_id, &error);
             }
         }
         Err(error)
@@ -19932,7 +20375,9 @@ fn validate_audio_alignment_batch_fine_staged_evidence(
                 validate_audio_alignment_batch_fine_execution_evidence(
                     receipt, execution, proposal,
                 )?;
-            } else if proposal.time_map.is_some() {
+            } else if proposal.time_map.is_some()
+                && !is_v2_blocked_review_proposal(receipt, proposal)
+            {
                 return Err(
                     "没有 fineExecutionEvidence 的 pair 不得发布可确认 TimeMap。".to_string(),
                 );
@@ -19950,6 +20395,22 @@ fn validate_audio_alignment_batch_fine_staged_evidence(
         }
     }
     Ok(())
+}
+
+fn is_v2_blocked_review_proposal(
+    receipt: &AudioAlignmentBatchFineFrontierReceiptSnapshot,
+    proposal: &AudioAlignmentProposal,
+) -> bool {
+    receipt.final_state == AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate
+        && receipt.selected_candidate_ids.is_empty()
+        && proposal.confidence.is_finite()
+        && proposal.confidence == 0.0
+        && proposal.anchors.is_empty()
+        && proposal.cut_candidates.is_empty()
+        && proposal.match_range.is_some()
+        && proposal.time_map.as_ref().is_some_and(|time_map| {
+            time_map.quality.level == "blocked" && !time_map.spans.is_empty()
+        })
 }
 
 fn commit_staged_audio_alignment_batch_results(
@@ -20758,6 +21219,47 @@ fn invalidate_audio_alignment_batch_after_final_identity_failure(
     entry.snapshot.current_pair_ordinal = None;
     entry.snapshot.message = "批次结束前媒体身份复核失败；所有 proposal 已清除。".to_string();
     entry.snapshot.error = Some("批次级 distinct-media 身份绑定失效。".to_string());
+    entry.snapshot.updated_at_ms = current_time_ms();
+    mark_audio_alignment_batch_terminal(entry);
+    prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
+    Ok(())
+}
+
+fn invalidate_audio_alignment_batch_after_commit_failure(
+    job_id: &str,
+    _internal_error: &str,
+) -> Result<(), String> {
+    let mut jobs = audio_alignment_batch_jobs()
+        .lock()
+        .map_err(|_| "批量音频对齐任务状态锁已损坏。".to_string())?;
+    let entry = jobs
+        .get_mut(job_id)
+        .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    append_audio_alignment_batch_diagnostic_event_to_entry(
+        entry,
+        AudioAlignmentBatchDiagnosticLevel::Error,
+        "batch.evidence-contract-failed",
+        None,
+        None,
+        "最终媒体身份复核已通过，但 staged 结果未通过证据合同校验；所有结果已作废。",
+        None,
+    );
+    for pair in &mut entry.snapshot.pairs {
+        pair.status = AudioAlignmentJobStatus::Failed;
+        pair.progress = 1.0;
+        pair.message = "批次最终证据合同校验失败；该 pair 的结果已作废。".to_string();
+        pair.relation_ranking = AudioAlignmentBatchRelationRankingSnapshot::failed();
+        pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
+        pair.proposal = None;
+        pair.error = Some("批次级 staged evidence binding invalid。".to_string());
+    }
+    entry.snapshot.status = AudioAlignmentJobStatus::Failed;
+    entry.snapshot.progress = 1.0;
+    entry.snapshot.processed_pair_count = entry.snapshot.total_pair_count;
+    entry.snapshot.failed_pair_count = entry.snapshot.total_pair_count;
+    entry.snapshot.current_pair_ordinal = None;
+    entry.snapshot.message = "批次最终证据合同校验失败；所有 proposal 已清除。".to_string();
+    entry.snapshot.error = Some("批次级 staged evidence binding invalid。".to_string());
     entry.snapshot.updated_at_ms = current_time_ms();
     mark_audio_alignment_batch_terminal(entry);
     prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
@@ -21955,6 +22457,84 @@ fn probe_alignment_run_expected_identity(
         format!("blocked:media-identity-invalid：{role}没有有效的 sha256-full-file-v2 全文件摘要。")
     })?;
     Ok(identity)
+}
+
+fn verify_pinned_media_identity_guard(
+    guard: &PinnedMediaIdentityGuard,
+    media_path: &str,
+    expected_identity: Option<&MediaContentIdentity>,
+    cancel_flag: Option<&AtomicBool>,
+    operation: &str,
+) -> Result<(), String> {
+    check_cancelled(cancel_flag)?;
+    ensure_alignment_process_supervision_clean()?;
+    let expected_identity = require_full_file_media_content_identity(expected_identity)?;
+    if expected_identity != &guard.expected_identity
+        || Path::new(media_path) != guard.physical_pin.handle_final_path()
+    {
+        return Err(format!(
+            "blocked:media-identity-changed：{operation}使用的固定媒体与已建立的全文件身份不一致。"
+        ));
+    }
+    guard
+        .physical_pin
+        .verify_handle_and_path()
+        .map_err(|_| {
+            format!(
+                "blocked:media-identity-changed：固定媒体在{operation}期间发生变化；已丢弃相关输出、缓存与结论。"
+            )
+        })?;
+    check_cancelled(cancel_flag)
+}
+
+fn verify_media_content_identity_before_tool_input_or_pinned(
+    guard: Option<&PinnedMediaIdentityGuard>,
+    media_path: &str,
+    expected_identity: Option<&MediaContentIdentity>,
+    cancel_flag: Option<&AtomicBool>,
+    operation: &str,
+) -> Result<(), String> {
+    if let Some(guard) = guard {
+        verify_pinned_media_identity_guard(
+            guard,
+            media_path,
+            expected_identity,
+            cancel_flag,
+            operation,
+        )
+    } else {
+        verify_media_content_identity_before_tool_input(
+            media_path,
+            expected_identity,
+            cancel_flag,
+            operation,
+        )
+    }
+}
+
+fn verify_media_content_identity_after_tool_output_or_pinned(
+    guard: Option<&PinnedMediaIdentityGuard>,
+    media_path: &str,
+    expected_identity: Option<&MediaContentIdentity>,
+    cancel_flag: Option<&AtomicBool>,
+    operation: &str,
+) -> Result<(), String> {
+    if let Some(guard) = guard {
+        verify_pinned_media_identity_guard(
+            guard,
+            media_path,
+            expected_identity,
+            cancel_flag,
+            operation,
+        )
+    } else {
+        verify_media_content_identity_after_tool_output(
+            media_path,
+            expected_identity,
+            cancel_flag,
+            operation,
+        )
+    }
 }
 
 fn verify_media_content_identity_before_tool_input(
@@ -24690,11 +25270,13 @@ mod tests {
                 time_ms: bounds.start_ms.saturating_add(1_000),
                 strength_milli: 1_000,
             }]),
+            coarse_fingerprint: Arc::new(Vec::new()),
             pcm: None,
             fine_features: None,
             cache_key: "test-window-artifact".to_string(),
             cache_hit: false,
             cache_origin: V2ArtifactCacheOrigin::NewMemoryOnly,
+            cache_persistence_error: None,
             spectral_backend: SpectralBackendExecution {
                 backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
                 requested_backend: "streaming-cpu".to_string(),
@@ -24702,6 +25284,7 @@ mod tests {
                 fallback_reason: None,
             },
             presentation_bounds: bounds,
+            identity_guard: None,
         }
     }
 
@@ -24825,6 +25408,143 @@ mod tests {
     }
 
     #[test]
+    fn v2_fine_frontier_evaluates_every_mandatory_target_seed_before_resolution() {
+        let first_target = FineCandidateId {
+            pair_ordinal: 1,
+            candidate_ordinal: 1,
+        };
+        let second_target = FineCandidateId {
+            pair_ordinal: 2,
+            candidate_ordinal: 1,
+        };
+        let inventory = FineCandidateInventory {
+            candidates: vec![
+                v2_test_unresolved_fine_candidate(first_target, 900_000),
+                v2_test_unresolved_fine_candidate(second_target, 300_000),
+            ],
+        };
+        let bindings = vec![
+            v2_test_fine_binding(first_target),
+            v2_test_fine_binding(second_target),
+        ];
+        let mandatory_seeds = vec![first_target, second_target];
+        let mut evaluation_order = Vec::new();
+
+        let resolution = resolve_v2_fine_frontier_component_with(
+            vec![0, 1],
+            inventory,
+            "sha256:test-inventory".to_string(),
+            V2FineComponentExecutionLimits {
+                frontier: FineFrontierConfig::default(),
+                component: V2FineComponentBudget::default(),
+            },
+            &bindings,
+            &mandatory_seeds,
+            None,
+            |binding, _, _| {
+                evaluation_order.push(binding.id);
+                let (score, occupancy) = if binding.id == first_target {
+                    (800_000, v2_test_fine_occupancy(7, 0, 1_000, 11, 0, 1_000))
+                } else {
+                    (
+                        250_000,
+                        v2_test_fine_occupancy(7, 2_000, 3_000, 12, 0, 1_000),
+                    )
+                };
+                Ok(V2FineGroupEvaluationOutcome {
+                    state: FineEvaluationState::Scored {
+                        score: ScoreMicros::new(score).unwrap(),
+                    },
+                    record: Some(v2_test_fine_record(binding.id, score, occupancy)),
+                    review_proposal: None,
+                    member_execution_count: 1,
+                    diagnostics: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(evaluation_order, mandatory_seeds);
+        assert_eq!(resolution.evaluated_candidate_count, 2);
+        assert!(resolution
+            .outcome
+            .best_completed
+            .candidate_ids
+            .contains(&first_target));
+        assert!(resolution
+            .outcome
+            .best_completed
+            .candidate_ids
+            .contains(&second_target));
+    }
+
+    #[test]
+    fn v2_fine_inventory_seeds_the_best_candidate_for_each_target_axis() {
+        let plan = test_one_source_five_target_batch_plan();
+        let coarse_by_pair = plan
+            .pairs
+            .iter()
+            .enumerate()
+            .map(|(pair_index, _)| {
+                let source_start_ms = pair_index as i64 * 100_000;
+                Ok(V2PairCoarseCandidates {
+                    candidates: vec![
+                        v2_test_global_candidate(
+                            PresentationRangeMs {
+                                start_ms: 0,
+                                end_ms: 90_000,
+                            },
+                            PresentationRangeMs {
+                                start_ms: source_start_ms,
+                                end_ms: source_start_ms + 90_000,
+                            },
+                            0.90,
+                            false,
+                        ),
+                        v2_test_global_candidate(
+                            PresentationRangeMs {
+                                start_ms: 0,
+                                end_ms: 90_000,
+                            },
+                            PresentationRangeMs {
+                                start_ms: source_start_ms + 500_000,
+                                end_ms: source_start_ms + 590_000,
+                            },
+                            0.40,
+                            false,
+                        ),
+                    ],
+                    temporal_window_groups: vec![
+                        V2TemporalWindowGroup {
+                            member_indices: vec![0],
+                        },
+                        V2TemporalWindowGroup {
+                            member_indices: vec![1],
+                        },
+                    ],
+                    alternatives: Vec::new(),
+                    diagnostics: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let pair_indices = (0..plan.pairs.len()).collect::<Vec<_>>();
+
+        let (_, _, mandatory_seeds, _, _) =
+            create_v2_fine_frontier_inventory(&plan, &coarse_by_pair, &pair_indices).unwrap();
+
+        assert_eq!(mandatory_seeds.len(), 5);
+        assert_eq!(
+            mandatory_seeds,
+            (1..=5)
+                .map(|pair_ordinal| FineCandidateId {
+                    pair_ordinal,
+                    candidate_ordinal: 1,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn v2_fine_frontier_refines_k_plus_one_and_can_replace_same_pair_leader() {
         let first = FineCandidateId {
             pair_ordinal: 1,
@@ -24854,6 +25574,7 @@ mod tests {
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &[],
             None,
             |binding, _, _| {
                 evaluation_order.push(binding.id);
@@ -24871,6 +25592,7 @@ mod tests {
                         score,
                         v2_test_fine_occupancy(1, 0, 1_000, 2, 0, 1_000),
                     )),
+                    review_proposal: None,
                     member_execution_count: 1,
                     diagnostics: Vec::new(),
                 })
@@ -24917,11 +25639,13 @@ mod tests {
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &[],
             None,
             |_, _, _| {
                 Ok(V2FineGroupEvaluationOutcome {
                     state: FineEvaluationState::ResourceBlocked,
                     record: None,
+                    review_proposal: None,
                     member_execution_count: 0,
                     diagnostics: Vec::new(),
                 })
@@ -24960,12 +25684,14 @@ mod tests {
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &[],
             None,
             |_, _, _| {
                 evaluation_calls += 1;
                 Ok(V2FineGroupEvaluationOutcome {
                     state: FineEvaluationState::EvidenceBlocked,
                     record: None,
+                    review_proposal: None,
                     member_execution_count: 1,
                     diagnostics: Vec::new(),
                 })
@@ -25017,12 +25743,14 @@ mod tests {
                 },
             },
             &bindings,
+            &[],
             None,
             |_, _, _| {
                 evaluation_calls += 1;
                 Ok(V2FineGroupEvaluationOutcome {
                     state: FineEvaluationState::EvaluatedIneligible,
                     record: None,
+                    review_proposal: None,
                     member_execution_count: 1,
                     diagnostics: Vec::new(),
                 })
@@ -25067,6 +25795,7 @@ mod tests {
                 },
             },
             &bindings,
+            &[],
             None,
             |_, _, _| -> Result<_, String> {
                 panic!("exhausted component member budget must block before evaluation")
@@ -25106,6 +25835,7 @@ mod tests {
                 },
             },
             &bindings,
+            &[],
             None,
             |_, _, _| -> Result<_, String> {
                 panic!("exhausted wall-time budget must block before evaluation")
@@ -25144,6 +25874,7 @@ mod tests {
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &[],
             None,
             |_, _, _| -> Result<_, String> { panic!("ineligible candidate must not be evaluated") },
         )
@@ -25167,6 +25898,25 @@ mod tests {
             candidates: vec![v2_test_unresolved_fine_candidate(id, 900_000)],
         };
         let bindings = vec![v2_test_fine_binding(id)];
+        let mut review_proposal = test_audio_alignment_batch_proposal("blocked review candidate");
+        let mut review_time_map = visual_test_time_map(create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            0,
+            1_000,
+            0,
+            1_000,
+        ));
+        review_time_map.quality.level = "blocked";
+        review_time_map.quality.coverage = Some(0.978);
+        review_time_map.quality.p95_residual_ms = Some(11);
+        review_proposal.match_range = Some(AlignmentMatchRange {
+            source_start_ms: 0,
+            source_end_ms: 1_000,
+            target_start_ms: 0,
+            target_end_ms: 1_000,
+            coverage: 0.978,
+        });
+        review_proposal.time_map = Some(review_time_map);
 
         let resolution = resolve_v2_fine_frontier_component_with(
             vec![0],
@@ -25177,11 +25927,13 @@ mod tests {
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &[],
             None,
             |_, _, _| {
                 Ok(V2FineGroupEvaluationOutcome {
                     state: FineEvaluationState::EvaluatedIneligible,
                     record: None,
+                    review_proposal: Some(Box::new(review_proposal.clone())),
                     member_execution_count: 1,
                     diagnostics: vec![
                         "Final blocked TimeMap：source coverage 12.5%，P95=420 ms。".to_string()
@@ -25198,6 +25950,24 @@ mod tests {
         assert_eq!(
             resolution.diagnostics_by_pair.get(&0).unwrap(),
             &vec!["Final blocked TimeMap：source coverage 12.5%，P95=420 ms。".to_string()]
+        );
+        let preserved = resolution
+            .review_proposals_by_pair
+            .get(&0)
+            .expect("blocked review proposal must survive noEligibleCandidate resolution");
+        assert_eq!(
+            preserved
+                .time_map
+                .as_ref()
+                .map(|time_map| time_map.quality.level),
+            Some("blocked")
+        );
+        assert_eq!(
+            preserved
+                .time_map
+                .as_ref()
+                .and_then(|time_map| time_map.quality.coverage),
+            Some(0.978)
         );
     }
 
@@ -25237,6 +26007,7 @@ mod tests {
                 component: V2FineComponentBudget::default(),
             },
             &bindings,
+            &[],
             None,
             |binding, _, _| {
                 let (score, occupancy) = if binding.id == first_pair {
@@ -25254,6 +26025,7 @@ mod tests {
                         score: ScoreMicros::new(score).unwrap(),
                     },
                     record: Some(v2_test_fine_record(binding.id, score, occupancy)),
+                    review_proposal: None,
                     member_execution_count: 1,
                     diagnostics: Vec::new(),
                 })
@@ -25439,6 +26211,47 @@ mod tests {
 
         receipt.inventory_digest = format!("sha256:{}", "f".repeat(64));
         assert!(validate_audio_alignment_batch_fine_frontier_receipt(&receipt).is_err());
+    }
+
+    #[test]
+    fn v2_no_eligible_frontier_can_publish_only_a_zero_confidence_blocked_review_time_map() {
+        let plan = test_one_source_three_target_batch_plan();
+        let receipt = create_test_audio_alignment_batch_fine_frontier_receipt(
+            &plan.pairs[0],
+            AudioAlignmentBatchFineFrontierStateSnapshot::NoEligibleCandidate,
+        );
+        let mut proposal = test_audio_alignment_batch_proposal("blocked review candidate");
+        let mut time_map = visual_test_time_map(create_v2_span(
+            AudioTimeMapSpanKind::Ambiguous,
+            0,
+            1_000,
+            0,
+            1_000,
+        ));
+        time_map.quality.level = "blocked";
+        proposal.match_range = Some(AlignmentMatchRange {
+            source_start_ms: 0,
+            source_end_ms: 1_000,
+            target_start_ms: 0,
+            target_end_ms: 1_000,
+            coverage: 0.9,
+        });
+        proposal.time_map = Some(time_map);
+        let outcome = StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(proposal.clone()));
+
+        validate_audio_alignment_batch_fine_staged_evidence(&receipt, None, &outcome).unwrap();
+
+        proposal.confidence = 0.1;
+        let tampered = StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(proposal.clone()));
+        assert!(
+            validate_audio_alignment_batch_fine_staged_evidence(&receipt, None, &tampered).is_err()
+        );
+        proposal.confidence = 0.0;
+        proposal.time_map.as_mut().unwrap().quality.level = "review";
+        let tampered = StagedAudioAlignmentBatchPairOutcome::Proposal(Box::new(proposal));
+        assert!(
+            validate_audio_alignment_batch_fine_staged_evidence(&receipt, None, &tampered).is_err()
+        );
     }
 
     #[test]
@@ -26657,7 +27470,7 @@ mod tests {
         assert!(first.contains("requestedSpectralBackend=cpu"));
         assert!(first.contains("ptsOrigin=-80"));
         assert!(first.contains("streamPtsOffset=80"));
-        assert!(first.contains(crate::alignment_v2::CPU_SPECTRAL_BACKEND_ID));
+        assert!(first.contains(STREAMING_CPU_SPECTRAL_BACKEND_ID));
         assert!(cuda_key.contains(crate::cuda_fft_backend::CUDA_FFT_BACKEND_ID));
         assert_ne!(first, cuda_key);
         assert_ne!(first, other_stream);
@@ -27699,6 +28512,39 @@ mod tests {
             v2_bracketing_anchor_inverse_for_target_chunk(&coarse, &inverse, 170_000, 215_000)
                 .is_none(),
             "one-sided evidence must not suppress recursive edit recovery"
+        );
+    }
+
+    #[test]
+    fn v2_local_anchor_guide_never_consumes_held_out_coordinates() {
+        let mut coarse = v2_test_hypothesis(1.0, 0);
+        coarse.training_anchors = vec![AffineAnchorEvidence {
+            source_time_ms: 0,
+            target_time_ms: 0,
+            residual_ms: 0,
+        }];
+        coarse.held_out_anchors = vec![AffineAnchorEvidence {
+            source_time_ms: 360_000,
+            target_time_ms: 360_000,
+            residual_ms: 0,
+        }];
+        let inverse = inverse_affine_hypothesis(&coarse).unwrap();
+
+        assert!(
+            v2_bracketing_anchor_inverse_for_target_chunk(&coarse, &inverse, 170_000, 215_000)
+                .is_none(),
+            "a held-out after-anchor must not close a training bracket or steer fine DP"
+        );
+
+        coarse.training_anchors.push(AffineAnchorEvidence {
+            source_time_ms: 360_000,
+            target_time_ms: 360_000,
+            residual_ms: 0,
+        });
+        assert!(
+            v2_bracketing_anchor_inverse_for_target_chunk(&coarse, &inverse, 170_000, 215_000)
+                .is_some(),
+            "the same coordinate is eligible only after it belongs to the training partition"
         );
     }
 
@@ -28981,6 +29827,7 @@ mod tests {
             &input,
             backend_request,
             None,
+            None,
         )
         .unwrap();
         assert!(!coarse.index.landmarks.is_empty());
@@ -29002,6 +29849,7 @@ mod tests {
                 shared_backend_request: None,
                 cache_plan: None,
                 retained_artifact_bytes: 0,
+                identity_guard: None,
             },
         )
         .unwrap();
@@ -29065,6 +29913,7 @@ mod tests {
             &stale,
             backend_request,
             None,
+            None,
         )
         .unwrap_err();
         assert!(identity_error.starts_with("blocked:media-identity-changed"));
@@ -29095,6 +29944,7 @@ mod tests {
             &input,
             backend_request,
             Some(&cancelled),
+            None,
         )
         .unwrap_err();
         assert_eq!(cancel_error, AUDIO_ALIGNMENT_CANCELLED);
@@ -29483,6 +30333,118 @@ mod tests {
         eprintln!(
             "C137 real-media audio PTS profile: elapsedMs={elapsed_ms} streamCount={} decodedFrameCount={decoded_frame_count}",
             timelines.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires user-provided source/target media and can run for several minutes"]
+    fn production_real_media_approximate_fingerprint_profile_from_environment() {
+        let source_path = std::env::var("C137_REAL_MEDIA_SOURCE")
+            .expect("C137_REAL_MEDIA_SOURCE must point to one reference video");
+        let target_path = std::env::var("C137_REAL_MEDIA_TARGETS")
+            .expect("C137_REAL_MEDIA_TARGETS must contain one target video path")
+            .split('|')
+            .map(str::trim)
+            .find(|path| !path.is_empty())
+            .expect("C137_REAL_MEDIA_TARGETS must contain one target video path")
+            .to_string();
+        assert!(Path::new(&source_path).is_file());
+        assert!(Path::new(&target_path).is_file());
+        let backend_request = resolve_spectral_backend_preference(SpectralBackendPreference::Cuda)
+            .expect("CUDA backend must be available for the real-media profile");
+        let options = AudioAlignmentOptions {
+            spectral_backend_request: backend_request.clone(),
+            ..test_options()
+        };
+        let source_identity =
+            probe_media_content_identity_cancellable(Path::new(&source_path), None)
+                .expect("source full-file identity must complete");
+        let target_identity =
+            probe_media_content_identity_cancellable(Path::new(&target_path), None)
+                .expect("target full-file identity must complete");
+        let create_input = |identity, duration_ms| AlignmentAudioInput {
+            presentation_origin_ms: 0,
+            media_duration_ms: Some(duration_ms),
+            content_identity: Some(identity),
+            decode_timeline: None,
+            audio_stream_count: 1,
+            explicit_stream_selection: true,
+            stream: AudioStreamProbe {
+                stream_index: 1,
+                codec_name: None,
+                start_time_ms: 0,
+                timeline_offset_ms: 0,
+                duration_ms: None,
+                time_base: None,
+                sample_rate: None,
+                channels: None,
+                channel_layout: None,
+                language: None,
+                title: None,
+                is_default: true,
+                is_commentary: false,
+            },
+        };
+        let source_input = create_input(source_identity.clone(), 8 * 60 * 60 * 1_000);
+        let target_input = create_input(target_identity.clone(), 4 * 60 * 60 * 1_000);
+        let source_guard = PinnedMediaIdentityGuard {
+            physical_pin: PinnedPhysicalFile::open(Path::new(&source_path)).unwrap(),
+            expected_identity: source_identity,
+        };
+        let target_guard = PinnedMediaIdentityGuard {
+            physical_pin: PinnedPhysicalFile::open(Path::new(&target_path)).unwrap(),
+            expected_identity: target_identity,
+        };
+        let stable_source_path = source_guard
+            .physical_pin
+            .handle_final_path()
+            .to_string_lossy()
+            .into_owned();
+        let stable_target_path = target_guard
+            .physical_pin
+            .handle_final_path()
+            .to_string_lossy()
+            .into_owned();
+        let started_at = Instant::now();
+        let source = decode_v2_coarse_landmarks_streaming(
+            &stable_source_path,
+            "真实参考",
+            &options,
+            &source_input,
+            &backend_request,
+            None,
+            Some(&source_guard),
+        )
+        .expect("source streaming landmarks must decode");
+        let target = decode_v2_coarse_landmarks_streaming(
+            &stable_target_path,
+            "真实目标",
+            &options,
+            &target_input,
+            &backend_request,
+            None,
+            Some(&target_guard),
+        )
+        .expect("target streaming landmarks must decode");
+        let source_bounds =
+            v2_presentation_bounds_for_samples(0, source.decoded_sample_count).unwrap();
+        let target_bounds =
+            v2_presentation_bounds_for_samples(0, target.decoded_sample_count).unwrap();
+        let result = match_spectral_fingerprints_approximately(
+            &source.coarse_fingerprint,
+            &target.coarse_fingerprint,
+            (target_bounds.start_ms, target_bounds.end_ms),
+            &ApproximateFingerprintConfig::default(),
+            None,
+        )
+        .expect("approximate fingerprint profile must execute");
+        eprintln!(
+            "C137 approximate fingerprint profile: elapsedMs={} sourceLandmarks={} targetLandmarks={} sourceFingerprintFrames={} targetFingerprintFrames={} sourceBounds={source_bounds:?} targetBounds={target_bounds:?} result={result:#?}",
+            started_at.elapsed().as_millis(),
+            source.index.landmarks.len(),
+            target.index.landmarks.len(),
+            source.coarse_fingerprint.len(),
+            target.coarse_fingerprint.len()
         );
     }
 
@@ -29919,6 +30881,7 @@ mod tests {
             "PTS gap fixture",
             &test_options(),
             &input,
+            None,
             None,
         )
         .unwrap();
@@ -30383,6 +31346,7 @@ mod tests {
                 time_ms: marker as i64,
                 strength_milli: 1_000,
             }]),
+            coarse_fingerprint: Arc::new(Vec::new()),
             fine_features: None,
             spectral_backend: SpectralBackendExecution {
                 backend_id: crate::alignment_v2::CPU_SPECTRAL_BACKEND_ID.to_string(),
@@ -30574,6 +31538,7 @@ mod tests {
                 shared_backend_request: Some(backend_request),
                 cache_plan: plan.candidates.pop(),
                 retained_artifact_bytes: 0,
+                identity_guard: None,
             },
         )
         .unwrap();
@@ -30693,6 +31658,18 @@ mod tests {
                     strength_milli: 800,
                 },
             ]),
+            coarse_fingerprint: Arc::new(vec![
+                CoarseSpectralFingerprintFrame {
+                    time_ms: 1_000,
+                    values: [10; 12],
+                    active_ratio_milli: 1_000,
+                },
+                CoarseSpectralFingerprintFrame {
+                    time_ms: 2_000,
+                    values: [11; 12],
+                    active_ratio_milli: 1_000,
+                },
+            ]),
             fine_features: None,
             spectral_backend: SpectralBackendExecution {
                 backend_id: STREAMING_CPU_SPECTRAL_BACKEND_ID.to_string(),
@@ -30720,6 +31697,10 @@ mod tests {
 
         let loaded = load_persistent_v2_coarse_artifact_at(&root, cache_key).unwrap();
         assert_eq!(loaded.landmarks.as_ref(), artifact.landmarks.as_ref());
+        assert_eq!(
+            loaded.coarse_fingerprint.as_ref(),
+            artifact.coarse_fingerprint.as_ref()
+        );
         assert_eq!(loaded.spectral_backend, artifact.spectral_backend);
         assert_eq!(loaded.presentation_bounds, artifact.presentation_bounds);
 

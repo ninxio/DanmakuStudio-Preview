@@ -35,7 +35,14 @@ export function applyTestManualMediaTimeMapVerification(
           )
     )
   };
-  if (hydratedMap.spans.some((span) => span.kind === "ambiguous")) {
+  const hasUnresolvedAmbiguous = hydratedMap.spans.some(
+    (span, spanIndex) =>
+      span.kind === "ambiguous" &&
+      !hydratedMap.evidence.notes.some((note) =>
+        note.startsWith(`manual-span-review:v1:${spanIndex}:replacement:`)
+      )
+  );
+  if (hasUnresolvedAmbiguous) {
     // Some projection tests intentionally construct an impossible self-reported verified map to
     // assert that the export path still blocks it. Production issuance rejects this shape.
     return {

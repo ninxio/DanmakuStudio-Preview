@@ -1,3 +1,18 @@
+- 2026-07-19：C137 完成“1×5 强制逐 pair fine、失败候选保留与人工恢复闭环”开发切片；M1 达成，M2/M3 与 C137 总 Goal 继续 active。
+  - 计划纠偏：`docs/goals/C137-execution-plan.md` 已取代本文件上一条中的过度验收规模。C137 的 Beta 规模是 **5 套真实 1×5 / 25 个正确关系、10 个真实负关系、至少 30 个 ≥1 秒编辑事件**；10 套/50 集只作为完成后的扩大验证。单 pair 冷/热 p95 门槛为 10/5 分钟，完整 1×5 冷/热 p95 门槛为 25/12 分钟。
+  - M1 可观察已闭合：1×5 不再由第一个 pair 独占 fine 预算，每个有 coarse 关系的原片都获得必要 fine seed 或明确的淘汰状态；held-out 证据继续只用于验收，不参与路径选择。持久粗索引升级为 schema v2，并以 feature v18 隔离旧制品。
+  - 失败候选不是假成功：当 fine 真实执行但没有合格候选时，后端可保留置信度为 0、无 `fineExecutionEvidence`、整体 blocked 的最佳 TimeMap 供人工复核；没有物理全局选择权、无关系、身份错误或运行错误的 pair 不得发布候选。最新代码进一步阻止全局区间占用冲突的 pair 通过单 pair 人工签名绕开批次约束。
+  - 人工恢复形成完整的 fail-closed 链：用户必须逐段给出与边界形状一致的 `matched/source-extra/target-extra/replacement` 判定，并为每段完成绑定当前媒体与修订的 A/B 播放证据；任一重分类都会使旧播放证据失效。全部段落、媒体身份、提案 lineage 和原生证据通过后才可签发人工验证，重开项目可复核，撤销或媒体变化会降级。
+  - XML 安全边界：已签名且明确判为 `replacement` 的不同版本区间可以通过导出门禁，但该区间内参考弹幕会被安全丢弃并计入 source-only，不会线性投影到不同画面；未判定 ambiguous 仍阻断导出。原始 XML 继续只读。
+  - 真实 E02 单 pair（强制 RTX 4090/CUDA）耗时 **455,243ms（7.59 分钟）**，fine 终态为 `noEligibleCandidate`，保留 blocked review TimeMap；source coverage **0.977907**，可信留出残差 P50/P95/P99/max 为 **2/11/11/11ms**，41 spans 中 matched/source-only/target-only/ambiguous 为 **18/9/12/2**。该结果证明候选与误差可观察，不等于候选已经可直接导出。
+  - 真实《暗黑》1×5 冷批次耗时 **1,130,666ms（18.84 分钟）**，5/5 pair 均完成 fine、运行失败 0，执行身份均记录 CUDA/cuFFT 且无 CPU 回退；但实测 GPU 利用率约 6%，整链主要仍受解码、特征组织与 fine DP 的 CPU 工作限制，不能描述为“全链 GPU 加速”。
+  - 1×5 质量结果仍未达到 M2：E01–E05 coverage 分别为 **0.467750 / 0.977907 / 0.963854 / 0.770214 / 0.899226**；E01 缺少可用 held-out 残差，E03 P95 为 **44,950ms**，E04 存在物理区间占用冲突。五组编辑 span 数分别为 **49/23/30/123/49**，其中 ≤5 秒碎片为 **37/21/25/110/42**，表明当前逐帧 gap path 仍把局部噪声放大为大量微编辑。不能靠降低门槛或针对 Dark 调参结束 C137，下一算法切片应改为稳健分段仿射锚点/变化点建模，现有 DP 只做局部边界精修。
+  - 当前真实回执：`artifacts/c137-real-media-smoke-e02-review-candidate-v4.json` 与 `artifacts/c137-real-media-smoke-dark-1x5-spectral-v2.json`。前者是可人工恢复的单 pair 候选；后者采集于全局冲突安全补丁之前，因此其中 E04 的 blocked proposal 只作问题证据，最新代码不会再发布该候选。
+  - 自动回归通过：Rust 全量 **437 passed / 24 ignored / 0 failed**，strict Clippy `-D warnings` 通过；源码审计、ESLint、Vitest **93 files / 968 tests** 和 TypeScript/Vite production build 全绿。Chromium 四页北极星 E2E **6/6**；其中多素材用例按新契约证明 blocked 候选不能在 A/B 失败时保存，另外 4 个普通 review 关系可保存但仍不能签发或导出。
+  - E2E 可靠性修复：Vite 不再监听 `artifacts`、`test-results` 和 `playwright-report`，避免并行 worker 写截图时让另一页面热重载；运行期截图/下载改写到 `test-results/acceptance-artifacts/<worker-pid>`，不再覆盖仓库内既有验收图，也避开 Windows 固定文件名锁。长多素材用例只把总预算调整为 90 秒，单项断言仍保持 10 秒。
+  - release 安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，4,312,771 bytes，SHA-256 `957809BC953BED244170C1302D6FFBCF32370DF1C72DB56778F6C2B135447E88`；便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，16,858,624 bytes，SHA-256 `DEC674F1006BFA7579B145D69A5076F0FF80708CF42E0335FAEF6D5F91068643`。
+  - C137 结束边界保持不变：M2 仍要求《暗黑》5/5 候选可在 UI 完成复核；M3 仍要求真实导出 5 个 XML 并达到抽样同步 p95 ≤200ms；最终完成还需 5 套 Beta、负关系、真实编辑、重复性能、取消/恢复与 XML Gold 全部达标。当前不得标记 C137 完成。
+
 - 2026-07-19：根据用户真实 1×5 验收失败，建立 `docs/goals/C137-execution-plan.md`，将 C137 从宽泛技术清单收敛为 A–G 七个可退出阶段，并设置真实媒体、准确率、删减边界、最终 XML、RTX 4090 性能、UX、可靠性和 release 的硬结束指标。
   - 当前第一优先级固定为修复 1×5 项目级裁剪：最近实机日志中 5 个 pair 只有 pair 1/5 进入 fine，pair 2–4 仅完成 coarse；在每个原片获得必要 fine 或明确无 coarse 关系前，不继续把“批次完成”表述为匹配完成。
   - C137 完成集要求至少 10 套真实 1×5、25 个真实负关系、120 个 ≥1 秒真实编辑事件且至少 30% 为从未参与调参的 frozen-test；用户《暗黑》第一季是强制回归，但不能单独代替规模化验收。

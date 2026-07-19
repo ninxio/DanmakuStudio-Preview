@@ -5,7 +5,6 @@ import {
 } from "./timeMapProposal";
 import {
   areMediaTimeMapImmutableLineagesEquivalent,
-  areMediaTimeMapsSemanticallyEquivalent,
   confirmCandidateTimeMap,
   createCandidateTimeMapId,
   createConfirmedTimeMapId,
@@ -1196,8 +1195,9 @@ function requireOrCreateCandidateTimeMap(
 }
 
 /**
- * V2/V3 候选必须能由其持久化 proposal.timeMap 确定性重建；旧候选没有正式提案图，
- * 仍由 legacy-unverified 闸门负责阻断导出。
+ * V2/V3 候选的媒体、范围、spans 和引擎 provenance 必须仍与 proposal.timeMap
+ * 属于同一不可变 lineage。质量、逐段证据和人工复核 notes 会在候选生命周期中合法演进，
+ * 因而由各自校验器和签名摘要约束，不能继续要求与最初自动提案逐字相等。
  */
 export function doesCandidateTimeMapMatchProposal(
   map: MediaTimeMap,
@@ -1208,7 +1208,7 @@ export function doesCandidateTimeMapMatchProposal(
   }
   try {
     const expected = createCandidateTimeMap(candidate, candidate.createdAt);
-    return areMediaTimeMapsSemanticallyEquivalent(map, expected);
+    return areMediaTimeMapImmutableLineagesEquivalent(map, expected);
   } catch {
     return false;
   }

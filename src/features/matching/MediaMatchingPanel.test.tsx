@@ -1240,6 +1240,46 @@ describe("多媒体自动匹配工作台", () => {
     expect(screen.queryByRole("button", { name: /确认关系|保存关系/ })).not.toBeInTheDocument();
   });
 
+  it("精匹配找到高覆盖 blocked TimeMap 时保留人工复核候选而不是误报未找到", async () => {
+    vi.mocked(startTauriAudioAlignmentJob).mockImplementation(() => {
+      const proposal = createV2Proposal(30_000, "blocked");
+      proposal.confidence = 0;
+      return Promise.resolve({
+        jobId: "job-blocked-review-candidate",
+        status: "completed",
+        progress: 1,
+        message: "完成",
+        logs: [],
+        proposal,
+        error: null,
+        updatedAtMs: 1
+      });
+    });
+    testFineBatchOptions = { finalState: "noEligibleCandidate", inventoryCandidateCount: 2 };
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.mediaMatchCandidates).toHaveLength(2)
+    );
+
+    const candidates = useEditorStore.getState().project.mediaMatchCandidates;
+    expect(candidates.every((candidate) => candidate.state === "blocked")).toBe(true);
+    expect(
+      candidates.every((candidate) => candidate.proposal.timeMap?.quality.level === "blocked")
+    ).toBe(true);
+    expect(useEditorStore.getState().status.message).toBe(
+      "批量匹配完成：0 组可逐项确认，2 组暂不可确认。"
+    );
+    expect(
+      within(screen.getByLabelText("批量匹配任务")).getAllByText(
+        /找到候选，但差异边界需要人工复核/
+      )
+    ).toHaveLength(2);
+    expect(screen.getAllByTestId("media-match-candidate")).toHaveLength(2);
+    expect(screen.queryByText(/没有可用的对应候选/)).not.toBeInTheDocument();
+  });
+
   it("精匹配受资源限制时显示可操作原因且绝不误报为未找到", async () => {
     testFineBatchOptions = {
       finalState: "unresolved",
@@ -1410,9 +1450,9 @@ describe("多媒体自动匹配工作台", () => {
     render(<MatchingHarness />);
 
     const warning = screen.getByTestId("legacy-alignment-warning");
-    expect(warning).toHaveTextContent("未决结果不会进入候选");
-    expect(warning).toHaveTextContent("可用资源不足");
-    expect(warning).toHaveTextContent("仍需逐项试听或预览复核");
+    expect(warning).toHaveTextContent("未决结果不会伪装成匹配成功");
+    expect(warning).toHaveTextContent("全局占用冲突");
+    expect(warning).toHaveTextContent("A/B 复核");
     expect(warning).toHaveTextContent("Evidence v5");
     expect(warning).toHaveTextContent("显式多版本复用策略");
     expect(warning).toHaveTextContent("前端不会再次求解");
@@ -1760,13 +1800,13 @@ describe("多媒体自动匹配工作台", () => {
     const ambiguousItem = ambiguousButton.closest("li");
     if (!ambiguousItem) throw new Error("未找到无法判断分段容器");
     await user.click(within(ambiguousItem).getByRole("button", { name: "版本替换" }));
-    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("pending");
-    expect(useEditorStore.getState().project.mediaTimeMaps[0]?.quality.level).toBe("review");
+    expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("blocked");
+    expect(useEditorStore.getState().project.mediaTimeMaps[0]?.quality.level).toBe("blocked");
     expect(
       within(await screen.findByTestId("media-match-candidate")).getByRole("button", {
-        name: "保存关系供试听复核"
+        name: "此候选不能确认"
       })
-    ).toBeEnabled();
+    ).toBeDisabled();
   });
 
   it("候选保存后明确显示关系待复核，不用绿色已确认暗示可导出", async () => {
@@ -1827,7 +1867,17 @@ describe("多媒体自动匹配工作台", () => {
         )
     );
     const card = await screen.findByTestId("media-match-candidate");
-    await user.click(within(card).getByRole("button", { name: "保存关系供试听复核" }));
+    const saveRelationship = within(card).getByRole("button", {
+      name: "保存关系供试听复核"
+    });
+    await waitFor(() => expect(saveRelationship).toBeEnabled());
+    await user.click(saveRelationship);
+    await waitFor(() => {
+      const state = useEditorStore.getState();
+      if (state.project.mediaMatchCandidates[0]?.state !== "accepted") {
+        throw new Error(state.status.message);
+      }
+    });
 
     const verification = within(card).getByTestId("manual-time-map-verification");
     expect(verification).toHaveTextContent("已通过签发预检");

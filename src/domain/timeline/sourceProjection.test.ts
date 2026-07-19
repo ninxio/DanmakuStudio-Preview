@@ -929,6 +929,42 @@ describe("projectDanmakuToTargets", () => {
     );
   });
 
+  it("经 A/B 复核并签发的版本替换区间可导出，但不会把参考弹幕投到另一版画面", () => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    const candidate = attachTimeMap(
+      project,
+      "segment_verified",
+      [
+        {
+          kind: "ambiguous",
+          sourceStartMs: 0,
+          sourceEndMs: 10_000,
+          targetStartMs: 0,
+          targetEndMs: 10_000
+        }
+      ],
+      "review"
+    );
+    candidate.evidence.types.push("manual");
+    candidate.evidence.notes.push(
+      "manual-span-review:v1:0:replacement:2026-07-12T00:00:00.000Z"
+    );
+    const verified = applyManualMediaTimeMapVerification(candidate, {
+      calibrationArtifactId: "test-manual-review-protocol",
+      calibrationArtifactVersion: "1",
+      verifier: "vitest",
+      verifiedAt: "2026-07-12T00:00:00.000Z"
+    });
+    project.mediaTimeMaps = [verified];
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(result.status).toBe("readyWithWarnings");
+    expect(result.groups[0]?.entries).toHaveLength(0);
+    expect(result.sourceOnlyItemCount).toBe(1);
+    expect(result.unexpectedUnmappedItemCount).toBe(0);
+  });
+
   it.each<{
     level: MediaTimeMapQualityLevel;
     expectedStatus: "ready" | "blocked";

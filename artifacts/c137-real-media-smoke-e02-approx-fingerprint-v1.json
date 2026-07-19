@@ -1,0 +1,481 @@
+{
+  "elapsedMs": 425048,
+  "evidenceKind": "c137-development-real-media-smoke",
+  "releaseEligible": false,
+  "requestedBackend": "cuda",
+  "schemaVersion": 1,
+  "snapshot": {
+    "currentPairOrdinal": null,
+    "diagnosticEvents": [
+      {
+        "atMs": 1784414442686,
+        "durationMs": null,
+        "elapsedMs": 0,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "批量匹配已进入原生任务队列。",
+        "pairOrdinal": null,
+        "sequence": 1,
+        "stageKey": "batch.queued"
+      },
+      {
+        "atMs": 1784414442687,
+        "durationMs": null,
+        "elapsedMs": 0,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在检查 FFmpeg、CUDA 计算策略与批次资源。",
+        "pairOrdinal": null,
+        "sequence": 2,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414454163,
+        "durationMs": null,
+        "elapsedMs": 11477,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 1/2 个素材（B 站参考）：读取 PTS、音轨并生成共享声谱特征。",
+        "pairOrdinal": null,
+        "sequence": 3,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414454164,
+        "durationMs": null,
+        "elapsedMs": 11477,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 1/2 个素材（B 站参考）：开始核验媒体身份并读取容器、音轨和展示时间线。",
+        "pairOrdinal": null,
+        "sequence": 4,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414454164,
+        "durationMs": null,
+        "elapsedMs": 11477,
+        "level": "info",
+        "mediaOrdinal": 1,
+        "message": "开始核验媒体身份并读取容器、音轨和展示时间线。",
+        "pairOrdinal": null,
+        "sequence": 5,
+        "stageKey": "media.timeline-probe"
+      },
+      {
+        "atMs": 1784414601544,
+        "durationMs": 147380,
+        "elapsedMs": 158858,
+        "level": "info",
+        "mediaOrdinal": 1,
+        "message": "媒体身份与容器时间线读取完成。",
+        "pairOrdinal": null,
+        "sequence": 6,
+        "stageKey": "media.timeline-probe"
+      },
+      {
+        "atMs": 1784414601544,
+        "durationMs": null,
+        "elapsedMs": 158858,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 1/2 个素材（B 站参考）：开始扫描音频 frame/packet PTS 与 skip-sample 证据。",
+        "pairOrdinal": null,
+        "sequence": 7,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414601544,
+        "durationMs": null,
+        "elapsedMs": 158858,
+        "level": "info",
+        "mediaOrdinal": 1,
+        "message": "开始扫描音频 frame/packet PTS 与 skip-sample 证据。",
+        "pairOrdinal": null,
+        "sequence": 8,
+        "stageKey": "media.audio-pts-probe"
+      },
+      {
+        "atMs": 1784414773345,
+        "durationMs": 171800,
+        "elapsedMs": 330658,
+        "level": "info",
+        "mediaOrdinal": 1,
+        "message": "音频 PTS 与 skip-sample 扫描完成。",
+        "pairOrdinal": null,
+        "sequence": 9,
+        "stageKey": "media.audio-pts-probe"
+      },
+      {
+        "atMs": 1784414773345,
+        "durationMs": null,
+        "elapsedMs": 330659,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 1/2 个素材（B 站参考）：正在加载或生成共享声谱地标。",
+        "pairOrdinal": null,
+        "sequence": 10,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414773346,
+        "durationMs": null,
+        "elapsedMs": 330659,
+        "level": "info",
+        "mediaOrdinal": 1,
+        "message": "开始加载或生成共享声谱地标。",
+        "pairOrdinal": null,
+        "sequence": 11,
+        "stageKey": "media.coarse-landmarks"
+      },
+      {
+        "atMs": 1784414774393,
+        "durationMs": 1047,
+        "elapsedMs": 331706,
+        "level": "info",
+        "mediaOrdinal": 1,
+        "message": "共享声谱地标准备完成：1 条音轨制品，缓存命中 1 条（磁盘 1 条），新写入磁盘粗索引 0 条，计算后端 cuda-cufft-r2c-512-v1。",
+        "pairOrdinal": null,
+        "sequence": 12,
+        "stageKey": "media.coarse-landmarks"
+      },
+      {
+        "atMs": 1784414774393,
+        "durationMs": null,
+        "elapsedMs": 331706,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "已预处理 1/2 个素材；正在准备下一项。",
+        "pairOrdinal": null,
+        "sequence": 13,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414774393,
+        "durationMs": null,
+        "elapsedMs": 331706,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 2/2 个素材（目标原片）：读取 PTS、音轨并生成共享声谱特征。",
+        "pairOrdinal": null,
+        "sequence": 14,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414774393,
+        "durationMs": null,
+        "elapsedMs": 331706,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 2/2 个素材（目标原片）：开始核验媒体身份并读取容器、音轨和展示时间线。",
+        "pairOrdinal": null,
+        "sequence": 15,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414774393,
+        "durationMs": null,
+        "elapsedMs": 331706,
+        "level": "info",
+        "mediaOrdinal": 2,
+        "message": "开始核验媒体身份并读取容器、音轨和展示时间线。",
+        "pairOrdinal": null,
+        "sequence": 16,
+        "stageKey": "media.timeline-probe"
+      },
+      {
+        "atMs": 1784414812333,
+        "durationMs": 37939,
+        "elapsedMs": 369646,
+        "level": "info",
+        "mediaOrdinal": 2,
+        "message": "媒体身份与容器时间线读取完成。",
+        "pairOrdinal": null,
+        "sequence": 17,
+        "stageKey": "media.timeline-probe"
+      },
+      {
+        "atMs": 1784414812333,
+        "durationMs": null,
+        "elapsedMs": 369646,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 2/2 个素材（目标原片）：开始扫描音频 frame/packet PTS 与 skip-sample 证据。",
+        "pairOrdinal": null,
+        "sequence": 18,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414812333,
+        "durationMs": null,
+        "elapsedMs": 369646,
+        "level": "info",
+        "mediaOrdinal": 2,
+        "message": "开始扫描音频 frame/packet PTS 与 skip-sample 证据。",
+        "pairOrdinal": null,
+        "sequence": 19,
+        "stageKey": "media.audio-pts-probe"
+      },
+      {
+        "atMs": 1784414853849,
+        "durationMs": 41516,
+        "elapsedMs": 411162,
+        "level": "info",
+        "mediaOrdinal": 2,
+        "message": "音频 PTS 与 skip-sample 扫描完成。",
+        "pairOrdinal": null,
+        "sequence": 20,
+        "stageKey": "media.audio-pts-probe"
+      },
+      {
+        "atMs": 1784414853849,
+        "durationMs": null,
+        "elapsedMs": 411162,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在预处理第 2/2 个素材（目标原片）：正在加载或生成共享声谱地标。",
+        "pairOrdinal": null,
+        "sequence": 21,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414853849,
+        "durationMs": null,
+        "elapsedMs": 411162,
+        "level": "info",
+        "mediaOrdinal": 2,
+        "message": "开始加载或生成共享声谱地标。",
+        "pairOrdinal": null,
+        "sequence": 22,
+        "stageKey": "media.coarse-landmarks"
+      },
+      {
+        "atMs": 1784414861513,
+        "durationMs": 7664,
+        "elapsedMs": 418826,
+        "level": "info",
+        "mediaOrdinal": 2,
+        "message": "共享声谱地标准备完成：1 条音轨制品，缓存命中 0 条（磁盘 0 条），新写入磁盘粗索引 0 条，计算后端 cuda-cufft-r2c-512-v1。",
+        "pairOrdinal": null,
+        "sequence": 23,
+        "stageKey": "media.coarse-landmarks"
+      },
+      {
+        "atMs": 1784414861513,
+        "durationMs": null,
+        "elapsedMs": 418826,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "已预处理 2/2 个素材；正在准备下一项。",
+        "pairOrdinal": null,
+        "sequence": 24,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414861513,
+        "durationMs": null,
+        "elapsedMs": 418826,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "2 个素材预处理完成，正在比较 1 组对应关系。",
+        "pairOrdinal": null,
+        "sequence": 25,
+        "stageKey": "batch.phase"
+      },
+      {
+        "atMs": 1784414861513,
+        "durationMs": null,
+        "elapsedMs": 418826,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "正在完成全批项目级 Top-K coarse scoring；尚未执行 fine。",
+        "pairOrdinal": 1,
+        "sequence": 26,
+        "stageKey": "pair.progress"
+      },
+      {
+        "atMs": 1784414866912,
+        "durationMs": 424225,
+        "elapsedMs": 424225,
+        "level": "info",
+        "mediaOrdinal": null,
+        "message": "批量音频对齐完成：1 个 pair 均已真实执行。",
+        "pairOrdinal": null,
+        "sequence": 27,
+        "stageKey": "batch.completed"
+      }
+    ],
+    "error": null,
+    "evidenceVersion": 5,
+    "failedPairCount": 0,
+    "jobId": "real-media-smoke-1784414442686",
+    "message": "批量音频对齐完成：1 个 pair 均已真实执行。",
+    "pairingMode": "fullCartesian",
+    "pairs": [
+      {
+        "error": null,
+        "fineExecutionEvidence": null,
+        "fineFrontier": {
+          "bestCompleted": {
+            "candidateIds": [],
+            "totalScoreMicros": 0
+          },
+          "componentOrdinal": 1,
+          "componentPairOrdinals": [
+            1
+          ],
+          "contractVersion": "alignment-v2-adaptive-fine-frontier-v3",
+          "deferredCandidateCount": 0,
+          "evaluatedCandidateCount": 0,
+          "finalState": "noEligibleCandidate",
+          "inventoryCandidateCount": 0,
+          "inventoryCandidates": [],
+          "inventoryDigest": "sha256:4b22f76e61612c9fe395c6abada307b48b70f0c1b22797e81be26e2b3f670ef9",
+          "inventoryStateCounts": {
+            "cancelled": 0,
+            "evaluatedIneligible": 0,
+            "evidenceBlocked": 0,
+            "infrastructureFailed": 0,
+            "resourceBlocked": 0,
+            "scored": 0,
+            "unresolved": 0
+          },
+          "limits": {
+            "maxCandidates": 32768,
+            "maxIntervalComparisons": 32000000,
+            "maxIntervalsPerAxis": 4096,
+            "maxSearchExpansions": 8000000,
+            "maxSearchStates": 2000000,
+            "maxTotalIntervals": 262144,
+            "refinementBatchSize": 16
+          },
+          "nextRefinementCandidateIds": [],
+          "optimisticOmitted": null,
+          "overlapToleranceMs": 250,
+          "proof": {
+            "beatsOptimisticOmittedWithMargin": true,
+            "beatsRunnerUpWithMargin": true
+          },
+          "receiptDigest": "sha256:0581109e84a3730ec80468cd9f0191c6f7fe2a5011eb01fa5efd7cf65977a052",
+          "refinementRoundCount": 0,
+          "resolutionMarginMicros": 1,
+          "resolved": false,
+          "runnerUpCompleted": null,
+          "scoreVersion": "alignment-v2-coarse-upper-times-confidence-v1",
+          "search": {
+            "expansionsConsidered": 0,
+            "intervalComparisons": 0,
+            "statesVisited": 1
+          },
+          "selectedCandidateIds": [],
+          "selectedTotalScoreMicros": null
+        },
+        "globalSelection": {
+          "candidateCount": 0,
+          "decisionCandidate": null,
+          "decisionRank": null,
+          "decisionScore": null,
+          "eligibleCandidateCount": 0,
+          "margin": 1.0,
+          "selected": false,
+          "selectedRank": null,
+          "selectedScore": null,
+          "state": "blocked",
+          "topK": []
+        },
+        "message": "当前 pair 已完成并通过批次最终身份复核。",
+        "pairIndex": 0,
+        "pairOrdinal": 1,
+        "progress": 1.0,
+        "proposal": {
+          "anchors": [],
+          "confidence": 0.0,
+          "cutCandidates": [],
+          "diagnostics": [
+            "音轨 #1 → #1 的 exact-landmark 仿射拟合没有候选：sourceLandmarks=106365、targetLandmarks=60574、exactObservations=17215、modelSeeds=107；转入近似声谱时间指纹。",
+            "音轨 #1 → #1 的近似声谱时间指纹也没有形成满足分布、唯一性与内点门槛的候选。",
+            "pair coarse temporal-window grouping：完整保留 0 个跨音轨 affine raw candidate，以 bounded intersection-core 归入 0 个稳定时间候选组，共执行 0 次 O(1) group probe；raw candidate 仍逐个计入完整证据集，temporal group 作为 pair-level relation alternative 进入 evidence v3 完整 fine frontier，不是展示用 Top-K。",
+            "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
+            "没有可形成主结论的音轨组合。",
+            "阻断时 Top1/Top2 margin 为 0.000。"
+          ],
+          "evidence": {
+            "algorithm": "alignment-v2-edit-map",
+            "completeFingerprintCount": 0,
+            "confirmedChangeCount": 0,
+            "fingerprintMatchCount": 0,
+            "lowConfidenceRegionCount": 1,
+            "monotonicMatchCount": 0,
+            "offsetClusterCount": 0,
+            "quality": "blocked",
+            "refinedCandidateCount": 0,
+            "signals": [
+              {
+                "kind": "audio",
+                "label": "Alignment V2 landmark + edit-aware DP",
+                "note": "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
+                "observations": 0,
+                "status": "blocked",
+                "weight": 0.0
+              }
+            ],
+            "sourceFingerprintCount": 0,
+            "strongAnchorCount": 0,
+            "timeMappingSegmentCount": 0,
+            "weakAnchorCount": 0
+          }
+        },
+        "relationRanking": {
+          "bestEligibleCandidate": null,
+          "candidateCount": 0,
+          "eligibleCandidateCount": 0,
+          "executionIdentity": {
+            "engineVersion": "alignment-v2.3-rust",
+            "featureVersion": "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v17",
+            "ffmpegBinaryDigest": "sha256:e6d5cad4ab133c37f3db224986992b3fa1235d10c356f94dabb0cdf862013b3e",
+            "ffprobeBinaryDigest": "sha256:9f4452d02b78327492f5e7ada8249adff55b3d6aae21e73d2af2fbda4dabffb9",
+            "nativeExecutableDigest": "sha256:e77611797d202117508d37e0042108c7e2022f6969fa615acad83292242abbd0",
+            "relationScoreVersion": "alignment-v2-pair-intrinsic-global-weight-v1",
+            "schemaVersion": 1,
+            "sourceSpectralBackends": [
+              {
+                "backendDetail": "CUDA/cuFFT device #0 NVIDIA GeForce RTX 4090; bindings=CUDA 13.x ABI via cudarc 0.19.8; driverLibrary=nvcuda.dll; cufftLibrary=cufft64_12.dll; driverRuntime=13030; cufftRuntime=12300（跨 PCM chunk 流式批次）",
+                "backendId": "cuda-cufft-r2c-512-v1",
+                "fallbackReason": null,
+                "requestedBackend": "cuda"
+              }
+            ],
+            "targetSpectralBackends": [
+              {
+                "backendDetail": "CUDA/cuFFT device #0 NVIDIA GeForce RTX 4090; bindings=CUDA 13.x ABI via cudarc 0.19.8; driverLibrary=nvcuda.dll; cufftLibrary=cufft64_12.dll; driverRuntime=13030; cufftRuntime=12300",
+                "backendId": "cuda-cufft-r2c-512-v1",
+                "fallbackReason": null,
+                "requestedBackend": "cuda"
+              }
+            ]
+          },
+          "executionIdentityDigest": "sha256:c948f124f7ef962db4f81656cb7fac73bc1f26023a7e08d0aaba5dc7138bf231",
+          "score": null,
+          "scoreVersion": "alignment-v2-pair-intrinsic-global-weight-v1",
+          "state": "noEligibleCandidate"
+        },
+        "sourceMediaId": "real-reference-001",
+        "status": "completed",
+        "targetMediaId": "real-target-001"
+      }
+    ],
+    "processedPairCount": 1,
+    "progress": 1.0,
+    "schemaVersion": 2,
+    "sourceMediaIds": [
+      "real-reference-001"
+    ],
+    "status": "completed",
+    "targetMediaIds": [
+      "real-target-001"
+    ],
+    "totalPairCount": 1,
+    "updatedAtMs": 1784414866912,
+    "versionReuseGroups": []
+  }
+}

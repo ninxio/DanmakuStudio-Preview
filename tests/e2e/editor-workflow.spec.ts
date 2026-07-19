@@ -2,8 +2,14 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 
-const screenshotDir = resolve(process.cwd(), "artifacts", "screenshots");
-const downloadDir = resolve(process.cwd(), "artifacts", "downloads");
+const runArtifactDir = resolve(
+  process.cwd(),
+  "test-results",
+  "acceptance-artifacts",
+  String(process.pid)
+);
+const screenshotDir = resolve(runArtifactDir, "screenshots");
+const downloadDir = resolve(runArtifactDir, "downloads");
 
 interface SavedProjectFile {
   schemaVersion?: number;

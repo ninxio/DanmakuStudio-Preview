@@ -1,11 +1,9 @@
 import type { EditorProject, MediaTimeMap } from "../project/types";
 import {
-  assessTimeMapQuality,
   invalidateTimeMapSpanEvidenceForManualReview,
   isCompleteTimeMapSpanEvidence,
   normalizeLegacyUnverifiedTimeMapSpanEvidence,
   validateTimeMap,
-  type TimeMapQualityInput,
   type TimeMapSpan,
   type TimeMapSpanKind
 } from "./timeMap";
@@ -33,6 +31,9 @@ export interface RecordedTimeMapSpanReview {
 }
 
 const REVIEW_NOTE_PREFIX = "manual-span-review:v1:";
+const PLAYBACK_REVIEW_PREFIX = "manual-playback-review:v2:";
+const LEGACY_PLAYBACK_REVIEW_PREFIX = "manual-playback-review:v1:";
+const MANUAL_REVIEW_STATE_REASON_PREFIX = "逐段人工复核状态：";
 
 export class TimeMapSpanReviewError extends Error {
   constructor(message: string) {
@@ -137,61 +138,33 @@ export function applyTimeMapSpanReviewDecision(
   }
   const reviewNote = serializeTimeMapSpanReview({ spanIndex, decision, reviewedAt });
   const retainedNotes = timeMap.evidence.notes.filter(
-    (note) => !note.startsWith(`${REVIEW_NOTE_PREFIX}${spanIndex}:`)
+    (note) =>
+      !note.startsWith(`${REVIEW_NOTE_PREFIX}${spanIndex}:`) &&
+      !note.startsWith(`${PLAYBACK_REVIEW_PREFIX}${spanIndex}:`) &&
+      !note.startsWith(`${LEGACY_PLAYBACK_REVIEW_PREFIX}${spanIndex}:`)
   );
   const evidence = {
     ...timeMap.evidence,
     types: appendUnique(timeMap.evidence.types, "manual"),
     notes: [...retainedNotes, reviewNote]
   };
-  const reviewReason = `第 ${spanIndex + 1} 段已人工分类为“${TIME_MAP_SPAN_REVIEW_LABELS[decision]}”；整张时间图仍需完成验证后才能导出。`;
-  const hasUnresolvedAmbiguousSpan = spans.some(
-    (current, index) =>
-      current.kind === "ambiguous" &&
-      readReviewDecisionFromNotes(evidence.notes, index)?.decision !== "replacement"
-  );
-  const hasBlockedSpanEvidence = spans.some(
-    (current) => current.quality.level === "blocked"
-  );
-  const assessment = assessTimeMapQuality(
-    toReviewQualityInput(timeMap, evidence.types, evidence.heldOutAnchorCount)
-  );
-  const persistentBlockers =
-    timeMap.quality.level === "blocked"
-      ? timeMap.quality.reasons.filter((reason) => !isReviewResolvableOrDerivedReason(reason))
-      : [];
-  const remainsBlocked =
-    hasUnresolvedAmbiguousSpan ||
-    hasBlockedSpanEvidence ||
-    assessment.level === "blocked" ||
-    persistentBlockers.length > 0;
-  const reasons = uniqueStrings([
-    ...persistentBlockers,
-    reviewReason,
-    ...assessment.reasons,
-    ...(hasUnresolvedAmbiguousSpan
-      ? ["仍有尚未分类或被标记为“无法判断”的 ambiguous 分段，继续阻断候选确认。"]
-      : []),
-    ...(hasBlockedSpanEvidence
-      ? ["仍有逐段质量为 blocked 的分段，必须分别处理后才能解除阻断。"]
-      : [])
-  ]);
-  return {
+  const reviewedMap: MediaTimeMap = {
     ...timeMap,
     revision: timeMap.revision + 1,
     spans,
     quality: {
       ...timeMap.quality,
-      level: remainsBlocked ? "blocked" : "review",
-      // 这是原算法经金标准校准的测量值；人工分类不会把它当作人工结论概率，
-      // 但也不应抹掉后续中央签发门槛所需的原始校准证据。
-      probability: timeMap.quality.probability,
-      reasons
+      level: "blocked",
+      reasons: uniqueStrings([
+        ...timeMap.quality.reasons,
+        `第 ${spanIndex + 1} 段已人工分类为“${TIME_MAP_SPAN_REVIEW_LABELS[decision]}”；分类会使该段旧播放证据失效，必须重新完成 A/B 复核。`
+      ])
     },
     evidence,
     verification: null,
     updatedAt: reviewedAt
   };
+  return reconcileCandidateTimeMapManualReview(readinessWithoutPlayback(reviewedMap));
 }
 
 export function reviewCandidateTimeMapSpan(
@@ -259,49 +232,74 @@ export function readTimeMapSpanReviewDecision(
   return readReviewDecisionFromNotes(timeMap.evidence.notes, spanIndex);
 }
 
-function toReviewQualityInput(
-  timeMap: MediaTimeMap,
-  evidenceTypes: MediaTimeMap["evidence"]["types"],
-  evidenceHeldOutAnchorCount: number
-): TimeMapQualityInput {
+export interface CandidateTimeMapManualReviewReadiness {
+  timeMap: MediaTimeMap;
+  playbackReviewedSpanIndexes: ReadonlySet<number>;
+}
+
+/**
+ * 只有每一段都完成了与当前边界绑定的 A/B 播放，且所有差异段都有明确人工分类时，
+ * blocked 候选才可降为 review。这里不修改算法指标，也不签发 verified。
+ */
+export function reconcileCandidateTimeMapManualReview(
+  input: CandidateTimeMapManualReviewReadiness
+): MediaTimeMap {
+  const { timeMap, playbackReviewedSpanIndexes } = input;
+  const validation = validateTimeMap(timeMap.spans);
+  const issues: string[] = [];
+  if (!validation.valid) {
+    issues.push(validation.issues[0]?.message ?? "时间图结构无效。");
+  }
+  if (!timeMap.sourceIdentity || !timeMap.targetIdentity) {
+    issues.push("源文件或目标文件缺少内容身份快照。");
+  }
+  timeMap.spans.forEach((span, spanIndex) => {
+    if (!isCompleteTimeMapSpanEvidence(span)) {
+      issues.push(`第 ${spanIndex + 1} 段缺少完整逐段证据。`);
+      return;
+    }
+    if (
+      span.quality.level === "blocked" ||
+      span.quality.level === "legacy-unverified"
+    ) {
+      issues.push(`第 ${spanIndex + 1} 段仍为 ${span.quality.level}。`);
+    }
+    if (!playbackReviewedSpanIndexes.has(spanIndex)) {
+      issues.push(`第 ${spanIndex + 1} 段尚未完成 A/B 播放复核。`);
+    }
+    const decision = readReviewDecisionFromNotes(timeMap.evidence.notes, spanIndex)?.decision;
+    if (span.kind === "sourceOnly" && decision !== "source-extra") {
+      issues.push(`第 ${spanIndex + 1} 段尚未确认为“参考多出”。`);
+    } else if (span.kind === "targetOnly" && decision !== "target-extra") {
+      issues.push(`第 ${spanIndex + 1} 段尚未确认为“原片多出”。`);
+    } else if (span.kind === "ambiguous" && decision !== "replacement") {
+      issues.push(`第 ${spanIndex + 1} 段仍未确认为“版本替换”。`);
+    }
+  });
+
+  const retainedReasons = timeMap.quality.reasons.filter(
+    (reason) => !reason.startsWith(MANUAL_REVIEW_STATE_REASON_PREFIX)
+  );
+  const stateReason =
+    issues.length === 0
+      ? `${MANUAL_REVIEW_STATE_REASON_PREFIX}全部 ${timeMap.spans.length} 段均已完成 A/B 播放与必要分类，可进入确认；算法质量指标保持原值。`
+      : `${MANUAL_REVIEW_STATE_REASON_PREFIX}尚有 ${issues.length} 项未完成：${issues
+          .slice(0, 3)
+          .join("；")}${issues.length > 3 ? "；其余请逐段检查。" : ""}`;
   return {
-    probability: timeMap.quality.probability,
-    metricSource: timeMap.quality.metricSource,
-    coverage: timeMap.quality.coverage,
-    uniqueContentCoverage: timeMap.quality.uniqueContentCoverage,
-    p50ResidualMs: timeMap.quality.p50ResidualMs,
-    p95ResidualMs: timeMap.quality.p95ResidualMs,
-    p99ResidualMs: timeMap.quality.p99ResidualMs,
-    maxResidualMs: timeMap.quality.maxResidualMs,
-    boundaryUncertaintyMs: timeMap.quality.boundaryUncertaintyMs,
-    alternativeMargin: timeMap.quality.alternativeMargin,
-    anchorCount: timeMap.quality.anchorCount,
-    anchorRegionCount: timeMap.quality.anchorRegionCount,
-    heldOutAnchorCount: timeMap.quality.heldOutAnchorCount,
-    evidenceTypes,
-    audioAnchorCount: timeMap.evidence.audioAnchorCount,
-    visualAnchorCount: timeMap.evidence.visualAnchorCount,
-    evidenceHeldOutAnchorCount,
-    sourceStreamType: timeMap.sourceStream?.type ?? null,
-    targetStreamType: timeMap.targetStream?.type ?? null
+    ...timeMap,
+    quality: {
+      ...timeMap.quality,
+      level: issues.length === 0 ? "review" : "blocked",
+      reasons: uniqueStrings([...retainedReasons, stateReason])
+    }
   };
 }
 
-function isReviewResolvableOrDerivedReason(reason: string): boolean {
-  return (
-    /无法唯一解释的歧义区间|ambiguous steps?/iu.test(reason) ||
-    reason.includes("已人工分类为") ||
-    reason.includes("仍有尚未分类") ||
-    reason.includes("质量指标不完整") ||
-    reason.includes("映射尚未达到已验证门槛") ||
-    reason.includes("指标可用于复核") ||
-    reason.includes("只有单一主要证据") ||
-    reason.includes("金标准校准概率低于") ||
-    reason.includes("完整实测指标和独立证据") ||
-    reason.includes("保留外部的保守质量声明") ||
-    reason.includes("逐段质量为 blocked") ||
-    reason.includes("Pairwise 时间图已被质量闸门阻断，未进入全局组合")
-  );
+function readinessWithoutPlayback(
+  timeMap: MediaTimeMap
+): CandidateTimeMapManualReviewReadiness {
+  return { timeMap, playbackReviewedSpanIndexes: new Set<number>() };
 }
 
 function readReviewDecisionFromNotes(

@@ -756,9 +756,6 @@ function assertManualVerificationEligible(
         `时间图第 ${spanIndex + 1} 段仍为${span.quality.level === "blocked" ? "已阻断" : "旧版未验证"}状态，不能签发人工验证。`
       );
     }
-    if (span.kind === "ambiguous") {
-      throw new Error(`时间图第 ${spanIndex + 1} 段仍为 ambiguous，不能签发人工验证。`);
-    }
     if (span.kind === "matched") {
       if (!readTimeMapSpanPlaybackReview(map, spanIndex)) {
         throw new Error(
@@ -768,7 +765,12 @@ function assertManualVerificationEligible(
       return;
     }
     const review = readTimeMapSpanReviewDecision(map, spanIndex);
-    const expectedDecision = span.kind === "sourceOnly" ? "source-extra" : "target-extra";
+    const expectedDecision =
+      span.kind === "sourceOnly"
+        ? "source-extra"
+        : span.kind === "targetOnly"
+          ? "target-extra"
+          : "replacement";
     if (review?.decision !== expectedDecision) {
       throw new Error(
         `时间图第 ${spanIndex + 1} 段必须先人工分类为“${expectedDecision}”，不能凭自动结果签发。`
@@ -784,17 +786,13 @@ function assertManualVerificationEligible(
 }
 
 function createDeclaredVerifiedMap(map: MediaTimeMap): MediaTimeMap {
-  const central = reconcileTimeMapQualityClaim(
-    "verified",
-    canonicalSignedQualityReasons(map.quality.reasons),
-    toTimeMapQualityInput(map)
-  );
-  if (central.assessment.level !== "verified") {
-    throw new Error("时间图的实测指标与独立证据尚未达到中央 verified 门槛。");
-  }
+  const reasons = canonicalSignedQualityReasons([
+    ...map.quality.reasons,
+    "全部片段已完成与当前媒体身份和边界绑定的 A/B 播放复核，并由安装级验证机构签发人工验证。"
+  ]);
   return {
     ...map,
-    quality: { ...map.quality, level: "verified", reasons: [...central.reasons] },
+    quality: { ...map.quality, level: "verified", reasons },
     verification: null
   };
 }
@@ -897,30 +895,80 @@ function assertPositiveSafeInteger(label: string, value: number): void {
 
 /** 对持久化或外部输入的质量声明执行中央重算，且绝不自动提高声明等级。 */
 export function reconcileMediaTimeMapQuality(map: MediaTimeMap): MediaTimeMap {
-  const reconciliation = reconcileTimeMapQualityClaim(
-    map.quality.level,
-    map.quality.reasons,
-    toTimeMapQualityInput(map)
-  );
-  const missingIdentity = map.sourceIdentity === null || map.targetIdentity === null;
-  const inconsistentUniqueCoverage =
-    (map.quality.uniqueContentCoverage ?? null) !==
-    (map.evidence.uniqueContentCoverage ?? null);
-  let level =
-    reconciliation.level === "verified" && missingIdentity ? "blocked" : reconciliation.level;
-  const reasons = [...reconciliation.reasons];
   const hasIncompleteSpan = map.spans.some((span) => !isCompleteTimeMapSpanEvidence(span));
   const completeSpans = map.spans.filter(isCompleteTimeMapSpanEvidence);
   const hasBlockedSpan = completeSpans.some((span) => span.quality.level === "blocked");
   const hasLegacySpan = completeSpans.some(
     (span) => span.quality.level === "legacy-unverified"
   );
-  const hasReviewSpan = completeSpans.some((span) => span.quality.level === "review");
+  const missingIdentity = map.sourceIdentity === null || map.targetIdentity === null;
+  const inconsistentUniqueCoverage =
+    (map.quality.uniqueContentCoverage ?? null) !==
+    (map.evidence.uniqueContentCoverage ?? null);
+  const hasSignedManualVerification =
+    map.verification?.recordVersion === 2 &&
+    map.verification.method === "manual-review";
+  const manualVerificationAssessment = hasSignedManualVerification
+    ? assessMediaTimeMapVerification(map)
+    : null;
   const trustedManualVerification =
     !hasIncompleteSpan &&
-    map.verification?.recordVersion === 2 &&
-    map.verification.method === "manual-review" &&
-    assessMediaTimeMapVerification(map).trusted;
+    !hasBlockedSpan &&
+    !hasLegacySpan &&
+    !missingIdentity &&
+    !inconsistentUniqueCoverage &&
+    map.quality.level === "verified" &&
+    manualVerificationAssessment?.trusted === true;
+  if (trustedManualVerification) {
+    return {
+      ...map,
+      quality: {
+        ...map.quality,
+        level: "verified",
+        reasons: canonicalSignedQualityReasons(map.quality.reasons)
+      }
+    };
+  }
+  if (hasSignedManualVerification) {
+    const blocked =
+      hasIncompleteSpan ||
+      hasBlockedSpan ||
+      missingIdentity ||
+      inconsistentUniqueCoverage;
+    const legacy = !blocked && hasLegacySpan;
+    return {
+      ...map,
+      verification: legacy ? null : map.verification,
+      quality: {
+        ...map.quality,
+        level: blocked ? "blocked" : legacy ? "legacy-unverified" : "review",
+        reasons: uniqueReasons([
+          ...canonicalSignedQualityReasons(map.quality.reasons),
+          ...(manualVerificationAssessment?.reason
+            ? [manualVerificationAssessment.reason]
+            : []),
+          ...(hasIncompleteSpan ? ["至少一个片段缺少完整逐段证据，已阻断整张时间图。"] : []),
+          ...(hasBlockedSpan ? ["至少一个片段的逐段质量为 blocked，已阻断整张时间图。"] : []),
+          ...(missingIdentity
+            ? ["时间图缺少源文件或目标文件的内容身份快照，不能确认它仍对应当前媒体文件。"]
+            : []),
+          ...(inconsistentUniqueCoverage
+            ? ["图级质量与轨道证据的独特内容覆盖率不一致，已阻断该时间图。"]
+            : []),
+          ...(legacy ? ["至少一个片段只有旧版未验证证据，整张时间图必须重新分析或复核。"] : [])
+        ])
+      }
+    };
+  }
+  const reconciliation = reconcileTimeMapQualityClaim(
+    map.quality.level,
+    map.quality.reasons,
+    toTimeMapQualityInput(map)
+  );
+  let level =
+    reconciliation.level === "verified" && missingIdentity ? "blocked" : reconciliation.level;
+  const reasons = [...reconciliation.reasons];
+  const hasReviewSpan = completeSpans.some((span) => span.quality.level === "review");
   if (hasIncompleteSpan || hasBlockedSpan) {
     level = "blocked";
     reasons.push(

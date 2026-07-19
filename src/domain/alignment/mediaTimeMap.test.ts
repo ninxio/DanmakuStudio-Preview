@@ -280,7 +280,7 @@ describe("媒体时间图 revision", () => {
     }
   });
 
-  it("拒绝 ambiguous 与没有逐段人工分类的单侧差异，分类 note 会进入签名摘要", () => {
+  it("拒绝未分类的 ambiguous 与单侧差异，人工分类 note 会进入签名摘要", () => {
     const ambiguous = createVerificationEligibleMap();
     ambiguous.spans = [
       createTestCompleteTimeMapSpan({
@@ -293,7 +293,12 @@ describe("媒体时间图 revision", () => {
     ];
     expect(() =>
       createManualMediaTimeMapVerificationRequest(ambiguous, verificationInput())
-    ).toThrow("ambiguous");
+    ).toThrow("replacement");
+    ambiguous.evidence.notes.push(`manual-span-review:v1:0:replacement:${TIMESTAMP}`);
+    attachTestPlaybackReviews(ambiguous);
+    expect(
+      createManualMediaTimeMapVerificationRequest(ambiguous, verificationInput()).requestDigest
+    ).toMatch(/^sha256:[0-9a-f]{64}$/);
 
     const oneSided = createVerificationEligibleMap();
     oneSided.targetEndMs = 55_000;

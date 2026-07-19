@@ -62,7 +62,8 @@ describe("时间图差异人工分类", () => {
     expect(
       unresolved.evidence.notes.filter((note) => note.startsWith("manual-span-review:v1:3:"))
     ).toHaveLength(1);
-    expect(replacement.quality.level).toBe("review");
+    expect(replacement.quality.level).toBe("blocked");
+    expect(replacement.quality.reasons.join(" ")).toContain("A/B 播放");
     expect(unresolved.quality.level).toBe("blocked");
   });
 
@@ -141,8 +142,8 @@ describe("时间图差异人工分类", () => {
       "replacement",
       "2026-07-12T10:01:00.000Z"
     );
-    expect(resolved.mediaTimeMaps[0]?.quality.level).toBe("review");
-    expect(resolved.mediaMatchCandidates[0]?.state).toBe("pending");
+    expect(resolved.mediaTimeMaps[0]?.quality.level).toBe("blocked");
+    expect(resolved.mediaMatchCandidates[0]?.state).toBe("blocked");
 
     project.mediaMatchCandidates[0].state = "accepted";
     expect(() =>

@@ -1,6 +1,6 @@
 import type { EditorProject, MediaTimeMap } from "../project/types";
 import { sha256Hex } from "../shared/sha256";
-import type { TimeMapSpan } from "./timeMap";
+import { isCompleteTimeMapSpanEvidence, type TimeMapSpan } from "./timeMap";
 import {
   createTimeMapPlaybackBoundaryContext,
   createTimeMapPlaybackSpanPlan,
@@ -8,6 +8,10 @@ import {
   type TimeMapPlaybackAxis,
   type TimeMapPlaybackInterval
 } from "./timeMapPlayback";
+import {
+  readTimeMapSpanReviewDecision,
+  reconcileCandidateTimeMapManualReview
+} from "./timeMapReviewDecision";
 
 export const TIME_MAP_PLAYBACK_REVIEW_POLICY_VERSION = 2;
 export const MATCHED_MINIMUM_EFFECTIVE_MS = 2_000;
@@ -322,9 +326,34 @@ export function recordCandidateTimeMapSpanPlaybackReview(
       !note.startsWith(`${PLAYBACK_REVIEW_PREFIX}${spanIndex}:`) &&
       !note.startsWith(`${LEGACY_PLAYBACK_REVIEW_PREFIX}${spanIndex}:`)
   );
-  const reviewedMap: MediaTimeMap = {
+  const spans = timeMap.spans.map((span, index) => {
+    if (index !== spanIndex || !isCompleteTimeMapSpanEvidence(span)) {
+      return span;
+    }
+    const decision = readTimeMapSpanReviewDecision(timeMap, spanIndex)?.decision;
+    const manuallyResolved =
+      span.kind === "matched" ||
+      (span.kind === "sourceOnly" && decision === "source-extra") ||
+      (span.kind === "targetOnly" && decision === "target-extra") ||
+      (span.kind === "ambiguous" && decision === "replacement");
+    if (!manuallyResolved) {
+      return span;
+    }
+    return {
+      ...span,
+      quality: {
+        ...span.quality,
+        level: "review" as const,
+        reasons: [
+          `第 ${spanIndex + 1} 段已完成与当前边界绑定的 A/B 播放复核；人工签发前仍保留 review。`
+        ]
+      }
+    };
+  });
+  const provisionalMap: MediaTimeMap = {
     ...timeMap,
     revision: timeMap.revision + 1,
+    spans,
     evidence: {
       ...timeMap.evidence,
       types: timeMap.evidence.types.includes("manual")
@@ -335,9 +364,25 @@ export function recordCandidateTimeMapSpanPlaybackReview(
     verification: null,
     updatedAt: reviewedAt
   };
+  const playbackReviewedSpanIndexes = new Set(
+    provisionalMap.spans.flatMap((_, index) =>
+      readTimeMapSpanPlaybackReview(provisionalMap, index) ? [index] : []
+    )
+  );
+  const reviewedMap = reconcileCandidateTimeMapManualReview({
+    timeMap: provisionalMap,
+    playbackReviewedSpanIndexes
+  });
+  const hasBoundAsset = project.danmakuSourceBindings.some(
+    (binding) =>
+      binding.sourceMediaId === candidate.sourceMediaId &&
+      project.assets.some((asset) => asset.id === binding.assetId)
+  );
   const proposalTimeMap = candidate.proposal.timeMap
     ? {
         ...candidate.proposal.timeMap,
+        spans: structuredClone(reviewedMap.spans),
+        quality: structuredClone(reviewedMap.quality),
         evidence: {
           ...candidate.proposal.timeMap.evidence,
           types: [...reviewedMap.evidence.types],
@@ -354,6 +399,10 @@ export function recordCandidateTimeMapSpanPlaybackReview(
       item.id === candidate.id
         ? {
             ...item,
+            state:
+              hasBoundAsset && reviewedMap.quality.level !== "blocked"
+                ? "pending"
+                : "blocked",
             proposal: proposalTimeMap
               ? { ...item.proposal, timeMap: proposalTimeMap }
               : item.proposal,

@@ -85,6 +85,7 @@ interface CandidateAssetSelection {
 
 type NativeFineDispositionKind =
   | "confirmable"
+  | "reviewCandidate"
   | "alternative"
   | "unresolved"
   | "noEligibleCandidate"
@@ -616,6 +617,8 @@ export function MediaMatchingPanel({
       const taskMessage =
         disposition.kind === "confirmable" && matchRange
           ? `${pair.target.name} ← ${pair.source.name} ${formatTimecode(matchRange.sourceStartMs)}–${formatTimecode(matchRange.sourceEndMs)}；已唯一确定，等待逐项确认`
+          : disposition.kind === "reviewCandidate" && matchRange
+            ? `${pair.target.name} ← ${pair.source.name} ${formatTimecode(matchRange.sourceStartMs)}–${formatTimecode(matchRange.sourceEndMs)}；找到候选，但差异边界需要人工复核`
           : disposition.message;
       updateTask(pair.id, {
         state: disposition.taskState,
@@ -623,7 +626,10 @@ export function MediaMatchingPanel({
         message: taskMessage,
         jobId: snapshot.jobId
       });
-      if (disposition.kind !== "confirmable" || !pairSnapshot.proposal?.matchRange) {
+      if (
+        (disposition.kind !== "confirmable" && disposition.kind !== "reviewCandidate") ||
+        !pairSnapshot.proposal?.matchRange
+      ) {
         continue;
       }
       const currentProject = useEditorStore.getState().project;
@@ -641,7 +647,9 @@ export function MediaMatchingPanel({
       addCandidate(
         appendCandidateDiagnostic(
           candidate,
-          "原生精匹配：组件最终分配已解析，当前候选由后端选定。"
+          disposition.kind === "confirmable"
+            ? "原生精匹配：组件最终分配已解析，当前候选由后端选定。"
+            : "原生精匹配：已保留高覆盖 blocked TimeMap 供逐段人工复核；它没有通过自动确认门控，不能直接确认或导出。"
         )
       );
     }
@@ -738,16 +746,16 @@ export function MediaMatchingPanel({
         </span>
       </div>
       <p className="mt-2 leading-5 text-slate-500">
-        直接使用素材页已导入的视频批量寻找对应关系。只有原生精匹配已经唯一确定的结果才会进入候选队列，并且仍需逐项检查后手动确认。
+        直接使用素材页已导入的视频批量寻找对应关系。自动合格结果和仍有局部边界问题的受限候选会分开显示；两者都不会直接改变导出。
       </p>
       <div
         role="alert"
         data-testid="legacy-alignment-warning"
         className="mt-3 rounded border border-amber-400/40 bg-amber-400/10 p-3 leading-5 text-amber-100"
       >
-        <div className="font-medium">未决结果不会进入候选</div>
+        <div className="font-medium">未决结果不会伪装成匹配成功</div>
         <p className="mt-1">
-          无法唯一确定、可用资源不足、运行环境失败或已取消的组合，会在任务结果中说明原因且无法确认。自动结果不会直接改变导出；范围、起点和删减修正仍需逐项试听或预览复核。
+          找到整体关系但局部质量门禁未通过时，会保留一张已阻断的时间图供逐段复核；无粗关系、全局占用冲突、运行失败或已取消则只显示原因。只有完成全部 A/B 复核、必要分类和本机签发后才能导出。
         </p>
         <details className="mt-2 text-[11px] text-amber-100/80">
           <summary className="cursor-pointer">技术说明</summary>
@@ -1050,6 +1058,20 @@ function describeNativeFineDisposition(
     return { kind: "infrastructureFailed", taskState: "failed", message: reason, reason };
   }
   if (frontier.finalState === "noEligibleCandidate") {
+    const reviewTimeMap = snapshot.proposal?.timeMap ?? null;
+    if (
+      reviewTimeMap?.quality.level === "blocked" &&
+      snapshot.proposal?.matchRange &&
+      reviewTimeMap.spans.length > 0
+    ) {
+      return {
+        kind: "reviewCandidate",
+        taskState: "unresolved",
+        message:
+          "找到一张候选时间图，但检测到删减边界、证据空白或局部歧义；已加入人工复核，不能直接确认或导出。",
+        reason: "候选时间图未通过自动确认门控，必须逐段复核并修正阻断区域。"
+      };
+    }
     return {
       kind: "noEligibleCandidate",
       taskState: "notFound",

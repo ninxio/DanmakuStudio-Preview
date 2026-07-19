@@ -276,6 +276,17 @@ pub struct SpectralLandmark {
     pub strength_milli: u32,
 }
 
+pub const COARSE_SPECTRAL_FINGERPRINT_BANDS: usize = 12;
+const COARSE_SPECTRAL_FINGERPRINT_INTERVAL_MS: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoarseSpectralFingerprintFrame {
+    pub time_ms: i64,
+    pub values: [u8; COARSE_SPECTRAL_FINGERPRINT_BANDS],
+    pub active_ratio_milli: u16,
+}
+
 #[derive(Debug, Clone)]
 struct SpectralPeak {
     bin: usize,
@@ -332,6 +343,7 @@ impl std::fmt::Debug for StreamingSpectralProcessor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamingLandmarkExtraction {
     pub index: MediaCoarseIndexResult,
+    pub coarse_fingerprint: Vec<CoarseSpectralFingerprintFrame>,
     pub spectral_backend: SpectralBackendExecution,
 }
 
@@ -539,6 +551,11 @@ pub struct StreamingLandmarkExtractor {
     pending_frame: Option<StreamingSpectralFrame>,
     pending_anchors: VecDeque<StreamingAnchorFrame>,
     coarse_index: MediaCoarseIndex,
+    coarse_fingerprint: Vec<CoarseSpectralFingerprintFrame>,
+    coarse_fingerprint_band_sums: [f64; COARSE_SPECTRAL_FINGERPRINT_BANDS],
+    coarse_fingerprint_frame_count: usize,
+    coarse_fingerprint_active_count: usize,
+    coarse_fingerprint_first_time_ms: Option<i64>,
     spectral_processor: StreamingSpectralProcessor,
     spectral_backend: SpectralBackendExecution,
 }
@@ -594,6 +611,11 @@ impl StreamingLandmarkExtractor {
             pending_frame: None,
             pending_anchors: VecDeque::new(),
             coarse_index,
+            coarse_fingerprint: Vec::new(),
+            coarse_fingerprint_band_sums: [0.0; COARSE_SPECTRAL_FINGERPRINT_BANDS],
+            coarse_fingerprint_frame_count: 0,
+            coarse_fingerprint_active_count: 0,
+            coarse_fingerprint_first_time_ms: None,
             spectral_processor,
             spectral_backend,
         })
@@ -664,9 +686,11 @@ impl StreamingLandmarkExtractor {
             );
             self.consume_finalized_peaks(pending.frame_index, peaks)?;
         }
+        self.flush_coarse_fingerprint_frame()?;
         check_algorithm_cancelled(cancel_flag)?;
         Ok(StreamingLandmarkExtraction {
             index: self.coarse_index.finish()?,
+            coarse_fingerprint: self.coarse_fingerprint,
             spectral_backend: self.spectral_backend,
         })
     }
@@ -736,6 +760,7 @@ impl StreamingLandmarkExtractor {
     }
 
     fn consume_spectral_frame(&mut self, current: StreamingSpectralFrame) -> Result<(), String> {
+        self.consume_coarse_fingerprint_spectrum(&current)?;
         if let Some(pending) = self.pending_frame.take() {
             let peaks = extract_spectral_peaks(
                 &pending.spectrum,
@@ -748,6 +773,93 @@ impl StreamingLandmarkExtractor {
             self.previous_spectrum = Some(pending.spectrum);
         }
         self.pending_frame = Some(current);
+        Ok(())
+    }
+
+    fn consume_coarse_fingerprint_spectrum(
+        &mut self,
+        frame: &StreamingSpectralFrame,
+    ) -> Result<(), String> {
+        let frame_time_ms = landmark_frame_time_ms(
+            frame.frame_index,
+            self.hop_samples,
+            self.window_samples,
+            &self.config,
+        )?;
+        if self.coarse_fingerprint_first_time_ms.is_none() {
+            self.coarse_fingerprint_first_time_ms = Some(frame_time_ms);
+        }
+        self.coarse_fingerprint_frame_count = self.coarse_fingerprint_frame_count.saturating_add(1);
+        if frame.active && !frame.spectrum.is_empty() {
+            let mut band_values = [0.0_f64; COARSE_SPECTRAL_FINGERPRINT_BANDS];
+            for (index, magnitude) in frame.spectrum.iter().copied().enumerate() {
+                let band =
+                    index.saturating_mul(COARSE_SPECTRAL_FINGERPRINT_BANDS) / frame.spectrum.len();
+                let band = band.min(COARSE_SPECTRAL_FINGERPRINT_BANDS - 1);
+                band_values[band] += magnitude.max(0.0).ln_1p();
+            }
+            let total = band_values.iter().sum::<f64>();
+            if total > f64::EPSILON {
+                for (destination, value) in self
+                    .coarse_fingerprint_band_sums
+                    .iter_mut()
+                    .zip(band_values)
+                {
+                    *destination += value / total;
+                }
+                self.coarse_fingerprint_active_count =
+                    self.coarse_fingerprint_active_count.saturating_add(1);
+            }
+        }
+        let frames_per_output = COARSE_SPECTRAL_FINGERPRINT_INTERVAL_MS
+            .div_ceil(self.config.hop_ms as usize)
+            .max(1);
+        if self.coarse_fingerprint_frame_count >= frames_per_output {
+            self.flush_coarse_fingerprint_frame()?;
+        }
+        Ok(())
+    }
+
+    fn flush_coarse_fingerprint_frame(&mut self) -> Result<(), String> {
+        if self.coarse_fingerprint_frame_count == 0 {
+            return Ok(());
+        }
+        let mut values = [0_u8; COARSE_SPECTRAL_FINGERPRINT_BANDS];
+        if self.coarse_fingerprint_active_count > 0 {
+            let total = self.coarse_fingerprint_band_sums.iter().sum::<f64>();
+            if total > f64::EPSILON {
+                for (destination, value) in values.iter_mut().zip(self.coarse_fingerprint_band_sums)
+                {
+                    *destination = (value / total * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let active_ratio_milli = self
+            .coarse_fingerprint_active_count
+            .saturating_mul(1_000)
+            .checked_div(self.coarse_fingerprint_frame_count)
+            .unwrap_or(0)
+            .min(1_000) as u16;
+        let interval_ms = i64::try_from(
+            self.coarse_fingerprint_frame_count
+                .saturating_sub(1)
+                .saturating_mul(self.config.hop_ms as usize)
+                / 2,
+        )
+        .map_err(|_| "StreamingLandmarkExtractor 粗声谱指纹时间无法表示。".to_string())?;
+        self.coarse_fingerprint
+            .push(CoarseSpectralFingerprintFrame {
+                time_ms: self
+                    .coarse_fingerprint_first_time_ms
+                    .unwrap_or(self.config.presentation_offset_ms)
+                    .saturating_add(interval_ms),
+                values,
+                active_ratio_milli,
+            });
+        self.coarse_fingerprint_band_sums = [0.0; COARSE_SPECTRAL_FINGERPRINT_BANDS];
+        self.coarse_fingerprint_frame_count = 0;
+        self.coarse_fingerprint_active_count = 0;
+        self.coarse_fingerprint_first_time_ms = None;
         Ok(())
     }
 
@@ -1113,6 +1225,7 @@ fn enqueue_streaming_cuda_frame(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct LandmarkSpectralAnalysis {
     spectra: Vec<Vec<f64>>,
@@ -1164,6 +1277,7 @@ fn analyze_landmark_spectral_frames(
     .map(|(analysis, _)| analysis)
 }
 
+#[cfg(test)]
 fn analyze_landmark_spectral_frames_with_backend(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
@@ -1267,6 +1381,7 @@ fn analyze_landmark_spectral_frames_with_backend(
     ))
 }
 
+#[cfg(test)]
 fn analyze_landmark_spectral_frames_cpu(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
@@ -1461,6 +1576,7 @@ fn extract_fine_features_cuda_bounded(
     Ok(fine_features)
 }
 
+#[cfg(test)]
 fn analyze_landmark_spectral_frames_cuda(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
@@ -1603,6 +1719,7 @@ fn analyze_landmark_spectral_frames_cuda(
     })
 }
 
+#[cfg(test)]
 fn extract_landmarks_from_spectral_analysis(
     analysis: &LandmarkSpectralAnalysis,
     config: &LandmarkConfig,
@@ -2099,7 +2216,8 @@ pub struct FineFeatureFrame {
 
 /// Fine-only feature extraction together with the spectral backend that actually completed it.
 ///
-/// This is intentionally separate from [`LandmarkFineFeatureExtraction`]: bounded fine windows
+/// This is intentionally separate from the test-only shared landmark/fine extraction:
+/// bounded fine windows
 /// do not need to retain or rank landmark families, but they still share the production
 /// CPU/CUDA spectral grid and its failover identity.
 #[derive(Debug, Clone, PartialEq)]
@@ -2112,12 +2230,14 @@ pub struct FineFeatureExtraction {
 ///
 /// 调用方只有在两套配置使用相同 sample rate、window 和 hop 时才能共享遍历；两者的
 /// presentation offset 可以不同，并会分别写入各自输出的时间戳。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandmarkFineFeatureBundle {
     pub landmarks: Vec<SpectralLandmark>,
     pub fine_features: Vec<FineFeatureFrame>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandmarkFineFeatureExtraction {
     pub bundle: LandmarkFineFeatureBundle,
@@ -2153,6 +2273,7 @@ pub fn extract_landmarks_and_fine_features_with_cancel(
     .map(|extraction| extraction.bundle)
 }
 
+#[cfg(test)]
 pub fn extract_landmarks_and_fine_features_with_backend_request(
     pcm: &[i16],
     landmark_config: &LandmarkConfig,
@@ -3168,6 +3289,7 @@ fn validate_fine_feature_config(config: &FineFeatureConfig) -> Result<(), String
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_shared_spectral_grid(
     landmark_config: &LandmarkConfig,
     fine_config: &FineFeatureConfig,
@@ -3380,6 +3502,7 @@ fn peak_strength_milli(left: f64, right: f64) -> u32 {
         .clamp(0.0, u32::MAX as f64) as u32
 }
 
+#[cfg(test)]
 fn suppress_common_landmarks(landmarks: &mut Vec<SpectralLandmark>, max_occurrences: usize) {
     let mut by_family = HashMap::<u64, Vec<SpectralLandmark>>::new();
     for landmark in std::mem::take(landmarks) {

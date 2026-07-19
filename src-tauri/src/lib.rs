@@ -10,6 +10,7 @@ mod alignment_v2;
 mod app_settings;
 mod audio_alignment;
 mod c137_process_attestation;
+mod coarse_fingerprint;
 pub mod cuda_fft_backend;
 mod diagnostic_log;
 mod export_files;

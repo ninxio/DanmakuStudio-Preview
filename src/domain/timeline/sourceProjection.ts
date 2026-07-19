@@ -5,6 +5,7 @@ import {
   type CompiledTimeMap
 } from "../alignment/timeMap";
 import { reconcileMediaTimeMapQuality } from "../alignment/mediaTimeMap";
+import { readTimeMapSpanReviewDecision } from "../alignment/timeMapReviewDecision";
 import { areMediaContentIdentitiesEqual } from "../project/mediaIdentity";
 import type { DanmakuItem } from "../danmaku/types";
 import type {
@@ -229,7 +230,7 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   let projectedItemCount = 0;
   let disabledTotal = 0;
 
-  for (const { segment, compiledTimeMap } of usableSegments) {
+  for (const { segment, timeMap, compiledTimeMap } of usableSegments) {
     const asset = assetsById.get(segment.assetId as string);
     const target = mediaById.get(segment.targetMediaId as string);
     if (!asset || !target) {
@@ -256,7 +257,16 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
         continue;
       }
       if (mapping.status === "ambiguous") {
-        // 正常情况下 ambiguous 会在时间图校验阶段阻断；保留防御性检查，避免未来改动静默投影。
+        // “版本替换”表示双方都有内容，但参考侧弹幕不应投到另一版画面。
+        // 可信人工验证允许把它作为已解释的来源舍弃区间；其余 ambiguous 仍 fail-closed。
+        if (
+          readTimeMapSpanReviewDecision(timeMap, mapping.spanIndex)?.decision ===
+          "replacement"
+        ) {
+          const itemKey = createItemKey(asset.id, item.id);
+          coveredItemKeys.add(itemKey);
+          sourceOnlyItemKeys.add(itemKey);
+        }
         continue;
       }
       const mappedTimeMs = mapping.targetTimeMs;
@@ -506,7 +516,13 @@ function findTimeMapBlocker(
   ) {
     return `${segment.label} 的时间图边界与其声明范围不一致，无法导出。`;
   }
-  if (timeMap.spans.some((span) => span.kind === "ambiguous")) {
+  if (
+    timeMap.spans.some(
+      (span, spanIndex) =>
+        span.kind === "ambiguous" &&
+        readTimeMapSpanReviewDecision(timeMap, spanIndex)?.decision !== "replacement"
+    )
+  ) {
     return `${segment.label} 的时间图包含歧义（ambiguous）区间，必须先人工消除歧义才能导出。`;
   }
 

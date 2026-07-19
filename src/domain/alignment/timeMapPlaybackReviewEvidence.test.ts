@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { MediaTimeMap } from "../project/types";
+import { createEmptyProject } from "../project/factory";
+import type {
+  MediaContentIdentity,
+  MediaMatchCandidate,
+  MediaTimeMap
+} from "../project/types";
+import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
 import {
   accumulateTimeMapPlaybackObservation,
   assessTimeMapSpanPlaybackEvidence,
@@ -8,6 +14,7 @@ import {
   createTimeMapSpanPlaybackReviewToken,
   describeMissingTimeMapSpanPlaybackEvidence,
   readTimeMapSpanPlaybackReview,
+  recordCandidateTimeMapSpanPlaybackReview,
   resetTimeMapPlaybackAccumulator,
   type TimeMapPlaybackAccumulatorState,
   type TimeMapPlaybackReviewScope,
@@ -211,6 +218,80 @@ describe("TimeMap 累计有效播放复核证据", () => {
     const oversized = `manual-playback-review:v2:${"x".repeat(70_000)}`;
     expect(readTimeMapSpanPlaybackReview(withNote(map, oversized), 0)).toBeNull();
   });
+
+  it("blocked matched 候选完成真实 A/B 后降为 review，并恢复可确认状态", () => {
+    const project = createEmptyProject("manual-recovery");
+    const map = createMap("matched");
+    map.sourceIdentity = createIdentity("1");
+    map.targetIdentity = createIdentity("2");
+    map.spans = [
+      {
+        ...createTestCompleteTimeMapSpan(
+          {
+            kind: "matched",
+            sourceStartMs: 0,
+            sourceEndMs: 10_000,
+            targetStartMs: 0,
+            targetEndMs: 10_000
+          },
+          "candidate:playback-review:span:0001"
+        ),
+        quality: {
+          ...createTestCompleteTimeMapSpan(
+            {
+              kind: "matched",
+              sourceStartMs: 0,
+              sourceEndMs: 10_000,
+              targetStartMs: 0,
+              targetEndMs: 10_000
+            },
+            "candidate:playback-review:span:0001"
+          ).quality,
+          level: "blocked",
+          reasons: ["自动候选需要逐段人工复核。"]
+        }
+      }
+    ];
+    map.quality.level = "blocked";
+    project.mediaTimeMaps = [map];
+    project.mediaMatchCandidates = [createCandidate(map)];
+    project.assets = [
+      {
+        id: "asset-review",
+        name: "review.xml",
+        fileName: "review.xml",
+        color: "#ffffff",
+        items: [],
+        warnings: [],
+        importedAt: REVIEWED_AT,
+        sourceReceipt: null
+      }
+    ];
+    project.danmakuSourceBindings = [
+      {
+        id: "binding-review",
+        assetId: "asset-review",
+        sourceMediaId: map.sourceMediaId,
+        linkedAt: REVIEWED_AT,
+        updatedAt: REVIEWED_AT
+      }
+    ];
+
+    const reviewed = recordCandidateTimeMapSpanPlaybackReview(
+      project,
+      map.id,
+      0,
+      completeEvidence(map, 0),
+      REVIEWED_AT
+    );
+
+    expect(reviewed.mediaTimeMaps[0]).toMatchObject({
+      quality: { level: "review" },
+      spans: [{ quality: { level: "review" } }]
+    });
+    expect(reviewed.mediaMatchCandidates[0]?.state).toBe("pending");
+    expect(readTimeMapSpanPlaybackReview(reviewed.mediaTimeMaps[0], 0)).not.toBeNull();
+  });
 });
 
 function observe(
@@ -343,5 +424,43 @@ function createMap(
     createdAt: REVIEWED_AT,
     updatedAt: REVIEWED_AT,
     confirmedAt: null
+  };
+}
+
+function createCandidate(map: MediaTimeMap): MediaMatchCandidate {
+  return {
+    id: "candidate-playback-review",
+    batchId: "batch-playback-review",
+    sourceMediaId: map.sourceMediaId,
+    targetMediaId: map.targetMediaId,
+    sourceStartMs: map.sourceStartMs,
+    sourceEndMs: map.sourceEndMs,
+    targetStartMs: map.targetStartMs,
+    targetEndMs: map.targetEndMs,
+    confidence: 0,
+    state: "blocked",
+    proposal: {
+      anchors: [],
+      cutCandidates: [],
+      confidence: 0,
+      diagnostics: []
+    },
+    timingRules: [],
+    appliedSegmentIds: [],
+    timeMapId: map.id,
+    confirmedTimeMapId: null,
+    createdAt: REVIEWED_AT,
+    updatedAt: REVIEWED_AT
+  };
+}
+
+function createIdentity(digit: string): MediaContentIdentity {
+  return {
+    algorithm: "test-identity-v1",
+    sizeBytes: Number(digit) * 1_000,
+    modifiedUnixMs: Number(digit) * 100,
+    firstSampleDigest: digit.repeat(16),
+    middleSampleDigest: ((Number(digit) + 1) % 10).toString().repeat(16),
+    lastSampleDigest: ((Number(digit) + 2) % 10).toString().repeat(16)
   };
 }
