@@ -880,6 +880,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与人工接
 
   await page.getByTestId("workspace-nav-matching").click();
   const matchingPanel = page.getByTestId("media-matching-panel");
+  await page.getByText("开发与验收工具", { exact: true }).click();
   const benchmarkPanel = page.getByTestId("real-media-benchmark-panel");
   await benchmarkPanel
     .getByRole("button", { name: /高级：C137 精度基准（开发与验收）/ })
@@ -1130,6 +1131,7 @@ test("浏览器预览中的原生性能证据入口失败关闭", async ({ page 
   });
 
   await page.getByTestId("workspace-nav-matching").click();
+  await page.getByText("开发与验收工具", { exact: true }).click();
   const benchmarkPanel = page.getByTestId("real-media-benchmark-panel");
   await benchmarkPanel
     .getByRole("button", { name: /高级：C137 精度基准（开发与验收）/ })

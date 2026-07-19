@@ -205,6 +205,8 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
   const [targetValidationLoading, setTargetValidationLoading] = useState(false);
   const [reconnectMediaId, setReconnectMediaId] = useState<string | null>(null);
   const [xmlDropActive, setXmlDropActive] = useState(false);
+  const [matchingTechnicalToolsOpen, setMatchingTechnicalToolsOpen] =
+    useState(false);
   const targetMediaInputRef = useRef<HTMLInputElement | null>(null);
   const sourceMediaInputRef = useRef<HTMLInputElement | null>(null);
   const reconnectMediaInputRef = useRef<HTMLInputElement | null>(null);
@@ -1042,15 +1044,32 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 text="匹配需要弹幕 XML、B 站参考素材和原片素材。"
               />
             )}
-            <Suspense
-              fallback={
-                <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-500">
-                  正在载入高级精度基准工具…
-                </section>
+            <details
+              className="rounded-lg border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+              onToggle={(event) =>
+                setMatchingTechnicalToolsOpen(event.currentTarget.open)
               }
             >
-              <RealMediaBenchmarkPanel project={project} />
-            </Suspense>
+              <summary className="cursor-pointer text-sm font-medium text-slate-300">
+                开发与验收工具
+              </summary>
+              <p className="mt-2 leading-5 text-slate-500">
+                C137 精度基准、原生性能证据和诊断只面向开发验收，不是普通匹配流程的一部分。
+              </p>
+              {matchingTechnicalToolsOpen ? (
+                <div className="mt-3">
+                  <Suspense
+                    fallback={
+                      <section className="rounded border border-panel-line bg-black/10 p-3 text-xs text-slate-500">
+                        正在载入高级精度基准工具…
+                      </section>
+                    }
+                  >
+                    <RealMediaBenchmarkPanel project={project} />
+                  </Suspense>
+                </div>
+              ) : null}
+            </details>
           </div>
         ) : null}
         {section === "export" ? (
@@ -1407,6 +1426,7 @@ function MediaLibrarySection({
                 >
                   {media.fileName}
                 </span>
+                <span className="sr-only">{media.name}</span>
                 <span className="shrink-0 rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
                   {formatMediaConnectionState(media)}
                 </span>

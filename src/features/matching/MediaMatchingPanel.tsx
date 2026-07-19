@@ -1,4 +1,6 @@
 import {
+  ArrowRight,
+  CircleAlert,
   CircleCheck,
   CircleX,
   FolderOpen,
@@ -129,6 +131,9 @@ export function MediaMatchingPanel({
   const [treatSelectedTargetsAsVersions, setTreatSelectedTargetsAsVersions] = useState(false);
   const [tasks, setTasks] = useState<BatchTask[]>([]);
   const [running, setRunning] = useState(false);
+  const [configurationOpen, setConfigurationOpen] = useState(
+    project.mediaMatchCandidates.length === 0
+  );
   const [candidateAssetSelections, setCandidateAssetSelections] = useState<
     Record<string, CandidateAssetSelection>
   >({});
@@ -141,6 +146,7 @@ export function MediaMatchingPanel({
   const sourceSelectionTouchedRef = useRef(false);
   const targetSelectionTouchedRef = useRef(false);
   const addCandidate = useEditorStore((state) => state.addMediaMatchCandidate);
+  const setWorkspacePage = useEditorStore((state) => state.setWorkspacePage);
   const projectEpoch = useEditorStore((state) => state.projectEpoch);
   const projectEpochRef = useRef(projectEpoch);
   const batchTokenRef = useRef(0);
@@ -260,6 +266,17 @@ export function MediaMatchingPanel({
   const pendingCandidates = project.mediaMatchCandidates.filter(
     (candidate) => candidate.state === "pending" || candidate.state === "blocked"
   );
+  const acceptedTargetIds = new Set(
+    project.mediaMatchCandidates.flatMap((candidate) =>
+      candidate.state === "accepted" ? [candidate.targetMediaId] : []
+    )
+  );
+  const acceptedCount = project.mediaMatchCandidates.filter(
+    (candidate) => candidate.state === "accepted"
+  ).length;
+  const waitingTargetCount = Math.max(0, targetMedia.length - acceptedTargetIds.size);
+  const matchingComplete =
+    targetMedia.length > 0 && acceptedTargetIds.size === targetMedia.length;
   const hasCancelledTasks = tasks.some((task) => task.state === "cancelled");
 
   const openDiagnosticLogDirectory = async () => {
@@ -740,29 +757,95 @@ export function MediaMatchingPanel({
       className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
       data-testid="media-matching-panel"
     >
-      <div className="flex flex-wrap items-center gap-2">
-        <WandSparkles size={16} className="text-accent-cyan" />
-        <h3 className="text-sm font-medium text-slate-100">自动匹配项目素材</h3>
-        <span className="ml-auto text-[11px] text-slate-500">
-          {savedRelationTargetCount(project)} / {targetMedia.length} 个原片已有保存关系 ·{" "}
-          {pendingCandidates.length} 个候选待复核
-        </span>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <WandSparkles size={17} className="text-accent-cyan" />
+            <h3 className="text-base font-semibold text-slate-100">
+              {pendingCandidates.length > 0
+                ? `${pendingCandidates.length} 个结果需要检查`
+                : matchingComplete
+                  ? "所有原片都已保存匹配关系"
+                  : "让应用寻找对应关系"}
+            </h3>
+          </div>
+          <p className="mt-2 leading-5 text-slate-500">
+            {pendingCandidates.length > 0
+              ? "系统不会悄悄接受有疑问的结果；请只检查下面标记的项目。"
+              : matchingComplete
+                ? "可以进入校准，试听关键位置并处理仍有疑问的片段。"
+                : "默认会分析当前全部参考视频和原片，并把不确定的结果单独列出。"}
+          </p>
+        </div>
+        {pendingCandidates.length > 0 ? (
+          <TextButton
+            tone="primary"
+            onClick={() => {
+              const firstCandidate = document.getElementById(
+                `media-match-candidate-${pendingCandidates[0].id}`
+              );
+              firstCandidate?.scrollIntoView?.({ block: "center" });
+              firstCandidate?.focus();
+            }}
+          >
+            检查 {pendingCandidates.length} 个结果
+            <ArrowRight size={14} />
+          </TextButton>
+        ) : matchingComplete ? (
+          <TextButton tone="primary" onClick={() => setWorkspacePage("editing")}>
+            进入校准
+            <ArrowRight size={14} />
+          </TextButton>
+        ) : (
+          <TextButton
+            tone="primary"
+            disabled={pairCount === 0 || running}
+            onClick={() => void runBatch()}
+          >
+            <Play size={13} />
+            开始智能匹配
+          </TextButton>
+        )}
       </div>
-      <p className="mt-2 leading-5 text-slate-500">
-        直接使用素材页已导入的视频批量寻找对应关系。自动合格结果和仍有局部边界问题的受限候选会分开显示；两者都不会直接改变导出。
-      </p>
+      <div className="mt-3 grid grid-cols-3 gap-2" data-testid="matching-summary">
+        <span className="sr-only">
+          {acceptedTargetIds.size} / {targetMedia.length} 个原片已有保存关系
+        </span>
+        <MatchingMetric
+          label="已保存"
+          value={acceptedCount}
+          tone={acceptedCount > 0 ? "success" : "neutral"}
+        />
+        <MatchingMetric
+          label="需复核"
+          value={pendingCandidates.length}
+          tone={pendingCandidates.length > 0 ? "warning" : "neutral"}
+        />
+        <MatchingMetric
+          label="待匹配原片"
+          value={waitingTargetCount}
+          tone={waitingTargetCount > 0 ? "neutral" : "success"}
+        />
+      </div>
       <div
         role="alert"
         data-testid="legacy-alignment-warning"
-        className="mt-3 rounded border border-amber-400/40 bg-amber-400/10 p-3 leading-5 text-amber-100"
+        className="mt-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] p-3 leading-5 text-amber-100"
       >
-        <div className="font-medium">未决结果不会伪装成匹配成功</div>
-        <p className="mt-1">
-          找到整体关系但局部质量门禁未通过时，会保留一张已阻断的时间图供逐段复核；无粗关系、全局占用冲突、运行失败或已取消则只显示原因。只有完成全部 A/B 复核、必要分类和本机签发后才能导出。
-        </p>
+        <div className="flex items-center gap-2 font-medium">
+          <CircleAlert size={14} />
+          未决结果不会伪装成匹配成功
+        </div>
         <details className="mt-2 text-[11px] text-amber-100/80">
-          <summary className="cursor-pointer">技术说明</summary>
-          <p className="mt-1">
+          <summary className="cursor-pointer">为什么需要复核？</summary>
+          <p className="mt-2">
+            找到整体关系但局部仍有删减、空白或歧义时，应用会保留结果供你试听，不会直接用于导出。无法确认关系、运行失败或取消时只显示原因。
+          </p>
+          <p className="mt-2">
+            全局占用冲突会作为未决结果保留；完成必要的 A/B
+            复核与本机验证前，不会改变正式导出。
+          </p>
+          <p className="mt-2">
             候选发布只服从原生 Evidence v5
             的组件最终分配、显式多版本复用策略与精执行证据绑定；旧的 coarse globalSelection
             仅保留为诊断信息，前端不会再次求解。
@@ -770,6 +853,17 @@ export function MediaMatchingPanel({
         </details>
       </div>
 
+      <details
+        className="mt-3 rounded-lg border border-panel-line bg-black/10 p-3"
+        open={configurationOpen}
+        onToggle={(event) => setConfigurationOpen(event.currentTarget.open)}
+      >
+        <summary className="cursor-pointer font-medium text-slate-300">
+          匹配范围与计算设置
+          <span className="ml-2 text-[11px] font-normal text-slate-500">
+            {selectedSourceIds.length} 个参考 × {selectedTargetIds.length} 个原片
+          </span>
+        </summary>
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <MediaChoiceList
           title="B 站参考素材"
@@ -845,6 +939,7 @@ export function MediaMatchingPanel({
           </label>
         </details>
       </div>
+      </details>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 rounded border border-panel-line bg-black/15 p-2">
         <span className="mr-auto text-slate-400">
@@ -863,7 +958,7 @@ export function MediaMatchingPanel({
             取消剩余任务
           </TextButton>
         ) : (
-          <TextButton tone="primary" disabled={pairCount === 0} onClick={() => void runBatch()}>
+          <TextButton disabled={pairCount === 0} onClick={() => void runBatch()}>
             <Play size={13} />
             {hasCancelledTasks ? "继续剩余任务" : "开始批量匹配"}
           </TextButton>
@@ -910,6 +1005,33 @@ export function MediaMatchingPanel({
 
       <ConfirmedRelations project={project} />
     </section>
+  );
+}
+
+function MatchingMetric({
+  label,
+  value,
+  tone
+}: {
+  label: string;
+  value: number;
+  tone: "success" | "warning" | "neutral";
+}) {
+  return (
+    <div className="rounded-lg border border-panel-line/70 bg-black/15 px-3 py-2">
+      <div className="text-[10px] text-slate-500">{label}</div>
+      <div
+        className={`mt-1 text-base font-semibold ${
+          tone === "success"
+            ? "text-accent-green"
+            : tone === "warning"
+              ? "text-accent-yellow"
+              : "text-slate-300"
+        }`}
+      >
+        {value}
+      </div>
+    </div>
   );
 }
 
@@ -1478,6 +1600,8 @@ function MediaMatchCandidateCard({
     <article
       className="rounded border border-panel-line bg-[#111318] p-3"
       data-testid="media-match-candidate"
+      id={`media-match-candidate-${candidate.id}`}
+      tabIndex={-1}
     >
       <div className="flex flex-wrap items-start gap-2">
         <div className="min-w-0 flex-1">
@@ -3061,14 +3185,6 @@ function areCandidateAssetSelectionsEqual(
       );
     })
   );
-}
-
-function savedRelationTargetCount(project: EditorProject): number {
-  return new Set(
-    project.danmakuSourceSegments
-      .filter((segment) => segment.kind === "content" && segment.targetMediaId)
-      .map((segment) => segment.targetMediaId)
-  ).size;
 }
 
 function canAnalyzeMedia(media: ProjectMediaReference): boolean {

@@ -170,6 +170,9 @@ test("易用化阶段 2 可从空项目准备三类素材并进入智能匹配",
 
   await page.getByRole("button", { name: "进入智能匹配" }).click();
   await expect(page.getByTestId("workspace-matching")).toBeVisible();
+  await expect(page.getByTestId("matching-summary")).toBeVisible();
+  await expect(page.getByTestId("real-media-benchmark-panel")).toHaveCount(0);
+  await expect(page.getByText("开发与验收工具", { exact: true })).toBeVisible();
 });
 
 function roundMilliseconds(value: number): number {
