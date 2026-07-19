@@ -1,3 +1,14 @@
+- 2026-07-19：C137 完成“留出碰撞去伪、相邻分集候选恢复与用户可控人工接管”开发切片；自动门控不再等同于剥夺用户导出权，M2/M3 与 C137 总 Goal 继续 active。
+  - feature v22 把 held-out 证据拆成“可信留出 anchor”和“歧义留出候选”：全局仿射一致的锚点仍可信；局部编辑偏移必须由至少 3 个不同来源秒和 3 个不同目标秒形成同一或相邻 500ms 模式才可进入误差统计。同一瞬间多频率投票和孤立重复内容碰撞只能作为歧义诊断，不能再污染 P95/P99。
+  - 真实 E03 强制 RTX 4090/CUDA 回归耗时 **505,063ms（8.42 分钟）**：27 个候选留出锚点被区分为 **23 个可信 + 4 个歧义**，P50/P95/P99/max 从 v20 的 **58/44,950/65,851/65,851ms** 收敛为 **57/149/150/150ms**；四个 `+45s/-33.5s/+88s/+27.5s` 重复内容碰撞被明确列出而非伪装成测量。证据为 `artifacts/c137-real-media-smoke-e03-anchor-uniqueness-v22.json`。
+  - feature v23 只在项目级 coarse 关系搜索中加入按较短候选区间 **1%** 计算、上限 **30 秒** 的相邻分集边界容差；最终 fine TimeMap 的真实物理占用仍使用原 **250ms** 严格冲突规则。因此约 45 分钟相邻分集可容忍 20.5 秒粗窗口重叠，31 秒重叠仍失败关闭。
+  - 真实 E03+E04 回归耗时 **680,086ms（11.33 分钟）**，2/2 pair 均完成且无运行失败；E04 不再在 coarse 阶段消失，而是保留 coverage **0.899**、P95/P99/max **200/200/200ms**、10 spans 的 blocked TimeMap 供复核。E03 同批保持 coverage **0.965**、P95 **149ms**。证据为 `artifacts/c137-real-media-smoke-dark-e03-e04-coarse-boundary-v23.json`。
+  - 产品门控分层：灾难性/质量门控现在只决定“能否自动确认”。只要 TimeMap 结构、单调性、范围、媒体身份和 XML 绑定有效，用户可勾选明确错位风险后选择“采用系统建议并建立人工方案”；系统按双轴区间形状自动采用每段最高可能性分类，保留全部算法失败原因，并复用原有安装级签名与撤销链签发后允许导出。真正缺图、结构越界、身份缺失或 XML 未绑定仍阻断。
+  - 人工判定不再展示一排不可用灰按钮：每段只显示与当前双轴边界形状兼容的分类、`无法判断` 和系统建议；其他分类明确说明需先编辑边界。用户可改写系统建议，但不再被迫逐段点击唯一可能选项。
+  - 自动验收：源码审计和 ESLint 通过；Vitest 全量 **93 files / 971 tests** 全绿，新增领域、store/UI 与签发预检覆盖；Rust 全量 **442 passed / 24 ignored / 0 failed**，strict Clippy `-D warnings` 通过；TypeScript/Vite production build 通过。Chromium 四页北极星 E2E **6/6**，明确覆盖“自动门控失败 → 风险确认 → 人工方案 → 签发入口”。
+  - release 安装包：`src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`，**4,331,779 bytes**，SHA-256 `F9C2B4E6AA71F30FBA593D6A43B681D5AEBC00336198C50A2523EE4CB98353EC`；便携版：`src-tauri/target/release/danmaku_timeline_studio.exe`，**16,899,072 bytes**，SHA-256 `54DAE9F0B54EA33BADD9B41997C4E6DDC71096C1B34CB8D52FF42634B61E9F5C`。
+  - 诚实边界：人工接管代表“用户接受自动证据未覆盖的错位风险”，不是把算法失败重新命名为准确。C137 仍需完成 Dark 1×5 的最终 XML 抽样同步、扩大到 5 套 Beta/负关系/真实编辑事件并重复性能验收，当前不标记完成。
+
 - 2026-07-19：C137 完成“1×5 强制逐 pair fine、失败候选保留与人工恢复闭环”开发切片；M1 达成，M2/M3 与 C137 总 Goal 继续 active。
   - 稳健分段锚点模型已接入 feature v20：每个 45 秒 chunk 及批次全局只使用 `localCost <= 120` 的连续 fine-DP matched 证据；在两侧各有至少 5 秒支持、完整区间证据密度至少 90%、净仿射时长残差不超过 100ms 且不含 ambiguous 时，才把成对 SourceOnly/TargetOnly lattice noise 合并为 matched。单侧编辑、低密度 replacement 和 ambiguous 均保持不变。
   - 真实 E02 v18→v20：span **41→12**、≤5 秒短编辑 **21→5**、coverage **0.977907→0.982116**，P95/P99/max 保持 **11/11/11ms**；46.4 秒低密度 ambiguous 和 15.613 秒片尾 target-only 没有被吞并。v19 的逐 chunk 中间证据为 `artifacts/c137-real-media-smoke-e02-piecewise-anchor-v19.json`，最终 v20 证据为 `artifacts/c137-real-media-smoke-e02-piecewise-anchor-v20.json`。

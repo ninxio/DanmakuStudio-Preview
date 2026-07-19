@@ -33,7 +33,10 @@ import {
   reconcileAlignmentTimeMapProposalQuality
 } from "../../domain/alignment/timeMapProposal";
 import { createTestCompleteTimeMapSpan } from "../../test/timeMapEvidence";
-import { readTimeMapSpanReviewDecision } from "../../domain/alignment/timeMapReviewDecision";
+import {
+  readTimeMapManualTakeover,
+  readTimeMapSpanReviewDecision
+} from "../../domain/alignment/timeMapReviewDecision";
 import {
   applyAuthorityIssuedManualMediaTimeMapVerification,
   createManualMediaTimeMapVerificationRequest
@@ -1474,7 +1477,14 @@ describe("多媒体自动匹配工作台", () => {
   it.each([
     ["verified", "需复核", "保存关系供试听复核", false, "仍不能导出", true],
     ["review", "需复核", "保存关系供试听复核", false, "仍不能导出", false],
-    ["blocked", "已阻断", "此候选不能确认", true, "不能确认，也不能导出", false],
+    [
+      "blocked",
+      "已阻断",
+      "采用系统建议并建立人工方案",
+      true,
+      "自动确认未通过",
+      false
+    ],
     ["legacy-unverified", "旧版未验证", "保存关系供试听复核", false, "仍不能导出", false]
   ] as const)(
     "V2 自报质量等级 %s 经过 provenance 重算后显示对应导出闸门",
@@ -1504,6 +1514,48 @@ describe("多媒体自动匹配工作台", () => {
       }
     }
   );
+
+  it("灾难性门控只阻止自动确认，用户接受风险后可采用系统建议建立待签发人工方案", async () => {
+    const user = userEvent.setup();
+    configureSingleTargetV2Project("blocked");
+    vi.mocked(isManualVerificationAuthorityAvailable).mockReturnValue(true);
+    const issue = vi.fn<typeof defaultIssueManualVerification>(() => Promise.resolve());
+    useEditorStore.setState({ issueManualMediaTimeMapVerification: issue });
+    render(<MatchingHarness />);
+
+    await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    const card = await screen.findByTestId("media-match-candidate");
+    const takeoverButton = within(card).getByRole("button", {
+      name: "采用系统建议并建立人工方案"
+    });
+    expect(takeoverButton).toBeDisabled();
+
+    await user.click(
+      within(card).getByRole("checkbox", {
+        name: /我接受未验证区间可能造成弹幕前后错位/
+      })
+    );
+    expect(takeoverButton).toBeEnabled();
+    await user.click(takeoverButton);
+
+    await waitFor(() =>
+      expect(useEditorStore.getState().project.mediaMatchCandidates[0]?.state).toBe("accepted")
+    );
+    const confirmedMap = useEditorStore
+      .getState()
+      .project.mediaTimeMaps.find((map) => map.state === "confirmed");
+    expect(confirmedMap?.quality.level).toBe("review");
+    expect(readTimeMapManualTakeover(confirmedMap!)).not.toBeNull();
+    expect(within(card).getByText("人工方案签发")).toBeInTheDocument();
+    const signButton = within(card).getByRole("button", {
+      name: "签发人工方案并允许导出"
+    });
+    expect(signButton).toBeEnabled();
+    expect(card).toHaveTextContent("诊断中的未验证区间和潜在错位不会被删除");
+    await user.click(signButton);
+    await waitFor(() => expect(issue).toHaveBeenCalledTimes(1));
+    expect(issue.mock.calls[0]?.[0]).toBe(confirmedMap?.id);
+  });
 
   it("在折叠详情展示 V2 指标、分段、音轨和主要原因", async () => {
     configureSingleTargetV2Project("verified");
@@ -1769,10 +1821,11 @@ describe("多媒体自动匹配工作台", () => {
     if (!sourceOnlyItem) throw new Error("未找到参考独有分段容器");
     const controls = within(sourceOnlyItem);
     expect(controls.getByRole("button", { name: "参考多出" })).toBeEnabled();
-    expect(controls.getByRole("button", { name: "原片多出" })).toBeDisabled();
-    expect(controls.getByRole("button", { name: "版本替换" })).toBeDisabled();
+    expect(controls.queryByRole("button", { name: "原片多出" })).not.toBeInTheDocument();
+    expect(controls.queryByRole("button", { name: "版本替换" })).not.toBeInTheDocument();
     expect(controls.getByRole("button", { name: "无法判断" })).toBeEnabled();
-    expect(sourceOnlyItem).toHaveTextContent("灰色选项不会改写边界");
+    expect(sourceOnlyItem).toHaveTextContent("系统建议：参考多出");
+    expect(sourceOnlyItem).toHaveTextContent("未显示的分类与当前两侧长度不兼容");
 
     await user.click(controls.getByRole("button", { name: "参考多出" }));
     const reviewedMap = useEditorStore.getState().project.mediaTimeMaps[0];
@@ -1804,7 +1857,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(useEditorStore.getState().project.mediaTimeMaps[0]?.quality.level).toBe("blocked");
     expect(
       within(await screen.findByTestId("media-match-candidate")).getByRole("button", {
-        name: "此候选不能确认"
+        name: "采用系统建议并建立人工方案"
       })
     ).toBeDisabled();
   });

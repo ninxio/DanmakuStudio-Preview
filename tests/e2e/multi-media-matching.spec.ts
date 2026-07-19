@@ -950,20 +950,23 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   const sourceOnlyButton = firstReview.getByRole("button", { name: /第 2 段 参考独有/ });
   const sourceOnlyItem = sourceOnlyButton.locator("..");
   await expect(sourceOnlyItem.getByRole("button", { name: "参考多出" })).toBeEnabled();
-  await expect(sourceOnlyItem.getByRole("button", { name: "原片多出" })).toBeDisabled();
-  await expect(sourceOnlyItem.getByRole("button", { name: "版本替换" })).toBeDisabled();
+  await expect(sourceOnlyItem.getByRole("button", { name: "原片多出" })).toHaveCount(0);
+  await expect(sourceOnlyItem.getByRole("button", { name: "版本替换" })).toHaveCount(0);
   await expect(sourceOnlyItem.getByRole("button", { name: "无法判断" })).toBeEnabled();
-  await expect(sourceOnlyItem).toContainText("灰色选项不会改写边界");
+  await expect(sourceOnlyItem).toContainText("系统建议：参考多出");
+  await expect(sourceOnlyItem).toContainText("未显示的分类与当前两侧长度不兼容");
 
   const targetOnlyButton = firstReview.getByRole("button", { name: /第 3 段 原片独有/ });
   const targetOnlyItem = targetOnlyButton.locator("..");
-  await expect(targetOnlyItem.getByRole("button", { name: "参考多出" })).toBeDisabled();
+  await expect(targetOnlyItem.getByRole("button", { name: "参考多出" })).toHaveCount(0);
   await expect(targetOnlyItem.getByRole("button", { name: "原片多出" })).toBeEnabled();
-  await expect(targetOnlyItem.getByRole("button", { name: "版本替换" })).toBeDisabled();
+  await expect(targetOnlyItem.getByRole("button", { name: "版本替换" })).toHaveCount(0);
+  await expect(targetOnlyItem).toContainText("系统建议：原片多出");
 
   const ambiguousButton = firstReview.getByRole("button", { name: /第 4 段 无法判断/ });
   const ambiguousItem = ambiguousButton.locator("..");
   await expect(ambiguousItem.getByRole("button", { name: "版本替换" })).toBeEnabled();
+  await expect(ambiguousItem).toContainText("系统建议：版本替换");
   await sourceOnlyItem.scrollIntoViewIfNeeded();
   await page.screenshot({
     path: resolve(screenshotDir, "c137-four-kind-review.png"),
@@ -974,9 +977,10 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await targetOnlyItem.getByRole("button", { name: "原片多出" }).click();
   await ambiguousItem.getByRole("button", { name: "版本替换" }).click();
   await expect(ambiguousItem).toContainText("已保存：版本替换");
-  await expect(
-    firstCandidate.getByRole("button", { name: "此候选不能确认" })
-  ).toBeDisabled();
+  const takeoverButton = firstCandidate.getByRole("button", {
+    name: "采用系统建议并建立人工方案"
+  });
+  await expect(takeoverButton).toBeDisabled();
 
   await firstReview.getByRole("button", { name: /第 1 段 共同内容/ }).click();
   const playbackReview = firstReview.getByTestId("time-map-playback-review");
@@ -993,11 +997,19 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
     fullPage: true
   });
 
+  await firstCandidate
+    .getByRole("checkbox", { name: /我接受未验证区间可能造成弹幕前后错位/ })
+    .check();
+  await expect(takeoverButton).toBeEnabled();
+  await takeoverButton.click();
+  await expect(firstCandidate).toContainText("人工方案签发");
+  await expect(firstCandidate).toContainText("签发后允许导出");
+
   const candidateCards = page.getByTestId("media-match-candidate");
   for (let index = 1; index < 5; index += 1) {
     await candidateCards.nth(index).getByRole("button", { name: "保存关系供试听复核" }).click();
   }
-  await expect(matchingPanel).toContainText("4 / 5 个原片已有保存关系");
+  await expect(matchingPanel).toContainText("5 / 5 个原片已有保存关系");
   const confirmedRelations = page.getByTestId("confirmed-media-relations");
   await expect(confirmedRelations).toContainText("C136-E02");
   await expect(confirmedRelations).toContainText("C136-E05");

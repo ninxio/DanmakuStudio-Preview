@@ -25,7 +25,9 @@ import {
 } from "../../domain/alignment/timeMap";
 import {
   describeTimeMapSpanReviewAvailability,
+  readTimeMapManualTakeover,
   readTimeMapSpanReviewDecision,
+  suggestTimeMapSpanReviewDecision,
   TIME_MAP_SPAN_REVIEW_LABELS,
   type TimeMapSpanReviewDecision
 } from "../../domain/alignment/timeMapReviewDecision";
@@ -1380,14 +1382,22 @@ function MediaMatchCandidateCard({
   );
   const updateRange = useEditorStore((state) => state.updateMediaMatchCandidateRange);
   const acceptCandidate = useEditorStore((state) => state.acceptMediaMatchCandidate);
+  const acceptCandidateWithManualTakeover = useEditorStore(
+    (state) => state.acceptMediaMatchCandidateWithManualTakeover
+  );
   const revokeAcceptance = useEditorStore((state) => state.revokeMediaMatchCandidateAcceptance);
   const rejectCandidate = useEditorStore((state) => state.rejectMediaMatchCandidate);
+  const [manualRiskAccepted, setManualRiskAccepted] = useState(false);
 
   useEffect(() => {
     setSourceStartText(formatTimecode(candidate.sourceStartMs));
     setSourceEndText(formatTimecode(candidate.sourceEndMs));
     setTargetStartText(formatTimecode(candidate.targetStartMs));
   }, [candidate.sourceEndMs, candidate.sourceStartMs, candidate.targetStartMs]);
+
+  useEffect(() => {
+    setManualRiskAccepted(false);
+  }, [candidate.id, candidate.state]);
 
   const createRangePatch = () => {
     const sourceStartMs = parseSourceTimecode(sourceStartText);
@@ -1450,6 +1460,17 @@ function MediaMatchCandidateCard({
       return;
     }
     acceptCandidate(candidate.id, selectedAssetIds);
+  };
+
+  const acceptWithManualTakeover = () => {
+    if (!manualRiskAccepted) {
+      setEditorStatus("请先确认你接受未验证区间可能造成弹幕错位。", "warning");
+      return;
+    }
+    if (!saveRange()) {
+      return;
+    }
+    acceptCandidateWithManualTakeover(candidate.id, selectedAssetIds);
   };
 
   return (
@@ -1534,18 +1555,38 @@ function MediaMatchCandidateCard({
               <CircleX size={13} />
               忽略候选
             </TextButton>
-            <TextButton
-              tone="primary"
-              disabled={
-                selectedAssetIds.length === 0 ||
-                candidate.state === "blocked" ||
-                !timeMapGate.canSaveRelationship
-              }
-              onClick={accept}
-            >
-              <CircleCheck size={13} />
-              {acceptLabel}
-            </TextButton>
+            {candidate.state === "blocked" &&
+            candidateTimeMap?.quality.level === "blocked" ? (
+              <div className="flex w-full flex-col items-end gap-2">
+                <label className="inline-flex max-w-2xl items-start gap-2 rounded border border-amber-400/25 bg-amber-400/5 px-2.5 py-2 text-left text-[11px] leading-5 text-amber-100">
+                  <input
+                    className="mt-1"
+                    type="checkbox"
+                    checked={manualRiskAccepted}
+                    onChange={(event) => setManualRiskAccepted(event.target.checked)}
+                  />
+                  我接受未验证区间可能造成弹幕前后错位；应用将采用每段最高可能性建议，
+                  但保留原始诊断并要求再次签发后才允许导出。
+                </label>
+                <TextButton
+                  tone="primary"
+                  disabled={selectedAssetIds.length === 0 || !manualRiskAccepted}
+                  onClick={acceptWithManualTakeover}
+                >
+                  <WandSparkles size={13} />
+                  采用系统建议并建立人工方案
+                </TextButton>
+              </div>
+            ) : (
+              <TextButton
+                tone="primary"
+                disabled={selectedAssetIds.length === 0 || !timeMapGate.canSaveRelationship}
+                onClick={accept}
+              >
+                <CircleCheck size={13} />
+                {acceptLabel}
+              </TextButton>
+            )}
           </div>
         </>
       ) : null}
@@ -1603,6 +1644,7 @@ function ManualTimeMapVerificationControls({ timeMap }: { timeMap: MediaTimeMap 
       ? timeMap.verification
       : null;
   const verificationAssessment = assessMediaTimeMapVerification(timeMap);
+  const manualTakeoverAt = readTimeMapManualTakeover(timeMap);
   const trustedRecord =
     persistedRecord && verificationAssessment.trusted ? persistedRecord : null;
   const desktopAvailable = isManualVerificationAuthorityAvailable();
@@ -1654,7 +1696,9 @@ function ManualTimeMapVerificationControls({ timeMap }: { timeMap: MediaTimeMap 
       data-testid="manual-time-map-verification"
     >
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-slate-200">整图人工验证</span>
+        <span className="font-medium text-slate-200">
+          {manualTakeoverAt ? "人工方案签发" : "整图人工验证"}
+        </span>
         {trustedRecord ? (
           <span className="rounded border border-emerald-400/40 bg-emerald-400/10 px-2 py-0.5 text-emerald-100">
             本机签名已验证
@@ -1680,13 +1724,14 @@ function ManualTimeMapVerificationControls({ timeMap }: { timeMap: MediaTimeMap 
             disabled={!desktopAvailable || !eligibility.eligible || busy}
             onClick={() => void issue()}
           >
-            完成复核并签发
+            {manualTakeoverAt ? "签发人工方案并允许导出" : "完成复核并签发"}
           </TextButton>
         )}
       </div>
       <p className="mt-1.5 leading-5 text-slate-400">
-        只有明确点击后，应用才会把分段人工分类、当前 revision
-        与媒体身份交给本机安装级验证机构签名；自动匹配和保存关系都不会触发签发。
+        {manualTakeoverAt
+          ? `你已于 ${new Date(manualTakeoverAt).toLocaleString("zh-CN")} 接管该候选。签发后允许导出，但诊断中的未验证区间和潜在错位不会被删除。`
+          : "只有明确点击后，应用才会把分段人工分类、当前 revision 与媒体身份交给本机安装级验证机构签名；自动匹配和保存关系都不会触发签发。"}
       </p>
       {trustedRecord ? (
         <p className="mt-1 leading-5 text-slate-500">
@@ -2188,24 +2233,26 @@ function TimeMapSpanReviewControls({
   onReview: (decision: TimeMapSpanReviewDecision) => void;
 }) {
   const recorded = readTimeMapSpanReviewDecision(timeMap, spanIndex);
-  const unavailableReasons = new Set<string>();
-  const options = TIME_MAP_REVIEW_DECISIONS.map((decision) => {
-    const availability = describeTimeMapSpanReviewAvailability(span, decision);
-    if (!availability.allowed) {
-      unavailableReasons.add(availability.reason);
-    }
-    return { decision, availability };
-  });
+  const suggestion = suggestTimeMapSpanReviewDecision(span);
+  const options = TIME_MAP_REVIEW_DECISIONS.map((decision) => ({
+    decision,
+    availability: describeTimeMapSpanReviewAvailability(span, decision)
+  })).filter(({ availability }) => availability.allowed);
   return (
     <fieldset className="mt-1 rounded border border-panel-line/60 bg-black/20 p-2">
       <legend className="px-1 font-medium text-slate-400">人工判定这一段</legend>
+      {suggestion && suggestion !== "unresolved" ? (
+        <p className="mb-1.5 text-[11px] leading-5 text-cyan-100">
+          系统建议：{TIME_MAP_SPAN_REVIEW_LABELS[suggestion]}。建立人工方案时会自动采用；
+          你只需在判断不同意时改选。
+        </p>
+      ) : null}
       <div className="flex flex-wrap gap-1.5">
         {options.map(({ decision, availability }) => (
           <TextButton
             key={decision}
             className="h-7 px-2 text-[11px]"
             tone={recorded?.decision === decision ? "primary" : "neutral"}
-            disabled={!availability.allowed}
             aria-pressed={recorded?.decision === decision}
             title={availability.reason}
             onClick={() => onReview(decision)}
@@ -2219,11 +2266,9 @@ function TimeMapSpanReviewControls({
           ? `已保存：${TIME_MAP_SPAN_REVIEW_LABELS[recorded.decision]} · ${new Date(recorded.reviewedAt).toLocaleString("zh-CN")}`
           : "尚未人工分类；当前颜色只是算法候选结果。"}
       </p>
-      {unavailableReasons.size > 0 ? (
-        <p className="mt-1 leading-5 text-amber-200">
-          灰色选项不会改写边界：{[...unavailableReasons].join("；")}
-        </p>
-      ) : null}
+      <p className="mt-1 leading-5 text-slate-500">
+        未显示的分类与当前两侧长度不兼容；如需改成其他类型，请先在编辑页调整该段边界。
+      </p>
     </fieldset>
   );
 }
@@ -2465,8 +2510,8 @@ function describeTimeMapGate(
     kind: "blocked",
     label: "已阻断",
     message: isConfirmedRelation
-      ? "已保存时间图不满足质量门槛，仍不能导出；请先处理歧义或证据不足问题。"
-      : "证据不足或存在歧义，不能确认，也不能导出；请查看原因并重新分析。",
+      ? "自动质量门槛未通过；如已检查风险，可签发人工方案后导出。"
+      : "自动确认未通过；可重新分析，也可接受潜在错位并采用系统建议建立人工方案。",
     canSaveRelationship: false,
     exportReady: false
   };

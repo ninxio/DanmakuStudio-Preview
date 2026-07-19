@@ -27,6 +27,10 @@ import {
   normalizeLegacyUnverifiedTimeMapSpanEvidence,
   type TimeMapBoundaryEvidence
 } from "./timeMap";
+import {
+  applyCandidateTimeMapManualTakeover,
+  applySystemSuggestedTimeMapReviews
+} from "./timeMapReviewDecision";
 
 export interface CreateMediaMatchCandidateInput {
   id: string;
@@ -549,6 +553,55 @@ export function acceptMediaMatchCandidate(
     danmakuSourceSegments: segments,
     mediaTimeMaps
   };
+}
+
+export function acceptMediaMatchCandidateWithManualTakeover(
+  project: EditorProject,
+  candidateId: string,
+  assetIds: readonly string[],
+  timestamp = new Date().toISOString()
+): EditorProject {
+  const candidate = requireCandidate(project, candidateId);
+  if (candidate.state !== "blocked" && candidate.state !== "pending") {
+    throw new Error("只有待复核或已阻断的候选可以建立人工接管方案。");
+  }
+  const candidateMap = requireOrCreateCandidateTimeMap(project, candidate, timestamp);
+  const suggestedMap = applySystemSuggestedTimeMapReviews(candidateMap, timestamp);
+  const takeoverMap = applyCandidateTimeMapManualTakeover(suggestedMap, timestamp);
+  const proposalTimeMap = candidate.proposal.timeMap
+    ? {
+        ...candidate.proposal.timeMap,
+        spans: structuredClone(takeoverMap.spans),
+        quality: structuredClone(takeoverMap.quality),
+        evidence: {
+          ...candidate.proposal.timeMap.evidence,
+          types: [...takeoverMap.evidence.types],
+          audioAnchorCount: takeoverMap.evidence.audioAnchorCount,
+          visualAnchorCount: takeoverMap.evidence.visualAnchorCount,
+          heldOutAnchorCount: takeoverMap.evidence.heldOutAnchorCount,
+          notes: [...takeoverMap.evidence.notes]
+        }
+      }
+    : undefined;
+  const preparedProject: EditorProject = {
+    ...project,
+    mediaTimeMaps: project.mediaTimeMaps.map((map) =>
+      map.id === takeoverMap.id ? takeoverMap : map
+    ),
+    mediaMatchCandidates: project.mediaMatchCandidates.map((item) =>
+      item.id === candidate.id
+        ? {
+            ...item,
+            state: "pending",
+            proposal: proposalTimeMap
+              ? { ...item.proposal, timeMap: proposalTimeMap }
+              : item.proposal,
+            updatedAt: timestamp
+          }
+        : item
+    )
+  };
+  return acceptMediaMatchCandidate(preparedProject, candidateId, assetIds, timestamp);
 }
 
 export function createAppliedSegmentId(candidateId: string, assetId: string): string {

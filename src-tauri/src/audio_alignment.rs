@@ -124,7 +124,7 @@ const TIME_MAPPING_MIN_STABLE_SPAN_MS: u64 = 10_000;
 const SPECTRAL_FREQUENCIES_HZ: [f64; 6] = [120.0, 240.0, 480.0, 960.0, 1_600.0, 2_800.0];
 const ALIGNMENT_V2_ENGINE_VERSION: &str = "alignment-v2.3-rust";
 const ALIGNMENT_V2_FEATURE_VERSION: &str =
-    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v21";
+    "pcm-s16le-16k-pts-streaming-cuda-affine-window-version-reuse-frontier-v23";
 const ALIGNMENT_V2_SAMPLE_RATE: u32 = 16_000;
 const ALIGNMENT_V2_LANDMARK_HOP_MS: u32 = 50;
 const ALIGNMENT_V2_FINE_HOP_MS: u32 = 50;
@@ -219,6 +219,9 @@ const ALIGNMENT_V2_LOCAL_HELD_OUT_P95_MAX_MS: u64 = 200;
 // hundreds-of-seconds collision as exact target-time gold. Short fixtures need three distributed
 // anchors; long-form media requires at least five.
 const ALIGNMENT_V2_HELD_OUT_CREDIBILITY_RADIUS_MS: u64 = ALIGNMENT_V2_RECURSIVE_LOOKAHEAD_MS as u64;
+const ALIGNMENT_V2_HELD_OUT_OFFSET_MODE_QUANTUM_MS: i64 = 500;
+const ALIGNMENT_V2_HELD_OUT_EVIDENCE_TIME_QUANTUM_MS: i64 = 1_000;
+const ALIGNMENT_V2_HELD_OUT_MIN_UNIQUE_MODE_SUPPORT: usize = 3;
 const ALIGNMENT_V2_MAX_HELD_OUT_TRACE_ITEMS: usize = 32;
 const ALIGNMENT_V2_MIN_SHORT_CREDIBLE_HELD_OUT_ANCHORS: usize = 3;
 const ALIGNMENT_V2_MIN_LONG_CREDIBLE_HELD_OUT_ANCHORS: usize = 5;
@@ -279,6 +282,8 @@ const ALIGNMENT_V2_AFFINE_MATCH_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
 const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_STATES: usize = 500_000;
 const ALIGNMENT_V2_GLOBAL_SHORTLIST_MAX_EXPANSIONS: usize = 2_000_000;
 const ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS: i64 = 250;
+const ALIGNMENT_V2_COARSE_BOUNDARY_OVERLAP_RATIO_DENOMINATOR: i64 = 100;
+const ALIGNMENT_V2_COARSE_BOUNDARY_OVERLAP_MAX_MS: i64 = 30_000;
 const ALIGNMENT_V2_GLOBAL_REPEATED_CONTENT_PENALTY: f64 = 0.30;
 const ALIGNMENT_V2_GLOBAL_AMBIGUITY_MARGIN: f64 = 0.08;
 // Short-media V2 cache entries own decoded mono PCM plus landmarks/fine features; long-media
@@ -7957,6 +7962,20 @@ fn v2_interval_overlap_ms(left: (i64, i64), right: (i64, i64)) -> i64 {
         .max(0)
 }
 
+fn v2_coarse_intervals_conflict(left: (i64, i64), right: (i64, i64)) -> bool {
+    let shorter_duration_ms = left
+        .1
+        .saturating_sub(left.0)
+        .min(right.1.saturating_sub(right.0))
+        .max(0);
+    let proportional_tolerance_ms = shorter_duration_ms
+        .div_euclid(ALIGNMENT_V2_COARSE_BOUNDARY_OVERLAP_RATIO_DENOMINATOR)
+        .min(ALIGNMENT_V2_COARSE_BOUNDARY_OVERLAP_MAX_MS);
+    let effective_tolerance_ms =
+        proportional_tolerance_ms.max(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS);
+    v2_interval_overlap_ms(left, right) > effective_tolerance_ms
+}
+
 #[derive(Debug, Clone)]
 struct V2GlobalAssignmentState {
     choices: Vec<Option<usize>>,
@@ -9741,7 +9760,7 @@ fn v2_global_candidates_conflict(
             left_pair.target_physical_media_index,
             right_pair.target_physical_media_index,
         )
-        && v2_interval_overlap_ms(
+        && v2_coarse_intervals_conflict(
             (
                 left.global_source_interval.start_ms,
                 left.global_source_interval.end_ms,
@@ -9750,7 +9769,7 @@ fn v2_global_candidates_conflict(
                 right.global_source_interval.start_ms,
                 right.global_source_interval.end_ms,
             ),
-        ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+        ))
         || (left_pair.target_physical_media_index == right_pair.target_physical_media_index
             && !v2_version_reuse_allows_shared_axis(
                 left_pair.target_axis_reuse_group_ordinal,
@@ -9758,7 +9777,7 @@ fn v2_global_candidates_conflict(
                 left_pair.source_physical_media_index,
                 right_pair.source_physical_media_index,
             )
-            && v2_interval_overlap_ms(
+            && v2_coarse_intervals_conflict(
                 (
                     left.global_target_interval.start_ms,
                     left.global_target_interval.end_ms,
@@ -9767,7 +9786,7 @@ fn v2_global_candidates_conflict(
                     right.global_target_interval.start_ms,
                     right.global_target_interval.end_ms,
                 ),
-            ) > ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+            ))
 }
 
 fn v2_version_reuse_allows_shared_axis(
@@ -14449,7 +14468,8 @@ fn finalize_v2_span_evidence(
     alternative_margin: f64,
 ) -> V2FinalMapAnchorSummary {
     let final_summary = v2_recompute_final_map_anchor_summary(spans, hypothesis);
-    let credible_held_out_anchors = v2_credible_held_out_anchors(hypothesis);
+    let (credible_held_out_anchors, ambiguous_held_out_anchors) =
+        v2_partition_held_out_anchors(hypothesis);
     for (index, span) in spans.iter_mut().enumerate() {
         span.id = format!(
             "span-{}-{}-{}-{}-{}-{}",
@@ -14462,6 +14482,7 @@ fn finalize_v2_span_evidence(
         );
         let training = v2_anchors_in_source_span(&hypothesis.training_anchors, span);
         let held_out = v2_anchors_in_source_span(&credible_held_out_anchors, span);
+        let ambiguous_held_out = v2_anchors_in_source_span(&ambiguous_held_out_anchors, span);
         let training_residuals = training
             .iter()
             .filter_map(|item| v2_final_map_anchor_residual(std::slice::from_ref(&*span), item))
@@ -14514,7 +14535,8 @@ fn finalize_v2_span_evidence(
             span.kind == AudioTimeMapSpanKind::Matched && held_out.is_empty();
         let no_training_support = span.kind == AudioTimeMapSpanKind::Matched && training.is_empty();
         let anchors_in_unmapped_span = span.kind != AudioTimeMapSpanKind::Matched
-            && (!training.is_empty() || !held_out.is_empty());
+            && (!training.is_empty() || !held_out.is_empty() || !ambiguous_held_out.is_empty());
+        let ambiguous_held_out_evidence = !ambiguous_held_out.is_empty();
         let final_residual_blocked = span.kind == AudioTimeMapSpanKind::Matched
             && (held_out_unmapped_count > 0
                 || training_unmapped_count > 0
@@ -14527,6 +14549,7 @@ fn finalize_v2_span_evidence(
             || boundary_blocked
             || no_training_support
             || no_independent_validation
+            || ambiguous_held_out_evidence
             || anchors_in_unmapped_span
             || final_residual_blocked;
         let mut reasons = vec![span.reason.clone()];
@@ -14549,7 +14572,16 @@ fn finalize_v2_span_evidence(
         if anchors_in_unmapped_span {
             reasons.push(format!(
                 "最终分段 TimeMap 将含 {} 个真实 anchor 的范围分类为不可投影内容，必须阻断复核。",
-                training.len().saturating_add(held_out.len())
+                training
+                    .len()
+                    .saturating_add(held_out.len())
+                    .saturating_add(ambiguous_held_out.len())
+            ));
+        }
+        if ambiguous_held_out_evidence {
+            reasons.push(format!(
+                "该 span 含 {} 个未获得独立偏移模式共识的歧义留出候选；保留位置证据并阻断自动确认。",
+                ambiguous_held_out.len()
             ));
         }
         if final_residual_blocked {
@@ -15006,28 +15038,97 @@ fn v2_final_map_anchor_residual(
 }
 
 fn v2_credible_held_out_anchors(hypothesis: &AffineHypothesis) -> Vec<AffineAnchorEvidence> {
-    hypothesis
-        .held_out_anchors
-        .iter()
-        .filter(|anchor| {
-            let predicted_target_ms =
-                hypothesis.scale * anchor.source_time_ms as f64 + hypothesis.offset_ms as f64;
-            predicted_target_ms.is_finite()
-                && (anchor.target_time_ms as f64 - predicted_target_ms)
-                    .abs()
-                    .round()
-                    <= ALIGNMENT_V2_HELD_OUT_CREDIBILITY_RADIUS_MS as f64
-        })
-        .cloned()
-        .collect()
+    v2_partition_held_out_anchors(hypothesis).0
+}
+
+fn v2_partition_held_out_anchors(
+    hypothesis: &AffineHypothesis,
+) -> (Vec<AffineAnchorEvidence>, Vec<AffineAnchorEvidence>) {
+    #[derive(Default)]
+    struct OffsetModeSupport {
+        source_times: HashSet<i64>,
+        target_times: HashSet<i64>,
+    }
+
+    let residual_tolerance_ms = v2_affine_match_config()
+        .residual_tolerance_ms
+        .unsigned_abs();
+    let signed_residual = |anchor: &AffineAnchorEvidence| {
+        let predicted_target_ms =
+            hypothesis.scale * anchor.source_time_ms as f64 + hypothesis.offset_ms as f64;
+        predicted_target_ms
+            .is_finite()
+            .then(|| (anchor.target_time_ms as f64 - predicted_target_ms).round() as i64)
+    };
+    let mut mode_support = HashMap::<i64, OffsetModeSupport>::new();
+    for anchor in &hypothesis.held_out_anchors {
+        let Some(residual_ms) = signed_residual(anchor) else {
+            continue;
+        };
+        if residual_ms.unsigned_abs() > ALIGNMENT_V2_HELD_OUT_CREDIBILITY_RADIUS_MS {
+            continue;
+        }
+        let support = mode_support
+            .entry(residual_ms.div_euclid(ALIGNMENT_V2_HELD_OUT_OFFSET_MODE_QUANTUM_MS))
+            .or_default();
+        support.source_times.insert(
+            anchor
+                .source_time_ms
+                .div_euclid(ALIGNMENT_V2_HELD_OUT_EVIDENCE_TIME_QUANTUM_MS),
+        );
+        support.target_times.insert(
+            anchor
+                .target_time_ms
+                .div_euclid(ALIGNMENT_V2_HELD_OUT_EVIDENCE_TIME_QUANTUM_MS),
+        );
+    }
+
+    let mut credible = Vec::new();
+    let mut ambiguous = Vec::new();
+    for anchor in &hypothesis.held_out_anchors {
+        let Some(residual_ms) = signed_residual(anchor) else {
+            ambiguous.push(anchor.clone());
+            continue;
+        };
+        let globally_consistent = residual_ms.unsigned_abs() <= residual_tolerance_ms;
+        let mode_supported = if globally_consistent
+            || residual_ms.unsigned_abs() > ALIGNMENT_V2_HELD_OUT_CREDIBILITY_RADIUS_MS
+        {
+            globally_consistent
+        } else {
+            let offset_bucket =
+                residual_ms.div_euclid(ALIGNMENT_V2_HELD_OUT_OFFSET_MODE_QUANTUM_MS);
+            let mut source_times = HashSet::<i64>::new();
+            let mut target_times = HashSet::<i64>::new();
+            for adjacent_bucket in (offset_bucket - 1)..=(offset_bucket + 1) {
+                if let Some(support) = mode_support.get(&adjacent_bucket) {
+                    source_times.extend(&support.source_times);
+                    target_times.extend(&support.target_times);
+                }
+            }
+            source_times.len() >= ALIGNMENT_V2_HELD_OUT_MIN_UNIQUE_MODE_SUPPORT
+                && target_times.len() >= ALIGNMENT_V2_HELD_OUT_MIN_UNIQUE_MODE_SUPPORT
+        };
+        if globally_consistent || mode_supported {
+            credible.push(anchor.clone());
+        } else {
+            ambiguous.push(anchor.clone());
+        }
+    }
+    (credible, ambiguous)
 }
 
 fn v2_final_map_held_out_anchor_diagnostics(
     spans: &[AudioTimeMapSpanDto],
     hypothesis: &AffineHypothesis,
 ) -> Vec<String> {
-    let mut anchors = v2_credible_held_out_anchors(hypothesis);
-    anchors.sort_by(|left, right| {
+    let (credible, ambiguous) = v2_partition_held_out_anchors(hypothesis);
+    let mut anchors = credible
+        .into_iter()
+        .map(|anchor| (anchor, true))
+        .chain(ambiguous.into_iter().map(|anchor| (anchor, false)))
+        .collect::<Vec<_>>();
+    anchors.sort_by(|(left, _), (right, _)| {
         left.source_time_ms
             .cmp(&right.source_time_ms)
             .then_with(|| left.target_time_ms.cmp(&right.target_time_ms))
@@ -15042,7 +15143,7 @@ fn v2_final_map_held_out_anchor_diagnostics(
         .into_iter()
         .take(ALIGNMENT_V2_MAX_HELD_OUT_TRACE_ITEMS)
         .enumerate()
-        .map(|(index, anchor)| {
+        .map(|(index, (anchor, credible))| {
             let predicted_target_ms =
                 hypothesis.scale * anchor.source_time_ms as f64 + hypothesis.offset_ms as f64;
             let coarse_signed_residual_ms =
@@ -15062,8 +15163,14 @@ fn v2_final_map_held_out_anchor_diagnostics(
                 Some(residual_ms) => format!("{} ms（超阈值）", residual_ms),
                 None => "未映射（阻断）".to_string(),
             };
+            let evidence_label = if credible {
+                "可信留出 anchor"
+            } else {
+                "歧义留出候选"
+            };
             format!(
-                "Final TimeMap 可信留出 anchor #{}：source={} ms，target={} ms，coarseSignedResidual={:+} ms，finalResidual={}，span={}。",
+                "Final TimeMap {} #{}：source={} ms，target={} ms，coarseSignedResidual={:+} ms，finalResidual={}，span={}。",
+                evidence_label,
                 index + 1,
                 anchor.source_time_ms,
                 anchor.target_time_ms,
@@ -15075,7 +15182,7 @@ fn v2_final_map_held_out_anchor_diagnostics(
         .collect::<Vec<_>>();
     if omitted_count > 0 {
         diagnostics.push(format!(
-            "Final TimeMap 可信留出 anchor 追踪已限长；另有 {omitted_count} 个候选未逐条展开。"
+            "Final TimeMap 留出 anchor 追踪已限长；另有 {omitted_count} 个候选未逐条展开。"
         ));
     }
     diagnostics
@@ -15446,8 +15553,12 @@ fn create_v2_alignment_proposal(
     let credible_held_out_support_sufficient = final_anchor_summary.held_out_credible_count
         >= required_credible_held_out_anchor_count
         && credible_held_out_region_count >= ALIGNMENT_V2_MIN_CREDIBLE_HELD_OUT_REGIONS;
+    let ambiguous_held_out_candidate_count = final_anchor_summary
+        .held_out_candidate_count
+        .saturating_sub(final_anchor_summary.held_out_credible_count);
     let catastrophic = coverage < 0.50
         || !credible_held_out_support_sufficient
+        || ambiguous_held_out_candidate_count > 0
         || final_anchor_summary.held_out_unmapped_count > 0
         || final_anchor_summary.training_unmapped_count > 0
         || graph_p95_residual_ms.is_none_or(|value| value > 400)
@@ -15484,7 +15595,7 @@ fn create_v2_alignment_proposal(
     if final_anchor_summary.held_out_credible_count == 0 {
         quality_reasons.push(
             format!(
-                "独立留出集有 {} 个全局内点或局部共识候选，但没有候选落在有界 edit-recovery 范围内；拒绝把远距离碰撞当作时间金标准。",
+                "独立留出集有 {} 个全局内点或局部共识候选，但没有候选通过全局一致性或独立时间点模式共识；拒绝把远距离碰撞当作时间金标准，也拒绝把未形成模式共识的重复内容碰撞计为测量。",
                 final_anchor_summary.held_out_candidate_count
             ),
         );
@@ -15497,6 +15608,11 @@ fn create_v2_alignment_proposal(
             final_anchor_summary.held_out_candidate_count,
             credible_held_out_region_count,
             ALIGNMENT_V2_MIN_CREDIBLE_HELD_OUT_REGIONS
+        ));
+    }
+    if ambiguous_held_out_candidate_count > 0 {
+        quality_reasons.push(format!(
+            "独立留出证据仍有 {ambiguous_held_out_candidate_count} 个歧义候选：它们既不贴合全局模型，也没有至少 {ALIGNMENT_V2_HELD_OUT_MIN_UNIQUE_MODE_SUPPORT} 个独立 source/target 时间点支持同一偏移模式；保留位置诊断并阻断自动确认。"
         ));
     }
     if !credible_held_out_support_sufficient {
@@ -15560,7 +15676,7 @@ fn create_v2_alignment_proposal(
         target_matched_ratio * 100.0
     ));
     diagnostics.push(format!(
-        "Final TimeMap：coarse scale {:.8}，offset {:+} ms，训练 anchor {} 个（最终图可投影 {}，未映射 {}），留出全局内点/局部共识候选 {} 个、可信 anchor {} 个（最终图阈值内 {}，未映射 {}，时间区域 {}），可信留出重投影 P50/P95/P99/max={:?}/{:?}/{:?}/{:?} ms。",
+        "Final TimeMap：coarse scale {:.8}，offset {:+} ms，训练 anchor {} 个（最终图可投影 {}，未映射 {}），留出全局内点/局部共识候选 {} 个、可信 anchor {} 个、歧义候选 {} 个（最终图阈值内 {}，未映射 {}，时间区域 {}），可信留出重投影 P50/P95/P99/max={:?}/{:?}/{:?}/{:?} ms。",
         pair.hypothesis.scale,
         pair.hypothesis.offset_ms,
         pair.hypothesis.training_anchors.len(),
@@ -15568,6 +15684,7 @@ fn create_v2_alignment_proposal(
         final_anchor_summary.training_unmapped_count,
         final_anchor_summary.held_out_candidate_count,
         final_anchor_summary.held_out_credible_count,
+        ambiguous_held_out_candidate_count,
         final_anchor_summary.held_out_within_tolerance_count,
         final_anchor_summary.held_out_unmapped_count,
         credible_held_out_region_count,
@@ -29975,7 +30092,63 @@ mod tests {
         assert!(diagnostics[0].contains("finalResidual=50 ms（通过）"));
         assert!(diagnostics[0].contains(&spans[0].id));
         assert!(diagnostics[1].contains("source=8000 ms"));
+        assert!(diagnostics[1].contains("歧义留出候选"));
         assert!(diagnostics[1].contains("finalResidual=500 ms（超阈值）"));
+    }
+
+    #[test]
+    fn v2_held_out_credibility_separates_supported_edit_modes_from_isolated_collisions() {
+        let mut hypothesis = v2_test_hypothesis(1.0, 0);
+        hypothesis.held_out_anchors = vec![
+            AffineAnchorEvidence {
+                source_time_ms: 10_000,
+                target_time_ms: 10_020,
+                residual_ms: 20,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 20_000,
+                target_time_ms: 42_000,
+                residual_ms: 22_000,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 40_000,
+                target_time_ms: 62_100,
+                residual_ms: 22_100,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 60_000,
+                target_time_ms: 82_200,
+                residual_ms: 22_200,
+            },
+            AffineAnchorEvidence {
+                source_time_ms: 80_000,
+                target_time_ms: 125_000,
+                residual_ms: 45_000,
+            },
+        ];
+
+        let (credible, ambiguous) = v2_partition_held_out_anchors(&hypothesis);
+
+        assert_eq!(credible.len(), 4);
+        assert_eq!(ambiguous.len(), 1);
+        assert_eq!(ambiguous[0].source_time_ms, 80_000);
+    }
+
+    #[test]
+    fn v2_held_out_credibility_does_not_count_same_instant_votes_as_independent_mode_support() {
+        let mut hypothesis = v2_test_hypothesis(1.0, 0);
+        hypothesis.held_out_anchors = (0..3)
+            .map(|index| AffineAnchorEvidence {
+                source_time_ms: 10_000,
+                target_time_ms: 32_000 + index,
+                residual_ms: 22_000,
+            })
+            .collect();
+
+        let (credible, ambiguous) = v2_partition_held_out_anchors(&hypothesis);
+
+        assert!(credible.is_empty());
+        assert_eq!(ambiguous.len(), 3);
     }
 
     #[test]
@@ -30077,6 +30250,9 @@ mod tests {
         hypothesis.inlier_count = hypothesis.training_anchors.len();
         hypothesis.held_out_within_tolerance_count = hypothesis.held_out_anchors.len();
         hypothesis.source_end_ms = 30_000;
+        let (credible, ambiguous) = v2_partition_held_out_anchors(&hypothesis);
+        assert_eq!(credible.len(), 1);
+        assert_eq!(ambiguous.len(), 2);
         let mut pair = v2_test_pair_candidate();
         pair.hypothesis = hypothesis;
 
@@ -30108,7 +30284,7 @@ mod tests {
         assert!(proposal
             .diagnostics
             .iter()
-            .any(|line| line.contains("未映射训练/留出 anchor=0/1")));
+            .any(|line| line.contains("歧义留出候选") && line.contains("source=15000 ms")));
     }
 
     #[test]
@@ -33853,7 +34029,7 @@ mod tests {
     }
 
     #[test]
-    fn global_shortlist_uses_250ms_overlap_tolerance_and_zero_guard_content_ranges() {
+    fn global_shortlist_uses_bounded_coarse_overlap_and_zero_guard_content_ranges() {
         let plan = test_one_source_three_target_batch_plan();
         let left = v2_test_global_candidate(
             PresentationRangeMs {
@@ -33892,6 +34068,40 @@ mod tests {
             &plan.pairs[1],
             &touching,
         ));
+
+        let long_left = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 2_700_000,
+            },
+            PresentationRangeMs {
+                start_ms: 1_000_000,
+                end_ms: 3_700_000,
+            },
+            0.9,
+            false,
+        );
+        let mut long_right = v2_test_global_candidate(
+            PresentationRangeMs {
+                start_ms: 0,
+                end_ms: 2_700_000,
+            },
+            PresentationRangeMs {
+                start_ms: 3_679_500,
+                end_ms: 6_379_500,
+            },
+            0.9,
+            false,
+        );
+        assert!(
+            !v2_global_candidates_conflict(&plan.pairs[0], &long_left, &plan.pairs[1], &long_right,),
+            "20.5 s coarse boundary overlap is below 1% of an episode"
+        );
+        long_right.global_source_interval.start_ms = 3_669_000;
+        assert!(
+            v2_global_candidates_conflict(&plan.pairs[0], &long_left, &plan.pairs[1], &long_right,),
+            "31 s overlap exceeds the bounded 1% coarse tolerance"
+        );
 
         let mut adjacent_left = v2_test_global_candidate(
             PresentationRangeMs {

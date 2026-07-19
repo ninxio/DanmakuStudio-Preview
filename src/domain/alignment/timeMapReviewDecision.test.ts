@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { createEmptyProject } from "../project/factory";
 import type { MediaMatchCandidate, MediaTimeMap } from "../project/types";
 import {
+  applyCandidateTimeMapManualTakeover,
+  applySystemSuggestedTimeMapReviews,
   applyTimeMapSpanReviewDecision,
   describeTimeMapSpanReviewAvailability,
+  readTimeMapManualTakeover,
   readTimeMapSpanReviewDecision,
   reviewCandidateTimeMapSpan
 } from "./timeMapReviewDecision";
@@ -95,6 +98,40 @@ describe("时间图差异人工分类", () => {
       applyTimeMapSpanReviewDecision(map, 3, "source-extra", "2026-07-12T10:00:00.000Z")
     ).toThrow("当前分类未写入");
     expect(map.spans[3]?.kind).toBe("ambiguous");
+  });
+
+  it("系统按区间形状采用最高可能性分类，用户接管后保留算法诊断并进入可签发 review 状态", () => {
+    const map = createMap();
+    const identity = {
+      algorithm: "fnv1a64-first-middle-last-64k-v1",
+      sizeBytes: 1_000,
+      modifiedUnixMs: 1_700_000_000_000,
+      firstSampleDigest: "a".repeat(16),
+      middleSampleDigest: "b".repeat(16),
+      lastSampleDigest: "c".repeat(16)
+    };
+    map.sourceIdentity = identity;
+    map.targetIdentity = { ...identity, sizeBytes: 2_000 };
+
+    const suggested = applySystemSuggestedTimeMapReviews(
+      map,
+      "2026-07-12T10:00:00.000Z"
+    );
+    expect(readTimeMapSpanReviewDecision(suggested, 1)?.decision).toBe("source-extra");
+    expect(readTimeMapSpanReviewDecision(suggested, 2)?.decision).toBe("target-extra");
+    expect(readTimeMapSpanReviewDecision(suggested, 3)?.decision).toBe("replacement");
+
+    const takeover = applyCandidateTimeMapManualTakeover(
+      suggested,
+      "2026-07-12T10:01:00.000Z"
+    );
+    expect(takeover.quality.level).toBe("review");
+    expect(takeover.quality.reasons.join(" ")).toContain("无法唯一解释");
+    expect(takeover.quality.reasons.join(" ")).toContain("用户已采用系统最高可能性建议");
+    expect(takeover.spans.every((span) => span.quality?.level === "review")).toBe(true);
+    expect(takeover.evidence.types).toContain("manual");
+    expect(readTimeMapManualTakeover(takeover)).toBe("2026-07-12T10:01:00.000Z");
+    expect(takeover.verification).toBeNull();
   });
 
   it("只允许待复核候选引用的 candidate 时间图通过项目 API 更新", () => {

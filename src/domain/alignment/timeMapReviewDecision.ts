@@ -33,6 +33,7 @@ export interface RecordedTimeMapSpanReview {
 const REVIEW_NOTE_PREFIX = "manual-span-review:v1:";
 const PLAYBACK_REVIEW_PREFIX = "manual-playback-review:v2:";
 const LEGACY_PLAYBACK_REVIEW_PREFIX = "manual-playback-review:v1:";
+const MANUAL_TAKEOVER_NOTE_PREFIX = "manual-takeover:v1:";
 const MANUAL_REVIEW_STATE_REASON_PREFIX = "逐段人工复核状态：";
 
 export class TimeMapSpanReviewError extends Error {
@@ -40,6 +41,115 @@ export class TimeMapSpanReviewError extends Error {
     super(message);
     this.name = "TimeMapSpanReviewError";
   }
+}
+
+export function suggestTimeMapSpanReviewDecision(
+  span: TimeMapSpan
+): TimeMapSpanReviewDecision | null {
+  if (span.kind === "matched") return null;
+  const sourceDurationMs = span.sourceEndMs - span.sourceStartMs;
+  const targetDurationMs = span.targetEndMs - span.targetStartMs;
+  if (sourceDurationMs > 0 && targetDurationMs === 0) return "source-extra";
+  if (sourceDurationMs === 0 && targetDurationMs > 0) return "target-extra";
+  if (sourceDurationMs > 0 && targetDurationMs > 0) return "replacement";
+  return "unresolved";
+}
+
+export function applySystemSuggestedTimeMapReviews(
+  timeMap: MediaTimeMap,
+  reviewedAt: string
+): MediaTimeMap {
+  return timeMap.spans.reduce((current, span, spanIndex) => {
+    const suggestion = suggestTimeMapSpanReviewDecision(span);
+    return suggestion && suggestion !== "unresolved"
+      ? applyTimeMapSpanReviewDecision(current, spanIndex, suggestion, reviewedAt)
+      : current;
+  }, timeMap);
+}
+
+export function applyCandidateTimeMapManualTakeover(
+  timeMap: MediaTimeMap,
+  reviewedAt: string
+): MediaTimeMap {
+  if (timeMap.state !== "candidate") {
+    throw new TimeMapSpanReviewError("只能接管尚未确认的候选时间图。");
+  }
+  if (!isIsoTimestamp(reviewedAt)) {
+    throw new TimeMapSpanReviewError("人工接管时间必须是有效的 ISO 时间戳。");
+  }
+  if (!timeMap.sourceIdentity || !timeMap.targetIdentity) {
+    throw new TimeMapSpanReviewError("人工接管前必须保留参考与原片的内容身份快照。");
+  }
+  const validation = validateTimeMap(timeMap.spans);
+  if (!validation.valid || timeMap.spans.length === 0) {
+    throw new TimeMapSpanReviewError(
+      `候选时间图结构无效，不能人工接管：${validation.issues[0]?.message ?? "没有可用分段"}`
+    );
+  }
+  const unresolved = timeMap.spans.flatMap((span, spanIndex) => {
+    const suggestion = suggestTimeMapSpanReviewDecision(span);
+    if (!suggestion) return [];
+    const recorded = readTimeMapSpanReviewDecision(timeMap, spanIndex)?.decision;
+    return recorded === suggestion
+      ? []
+      : [`第 ${spanIndex + 1} 段尚未采用系统建议“${TIME_MAP_SPAN_REVIEW_LABELS[suggestion]}”`];
+  });
+  if (unresolved.length > 0) {
+    throw new TimeMapSpanReviewError(`人工接管前仍有未定区间：${unresolved.slice(0, 3).join("；")}。`);
+  }
+  const spans = timeMap.spans.map((span, spanIndex) => {
+    const complete = isCompleteTimeMapSpanEvidence(span)
+      ? { ...span }
+      : normalizeLegacyUnverifiedTimeMapSpanEvidence(span, {
+          id: span.id ?? `${timeMap.id}:span:${String(spanIndex + 1).padStart(4, "0")}`,
+          blocked: true
+        });
+    return {
+      ...complete,
+      quality: {
+        ...complete.quality,
+        level: "review" as const,
+        reasons: [
+          `第 ${spanIndex + 1} 段由用户采用系统建议并明确接管；算法阻断仍保留在整图诊断中，导出需安装级签名。`
+        ]
+      }
+    };
+  });
+  return {
+    ...timeMap,
+    revision: timeMap.revision + 1,
+    spans,
+    quality: {
+      ...timeMap.quality,
+      level: "review",
+      reasons: uniqueStrings([
+        ...timeMap.quality.reasons,
+        "用户已采用系统最高可能性建议并接管该候选；允许保存关系，但正式导出仍需明确签发人工方案。"
+      ])
+    },
+    evidence: {
+      ...timeMap.evidence,
+      types: appendUnique(timeMap.evidence.types, "manual"),
+      notes: [
+        ...timeMap.evidence.notes.filter(
+          (note) => !note.startsWith(MANUAL_TAKEOVER_NOTE_PREFIX)
+        ),
+        `${MANUAL_TAKEOVER_NOTE_PREFIX}${reviewedAt}`
+      ]
+    },
+    verification: null,
+    updatedAt: reviewedAt
+  };
+}
+
+export function readTimeMapManualTakeover(timeMap: MediaTimeMap): string | null {
+  for (let index = timeMap.evidence.notes.length - 1; index >= 0; index -= 1) {
+    const note = timeMap.evidence.notes[index] ?? "";
+    if (!note.startsWith(MANUAL_TAKEOVER_NOTE_PREFIX)) continue;
+    const reviewedAt = note.slice(MANUAL_TAKEOVER_NOTE_PREFIX.length);
+    return isIsoTimestamp(reviewedAt) ? reviewedAt : null;
+  }
+  return null;
 }
 
 /**

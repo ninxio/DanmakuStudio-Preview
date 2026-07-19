@@ -9,6 +9,7 @@ import type { EditorProject, ProjectMediaReference, ProjectMediaRole } from "../
 import { projectDanmakuToTargets } from "../timeline/sourceProjection";
 import {
   acceptMediaMatchCandidate,
+  acceptMediaMatchCandidateWithManualTakeover,
   createAppliedSegmentId,
   createMediaMatchCandidate,
   reconcileMediaMatchCandidates,
@@ -17,6 +18,8 @@ import {
   upsertMediaMatchCandidate,
   updateMediaMatchCandidateRange
 } from "./mediaMatching";
+import { assessManualMediaTimeMapVerificationEligibility } from "./mediaTimeMap";
+import { readTimeMapManualTakeover } from "./timeMapReviewDecision";
 
 const TIMESTAMP = "2026-07-11T00:00:00.000Z";
 
@@ -869,6 +872,56 @@ describe("media matching candidates", () => {
     expect(() => acceptMediaMatchCandidate(project, candidate.id, ["asset-1"])).toThrow(
       "候选时间图已阻断"
     );
+  });
+
+  it("自动门控阻断时允许用户采用系统建议建立人工方案，并进入安装级签发预检", () => {
+    let project = createMatchingProject();
+    const proposal = createProposal({
+      sourceStartMs: 10_000,
+      sourceEndMs: 70_000,
+      targetStartMs: 30_000,
+      targetEndMs: 95_000
+    });
+    const blockedTimeMap = createVerifiedTimeMapProposal();
+    blockedTimeMap.quality = {
+      ...blockedTimeMap.quality,
+      level: "blocked",
+      reasons: ["留出锚点未覆盖全部范围，自动确认已阻断。"]
+    };
+    proposal.timeMap = blockedTimeMap;
+    const candidate = createMediaMatchCandidate(project, {
+      id: "candidate-manual-takeover",
+      batchId: "batch-v2",
+      sourceMediaId: "source-1",
+      targetMediaId: "target-1",
+      proposal
+    });
+    project = upsertMediaMatchCandidate(project, candidate, TIMESTAMP);
+
+    const accepted = acceptMediaMatchCandidateWithManualTakeover(
+      project,
+      candidate.id,
+      ["asset-1"],
+      "2026-07-11T01:00:00.000Z"
+    );
+    const confirmedMap = accepted.mediaTimeMaps.find((map) => map.state === "confirmed");
+
+    expect(accepted.mediaMatchCandidates[0]).toMatchObject({
+      state: "accepted",
+      confirmedTimeMapId: confirmedMap?.id
+    });
+    expect(accepted.danmakuSourceSegments).toHaveLength(1);
+    expect(confirmedMap?.quality.level).toBe("review");
+    expect(confirmedMap?.quality.reasons.join(" ")).toContain("自动确认已阻断");
+    expect(readTimeMapManualTakeover(confirmedMap!)).toBe("2026-07-11T01:00:00.000Z");
+    expect(
+      assessManualMediaTimeMapVerificationEligibility(confirmedMap!, {
+        calibrationArtifactId: "manual-takeover-ui",
+        calibrationArtifactVersion: "1",
+        verifier: "user",
+        verifiedAt: "2026-07-11T01:01:00.000Z"
+      })
+    ).toEqual({ eligible: true, reason: null });
   });
 
   it("只改 V2 候选边界时不会硬拉旧映射，而是明确降级为 ambiguous", () => {

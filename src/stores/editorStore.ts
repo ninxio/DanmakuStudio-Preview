@@ -94,6 +94,7 @@ import {
 import { cutCandidateToMarker, type AlignmentProposal } from "../domain/alignment/types";
 import {
   acceptMediaMatchCandidate as acceptProjectMediaMatchCandidate,
+  acceptMediaMatchCandidateWithManualTakeover as acceptProjectMediaMatchCandidateWithManualTakeover,
   reconcileMediaMatchCandidates,
   rejectMediaMatchCandidate as rejectProjectMediaMatchCandidate,
   revokeMediaMatchCandidateAcceptance as revokeProjectMediaMatchCandidateAcceptance,
@@ -198,6 +199,10 @@ interface EditorStore {
     evidence: TimeMapSpanPlaybackEvidence
   ) => void;
   acceptMediaMatchCandidate: (candidateId: string, assetIds: string[]) => void;
+  acceptMediaMatchCandidateWithManualTakeover: (
+    candidateId: string,
+    assetIds: string[]
+  ) => void;
   issueManualMediaTimeMapVerification: (
     timeMapId: string,
     input: ManualMediaTimeMapVerificationInput
@@ -581,6 +586,24 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
       });
     } catch (error) {
       set({ status: createErrorStatus("无法接受匹配候选", error) });
+    }
+  },
+
+  acceptMediaMatchCandidateWithManualTakeover: (candidateId, assetIds) => {
+    try {
+      const beforeCount = get().project.danmakuSourceSegments.length;
+      commitProject(set, get, "采用系统建议并建立人工接管方案", (project) =>
+        acceptProjectMediaMatchCandidateWithManualTakeover(project, candidateId, assetIds)
+      );
+      const addedCount = get().project.danmakuSourceSegments.length - beforeCount;
+      set({
+        status: {
+          message: `已采用系统建议并保存人工方案，新增 ${Math.max(0, addedCount)} 个来源段；请检查摘要后完成本机签发，即可进入导出。`,
+          tone: "warning"
+        }
+      });
+    } catch (error) {
+      set({ status: createErrorStatus("无法建立人工接管方案", error) });
     }
   },
 

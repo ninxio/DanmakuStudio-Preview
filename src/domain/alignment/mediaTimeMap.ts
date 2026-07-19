@@ -14,7 +14,10 @@ import {
 } from "../project/mediaIdentity";
 import type { Milliseconds } from "../shared/time";
 import { sha256Hex } from "../shared/sha256";
-import { readTimeMapSpanReviewDecision } from "./timeMapReviewDecision";
+import {
+  readTimeMapManualTakeover,
+  readTimeMapSpanReviewDecision
+} from "./timeMapReviewDecision";
 import {
   readTimeMapSpanPlaybackReview,
   summarizeTimeMapSpanPlaybackEvidence
@@ -734,6 +737,7 @@ function assertManualVerificationEligible(
   if (!map.evidence.types.includes("manual")) {
     throw new Error("人工验证前必须先写入真实 manual 复核证据。");
   }
+  const manualTakeoverAt = readTimeMapManualTakeover(map);
   for (const [label, value] of [
     ["calibrationArtifactId", input.calibrationArtifactId],
     ["calibrationArtifactVersion", input.calibrationArtifactVersion],
@@ -757,7 +761,7 @@ function assertManualVerificationEligible(
       );
     }
     if (span.kind === "matched") {
-      if (!readTimeMapSpanPlaybackReview(map, spanIndex)) {
+      if (!manualTakeoverAt && !readTimeMapSpanPlaybackReview(map, spanIndex)) {
         throw new Error(
           `时间图第 ${spanIndex + 1} 段缺少与当前边界一致的真实 A/B 播放复核证据。`
         );
@@ -776,7 +780,7 @@ function assertManualVerificationEligible(
         `时间图第 ${spanIndex + 1} 段必须先人工分类为“${expectedDecision}”，不能凭自动结果签发。`
       );
     }
-    if (!readTimeMapSpanPlaybackReview(map, spanIndex)) {
+    if (!manualTakeoverAt && !readTimeMapSpanPlaybackReview(map, spanIndex)) {
       throw new Error(
         `时间图第 ${spanIndex + 1} 段缺少与当前边界一致的真实 A/B 播放复核证据。`
       );
@@ -786,9 +790,12 @@ function assertManualVerificationEligible(
 }
 
 function createDeclaredVerifiedMap(map: MediaTimeMap): MediaTimeMap {
+  const verificationReason = readTimeMapManualTakeover(map)
+    ? "用户已明确采用系统建议、接受未验证区间可能造成的弹幕错位，并由安装级验证机构签发人工接管方案。"
+    : "全部片段已完成与当前媒体身份和边界绑定的 A/B 播放复核，并由安装级验证机构签发人工验证。";
   const reasons = canonicalSignedQualityReasons([
     ...map.quality.reasons,
-    "全部片段已完成与当前媒体身份和边界绑定的 A/B 播放复核，并由安装级验证机构签发人工验证。"
+    verificationReason
   ]);
   return {
     ...map,
