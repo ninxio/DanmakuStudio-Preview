@@ -7,6 +7,7 @@ import {
   applyTimeMapSpanReviewDecision,
   describeTimeMapSpanReviewAvailability,
   editCandidateTimeMapSpan,
+  isTimeMapManualTakeoverExportApproved,
   mergeCandidateTimeMapSpanWithNext,
   readTimeMapManualTakeover,
   readTimeMapSpanReviewDecision,
@@ -103,7 +104,7 @@ describe("时间图差异人工分类", () => {
     expect(map.spans[3]?.kind).toBe("ambiguous");
   });
 
-  it("系统按区间形状采用最高可能性分类，用户接管后保留算法诊断并进入可签发 review 状态", () => {
+  it("系统按区间形状采用最高可能性分类，用户接管后保留算法诊断并形成可导出的正式关系", () => {
     const map = createMap();
     const identity = {
       algorithm: "fnv1a64-first-middle-last-64k-v1",
@@ -135,6 +136,14 @@ describe("时间图差异人工分类", () => {
     expect(takeover.evidence.types).toContain("manual");
     expect(readTimeMapManualTakeover(takeover)).toBe("2026-07-12T10:01:00.000Z");
     expect(takeover.verification).toBeNull();
+    expect(isTimeMapManualTakeoverExportApproved(takeover)).toBe(false);
+    expect(
+      isTimeMapManualTakeoverExportApproved({
+        ...takeover,
+        state: "confirmed",
+        confirmedAt: "2026-07-12T10:01:00.000Z"
+      })
+    ).toBe(true);
   });
 
   it("只允许待复核候选引用的 candidate 时间图通过项目 API 更新", () => {

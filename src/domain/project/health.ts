@@ -7,7 +7,10 @@ import type {
   SyncAnchor
 } from "../danmaku/types";
 import { reconcileMediaTimeMapQuality } from "../alignment/mediaTimeMap";
-import { readTimeMapSpanReviewDecision } from "../alignment/timeMapReviewDecision";
+import {
+  isTimeMapManualTakeoverExportApproved,
+  readTimeMapSpanReviewDecision
+} from "../alignment/timeMapReviewDecision";
 import { areMediaContentIdentitiesEqual } from "./mediaIdentity";
 import { formatTimecode, type Milliseconds } from "../shared/time";
 import { isItemInsideClip, resolveProjectDanmakuEvents } from "../timeline/mapping";
@@ -340,12 +343,15 @@ export function createProjectHealthSummary(project: EditorProject): ProjectHealt
         return;
       }
       const effectiveQuality = reconcileMediaTimeMapQuality(timeMap).quality;
+      const manualTakeoverApproved = isTimeMapManualTakeoverExportApproved(timeMap);
       if (effectiveQuality.level !== "verified") {
         findings.push({
           id: `source-segment-time-map-quality-${segment.id}`,
-          severity: "error",
-          title: "时间映射尚未验证",
-          detail: `${segment.label} 的时间图质量为${formatTimeMapQualityLevel(effectiveQuality.level)}，默认阻断导出。`,
+          severity: manualTakeoverApproved ? "warning" : "error",
+          title: manualTakeoverApproved ? "正在使用人工接管方案" : "时间映射尚未验证",
+          detail: manualTakeoverApproved
+            ? `${segment.label} 已由用户采用系统最高可能性建议并接受错位风险；允许导出，但建议先抽查开头、中段和结尾。`
+            : `${segment.label} 的时间图质量为${formatTimeMapQualityLevel(effectiveQuality.level)}，默认阻断导出。`,
           evidence: effectiveQuality.reasons.slice(0, EVIDENCE_PREVIEW_LIMIT)
         });
       } else {

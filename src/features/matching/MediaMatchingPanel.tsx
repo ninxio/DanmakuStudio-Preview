@@ -25,6 +25,7 @@ import {
 } from "../../domain/alignment/timeMap";
 import {
   describeTimeMapSpanReviewAvailability,
+  isTimeMapManualTakeoverExportApproved,
   readTimeMapManualTakeover,
   readTimeMapSpanReviewDecision,
   suggestTimeMapSpanReviewDecision,
@@ -1493,7 +1494,7 @@ function MediaMatchCandidateCard({
         <span
           className={`rounded border px-2 py-0.5 text-[11px] ${candidateStateClass(candidate.state, displayedTimeMapGate.exportReady)}`}
         >
-          {candidateStateText(candidate, displayedTimeMapGate.exportReady)}
+          {candidateStateText(candidate, displayedTimeMapGate)}
         </span>
       </div>
 
@@ -1555,8 +1556,13 @@ function MediaMatchCandidateCard({
               <CircleX size={13} />
               忽略候选
             </TextButton>
-            {candidate.state === "blocked" &&
-            candidateTimeMap?.quality.level === "blocked" ? (
+            {timeMapGate.manualTakeoverAvailable && timeMapGate.canSaveRelationship ? (
+              <TextButton disabled={selectedAssetIds.length === 0} onClick={accept}>
+                <CircleCheck size={13} />
+                {acceptLabel}
+              </TextButton>
+            ) : null}
+            {timeMapGate.manualTakeoverAvailable ? (
               <div className="flex w-full flex-col items-end gap-2">
                 <label className="inline-flex max-w-2xl items-start gap-2 rounded border border-amber-400/25 bg-amber-400/5 px-2.5 py-2 text-left text-[11px] leading-5 text-amber-100">
                   <input
@@ -1565,8 +1571,8 @@ function MediaMatchCandidateCard({
                     checked={manualRiskAccepted}
                     onChange={(event) => setManualRiskAccepted(event.target.checked)}
                   />
-                  我接受未验证区间可能造成弹幕前后错位；应用将采用每段最高可能性建议，
-                  但保留原始诊断并要求再次签发后才允许导出。
+                  我接受未验证区间可能造成弹幕前后错位；应用将自动采用每段最高可能性建议，
+                  保留原始诊断，并立即建立可导出的人工方案。
                 </label>
                 <TextButton
                   tone="primary"
@@ -1574,7 +1580,7 @@ function MediaMatchCandidateCard({
                   onClick={acceptWithManualTakeover}
                 >
                   <WandSparkles size={13} />
-                  采用系统建议，建立可导出方案
+                  采用系统建议并允许导出
                 </TextButton>
               </div>
             ) : (
@@ -1647,6 +1653,28 @@ function ManualTimeMapVerificationControls({ timeMap }: { timeMap: MediaTimeMap 
   const manualTakeoverAt = readTimeMapManualTakeover(timeMap);
   const trustedRecord =
     persistedRecord && verificationAssessment.trusted ? persistedRecord : null;
+  if (manualTakeoverAt && isTimeMapManualTakeoverExportApproved(timeMap)) {
+    return (
+      <section
+        className="mt-3 rounded border border-amber-400/30 bg-amber-400/5 p-2.5 text-[11px]"
+        data-testid="manual-time-map-verification"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium text-amber-100">人工接管方案</span>
+          <span className="rounded border border-amber-300/40 bg-amber-300/10 px-2 py-0.5 text-amber-100">
+            已允许导出
+          </span>
+          {trustedRecord ? (
+            <span className="text-slate-500">既有本机签名仍保留</span>
+          ) : null}
+        </div>
+        <p className="mt-1.5 leading-5 text-slate-400">
+          你已于 {new Date(manualTakeoverAt).toLocaleString("zh-CN")} 明确采用系统最高可能性建议。
+          导出不会再被自动质量门槛重复否决；未验证区间和潜在错位仍保留在诊断中，建议导出前抽查开头、中段和结尾。
+        </p>
+      </section>
+    );
+  }
   const desktopAvailable = isManualVerificationAuthorityAvailable();
   const preflightInput = {
     calibrationArtifactId: MANUAL_VERIFICATION_ARTIFACT_ID,
@@ -1759,7 +1787,13 @@ function ManualTimeMapVerificationControls({ timeMap }: { timeMap: MediaTimeMap 
 }
 
 type TimeMapGateKind =
-  "verified" | "review" | "blocked" | "legacy-unverified" | "missing" | "state-error";
+  | "verified"
+  | "manual-takeover"
+  | "review"
+  | "blocked"
+  | "legacy-unverified"
+  | "missing"
+  | "state-error";
 
 interface TimeMapGateDescription {
   kind: TimeMapGateKind;
@@ -1929,6 +1963,9 @@ function TimeMapReview({
     (state) => state.mergeCandidateTimeMapSpanWithNext
   );
   const [selectedSpanIndex, setSelectedSpanIndex] = useState(0);
+  const [manualEditRequests, setManualEditRequests] = useState<
+    Record<number, { kind: TimeMapSpanKind; nonce: number }>
+  >({});
   const onPlaybackOpenChangeRef = useRef(onPlaybackOpenChange);
 
   useEffect(() => {
@@ -1937,6 +1974,7 @@ function TimeMapReview({
 
   useEffect(() => {
     setSelectedSpanIndex(0);
+    setManualEditRequests({});
   }, [timeMap?.id]);
 
   useEffect(() => {
@@ -1979,9 +2017,11 @@ function TimeMapReview({
   const spanCounts = countTimeMapSpans(timeMap.spans);
   const safeSelectedSpanIndex = Math.min(selectedSpanIndex, timeMap.spans.length - 1);
   const selectedSpan = timeMap.spans[safeSelectedSpanIndex];
+  const manualTakeoverApproved = isTimeMapManualTakeoverExportApproved(timeMap);
   const blockingReason =
-    timeMap.quality.level === "blocked" ||
-    timeMap.spans.some((span) => span.kind === "ambiguous")
+    !manualTakeoverApproved &&
+    (timeMap.quality.level === "blocked" ||
+      timeMap.spans.some((span) => span.kind === "ambiguous"))
       ? timeMap.quality.reasons.slice(0, 3).join("；") ||
         "存在无法唯一判断的内容，当前时间图不能用于导出。"
       : null;
@@ -2019,8 +2059,10 @@ function TimeMapReview({
         <span className="font-medium text-slate-200">来源↔原片时间图复核</span>
         <span className="ml-2 text-slate-500">
           {relationState === "accepted"
-            ? timeMap.quality.level === "verified"
-              ? "已验证 · 可导出 · "
+            ? manualTakeoverApproved
+              ? "人工接管 · 可导出 · "
+              : timeMap.quality.level === "verified"
+                ? "已验证 · 可导出 · "
               : "关系已保存 / 待完成复核 · "
             : "候选图 · "}
           共同内容 {spanCounts.matched} · 参考独有 {spanCounts.sourceOnly} · 原片独有{" "}
@@ -2141,6 +2183,20 @@ function TimeMapReview({
                   onReview={(decision) =>
                     reviewCandidateTimeMapSpan(timeMap.id, spanIndex, decision)
                   }
+                  onRequestManualEdit={(kind, reason) => {
+                    setSelectedSpanIndex(spanIndex);
+                    setManualEditRequests((current) => ({
+                      ...current,
+                      [spanIndex]: {
+                        kind,
+                        nonce: (current[spanIndex]?.nonce ?? 0) + 1
+                      }
+                    }));
+                    setEditorStatus(
+                      `已打开“${MANUAL_TIME_MAP_KIND_OPTIONS.find((option) => option.value === kind)?.label ?? "所选类型"}”的边界调整。${reason}`,
+                      "neutral"
+                    );
+                  }}
                 />
               ) : null}
               {relationState === "candidate" ? (
@@ -2149,6 +2205,7 @@ function TimeMapReview({
                   span={span}
                   nextSpan={timeMap.spans[spanIndex + 1]}
                   spanIndex={spanIndex}
+                  requestedKind={manualEditRequests[spanIndex]}
                   onSave={(patch) =>
                     editCandidateTimeMapSpan(timeMap.id, spanIndex, patch)
                   }
@@ -2260,19 +2317,21 @@ function TimeMapSpanReviewControls({
   timeMap,
   span,
   spanIndex,
-  onReview
+  onReview,
+  onRequestManualEdit
 }: {
   timeMap: MediaTimeMap;
   span: TimeMapSpan;
   spanIndex: number;
   onReview: (decision: TimeMapSpanReviewDecision) => void;
+  onRequestManualEdit: (kind: TimeMapSpanKind, reason: string) => void;
 }) {
   const recorded = readTimeMapSpanReviewDecision(timeMap, spanIndex);
   const suggestion = suggestTimeMapSpanReviewDecision(span);
   const options = TIME_MAP_REVIEW_DECISIONS.map((decision) => ({
     decision,
     availability: describeTimeMapSpanReviewAvailability(span, decision)
-  })).filter(({ availability }) => availability.allowed);
+  }));
   return (
     <fieldset className="mt-1 rounded border border-panel-line/60 bg-black/20 p-2">
       <legend className="px-1 font-medium text-slate-400">人工判定这一段</legend>
@@ -2290,7 +2349,11 @@ function TimeMapSpanReviewControls({
             tone={recorded?.decision === decision ? "primary" : "neutral"}
             aria-pressed={recorded?.decision === decision}
             title={availability.reason}
-            onClick={() => onReview(decision)}
+            onClick={() =>
+              availability.allowed
+                ? onReview(decision)
+                : onRequestManualEdit(availability.desiredKind, availability.reason)
+            }
           >
             {TIME_MAP_SPAN_REVIEW_LABELS[decision]}
           </TextButton>
@@ -2302,8 +2365,8 @@ function TimeMapSpanReviewControls({
           : "尚未人工分类；当前颜色只是算法候选结果。"}
       </p>
       <p className="mt-1 leading-5 text-slate-500">
-        当前可直接采用的分类按两侧长度显示。若判断不同，可在下方“调整边界与结构”中
-        同时修改双轴边界和类型，不会再被算法给出的形状锁死。
+        四种结论始终可选。与当前边界形状兼容的会直接保存；其余选项会打开对应的双轴边界调整，
+        不会再被算法给出的形状锁死。
       </p>
     </fieldset>
   );
@@ -2324,6 +2387,7 @@ function TimeMapSpanManualEditControls({
   span,
   nextSpan,
   spanIndex,
+  requestedKind,
   onSave,
   onSplit,
   onMergeNext
@@ -2332,6 +2396,7 @@ function TimeMapSpanManualEditControls({
   span: TimeMapSpan;
   nextSpan: TimeMapSpan | undefined;
   spanIndex: number;
+  requestedKind: { kind: TimeMapSpanKind; nonce: number } | undefined;
   onSave: (patch: {
     kind: TimeMapSpanKind;
     sourceStartMs: number;
@@ -2354,6 +2419,7 @@ function TimeMapSpanManualEditControls({
     formatTimecode(createManualSplitPoint(span.targetStartMs, span.targetEndMs))
   );
   const [inputError, setInputError] = useState<string | null>(null);
+  const detailsRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
     setKind(span.kind);
@@ -2378,6 +2444,14 @@ function TimeMapSpanManualEditControls({
     span.targetStartMs,
     spanIndex
   ]);
+
+  useEffect(() => {
+    if (!requestedKind) return;
+    setKind(requestedKind.kind);
+    if (detailsRef.current) {
+      detailsRef.current.open = true;
+    }
+  }, [requestedKind]);
 
   const save = () => {
     const sourceStartMs = parseSourceTimecode(sourceStartText);
@@ -2415,13 +2489,16 @@ function TimeMapSpanManualEditControls({
   };
 
   return (
-    <details className="mt-1 rounded border border-panel-line/60 bg-black/20 p-2">
+    <details
+      ref={detailsRef}
+      className="mt-1 rounded border border-panel-line/60 bg-black/20 p-2"
+    >
       <summary className="cursor-pointer select-none font-medium text-slate-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent-cyan">
         调整边界与结构
       </summary>
       <p className="mt-1.5 leading-5 text-slate-500">
         用于算法边界或类型判断不对的情况。保存会同步相邻段的共享边界，并撤销旧验证；
-        之后可重新 A/B 复核，也可明确采用当前方案并在本机签发。
+        之后可重新 A/B 复核，也可明确采用当前方案直接导出。
       </p>
       <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
         <label className="grid gap-1 text-slate-400">
@@ -2732,6 +2809,24 @@ function describeTimeMapGate(
     };
   }
 
+  const manualTakeoverAvailable =
+    !isConfirmedRelation &&
+    Boolean(timeMap.sourceIdentity && timeMap.targetIdentity) &&
+    timeMap.spans.length > 0 &&
+    validateTimeMap(timeMap.spans).valid;
+
+  if (isConfirmedRelation && isTimeMapManualTakeoverExportApproved(timeMap)) {
+    return {
+      kind: "manual-takeover",
+      label: "人工接管",
+      message:
+        "你已明确采用系统最高可能性建议并接受潜在错位风险；当前方案可以导出，自动门控诊断仍完整保留。",
+      canSaveRelationship: true,
+      exportReady: true,
+      manualTakeoverAvailable: false
+    };
+  }
+
   if (timeMap.quality.level === "verified") {
     return {
       kind: "verified",
@@ -2750,10 +2845,10 @@ function describeTimeMapGate(
       label: "需复核",
       message: isConfirmedRelation
         ? "关系已保存供试听复核，但仍不能导出；当前引擎尚未完成真实基准校准，本版本不会把试听结果伪装成已验证。"
-        : "可以保存关系供试听复核，但仍不能导出；当前引擎尚未完成真实基准校准，本版本不会把试听结果伪装成已验证。",
+        : "可采用系统建议直接建立人工导出方案，也可只保存关系继续试听；自动质量结论仍保留为“需复核”。",
       canSaveRelationship: true,
       exportReady: false,
-      manualTakeoverAvailable: false
+      manualTakeoverAvailable
     };
   }
   if (timeMap.quality.level === "legacy-unverified") {
@@ -2762,10 +2857,12 @@ function describeTimeMapGate(
       label: "旧版未验证",
       message: isConfirmedRelation
         ? "旧版关系仅保留供试听复核，仍不能导出；需要用完成真实媒体校准的 V2 重新分析。"
-        : "可以保存旧版关系供试听复核，但仍不能导出；需要用完成真实媒体校准的 V2 重新分析。",
+        : manualTakeoverAvailable
+          ? "旧版候选可由你明确接管并导出，但建议优先重新分析；原始风险诊断会保留。"
+          : "可以保存旧版关系供试听复核，但缺少人工接管所需的媒体身份或合法分段。",
       canSaveRelationship: true,
       exportReady: false,
-      manualTakeoverAvailable: false
+      manualTakeoverAvailable
     };
   }
   return {
@@ -2776,7 +2873,7 @@ function describeTimeMapGate(
       : "自动确认未通过；可重新分析，也可接受潜在错位并采用系统建议建立人工方案。",
     canSaveRelationship: false,
     exportReady: false,
-    manualTakeoverAvailable: !isConfirmedRelation
+    manualTakeoverAvailable
   };
 }
 
@@ -3017,10 +3114,15 @@ function batchTaskStateText(state: BatchTaskState): string {
   return "失败";
 }
 
-function candidateStateText(candidate: MediaMatchCandidate, exportReady: boolean): string {
+function candidateStateText(
+  candidate: MediaMatchCandidate,
+  gate: TimeMapGateDescription
+): string {
   if (candidate.state === "pending") return "待复核";
-  if (candidate.state === "accepted")
-    return exportReady ? "已验证 · 可导出" : "关系已保存 / 待完成复核";
+  if (candidate.state === "accepted") {
+    if (gate.kind === "manual-takeover") return "人工接管 · 可导出";
+    return gate.exportReady ? "已验证 · 可导出" : "关系已保存 / 待完成复核";
+  }
   if (candidate.state === "rejected") return "已忽略";
   if (candidate.proposal.timeMap?.quality.level === "blocked") return "可人工接管";
   return "缺少 XML 绑定";

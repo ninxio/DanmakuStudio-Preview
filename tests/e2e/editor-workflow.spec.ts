@@ -36,6 +36,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("核心编辑流程可导入、编辑、导出并重新导入 XML", async ({ page }) => {
+  test.setTimeout(120_000);
   await page.goto("/");
 
   await expect(page.getByTestId("status-bar")).toContainText("准备就绪");

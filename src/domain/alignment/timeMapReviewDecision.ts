@@ -167,6 +167,43 @@ export function readTimeMapManualTakeover(timeMap: MediaTimeMap): string | null 
 }
 
 /**
+ * 用户明确接管的方案是一个真实的产品决策，不应再被自动质量门槛重复否决。
+ * 这里仍保留不可绕过的数据完整性要求：正式关系、媒体身份、合法连续分段、
+ * 完整逐段证据，以及所有差异段的明确分类。
+ */
+export function isTimeMapManualTakeoverExportApproved(timeMap: MediaTimeMap): boolean {
+  if (
+    timeMap.state !== "confirmed" ||
+    !readTimeMapManualTakeover(timeMap) ||
+    !timeMap.evidence.types.includes("manual") ||
+    !timeMap.sourceIdentity ||
+    !timeMap.targetIdentity
+  ) {
+    return false;
+  }
+  const validation = validateTimeMap(timeMap.spans);
+  if (!validation.valid || timeMap.spans.length === 0) {
+    return false;
+  }
+  return timeMap.spans.every((span, spanIndex) => {
+    if (
+      !isCompleteTimeMapSpanEvidence(span) ||
+      span.quality.level === "blocked" ||
+      span.quality.level === "legacy-unverified"
+    ) {
+      return false;
+    }
+    if (span.kind === "matched") {
+      return true;
+    }
+    const decision = readTimeMapSpanReviewDecision(timeMap, spanIndex)?.decision;
+    if (span.kind === "sourceOnly") return decision === "source-extra";
+    if (span.kind === "targetOnly") return decision === "target-extra";
+    return decision === "replacement";
+  });
+}
+
+/**
  * 根据双方区间形状判断一个人工分类是否可写回。分类不会暗改边界；形状不兼容时
  * 必须先做边界编辑，因此这里 fail-closed。
  */

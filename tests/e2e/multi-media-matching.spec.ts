@@ -836,7 +836,7 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
-test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻断", async ({ page }) => {
+test("北极星多素材流程覆盖四类判定、真实 A/B 失败与人工接管导出", async ({ page }) => {
   test.setTimeout(90_000);
   await page.goto("/");
 
@@ -950,11 +950,11 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   const sourceOnlyButton = firstReview.getByRole("button", { name: /第 2 段 参考独有/ });
   const sourceOnlyItem = sourceOnlyButton.locator("..");
   await expect(sourceOnlyItem.getByRole("button", { name: "参考多出" })).toBeEnabled();
-  await expect(sourceOnlyItem.getByRole("button", { name: "原片多出" })).toHaveCount(0);
-  await expect(sourceOnlyItem.getByRole("button", { name: "版本替换" })).toHaveCount(0);
+  await expect(sourceOnlyItem.getByRole("button", { name: "原片多出" })).toBeEnabled();
+  await expect(sourceOnlyItem.getByRole("button", { name: "版本替换" })).toBeEnabled();
   await expect(sourceOnlyItem.getByRole("button", { name: "无法判断" })).toBeEnabled();
   await expect(sourceOnlyItem).toContainText("系统建议：参考多出");
-  await expect(sourceOnlyItem).toContainText("不会再被算法给出的形状锁死");
+  await expect(sourceOnlyItem).toContainText("四种结论始终可选");
   await sourceOnlyItem.getByText("调整边界与结构", { exact: true }).click();
   await expect(sourceOnlyItem.getByRole("combobox", { name: "片段类型" })).toHaveValue(
     "sourceOnly"
@@ -965,9 +965,9 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
 
   const targetOnlyButton = firstReview.getByRole("button", { name: /第 3 段 原片独有/ });
   const targetOnlyItem = targetOnlyButton.locator("..");
-  await expect(targetOnlyItem.getByRole("button", { name: "参考多出" })).toHaveCount(0);
+  await expect(targetOnlyItem.getByRole("button", { name: "参考多出" })).toBeEnabled();
   await expect(targetOnlyItem.getByRole("button", { name: "原片多出" })).toBeEnabled();
-  await expect(targetOnlyItem.getByRole("button", { name: "版本替换" })).toHaveCount(0);
+  await expect(targetOnlyItem.getByRole("button", { name: "版本替换" })).toBeEnabled();
   await expect(targetOnlyItem).toContainText("系统建议：原片多出");
 
   const ambiguousButton = firstReview.getByRole("button", { name: /第 4 段 无法判断/ });
@@ -985,7 +985,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await ambiguousItem.getByRole("button", { name: "版本替换" }).click();
   await expect(ambiguousItem).toContainText("已保存：版本替换");
   const takeoverButton = firstCandidate.getByRole("button", {
-    name: "采用系统建议，建立可导出方案"
+    name: "采用系统建议并允许导出"
   });
   await expect(takeoverButton).toBeDisabled();
 
@@ -1009,12 +1009,16 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
     .check();
   await expect(takeoverButton).toBeEnabled();
   await takeoverButton.click();
-  await expect(firstCandidate).toContainText("人工方案签发");
-  await expect(firstCandidate).toContainText("签发后允许导出");
+  await expect(firstCandidate).toContainText("人工接管方案");
+  await expect(firstCandidate).toContainText("已允许导出");
 
   const candidateCards = page.getByTestId("media-match-candidate");
   for (let index = 1; index < 5; index += 1) {
-    await candidateCards.nth(index).getByRole("button", { name: "保存关系供试听复核" }).click();
+    const card = candidateCards.nth(index);
+    await card
+      .getByRole("checkbox", { name: /我接受未验证区间可能造成弹幕前后错位/ })
+      .check();
+    await card.getByRole("button", { name: "采用系统建议并允许导出" }).click();
   }
   await expect(matchingPanel).toContainText("5 / 5 个原片已有保存关系");
   const confirmedRelations = page.getByTestId("confirmed-media-relations");
@@ -1022,9 +1026,8 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await expect(confirmedRelations).toContainText("C136-E05");
 
   const verification = candidateCards.nth(1).getByTestId("manual-time-map-verification");
-  await expect(verification).toContainText("自动匹配和保存关系都不会触发签发");
-  await expect(verification).toContainText("当前不能签发");
-  await expect(verification.getByRole("button", { name: "完成复核并签发" })).toBeDisabled();
+  await expect(verification).toContainText("人工接管方案");
+  await expect(verification).toContainText("已允许导出");
   const verificationCalls = await page.evaluate(
     () =>
       (
@@ -1043,11 +1046,14 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await page.getByTestId("workspace-nav-export").click();
   const projectionExport = page.getByRole("region", { name: "按原片分集导出" });
   await expect(projectionExport).toContainText("可导出分集");
-  await expect(projectionExport).toContainText("0 个");
-  await expect(projectionExport).toContainText("不能导出");
-  await expect(
-    projectionExport.getByRole("button", { name: "导出全部分集 XML" })
-  ).toBeDisabled();
+  await expect(projectionExport).toContainText("1 个");
+  await expect(projectionExport).toContainText("C136-E05.xml");
+  const exportAllButton = projectionExport.getByRole("button", { name: "导出全部分集 XML" });
+  await expect(exportAllButton).toBeDisabled();
+  await expect(exportAllButton).toHaveAttribute(
+    "title",
+    "高精度分集导出必须先在设置中选择桌面导出文件夹。"
+  );
   await projectionExport.scrollIntoViewIfNeeded();
   await page.screenshot({
     path: resolve(screenshotDir, "c137-export-gate-blocked.png"),

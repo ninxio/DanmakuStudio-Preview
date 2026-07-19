@@ -1019,6 +1019,33 @@ describe("projectDanmakuToTargets", () => {
     expect(result.unexpectedUnmappedItemCount).toBe(0);
   });
 
+  it("用户明确接管系统建议后可直接导出，不再要求安装级二次签发", () => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    const timeMap = attachTimeMap(
+      project,
+      "segment_verified",
+      [
+        {
+          kind: "matched",
+          sourceStartMs: 0,
+          sourceEndMs: 10_000,
+          targetStartMs: 0,
+          targetEndMs: 10_000
+        }
+      ],
+      "review"
+    );
+    timeMap.evidence.types.push("manual");
+    timeMap.evidence.notes.push("manual-takeover:v1:2026-07-12T00:00:00.000Z");
+
+    const result = projectDanmakuToTargets(project);
+
+    expect(timeMap.verification).toBeNull();
+    expect(result.status).toBe("ready");
+    expect(result.projectedItemCount).toBe(1);
+    expect(result.groups[0]?.entries[0]?.finalTimeMs).toBe(5_000);
+  });
+
   it.each<{
     level: MediaTimeMapQualityLevel;
     expectedStatus: "ready" | "blocked";

@@ -5,7 +5,10 @@ import {
   type CompiledTimeMap
 } from "../alignment/timeMap";
 import { reconcileMediaTimeMapQuality } from "../alignment/mediaTimeMap";
-import { readTimeMapSpanReviewDecision } from "../alignment/timeMapReviewDecision";
+import {
+  isTimeMapManualTakeoverExportApproved,
+  readTimeMapSpanReviewDecision
+} from "../alignment/timeMapReviewDecision";
 import { areMediaContentIdentitiesEqual } from "../project/mediaIdentity";
 import type { DanmakuItem } from "../danmaku/types";
 import type {
@@ -536,14 +539,15 @@ function findTimeMapBlocker(
     return `${segment.label} 的时间图包含歧义（ambiguous）区间，必须先人工消除歧义才能导出。`;
   }
 
+  const manualTakeoverApproved = isTimeMapManualTakeoverExportApproved(timeMap);
   const effectiveQuality = reconcileMediaTimeMapQuality(timeMap).quality;
-  if (effectiveQuality.level === "review") {
+  if (effectiveQuality.level === "review" && !manualTakeoverApproved) {
     return `${segment.label} 的时间图仍需人工复核，不能导出。`;
   }
-  if (effectiveQuality.level === "blocked") {
+  if (effectiveQuality.level === "blocked" && !manualTakeoverApproved) {
     return `${segment.label} 的时间图质量评估已阻断，不能导出。`;
   }
-  if (effectiveQuality.level === "legacy-unverified") {
+  if (effectiveQuality.level === "legacy-unverified" && !manualTakeoverApproved) {
     return `${segment.label} 的时间图由旧规则迁移且未经验证，不能导出。`;
   }
   const sourceMedia = mediaById.get(timeMap.sourceMediaId);

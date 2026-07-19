@@ -1475,17 +1475,24 @@ describe("多媒体自动匹配工作台", () => {
   });
 
   it.each([
-    ["verified", "需复核", "保存关系供试听复核", false, "仍不能导出", true],
-    ["review", "需复核", "保存关系供试听复核", false, "仍不能导出", false],
+    ["verified", "需复核", "保存关系供试听复核", false, "可采用系统建议", true],
+    ["review", "需复核", "保存关系供试听复核", false, "可采用系统建议", false],
     [
       "blocked",
       "可人工接管",
-      "采用系统建议，建立可导出方案",
+      "采用系统建议并允许导出",
       true,
       "自动确认未通过",
       false
     ],
-    ["legacy-unverified", "旧版未验证", "保存关系供试听复核", false, "仍不能导出", false]
+    [
+      "legacy-unverified",
+      "旧版未验证",
+      "保存关系供试听复核",
+      false,
+      "旧版候选可由你明确接管",
+      false
+    ]
   ] as const)(
     "V2 自报质量等级 %s 经过 provenance 重算后显示对应导出闸门",
     async (level, label, buttonName, disabled, gateMessage, keepsReportedProbability) => {
@@ -1515,12 +1522,9 @@ describe("多媒体自动匹配工作台", () => {
     }
   );
 
-  it("严格自动质量门槛只阻止自动确认，用户仍可采用系统建议建立待签发方案", async () => {
+  it("严格自动质量门槛只阻止自动确认，用户可采用系统建议直接建立可导出方案", async () => {
     const user = userEvent.setup();
     configureSingleTargetV2Project("blocked");
-    vi.mocked(isManualVerificationAuthorityAvailable).mockReturnValue(true);
-    const issue = vi.fn<typeof defaultIssueManualVerification>(() => Promise.resolve());
-    useEditorStore.setState({ issueManualMediaTimeMapVerification: issue });
     render(<MatchingHarness />);
 
     await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
@@ -1530,7 +1534,7 @@ describe("多媒体自动匹配工作台", () => {
     );
     expect(within(card).getAllByText("可人工接管")).toHaveLength(2);
     const takeoverButton = within(card).getByRole("button", {
-      name: "采用系统建议，建立可导出方案"
+      name: "采用系统建议并允许导出"
     });
     expect(takeoverButton).toBeDisabled();
 
@@ -1550,15 +1554,16 @@ describe("多媒体自动匹配工作台", () => {
       .project.mediaTimeMaps.find((map) => map.state === "confirmed");
     expect(confirmedMap?.quality.level).toBe("review");
     expect(readTimeMapManualTakeover(confirmedMap!)).not.toBeNull();
-    expect(within(card).getByText("人工方案签发")).toBeInTheDocument();
-    const signButton = within(card).getByRole("button", {
-      name: "签发人工方案并允许导出"
-    });
-    expect(signButton).toBeEnabled();
-    expect(card).toHaveTextContent("诊断中的未验证区间和潜在错位不会被删除");
-    await user.click(signButton);
-    await waitFor(() => expect(issue).toHaveBeenCalledTimes(1));
-    expect(issue.mock.calls[0]?.[0]).toBe(confirmedMap?.id);
+    expect(within(card).getByText("人工接管方案")).toBeInTheDocument();
+    expect(within(card).getByText("已允许导出")).toBeInTheDocument();
+    expect(within(card).getByTestId("candidate-time-map-quality")).toHaveTextContent(
+      "导出状态：可以导出"
+    );
+    expect(card).toHaveTextContent("人工接管 · 可导出");
+    expect(card).toHaveTextContent("未验证区间和潜在错位仍保留在诊断中");
+    expect(
+      within(card).queryByRole("button", { name: "签发人工方案并允许导出" })
+    ).not.toBeInTheDocument();
   });
 
   it("在折叠详情展示 V2 指标、分段、音轨和主要原因", async () => {
@@ -1796,7 +1801,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(playback).toHaveTextContent("已达到本段要求的有效试听时长和覆盖范围");
   });
 
-  it("快捷判定保持边界约束，但结构编辑提供全部类型并在项目保存重开后恢复", async () => {
+  it("四种快捷判定始终可操作，不兼容形状会打开对应边界编辑并在保存重开后恢复", async () => {
     const user = userEvent.setup();
     const project = createMatchingProject();
     project.mediaLibrary = project.mediaLibrary.filter((media) => media.id !== "target-ep2");
@@ -1825,14 +1830,17 @@ describe("多媒体自动匹配工作台", () => {
     if (!sourceOnlyItem) throw new Error("未找到参考独有分段容器");
     const controls = within(sourceOnlyItem);
     expect(controls.getByRole("button", { name: "参考多出" })).toBeEnabled();
-    expect(controls.queryByRole("button", { name: "原片多出" })).not.toBeInTheDocument();
-    expect(controls.queryByRole("button", { name: "版本替换" })).not.toBeInTheDocument();
+    expect(controls.getByRole("button", { name: "原片多出" })).toBeEnabled();
+    expect(controls.getByRole("button", { name: "版本替换" })).toBeEnabled();
     expect(controls.getByRole("button", { name: "无法判断" })).toBeEnabled();
     expect(sourceOnlyItem).toHaveTextContent("系统建议：参考多出");
-    expect(sourceOnlyItem).toHaveTextContent("不会再被算法给出的形状锁死");
+    expect(sourceOnlyItem).toHaveTextContent("四种结论始终可选");
     expect(
       within(controls.getByRole("combobox", { name: "片段类型" })).getAllByRole("option")
     ).toHaveLength(4);
+
+    await user.click(controls.getByRole("button", { name: "原片多出" }));
+    expect(controls.getByRole("combobox", { name: "片段类型" })).toHaveValue("targetOnly");
 
     await user.click(controls.getByRole("button", { name: "参考多出" }));
     const reviewedMap = useEditorStore.getState().project.mediaTimeMaps[0];
@@ -1864,7 +1872,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(useEditorStore.getState().project.mediaTimeMaps[0]?.quality.level).toBe("blocked");
     expect(
       within(await screen.findByTestId("media-match-candidate")).getByRole("button", {
-        name: "采用系统建议，建立可导出方案"
+        name: "采用系统建议并允许导出"
       })
     ).toBeDisabled();
   });
