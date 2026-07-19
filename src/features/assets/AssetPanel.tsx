@@ -132,6 +132,7 @@ import {
   downloadLegacyXmlFiles,
   formatExportFileError,
   getVerifiedExportUnavailableReason,
+  openExportDirectoryPath,
   saveProjectedXmlExports,
   type SaveTextExportResult,
   type ProjectionDerivationV2,
@@ -1074,18 +1075,17 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
         ) : null}
         {section === "export" ? (
           <div className="grid gap-3 text-xs text-slate-400">
-            <WorkspaceProgressBanner pageId="export" />
-            <ProjectionExportPanel
-              projection={sourceProjection}
-              project={project}
-              onGoMatching={() => setWorkspacePage("matching")}
-            />
             <ExportReadinessPanel
               projectName={project.name}
               reportSummary={projectHealth}
               readiness={projectReadiness}
               onCleanupEditReferences={cleanupProjectEditReferences}
               onCleanupMissingAssetClips={cleanupProjectMissingAssetClips}
+            />
+            <ProjectionExportPanel
+              projection={sourceProjection}
+              project={project}
+              onGoMatching={() => setWorkspacePage("matching")}
             />
             <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
               <h3 className="text-sm font-medium text-slate-100">其他导出方式</h3>
@@ -4236,12 +4236,12 @@ function setStatus(status: EditorStatus) {
 async function exportProjectionGroups(
   projection: SourceProjectionResult,
   project: EditorProject
-) {
+): Promise<SaveTextExportResult | null> {
   const projectSnapshot = project;
   const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
   if (exportableGroups.length === 0) {
     setStatus({ message: "没有可导出的分集弹幕，请先在匹配页完成来源段。", tone: "warning" });
-    return;
+    return null;
   }
   setStatus({ message: "正在重新核验参考视频与原片的文件身份……", tone: "neutral" });
   const settings = loadAppSettings();
@@ -4253,14 +4253,14 @@ async function exportProjectionGroups(
       message: `导出已阻断：${identityPreflight.issues.map((issue) => issue.message).join("；")}`,
       tone: "error"
     });
-    return;
+    return null;
   }
   if (!isProjectExportSnapshotCurrent(projectSnapshot)) {
     setStatus({
       message: "导出已取消：项目在媒体身份核验期间发生变化，请检查最新结果后重新导出。",
       tone: "warning"
     });
-    return;
+    return null;
   }
   const files = exportableGroups.map((group) => {
     const result = serializeBilibiliXml(
@@ -4277,7 +4277,7 @@ async function exportProjectionGroups(
   const invalid = files.find((file) => !file.valid);
   if (invalid) {
     setStatus({ message: `分集 XML 验证失败：${invalid.message}`, tone: "error" });
-    return;
+    return null;
   }
   try {
     const verification = await createVerifiedExportVerificationSeed(
@@ -4295,21 +4295,31 @@ async function exportProjectionGroups(
       }
     );
     setStatus(createBatchExportStatus(exportResult));
+    return exportResult;
   } catch (error) {
     setStatus({ message: `分集 XML 导出失败：${formatExportFileError(error)}`, tone: "error" });
+    return null;
   }
 }
 
 export function ProjectionExportPanel({
   projection,
   project,
-  onGoMatching
+  onGoMatching,
+  exportGroups = exportProjectionGroups,
+  openDirectory = openExportDirectoryPath
 }: {
   projection: SourceProjectionResult;
   project: EditorProject;
   onGoMatching: () => void;
+  exportGroups?: (
+    projection: SourceProjectionResult,
+    project: EditorProject
+  ) => Promise<SaveTextExportResult | null>;
+  openDirectory?: (directoryPath: string) => Promise<void>;
 }) {
   const [isExporting, setIsExporting] = useState(false);
+  const [lastExport, setLastExport] = useState<SaveTextExportResult | null>(null);
   const exportInFlightRef = useRef(false);
   const exportableGroups = projection.groups.filter((group) => group.entries.length > 0);
   const verifiedExportUnavailableReason = getVerifiedExportUnavailableReason(
@@ -4327,21 +4337,59 @@ export function ProjectionExportPanel({
       : exportableGroups.length === 0
         ? "还没有可导出的分集弹幕。请先在匹配页标出来源段并关联原片。"
         : (verifiedExportUnavailableReason ?? "为每个原片导出一个精准同步的弹幕 XML");
+  useEffect(() => {
+    setLastExport(null);
+  }, [project.id, project.updatedAt]);
   return (
     <section
-      className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300"
+      className="rounded-xl border border-panel-line bg-panel-soft p-4 text-xs text-slate-300"
       aria-label="按原片分集导出"
     >
-      <div className="flex items-center gap-2">
-        <h3 className="text-sm font-medium text-slate-100">按原片分集导出</h3>
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-base font-semibold text-slate-100">
+            {lastExport ? "分集 XML 已导出" : "确认导出内容"}
+          </h3>
+          <p className="mt-1 leading-5 text-slate-500">
+            {lastExport
+              ? `已完成 ${lastExport.fileCount} 个文件；项目中的映射和原始 XML 没有改变。`
+              : "按原片分集生成 XML，文件名和弹幕数量如下。导出前会再次核验媒体身份并重新解析 XML。"}
+          </p>
+        </div>
         <span className="ml-auto rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
           {projectionStatusLabel(projection.status)}
         </span>
       </div>
-      <p className="mt-2 leading-5 text-slate-500">
-        按匹配页确认的来源段，把弹幕从 B 站参考时间轴投影到每个原片的时间轴，为每集导出一个
-        XML。
-      </p>
+      {lastExport?.mode === "directory" ? (
+        <div
+          className="mt-3 rounded-lg border border-accent-green/30 bg-accent-green/10 p-3"
+          data-testid="export-completion"
+        >
+          <div className="flex items-center gap-2 font-medium text-accent-green">
+            <CircleCheck size={15} />
+            导出完成
+          </div>
+          <p className="mt-1 break-all text-[11px] leading-5 text-slate-300">
+            {lastExport.filePath}
+            {lastExport.wasRenamed ? "（已有同名文件，已自动改名）" : ""}
+          </p>
+          <div className="mt-2">
+            <TextButton
+              onClick={() => {
+                void openDirectory(lastExport.directoryPath).catch((error) =>
+                  setStatus({
+                    message: `打开目录失败：${formatExportFileError(error)}`,
+                    tone: "error"
+                  })
+                );
+              }}
+            >
+              <FolderOpen size={14} />
+              打开导出目录
+            </TextButton>
+          </div>
+        </div>
+      ) : null}
       {verifiedExportUnavailableReason ? (
         <p className="mt-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 leading-5 text-accent-yellow">
           {verifiedExportUnavailableReason} 本导出不会降级为普通浏览器下载。
@@ -4360,25 +4408,20 @@ export function ProjectionExportPanel({
             {projection.projectedItemCount.toLocaleString("zh-CN")} 条
           </div>
         </div>
-        <div className="rounded border border-panel-line bg-[#111318] p-2">
-          <div className="text-[11px] text-slate-500">忽略段弹幕</div>
-          <div className="mt-1 text-sm font-medium text-slate-100">
-            {projection.ignoredItemCount.toLocaleString("zh-CN")} 条
-          </div>
-        </div>
-        <div className="rounded border border-panel-line bg-[#111318] p-2">
-          <div className="text-[11px] text-slate-500">参考独有段弹幕</div>
-          <div className="mt-1 text-sm font-medium text-slate-100">
-            {projection.sourceOnlyItemCount.toLocaleString("zh-CN")} 条
-          </div>
-        </div>
-        <div className="rounded border border-panel-line bg-[#111318] p-2">
-          <div className="text-[11px] text-slate-500">意外未覆盖弹幕</div>
-          <div className="mt-1 text-sm font-medium text-slate-100">
-            {projection.unexpectedUnmappedItemCount.toLocaleString("zh-CN")} 条
-          </div>
-        </div>
       </div>
+      <details className="mt-2 rounded border border-panel-line/70 bg-black/10 px-2.5 py-2">
+        <summary className="cursor-pointer text-[11px] text-slate-400">
+          查看未导出弹幕统计
+        </summary>
+        <dl className="mt-2 grid grid-cols-3 gap-2 border-t border-panel-line/70 pt-2">
+          <ExportMetric label="忽略段" value={projection.ignoredItemCount} />
+          <ExportMetric label="参考独有段" value={projection.sourceOnlyItemCount} />
+          <ExportMetric
+            label="意外未覆盖"
+            value={projection.unexpectedUnmappedItemCount}
+          />
+        </dl>
+      </details>
       {projection.issues.length > 0 ? (
         <div className="mt-3 grid gap-1">
           {projection.issues.map((issue) => (
@@ -4420,17 +4463,38 @@ export function ProjectionExportPanel({
             }
             exportInFlightRef.current = true;
             setIsExporting(true);
-            void exportProjectionGroups(projection, project).finally(() => {
-              exportInFlightRef.current = false;
-              setIsExporting(false);
-            });
+            void exportGroups(projection, project)
+              .then((result) => {
+                if (result) {
+                  setLastExport(result);
+                }
+              })
+              .finally(() => {
+                exportInFlightRef.current = false;
+                setIsExporting(false);
+              });
           }}
         >
           <Download size={14} />
-          {isExporting ? "正在核验并导出…" : "导出全部分集 XML"}
+          {isExporting
+            ? "正在核验并导出…"
+            : lastExport
+              ? "再次导出全部分集 XML"
+              : "导出全部分集 XML"}
         </TextButton>
       </div>
     </section>
+  );
+}
+
+function ExportMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded border border-panel-line/70 bg-black/10 px-2 py-1.5">
+      <dt className="text-[10px] text-slate-500">{label}</dt>
+      <dd className="mt-0.5 text-xs font-medium text-slate-300">
+        {value.toLocaleString("zh-CN")} 条
+      </dd>
+    </div>
   );
 }
 

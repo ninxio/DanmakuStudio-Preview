@@ -607,6 +607,75 @@ describe("资源面板", () => {
     }
   });
 
+  it("正式分集导出完成后显示实际路径、再次导出和打开目录", async () => {
+    const restoreTauri = enableTauriForTest();
+    const user = userEvent.setup();
+    const project = useEditorStore.getState().project;
+    const item = project.assets[0].items[0];
+    const projection: SourceProjectionResult = {
+      status: "ready",
+      groups: [
+        {
+          targetMediaId: "target-export",
+          targetName: "目标原片",
+          targetFileName: "target.mkv",
+          episodeLabel: "第 1 集",
+          exportFileName: "target.xml",
+          segments: [],
+          entries: [{ item, finalTimeMs: 0, segmentId: "segment-export" }],
+          disabledCount: 0,
+          appliedRules: [],
+          warnings: []
+        }
+      ],
+      issues: [],
+      contentSegmentCount: 1,
+      ignoredSegmentCount: 0,
+      projectedItemCount: 1,
+      ignoredItemCount: 0,
+      sourceOnlyItemCount: 0,
+      unexpectedUnmappedItemCount: 0,
+      unmappedItemCount: 0
+    };
+    const exportGroups = vi.fn().mockResolvedValue({
+      mode: "directory" as const,
+      fileCount: 1,
+      fileName: "target.xml",
+      filePath: "D:\\exports\\target.xml",
+      directoryPath: "D:\\exports",
+      wasRenamed: false
+    });
+    const openDirectory = vi.fn().mockResolvedValue(undefined);
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      export: { defaultDirectory: "D:\\exports" }
+    });
+
+    try {
+      render(
+        <ProjectionExportPanel
+          projection={projection}
+          project={project}
+          onGoMatching={() => undefined}
+          exportGroups={exportGroups}
+          openDirectory={openDirectory}
+        />
+      );
+      await user.click(screen.getByRole("button", { name: "导出全部分集 XML" }));
+
+      expect(await screen.findByTestId("export-completion")).toHaveTextContent(
+        "D:\\exports\\target.xml"
+      );
+      expect(
+        screen.getByRole("button", { name: "再次导出全部分集 XML" })
+      ).toBeEnabled();
+      await user.click(screen.getByRole("button", { name: "打开导出目录" }));
+      expect(openDirectory).toHaveBeenCalledWith("D:\\exports");
+    } finally {
+      restoreTauri();
+    }
+  });
+
   it("存在目标原片时禁用所有不消费时间图的导出旁路", () => {
     const project = useEditorStore.getState().project;
     const asset = project.assets[0];

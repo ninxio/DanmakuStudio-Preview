@@ -1046,9 +1046,11 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与人工接
 
   await page.getByTestId("workspace-nav-export").click();
   const projectionExport = page.getByRole("region", { name: "按原片分集导出" });
+  await expect(projectionExport.getByRole("heading", { name: "确认导出内容" })).toBeVisible();
   await expect(projectionExport).toContainText("可导出分集");
   await expect(projectionExport).toContainText("1 个");
   await expect(projectionExport).toContainText("C136-E05.xml");
+  await expect(projectionExport.getByText("查看未导出弹幕统计")).toBeVisible();
   const exportAllButton = projectionExport.getByRole("button", { name: "导出全部分集 XML" });
   await expect(exportAllButton).toBeDisabled();
   await expect(exportAllButton).toHaveAttribute(
