@@ -1026,6 +1026,8 @@ describe("多媒体自动匹配工作台", () => {
     await waitFor(() =>
       expect(useEditorStore.getState().status.message).toContain("清理状态不确定")
     );
+    expect(useEditorStore.getState().status.message).toContain("状态读取失败");
+    expect(useEditorStore.getState().status.message).toContain("无法确认原生任务已停止");
     expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));

@@ -9521,6 +9521,63 @@ fn create_failed_audio_alignment_batch_fine_frontier_receipt(
     )
 }
 
+fn create_empty_audio_alignment_batch_fine_frontier_receipt(
+    component_ordinal: usize,
+    component_pair_ordinals: Vec<usize>,
+    final_state: AudioAlignmentBatchFineFrontierStateSnapshot,
+) -> Result<AudioAlignmentBatchFineFrontierReceiptSnapshot, String> {
+    let config = FineFrontierConfig {
+        resolution_margin_micros: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS,
+        overlap_tolerance_ms: u64::try_from(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS)
+            .map_err(|_| "fine frontier overlap tolerance 不能为负数。".to_string())?,
+        ..FineFrontierConfig::default()
+    };
+    let inventory_json = canonicalize_v2_cross_language_json(&serde_json::json!([]))?;
+    let proof = final_state != AudioAlignmentBatchFineFrontierStateSnapshot::Failed;
+    seal_audio_alignment_batch_fine_frontier_receipt(
+        AudioAlignmentBatchFineFrontierReceiptSnapshot {
+            contract_version: FINE_FRONTIER_CONTRACT_VERSION,
+            score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
+            inventory_digest: v2_domain_separated_canonical_digest(
+                AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
+                &inventory_json,
+            ),
+            inventory_candidates: Vec::new(),
+            receipt_digest: String::new(),
+            component_ordinal,
+            component_pair_ordinals,
+            inventory_candidate_count: 0,
+            resolution_margin_micros: config.resolution_margin_micros,
+            overlap_tolerance_ms: config.overlap_tolerance_ms,
+            limits: audio_alignment_batch_fine_limits_snapshot(config),
+            inventory_state_counts: AudioAlignmentBatchFineStateCountsSnapshot::default(),
+            refinement_round_count: 0,
+            evaluated_candidate_count: 0,
+            final_state,
+            resolved: false,
+            selected_candidate_ids: Vec::new(),
+            selected_total_score_micros: None,
+            best_completed: AudioAlignmentBatchFineAssignmentSnapshot {
+                candidate_ids: Vec::new(),
+                total_score_micros: 0,
+            },
+            runner_up_completed: None,
+            optimistic_omitted: None,
+            next_refinement_candidate_ids: Vec::new(),
+            deferred_candidate_count: 0,
+            proof: AudioAlignmentBatchFineResolutionProofSnapshot {
+                beats_runner_up_with_margin: proof,
+                beats_optimistic_omitted_with_margin: proof,
+            },
+            search: AudioAlignmentBatchFineSearchSnapshot {
+                states_visited: 0,
+                expansions_considered: 0,
+                interval_comparisons: 0,
+            },
+        },
+    )
+}
+
 fn audio_alignment_batch_spectral_backend_identity(
     backend: &SpectralBackendExecution,
 ) -> AudioAlignmentBatchSpectralBackendIdentitySnapshot {
@@ -19178,6 +19235,35 @@ fn create_v2_fine_frontier_blocked_proposal(
     }
 }
 
+fn create_v2_unselected_fine_staged_outcome<F>(
+    final_state: CoreFineFrontierState,
+    relation_ranking: &AudioAlignmentBatchRelationRankingSnapshot,
+    global_selection: &AudioAlignmentBatchGlobalSelectionSnapshot,
+    reason: &str,
+    create_review_proposal: F,
+) -> (
+    AudioAlignmentBatchRelationRankingSnapshot,
+    AudioAlignmentBatchGlobalSelectionSnapshot,
+    StagedAudioAlignmentBatchPairOutcome,
+)
+where
+    F: FnOnce() -> Box<AudioAlignmentProposal>,
+{
+    if final_state == CoreFineFrontierState::NoEligibleCandidate {
+        (
+            relation_ranking.clone(),
+            global_selection.clone(),
+            StagedAudioAlignmentBatchPairOutcome::Proposal(create_review_proposal()),
+        )
+    } else {
+        (
+            AudioAlignmentBatchRelationRankingSnapshot::failed(),
+            global_selection.clone().mark_failed(),
+            StagedAudioAlignmentBatchPairOutcome::Failed(reason.to_string()),
+        )
+    }
+}
+
 fn create_prepared_audio_alignment_batch_pair_request(
     pair: &PlannedAudioAlignmentBatchPair,
     source: &PreparedAudioAlignmentBatchMedia,
@@ -19458,57 +19544,61 @@ fn execute_v2_fine_frontier_batch(
             if selected_id.len() > 1 {
                 return Err("fine second assignment 为同一 pair 选择了多个 relation。".to_string());
             }
-            let (fine_execution_evidence, outcome) = if let Some(selected_id) = selected_id.first()
-            {
-                let expected = resolution
-                    .records
-                    .get(selected_id)
-                    .ok_or_else(|| "fine selected assignment 缺少 compact record。".to_string())?;
-                (
-                    Some(expected.execution_evidence.clone()),
-                    StagedAudioAlignmentBatchPairOutcome::Proposal(expected.proposal.clone()),
-                )
-            } else {
-                let review_proposal = (resolution.outcome.state
-                    == CoreFineFrontierState::NoEligibleCandidate
-                    && pair.global_selection.state
+            let (relation_ranking, global_selection, fine_execution_evidence, outcome) =
+                if let Some(selected_id) = selected_id.first() {
+                    let expected = resolution.records.get(selected_id).ok_or_else(|| {
+                        "fine selected assignment 缺少 compact record。".to_string()
+                    })?;
+                    (
+                        pair.relation_ranking.clone(),
+                        pair.global_selection.clone(),
+                        Some(expected.execution_evidence.clone()),
+                        StagedAudioAlignmentBatchPairOutcome::Proposal(expected.proposal.clone()),
+                    )
+                } else {
+                    let reason = match resolution.outcome.state {
+                        CoreFineFrontierState::Resolved =>
+                            "fine frontier 已完成第二次 exact assignment；当前 pair 因全局物理占用冲突未被选择。",
+                        CoreFineFrontierState::NoEligibleCandidate
+                            if pair.global_selection.state
+                                == AudioAlignmentBatchGlobalSelectionState::Blocked =>
+                            "fine frontier 已完成必要评估，但当前 pair 与批内其他关系存在全局物理占用冲突；不能发布可由单 pair 人工复核绕过的候选图。",
+                        CoreFineFrontierState::NoEligibleCandidate =>
+                            "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
+                        CoreFineFrontierState::Unresolved | CoreFineFrontierState::Pending =>
+                            "fine frontier 仍有保留 coarse upper bound 的阻断候选；未发布局部可确认结果。",
+                    };
+                    let review_proposal = (pair.global_selection.state
                         == AudioAlignmentBatchGlobalSelectionState::Selected
-                    && pair.global_selection.selected)
-                    .then(|| resolution.review_proposals_by_pair.get(pair_index))
-                    .flatten()
-                    .cloned();
-                let reason = match resolution.outcome.state {
-                    CoreFineFrontierState::Resolved =>
-                        "fine frontier 已完成第二次 exact assignment；当前 pair 因全局物理占用冲突未被选择。",
-                    CoreFineFrontierState::NoEligibleCandidate
-                        if pair.global_selection.state
-                            == AudioAlignmentBatchGlobalSelectionState::Blocked =>
-                        "fine frontier 已完成必要评估，但当前 pair 与批内其他关系存在全局物理占用冲突；不能发布可由单 pair 人工复核绕过的候选图。",
-                    CoreFineFrontierState::NoEligibleCandidate =>
-                        "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
-                    CoreFineFrontierState::Unresolved | CoreFineFrontierState::Pending =>
-                        "fine frontier 仍有保留 coarse upper bound 的阻断候选；未发布局部可确认结果。",
+                        && pair.global_selection.selected)
+                        .then(|| resolution.review_proposals_by_pair.get(pair_index))
+                        .flatten()
+                        .cloned();
+                    let (relation_ranking, global_selection, outcome) =
+                        create_v2_unselected_fine_staged_outcome(
+                            resolution.outcome.state,
+                            &pair.relation_ranking,
+                            &pair.global_selection,
+                            reason,
+                            || {
+                                review_proposal.unwrap_or_else(|| {
+                                    Box::new(create_v2_fine_frontier_blocked_proposal(
+                                        &coarse_by_pair[*pair_index],
+                                        reason,
+                                        resolution
+                                            .diagnostics_by_pair
+                                            .get(pair_index)
+                                            .map(Vec::as_slice),
+                                    ))
+                                })
+                            },
+                        );
+                    (relation_ranking, global_selection, None, outcome)
                 };
-                (
-                    None,
-                    StagedAudioAlignmentBatchPairOutcome::Proposal(review_proposal.unwrap_or_else(
-                        || {
-                            Box::new(create_v2_fine_frontier_blocked_proposal(
-                                &coarse_by_pair[*pair_index],
-                                reason,
-                                resolution
-                                    .diagnostics_by_pair
-                                    .get(pair_index)
-                                    .map(Vec::as_slice),
-                            ))
-                        },
-                    )),
-                )
-            };
             staged.push(StagedAudioAlignmentBatchPairResult {
                 pair_index: *pair_index,
-                relation_ranking: pair.relation_ranking.clone(),
-                global_selection: pair.global_selection.clone(),
+                relation_ranking,
+                global_selection,
                 fine_frontier: Some(receipt.clone()),
                 fine_execution_evidence,
                 outcome,
@@ -19876,54 +19966,10 @@ fn create_test_audio_alignment_batch_fine_frontier_receipt(
     pair: &PlannedAudioAlignmentBatchPair,
     final_state: AudioAlignmentBatchFineFrontierStateSnapshot,
 ) -> AudioAlignmentBatchFineFrontierReceiptSnapshot {
-    let config = FineFrontierConfig {
-        resolution_margin_micros: AUDIO_ALIGNMENT_BATCH_FINE_FRONTIER_MIN_RESOLUTION_MARGIN_MICROS,
-        overlap_tolerance_ms: u64::try_from(ALIGNMENT_V2_GLOBAL_OVERLAP_TOLERANCE_MS).unwrap(),
-        ..FineFrontierConfig::default()
-    };
-    let inventory_json = canonicalize_v2_cross_language_json(&serde_json::json!([])).unwrap();
-    let proof = final_state != AudioAlignmentBatchFineFrontierStateSnapshot::Failed;
-    seal_audio_alignment_batch_fine_frontier_receipt(
-        AudioAlignmentBatchFineFrontierReceiptSnapshot {
-            contract_version: FINE_FRONTIER_CONTRACT_VERSION,
-            score_version: AUDIO_ALIGNMENT_BATCH_FINE_SCORE_VERSION,
-            inventory_digest: v2_domain_separated_canonical_digest(
-                AUDIO_ALIGNMENT_BATCH_FINE_INVENTORY_DIGEST_DOMAIN,
-                &inventory_json,
-            ),
-            inventory_candidates: Vec::new(),
-            receipt_digest: String::new(),
-            component_ordinal: pair.pair_index + 1,
-            component_pair_ordinals: vec![pair.pair_ordinal],
-            inventory_candidate_count: 0,
-            resolution_margin_micros: config.resolution_margin_micros,
-            overlap_tolerance_ms: config.overlap_tolerance_ms,
-            limits: audio_alignment_batch_fine_limits_snapshot(config),
-            inventory_state_counts: AudioAlignmentBatchFineStateCountsSnapshot::default(),
-            refinement_round_count: 0,
-            evaluated_candidate_count: 0,
-            final_state,
-            resolved: false,
-            selected_candidate_ids: Vec::new(),
-            selected_total_score_micros: None,
-            best_completed: AudioAlignmentBatchFineAssignmentSnapshot {
-                candidate_ids: Vec::new(),
-                total_score_micros: 0,
-            },
-            runner_up_completed: None,
-            optimistic_omitted: None,
-            next_refinement_candidate_ids: Vec::new(),
-            deferred_candidate_count: 0,
-            proof: AudioAlignmentBatchFineResolutionProofSnapshot {
-                beats_runner_up_with_margin: proof,
-                beats_optimistic_omitted_with_margin: proof,
-            },
-            search: AudioAlignmentBatchFineSearchSnapshot {
-                states_visited: 0,
-                expansions_considered: 0,
-                interval_comparisons: 0,
-            },
-        },
+    create_empty_audio_alignment_batch_fine_frontier_receipt(
+        pair.pair_index + 1,
+        vec![pair.pair_ordinal],
+        final_state,
     )
     .unwrap()
 }
@@ -21460,6 +21506,17 @@ fn fail_audio_alignment_batch_worker(
     let entry = jobs
         .get_mut(job_id)
         .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    let failed_pair_ordinal = entry
+        .snapshot
+        .pairs
+        .get(current_pair_index)
+        .map(|pair| pair.pair_ordinal)
+        .ok_or_else(|| "批量音频对齐失败 pair 索引越界。".to_string())?;
+    let failed_receipt = create_empty_audio_alignment_batch_fine_frontier_receipt(
+        1,
+        vec![failed_pair_ordinal],
+        AudioAlignmentBatchFineFrontierStateSnapshot::Failed,
+    )?;
     for (index, pair) in entry.snapshot.pairs.iter_mut().enumerate() {
         if index == current_pair_index
             && matches!(
@@ -21472,6 +21529,8 @@ fn fail_audio_alignment_batch_worker(
             pair.message = "底层媒体进程未能可信收尾；当前 pair 已失败。".to_string();
             pair.relation_ranking = AudioAlignmentBatchRelationRankingSnapshot::failed();
             pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
+            pair.fine_frontier = Some(failed_receipt.clone());
+            pair.fine_execution_evidence = None;
             pair.proposal = None;
             pair.error = Some("受监督媒体进程清理状态不可信。".to_string());
         } else if matches!(
@@ -21547,6 +21606,17 @@ fn fail_audio_alignment_batch_worker_with_error(
     let entry = jobs
         .get_mut(job_id)
         .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    let failed_pair_ordinal = entry
+        .snapshot
+        .pairs
+        .get(current_pair_index)
+        .map(|pair| pair.pair_ordinal)
+        .ok_or_else(|| "批量音频对齐失败 pair 索引越界。".to_string())?;
+    let failed_receipt = create_empty_audio_alignment_batch_fine_frontier_receipt(
+        1,
+        vec![failed_pair_ordinal],
+        AudioAlignmentBatchFineFrontierStateSnapshot::Failed,
+    )?;
     for (index, pair) in entry.snapshot.pairs.iter_mut().enumerate() {
         if index == current_pair_index
             && matches!(
@@ -21559,6 +21629,8 @@ fn fail_audio_alignment_batch_worker_with_error(
             pair.message = safe_message.clone();
             pair.relation_ranking = AudioAlignmentBatchRelationRankingSnapshot::failed();
             pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
+            pair.fine_frontier = Some(failed_receipt.clone());
+            pair.fine_execution_evidence = None;
             pair.proposal = None;
             pair.error = Some(safe_message.clone());
         } else if matches!(
@@ -21601,12 +21673,27 @@ fn invalidate_audio_alignment_batch_after_final_identity_failure(
     let entry = jobs
         .get_mut(job_id)
         .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
-    for pair in &mut entry.snapshot.pairs {
+    let failed_receipts = entry
+        .snapshot
+        .pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| {
+            create_empty_audio_alignment_batch_fine_frontier_receipt(
+                index + 1,
+                vec![pair.pair_ordinal],
+                AudioAlignmentBatchFineFrontierStateSnapshot::Failed,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (pair, failed_receipt) in entry.snapshot.pairs.iter_mut().zip(failed_receipts) {
         pair.status = AudioAlignmentJobStatus::Failed;
         pair.progress = 1.0;
         pair.message = "批次结束前媒体身份复核失败；该 pair 的结果已作废。".to_string();
         pair.relation_ranking = AudioAlignmentBatchRelationRankingSnapshot::failed();
         pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
+        pair.fine_frontier = Some(failed_receipt);
+        pair.fine_execution_evidence = None;
         pair.proposal = None;
         pair.error = Some("批次级 distinct-media 身份绑定失效。".to_string());
     }
@@ -21625,7 +21712,7 @@ fn invalidate_audio_alignment_batch_after_final_identity_failure(
 
 fn invalidate_audio_alignment_batch_after_commit_failure(
     job_id: &str,
-    _internal_error: &str,
+    internal_error: &str,
 ) -> Result<(), String> {
     let mut jobs = audio_alignment_batch_jobs()
         .lock()
@@ -21633,21 +21720,39 @@ fn invalidate_audio_alignment_batch_after_commit_failure(
     let entry = jobs
         .get_mut(job_id)
         .ok_or_else(|| "未找到批量音频对齐任务。".to_string())?;
+    let failed_receipts = entry
+        .snapshot
+        .pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| {
+            create_empty_audio_alignment_batch_fine_frontier_receipt(
+                index + 1,
+                vec![pair.pair_ordinal],
+                AudioAlignmentBatchFineFrontierStateSnapshot::Failed,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let diagnostic_message = format!(
+        "最终媒体身份复核已通过，但 staged 结果未通过证据合同校验；所有结果已作废。拒绝原因：{internal_error}"
+    );
     append_audio_alignment_batch_diagnostic_event_to_entry(
         entry,
         AudioAlignmentBatchDiagnosticLevel::Error,
         "batch.evidence-contract-failed",
         None,
         None,
-        "最终媒体身份复核已通过，但 staged 结果未通过证据合同校验；所有结果已作废。",
+        &diagnostic_message,
         None,
     );
-    for pair in &mut entry.snapshot.pairs {
+    for (pair, failed_receipt) in entry.snapshot.pairs.iter_mut().zip(failed_receipts) {
         pair.status = AudioAlignmentJobStatus::Failed;
         pair.progress = 1.0;
         pair.message = "批次最终证据合同校验失败；该 pair 的结果已作废。".to_string();
         pair.relation_ranking = AudioAlignmentBatchRelationRankingSnapshot::failed();
         pair.global_selection = AudioAlignmentBatchGlobalSelectionSnapshot::failed();
+        pair.fine_frontier = Some(failed_receipt);
+        pair.fine_execution_evidence = None;
         pair.proposal = None;
         pair.error = Some("批次级 staged evidence binding invalid。".to_string());
     }
@@ -26650,6 +26755,60 @@ mod tests {
         assert!(
             validate_audio_alignment_batch_fine_staged_evidence(&receipt, None, &tampered).is_err()
         );
+    }
+
+    #[test]
+    fn v2_resolved_frontier_does_not_publish_an_unselected_conflicting_pair() {
+        let plan =
+            test_plan_with_selected_global_evidence(test_one_source_three_target_batch_plan());
+        let global_selection = &plan.pairs[0].global_selection;
+        let reason = "fine frontier 已解析，但当前 pair 因项目级物理时间区间冲突未被选择。";
+
+        let (failed_ranking, failed_selection, failed_outcome) =
+            create_v2_unselected_fine_staged_outcome(
+                CoreFineFrontierState::Resolved,
+                &plan.pairs[0].relation_ranking,
+                global_selection,
+                reason,
+                || panic!("resolved-but-unselected pair must not construct a review proposal"),
+            );
+        assert_eq!(
+            failed_ranking.state,
+            AudioAlignmentBatchRelationRankingState::Failed
+        );
+        validate_audio_alignment_batch_relation_ranking_evidence(&failed_ranking, false).unwrap();
+        assert_eq!(
+            failed_selection.state,
+            AudioAlignmentBatchGlobalSelectionState::Failed
+        );
+        assert!(!failed_selection.selected);
+        assert!(failed_selection
+            .top_k
+            .iter()
+            .all(|candidate| !candidate.global_selected));
+        assert!(matches!(
+            failed_outcome,
+            StagedAudioAlignmentBatchPairOutcome::Failed(error) if error == reason
+        ));
+
+        let (review_ranking, review_selection, review_outcome) =
+            create_v2_unselected_fine_staged_outcome(
+                CoreFineFrontierState::NoEligibleCandidate,
+                &plan.pairs[0].relation_ranking,
+                global_selection,
+                "没有可自动确认的候选。",
+                || Box::new(test_audio_alignment_batch_proposal("manual review")),
+            );
+        assert_eq!(review_ranking.state, plan.pairs[0].relation_ranking.state);
+        assert_eq!(
+            review_selection.state,
+            AudioAlignmentBatchGlobalSelectionState::Selected
+        );
+        assert!(review_selection.selected);
+        assert!(matches!(
+            review_outcome,
+            StagedAudioAlignmentBatchPairOutcome::Proposal(_)
+        ));
     }
 
     #[test]
@@ -34940,6 +35099,58 @@ mod tests {
         assert!(terminal.pairs[0].proposal.is_some());
         assert_eq!(terminal.pairs[1].status, AudioAlignmentJobStatus::Failed);
         assert!(terminal.pairs[1].proposal.is_none());
+        let failed_receipt = terminal.pairs[1]
+            .fine_frontier
+            .as_ref()
+            .expect("failed pair must expose a parseable fine receipt");
+        assert_eq!(
+            failed_receipt.final_state,
+            AudioAlignmentBatchFineFrontierStateSnapshot::Failed
+        );
+        validate_audio_alignment_batch_fine_frontier_receipt(failed_receipt).unwrap();
+    }
+
+    #[test]
+    fn audio_alignment_batch_contract_failure_is_diagnostic_and_returns_a_valid_terminal_snapshot()
+    {
+        let plan = test_one_source_three_target_batch_plan();
+        let job_id = format!("test-audio-batch-contract-failure-{}", current_time_ms());
+        insert_audio_alignment_batch_job(&job_id, &plan, Arc::new(AtomicBool::new(false))).unwrap();
+
+        invalidate_audio_alignment_batch_after_commit_failure(
+            &job_id,
+            "fine component 的 selected IDs、execution evidence 与总分不闭合。",
+        )
+        .unwrap();
+
+        let terminal = get_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(terminal.status, AudioAlignmentJobStatus::Failed);
+        assert_eq!(terminal.failed_pair_count, terminal.total_pair_count);
+        assert!(terminal
+            .diagnostic_events
+            .iter()
+            .any(|event| event.stage_key == "batch.evidence-contract-failed"
+                && event.message.contains("selected IDs")));
+        for (index, pair) in terminal.pairs.iter().enumerate() {
+            assert_eq!(pair.status, AudioAlignmentJobStatus::Failed);
+            assert!(pair.proposal.is_none());
+            assert!(pair.fine_execution_evidence.is_none());
+            let receipt = pair
+                .fine_frontier
+                .as_ref()
+                .expect("contract failure must publish a valid failed receipt");
+            assert_eq!(receipt.component_ordinal, index + 1);
+            assert_eq!(receipt.component_pair_ordinals, vec![pair.pair_ordinal]);
+            assert_eq!(
+                receipt.final_state,
+                AudioAlignmentBatchFineFrontierStateSnapshot::Failed
+            );
+            validate_audio_alignment_batch_fine_frontier_receipt(receipt).unwrap();
+        }
+        let repeated_cancel = cancel_audio_alignment_batch_job(job_id.clone()).unwrap();
+        assert_eq!(repeated_cancel.status, AudioAlignmentJobStatus::Failed);
+
+        audio_alignment_batch_jobs().lock().unwrap().remove(&job_id);
     }
 
     #[test]

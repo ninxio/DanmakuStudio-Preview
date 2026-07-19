@@ -517,10 +517,15 @@ export function MediaMatchingPanel({
           if (isBatchContextCurrent()) {
             updateTasksFromBatchSnapshot(snapshot);
           }
-        } catch {
+        } catch (cleanupError) {
           cleanupUnconfirmed = true;
-          batchFailure =
+          const cleanupMessage =
+            cleanupError instanceof Error ? cleanupError.message : "无法确认原生任务已停止";
+          const cleanupFailure =
             "原生批次清理状态不确定；已保留任务引用并阻止新任务，必要时请重启应用。";
+          batchFailure = batchFailure
+            ? `${batchFailure}；${cleanupFailure}（${cleanupMessage}）`
+            : `${cleanupFailure}（${cleanupMessage}）`;
         }
       }
       if (
