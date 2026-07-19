@@ -276,6 +276,66 @@ describe("资源面板", () => {
     }
   });
 
+  it("三个素材区支持直接拖放，并用摘要给出下一步", async () => {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn<(object: Blob | MediaSource) => string>((object) =>
+        object instanceof File ? `blob:${object.name}` : "blob:media"
+      )
+    });
+
+    try {
+      render(<AssetPanel section="materials" />);
+      expect(screen.getByTestId("materials-summary")).toHaveTextContent("添加原片");
+
+      fireEvent.drop(screen.getByTestId("targetOriginal-dropzone"), {
+        dataTransfer: {
+          types: ["Files"],
+          files: [new File(["target"], "S01E01.mkv", { type: "video/x-matroska" })]
+        }
+      });
+      fireEvent.drop(screen.getByTestId("bilibiliReference-dropzone"), {
+        dataTransfer: {
+          types: ["Files"],
+          files: [new File(["reference"], "reference.mp4", { type: "video/mp4" })]
+        }
+      });
+      fireEvent.drop(screen.getByTestId("xml-material-dropzone"), {
+        dataTransfer: {
+          types: ["Files"],
+          files: [
+            new File(
+              [
+                '<?xml version="1.0" encoding="UTF-8"?><i><d p="1,1,25,16777215,0,0,u,r">拖入</d></i>'
+              ],
+              "02.xml",
+              { type: "text/xml" }
+            )
+          ]
+        }
+      });
+
+      await waitFor(() => {
+        expect(useEditorStore.getState().project.mediaLibrary).toHaveLength(2);
+        expect(useEditorStore.getState().project.assets).toHaveLength(2);
+      });
+      expect(screen.getByTestId("materials-summary")).toHaveTextContent(
+        "确认 2 个弹幕来源"
+      );
+      expect(screen.getAllByText("文件详情")).toHaveLength(4);
+      expect(
+        screen.getAllByText("文件详情")[0].closest("details")
+      ).not.toHaveAttribute("open");
+    } finally {
+      if (createDescriptor) {
+        Object.defineProperty(URL, "createObjectURL", createDescriptor);
+      } else {
+        Reflect.deleteProperty(URL, "createObjectURL");
+      }
+    }
+  });
+
   it("桌面端批量按钮会把原生多选返回的全部路径按角色导入", async () => {
     const restoreTauri = enableTauriForTest();
     const user = userEvent.setup();

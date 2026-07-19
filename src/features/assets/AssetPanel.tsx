@@ -1,4 +1,5 @@
 import {
+  ArrowRight,
   CircleAlert,
   CircleCheck,
   Clock3,
@@ -203,6 +204,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
   const [alignmentProposalText, setAlignmentProposalText] = useState("");
   const [targetValidationLoading, setTargetValidationLoading] = useState(false);
   const [reconnectMediaId, setReconnectMediaId] = useState<string | null>(null);
+  const [xmlDropActive, setXmlDropActive] = useState(false);
   const targetMediaInputRef = useRef<HTMLInputElement | null>(null);
   const sourceMediaInputRef = useRef<HTMLInputElement | null>(null);
   const reconnectMediaInputRef = useRef<HTMLInputElement | null>(null);
@@ -459,7 +461,32 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
       <div className="thin-scrollbar min-h-0 flex-1 overflow-auto p-3">
         {section === "materials" ? (
           <div className="grid gap-3">
-            <WorkspaceProgressBanner pageId="materials" />
+            <MaterialsSummaryPanel
+              originalCount={targetOriginalMedia.length}
+              referenceCount={bilibiliReferenceMedia.length}
+              xmlCount={project.assets.length}
+              unboundXmlCount={
+                project.assets.filter(
+                  (asset) =>
+                    !findDanmakuSourceBinding(
+                      project.danmakuSourceBindings,
+                      asset.id
+                    )
+                ).length
+              }
+              reconnectCount={project.mediaLibrary.filter(
+                (media) => media.connectionState === "needsReconnect"
+              ).length}
+              onAddOriginal={() => void openMediaImport("targetOriginal")}
+              onAddReference={() => void openMediaImport("bilibiliReference")}
+              onAddXml={() => void openXmlImport()}
+              onReviewBindings={() =>
+                document
+                  .querySelector<HTMLSelectElement>("[data-unbound-xml='true']")
+                  ?.focus()
+              }
+              onContinue={() => setWorkspacePage("matching")}
+            />
             <MediaRoleGuidePanel
               targetCount={targetOriginalMedia.length}
               referenceCount={bilibiliReferenceMedia.length}
@@ -470,6 +497,9 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
               role="targetOriginal"
               mediaItems={targetOriginalMedia}
               onImport={() => void openMediaImport("targetOriginal")}
+              onDropFiles={(files) =>
+                importMediaFiles(files, "targetOriginal")
+              }
               onReconnect={(mediaId) => {
                 setReconnectMediaId(mediaId);
                 reconnectMediaInputRef.current?.click();
@@ -482,23 +512,58 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
               role="bilibiliReference"
               mediaItems={bilibiliReferenceMedia}
               onImport={() => void openMediaImport("bilibiliReference")}
+              onDropFiles={(files) =>
+                importMediaFiles(files, "bilibiliReference")
+              }
               onReconnect={(mediaId) => {
                 setReconnectMediaId(mediaId);
                 reconnectMediaInputRef.current?.click();
               }}
               onDelete={removeMediaReference}
             />
-            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+            <section
+              id="xml-materials"
+              className={`rounded-lg border p-3 text-xs text-slate-300 transition ${
+                xmlDropActive
+                  ? "border-accent-cyan bg-accent-cyan/10"
+                  : "border-panel-line bg-panel-soft"
+              }`}
+              data-testid="xml-material-dropzone"
+              onDragEnter={(event) => {
+                if (event.dataTransfer.types.includes("Files")) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setXmlDropActive(true);
+                }
+              }}
+              onDragOver={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                event.dataTransfer.dropEffect = "copy";
+              }}
+              onDragLeave={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!event.currentTarget.contains(event.relatedTarget as Node)) {
+                  setXmlDropActive(false);
+                }
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setXmlDropActive(false);
+                void importXmlFiles(event.dataTransfer.files);
+              }}
+            >
               <div className="flex items-center justify-between gap-2">
                 <h3 className="text-sm font-medium text-slate-100">弹幕 XML</h3>
-                <TextButton tone="primary" onClick={() => void openXmlImport()}>
+                <TextButton onClick={() => void openXmlImport()}>
                   <ListPlus size={14} />
                   导入 XML
                 </TextButton>
               </div>
               <p className="mt-2 leading-5 text-slate-500">
-                XML 是要被修正和导出的弹幕来源。导入后，请把每个 XML 关联到它来自的 B
-                站参考视频，后续匹配才可靠。桌面端会保留原文件内容收据，用于正式受验证导出。
+                拖入或多选要转换的弹幕 XML，再为每个文件选择它原本对应的参考视频。
               </p>
               {importProgress !== null ? (
                 <div className="mt-2 rounded border border-panel-line bg-black/15 p-2 text-slate-300">
@@ -533,19 +598,18 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                             {asset.fileName}
                           </h4>
                         </div>
-                        <dl className="mt-3 grid gap-1 text-xs text-slate-400">
-                          <Row
-                            label="弹幕数量"
-                            value={asset.items.length.toLocaleString("zh-CN")}
-                          />
-                          <Row label="最早时间" value={formatTimecode(range.earliestMs)} />
-                          <Row label="最晚时间" value={formatTimecode(range.latestMs)} />
-                          <Row label="导入警告" value={asset.warnings.length.toString()} />
-                          <Row
-                            label="原文件验证"
-                            value={asset.sourceReceipt ? "已受验证" : "仅预览"}
-                          />
-                        </dl>
+                        <p className="mt-2 text-[11px] text-slate-500">
+                          {asset.items.length.toLocaleString("zh-CN")} 条弹幕
+                        </p>
+                        <span
+                          className={`mt-2 inline-flex rounded border px-1.5 py-0.5 text-[10px] ${
+                            asset.sourceReceipt
+                              ? "border-accent-green/30 bg-accent-green/10 text-accent-green"
+                              : "border-accent-yellow/30 bg-accent-yellow/10 text-accent-yellow"
+                          }`}
+                        >
+                          {asset.sourceReceipt ? "已受验证" : "仅预览"}
+                        </span>
                         {asset.sourceReceipt ? (
                           <p className="mt-3 rounded border border-accent-green/30 bg-accent-green/10 p-2 text-[11px] leading-5 text-accent-green">
                             已由桌面端核验原始 XML 内容，可用于正式受验证导出。
@@ -561,6 +625,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                             <span className="text-slate-500">弹幕来源视频</span>
                             <select
                               aria-label={`${asset.fileName} 弹幕来源视频`}
+                              data-unbound-xml={sourceBinding ? undefined : "true"}
                               className="h-8 rounded border border-panel-line bg-[#111318] px-2 text-xs text-slate-100"
                               value={sourceBinding?.sourceMediaId ?? ""}
                               onChange={(event) => {
@@ -596,6 +661,28 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                             </p>
                           )}
                         </div>
+                        <details className="mt-3 rounded border border-panel-line/70 bg-black/10">
+                          <summary className="cursor-pointer px-2.5 py-2 text-[11px] text-slate-400 hover:text-slate-200">
+                            文件详情
+                          </summary>
+                          <dl className="grid gap-1 border-t border-panel-line/70 px-2.5 py-2 text-xs text-slate-400">
+                            <Row
+                              label="弹幕数量"
+                              value={asset.items.length.toLocaleString("zh-CN")}
+                            />
+                            <Row label="最早时间" value={formatTimecode(range.earliestMs)} />
+                            <Row label="最晚时间" value={formatTimecode(range.latestMs)} />
+                            <Row label="导入警告" value={asset.warnings.length.toString()} />
+                            <Row
+                              label="原文件验证"
+                              value={
+                                asset.sourceReceipt
+                                  ? "原文件收据有效"
+                                  : "正式导出前需重新导入"
+                              }
+                            />
+                          </dl>
+                        </details>
                         <div className="mt-3 flex flex-wrap justify-end gap-2">
                           <TextButton
                             tone="danger"
@@ -1241,6 +1328,7 @@ function MediaLibrarySection({
   role,
   mediaItems,
   onImport,
+  onDropFiles,
   onReconnect,
   onDelete
 }: {
@@ -1249,11 +1337,45 @@ function MediaLibrarySection({
   role: ProjectMediaRole;
   mediaItems: ProjectMediaReference[];
   onImport: () => void;
+  onDropFiles: (files: FileList) => void;
   onReconnect: (mediaId: string) => void;
   onDelete: (mediaId: string) => void;
 }) {
+  const [dropActive, setDropActive] = useState(false);
   return (
-    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+    <section
+      className={`rounded-lg border p-3 text-xs text-slate-300 transition ${
+        dropActive
+          ? "border-accent-cyan bg-accent-cyan/10"
+          : "border-panel-line bg-panel-soft"
+      }`}
+      data-testid={`${role}-dropzone`}
+      onDragEnter={(event) => {
+        if (event.dataTransfer.types.includes("Files")) {
+          event.preventDefault();
+          event.stopPropagation();
+          setDropActive(true);
+        }
+      }}
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "copy";
+      }}
+      onDragLeave={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.currentTarget.contains(event.relatedTarget as Node)) {
+          setDropActive(false);
+        }
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setDropActive(false);
+        onDropFiles(event.dataTransfer.files);
+      }}
+    >
       <div className="flex items-center gap-2">
         <Video
           size={16}
@@ -1266,7 +1388,7 @@ function MediaLibrarySection({
       </div>
       <p className="mt-2 leading-5 text-slate-500">{description}</p>
       <div className="mt-3 flex flex-wrap gap-2">
-        <TextButton tone="primary" onClick={onImport}>
+        <TextButton onClick={onImport}>
           <FolderOpen size={14} />
           {role === "targetOriginal" ? "批量导入原片素材" : "批量导入 B 站参考素材"}
         </TextButton>
@@ -1283,30 +1405,41 @@ function MediaLibrarySection({
                   className="min-w-0 flex-1 truncate text-sm text-slate-100"
                   title={media.name}
                 >
-                  {media.name}
+                  {media.fileName}
                 </span>
                 <span className="shrink-0 rounded border border-panel-line bg-black/25 px-1.5 py-0.5 text-[11px] text-slate-400">
                   {formatMediaConnectionState(media)}
                 </span>
               </div>
-              <dl className="mt-2 grid gap-1 text-slate-400">
-                <Row label="文件" value={media.fileName} />
-                <Row label="角色" value={formatMediaRole(media.role)} />
-                <Row
-                  label="时长"
-                  value={
-                    media.durationMs === null ? "时长未知" : formatTimecode(media.durationMs)
-                  }
-                />
-                <Row label="来源" value={media.sourceSummary} />
-                <Row label="引用" value={formatProjectMediaReferenceKind(media)} />
-              </dl>
+              <p className="mt-1 text-[11px] text-slate-500">
+                {media.durationMs === null
+                  ? "时长将在分析时读取"
+                  : formatTimecode(media.durationMs)}
+              </p>
               {media.connectionState === "needsReconnect" ? (
                 <p className="mt-2 rounded border border-accent-yellow/30 bg-accent-yellow/10 p-2 text-[11px] leading-5 text-accent-yellow">
                   此素材使用的是临时浏览器引用，重新打开项目后需要重新选择原文件。项目中的绑定和时间段信息仍然保留。
                   自动匹配需要桌面端持久本地路径；请删除此临时引用后，使用本区的批量导入按钮重新加入。
                 </p>
               ) : null}
+              <details className="mt-2 rounded border border-panel-line/70 bg-black/10">
+                <summary className="cursor-pointer px-2 py-1.5 text-[11px] text-slate-400 hover:text-slate-200">
+                  文件详情
+                </summary>
+                <dl className="grid gap-1 border-t border-panel-line/70 px-2 py-2 text-slate-400">
+                  <Row label="角色" value={formatMediaRole(media.role)} />
+                  <Row
+                    label="时长"
+                    value={
+                      media.durationMs === null
+                        ? "时长未知"
+                        : formatTimecode(media.durationMs)
+                    }
+                  />
+                  <Row label="来源" value={media.sourceSummary} />
+                  <Row label="引用" value={formatProjectMediaReferenceKind(media)} />
+                </dl>
+              </details>
               <div className="mt-2 flex flex-wrap justify-end gap-2">
                 {media.connectionState === "needsReconnect" ||
                 media.referenceKind === "browserFile" ? (
@@ -1337,6 +1470,147 @@ function MediaLibrarySection({
   );
 }
 
+function MaterialsSummaryPanel({
+  originalCount,
+  referenceCount,
+  xmlCount,
+  unboundXmlCount,
+  reconnectCount,
+  onAddOriginal,
+  onAddReference,
+  onAddXml,
+  onReviewBindings,
+  onContinue
+}: {
+  originalCount: number;
+  referenceCount: number;
+  xmlCount: number;
+  unboundXmlCount: number;
+  reconnectCount: number;
+  onAddOriginal: () => void;
+  onAddReference: () => void;
+  onAddXml: () => void;
+  onReviewBindings: () => void;
+  onContinue: () => void;
+}) {
+  const nextAction =
+    originalCount === 0
+      ? {
+          label: "添加原片",
+          detail: "先选择最终要观看的完整视频。",
+          run: onAddOriginal
+        }
+      : referenceCount === 0
+        ? {
+            label: "添加参考视频",
+            detail: "参考视频用于确定弹幕原本的时间位置。",
+            run: onAddReference
+          }
+        : xmlCount === 0
+          ? {
+              label: "添加弹幕 XML",
+              detail: "可一次选择一集或多集 XML。",
+              run: onAddXml
+            }
+          : unboundXmlCount > 0
+            ? {
+                label: `确认 ${unboundXmlCount} 个弹幕来源`,
+                detail: "告诉应用每个 XML 原本对应哪个参考视频。",
+                run: onReviewBindings
+              }
+            : {
+                label: "进入智能匹配",
+                detail: "素材已经齐全，可以开始分析时间关系。",
+                run: onContinue
+              };
+  const ready =
+    originalCount > 0 &&
+    referenceCount > 0 &&
+    xmlCount > 0 &&
+    unboundXmlCount === 0 &&
+    reconnectCount === 0;
+
+  return (
+    <section
+      className="rounded-xl border border-panel-line bg-[#151920] p-4"
+      aria-label="素材准备摘要"
+      data-testid="materials-summary"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            {ready ? (
+              <CircleCheck size={18} className="text-accent-green" />
+            ) : (
+              <Layers size={18} className="text-accent-cyan" />
+            )}
+            <h2 className="text-base font-semibold text-slate-100">
+              {ready ? "素材已经准备好" : "准备项目素材"}
+            </h2>
+          </div>
+          <p className="mt-2 text-xs leading-5 text-slate-500">
+            {nextAction.detail}
+          </p>
+        </div>
+        <TextButton tone="primary" onClick={nextAction.run}>
+          {nextAction.label}
+          <ArrowRight size={14} />
+        </TextButton>
+      </div>
+      <div className="mt-4 grid grid-cols-3 gap-2">
+        <MaterialCount label="原片" count={originalCount} ready={originalCount > 0} />
+        <MaterialCount
+          label="参考视频"
+          count={referenceCount}
+          ready={referenceCount > 0}
+        />
+        <MaterialCount label="弹幕 XML" count={xmlCount} ready={xmlCount > 0} />
+      </div>
+      {unboundXmlCount > 0 || reconnectCount > 0 ? (
+        <div className="mt-3 grid gap-1.5 text-[11px]">
+          {unboundXmlCount > 0 ? (
+            <p className="flex items-center gap-2 text-accent-yellow">
+              <CircleAlert size={13} />
+              {unboundXmlCount} 个 XML 还没有选择参考视频
+            </p>
+          ) : null}
+          {reconnectCount > 0 ? (
+            <p className="flex items-center gap-2 text-accent-yellow">
+              <CircleAlert size={13} />
+              {reconnectCount} 个视频需要重新连接本地文件
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function MaterialCount({
+  label,
+  count,
+  ready
+}: {
+  label: string;
+  count: number;
+  ready: boolean;
+}) {
+  return (
+    <div className="rounded-lg border border-panel-line/70 bg-black/15 px-3 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] text-slate-500">{label}</span>
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${
+            ready ? "bg-accent-green" : "bg-slate-600"
+          }`}
+          aria-hidden="true"
+        />
+      </div>
+      <div className="mt-1 text-sm font-semibold text-slate-200">{count}</div>
+    </div>
+  );
+}
+
 function MediaRoleGuidePanel({
   targetCount,
   referenceCount
@@ -1345,20 +1619,24 @@ function MediaRoleGuidePanel({
   referenceCount: number;
 }) {
   return (
-    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
-      <div className="flex items-center gap-2">
-        <Video size={16} className="text-accent-cyan" />
+    <details className="rounded-lg border border-panel-line bg-panel-soft text-xs text-slate-300">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-slate-400 hover:text-slate-200">
+        <Video size={15} className="text-accent-cyan" />
+        <span className="font-medium">了解三类素材的关系</span>
+        <span className="ml-auto text-[10px] text-slate-600">说明</span>
+      </summary>
+      <div className="border-t border-panel-line px-3 py-3">
         <h3 className="text-sm font-medium text-slate-100">视频来源</h3>
+        <p className="mt-2 leading-5 text-slate-500">
+          按四页动线工作：先在素材页导入并绑定，再在匹配页标出来源段，最后在导出页按原片分集导出。视频不嵌入项目文件。
+        </p>
+        <dl className="mt-3 grid gap-2">
+          <Row label="原片素材" value={`${targetCount} 个`} />
+          <Row label="B 站参考" value={`${referenceCount} 个`} />
+          <Row label="关系" value="XML → 参考视频 → 来源段 → 原片" />
+        </dl>
       </div>
-      <p className="mt-2 leading-5 text-slate-500">
-        按四页动线工作：先在素材页导入并绑定，再在匹配页标出来源段，最后在导出页按原片分集导出。视频不嵌入项目文件。
-      </p>
-      <dl className="mt-3 grid gap-2">
-        <Row label="原片素材" value={`${targetCount} 个`} />
-        <Row label="B 站参考" value={`${referenceCount} 个`} />
-        <Row label="关系" value="XML → 参考视频 → 来源段 → 原片" />
-      </dl>
-    </section>
+    </details>
   );
 }
 

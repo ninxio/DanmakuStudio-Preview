@@ -124,6 +124,54 @@ test("易用化阶段 1 的四步壳层在最小视口可用并记住面板布�
   );
 });
 
+test("易用化阶段 2 可从空项目准备三类素材并进入智能匹配", async ({
+  page
+}) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/");
+
+  await expect(page.getByTestId("materials-summary")).toContainText("添加原片");
+  await page.getByLabel("导入原片素材文件").setInputFiles({
+    name: "S01E01.mkv",
+    mimeType: "video/x-matroska",
+    buffer: Buffer.from("target-video")
+  });
+  await expect(page.getByTestId("materials-summary")).toContainText(
+    "添加参考视频"
+  );
+
+  await page.getByLabel("导入 B 站参考素材文件").setInputFiles({
+    name: "bilibili-reference.mp4",
+    mimeType: "video/mp4",
+    buffer: Buffer.from("reference-video")
+  });
+  await expect(page.getByTestId("materials-summary")).toContainText(
+    "添加弹幕 XML"
+  );
+
+  await page.getByLabel("导入弹幕 XML 文件").setInputFiles({
+    name: "episode.xml",
+    mimeType: "text/xml",
+    buffer: Buffer.from(
+      '<?xml version="1.0" encoding="UTF-8"?><i><d p="1,1,25,16777215,0,0,u,r">测试</d></i>',
+      "utf8"
+    )
+  });
+  await expect(page.getByTestId("materials-summary")).toContainText(
+    "确认 1 个弹幕来源"
+  );
+
+  await page
+    .getByLabel("episode.xml 弹幕来源视频")
+    .selectOption({ label: "bilibili-reference" });
+  await expect(page.getByTestId("materials-summary")).toContainText(
+    "素材已经准备好"
+  );
+
+  await page.getByRole("button", { name: "进入智能匹配" }).click();
+  await expect(page.getByTestId("workspace-matching")).toBeVisible();
+});
+
 function roundMilliseconds(value: number): number {
   return Math.round(value * 10) / 10;
 }
