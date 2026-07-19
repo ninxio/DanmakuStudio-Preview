@@ -3,6 +3,8 @@ dist
 dist-ssr
 src-tauri/target
 src-tauri/target-*
+src-tauri/artifacts
+src-tauri/src-tauri
 src-tauri/gen
 .vite
 .DS_Store
@@ -13,13 +15,3 @@ artifacts/*.err
 artifacts/*.log
 playwright-report
 test-results
-
-# AI assistant local context / planning docs
-AGENTS.md
-agents.md
-progress.md
-docs/player-goal.md
-docs/PLAN.md
-docs/goals/
-.agents/
-.codex/
