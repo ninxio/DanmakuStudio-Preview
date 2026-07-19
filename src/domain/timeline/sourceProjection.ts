@@ -29,8 +29,9 @@ import type { Milliseconds } from "../shared/time";
  * 已验证时间图是正式投影路径：matched 段执行整数毫秒分段仿射插值，sourceOnly 不投影，
  * targetOnly 通过后续 matched 段的目标边界产生跳变，ambiguous 会阻断导出。单条调整最后叠加。
  *
- * ignored 段内的弹幕不投影；sourceOnly 内弹幕属于时间图明确舍弃的内容，单独计数且不触发
- * “来源段未覆盖”闸门。未被任何有效映射覆盖的弹幕计入 unexpectedUnmappedItemCount。
+ * ignored 段内的弹幕不投影；sourceOnly 内弹幕属于时间图明确舍弃的内容，单独计数。未被任何
+ * 有效映射覆盖的弹幕计入 unexpectedUnmappedItemCount 并提示用户，但数量本身不阻断导出：
+ * 原 XML 可以合法地长于当前已确认、准备导出的来源范围。
  * 本模块不修改原始 XML 数据，仅产出投影结果。
  */
 
@@ -354,13 +355,6 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     (itemKey) => !mappedItemKeys.has(itemKey)
   ).length;
   const unmappedItemCount = unexpectedUnmappedItemCount + sourceOnlyItemCount;
-  const nonIgnoredItemCount = Math.max(
-    0,
-    project.assets.reduce((count, asset) => count + asset.items.length, 0) -
-      ignoredItemCount -
-      sourceOnlyItemCount
-  );
-  const unmappedErrorThreshold = Math.max(5, nonIgnoredItemCount * 0.01);
   if (sourceOnlyItemCount > 0) {
     issues.push({
       id: "source-only-items",
@@ -370,16 +364,11 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     });
   }
   if (unexpectedUnmappedItemCount > 0) {
-    const exceedsThreshold = unexpectedUnmappedItemCount > unmappedErrorThreshold;
     issues.push({
       id: "unmapped-items",
-      severity: exceedsThreshold ? "error" : "warning",
+      severity: "warning",
       segmentId: null,
-      message: `${unexpectedUnmappedItemCount} 条弹幕不在任何来源段内，不会被导出。${
-        exceedsThreshold
-          ? `已超过非忽略弹幕的安全阈值 ${formatCoverageThreshold(unmappedErrorThreshold)} 条，导出已阻断。`
-          : "如需保留，请补充正片来源段。"
-      }`
+      message: `${unexpectedUnmappedItemCount} 条弹幕不在任何已确认来源段内，本次不会导出并已计入未映射统计。原 XML 可以长于当前导出范围，此项不会阻断导出；如需保留这些弹幕，请补充对应来源段。`
     });
   }
 
@@ -402,10 +391,6 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     unexpectedUnmappedItemCount,
     unmappedItemCount
   };
-}
-
-function formatCoverageThreshold(value: number): string {
-  return Number.isInteger(value) ? value.toString() : value.toFixed(2);
 }
 
 function findOverlappingProjectionSegments(

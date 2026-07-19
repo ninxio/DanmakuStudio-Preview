@@ -3997,7 +3997,7 @@ async function exportProjectionGroups(
   }
 }
 
-function ProjectionExportPanel({
+export function ProjectionExportPanel({
   projection,
   project,
   onGoMatching

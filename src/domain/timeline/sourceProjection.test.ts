@@ -740,7 +740,7 @@ describe("projectDanmakuToTargets", () => {
     expect(result.status).toBe("blocked");
   });
 
-  it("未覆盖非忽略弹幕超过五条或总量百分之一时阻断导出", () => {
+  it("大量未覆盖弹幕只计入警告，不因数量阻断合法来源段导出", () => {
     const project = createSingleSegmentProject(
       [1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 11_000, 12_000, 13_000, 14_000, 15_000, 16_000],
       10_000
@@ -758,8 +758,11 @@ describe("projectDanmakuToTargets", () => {
     const result = projectDanmakuToTargets(project);
 
     expect(result.unmappedItemCount).toBe(6);
-    expect(result.issues.find((issue) => issue.id === "unmapped-items")?.severity).toBe("error");
-    expect(result.status).toBe("blocked");
+    const unmappedIssue = result.issues.find((issue) => issue.id === "unmapped-items");
+    expect(unmappedIssue?.severity).toBe("warning");
+    expect(unmappedIssue?.message).toContain("此项不会阻断导出");
+    expect(unmappedIssue?.message).not.toContain("安全阈值");
+    expect(result.status).toBe("readyWithWarnings");
   });
 
   it("已验证时间图在媒体身份快照变化后立即失效", () => {

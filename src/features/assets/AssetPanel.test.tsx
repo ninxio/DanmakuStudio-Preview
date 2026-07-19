@@ -13,14 +13,20 @@ import {
   type ProjectMediaReference,
   type ProjectMediaRole
 } from "../../domain/project/types";
+import type { SourceProjectionResult } from "../../domain/timeline/sourceProjection";
 import {
   pickAlignmentMediaPath,
   pickMediaPaths,
   pickXmlPaths
 } from "../../infrastructure/file-system/nativeDialogs";
+import {
+  clearAppSettings,
+  DEFAULT_APP_SETTINGS,
+  saveAppSettings
+} from "../../infrastructure/settings/appSettings";
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import { useEditorStore } from "../../stores/editorStore";
-import { AssetPanel } from "./AssetPanel";
+import { AssetPanel, ProjectionExportPanel } from "./AssetPanel";
 
 const nativeXmlMocks = vi.hoisted(() => ({
   importPaths: vi.fn()
@@ -38,6 +44,7 @@ vi.mock("../../infrastructure/xml/nativeXmlReceipt", () => ({
 
 describe("资源面板", () => {
   beforeEach(() => {
+    clearAppSettings();
     vi.mocked(pickAlignmentMediaPath).mockReset();
     vi.mocked(pickMediaPaths).mockReset();
     vi.mocked(pickXmlPaths).mockReset();
@@ -477,6 +484,67 @@ describe("资源面板", () => {
     expect(screen.queryByLabelText("用户名")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("密码")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "登录" })).not.toBeInTheDocument();
+  });
+
+  it("大量未覆盖弹幕只显示提示，不禁用已配置目录的分集导出", () => {
+    const restoreTauri = enableTauriForTest();
+    const project = useEditorStore.getState().project;
+    const item = project.assets[0].items[0];
+    const projection: SourceProjectionResult = {
+      status: "readyWithWarnings",
+      groups: [
+        {
+          targetMediaId: "target-export",
+          targetName: "目标原片",
+          targetFileName: "target.mkv",
+          episodeLabel: "第 1 集",
+          exportFileName: "target.xml",
+          segments: [],
+          entries: [{ item, finalTimeMs: 0, segmentId: "segment-export" }],
+          disabledCount: 0,
+          appliedRules: [],
+          warnings: []
+        }
+      ],
+      issues: [
+        {
+          id: "unmapped-items",
+          severity: "warning",
+          segmentId: null,
+          message:
+            "6551 条弹幕不在任何已确认来源段内，本次不会导出并已计入未映射统计。原 XML 可以长于当前导出范围，此项不会阻断导出；如需保留这些弹幕，请补充对应来源段。"
+        }
+      ],
+      contentSegmentCount: 1,
+      ignoredSegmentCount: 0,
+      projectedItemCount: 1,
+      ignoredItemCount: 0,
+      sourceOnlyItemCount: 0,
+      unexpectedUnmappedItemCount: 6551,
+      unmappedItemCount: 6551
+    };
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      export: { defaultDirectory: "D:\\exports" }
+    });
+
+    try {
+      render(
+        <ProjectionExportPanel
+          projection={projection}
+          project={project}
+          onGoMatching={() => undefined}
+        />
+      );
+
+      expect(screen.getByText("可导出（有提示）")).toBeInTheDocument();
+      expect(screen.getByText("6,551 条")).toBeInTheDocument();
+      expect(screen.getByText(/此项不会阻断导出/)).toBeInTheDocument();
+      expect(screen.queryByText(/安全阈值/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "导出全部分集 XML" })).toBeEnabled();
+    } finally {
+      restoreTauri();
+    }
   });
 
   it("存在目标原片时禁用所有不消费时间图的导出旁路", () => {
