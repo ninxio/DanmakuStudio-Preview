@@ -1598,7 +1598,7 @@ function MediaMatchCandidateCard({
 
   return (
     <article
-      className="rounded border border-panel-line bg-[#111318] p-3"
+      className="performance-list-item rounded border border-panel-line bg-[#111318] p-3"
       data-testid="media-match-candidate"
       id={`media-match-candidate-${candidate.id}`}
       tabIndex={-1}

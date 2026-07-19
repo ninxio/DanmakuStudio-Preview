@@ -168,6 +168,12 @@ test("易用化阶段 2 可从空项目准备三类素材并进入智能匹配",
     "素材已经准备好"
   );
 
+  if (process.env.DANMAKU_CAPTURE_DOCS === "1") {
+    await page.screenshot({
+      path: resolve("docs", "images", "danmaku-studio-materials.png")
+    });
+  }
+
   await page.getByRole("button", { name: "进入智能匹配" }).click();
   await expect(page.getByTestId("workspace-matching")).toBeVisible();
   await expect(page.getByTestId("matching-summary")).toBeVisible();
@@ -210,6 +216,12 @@ test("易用化阶段 4 在校准工作区完成常用非破坏性修复", async
   await overview.getByLabel("版本差异秒数").fill("-1.5");
   await overview.getByRole("button", { name: "保存版本差异" }).click();
   await expect(page.getByTestId("status-bar")).toContainText("已标记版本差异");
+
+  if (process.env.DANMAKU_CAPTURE_DOCS === "1") {
+    await page.screenshot({
+      path: resolve("docs", "images", "danmaku-studio-calibration.png")
+    });
+  }
 });
 
 function roundMilliseconds(value: number): number {

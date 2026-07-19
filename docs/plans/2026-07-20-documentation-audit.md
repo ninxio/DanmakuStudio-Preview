@@ -1,6 +1,6 @@
 # 项目文档体系审计与重写方案
 
-状态：方案存档，尚未整体实施
+状态：方案存档；阶段 6 已完成用户侧与日常开发文档实施
 
 日期：2026-07-20
 
@@ -138,3 +138,14 @@ README 不应包含：
 - 文档中的所有用户可见入口在当前应用真实存在。
 - 旧 `progress.md` 仍可从 Git 历史读取。
 - Markdown 链接、命令、截图与版本号经过自动或人工检查。
+
+## 2026-07-20 实施结果
+
+- 根 README 已改为用户优先，不再承载 C137、Gold、HMAC 和证据链实现流水。
+- 已建立 `docs/README.md`、`USER_GUIDE.md`、`TROUBLESHOOTING.md`、
+  `PRIVACY_AND_DATA.md`、`VALIDATION.md` 与根 `CHANGELOG.md`。
+- `AGENTS.md` 和 `progress.md` 继续保持短上下文职责，历史仍由 Git 与
+  `checkpoint/...` 标签恢复。
+- 已加入不含本地绝对路径的素材页和校准页正式截图。
+- 现有架构与打包长文档仍保留为定点读取资料；后续只有在对应核心模块发生实质变化时，
+  才继续拆分 internals，避免为整理而制造重复文档。

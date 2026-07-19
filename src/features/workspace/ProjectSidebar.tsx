@@ -86,7 +86,7 @@ export function ProjectSidebar({
                 return (
                   <li
                     key={episode.id}
-                    className="rounded-md border border-transparent bg-white/[0.025] px-2.5 py-2"
+                    className="performance-list-item rounded-md border border-transparent bg-white/[0.025] px-2.5 py-2"
                   >
                     <div className="flex items-center gap-2">
                       <span className="w-8 shrink-0 font-mono text-[11px] text-slate-500">

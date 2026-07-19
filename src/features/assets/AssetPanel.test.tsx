@@ -536,6 +536,7 @@ describe("资源面板", () => {
     render(<AssetPanel section="export" />);
 
     expect(screen.queryByText("Emby 时长")).not.toBeInTheDocument();
+    await user.click(screen.getByText("兼容导出方式（单集或旧项目）"));
     await user.click(screen.getByRole("button", { name: /按文件名分 P 合并导出/ }));
     expect(screen.getByText("Emby 时长")).toBeInTheDocument();
     expect(screen.getByLabelText("搜索")).toBeInTheDocument();
@@ -676,7 +677,7 @@ describe("资源面板", () => {
     }
   });
 
-  it("存在目标原片时禁用所有不消费时间图的导出旁路", () => {
+  it("存在目标原片时禁用所有不消费时间图的导出旁路", async () => {
     const project = useEditorStore.getState().project;
     const asset = project.assets[0];
     useEditorStore.setState({
@@ -703,7 +704,9 @@ describe("资源面板", () => {
       }
     });
 
+    const user = userEvent.setup();
     render(<AssetPanel section="export" />);
+    await user.click(screen.getByText("兼容导出方式（单集或旧项目）"));
 
     expect(screen.getByText(/只可使用上方「按原片分集导出」/)).toBeInTheDocument();
     expect(screen.getByText(/高精度分集导出必须先在设置中选择桌面导出文件夹/)).toBeInTheDocument();
@@ -744,6 +747,7 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel section="export" />);
+    await user.click(screen.getByText("兼容导出方式（单集或旧项目）"));
     await user.click(screen.getByRole("button", { name: /按文件名分 P 合并导出/ }));
 
     const workbench = screen.getByRole("region", { name: "剧集工作台" });
@@ -780,6 +784,7 @@ describe("资源面板", () => {
     });
 
     render(<AssetPanel section="export" />);
+    await user.click(screen.getByText("兼容导出方式（单集或旧项目）"));
     await user.click(screen.getByRole("button", { name: /按文件名分 P 合并导出/ }));
 
     const bindingPanel = screen.getByRole("region", { name: "逐集目标绑定" });
@@ -1420,6 +1425,7 @@ describe("资源面板", () => {
       });
 
       render(<AssetPanel section="export" />);
+      await user.click(screen.getByText("兼容导出方式（单集或旧项目）"));
       await user.click(screen.getByRole("button", { name: /按文件名分 P 合并导出/ }));
       await user.click(screen.getByRole("button", { name: "导出分集 XML" }));
 
@@ -1484,6 +1490,7 @@ describe("资源面板", () => {
       });
 
       render(<AssetPanel section="export" />);
+      await user.click(screen.getByText("兼容导出方式（单集或旧项目）"));
       await user.click(screen.getByRole("button", { name: /按文件名分 P 合并导出/ }));
       await user.click(screen.getByRole("button", { name: "导出分集 XML" }));
 

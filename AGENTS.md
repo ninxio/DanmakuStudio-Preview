@@ -6,6 +6,7 @@
 - 先读本文件和根目录 `progress.md`；只读取与当前任务直接相关的文件。
 - 不默认遍历 `artifacts/`、构建目录、测试输出、Git 历史或旧目标。需要历史证据时按 `docs/DEVELOPMENT.md` 定点查询。
 - 保留用户已有改动；提交前检查暂存区，只纳入当前阶段文件。
+- 用户用法查 `README.md` / `docs/USER_GUIDE.md`，故障查 `docs/TROUBLESHOOTING.md`，架构、验证和打包分别定点读取对应文档；`docs/plans/` 不属于默认上下文。
 
 ## 产品边界
 

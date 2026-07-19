@@ -163,8 +163,12 @@ import {
   validateExportedXml
 } from "../../infrastructure/xml/bilibiliXml";
 import { WorkspaceProgressBanner } from "../workspace/WorkspaceProgressBanner";
-import { MediaMatchingPanel } from "../matching/MediaMatchingPanel";
 import { useEditorStore, type EditorStatus } from "../../stores/editorStore";
+
+const MediaMatchingPanel = lazy(async () => {
+  const module = await import("../matching/MediaMatchingPanel");
+  return { default: module.MediaMatchingPanel };
+});
 
 const RealMediaBenchmarkPanel = lazy(async () => {
   const module = await import("../matching/RealMediaBenchmarkPanel");
@@ -589,7 +593,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                     return (
                       <article
                         key={asset.id}
-                        className="rounded border border-panel-line bg-[#111318] p-3"
+                        className="performance-list-item rounded border border-panel-line bg-[#111318] p-3"
                         data-testid="asset-card"
                       >
                         <div className="flex items-center gap-2">
@@ -836,7 +840,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 return (
                   <article
                     key={asset.id}
-                    className="rounded border border-panel-line bg-panel-soft p-3"
+                    className="performance-list-item rounded border border-panel-line bg-panel-soft p-3"
                     data-testid="asset-card"
                   >
                     <div className="flex items-center gap-2">
@@ -947,10 +951,18 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
             </section>
             {project.assets.length > 0 ? (
               <>
-                <MediaMatchingPanel
-                  project={project}
-                  suspectedCutCandidates={suspectedCutCandidates}
-                />
+                <Suspense
+                  fallback={
+                    <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-500">
+                      正在载入智能匹配工作区…
+                    </section>
+                  }
+                >
+                  <MediaMatchingPanel
+                    project={project}
+                    suspectedCutCandidates={suspectedCutCandidates}
+                  />
+                </Suspense>
                 <details className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
                   <summary className="cursor-pointer text-sm font-medium text-slate-100">
                     手动补充或精修来源段
@@ -1087,19 +1099,22 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
               project={project}
               onGoMatching={() => setWorkspacePage("matching")}
             />
-            <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
-              <h3 className="text-sm font-medium text-slate-100">其他导出方式</h3>
-              <p className="mt-2 leading-5 text-slate-500">
+            <details className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
+              <summary className="cursor-pointer text-sm font-medium text-slate-200">
+                兼容导出方式（单集或旧项目）
+              </summary>
+              <div className="mt-2">
+                <p className="leading-5 text-slate-500">
                 以下为单文件或传统分 P
                 合并导出，不依赖来源段投影。多集场景请优先使用上方「按原片分集导出」。
-              </p>
-              {projectionOnlyExport ? (
-                <p className="mt-2 rounded border border-accent-red/30 bg-accent-red/10 p-2 leading-5 text-accent-red">
-                  当前项目已包含目标原片或时间映射。为避免导出错位
-                  XML，只可使用上方「按原片分集导出」。
                 </p>
-              ) : null}
-            </section>
+                {projectionOnlyExport ? (
+                  <p className="mt-2 rounded border border-accent-red/30 bg-accent-red/10 p-2 leading-5 text-accent-red">
+                    当前项目已包含目标原片或时间映射。为避免导出错位
+                    XML，只可使用上方「按原片分集导出」。
+                  </p>
+                ) : null}
+              </div>
             <section className="rounded border border-panel-line bg-panel-soft p-3 text-xs text-slate-300">
               <h3 className="text-sm font-medium text-slate-100">
                 导出当前编辑时间轴（单文件）
@@ -1232,6 +1247,7 @@ export function AssetPanel({ section }: { section: AssetPanelSection }) {
                 value={new Date(project.updatedAt).toLocaleString("zh-CN")}
               />
             </div>
+            </details>
           </div>
         ) : null}
       </div>
@@ -4759,7 +4775,7 @@ function ProjectionGroupRow({ group }: { group: TargetProjectionGroup }) {
   const totalGapMs = group.appliedRules.reduce((sum, rule) => sum + rule.gapMs, 0);
   return (
     <article
-      className="rounded border border-panel-line bg-[#111318] p-2"
+      className="performance-list-item rounded border border-panel-line bg-[#111318] p-2"
       data-testid="projection-group"
     >
       <div className="flex items-center gap-2">

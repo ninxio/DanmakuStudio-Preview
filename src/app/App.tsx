@@ -5,7 +5,6 @@ import { AssetPanel } from "../features/assets/AssetPanel";
 import { CalibrationOverview } from "../features/editor/CalibrationOverview";
 import { EditorToolbar } from "../features/editor/EditorToolbar";
 import { KeyboardShortcuts } from "../features/editor/KeyboardShortcuts";
-import { ExportDialog } from "../features/export/ExportDialog";
 import { InspectorPanel } from "../features/inspector/InspectorPanel";
 import { PreviewPanel } from "../features/preview/PreviewPanel";
 import { TimelinePanel } from "../features/timeline/TimelinePanel";
@@ -27,7 +26,12 @@ import {
 } from "../infrastructure/settings/appLayoutSettings";
 import { useEditorStore } from "../stores/editorStore";
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+
+const ExportDialog = lazy(async () => {
+  const module = await import("../features/export/ExportDialog");
+  return { default: module.ExportDialog };
+});
 
 type ResizeTarget = "left" | "right" | "timeline";
 
@@ -43,6 +47,7 @@ export function App() {
   const status = useEditorStore((state) => state.status);
   const project = useEditorStore((state) => state.project);
   const importProgress = useEditorStore((state) => state.importProgress);
+  const exportDraft = useEditorStore((state) => state.exportDraft);
   const workspacePage = useEditorStore((state) => state.workspacePage);
   const setWorkspacePage = useEditorStore((state) => state.setWorkspacePage);
   const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
@@ -402,7 +407,11 @@ export function App() {
         progress={importProgress}
         onAction={runStatusAction}
       />
-      <ExportDialog />
+      {exportDraft ? (
+        <Suspense fallback={null}>
+          <ExportDialog />
+        </Suspense>
+      ) : null}
     </div>
   );
 }

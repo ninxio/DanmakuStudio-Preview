@@ -300,6 +300,7 @@ test("核心编辑流程可导入、编辑、导出并重新导入 XML", async (
   await expect(cutGapInput).toHaveValue("12000");
 
   await page.getByTestId("workspace-nav-export").click();
+  await page.getByText("兼容导出方式（单集或旧项目）").click();
   await page.getByRole("button", { name: "预览并导出单个 XML" }).click();
   await expect(page.getByTestId("export-dialog")).toContainText("导出 XML 摘要");
   await expect(page.getByTestId("export-dialog")).toContainText("导出前检查");
@@ -377,6 +378,7 @@ test("导出前会阻断必须处理的问题", async ({ page }) => {
   await page.getByTestId("project-input").setInputFiles(blockedProjectPath);
   await expect(page.getByTestId("status-bar")).toContainText("已打开旧版项目");
   await page.getByTestId("workspace-nav-export").click();
+  await page.getByText("兼容导出方式（单集或旧项目）").click();
   await page.getByRole("button", { name: "预览并导出单个 XML" }).click();
   await expect(page.getByTestId("status-bar")).toContainText(
     "导出前检查未通过：片段引用了缺失资源"
@@ -416,6 +418,7 @@ test("导出前检查和导出摘要会展示负时间风险", async ({ page }) 
   await page.getByLabel("关闭设置").click();
 
   await page.getByTestId("workspace-nav-export").click();
+  await page.getByText("兼容导出方式（单集或旧项目）").click();
   const projectHealthPanel = page.getByTestId("project-health-panel");
   await expect(projectHealthPanel).toContainText("有弹幕会被挤到 0 秒");
   await expect(projectHealthPanel).toContainText("第一条滚动弹幕");

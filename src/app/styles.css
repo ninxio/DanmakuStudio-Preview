@@ -49,6 +49,11 @@ textarea:focus-visible {
   image-rendering: auto;
 }
 
+.performance-list-item {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 9rem;
+}
+
 .app-shell {
   --workspace-gutter: 0.75rem;
   background:
