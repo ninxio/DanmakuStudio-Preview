@@ -1,5 +1,6 @@
 import { Panel } from "../components/Panel";
 import { TextButton } from "../components/TextButton";
+import { createUsabilityViewModel } from "../domain/project/usabilityViewModel";
 import { AssetPanel } from "../features/assets/AssetPanel";
 import { EditorToolbar } from "../features/editor/EditorToolbar";
 import { KeyboardShortcuts } from "../features/editor/KeyboardShortcuts";
@@ -7,6 +8,9 @@ import { ExportDialog } from "../features/export/ExportDialog";
 import { InspectorPanel } from "../features/inspector/InspectorPanel";
 import { PreviewPanel } from "../features/preview/PreviewPanel";
 import { TimelinePanel } from "../features/timeline/TimelinePanel";
+import { BackgroundTaskBar } from "../features/workspace/BackgroundTaskBar";
+import { ContextRail } from "../features/workspace/ContextRail";
+import { ProjectSidebar } from "../features/workspace/ProjectSidebar";
 import {
   formatExportFileError,
   openExportDirectoryPath
@@ -15,9 +19,14 @@ import {
   formatDesktopSettingsError,
   hydrateDesktopAppSettings
 } from "../infrastructure/settings/desktopAppSettings";
+import {
+  loadAppLayoutSettings,
+  saveAppLayoutSettings,
+  type AppLayoutSettings
+} from "../infrastructure/settings/appLayoutSettings";
 import { useEditorStore } from "../stores/editorStore";
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type ResizeTarget = "left" | "right" | "timeline";
 
@@ -31,6 +40,8 @@ const RESIZE_STEP = 24;
 
 export function App() {
   const status = useEditorStore((state) => state.status);
+  const project = useEditorStore((state) => state.project);
+  const importProgress = useEditorStore((state) => state.importProgress);
   const workspacePage = useEditorStore((state) => state.workspacePage);
   const setWorkspacePage = useEditorStore((state) => state.setWorkspacePage);
   const importXmlFiles = useEditorStore((state) => state.importXmlFiles);
@@ -43,6 +54,13 @@ export function App() {
   const [timelineHeight, setTimelineHeight] = useState(320);
   const [dragActive, setDragActive] = useState(false);
   const [pendingDroppedVideos, setPendingDroppedVideos] = useState<File[]>([]);
+  const [layoutSettings, setLayoutSettings] = useState<AppLayoutSettings>(() =>
+    loadAppLayoutSettings()
+  );
+  const usabilityModel = useMemo(
+    () => createUsabilityViewModel(project),
+    [project]
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -129,6 +147,12 @@ export function App() {
     });
   };
 
+  const updateLayoutSettings = (patch: Partial<AppLayoutSettings>) => {
+    setLayoutSettings((current) =>
+      saveAppLayoutSettings({ ...current, ...patch })
+    );
+  };
+
   const handleDragEnter = (event: ReactDragEvent<HTMLDivElement>) => {
     if (!hasFileDrag(event)) {
       return;
@@ -192,15 +216,31 @@ export function App() {
 
   return (
     <div
-      className="relative flex h-screen min-h-0 flex-col bg-[#101216] text-slate-100"
+      className={`app-shell relative flex h-screen min-h-0 flex-col bg-[#0d1015] text-slate-100 ${
+        layoutSettings.reduceMotion ? "reduce-motion" : ""
+      }`}
       data-testid="app-root"
+      data-density={layoutSettings.density}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       <KeyboardShortcuts />
-      <EditorToolbar />
+      <EditorToolbar
+        projectSidebarCollapsed={layoutSettings.projectSidebarCollapsed}
+        contextPanelCollapsed={layoutSettings.contextPanelCollapsed}
+        onToggleProjectSidebar={() =>
+          updateLayoutSettings({
+            projectSidebarCollapsed: !layoutSettings.projectSidebarCollapsed
+          })
+        }
+        onToggleContextPanel={() =>
+          updateLayoutSettings({
+            contextPanelCollapsed: !layoutSettings.contextPanelCollapsed
+          })
+        }
+      />
       {dragActive ? (
         <div className="pointer-events-none fixed inset-3 z-50 grid place-items-center rounded border-2 border-dashed border-accent-cyan bg-black/70 text-center text-sm text-slate-200 shadow-2xl">
           <div className="grid gap-2">
@@ -324,48 +364,38 @@ export function App() {
         </main>
       ) : (
         <main
-          className="flex min-h-0 flex-1 justify-center overflow-hidden"
+          className="flex min-h-0 flex-1 overflow-hidden"
           data-testid={`workspace-${workspacePage}`}
         >
-          <div className="flex h-full w-full max-w-5xl min-h-0 flex-col px-4">
-            <Panel
-              title={
-                workspacePage === "materials"
-                  ? "素材：导入并关联原片、参考视频和弹幕 XML"
-                  : workspacePage === "matching"
-                    ? "匹配：确定参考视频与原片的对应关系"
-                    : "导出：按原片分集导出修正后的弹幕 XML"
-              }
-              className="min-h-0 flex-1"
-            >
-              <AssetPanel section={workspacePage} />
-            </Panel>
+          {layoutSettings.projectSidebarCollapsed ? null : (
+            <ProjectSidebar project={project} model={usabilityModel} />
+          )}
+          <div className="min-w-0 flex-1 overflow-hidden bg-[#0f1217] p-3">
+            <div className="mx-auto flex h-full w-full max-w-[1180px] min-h-0 flex-col overflow-hidden rounded-xl border border-panel-line bg-panel-base shadow-[0_12px_40px_rgba(0,0,0,0.18)]">
+              <Panel
+                title={
+                  workspacePage === "materials"
+                    ? "素材"
+                    : workspacePage === "matching"
+                      ? "智能匹配"
+                      : "导出"
+                }
+                className="min-h-0 flex-1"
+              >
+                <AssetPanel section={workspacePage} />
+              </Panel>
+            </div>
           </div>
+          {layoutSettings.contextPanelCollapsed ? null : (
+            <ContextRail model={usabilityModel} pageId={workspacePage} />
+          )}
         </main>
       )}
-      <footer
-        className={`flex h-7 shrink-0 items-center border-t border-panel-line px-3 text-xs ${
-          status.tone === "error"
-            ? "bg-accent-red/10 text-accent-red"
-            : status.tone === "warning"
-              ? "bg-accent-yellow/10 text-accent-yellow"
-              : status.tone === "success"
-                ? "bg-accent-green/10 text-accent-green"
-                : "bg-[#111318] text-slate-400"
-        }`}
-        data-testid="status-bar"
-      >
-        <span className="min-w-0 flex-1 truncate">{status.message}</span>
-        {status.action ? (
-          <button
-            type="button"
-            className="ml-3 shrink-0 rounded border border-current/30 px-2 py-0.5 text-[11px] transition hover:bg-current/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-current"
-            onClick={runStatusAction}
-          >
-            {status.action.label}
-          </button>
-        ) : null}
-      </footer>
+      <BackgroundTaskBar
+        status={status}
+        progress={importProgress}
+        onAction={runStatusAction}
+      />
       <ExportDialog />
     </div>
   );

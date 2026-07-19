@@ -5,8 +5,10 @@
 :root {
   color-scheme: dark;
   font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
-  background: #101216;
-  color: #e6e9ef;
+  background: #0d1015;
+  color: #e5e7eb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
 
 * {
@@ -18,6 +20,9 @@ body {
   min-width: 960px;
   min-height: 640px;
   overflow: hidden;
+  background:
+    radial-gradient(circle at 50% -20%, rgba(76, 201, 240, 0.045), transparent 38rem),
+    #0d1015;
 }
 
 button,
@@ -42,4 +47,36 @@ textarea:focus-visible {
 
 .timeline-canvas {
   image-rendering: auto;
+}
+
+.app-shell {
+  --workspace-gutter: 0.75rem;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.012), transparent 7rem),
+    #0d1015;
+}
+
+.app-shell[data-density="compact"] {
+  --workspace-gutter: 0.5rem;
+  font-size: 0.9375rem;
+}
+
+.app-shell.reduce-motion *,
+.app-shell.reduce-motion *::before,
+.app-shell.reduce-motion *::after {
+  scroll-behavior: auto !important;
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
