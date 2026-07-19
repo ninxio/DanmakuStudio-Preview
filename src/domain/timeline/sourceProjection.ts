@@ -227,6 +227,7 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
   const groupsByTarget = new Map<string, TargetProjectionGroup>();
   const coveredItemKeys = new Set<string>();
   const sourceOnlyItemKeys = new Set<string>();
+  const mappedItemKeys = new Set<string>();
   let projectedItemCount = 0;
   let disabledTotal = 0;
 
@@ -253,7 +254,9 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
       if (mapping.status === "unmapped") {
         const itemKey = createItemKey(asset.id, item.id);
         coveredItemKeys.add(itemKey);
-        sourceOnlyItemKeys.add(itemKey);
+        if (!mappedItemKeys.has(itemKey)) {
+          sourceOnlyItemKeys.add(itemKey);
+        }
         continue;
       }
       if (mapping.status === "ambiguous") {
@@ -265,13 +268,18 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
         ) {
           const itemKey = createItemKey(asset.id, item.id);
           coveredItemKeys.add(itemKey);
-          sourceOnlyItemKeys.add(itemKey);
+          if (!mappedItemKeys.has(itemKey)) {
+            sourceOnlyItemKeys.add(itemKey);
+          }
         }
         continue;
       }
       const mappedTimeMs = mapping.targetTimeMs;
 
-      coveredItemKeys.add(createItemKey(asset.id, item.id));
+      const itemKey = createItemKey(asset.id, item.id);
+      coveredItemKeys.add(itemKey);
+      mappedItemKeys.add(itemKey);
+      sourceOnlyItemKeys.delete(itemKey);
       if (!item.enabled || disabled.has(item.id)) {
         disabledCount += 1;
         continue;
@@ -339,7 +347,9 @@ export function projectDanmakuToTargets(project: EditorProject): SourceProjectio
     coveredItemKeys,
     usableIgnoredSegments
   );
-  const sourceOnlyItemCount = sourceOnlyItemKeys.size;
+  const sourceOnlyItemCount = Array.from(sourceOnlyItemKeys).filter(
+    (itemKey) => !mappedItemKeys.has(itemKey)
+  ).length;
   const unmappedItemCount = unexpectedUnmappedItemCount + sourceOnlyItemCount;
   const nonIgnoredItemCount = Math.max(
     0,

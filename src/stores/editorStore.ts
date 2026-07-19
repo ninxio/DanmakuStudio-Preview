@@ -508,7 +508,7 @@ export const useEditorStore = create<EditorStore>((set, get) => ({
         message:
           candidate.state === "blocked"
             ? candidate.proposal.timeMap?.quality.level === "blocked"
-              ? "匹配候选已保存，但时间图存在歧义或证据不足，不能确认或导出。"
+              ? "已识别出可复核时间图，但自动质量标准未通过；可接受风险后采用系统最高可能方案，并在本机签发后导出。"
               : "匹配候选已保存，但需要先为参考素材绑定 XML。"
             : "匹配候选已加入复核队列。",
         tone: candidate.state === "blocked" ? "warning" : "success"

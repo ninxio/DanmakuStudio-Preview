@@ -1479,8 +1479,8 @@ describe("多媒体自动匹配工作台", () => {
     ["review", "需复核", "保存关系供试听复核", false, "仍不能导出", false],
     [
       "blocked",
-      "已阻断",
-      "采用系统建议并建立人工方案",
+      "可人工接管",
+      "采用系统建议，建立可导出方案",
       true,
       "自动确认未通过",
       false
@@ -1515,7 +1515,7 @@ describe("多媒体自动匹配工作台", () => {
     }
   );
 
-  it("灾难性门控只阻止自动确认，用户接受风险后可采用系统建议建立待签发人工方案", async () => {
+  it("严格自动质量门槛只阻止自动确认，用户仍可采用系统建议建立待签发方案", async () => {
     const user = userEvent.setup();
     configureSingleTargetV2Project("blocked");
     vi.mocked(isManualVerificationAuthorityAvailable).mockReturnValue(true);
@@ -1525,8 +1525,12 @@ describe("多媒体自动匹配工作台", () => {
 
     await user.click(await screen.findByRole("button", { name: "开始批量匹配" }));
     const card = await screen.findByTestId("media-match-candidate");
+    expect(within(card).getByTestId("candidate-time-map-quality")).toHaveTextContent(
+      "导出状态：可建立人工方案"
+    );
+    expect(within(card).getAllByText("可人工接管")).toHaveLength(2);
     const takeoverButton = within(card).getByRole("button", {
-      name: "采用系统建议并建立人工方案"
+      name: "采用系统建议，建立可导出方案"
     });
     expect(takeoverButton).toBeDisabled();
 
@@ -1857,7 +1861,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(useEditorStore.getState().project.mediaTimeMaps[0]?.quality.level).toBe("blocked");
     expect(
       within(await screen.findByTestId("media-match-candidate")).getByRole("button", {
-        name: "采用系统建议并建立人工方案"
+        name: "采用系统建议，建立可导出方案"
       })
     ).toBeDisabled();
   });
@@ -2059,7 +2063,7 @@ describe("多媒体自动匹配工作台", () => {
     expect(within(review).queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("blocked 状态只有在质量阻断时显示已阻断，缺 XML 时仍显示缺少绑定", async () => {
+  it("blocked 状态提供人工接管路径，缺 XML 时仍显示缺少绑定", async () => {
     configureSingleTargetV2Project("verified");
     const project = useEditorStore.getState().project;
     useEditorStore.setState({
@@ -2071,19 +2075,19 @@ describe("多媒体自动匹配工作台", () => {
     const card = await screen.findByTestId("media-match-candidate");
 
     expect(within(card).getByText("缺少 XML 绑定")).toBeInTheDocument();
-    expect(within(card).queryByText("已阻断")).not.toBeInTheDocument();
+    expect(within(card).queryByText("可人工接管")).not.toBeInTheDocument();
     expect(within(card).getByRole("button", { name: "保存关系供试听复核" })).toBeDisabled();
   });
 
   it.each([
-    ["verified", "review", "需复核", "保存关系供试听复核", "导出闸门：未通过", "仍不能导出"],
-    ["review", "review", "需复核", "保存关系供试听复核", "导出闸门：未通过", "仍不能导出"],
+    ["verified", "review", "需复核", "保存关系供试听复核", "导出状态：待复核与签发", "仍不能导出"],
+    ["review", "review", "需复核", "保存关系供试听复核", "导出状态：待复核与签发", "仍不能导出"],
     [
       "legacy-unverified",
       "legacy-unverified",
       "旧版未验证",
       "保存关系供试听复核",
-      "导出闸门：未通过",
+      "导出状态：待复核与签发",
       "仍不能导出"
     ]
   ] as const)(

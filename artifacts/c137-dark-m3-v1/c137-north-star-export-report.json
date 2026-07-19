@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "c137-development-real-media-north-star-export",
+  "releaseEligible": false,
+  "sourceReceipt": {
+    "requestedBackend": "cuda",
+    "elapsedMs": 475245,
+    "digest": "sha256:c376656b17bed5635030f8d8aa61d16e21239e4271b2c48758bcd3d2ad92114a"
+  },
+  "sourceXml": {
+    "itemCount": 8614,
+    "digest": "sha256:7b6af5bdfdaf23796c587a02e125bcf91d2733fc3e0c26444df75420cc4eeddd"
+  },
+  "result": {
+    "status": "readyWithWarnings",
+    "fileCount": 5,
+    "projectedItemCount": 8059,
+    "sourceOnlyItemCount": 549,
+    "unexpectedUnmappedItemCount": 6,
+    "crossTargetDuplicateItemCount": 0,
+    "issues": [
+      {
+        "severity": "warning",
+        "message": "549 条弹幕位于参考视频独有内容中，已按确认时间图明确舍弃，不会触发来源段覆盖错误。"
+      },
+      {
+        "severity": "warning",
+        "message": "6 条弹幕不在任何来源段内，不会被导出。如需保留，请补充正片来源段。"
+      }
+    ],
+    "files": [
+      {
+        "targetMediaId": "real-target-001",
+        "targetFileName": "Dark.S01E01.XviD-AFG.mp4",
+        "outputFileName": "Dark.S01E01.XviD-AFG.xml",
+        "itemCount": 1702,
+        "firstTimeMs": 225953,
+        "lastTimeMs": 2969438,
+        "xmlDigest": "sha256:bd630dac5eb9e9299c91afd4592ffb33ca67ab22b0d6daea13a87cacb953d7b1"
+      },
+      {
+        "targetMediaId": "real-target-002",
+        "targetFileName": "Dark.S01E02.XviD-AFG.mp4",
+        "outputFileName": "Dark.S01E02.XviD-AFG.xml",
+        "itemCount": 1535,
+        "firstTimeMs": 2604,
+        "lastTimeMs": 2594398,
+        "xmlDigest": "sha256:9d097181b1c99a2e1aa4bd6b8ce6cae26963ffae50d1fc4417b8cbcb8e7a2d5d"
+      },
+      {
+        "targetMediaId": "real-target-003",
+        "targetFileName": "Dark.S01E03.XviD-AFG.mp4",
+        "outputFileName": "Dark.S01E03.XviD-AFG.xml",
+        "itemCount": 1406,
+        "firstTimeMs": 8170,
+        "lastTimeMs": 2575079,
+        "xmlDigest": "sha256:63ae38fc50f9fd27aa86e82f95edc58c820dc14525df1146a859f14a43c5c7d4"
+      },
+      {
+        "targetMediaId": "real-target-004",
+        "targetFileName": "Dark.S01E04.XviD-AFG.mp4",
+        "outputFileName": "Dark.S01E04.XviD-AFG.xml",
+        "itemCount": 1620,
+        "firstTimeMs": 3000,
+        "lastTimeMs": 2826800,
+        "xmlDigest": "sha256:8b98ffd6b7bae8c117ee488f8fd2e3dd95d430efa163879113043061ea9c11b1"
+      },
+      {
+        "targetMediaId": "real-target-005",
+        "targetFileName": "Dark.S01E05.XviD-AFG.mp4",
+        "outputFileName": "Dark.S01E05.XviD-AFG.xml",
+        "itemCount": 1796,
+        "firstTimeMs": 10581,
+        "lastTimeMs": 2579712,
+        "xmlDigest": "sha256:d1930a3216c553ee460bd9d0efccac059fe3d7c8f222aa7cc41531146c9b2463"
+      }
+    ]
+  },
+  "limitation": "该回执证明真实候选经领域人工接管、签发、投影和重解析可生成 5 份 XML；安装级原生收据与桌面交互仍需单独走查。"
+}

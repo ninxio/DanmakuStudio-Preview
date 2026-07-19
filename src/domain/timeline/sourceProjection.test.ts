@@ -907,6 +907,60 @@ describe("projectDanmakuToTargets", () => {
     expect(result.issues.find((issue) => issue.id === "unmapped-items")).toBeUndefined();
   });
 
+  it("同一参考弹幕在前一目标被舍弃、后一目标成功映射时只计入导出", () => {
+    const project = createSingleSegmentProject([5_000], 10_000);
+    project.mediaLibrary.push(createMedia("target_second", "targetOriginal"));
+    project.danmakuSourceSegments.push(
+      createDanmakuSourceSegment("segment_second", {
+        kind: "content",
+        assetId: project.assets[0].id,
+        sourceMediaId: "ref_verified",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetMediaId: "target_second",
+        targetStartMs: 0,
+        episodeKey: null,
+        episodeLabel: null
+      })
+    );
+    attachTimeMap(project, "segment_verified", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 1_000,
+        targetStartMs: 0,
+        targetEndMs: 1_000
+      },
+      {
+        kind: "sourceOnly",
+        sourceStartMs: 1_000,
+        sourceEndMs: 10_000,
+        targetStartMs: 1_000,
+        targetEndMs: 1_000
+      }
+    ]);
+    attachTimeMap(project, "segment_second", [
+      {
+        kind: "matched",
+        sourceStartMs: 0,
+        sourceEndMs: 10_000,
+        targetStartMs: 0,
+        targetEndMs: 10_000
+      }
+    ]);
+
+    const result = projectDanmakuToTargets(project);
+    const secondTarget = result.groups.find(
+      (group) => group.targetMediaId === "target_second"
+    );
+
+    expect(result.status).toBe("readyWithWarnings");
+    expect(result.projectedItemCount).toBe(1);
+    expect(result.sourceOnlyItemCount).toBe(0);
+    expect(result.unexpectedUnmappedItemCount).toBe(0);
+    expect(secondTarget?.entries.map((entry) => entry.item.sourceTimeMs)).toEqual([5_000]);
+  });
+
   it("即使质量标记为 verified，包含 ambiguous 区间也会阻断导出", () => {
     const project = createSingleSegmentProject([5_000], 10_000);
     attachTimeMap(project, "segment_verified", [

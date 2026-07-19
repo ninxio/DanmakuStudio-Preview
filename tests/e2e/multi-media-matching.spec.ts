@@ -978,7 +978,7 @@ test("北极星多素材流程覆盖四类判定、真实 A/B 失败与签发阻
   await ambiguousItem.getByRole("button", { name: "版本替换" }).click();
   await expect(ambiguousItem).toContainText("已保存：版本替换");
   const takeoverButton = firstCandidate.getByRole("button", {
-    name: "采用系统建议并建立人工方案"
+    name: "采用系统建议，建立可导出方案"
   });
   await expect(takeoverButton).toBeDisabled();
 

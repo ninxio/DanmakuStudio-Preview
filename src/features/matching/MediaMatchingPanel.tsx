@@ -1574,7 +1574,7 @@ function MediaMatchCandidateCard({
                   onClick={acceptWithManualTakeover}
                 >
                   <WandSparkles size={13} />
-                  采用系统建议并建立人工方案
+                  采用系统建议，建立可导出方案
                 </TextButton>
               </div>
             ) : (
@@ -1767,6 +1767,7 @@ interface TimeMapGateDescription {
   message: string;
   canSaveRelationship: boolean;
   exportReady: boolean;
+  manualTakeoverAvailable: boolean;
 }
 
 function TimeMapQualitySummary({
@@ -1779,14 +1780,15 @@ function TimeMapQualitySummary({
   testId: string;
 }) {
   const gate = describeTimeMapGate(timeMap, expectedState);
+  const needsManualCompletion = gate.canSaveRelationship || gate.manualTakeoverAvailable;
   const panelClass = gate.exportReady
     ? "border-emerald-400/35 bg-emerald-400/10 text-emerald-100"
-    : gate.canSaveRelationship
+    : needsManualCompletion
       ? "border-amber-400/35 bg-amber-400/10 text-amber-100"
       : "border-red-400/35 bg-red-400/10 text-red-100";
   const badgeClass = gate.exportReady
     ? "border-emerald-300/50 bg-emerald-300/10 text-emerald-100"
-    : gate.canSaveRelationship
+    : needsManualCompletion
       ? "border-amber-300/50 bg-amber-300/10 text-amber-100"
       : "border-red-300/50 bg-red-300/10 text-red-100";
   const spanCounts = { matched: 0, sourceOnly: 0, targetOnly: 0, ambiguous: 0 };
@@ -1799,7 +1801,7 @@ function TimeMapQualitySummary({
       className={`mt-3 rounded border p-2.5 ${panelClass}`}
       data-testid={testId}
       role={
-        gate.kind === "blocked" || gate.kind === "missing" || gate.kind === "state-error"
+        gate.kind === "missing" || gate.kind === "state-error"
           ? "alert"
           : undefined
       }
@@ -1812,7 +1814,14 @@ function TimeMapQualitySummary({
           {gate.label}
         </span>
         <span className="text-[11px] font-medium">
-          导出闸门：{gate.exportReady ? "通过" : "未通过"}
+          导出状态：
+          {gate.exportReady
+            ? "可以导出"
+            : gate.manualTakeoverAvailable
+              ? "可建立人工方案"
+              : gate.canSaveRelationship
+                ? "待复核与签发"
+                : "不可导出"}
         </span>
       </div>
       <p className="mt-1 leading-5">{gate.message}</p>
@@ -2460,7 +2469,8 @@ function describeTimeMapGate(
         ? "已保存关系的时间图缺失，这条关系数据异常，不能导出；请重新分析或人工建立可验证映射。"
         : "候选时间图缺失，这个候选数据异常，不能确认或导出；请重新运行匹配。",
       canSaveRelationship: false,
-      exportReady: false
+      exportReady: false,
+      manualTakeoverAvailable: false
     };
   }
   if (timeMap.state !== expectedState) {
@@ -2469,7 +2479,8 @@ function describeTimeMapGate(
       label: "时间图异常",
       message: `${isConfirmedRelation ? "已保存关系" : "候选"}引用的时间图状态为 ${timeMap.state}，预期为 ${expectedState}，不能继续保存或导出。`,
       canSaveRelationship: false,
-      exportReady: false
+      exportReady: false,
+      manualTakeoverAvailable: false
     };
   }
 
@@ -2481,7 +2492,8 @@ function describeTimeMapGate(
         ? "已验证时间图达到导出质量门槛，可用于导出。"
         : "质量指标已达到导出门槛；确认关系后可用于导出。",
       canSaveRelationship: true,
-      exportReady: true
+      exportReady: true,
+      manualTakeoverAvailable: false
     };
   }
   if (timeMap.quality.level === "review") {
@@ -2492,7 +2504,8 @@ function describeTimeMapGate(
         ? "关系已保存供试听复核，但仍不能导出；当前引擎尚未完成真实基准校准，本版本不会把试听结果伪装成已验证。"
         : "可以保存关系供试听复核，但仍不能导出；当前引擎尚未完成真实基准校准，本版本不会把试听结果伪装成已验证。",
       canSaveRelationship: true,
-      exportReady: false
+      exportReady: false,
+      manualTakeoverAvailable: false
     };
   }
   if (timeMap.quality.level === "legacy-unverified") {
@@ -2503,17 +2516,19 @@ function describeTimeMapGate(
         ? "旧版关系仅保留供试听复核，仍不能导出；需要用完成真实媒体校准的 V2 重新分析。"
         : "可以保存旧版关系供试听复核，但仍不能导出；需要用完成真实媒体校准的 V2 重新分析。",
       canSaveRelationship: true,
-      exportReady: false
+      exportReady: false,
+      manualTakeoverAvailable: false
     };
   }
   return {
     kind: "blocked",
-    label: "已阻断",
+    label: isConfirmedRelation ? "需重新处理" : "可人工接管",
     message: isConfirmedRelation
       ? "自动质量门槛未通过；如已检查风险，可签发人工方案后导出。"
       : "自动确认未通过；可重新分析，也可接受潜在错位并采用系统建议建立人工方案。",
     canSaveRelationship: false,
-    exportReady: false
+    exportReady: false,
+    manualTakeoverAvailable: !isConfirmedRelation
   };
 }
 
@@ -2759,7 +2774,7 @@ function candidateStateText(candidate: MediaMatchCandidate, exportReady: boolean
   if (candidate.state === "accepted")
     return exportReady ? "已验证 · 可导出" : "关系已保存 / 待完成复核";
   if (candidate.state === "rejected") return "已忽略";
-  if (candidate.proposal.timeMap?.quality.level === "blocked") return "已阻断";
+  if (candidate.proposal.timeMap?.quality.level === "blocked") return "可人工接管";
   return "缺少 XML 绑定";
 }
 
