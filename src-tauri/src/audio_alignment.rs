@@ -306,6 +306,12 @@ const PERSISTENT_V2_COARSE_CACHE_DIRECTORY: &str = "alignment-v2-coarse-cache-v2
 // one-decode shared-FFT path. Long candidates contribute only the bounded coarse index here.
 // Fail closed before a pathological multi-track input can make either working set unbounded.
 const MAX_V2_ACTIVE_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
+// A globally ranked fine candidate never executes in an empty process: shared coarse artifacts,
+// materialized affine evidence and the batch receipt frontier remain resident. Reserve a fixed
+// baseline before admitting a candidate so a near-1-GiB window cannot displace an executable
+// backup and then fail only after selection. The execution path still charges the measured
+// retained baseline exactly; this is the earlier conservative frontier gate.
+const ALIGNMENT_V2_FINE_FRONTIER_BASELINE_RESERVE_BYTES: usize = 128 * 1024 * 1024;
 // Product orchestration is deliberately sequential today. Enforce the same boundary in native
 // code so multiple callers cannot each reserve the per-run 1 GiB artifact budget and exhaust the
 // machine. A future batch engine may replace this with one global byte reservation ledger.
@@ -7549,7 +7555,7 @@ fn bind_v2_candidate_global_intervals(
         let cuda_transient_bytes =
             v2_selected_fine_cuda_transient_upper_bound(source_artifact, target_artifact)?;
         fine_working_set_bytes = v2_selected_fine_phase_peak_upper_bound(
-            0,
+            ALIGNMENT_V2_FINE_FRONTIER_BASELINE_RESERVE_BYTES,
             plan,
             &candidate.source_input,
             &candidate.target_input,
@@ -7580,6 +7586,7 @@ fn bind_v2_candidate_global_intervals(
     fine_working_set_bytes = fine_working_set_bytes
         .checked_add(dp_workspace_bytes)
         .ok_or_else(|| "blocked:resource-limit：candidate DP workspace 上界溢出。".to_string())?;
+    ensure_v2_active_artifact_budget(0, fine_working_set_bytes)?;
     candidate.global_source_interval = content_intervals.source;
     candidate.global_target_interval = content_intervals.target;
     candidate.fine_working_set_bytes = fine_working_set_bytes;
@@ -18603,6 +18610,30 @@ fn v2_fine_review_proposal_rank(proposal: &AudioAlignmentProposal) -> (u64, u64,
     )
 }
 
+fn v2_fine_review_track_priority(candidate: &V2TrackPairCandidate) -> u8 {
+    if candidate.source_input.explicit_stream_selection
+        || candidate.target_input.explicit_stream_selection
+    {
+        return 5;
+    }
+    match (
+        normalized_stream_language(candidate.source_input.stream.language.as_deref()),
+        normalized_stream_language(candidate.target_input.stream.language.as_deref()),
+    ) {
+        (Some(source), Some(target)) if source == target => 4,
+        (Some(_), Some(_)) => 0,
+        _ => match (
+            candidate.source_input.stream.is_default,
+            candidate.target_input.stream.is_default,
+        ) {
+            (true, true) => 3,
+            (false, true) => 2,
+            (true, false) => 1,
+            (false, false) => 0,
+        },
+    }
+}
+
 fn evaluate_v2_fine_frontier_group<F>(
     context: &V2FineEvaluationContext<'_>,
     binding: &V2FineFrontierGroupBinding,
@@ -18704,11 +18735,17 @@ where
                 let replace = best_review
                     .as_ref()
                     .is_none_or(|(best_index, best_proposal)| {
-                        v2_fine_review_proposal_rank(&proposal)
-                            > v2_fine_review_proposal_rank(best_proposal)
-                            || v2_fine_review_proposal_rank(&proposal)
-                                == v2_fine_review_proposal_rank(best_proposal)
-                                && member_index < *best_index
+                        let candidate = &coarse.candidates[member_index];
+                        let best_candidate = &coarse.candidates[*best_index];
+                        v2_fine_review_track_priority(candidate)
+                            > v2_fine_review_track_priority(best_candidate)
+                            || (v2_fine_review_track_priority(candidate)
+                                == v2_fine_review_track_priority(best_candidate)
+                                && (v2_fine_review_proposal_rank(&proposal)
+                                    > v2_fine_review_proposal_rank(best_proposal)
+                                    || (v2_fine_review_proposal_rank(&proposal)
+                                        == v2_fine_review_proposal_rank(best_proposal)
+                                        && member_index < *best_index)))
                     });
                 if replace {
                     best_review = Some((member_index, proposal));
@@ -19345,6 +19382,28 @@ where
     }
 }
 
+fn prepare_v2_blocked_review_proposal(
+    proposal: Option<Box<AudioAlignmentProposal>>,
+    reason: &str,
+) -> Option<Box<AudioAlignmentProposal>> {
+    proposal.map(|mut proposal| {
+        proposal.confidence = 0.0;
+        if !proposal.diagnostics.iter().any(|item| item == reason) {
+            proposal.diagnostics.push(reason.to_string());
+        }
+        if let Some(time_map) = proposal.time_map.as_mut() {
+            time_map.quality.level = "blocked";
+            if !time_map.quality.reasons.iter().any(|item| item == reason) {
+                time_map.quality.reasons.push(reason.to_string());
+            }
+            if !time_map.evidence.notes.iter().any(|item| item == reason) {
+                time_map.evidence.notes.push(reason.to_string());
+            }
+        }
+        proposal
+    })
+}
+
 fn create_prepared_audio_alignment_batch_pair_request(
     pair: &PlannedAudioAlignmentBatchPair,
     source: &PreparedAudioAlignmentBatchMedia,
@@ -19643,18 +19702,21 @@ fn execute_v2_fine_frontier_batch(
                         CoreFineFrontierState::NoEligibleCandidate
                             if pair.global_selection.state
                                 == AudioAlignmentBatchGlobalSelectionState::Blocked =>
-                            "fine frontier 已完成必要评估，但当前 pair 与批内其他关系存在全局物理占用冲突；不能发布可由单 pair 人工复核绕过的候选图。",
+                            "fine frontier 已完成必要评估；当前 pair 与批内其他关系存在全局物理占用冲突，已保留 blocked TimeMap 供人工复核，但不能自动确认或导出。",
                         CoreFineFrontierState::NoEligibleCandidate =>
                             "fine frontier 已完成全部必要评估，但当前 component 没有合格关系。",
                         CoreFineFrontierState::Unresolved | CoreFineFrontierState::Pending =>
                             "fine frontier 仍有保留 coarse upper bound 的阻断候选；未发布局部可确认结果。",
                     };
-                    let review_proposal = (pair.global_selection.state
-                        == AudioAlignmentBatchGlobalSelectionState::Selected
-                        && pair.global_selection.selected)
-                        .then(|| resolution.review_proposals_by_pair.get(pair_index))
-                        .flatten()
-                        .cloned();
+                    // A blocked TimeMap is evidence for the review workflow, not an accepted
+                    // physical assignment. Preserve the best fully evaluated map even when the
+                    // coarse global shortlist rejected this pair for an overlapping projected
+                    // interval. The unchanged blocked quality and global-selection receipt keep
+                    // it non-confirmable until the user reviews the ambiguous/cut spans.
+                    let review_proposal = prepare_v2_blocked_review_proposal(
+                        resolution.review_proposals_by_pair.get(pair_index).cloned(),
+                        reason,
+                    );
                     let (relation_ranking, global_selection, outcome) =
                         create_v2_unselected_fine_staged_outcome(
                             resolution.outcome.state,
@@ -26909,6 +26971,58 @@ mod tests {
     }
 
     #[test]
+    fn v2_no_eligible_frontier_preserves_blocked_review_map_for_global_conflict() {
+        let reason =
+            "存在全局物理占用冲突，已保留 blocked TimeMap 供人工复核，但不能自动确认或导出。";
+        let mut proposal = test_audio_alignment_batch_proposal("blocked review candidate");
+        let mut time_map = visual_test_time_map(create_v2_span(
+            AudioTimeMapSpanKind::Matched,
+            0,
+            60_000,
+            0,
+            60_000,
+        ));
+        time_map.quality.level = "blocked";
+        time_map.quality.coverage = Some(0.91);
+        proposal.match_range = Some(AlignmentMatchRange {
+            source_start_ms: 0,
+            source_end_ms: 60_000,
+            target_start_ms: 0,
+            target_end_ms: 60_000,
+            coverage: 0.91,
+        });
+        proposal.time_map = Some(time_map);
+
+        let preserved =
+            prepare_v2_blocked_review_proposal(Some(Box::new(proposal)), reason).unwrap();
+        assert_eq!(preserved.confidence, 0.0);
+        assert_eq!(
+            preserved
+                .time_map
+                .as_ref()
+                .map(|time_map| time_map.quality.level),
+            Some("blocked")
+        );
+        assert!(preserved.diagnostics.iter().any(|item| item == reason));
+        assert!(preserved
+            .time_map
+            .as_ref()
+            .unwrap()
+            .quality
+            .reasons
+            .iter()
+            .any(|item| item == reason));
+        assert!(preserved
+            .time_map
+            .as_ref()
+            .unwrap()
+            .evidence
+            .notes
+            .iter()
+            .any(|item| item == reason));
+    }
+
+    #[test]
     fn v2_fine_frontier_inventory_digest_binds_members_and_contiguous_ids() {
         let plan = test_one_source_three_target_batch_plan();
         let mut receipt = create_test_audio_alignment_batch_fine_frontier_receipt(
@@ -28319,6 +28433,17 @@ mod tests {
         assert!(
             v2_default_stream_pair_prior(&unknown_reference, &german_default)
                 > v2_default_stream_pair_prior(&unknown_reference, &english_secondary)
+        );
+        let mut default_review_candidate = v2_test_pair_candidate();
+        default_review_candidate.source_input = unknown_reference.clone();
+        default_review_candidate.target_input = german_default.clone();
+        let mut secondary_review_candidate = v2_test_pair_candidate();
+        secondary_review_candidate.source_input = unknown_reference.clone();
+        secondary_review_candidate.target_input = english_secondary;
+        assert!(
+            v2_fine_review_track_priority(&default_review_candidate)
+                > v2_fine_review_track_priority(&secondary_review_candidate),
+            "同位置 blocked TimeMap 应优先保留与未标语言参考轨对应的默认目标音轨"
         );
         german_default.explicit_stream_selection = true;
         assert_eq!(
@@ -31472,12 +31597,28 @@ mod tests {
             SpectralBackendPreference::Cpu => "cpu",
             SpectralBackendPreference::Cuda => "cuda",
         };
+        let source_audio_stream_index = std::env::var("C137_REAL_MEDIA_SOURCE_AUDIO_STREAM")
+            .ok()
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .expect("C137_REAL_MEDIA_SOURCE_AUDIO_STREAM must be an unsigned integer")
+            });
+        let target_audio_stream_index = std::env::var("C137_REAL_MEDIA_TARGET_AUDIO_STREAM")
+            .ok()
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .expect("C137_REAL_MEDIA_TARGET_AUDIO_STREAM must be an unsigned integer")
+            });
         let request = AudioAlignmentBatchRequest {
             schema_version: AUDIO_ALIGNMENT_BATCH_SCHEMA_VERSION,
             sources: vec![AudioAlignmentBatchMediaRequest {
                 media_id: "real-reference-001".to_string(),
                 path: source_path,
-                audio_stream_index: None,
+                audio_stream_index: source_audio_stream_index,
                 video_stream_index: None,
             }],
             targets: target_paths
@@ -31486,7 +31627,7 @@ mod tests {
                 .map(|(index, path)| AudioAlignmentBatchMediaRequest {
                     media_id: format!("real-target-{:03}", index + 1),
                     path: path.clone(),
-                    audio_stream_index: None,
+                    audio_stream_index: target_audio_stream_index,
                     video_stream_index: None,
                 })
                 .collect(),
@@ -34562,7 +34703,7 @@ mod tests {
         assert!(
             bind_v2_candidate_global_intervals(impossible, &long_source, &long_target)
                 .unwrap_err()
-                .starts_with("blocked:window-evidence-insufficient")
+                .starts_with("blocked:resource-limit")
         );
 
         let mut executable = v2_test_pair_candidate();

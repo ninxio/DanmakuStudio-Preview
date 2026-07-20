@@ -1348,7 +1348,7 @@ function describeNativeFineDisposition(
   }
   if (snapshot.status === "failed" && isResourceLimitedFineFailure(failureText)) {
     const reason =
-      "这组没有完成分析：精匹配窗口超过本机安全资源预算。可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。";
+      "这组没有完成分析：可用资源不足。精匹配窗口超过本机安全资源预算；可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。";
     return { kind: "resourceBlocked", taskState: "failed", message: reason, reason };
   }
   if (batchStatus === "failed" || snapshot.status === "failed") {
@@ -1438,7 +1438,7 @@ function describeNativeFineDisposition(
   const stateCounts = frontier.inventoryStateCounts;
   if (stateCounts.resourceBlocked > 0) {
     const reason =
-      "这组没有完成分析：精匹配窗口超过本机安全资源预算。可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。";
+      "这组没有完成分析：可用资源不足。精匹配窗口超过本机安全资源预算；可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。";
     return { kind: "resourceBlocked", taskState: "failed", message: reason, reason };
   }
   if (frontier.finalState === "failed" || stateCounts.infrastructureFailed > 0) {

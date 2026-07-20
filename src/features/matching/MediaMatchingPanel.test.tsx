@@ -1482,7 +1482,7 @@ describe("多媒体自动匹配工作台", () => {
     const taskList = screen.getByLabelText("批量匹配任务");
     expect(
       within(taskList).getAllByText(
-        /这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。/
+        /这组没有完成分析：可用资源不足。精匹配窗口超过本机安全资源预算；可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。/
       )
     ).toHaveLength(2);
     expect(within(taskList).queryByText(/没有找到可信对应片段/)).not.toBeInTheDocument();
