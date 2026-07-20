@@ -1094,11 +1094,12 @@ function batchTaskPatchFromPairSnapshot(
     return { ...base, state: "running", message: "正在寻找可能对应的片段" };
   }
   if (snapshot.status === "failed") {
+    const disposition = describeNativeFineDisposition(snapshot, "failed");
     return {
       ...base,
       state: "failed",
       progress: 1,
-      message: snapshot.error ?? "这组素材未能完成分析"
+      message: disposition.message
     };
   }
   if (snapshot.status === "cancelled") {
@@ -1167,6 +1168,14 @@ function describeNativeFineDisposition(
     return { kind: "cancelled", taskState: "cancelled", message: reason, reason };
   }
   const failureText = `${snapshot.error ?? ""} ${snapshot.message}`;
+  if (
+    (batchStatus === "failed" || snapshot.status === "failed") &&
+    isInternalResultValidationFailure(failureText)
+  ) {
+    const reason =
+      "这组没有完成分析：应用内部结果校验失败，素材未被判定为损坏。请展开“运行诊断”查看原因，并使用修复版本重试。";
+    return { kind: "infrastructureFailed", taskState: "failed", message: reason, reason };
+  }
   if (snapshot.status === "failed" && isResourceLimitedFineFailure(failureText)) {
     const reason =
       "这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。";
@@ -1309,6 +1318,16 @@ function isResourceLimitedFineFailure(message: string): boolean {
     normalized.includes("memory budget") ||
     normalized.includes("资源不足") ||
     normalized.includes("资源上限")
+  );
+}
+
+function isInternalResultValidationFailure(message: string): boolean {
+  const normalized = message.toLocaleLowerCase("en-US");
+  return (
+    normalized.includes("staged evidence binding invalid") ||
+    normalized.includes("evidence-contract-failed") ||
+    normalized.includes("证据合同校验失败") ||
+    normalized.includes("内部结果校验失败")
   );
 }
 

@@ -1104,6 +1104,63 @@ describe("多媒体自动匹配工作台", () => {
     expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
   });
 
+  it("批次内部证据校验失败时明确说明不是素材或 GPU 故障", async () => {
+    const internalFailure =
+      "应用内部结果校验失败；素材未被判定为损坏，请保留任务日志并使用修复版本重试。";
+    const baseSnapshot = createLegacyBatchSnapshot("native-batch-contract-failed", [
+      {
+        sourceMediaId: "source-long",
+        targetMediaId: "target-ep1",
+        snapshot: {
+          jobId: "contract-failed-1",
+          status: "failed",
+          progress: 1,
+          message: "批次最终证据合同校验失败；该 pair 的结果已作废。",
+          logs: [],
+          proposal: null,
+          error: internalFailure,
+          updatedAtMs: 1
+        }
+      },
+      {
+        sourceMediaId: "source-long",
+        targetMediaId: "target-ep2",
+        snapshot: {
+          jobId: "contract-failed-2",
+          status: "failed",
+          progress: 1,
+          message: "批次最终证据合同校验失败；该 pair 的结果已作废。",
+          logs: [],
+          proposal: null,
+          error: internalFailure,
+          updatedAtMs: 1
+        }
+      }
+    ]);
+    vi.mocked(startTauriAudioAlignmentBatchJob).mockResolvedValueOnce({
+      ...baseSnapshot,
+      status: "failed",
+      message: "批次最终证据合同校验失败；所有 proposal 已清除。",
+      error: internalFailure
+    });
+
+    render(<MatchingHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "开始批量匹配" }));
+    await waitFor(() =>
+      expect(useEditorStore.getState().status.message).toContain("内部结果校验失败")
+    );
+
+    const taskList = screen.getByLabelText("批量匹配任务");
+    expect(
+      within(taskList).getAllByText(
+        /应用内部结果校验失败，素材未被判定为损坏。请展开“运行诊断”查看原因/
+      )
+    ).toHaveLength(2);
+    expect(within(taskList).queryByText(/请检查 FFmpeg、GPU 环境/)).not.toBeInTheDocument();
+    expect(useEditorStore.getState().project.mediaMatchCandidates).toEqual([]);
+  });
+
   it("前端分数偏好第一组时仍只发布后端最终分配选中的第二组", async () => {
     const project = createMatchingProject();
     addSecondSource(project);

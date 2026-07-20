@@ -9060,6 +9060,22 @@ type V2FineFrontierInventoryBuild = (
     FineFrontierConfig,
 );
 
+fn canonical_v2_fine_member_ranks(member_indices: &[usize]) -> Result<Vec<usize>, String> {
+    let mut ranks = member_indices
+        .iter()
+        .map(|index| {
+            index
+                .checked_add(1)
+                .ok_or_else(|| "fine frontier raw member rank 溢出。".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ranks.sort_unstable();
+    if ranks.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("fine frontier raw member rank 重复。".to_string());
+    }
+    Ok(ranks)
+}
+
 fn create_v2_fine_frontier_inventory(
     plan: &PlannedAudioAlignmentBatch,
     coarse_by_pair: &[Result<V2PairCoarseCandidates, String>],
@@ -9095,13 +9111,15 @@ fn create_v2_fine_frontier_inventory(
             let mut upper = ScoreMicros::ZERO;
             let mut intrinsically_eligible = false;
             let mut members = Vec::with_capacity(group.member_indices.len());
-            for member_index in &group.member_indices {
+            let canonical_member_ranks = canonical_v2_fine_member_ranks(&group.member_indices)?;
+            for member_rank in canonical_member_ranks {
+                let member_index = member_rank - 1;
                 let candidate = coarse
                     .candidates
-                    .get(*member_index)
+                    .get(member_index)
                     .ok_or_else(|| "fine frontier temporal group member 索引越界。".to_string())?;
                 if std::mem::replace(
-                    seen.get_mut(*member_index).ok_or_else(|| {
+                    seen.get_mut(member_index).ok_or_else(|| {
                         "fine frontier temporal group seen 索引越界。".to_string()
                     })?,
                     true,
@@ -9112,7 +9130,7 @@ fn create_v2_fine_frontier_inventory(
                 intrinsically_eligible |=
                     v2_relation_candidate_is_intrinsically_eligible(candidate);
                 members.push(create_audio_alignment_batch_relation_candidate_snapshot(
-                    member_index + 1,
+                    member_rank,
                     candidate,
                 ));
             }
@@ -9748,11 +9766,7 @@ fn create_audio_alignment_batch_fine_execution_evidence(
         AudioAlignmentBatchFineExecutionEvidenceSnapshot {
             candidate_id: id.into(),
             selected_member_rank: selected_member_index + 1,
-            group_member_ranks: binding
-                .member_indices
-                .iter()
-                .map(|index| index + 1)
-                .collect(),
+            group_member_ranks: canonical_v2_fine_member_ranks(&binding.member_indices)?,
             source_stream_index: candidate.source_input.stream.stream_index,
             target_stream_index: candidate.target_input.stream.stream_index,
             source_coarse_backend: audio_alignment_batch_spectral_backend_identity(
@@ -20442,8 +20456,16 @@ fn validate_audio_alignment_batch_fine_inventory_candidates(
         }
         let mut previous_rank = 0_usize;
         for member in &candidate.members {
-            if member.rank <= previous_rank
-                || !member.score.is_finite()
+            if member.rank <= previous_rank {
+                return Err(format!(
+                    "fine frontier inventory member rank 未严格递增：pairOrdinal={}、candidateOrdinal={}、previousRank={}、rank={}。",
+                    candidate.id.pair_ordinal,
+                    candidate.id.candidate_ordinal,
+                    previous_rank,
+                    member.rank
+                ));
+            }
+            if !member.score.is_finite()
                 || !member.global_score.is_finite()
                 || !member.scale.is_finite()
                 || member.scale <= 0.0
@@ -20454,7 +20476,10 @@ fn validate_audio_alignment_batch_fine_inventory_candidates(
                 || !member.unique_source_coverage.is_finite()
                 || !(0.0..=1.0).contains(&member.unique_source_coverage)
             {
-                return Err("fine frontier inventory member 结构无效或未按 rank 递增。".to_string());
+                return Err(format!(
+                    "fine frontier inventory member 字段无效：pairOrdinal={}、candidateOrdinal={}、rank={}。",
+                    candidate.id.pair_ordinal, candidate.id.candidate_ordinal, member.rank
+                ));
             }
             previous_rank = member.rank;
         }
@@ -21754,7 +21779,10 @@ fn invalidate_audio_alignment_batch_after_commit_failure(
         pair.fine_frontier = Some(failed_receipt);
         pair.fine_execution_evidence = None;
         pair.proposal = None;
-        pair.error = Some("批次级 staged evidence binding invalid。".to_string());
+        pair.error = Some(
+            "应用内部结果校验失败；素材未被判定为损坏，请保留任务日志并使用修复版本重试。"
+                .to_string(),
+        );
     }
     entry.snapshot.status = AudioAlignmentJobStatus::Failed;
     entry.snapshot.progress = 1.0;
@@ -21762,7 +21790,9 @@ fn invalidate_audio_alignment_batch_after_commit_failure(
     entry.snapshot.failed_pair_count = entry.snapshot.total_pair_count;
     entry.snapshot.current_pair_ordinal = None;
     entry.snapshot.message = "批次最终证据合同校验失败；所有 proposal 已清除。".to_string();
-    entry.snapshot.error = Some("批次级 staged evidence binding invalid。".to_string());
+    entry.snapshot.error = Some(
+        "应用内部结果校验失败；素材未被判定为损坏，请保留任务日志并使用修复版本重试。".to_string(),
+    );
     entry.snapshot.updated_at_ms = current_time_ms();
     mark_audio_alignment_batch_terminal(entry);
     prune_audio_alignment_batch_terminal_jobs(&mut jobs, Some(job_id));
@@ -27265,6 +27295,46 @@ mod tests {
             2,
             "grouping must not truncate the executable universe"
         );
+        assert_eq!(
+            groups[0].member_indices,
+            vec![1, 0],
+            "fine execution keeps its quality-first member order"
+        );
+
+        let plan = test_one_source_three_target_batch_plan();
+        let coarse_by_pair = vec![Ok(V2PairCoarseCandidates {
+            candidates,
+            temporal_window_groups: groups,
+            alternatives: Vec::new(),
+            diagnostics: Vec::new(),
+        })];
+        let (_, bindings, _, inventory_evidence, _) =
+            create_v2_fine_frontier_inventory(&plan, &coarse_by_pair, &[0]).unwrap();
+
+        assert_eq!(
+            bindings[0].member_indices,
+            vec![1, 0],
+            "canonical evidence must not change fine execution priority"
+        );
+        assert_eq!(
+            inventory_evidence.candidates[0]
+                .members
+                .iter()
+                .map(|member| member.rank)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "inventory evidence must serialize raw ranks in canonical order"
+        );
+        assert_eq!(
+            canonical_v2_fine_member_ranks(&bindings[0].member_indices).unwrap(),
+            vec![1, 2],
+            "fine execution evidence must publish the same canonical rank set"
+        );
+        validate_audio_alignment_batch_fine_inventory_candidates(
+            &inventory_evidence.candidates,
+            &[plan.pairs[0].pair_ordinal],
+        )
+        .unwrap();
     }
 
     #[test]

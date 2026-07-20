@@ -27,18 +27,21 @@ Usability V2 阶段 0–6 已完成。应用在保留现有领域逻辑、项目
 - 修复全局物理区间冲突分支：已解析但未入选的关系不再发布缺少执行证据的候选，也不再连带作废同批其他安全结果。
 - 原生失败终态现在始终返回可校验的失败回执；若证据合同仍拒绝结果，技术诊断会保留准确拒绝原因。
 - 前端不再用“原生任务清理状态不确定”覆盖最初的读取或合同错误；主错误与次级清理错误会同时保留。
-- 已补充 Rust 合同回归与匹配工作台回归。自动测试、静态检查、端到端流程和 Windows release 构建均通过。
-- 尚未把自动测试当作真实素材结论：需要用新安装包重新运行该 1×5 批次，确认每一集的候选质量后再采用关系。
+- 第二次真实 1×5 日志进一步定位到 `fine frontier inventory member` 的 rank 顺序合同：算法按质量执行 `[2,1]`，旧代码却直接按该顺序封装证据，而校验器要求 canonical `[1,2]`。
+- inventory receipt 与 fine execution receipt 现在共用同一 rank 规范化函数；只排序证据集合，不改变质量优先的实际执行与候选选择。
+- 新回归固定覆盖“执行 `[2,1]`、证据 `[1,2]`”的真实故障形状，并让生成后的 inventory 通过同一严格合同。
+- 合同校验错误已拆分为准确的 rank/字段原因；用户界面会明确说明属于应用内部校验，不再误导用户检查素材、FFmpeg 或 GPU。
+- 自动测试、静态检查、端到端流程和 Windows release 构建均通过。仍需用新安装包重新运行该 1×5 批次，确认每一集候选质量后再采用关系。
 
 ## 最终验证
 
 - `corepack pnpm verify:release`：通过。
 - 源码审计：未发现待办标记或 TypeScript 裸 `any`。
 - ESLint：通过。
-- Vitest：97 个测试文件、990 项通过；1 项真实媒体环境测试按设计跳过。
+- Vitest：97 个测试文件、991 项通过；1 项真实媒体环境测试按设计跳过。
 - Rust：446 项通过、24 项按设计忽略；`cargo fmt --check` 与严格 Clippy 通过。
 - Playwright：10/10 通过；包含旧项目打开、核心编辑、四步易用性和多素材北极星流程。
-- 一万条 XML：导入后 382 个 DOM 节点；本次同机记录导入 293.3 ms。
+- 一万条 XML：导入后 382 个 DOM 节点；本次同机记录导入 210.0 ms。
 - TypeScript/Vite production build：通过；主包 492.00 kB（gzip 157.69 kB）。
 - Tauri release 与 NSIS 安装包：通过。
 
@@ -47,7 +50,7 @@ Usability V2 阶段 0–6 已完成。应用在保留现有领域逻辑、项目
 - `src-tauri/target/release/danmaku_timeline_studio.exe`
 - `src-tauri/target/release/bundle/nsis/Danmaku Timeline Studio_0.1.0_x64-setup.exe`
 
-本次热修安装包 SHA-256：`4EB50E956312B0ED38618074BEA2EDF6295479958410C94E1B4AF8E9AC34A8D8`。
+本次热修安装包 SHA-256：`EB9F8E8466DE2E243ADF9A14644144B2C1F978F84EC85BA44FB740330F30EB63`。
 
 ## 已知边界
 
