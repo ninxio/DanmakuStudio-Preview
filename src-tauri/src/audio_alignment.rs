@@ -244,6 +244,10 @@ const ALIGNMENT_V2_DP_PARENT_BYTES_PER_CELL: usize = 3 * std::mem::size_of::<u8>
 const ALIGNMENT_V2_DP_ROLLING_COST_ROW_COUNT: usize = 6;
 const ALIGNMENT_V2_DP_PATH_BYTES_PER_STEP: usize = 128;
 const ALIGNMENT_V2_DP_WORKSPACE_SLACK_BYTES: usize = 1024 * 1024;
+// This is the threshold for retaining whole-media PCM/fine features in the reusable short-media
+// cache. It is not a content or episode-duration limit. Longer media use streaming coarse
+// extraction and a selected affine fine window whose admission is governed by the phase-aware
+// 1 GiB working-set ledger below.
 const ALIGNMENT_V2_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 const ALIGNMENT_V2_MAX_STDERR_BYTES: usize = 1024 * 1024;
 const ALIGNMENT_V2_COARSE_MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -6773,54 +6777,6 @@ where
             ));
         }
     };
-    let mut fine_active_artifact_bytes = retained_artifact_bytes;
-    if let Some(plan) = fine_decode_plan {
-        for (input, window) in [
-            (&best_pair.source_input, plan.windows.source),
-            (&best_pair.target_input, plan.windows.target),
-        ] {
-            if should_stream_v2_coarse_only(input) {
-                let window_bytes = match v2_fine_window_artifact_upper_bound(window) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        extraction_notes.push(error);
-                        return Ok(create_blocked_v2_affine_proposal(
-                            "所选 affine 精解码窗口无法建立可信的活动内存上界。",
-                            &best_pair,
-                            top1_top2_margin,
-                            alternatives,
-                            extraction_notes,
-                        ));
-                    }
-                };
-                fine_active_artifact_bytes = match ensure_v2_active_artifact_budget(
-                    fine_active_artifact_bytes,
-                    window_bytes,
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        extraction_notes.push(error);
-                        return Ok(create_blocked_v2_affine_proposal(
-                            "所选 affine 精解码窗口超过单次活动内存预算。",
-                            &best_pair,
-                            top1_top2_margin,
-                            alternatives,
-                            extraction_notes,
-                        ));
-                    }
-                };
-            }
-        }
-        extraction_notes.push(format!(
-            "所选 affine 候选采用绝对 presentation 窗口精解码：参考 [{}，{}] ms，目标 [{}，{}] ms，自适应 guard {} ms；窗口包含完整目标逆投影与全部 coarse source support；本次活动制品上界 {} MiB。",
-            plan.windows.source.start_ms,
-            plan.windows.source.end_ms,
-            plan.windows.target.start_ms,
-            plan.windows.target.end_ms,
-            plan.adaptive_guard_ms,
-            fine_active_artifact_bytes.div_ceil(1024 * 1024)
-        ));
-    }
     let cuda_fine_transient_bytes = match v2_selected_fine_cuda_transient_upper_bound(
         source_landmark_artifact,
         target_landmark_artifact,
@@ -6837,16 +6793,24 @@ where
             ));
         }
     };
-    if cuda_fine_transient_bytes > 0 {
-        let fine_extraction_peak_bytes = match ensure_v2_active_artifact_budget(
-            fine_active_artifact_bytes,
+    let mut fine_retained_artifact_bytes = retained_artifact_bytes;
+    if let Some(plan) = fine_decode_plan {
+        let fine_phase_peak_bytes = match v2_selected_fine_phase_peak_upper_bound(
+            retained_artifact_bytes,
+            plan,
+            &best_pair.source_input,
+            &best_pair.target_input,
             cuda_fine_transient_bytes,
-        ) {
+        )
+        .and_then(|peak| {
+            ensure_v2_active_artifact_budget(0, peak)?;
+            Ok(peak)
+        }) {
             Ok(bytes) => bytes,
             Err(error) => {
                 extraction_notes.push(error);
                 return Ok(create_blocked_v2_affine_proposal(
-                    "所选候选的 CUDA fine 主机批次与 cuFFT 显存工作区超过单任务合计预算。",
+                    "所选 affine 精解码窗口超过单次活动内存预算。",
                     &best_pair,
                     top1_top2_margin,
                     alternatives,
@@ -6854,11 +6818,32 @@ where
                 ));
             }
         };
+        for (input, window) in [
+            (&best_pair.source_input, plan.windows.source),
+            (&best_pair.target_input, plan.windows.target),
+        ] {
+            if should_stream_v2_coarse_only(input) {
+                fine_retained_artifact_bytes = ensure_v2_active_artifact_budget(
+                    fine_retained_artifact_bytes,
+                    v2_fine_window_resident_upper_bound(window)?,
+                )?;
+            }
+        }
         extraction_notes.push(format!(
-            "选中窗口 fine 声谱锁定 CUDA/cuFFT；4096 帧有界批次的 pageable host、device input/output 与最坏 cuFFT workspace 合计按 {} MiB 计入 1 GiB 活跃预算，阶段峰值 {} MiB。",
-            cuda_fine_transient_bytes.div_ceil(1024 * 1024),
-            fine_extraction_peak_bytes.div_ceil(1024 * 1024)
+            "所选 affine 候选采用绝对 presentation 窗口精解码：参考 [{}，{}] ms，目标 [{}，{}] ms，自适应 guard {} ms；窗口包含完整目标逆投影与全部 coarse source support；参考与目标顺序解码后的阶段峰值上界 {} MiB。",
+            plan.windows.source.start_ms,
+            plan.windows.source.end_ms,
+            plan.windows.target.start_ms,
+            plan.windows.target.end_ms,
+            plan.adaptive_guard_ms,
+            fine_phase_peak_bytes.div_ceil(1024 * 1024)
         ));
+        if cuda_fine_transient_bytes > 0 {
+            extraction_notes.push(format!(
+                "选中窗口 fine 声谱锁定 CUDA/cuFFT；4096 帧有界批次的 pageable host、device input/output 与最坏 cuFFT workspace 合计按 {} MiB 计入各自顺序提取阶段，不与另一侧解码峰值重复常驻。",
+                cuda_fine_transient_bytes.div_ceil(1024 * 1024)
+            ));
+        }
     }
 
     benchmark_stage("extracting-source", "解码参考音轨细粒度特征");
@@ -6966,7 +6951,7 @@ where
         &target_audio.fine_features,
         &best_pair.hypothesis,
         options,
-        fine_active_artifact_bytes,
+        fine_retained_artifact_bytes,
         cancel_flag,
     ) {
         Ok(result) => result,
@@ -7561,21 +7546,30 @@ fn bind_v2_candidate_global_intervals(
     let fine_plan = plan_v2_selected_fine_decode(&candidate, source_artifact, target_artifact)?;
     let mut fine_working_set_bytes = 0_usize;
     if let Some(plan) = fine_plan {
-        for (input, window) in [
-            (&candidate.source_input, plan.windows.source),
-            (&candidate.target_input, plan.windows.target),
-        ] {
-            if should_stream_v2_coarse_only(input) {
-                fine_working_set_bytes = fine_working_set_bytes
-                    .checked_add(v2_fine_window_artifact_upper_bound(window)?)
-                    .ok_or_else(|| {
-                        "blocked:resource-limit：candidate fine working-set 上界溢出。".to_string()
-                    })?;
-            }
-        }
+        let cuda_transient_bytes =
+            v2_selected_fine_cuda_transient_upper_bound(source_artifact, target_artifact)?;
+        fine_working_set_bytes = v2_selected_fine_phase_peak_upper_bound(
+            0,
+            plan,
+            &candidate.source_input,
+            &candidate.target_input,
+            cuda_transient_bytes,
+        )?;
     }
+    let content_intervals = derive_v2_selected_candidate_content_intervals(
+        &candidate,
+        source_artifact,
+        target_artifact,
+    )?;
+    let maximum_fine_duration_ms = [
+        v2_presentation_range_duration_ms(content_intervals.source)?,
+        v2_presentation_range_duration_ms(content_intervals.target)?,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
     let maximum_fine_frames = usize::try_from(
-        u128::from(ALIGNMENT_V2_MAX_DURATION_MS).div_ceil(u128::from(ALIGNMENT_V2_FINE_HOP_MS)),
+        u128::from(maximum_fine_duration_ms).div_ceil(u128::from(ALIGNMENT_V2_FINE_HOP_MS)),
     )
     .map_err(|_| "blocked:resource-limit：candidate DP 帧数上界无法表示。".to_string())?;
     let dp_workspace_bytes = v2_dp_workspace_upper_bound(
@@ -7586,11 +7580,6 @@ fn bind_v2_candidate_global_intervals(
     fine_working_set_bytes = fine_working_set_bytes
         .checked_add(dp_workspace_bytes)
         .ok_or_else(|| "blocked:resource-limit：candidate DP workspace 上界溢出。".to_string())?;
-    let content_intervals = derive_v2_selected_candidate_content_intervals(
-        &candidate,
-        source_artifact,
-        target_artifact,
-    )?;
     candidate.global_source_interval = content_intervals.source;
     candidate.global_target_interval = content_intervals.target;
     candidate.fine_working_set_bytes = fine_working_set_bytes;
@@ -10269,10 +10258,10 @@ fn v2_fine_window_pcm_decode_budget(
     range: PresentationRangeMs,
 ) -> Result<V2PcmDecodeBudget, String> {
     let duration_ms = v2_presentation_range_duration_ms(range)?;
-    if duration_ms > ALIGNMENT_V2_MAX_DURATION_MS {
+    if duration_ms > ALIGNMENT_V2_COARSE_MAX_DURATION_MS {
         return Err(format!(
-            "blocked:resource-limit：精解码窗口超过 {} 分钟硬上限。",
-            ALIGNMENT_V2_MAX_DURATION_MS / 60_000
+            "blocked:resource-limit：精解码窗口超过 {} 小时媒体安全上限。",
+            ALIGNMENT_V2_COARSE_MAX_DURATION_MS / (60 * 60 * 1_000)
         ));
     }
     let duration_budget_ms = duration_ms
@@ -10716,6 +10705,58 @@ fn v2_fine_window_artifact_upper_bound(range: PresentationRangeMs) -> Result<usi
         "精解码 PCM 与 fine feature 阶段",
     )?;
     Ok(decode_phase_bytes.max(analysis_phase_bytes))
+}
+
+fn v2_fine_window_resident_upper_bound(range: PresentationRangeMs) -> Result<usize, String> {
+    let duration_ms = v2_presentation_range_duration_ms(range)?;
+    let decode_budget = v2_fine_window_pcm_decode_budget(range)?;
+    let frame_count =
+        usize::try_from(u128::from(duration_ms).div_ceil(u128::from(ALIGNMENT_V2_FINE_HOP_MS)))
+            .map_err(|_| {
+                "blocked:resource-limit：精解码窗口常驻细特征帧数无法表示。".to_string()
+            })?;
+    let fine_bytes = v2_fine_feature_bytes(frame_count)
+        .map_err(|_| "blocked:resource-limit：精解码窗口常驻细特征上界溢出。".to_string())?;
+    v2_resource_checked_sum(
+        &[decode_budget.stdout_hard_limit_bytes, fine_bytes],
+        "精解码 PCM 与 fine feature 常驻制品",
+    )
+}
+
+fn v2_selected_fine_phase_peak_upper_bound(
+    baseline_bytes: usize,
+    plan: V2SelectedFineDecodePlan,
+    source_input: &AlignmentAudioInput,
+    target_input: &AlignmentAudioInput,
+    cuda_transient_bytes: usize,
+) -> Result<usize, String> {
+    let mut retained = baseline_bytes;
+    let mut peak = baseline_bytes;
+    for (input, window) in [
+        (source_input, plan.windows.source),
+        (target_input, plan.windows.target),
+    ] {
+        if !should_stream_v2_coarse_only(input) {
+            continue;
+        }
+        let extraction_peak = v2_fine_window_artifact_upper_bound(window)?;
+        let resident = v2_fine_window_resident_upper_bound(window)?;
+        let extraction_with_backend = extraction_peak.max(
+            resident
+                .checked_add(cuda_transient_bytes)
+                .ok_or_else(|| "blocked:resource-limit：fine CUDA 阶段峰值溢出。".to_string())?,
+        );
+        peak = peak.max(
+            retained
+                .checked_add(extraction_with_backend)
+                .ok_or_else(|| "blocked:resource-limit：fine 顺序解码阶段峰值溢出。".to_string())?,
+        );
+        retained = retained
+            .checked_add(resident)
+            .ok_or_else(|| "blocked:resource-limit：fine 常驻制品累计上界溢出。".to_string())?;
+        peak = peak.max(retained);
+    }
+    Ok(peak)
 }
 
 fn v2_cuda_fine_transient_upper_bound_bytes() -> Result<usize, String> {
@@ -11781,10 +11822,10 @@ fn plan_v2_selected_fine_decode(
         target_artifact.presentation_bounds,
     )?;
 
-    // Spend the remaining one-hour decode budget on context rather than fixing every candidate
-    // to exactly ±31 s. The helper also unions the complete coarse source support, so internal
+    // Grow useful context first, then let the phase-aware 1 GiB ledger decide whether the complete
+    // windows fit. The helper also unions the complete coarse source support, so internal
     // source-only edits wider than the guard cannot be clipped. If even the mandatory DP/boundary
-    // context does not fit, fail closed instead of silently truncating the map.
+    // context does not fit the media safety boundary, fail closed instead of truncating the map.
     let mut guard_ms = 5 * 60_000_i64;
     let mut selected = None;
     while guard_ms >= ALIGNMENT_V2_FINE_WINDOW_GUARD_MS {
@@ -11800,8 +11841,8 @@ fn plan_v2_selected_fine_decode(
         )?;
         let source_window_duration = v2_presentation_range_duration_ms(windows.source)?;
         let target_window_duration = v2_presentation_range_duration_ms(windows.target)?;
-        if source_window_duration <= ALIGNMENT_V2_MAX_DURATION_MS
-            && target_window_duration <= ALIGNMENT_V2_MAX_DURATION_MS
+        if source_window_duration <= ALIGNMENT_V2_COARSE_MAX_DURATION_MS
+            && target_window_duration <= ALIGNMENT_V2_COARSE_MAX_DURATION_MS
         {
             selected = Some(V2SelectedFineDecodePlan {
                 windows,
@@ -11812,7 +11853,7 @@ fn plan_v2_selected_fine_decode(
         guard_ms = guard_ms.saturating_sub(1_000);
     }
     selected.ok_or_else(|| {
-        "blocked:resource-limit：完整候选逆投影、全部 coarse inlier support 与 edit-aware DP 必需上下文无法同时装入 60 分钟精解码窗口；未截断成功。"
+        "blocked:resource-limit：完整候选逆投影、全部 coarse inlier support 与 edit-aware DP 必需上下文超过媒体安全边界；未截断成功。"
             .to_string()
     })
     .map(Some)
@@ -11845,20 +11886,22 @@ fn v2_selected_candidate_target_query(
     source_bounds: PresentationRangeMs,
     target_bounds: PresentationRangeMs,
 ) -> Result<PresentationRangeMs, String> {
-    let source_duration_ms = v2_presentation_range_duration_ms(source_bounds)?;
     let target_duration_ms = v2_presentation_range_duration_ms(target_bounds)?;
-    if target_duration_ms <= ALIGNMENT_V2_MAX_DURATION_MS {
-        // Product direction is source=Bilibili reference -> target=original. When the original
-        // is episode-sized, consume its complete presentation interval.
+    if target_duration_ms <= ALIGNMENT_V2_COARSE_MAX_DURATION_MS {
+        // Product direction is source=Bilibili reference -> target=original. A complete original
+        // presentation interval defines the requested content regardless of whether the episode
+        // happens to be shorter or longer than the short-media cache threshold.
         Ok(target_bounds)
-    } else if source_duration_ms <= ALIGNMENT_V2_MAX_DURATION_MS {
-        // Symmetric long-target case: project the complete short source interval.
-        project_v2_source_range_to_target(source_bounds, &pair.hypothesis)
     } else {
-        Err(
-            "blocked:window-evidence-insufficient：粗定位两侧都超过 60 分钟，且没有一条完整 episode-sized 轴可定义精对齐查询；系统不会把局部 inlier support 冒充完整时间图。"
-                .to_string(),
-        )
+        let source_duration_ms = v2_presentation_range_duration_ms(source_bounds)?;
+        if source_duration_ms <= ALIGNMENT_V2_COARSE_MAX_DURATION_MS {
+            project_v2_source_range_to_target(source_bounds, &pair.hypothesis)
+        } else {
+            Err(
+                "blocked:window-evidence-insufficient：粗定位两侧都超过媒体安全边界，无法用完整一侧定义精对齐查询；系统不会把局部 inlier support 冒充完整时间图。"
+                    .to_string(),
+            )
+        }
     }
 }
 
@@ -29582,7 +29625,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_fine_window_blocks_instead_of_truncating_required_support() {
+    fn selected_fine_window_keeps_required_support_beyond_short_media_cache_threshold() {
         let mut pair = v2_test_pair_candidate();
         pair.source_input.media_duration_ms = Some(4 * 60 * 60 * 1_000);
         pair.target_input.media_duration_ms = Some(20 * 60 * 1_000);
@@ -29599,14 +29642,19 @@ mod tests {
             end_ms: 20 * 60 * 1_000,
         });
 
-        let error = plan_v2_selected_fine_decode(&pair, &source, &target).unwrap_err();
-        assert!(error.starts_with("blocked:resource-limit"));
-        assert!(error.contains("全部 coarse inlier support"));
-        assert!(error.contains("未截断成功"));
+        let plan = plan_v2_selected_fine_decode(&pair, &source, &target)
+            .unwrap()
+            .expect("long source requires bounded selected windows");
+        assert_eq!(plan.windows.target, target.presentation_bounds);
+        assert!(plan.windows.source.end_ms >= pair.hypothesis.source_end_ms);
+        assert!(
+            v2_presentation_range_duration_ms(plan.windows.source).unwrap()
+                > ALIGNMENT_V2_MAX_DURATION_MS
+        );
     }
 
     #[test]
-    fn selected_fine_window_blocks_when_both_axes_lack_complete_episode_bounds() {
+    fn selected_fine_window_uses_complete_original_when_both_axes_exceed_cache_threshold() {
         let mut pair = v2_test_pair_candidate();
         pair.source_input.media_duration_ms = None;
         pair.target_input.media_duration_ms = Some(90 * 60 * 1_000);
@@ -29619,9 +29667,56 @@ mod tests {
             end_ms: 90 * 60 * 1_000,
         });
 
-        let error = plan_v2_selected_fine_decode(&pair, &source, &target).unwrap_err();
-        assert!(error.starts_with("blocked:window-evidence-insufficient"));
-        assert!(error.contains("不会把局部 inlier support 冒充完整时间图"));
+        let plan = plan_v2_selected_fine_decode(&pair, &source, &target)
+            .unwrap()
+            .expect("both long axes still have complete presentation bounds");
+        assert_eq!(plan.windows.target, target.presentation_bounds);
+        assert!(
+            v2_presentation_range_duration_ms(plan.windows.target).unwrap()
+                > ALIGNMENT_V2_MAX_DURATION_MS
+        );
+    }
+
+    #[test]
+    fn seventy_four_minute_episode_fits_phase_aware_cpu_and_cuda_fine_budget() {
+        let mut pair = v2_test_pair_candidate();
+        pair.source_input.media_duration_ms = Some(6 * 60 * 60 * 1_000);
+        pair.target_input.media_duration_ms = Some(74 * 60 * 1_000);
+        pair.hypothesis.scale = 1.0;
+        pair.hypothesis.offset_ms = -2 * 60 * 60 * 1_000;
+        pair.hypothesis.source_start_ms = 2 * 60 * 60 * 1_000;
+        pair.hypothesis.source_end_ms = pair.hypothesis.source_start_ms + 74 * 60 * 1_000;
+        let source = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 6 * 60 * 60 * 1_000,
+        });
+        let target = v2_test_cached_landmarks(PresentationRangeMs {
+            start_ms: 0,
+            end_ms: 74 * 60 * 1_000,
+        });
+        let plan = plan_v2_selected_fine_decode(&pair, &source, &target)
+            .unwrap()
+            .expect("long media need selected fine windows");
+
+        let cpu_peak = v2_selected_fine_phase_peak_upper_bound(
+            32 * 1024 * 1024,
+            plan,
+            &pair.source_input,
+            &pair.target_input,
+            0,
+        )
+        .unwrap();
+        let cuda_peak = v2_selected_fine_phase_peak_upper_bound(
+            32 * 1024 * 1024,
+            plan,
+            &pair.source_input,
+            &pair.target_input,
+            v2_cuda_fine_transient_upper_bound_bytes().unwrap(),
+        )
+        .unwrap();
+
+        assert!(cpu_peak < MAX_V2_ACTIVE_ARTIFACT_BYTES);
+        assert!(cuda_peak < MAX_V2_ACTIVE_ARTIFACT_BYTES);
     }
 
     #[test]
