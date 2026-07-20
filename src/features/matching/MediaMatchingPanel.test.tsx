@@ -62,6 +62,7 @@ import {
 import { parseBilibiliXml } from "../../infrastructure/xml/bilibiliXml";
 import type { MediaAdapter } from "../../infrastructure/media/mediaAdapter";
 import { isManualVerificationAuthorityAvailable } from "../../infrastructure/media/manualVerificationAuthority";
+import { probeTauriMediaTimeline } from "../../infrastructure/media/tauriMediaProbe";
 import {
   DEFAULT_APP_SETTINGS,
   saveAppSettings
@@ -92,6 +93,14 @@ vi.mock("../../infrastructure/media/manualVerificationAuthority", async () => {
   return {
     ...actual,
     isManualVerificationAuthorityAvailable: vi.fn(() => false)
+  };
+});
+
+vi.mock("../../infrastructure/media/tauriMediaProbe", async () => {
+  const actual = await vi.importActual("../../infrastructure/media/tauriMediaProbe");
+  return {
+    ...actual,
+    probeTauriMediaTimeline: vi.fn()
   };
 });
 
@@ -735,6 +744,47 @@ describe("多媒体自动匹配工作台", () => {
     vi.mocked(getTauriAudioAlignmentJob).mockReset();
     vi.mocked(cancelTauriAudioAlignmentJob).mockReset();
     vi.mocked(openAudioAlignmentDiagnosticLogDirectory).mockResolvedValue(undefined);
+    vi.mocked(probeTauriMediaTimeline).mockImplementation((request) => Promise.resolve({
+      presentationOriginMs: 0,
+      durationMs: 60_000,
+      contentIdentity: null,
+      videoStreams: [],
+      preferredAudioStreamIndex: 1,
+      audioStreams: [
+        {
+          index: 1,
+          codec: "aac",
+          startMs: 0,
+          timelineOffsetMs: 0,
+          durationMs: 60_000,
+          timeBase: "1/48000",
+          language: "deu",
+          title: "German",
+          default: true,
+          commentary: false,
+          sampleRate: 48_000,
+          channels: 2
+        },
+        ...(request.path.includes("ep")
+          ? [
+              {
+                index: 2,
+                codec: "aac",
+                startMs: 0,
+                timelineOffsetMs: 0,
+                durationMs: 60_000,
+                timeBase: "1/48000",
+                language: "eng",
+                title: "English",
+                default: false,
+                commentary: false,
+                sampleRate: 48_000,
+                channels: 2
+              }
+            ]
+          : [])
+      ]
+    }));
     legacyBatchJobs.clear();
     installLegacyPairwiseBatchAdapter();
   });
@@ -820,6 +870,79 @@ describe("多媒体自动匹配工作台", () => {
         .project.mediaMatchCandidates.map((candidate) => candidate.state)
         .sort()
     ).toEqual(["accepted", "pending"]);
+  });
+
+  it("根据季集范围把 2×8 缩小为八个显式关系且保留全部组合开关", async () => {
+    const project = createMatchingProject();
+    const sources = [
+      createMedia(
+        "source-1-4",
+        "bilibiliReference",
+        "D:\\video\\5-第三季1-4-720P 准高清-HEVC.mp4",
+        19_830_513
+      ),
+      createMedia(
+        "source-5-8",
+        "bilibiliReference",
+        "D:\\video\\6-第三季5-8-720P 准高清-HEVC.mp4",
+        21_479_104
+      )
+    ];
+    const targets = Array.from({ length: 8 }, (_, index) =>
+      createMedia(
+        `target-${index + 1}`,
+        "targetOriginal",
+        `D:\\video\\Dark.S03E${String(index + 1).padStart(2, "0")}.mkv`,
+        3_600_000
+      )
+    );
+    project.mediaLibrary = [...sources, ...targets];
+    useEditorStore.setState({ project });
+    render(<MatchingHarness />);
+
+    expect(await screen.findByTestId("smart-pairing-summary")).toHaveTextContent(
+      "建议分析 8 组，跳过 8 组"
+    );
+    expect(screen.getByText(/共 8 组/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("匹配组合范围"), { target: { value: "all" } });
+    expect(screen.getByText(/共 16 组/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("匹配组合范围"), { target: { value: "smart" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
+    expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pairs: [
+          ...targets.slice(0, 4).map((target) => ({
+            sourceMediaId: "source-1-4",
+            targetMediaId: target.id
+          })),
+          ...targets.slice(4).map((target) => ({
+            sourceMediaId: "source-5-8",
+            targetMediaId: target.id
+          }))
+        ]
+      })
+    );
+
+  });
+
+  it("必要时允许检查并为单个素材显式指定音轨", async () => {
+    render(<MatchingHarness />);
+    fireEvent.click(screen.getByText("高级：音轨检查与手动选择"));
+    fireEvent.click(screen.getByRole("button", { name: "检查所选素材音轨" }));
+
+    const targetSelect = await screen.findByLabelText("target-ep1 音轨");
+    fireEvent.change(targetSelect, { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始批量匹配" }));
+
+    await waitFor(() => expect(startTauriAudioAlignmentBatchJob).toHaveBeenCalledTimes(1));
+    const request = vi.mocked(startTauriAudioAlignmentBatchJob).mock.calls[0]?.[0];
+    expect(request?.targets).toContainEqual({
+      mediaId: "target-ep1",
+      path: "D:\\video\\ep1.mkv",
+      audioStreamIndex: 2
+    });
   });
 
   it("把持久化的强制 GPU 策略送入整个原生批次并就地说明失败不回退", async () => {

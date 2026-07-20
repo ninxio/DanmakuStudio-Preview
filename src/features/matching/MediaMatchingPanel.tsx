@@ -4,6 +4,7 @@ import {
   CircleCheck,
   CircleX,
   FolderOpen,
+  Headphones,
   LoaderCircle,
   Play,
   RefreshCw,
@@ -15,6 +16,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { TextButton } from "../../components/TextButton";
 import { augmentAlignmentProposalWithDanmakuEvidence } from "../../domain/alignment/danmakuEvidence";
 import { createMediaMatchCandidate } from "../../domain/alignment/mediaMatching";
+import { createSmartBatchPairingPlan } from "../../domain/alignment/smartBatchPairing";
 import {
   assessManualMediaTimeMapVerificationEligibility,
   assessMediaTimeMapVerification
@@ -63,6 +65,10 @@ import {
 } from "../../infrastructure/alignment/tauriAudioAlignment";
 import { loadAppSettings } from "../../infrastructure/settings/appSettings";
 import { isManualVerificationAuthorityAvailable } from "../../infrastructure/media/manualVerificationAuthority";
+import {
+  probeTauriMediaTimeline,
+  type MediaTimelineAudioStream
+} from "../../infrastructure/media/tauriMediaProbe";
 import { useEditorStore } from "../../stores/editorStore";
 import {
   TimeMapPlaybackReview,
@@ -71,6 +77,7 @@ import {
 
 type BatchTaskState =
   "waiting" | "running" | "found" | "unresolved" | "notFound" | "failed" | "cancelled";
+type PairingScope = "smart" | "all";
 
 interface BatchTask {
   id: string;
@@ -86,6 +93,13 @@ interface BatchTask {
 interface CandidateAssetSelection {
   assetIds: string[];
   touched: boolean;
+}
+
+interface AudioTrackInspection {
+  state: "loading" | "ready" | "failed";
+  streams: MediaTimelineAudioStream[];
+  preferredStreamIndex: number | null;
+  error: string | null;
 }
 
 type NativeFineDispositionKind =
@@ -129,6 +143,13 @@ export function MediaMatchingPanel({
     useState<SpectralBackendPreference>(() => loadAppSettings().alignment.spectralBackend);
   const [treatSelectedSourcesAsVersions, setTreatSelectedSourcesAsVersions] = useState(false);
   const [treatSelectedTargetsAsVersions, setTreatSelectedTargetsAsVersions] = useState(false);
+  const [pairingScope, setPairingScope] = useState<PairingScope>("smart");
+  const [audioTrackInspections, setAudioTrackInspections] = useState<
+    Record<string, AudioTrackInspection>
+  >({});
+  const [selectedAudioStreamIndexes, setSelectedAudioStreamIndexes] = useState<
+    Record<string, number | null>
+  >({});
   const [tasks, setTasks] = useState<BatchTask[]>([]);
   const [running, setRunning] = useState(false);
   const [configurationOpen, setConfigurationOpen] = useState(
@@ -175,6 +196,9 @@ export function MediaMatchingPanel({
     setSelectedTargetIds(targetMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setTreatSelectedSourcesAsVersions(false);
     setTreatSelectedTargetsAsVersions(false);
+    setPairingScope("smart");
+    setAudioTrackInspections({});
+    setSelectedAudioStreamIndexes({});
     setTasks([]);
   }, [project.id, sourceMedia, targetMedia]);
 
@@ -246,6 +270,9 @@ export function MediaMatchingPanel({
     setSelectedTargetIds(targetMedia.filter(canAnalyzeMedia).map((media) => media.id));
     setTreatSelectedSourcesAsVersions(false);
     setTreatSelectedTargetsAsVersions(false);
+    setPairingScope("smart");
+    setAudioTrackInspections({});
+    setSelectedAudioStreamIndexes({});
     setRunning(false);
     setTasks([]);
   }, [projectEpoch, sourceMedia, targetMedia]);
@@ -262,7 +289,28 @@ export function MediaMatchingPanel({
     []
   );
 
-  const pairCount = selectedSourceIds.length * selectedTargetIds.length;
+  const selectedSourcesForPlanning = useMemo(
+    () =>
+      selectedSourceIds
+        .map((id) => sourceMedia.find((media) => media.id === id))
+        .filter((media): media is ProjectMediaReference => Boolean(media)),
+    [selectedSourceIds, sourceMedia]
+  );
+  const selectedTargetsForPlanning = useMemo(
+    () =>
+      selectedTargetIds
+        .map((id) => targetMedia.find((media) => media.id === id))
+        .filter((media): media is ProjectMediaReference => Boolean(media)),
+    [selectedTargetIds, targetMedia]
+  );
+  const smartPairingPlan = useMemo(
+    () => createSmartBatchPairingPlan(selectedSourcesForPlanning, selectedTargetsForPlanning),
+    [selectedSourcesForPlanning, selectedTargetsForPlanning]
+  );
+  const pairCount =
+    pairingScope === "smart"
+      ? smartPairingPlan.pairs.length
+      : selectedSourceIds.length * selectedTargetIds.length;
   const pendingCandidates = project.mediaMatchCandidates.filter(
     (candidate) => candidate.state === "pending" || candidate.state === "blocked"
   );
@@ -289,6 +337,55 @@ export function MediaMatchingPanel({
         "error"
       );
     }
+  };
+
+  const inspectSelectedAudioTracks = async () => {
+    const selectedMedia = [...selectedSourcesForPlanning, ...selectedTargetsForPlanning].filter(
+      (media) => media.localPath
+    );
+    if (selectedMedia.length === 0) return;
+    setAudioTrackInspections((current) => {
+      const next = { ...current };
+      selectedMedia.forEach((media) => {
+        next[media.id] = {
+          state: "loading",
+          streams: current[media.id]?.streams ?? [],
+          preferredStreamIndex: current[media.id]?.preferredStreamIndex ?? null,
+          error: null
+        };
+      });
+      return next;
+    });
+    const settings = loadAppSettings().alignment;
+    await Promise.all(
+      selectedMedia.map(async (media) => {
+        try {
+          const probe = await probeTauriMediaTimeline({
+            path: requireLocalPath(media),
+            ffmpegPath: settings.ffmpegPath.trim() || null
+          });
+          setAudioTrackInspections((current) => ({
+            ...current,
+            [media.id]: {
+              state: "ready",
+              streams: probe.audioStreams.filter((stream) => !stream.commentary),
+              preferredStreamIndex: probe.preferredAudioStreamIndex,
+              error: null
+            }
+          }));
+        } catch (error: unknown) {
+          setAudioTrackInspections((current) => ({
+            ...current,
+            [media.id]: {
+              state: "failed",
+              streams: [],
+              preferredStreamIndex: null,
+              error: error instanceof Error ? error.message : "音轨检查失败。"
+            }
+          }));
+        }
+      })
+    );
   };
 
   const runBatch = async () => {
@@ -320,12 +417,19 @@ export function MediaMatchingPanel({
       setEditorStatus("请至少选择一个可分析的 B 站参考素材和一个原片素材。", "warning");
       return;
     }
+    const smartPairKeys =
+      pairingScope === "smart"
+        ? new Set(
+            smartPairingPlan.pairs.map((pair) =>
+              createMediaPairKey(pair.sourceMediaId, pair.targetMediaId)
+            )
+          )
+        : null;
     const pairs = selectedSources.flatMap((source) =>
-      selectedTargets.map((target) => ({
-        source,
-        target,
-        id: createMediaPairKey(source.id, target.id)
-      }))
+      selectedTargets.flatMap((target) => {
+        const id = createMediaPairKey(source.id, target.id);
+        return smartPairKeys && !smartPairKeys.has(id) ? [] : [{ source, target, id }];
+      })
     );
     const existingPairKeys = new Set([
       ...useEditorStore
@@ -408,10 +512,24 @@ export function MediaMatchingPanel({
       snapshot = await startTauriAudioAlignmentBatchJob({
         sources: selectedSources
           .filter((media) => pendingSourceIds.has(media.id))
-          .map((media) => ({ mediaId: media.id, path: requireLocalPath(media) })),
+          .map((media) => ({
+            mediaId: media.id,
+            path: requireLocalPath(media),
+            ...(selectedAudioStreamIndexes[media.id] !== null &&
+            selectedAudioStreamIndexes[media.id] !== undefined
+              ? { audioStreamIndex: selectedAudioStreamIndexes[media.id] }
+              : {})
+          })),
         targets: selectedTargets
           .filter((media) => pendingTargetIds.has(media.id))
-          .map((media) => ({ mediaId: media.id, path: requireLocalPath(media) })),
+          .map((media) => ({
+            mediaId: media.id,
+            path: requireLocalPath(media),
+            ...(selectedAudioStreamIndexes[media.id] !== null &&
+            selectedAudioStreamIndexes[media.id] !== undefined
+              ? { audioStreamIndex: selectedAudioStreamIndexes[media.id] }
+              : {})
+          })),
         pairs: pendingPairs.map((pair) => ({
           sourceMediaId: pair.source.id,
           targetMediaId: pair.target.id
@@ -445,6 +563,7 @@ export function MediaMatchingPanel({
         windowMs: settings.windowMs,
         minGapMs: settings.minGapMs,
         matchThreshold: settings.matchThreshold,
+        enableVisualEvidence: true,
         localizationMode: true
       });
       batchJobId = snapshot.jobId;
@@ -891,6 +1010,33 @@ export function MediaMatchingPanel({
       </div>
 
       <div className="mt-3 rounded border border-panel-line bg-black/15 p-2">
+        <div
+          className="mb-2 rounded border border-cyan-400/20 bg-cyan-400/[0.05] p-2 text-xs text-slate-300"
+          data-testid="smart-pairing-summary"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <WandSparkles size={14} className="text-cyan-300" />
+            <span className="font-medium text-slate-100">智能匹配范围</span>
+            <select
+              aria-label="匹配组合范围"
+              className="ml-auto rounded border border-panel-line bg-panel px-2 py-1 text-xs text-slate-100 outline-none focus:border-accent-cyan"
+              value={pairingScope}
+              disabled={running}
+              onChange={(event) => setPairingScope(event.target.value as PairingScope)}
+            >
+              <option value="smart">按季集信息缩小范围</option>
+              <option value="all">分析全部组合</option>
+            </select>
+          </div>
+          <p className="mt-1 leading-5 text-slate-400">
+            {pairingScope === "smart"
+              ? smartPairingPlan.summary
+              : `将分析全部 ${smartPairingPlan.totalCartesianPairCount} 组组合。`}
+          </p>
+          <p className="text-[11px] leading-5 text-slate-500">
+            文件名和项目分集信息只用于减少明显无关的组合；最终是否匹配仍由音视频证据决定。
+          </p>
+        </div>
         <label className="flex flex-wrap items-center gap-2 text-slate-300">
           <span className="font-medium">本次匹配计算</span>
           <select
@@ -943,13 +1089,37 @@ export function MediaMatchingPanel({
             </span>
           </label>
         </details>
+        <details className="mt-2 border-t border-panel-line pt-2 text-[11px] text-slate-400">
+          <summary className="cursor-pointer text-slate-300">高级：音轨检查与手动选择</summary>
+          <p className="mt-2 leading-5 text-slate-500">
+            默认由内容指纹自动比较所有非解说音轨，并用语言和默认轨标记辅助排序。只有结果提示音轨难以区分，或你明确知道应使用哪条轨道时才需要手动指定。
+          </p>
+          <div className="mt-2">
+            <TextButton disabled={running} onClick={() => void inspectSelectedAudioTracks()}>
+              <Headphones size={13} />
+              检查所选素材音轨
+            </TextButton>
+          </div>
+          <AudioTrackSelectionList
+            media={[...selectedSourcesForPlanning, ...selectedTargetsForPlanning]}
+            inspections={audioTrackInspections}
+            selections={selectedAudioStreamIndexes}
+            disabled={running}
+            onChange={(mediaId, streamIndex) =>
+              setSelectedAudioStreamIndexes((current) => ({
+                ...current,
+                [mediaId]: streamIndex
+              }))
+            }
+          />
+        </details>
       </div>
       </details>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 rounded border border-panel-line bg-black/15 p-2">
         <span className="mr-auto text-slate-400">
           将分析 {selectedSourceIds.length} 个参考 × {selectedTargetIds.length} 个原片，共{" "}
-          {pairCount} 组；所选组合会合并为一个批次并按顺序检查，界面不会逐组重复启动任务。
+          {pairCount} 组；智能范围内的组合会合并为一个批次并按顺序检查。
           <span
             className="mt-1 block text-[11px] text-slate-500"
             data-testid="spectral-backend-policy"
@@ -1178,7 +1348,7 @@ function describeNativeFineDisposition(
   }
   if (snapshot.status === "failed" && isResourceLimitedFineFailure(failureText)) {
     const reason =
-      "这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。";
+      "这组没有完成分析：精匹配窗口超过本机安全资源预算。可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。";
     return { kind: "resourceBlocked", taskState: "failed", message: reason, reason };
   }
   if (batchStatus === "failed" || snapshot.status === "failed") {
@@ -1214,8 +1384,8 @@ function describeNativeFineDisposition(
     return {
       kind: "noEligibleCandidate",
       taskState: "notFound",
-      message: "原生精匹配已完整评估，但没有可用的对应候选。",
-      reason: null
+      message: "没有找到对应关系；计算已正常完成，这不是运行错误。",
+      reason: "所选两段素材没有足够的共同音视频证据，或并非同一集内容。"
     };
   }
 
@@ -1268,7 +1438,7 @@ function describeNativeFineDisposition(
   const stateCounts = frontier.inventoryStateCounts;
   if (stateCounts.resourceBlocked > 0) {
     const reason =
-      "这组没有完成分析：可用资源不足。请减少同时分析的素材数量，或检查 GPU 与内存环境后重试。";
+      "这组没有完成分析：精匹配窗口超过本机安全资源预算。可改用 CPU、减少同时选中的多音轨版本，或查看诊断中的窗口大小。";
     return { kind: "resourceBlocked", taskState: "failed", message: reason, reason };
   }
   if (frontier.finalState === "failed" || stateCounts.infrastructureFailed > 0) {
@@ -1394,6 +1564,74 @@ function MediaChoiceList({
         </div>
       )}
     </fieldset>
+  );
+}
+
+function AudioTrackSelectionList({
+  media,
+  inspections,
+  selections,
+  disabled,
+  onChange
+}: {
+  media: ProjectMediaReference[];
+  inspections: Record<string, AudioTrackInspection>;
+  selections: Record<string, number | null>;
+  disabled: boolean;
+  onChange: (mediaId: string, streamIndex: number | null) => void;
+}) {
+  const inspected = media.filter((item) => inspections[item.id]);
+  if (inspected.length === 0) return null;
+  return (
+    <div className="mt-2 grid gap-2" data-testid="audio-track-selections">
+      {inspected.map((item) => {
+        const inspection = inspections[item.id];
+        return (
+          <label
+            key={item.id}
+            className="grid gap-1 rounded border border-panel-line bg-black/15 p-2"
+          >
+            <span className="truncate text-slate-300">{item.name}</span>
+            {inspection.state === "loading" ? (
+              <span className="flex items-center gap-1 text-slate-500">
+                <LoaderCircle size={12} className="animate-spin" />
+                正在读取音轨…
+              </span>
+            ) : inspection.state === "failed" ? (
+              <span className="text-red-300">{inspection.error}</span>
+            ) : (
+              <select
+                aria-label={`${item.name} 音轨`}
+                className="rounded border border-panel-line bg-panel px-2 py-1 text-xs text-slate-100 outline-none focus:border-accent-cyan"
+                value={selections[item.id] ?? "auto"}
+                disabled={disabled || inspection.streams.length === 0}
+                onChange={(event) =>
+                  onChange(
+                    item.id,
+                    event.target.value === "auto" ? null : Number(event.target.value)
+                  )
+                }
+              >
+                <option value="auto">
+                  自动识别
+                  {inspection.preferredStreamIndex === null
+                    ? ""
+                    : `（当前默认 #${inspection.preferredStreamIndex}）`}
+                </option>
+                {inspection.streams.map((stream) => (
+                  <option key={stream.index} value={stream.index}>
+                    #{stream.index} {stream.language ?? "语言未知"}
+                    {stream.title ? ` / ${stream.title}` : ""}
+                    {stream.default ? " / 默认" : ""}
+                    {stream.channels ? ` / ${stream.channels} 声道` : ""}
+                  </option>
+                ))}
+              </select>
+            )}
+          </label>
+        );
+      })}
+    </div>
   );
 }
 

@@ -6702,9 +6702,9 @@ where
         ALIGNMENT_V2_MIN_TRACK_MARGIN
     };
     let selected_track_reason = format!(
-        "landmark 内容评分选择 B 站参考音轨 #{} 与目标原片音轨 #{}；{} margin {:.3}。",
-        best_pair.source_input.stream.stream_index,
-        best_pair.target_input.stream.stream_index,
+        "内容指纹结合语言/默认轨软先验选择 B 站参考音轨 {} 与目标原片音轨 {}；{} margin {:.3}。软先验只负责同分排序，不能替代内容证据。",
+        format_v2_audio_stream_choice(&best_pair.source_input),
+        format_v2_audio_stream_choice(&best_pair.target_input),
         if forced_global_margin.is_some() {
             "项目级 Top-K shortlist"
         } else {
@@ -10087,10 +10087,33 @@ fn v2_language_pair_prior(source: &AlignmentAudioInput, target: &AlignmentAudioI
         normalized_stream_language(source.stream.language.as_deref()),
         normalized_stream_language(target.stream.language.as_deref()),
     ) {
-        (Some(source), Some(target)) if source == target => 0.02,
-        (Some(_), Some(_)) => -0.02,
+        (Some(source), Some(target)) if source == target => 0.04,
+        (Some(_), Some(_)) => -0.04,
         _ => 0.0,
     }
+}
+
+fn v2_default_stream_pair_prior(source: &AlignmentAudioInput, target: &AlignmentAudioInput) -> f64 {
+    if source.explicit_stream_selection || target.explicit_stream_selection {
+        return 0.0;
+    }
+    match (source.stream.is_default, target.stream.is_default) {
+        (true, true) => 0.015,
+        (false, true) => 0.010,
+        (true, false) => -0.005,
+        (false, false) => 0.0,
+    }
+}
+
+fn format_v2_audio_stream_choice(input: &AlignmentAudioInput) -> String {
+    let language = normalized_stream_language(input.stream.language.as_deref())
+        .unwrap_or_else(|| "未标记语言".to_string());
+    let default = if input.stream.is_default {
+        "，默认轨"
+    } else {
+        ""
+    };
+    format!("#{}（{}{}）", input.stream.stream_index, language, default)
 }
 
 // These arguments deliberately keep media identity, cancellation and memory-accounting
@@ -12512,7 +12535,8 @@ fn score_v2_track_pair(
         + support * 0.25
         + hypothesis.unique_target_coverage.clamp(0.0, 1.0) * 0.10
         + residual * 0.10
-        + v2_language_pair_prior(source, target))
+        + v2_language_pair_prior(source, target)
+        + v2_default_stream_pair_prior(source, target))
     .clamp(0.0, 1.0)
 }
 
@@ -28283,6 +28307,26 @@ mod tests {
             normalized_stream_language(Some("chi")).as_deref(),
             Some("zh")
         );
+
+        let mut unknown_reference = source.clone();
+        unknown_reference.stream.language = Some("und".to_string());
+        let mut german_default = test_audio_input(4, 0);
+        german_default.stream.language = Some("ger".to_string());
+        german_default.stream.is_default = true;
+        let mut english_secondary = test_audio_input(5, 0);
+        english_secondary.stream.language = Some("eng".to_string());
+        english_secondary.stream.is_default = false;
+        assert!(
+            v2_default_stream_pair_prior(&unknown_reference, &german_default)
+                > v2_default_stream_pair_prior(&unknown_reference, &english_secondary)
+        );
+        german_default.explicit_stream_selection = true;
+        assert_eq!(
+            v2_default_stream_pair_prior(&unknown_reference, &german_default),
+            0.0
+        );
+        assert!(format_v2_audio_stream_choice(&german_default).contains("de"));
+        assert!(format_v2_audio_stream_choice(&german_default).contains("默认轨"));
     }
 
     #[test]
